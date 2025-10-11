@@ -71,19 +71,13 @@ fn initialize_loom_workspace(path: String, defaults_path: String) -> Result<(), 
         return Err("Workspace already initialized (.loom directory exists)".to_string());
     }
 
-    // In dev mode, the cwd is src-tauri, so look in parent directory
-    let defaults = if Path::new(&defaults_path).exists() {
-        Path::new(&defaults_path).to_path_buf()
-    } else {
-        // Try parent directory (for dev mode when cwd is src-tauri)
-        Path::new("..").join(&defaults_path)
-    };
-
+    // Copy defaults to .loom (symlink in src-tauri/ points to ../defaults/)
+    let defaults = Path::new(&defaults_path);
     if !defaults.exists() {
-        return Err(format!("Defaults directory not found at: {} or ../{}", defaults_path, defaults_path));
+        return Err(format!("Defaults directory not found: {}", defaults_path));
     }
 
-    copy_dir_recursive(&defaults, &loom_path)
+    copy_dir_recursive(defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {}", e))?;
 
     // Add .loom/ to .gitignore
