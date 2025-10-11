@@ -1,0 +1,60 @@
+{
+  // Editor settings
+  "editor.formatOnSave": true,
+  "editor.codeActionsOnSave": {
+    "source.fixAll.biome": "explicit"
+  },
+  "editor.defaultFormatter": "biomejs.biome",
+
+  // Biome settings
+  "[javascript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[typescript]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[json]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+  "[jsonc]": {
+    "editor.defaultFormatter": "biomejs.biome"
+  },
+
+  // Rust settings
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer",
+    "editor.formatOnSave": true
+  },
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
+
+  // File associations
+  "files.associations": {
+    "*.rs": "rust"
+  },
+
+  // Files to exclude from search
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/target": true,
+    "**/.git": true,
+    "**/.loom": true
+  },
+
+  // Files to exclude from file watcher
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/target/**": true,
+    "**/.git/**": true
+  },
+
+  // Terminal settings
+  "terminal.integrated.env.osx": {
+    "RUST_BACKTRACE": "1"
+  },
+
+  // Recommended extensions prompt
+  "extensions.ignoreRecommendations": false
+}
