@@ -4,7 +4,7 @@ import { AppState, TerminalStatus } from './lib/state';
 import { renderHeader, renderPrimaryTerminal, renderMiniTerminals } from './lib/ui';
 import { open } from '@tauri-apps/api/dialog';
 import { invoke } from '@tauri-apps/api/tauri';
-import { homeDir, join as pathJoin, resourceDir } from '@tauri-apps/api/path';
+import { homeDir } from '@tauri-apps/api/path';
 import { loadConfig, saveConfig, setConfigWorkspace } from './lib/config';
 
 // Initialize theme
@@ -156,10 +156,10 @@ async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> 
   try {
     console.log('🔧 Initializing Loom workspace...');
 
-    // Get defaults path (in dev mode, it's in the project root)
-    // TODO: For production, this should be bundled as a resource
-    const defaultsPath = await pathJoin(await resourceDir(), '..', '..', 'defaults');
-    console.log('🔧 Defaults path:', defaultsPath);
+    // In dev mode, use relative path from cwd (project root)
+    // TODO: For production, bundle defaults as a resource and use resourceDir()
+    const defaultsPath = 'defaults';
+    console.log('🔧 Using defaults path:', defaultsPath);
 
     await invoke('initialize_loom_workspace', {
       path: workspacePath,
