@@ -36,7 +36,6 @@ function render() {
   renderHeader();
   renderPrimaryTerminal(state.getPrimary());
   renderMiniTerminals(state.getTerminals());
-  setupEventListeners();
 }
 
 // Initial render
@@ -45,57 +44,62 @@ render();
 // Re-render on state changes
 state.onChange(render);
 
-// Event listeners
+// Set up event listeners (only once, since parent elements are static)
 function setupEventListeners() {
   // Theme toggle
   document.getElementById('theme-toggle')?.addEventListener('click', () => {
     toggleTheme();
   });
 
-  // Add terminal (placeholder for Issue #5)
-  document.getElementById('add-terminal-btn')?.addEventListener('click', () => {
-    const count = state.getTerminals().length + 1;
-    state.addTerminal({
-      id: String(Date.now()),
-      name: `Terminal ${count}`,
-      status: TerminalStatus.Idle,
-      isPrimary: false
+  // Mini terminal row - event delegation for dynamic children
+  const miniRow = document.getElementById('mini-terminal-row');
+  if (miniRow) {
+    miniRow.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement;
+
+      // Handle close button clicks
+      if (target.classList.contains('close-terminal-btn')) {
+        e.stopPropagation();
+        const id = target.getAttribute('data-terminal-id');
+
+        if (id) {
+          if (state.getTerminals().length <= 1) {
+            alert('Cannot close the last terminal');
+            return;
+          }
+
+          if (confirm('Close this terminal?')) {
+            state.removeTerminal(id);
+          }
+        }
+        return;
+      }
+
+      // Handle add terminal button
+      if (target.id === 'add-terminal-btn' || target.closest('#add-terminal-btn')) {
+        const count = state.getTerminals().length + 1;
+        state.addTerminal({
+          id: String(Date.now()),
+          name: `Terminal ${count}`,
+          status: TerminalStatus.Idle,
+          isPrimary: false
+        });
+        return;
+      }
+
+      // Handle terminal card clicks (switch primary)
+      const card = target.closest('[data-terminal-id]');
+      if (card) {
+        const id = card.getAttribute('data-terminal-id');
+        if (id) {
+          state.setPrimary(id);
+        }
+      }
     });
-  });
-
-  // Switch terminal (event delegation)
-  document.getElementById('mini-terminal-row')?.addEventListener('click', (e) => {
-    const target = e.target as HTMLElement;
-    const card = target.closest('[data-terminal-id]');
-
-    if (card && !target.classList.contains('close-terminal-btn')) {
-      const id = card.getAttribute('data-terminal-id');
-      if (id) {
-        state.setPrimary(id);
-      }
-    }
-  });
-
-  // Close terminal (event delegation)
-  document.getElementById('mini-terminal-row')?.addEventListener('click', (e) => {
-    const target = e.target as HTMLElement;
-
-    if (target.classList.contains('close-terminal-btn')) {
-      e.stopPropagation();
-      const id = target.getAttribute('data-terminal-id');
-
-      if (id) {
-        if (state.getTerminals().length <= 1) {
-          alert('Cannot close the last terminal');
-          return;
-        }
-
-        if (confirm('Close this terminal?')) {
-          state.removeTerminal(id);
-        }
-      }
-    }
-  });
+  }
 }
+
+// Set up all event listeners once
+setupEventListeners();
 
 console.log('Loom initialized');
