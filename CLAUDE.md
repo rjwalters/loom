@@ -6,18 +6,28 @@
 
 ### Core Concept
 
-- **Primary Terminal**: Large display showing the currently selected terminal
-- **Mini Terminal Row**: Horizontal strip at bottom showing all active terminals
-- **AI Orchestration**: Each terminal can run an AI agent working on different git worktrees
+- **Primary Display**: Large view showing the currently selected agent terminal
+- **Mini Terminal Row**: Horizontal strip at bottom showing all active agent terminals
+- **Workspace Selection**: Git repository workspace picker with validation
+- **AI Orchestration**: Each agent terminal works on different features in git worktrees
 - **GitHub Coordination**: Agents create PRs, issues serve as task queue
 
 ### Current Status
 
 - ✅ Issue #1: Basic Tauri setup with TypeScript, TailwindCSS, dark/light theme
-- ✅ Issue #2: Layout structure with terminal management (in progress)
+- ✅ Issue #2: Layout structure with agent management and workspace selection
 - ⏳ Issue #3: Daemon architecture (planned)
 - ⏳ Issue #4: Terminal display integration (planned)
 - ⏳ Issue #5: AI agent integration (planned)
+
+### Recent Features (Issue #2)
+
+- **Agent Management**: Create, close, rename, and reorder agent terminals
+- **Workspace Selection**: Native folder picker with git repository validation
+- **Smart Numbering**: Agents reuse lowest available numbers (e.g., Agent 1, Agent 3, Agent 5)
+- **Drag & Drop**: Reorder agent terminals in the mini row
+- **Inline Renaming**: Double-click agent names to rename
+- **Tilde Expansion**: Support for `~/path` notation in workspace paths
 
 ## Technology Stack
 
@@ -29,7 +39,10 @@
 - **Vanilla TS**: No framework overhead, direct DOM manipulation
 
 ### Backend
-- **Rust**: Tauri backend (minimal surface area currently)
+- **Rust**: Tauri backend with IPC commands
+  - `validate_git_repo`: Validates git repository paths
+  - `greet`: Example command (will be removed)
+- **Tauri APIs**: Dialog (file picker), Path (tilde expansion)
 - **Node.js**: For terminal process management (future)
 - **Anthropic Claude**: AI agent integration (future)
 
@@ -46,17 +59,17 @@ We deliberately chose vanilla TS over React/Vue/Svelte for:
 ```
 loom/
 ├── src/
-│   ├── main.ts              # Entry point, state initialization, event handlers
-│   ├── style.css            # Global styles, Tailwind imports, transitions
+│   ├── main.ts              # Entry point, state init, events, workspace logic
+│   ├── style.css            # Global styles, Tailwind imports
 │   └── lib/
-│       ├── state.ts         # State management (observer pattern)
+│       ├── state.ts         # State management (agents, workspace, observer)
 │       ├── ui.ts            # UI rendering (pure functions)
 │       └── theme.ts         # Dark/light theme system
 ├── src-tauri/
-│   ├── src/main.rs          # Rust backend, Tauri commands
-│   ├── tauri.conf.json      # Window config, build settings
-│   └── Cargo.toml           # Rust dependencies
-├── index.html               # HTML structure (3-section layout)
+│   ├── src/main.rs          # Rust backend, Tauri IPC commands
+│   ├── tauri.conf.json      # Window config, allowlist, build settings
+│   └── Cargo.toml           # Rust dependencies (tauri features)
+├── index.html               # HTML structure (header, primary, mini row)
 ├── tsconfig.json            # TypeScript strict mode config
 ├── tailwind.config.js       # Tailwind with dark mode: 'class'
 ├── vite.config.ts           # Vite config for Tauri
@@ -94,10 +107,12 @@ export class AppState {
 - Easy to add new listeners (e.g., persist to localStorage)
 
 **Key Features**:
-- Map-based storage for O(1) terminal lookups
+- Map-based storage for O(1) agent terminal lookups
 - Strong typing with `Terminal` interface and `TerminalStatus` enum
-- Safety: Cannot remove last terminal
+- Safety: Cannot remove last agent terminal
 - Auto-promotion: First terminal becomes primary when current removed
+- Workspace state: Separate valid workspace vs displayed path for error handling
+- Smart agent numbering: Reuses lowest available numbers
 
 ### 2. Pure Functions (UI Rendering)
 
@@ -159,6 +174,53 @@ State Change → notify() → onChange callbacks → render() → setupEventList
 1. Old elements are removed (garbage collected)
 2. New elements need fresh event listeners
 3. Event delegation minimizes performance impact
+
+### 5. Tauri IPC (Inter-Process Communication)
+
+**Files**: `src/main.ts`, `src-tauri/src/main.rs`
+
+Tauri provides a bridge between TypeScript frontend and Rust backend:
+
+**Frontend** (TypeScript):
+```typescript
+import { invoke } from '@tauri-apps/api/tauri';
+
+const isValid = await invoke<boolean>('validate_git_repo', { path });
+```
+
+**Backend** (Rust):
+```rust
+#[tauri::command]
+fn validate_git_repo(path: String) -> Result<bool, String> {
+    // Validation logic with full filesystem access
+}
+```
+
+**Why Use Rust Commands?**
+- Bypass client-side filesystem restrictions
+- Full native filesystem access
+- Type-safe IPC with automatic serialization
+- Better error handling and security
+
+**Current Commands**:
+- `validate_git_repo(path: String)`: Validates path is a git repository
+  - Checks path exists and is a directory
+  - Verifies `.git` directory exists
+  - Returns `Result<bool, String>` with specific error messages
+
+**Workspace Validation Pattern**:
+```typescript
+// Separate state: displayedWorkspacePath (shown) vs workspacePath (valid)
+state.setDisplayedWorkspace(userInput);  // Show immediately
+const isValid = await validateWorkspacePath(userInput);
+if (isValid) {
+  state.setWorkspace(userInput);  // Mark as valid
+} else {
+  state.setWorkspace('');  // Keep displayed but don't use
+}
+```
+
+This allows showing invalid paths with error messages while preventing use of invalid workspace.
 
 ## TypeScript Conventions
 
@@ -229,7 +291,7 @@ function getStatusColor(status: TerminalStatus): string {
 - Dark mode via `class="dark"` on `<html>`
 - Persists to localStorage
 - Respects system preference on first load
-- 300ms smooth transitions for all color changes
+- Instant color changes (no transitions for better UX)
 
 ```typescript
 export function toggleTheme(): void {
@@ -238,13 +300,16 @@ export function toggleTheme(): void {
 }
 ```
 
+**Design Choice**: Theme transitions were intentionally removed because animated color changes during theme toggle were distracting and made the interface feel sluggish.
+
 ### Custom CSS
 
 Minimal custom CSS in `src/style.css`:
 - Tailwind imports
-- Global transitions
 - Custom scrollbars (webkit)
 - Smooth scrolling for mini terminal row
+- Drop indicator for drag-and-drop
+- User-select: none on draggable cards
 
 ## State Flow Diagram
 
@@ -281,7 +346,7 @@ Minimal custom CSS in `src/style.css`:
 
 ## Common Tasks
 
-### Adding a New Terminal Property
+### Adding a New Agent Terminal Property
 
 1. Update interface in `src/lib/state.ts`:
    ```typescript
@@ -314,6 +379,33 @@ Minimal custom CSS in `src/style.css`:
 2. Create render function in `src/lib/ui.ts`
 3. Call from `render()` in `src/main.ts`
 4. Add event listeners in `setupEventListeners()`
+
+### Adding a New Tauri Command
+
+1. **Add Rust command** in `src-tauri/src/main.rs`:
+   ```rust
+   #[tauri::command]
+   fn my_command(param: String) -> Result<ReturnType, String> {
+       // Implementation
+       Ok(result)
+   }
+   ```
+
+2. **Register command** in `main()`:
+   ```rust
+   tauri::Builder::default()
+       .invoke_handler(tauri::generate_handler![my_command])
+   ```
+
+3. **Call from TypeScript** in `src/main.ts`:
+   ```typescript
+   import { invoke } from '@tauri-apps/api/tauri';
+
+   const result = await invoke<ReturnType>('my_command', { param: value });
+   ```
+
+4. **Add required APIs** to `src-tauri/tauri.conf.json` allowlist if needed
+5. **Update Cargo.toml** if new Tauri features required
 
 ### Debugging
 
@@ -470,6 +562,33 @@ Daemon → Spawn terminal with Claude
 3. **Familiarity**: OOP pattern many devs know
 4. **Extensibility**: Easy to add methods
 
+### Why HTML5 Drag API (Not Mouse Events)?
+
+We use HTML5 drag events (`dragstart`, `dragover`, `dragend`) despite initial complexity:
+
+1. **Native behavior**: Browser handles drag cursor and visual feedback
+2. **Accessibility**: Screen readers understand drag operations
+3. **Cross-platform**: Works consistently across operating systems
+4. **No conflicts**: Doesn't interfere with text selection when properly configured
+
+**Key Implementation Details**:
+- Use `dragend` (not `drop`) because Tauri webview doesn't always fire `drop` events
+- Set `user-select: none` on cards to prevent text selection during drag
+- Use border-based selection (not `ring`/`outline`) to prevent clipping during drag
+- Wrapper divs with padding ensure borders don't get cut off
+- Drop indicator shows insertion point using absolute positioning
+
+### Why Separate Workspace State Variables?
+
+We maintain `workspacePath` (valid) and `displayedWorkspacePath` (shown):
+
+1. **Better UX**: Don't clear user input when path is invalid
+2. **Error display**: Show specific validation errors while keeping input
+3. **State clarity**: Distinguish between "what user typed" and "what we'll use"
+4. **Validation workflow**: User sees path → validate → either accept or show error
+
+This pattern prevents frustrating behavior where invalid input disappears.
+
 ## Common Pitfalls
 
 ### 1. Forgetting to Call notify()
@@ -547,4 +666,4 @@ Keep this as a living document that helps both humans and AI understand the code
 
 ---
 
-Last updated: Issue #2 (Layout Structure) - Terminal management UI complete
+Last updated: Issue #2 (Layout Structure) - Agent management, workspace selection, and drag-and-drop reordering complete
