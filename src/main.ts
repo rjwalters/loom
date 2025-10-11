@@ -2,6 +2,9 @@ import './style.css';
 import { initTheme, toggleTheme } from './lib/theme';
 import { AppState, TerminalStatus } from './lib/state';
 import { renderHeader, renderPrimaryTerminal, renderMiniTerminals } from './lib/ui';
+import { open } from '@tauri-apps/api/dialog';
+import { invoke } from '@tauri-apps/api/tauri';
+import { homeDir } from '@tauri-apps/api/path';
 
 // Initialize theme
 initTheme();
@@ -12,28 +15,28 @@ const state = new AppState();
 // Add some example terminals
 state.addTerminal({
   id: '1',
-  name: 'Terminal 1',
+  name: 'Agent 1',
   status: TerminalStatus.Idle,
   isPrimary: true
 });
 
 state.addTerminal({
   id: '2',
-  name: 'Terminal 2',
+  name: 'Agent 2',
   status: TerminalStatus.Busy,
   isPrimary: false
 });
 
 state.addTerminal({
   id: '3',
-  name: 'Terminal 3',
+  name: 'Agent 3',
   status: TerminalStatus.Idle,
   isPrimary: false
 });
 
 // Render function
 function render() {
-  renderHeader();
+  renderHeader(state.getDisplayedWorkspace());
   renderPrimaryTerminal(state.getPrimary());
   renderMiniTerminals(state.getTerminals());
 }
@@ -49,6 +52,159 @@ let draggedTerminalId: string | null = null;
 let dropTargetId: string | null = null;
 let dropInsertBefore: boolean = false;
 let isDragging: boolean = false;
+
+// Find the next available agent number
+function getNextAgentNumber(): number {
+  const terminals = state.getTerminals();
+  const agentNumbers = terminals
+    .map(t => {
+      const match = t.name.match(/^Agent (\d+)$/);
+      return match ? parseInt(match[1], 10) : null;
+    })
+    .filter((n): n is number => n !== null);
+
+  // If no agents with default names, start at 1
+  if (agentNumbers.length === 0) {
+    return 1;
+  }
+
+  // Find the lowest available number starting from 1
+  const sortedNumbers = agentNumbers.sort((a, b) => a - b);
+  for (let i = 1; i <= sortedNumbers.length + 1; i++) {
+    if (!sortedNumbers.includes(i)) {
+      return i;
+    }
+  }
+
+  // Fallback (should never reach here)
+  return sortedNumbers.length + 1;
+}
+
+// Expand tilde (~) to home directory
+async function expandTildePath(path: string): Promise<string> {
+  if (path.startsWith('~')) {
+    try {
+      const home = await homeDir();
+      return path.replace(/^~/, home);
+    } catch (error) {
+      console.error('Failed to get home directory:', error);
+      return path;
+    }
+  }
+  return path;
+}
+
+// Workspace error UI helpers
+function showWorkspaceError(message: string) {
+  const input = document.getElementById('workspace-path') as HTMLInputElement;
+  const errorDiv = document.getElementById('workspace-error');
+
+  if (input) {
+    input.classList.remove('border-gray-300', 'dark:border-gray-600');
+    input.classList.add('border-red-500', 'dark:border-red-500');
+  }
+
+  if (errorDiv) {
+    errorDiv.textContent = message;
+    errorDiv.classList.remove('hidden');
+  }
+}
+
+function clearWorkspaceError() {
+  const input = document.getElementById('workspace-path') as HTMLInputElement;
+  const errorDiv = document.getElementById('workspace-error');
+
+  if (input) {
+    input.classList.remove('border-red-500', 'dark:border-red-500');
+    input.classList.add('border-gray-300', 'dark:border-gray-600');
+  }
+
+  if (errorDiv) {
+    errorDiv.textContent = '';
+    errorDiv.classList.add('hidden');
+  }
+}
+
+// Validate workspace path
+async function validateWorkspacePath(path: string): Promise<boolean> {
+  console.log('🔍 validateWorkspacePath called with:', path);
+
+  if (!path || path.trim() === '') {
+    console.log('🔍 Path is empty');
+    clearWorkspaceError();
+    return false;
+  }
+
+  try {
+    console.log('🔍 Calling Rust command to validate...');
+    const isValid = await invoke<boolean>('validate_git_repo', { path });
+    console.log('🔍 Rust command returned:', isValid);
+    console.log('✅ Validation passed');
+    clearWorkspaceError();
+    return true;
+  } catch (error) {
+    console.error('❌ Validation failed:', error);
+    // Extract error message from Tauri error object
+    const errorMessage = typeof error === 'string' ? error : (error as any)?.message || 'Invalid workspace path';
+    showWorkspaceError(errorMessage);
+    return false;
+  }
+}
+
+// Browse for workspace folder
+async function browseWorkspace() {
+  console.log('📂 browseWorkspace called');
+  try {
+    console.log('📂 Opening dialog...');
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: 'Select workspace folder'
+    });
+
+    console.log('📂 Dialog closed. Selected:', selected);
+
+    if (selected && typeof selected === 'string') {
+      console.log('📂 Setting displayed workspace path:', selected);
+      // Update the displayed workspace path first (before validation)
+      state.setDisplayedWorkspace(selected);
+
+      // Then validate the path
+      console.log('📂 Validating path...');
+      await handleWorkspacePathInput(selected);
+    } else {
+      console.log('📂 No folder selected or canceled');
+    }
+  } catch (error) {
+    console.error('❌ Error selecting workspace:', error);
+    alert('Failed to select workspace. Please try again.');
+  }
+}
+
+// Handle manual workspace path entry
+async function handleWorkspacePathInput(path: string) {
+  console.log('⌨️  handleWorkspacePathInput called with:', path);
+
+  // Expand tilde if present
+  const expandedPath = await expandTildePath(path);
+  console.log('⌨️  Expanded path:', expandedPath);
+
+  // Update displayed workspace with expanded path
+  if (expandedPath !== path) {
+    state.setDisplayedWorkspace(expandedPath);
+  }
+
+  const isValid = await validateWorkspacePath(expandedPath);
+  if (isValid) {
+    console.log('⌨️  Path is valid, setting workspace');
+    state.setWorkspace(expandedPath);
+  } else {
+    console.log('⌨️  Path is invalid, keeping in input but not setting in state');
+    // Keep the path in the input field (don't clear it)
+    // But clear it from state so it's not used
+    state.setWorkspace('');
+  }
+}
 
 // Helper function to start renaming a terminal
 function startRename(terminalId: string, nameElement: HTMLElement) {
@@ -108,6 +264,30 @@ function setupEventListeners() {
     toggleTheme();
   });
 
+  // Workspace path input - validate on Enter or blur
+  const workspaceInput = document.getElementById('workspace-path') as HTMLInputElement;
+  if (workspaceInput) {
+    workspaceInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        handleWorkspacePathInput(workspaceInput.value);
+        workspaceInput.blur();
+      }
+    });
+
+    workspaceInput.addEventListener('blur', () => {
+      if (workspaceInput.value !== state.getWorkspace()) {
+        handleWorkspacePathInput(workspaceInput.value);
+      }
+    });
+  }
+
+  // Browse workspace button
+  document.getElementById('browse-workspace')?.addEventListener('click', () => {
+    console.log('🖱️  Browse button clicked');
+    browseWorkspace();
+  });
+
   // Primary terminal - double-click to rename
   const primaryTerminal = document.getElementById('primary-terminal');
   if (primaryTerminal) {
@@ -137,11 +317,11 @@ function setupEventListeners() {
 
         if (id) {
           if (state.getTerminals().length <= 1) {
-            alert('Cannot close the last terminal');
+            alert('Cannot close the last agent');
             return;
           }
 
-          if (confirm('Close this terminal?')) {
+          if (confirm('Close this agent?')) {
             state.removeTerminal(id);
           }
         }
@@ -150,10 +330,10 @@ function setupEventListeners() {
 
       // Handle add terminal button
       if (target.id === 'add-terminal-btn' || target.closest('#add-terminal-btn')) {
-        const count = state.getTerminals().length + 1;
+        const agentNumber = getNextAgentNumber();
         state.addTerminal({
           id: String(Date.now()),
-          name: `Terminal ${count}`,
+          name: `Agent ${agentNumber}`,
           status: TerminalStatus.Idle,
           isPrimary: false
         });

@@ -18,6 +18,8 @@ export class AppState {
   private primaryId: string | null = null;
   private order: string[] = []; // Track display order of terminal IDs
   private listeners: Set<() => void> = new Set();
+  private workspacePath: string | null = null; // Valid workspace path
+  private displayedWorkspacePath: string = ''; // Path shown in input (may be invalid)
 
   addTerminal(terminal: Terminal): void {
     this.terminals.set(terminal.id, terminal);
@@ -106,6 +108,25 @@ export class AppState {
     this.order.splice(newIndex, 0, draggedId);
 
     this.notify();
+  }
+
+  setWorkspace(path: string): void {
+    this.workspacePath = path;
+    this.displayedWorkspacePath = path;
+    this.notify();
+  }
+
+  setDisplayedWorkspace(path: string): void {
+    this.displayedWorkspacePath = path;
+    this.notify();
+  }
+
+  getWorkspace(): string | null {
+    return this.workspacePath;
+  }
+
+  getDisplayedWorkspace(): string {
+    return this.displayedWorkspacePath;
   }
 
   onChange(callback: () => void): () => void {

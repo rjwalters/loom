@@ -1,9 +1,9 @@
 import { Terminal, TerminalStatus } from './state';
 
-export function renderHeader(): void {
-  const workspaceName = document.getElementById('workspace-name');
-  if (workspaceName) {
-    workspaceName.textContent = 'No workspace selected';
+export function renderHeader(displayedWorkspacePath: string): void {
+  const workspaceInput = document.getElementById('workspace-path') as HTMLInputElement;
+  if (workspaceInput) {
+    workspaceInput.value = displayedWorkspacePath;
   }
 }
 
@@ -14,7 +14,7 @@ export function renderPrimaryTerminal(terminal: Terminal | null): void {
   if (!terminal) {
     container.innerHTML = `
       <div class="h-full flex items-center justify-center text-gray-400">
-        <p>No terminal selected. Click + to add a terminal.</p>
+        <p>No agent selected. Click + to add an agent.</p>
       </div>
     `;
     return;
@@ -30,9 +30,9 @@ export function renderPrimaryTerminal(terminal: Terminal | null): void {
       </div>
       <div class="flex-1 p-4 overflow-auto" id="terminal-content-${terminal.id}">
         <div class="font-mono text-sm text-gray-600 dark:text-gray-400">
-          Terminal: ${escapeHtml(terminal.name)}<br>
+          ${escapeHtml(terminal.name)}<br>
           Status: ${terminal.status}<br>
-          (Terminal display will be implemented in Issue #4)
+          (Agent terminal display will be implemented in Issue #4)
         </div>
       </div>
     </div>
@@ -51,7 +51,7 @@ export function renderMiniTerminals(terminals: Terminal[]): void {
       <button
         id="add-terminal-btn"
         class="flex-shrink-0 w-32 h-32 flex items-center justify-center bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
-        title="Add terminal"
+        title="Add agent"
       >
         <span class="text-3xl text-gray-400">+</span>
       </button>
@@ -79,7 +79,7 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
         <button
           class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
           data-terminal-id="${terminal.id}"
-          title="Close terminal"
+          title="Close agent"
         >
           ×
         </button>
