@@ -45,10 +45,9 @@ export async function loadConfig(): Promise<LoomConfig> {
 
     const contents = await readTextFile(configPath);
     const config = JSON.parse(contents) as LoomConfig;
-    console.log('⚙️  Loaded config from .loom/config.json:', config);
     return config;
   } catch (error) {
-    console.error('⚙️  Failed to load config:', error);
+    console.error('Failed to load config:', error);
     throw error;
   }
 }
@@ -60,7 +59,6 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
   try {
     const configPath = await getConfigPath();
     if (!configPath) {
-      console.log('⚙️  No workspace set, skipping config save');
       return;
     }
 
@@ -68,14 +66,12 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
     const loomDir = await join(cachedWorkspacePath!, '.loom');
     const loomDirExists = await exists(loomDir);
     if (!loomDirExists) {
-      console.log('⚙️  Creating .loom directory');
       await createDir(loomDir, { recursive: true });
     }
 
     const contents = JSON.stringify(config, null, 2);
     await writeTextFile(configPath, contents);
-    console.log('⚙️  Saved config:', config);
   } catch (error) {
-    console.error('⚙️  Failed to save config:', error);
+    console.error('Failed to save config:', error);
   }
 }

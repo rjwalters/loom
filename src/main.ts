@@ -37,7 +37,6 @@ let isDragging: boolean = false;
 async function saveCurrentConfig() {
   const workspace = state.getWorkspace();
   if (!workspace) {
-    console.log('⚙️  No workspace, skipping config save');
     return;
   }
 
@@ -47,7 +46,6 @@ async function saveCurrentConfig() {
   };
 
   await saveConfig(config);
-  console.log('⚙️  Saved config with', config.agents.length, 'agents');
 }
 
 // Expand tilde (~) to home directory
@@ -97,24 +95,16 @@ function clearWorkspaceError() {
 
 // Validate workspace path
 async function validateWorkspacePath(path: string): Promise<boolean> {
-  console.log('🔍 validateWorkspacePath called with:', path);
-
   if (!path || path.trim() === '') {
-    console.log('🔍 Path is empty');
     clearWorkspaceError();
     return false;
   }
 
   try {
-    console.log('🔍 Calling Rust command to validate...');
-    const isValid = await invoke<boolean>('validate_git_repo', { path });
-    console.log('🔍 Rust command returned:', isValid);
-    console.log('✅ Validation passed');
+    await invoke<boolean>('validate_git_repo', { path });
     clearWorkspaceError();
     return true;
   } catch (error) {
-    console.error('❌ Validation failed:', error);
-    // Extract error message from Tauri error object
     const errorMessage = typeof error === 'string' ? error : (error as any)?.message || 'Invalid workspace path';
     showWorkspaceError(errorMessage);
     return false;
@@ -123,30 +113,19 @@ async function validateWorkspacePath(path: string): Promise<boolean> {
 
 // Browse for workspace folder
 async function browseWorkspace() {
-  console.log('📂 browseWorkspace called');
   try {
-    console.log('📂 Opening dialog...');
     const selected = await open({
       directory: true,
       multiple: false,
       title: 'Select workspace folder'
     });
 
-    console.log('📂 Dialog closed. Selected:', selected);
-
     if (selected && typeof selected === 'string') {
-      console.log('📂 Setting displayed workspace path:', selected);
-      // Update the displayed workspace path first (before validation)
       state.setDisplayedWorkspace(selected);
-
-      // Then validate the path
-      console.log('📂 Validating path...');
       await handleWorkspacePathInput(selected);
-    } else {
-      console.log('📂 No folder selected or canceled');
     }
   } catch (error) {
-    console.error('❌ Error selecting workspace:', error);
+    console.error('Error selecting workspace:', error);
     alert('Failed to select workspace. Please try again.');
   }
 }
@@ -154,22 +133,18 @@ async function browseWorkspace() {
 // Initialize Loom in workspace
 async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> {
   try {
-    console.log('🔧 Initializing Loom workspace...');
-
     // In dev mode, use relative path from cwd (project root)
-    // TODO: For production, bundle defaults as a resource and use resourceDir()
+    // TODO: For production, bundle defaults as a resource
     const defaultsPath = 'defaults';
-    console.log('🔧 Using defaults path:', defaultsPath);
 
     await invoke('initialize_loom_workspace', {
       path: workspacePath,
       defaultsPath: defaultsPath
     });
 
-    console.log('✅ Workspace initialized successfully');
     return true;
   } catch (error) {
-    console.error('❌ Failed to initialize workspace:', error);
+    console.error('Failed to initialize workspace:', error);
     alert(`Failed to initialize workspace: ${error}`);
     return false;
   }
@@ -177,11 +152,8 @@ async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> 
 
 // Handle manual workspace path entry
 async function handleWorkspacePathInput(path: string) {
-  console.log('⌨️  handleWorkspacePathInput called with:', path);
-
   // Expand tilde if present
   const expandedPath = await expandTildePath(path);
-  console.log('⌨️  Expanded path:', expandedPath);
 
   // Update displayed workspace with expanded path
   if (expandedPath !== path) {
@@ -190,17 +162,13 @@ async function handleWorkspacePathInput(path: string) {
 
   const isValid = await validateWorkspacePath(expandedPath);
   if (!isValid) {
-    console.log('⌨️  Path is invalid, keeping in input but not setting in state');
     state.setWorkspace('');
     return;
   }
 
-  console.log('⌨️  Path is valid git repository');
-
   // Check if Loom is initialized in this workspace
   try {
     const isInitialized = await invoke<boolean>('check_loom_initialized', { path: expandedPath });
-    console.log('⌨️  Workspace initialized:', isInitialized);
 
     if (!isInitialized) {
       // Ask user to confirm initialization
@@ -214,7 +182,6 @@ async function handleWorkspacePathInput(path: string) {
       );
 
       if (!confirmed) {
-        console.log('⌨️  User canceled initialization');
         state.setWorkspace('');
         return;
       }
@@ -228,21 +195,18 @@ async function handleWorkspacePathInput(path: string) {
     }
 
     // Now load config from workspace
-    console.log('⌨️  Setting workspace');
     state.setWorkspace(expandedPath);
 
     setConfigWorkspace(expandedPath);
     const config = await loadConfig();
     state.setNextAgentNumber(config.nextAgentNumber);
-    console.log('⌨️  Loaded config:', config);
 
     // Load agents from config
     if (config.agents && config.agents.length > 0) {
       state.loadAgents(config.agents);
-      console.log('⌨️  Loaded', config.agents.length, 'agents from config');
     }
   } catch (error) {
-    console.error('❌ Error handling workspace:', error);
+    console.error('Error handling workspace:', error);
     alert(`Error: ${error}`);
     state.setWorkspace('');
   }
@@ -327,7 +291,6 @@ function setupEventListeners() {
 
   // Browse workspace button
   document.getElementById('browse-workspace')?.addEventListener('click', () => {
-    console.log('🖱️  Browse button clicked');
     browseWorkspace();
   });
 
