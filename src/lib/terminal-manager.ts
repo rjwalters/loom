@@ -1,8 +1,8 @@
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
-import { WebLinksAddon } from '@xterm/addon-web-links';
-import { WebglAddon } from '@xterm/addon-webgl';
-import '@xterm/xterm/css/xterm.css';
+import { FitAddon } from "@xterm/addon-fit";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { Terminal } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 
 export interface ManagedTerminal {
   terminal: Terminal;
@@ -25,9 +25,10 @@ export class TerminalManager {
     }
 
     // Check if terminal already exists
-    if (this.terminals.has(terminalId)) {
+    const existing = this.terminals.get(terminalId);
+    if (existing) {
       console.warn(`Terminal ${terminalId} already exists`);
-      return this.terminals.get(terminalId)!;
+      return existing;
     }
 
     // Create xterm.js Terminal instance
@@ -36,26 +37,26 @@ export class TerminalManager {
       fontSize: 14,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       theme: {
-        background: '#1e1e1e',
-        foreground: '#d4d4d4',
-        cursor: '#ffffff',
-        selectionBackground: 'rgba(255, 255, 255, 0.3)',
-        black: '#000000',
-        red: '#cd3131',
-        green: '#0dbc79',
-        yellow: '#e5e510',
-        blue: '#2472c8',
-        magenta: '#bc3fbc',
-        cyan: '#11a8cd',
-        white: '#e5e5e5',
-        brightBlack: '#666666',
-        brightRed: '#f14c4c',
-        brightGreen: '#23d18b',
-        brightYellow: '#f5f543',
-        brightBlue: '#3b8eea',
-        brightMagenta: '#d670d6',
-        brightCyan: '#29b8db',
-        brightWhite: '#e5e5e5',
+        background: "#1e1e1e",
+        foreground: "#d4d4d4",
+        cursor: "#ffffff",
+        selectionBackground: "rgba(255, 255, 255, 0.3)",
+        black: "#000000",
+        red: "#cd3131",
+        green: "#0dbc79",
+        yellow: "#e5e510",
+        blue: "#2472c8",
+        magenta: "#bc3fbc",
+        cyan: "#11a8cd",
+        white: "#e5e5e5",
+        brightBlack: "#666666",
+        brightRed: "#f14c4c",
+        brightGreen: "#23d18b",
+        brightYellow: "#f5f543",
+        brightBlue: "#3b8eea",
+        brightMagenta: "#d670d6",
+        brightCyan: "#29b8db",
+        brightWhite: "#e5e5e5",
       },
       allowProposedApi: true,
     });
@@ -72,7 +73,7 @@ export class TerminalManager {
       const webglAddon = new WebglAddon();
       terminal.loadAddon(webglAddon);
     } catch (e) {
-      console.warn('WebGL addon failed to load, using canvas renderer', e);
+      console.warn("WebGL addon failed to load, using canvas renderer", e);
     }
 
     // Open terminal in container
@@ -196,7 +197,7 @@ export class TerminalManager {
     const resizeObserver = new ResizeObserver(() => {
       try {
         fitAddon.fit();
-      } catch (e) {
+      } catch (_e) {
         // Ignore errors during resize (can happen during rapid resizing)
       }
     });
@@ -218,16 +219,16 @@ export class TerminalManager {
 
     const theme = isDark
       ? {
-          background: '#1e1e1e',
-          foreground: '#d4d4d4',
-          cursor: '#ffffff',
-          selectionBackground: 'rgba(255, 255, 255, 0.3)',
+          background: "#1e1e1e",
+          foreground: "#d4d4d4",
+          cursor: "#ffffff",
+          selectionBackground: "rgba(255, 255, 255, 0.3)",
         }
       : {
-          background: '#ffffff',
-          foreground: '#333333',
-          cursor: '#000000',
-          selectionBackground: 'rgba(0, 0, 0, 0.3)',
+          background: "#ffffff",
+          foreground: "#333333",
+          cursor: "#000000",
+          selectionBackground: "rgba(0, 0, 0, 0.3)",
         };
 
     managed.terminal.options.theme = theme;

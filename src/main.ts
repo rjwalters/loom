@@ -174,7 +174,9 @@ async function validateWorkspacePath(path: string): Promise<boolean> {
     return true;
   } catch (error) {
     const errorMessage =
-      typeof error === "string" ? error : (error as any)?.message || "Invalid workspace path";
+      typeof error === "string"
+        ? error
+        : (error as { message?: string })?.message || "Invalid workspace path";
     console.log("[validateWorkspacePath] validation failed:", errorMessage);
     showWorkspaceError(errorMessage);
     return false;

@@ -1,5 +1,5 @@
-import { invoke } from '@tauri-apps/api/tauri';
-import { getTerminalManager } from './terminal-manager';
+import { invoke } from "@tauri-apps/api/tauri";
+import { getTerminalManager } from "./terminal-manager";
 
 interface TerminalOutput {
   output: string;
@@ -89,7 +89,7 @@ export class OutputPoller {
    */
   private async pollOnce(state: PollerState): Promise<void> {
     try {
-      const result = await invoke<TerminalOutput>('get_terminal_output', {
+      const result = await invoke<TerminalOutput>("get_terminal_output", {
         id: state.terminalId,
         startLine: state.lastLineCount > 0 ? state.lastLineCount : null,
       });
