@@ -6,13 +6,11 @@ on:
   pull_request:
     branches: [main]
 
-# Restrict permissions (principle of least privilege)
 permissions:
   contents: read
-  pull-requests: write # for CI summary comments
+  pull-requests: write
   security-events: write
 
-# Cancel in-progress runs when a new one starts
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -27,23 +25,18 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Detect what changed — so we only run needed jobs
-  # ─────────────────────────────────────────────────────────────────────────────
   changes:
     name: Detect Changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 5
     outputs:
       frontend: ${{ steps.filter.outputs.frontend }}
       rust: ${{ steps.filter.outputs.rust }}
       ci: ${{ steps.filter.outputs.ci }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Filter changes
-        id: filter
+      - id: filter
         uses: dorny/paths-filter@v3
         with:
           filters: |
@@ -58,40 +51,28 @@ jobs:
             ci:
               - '.github/workflows/**'
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Frontend checks: lint, format, types, and build
-  # ─────────────────────────────────────────────────────────────────────────────
   frontend:
     name: Frontend (Lint, Format, TypeScript, Build)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     needs: changes
     if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.ci == 'true'
-    strategy:
-      fail-fast: false
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: "package-lock.json"
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
 
       - name: Install dependencies
-        uses: ./.github/actions/retry-command
-        with:
-          command: npm ci --prefer-offline
-          max_attempts: 3
-          retry_wait_seconds: 5
-          timeout_minutes: 5
+        run: npm ci --prefer-offline
 
       - name: Run parallel checks
         run: |
           set -e
-          npm run lint & 
+          npm run lint &
           npm run format &
           npx tsc --noEmit &
           wait
@@ -106,54 +87,30 @@ jobs:
           name: frontend-dist
           path: dist/
           retention-days: 7
-          compression-level: 6 # default is 6, balance between speed and size
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Rust formatting (super fast)
-  # ─────────────────────────────────────────────────────────────────────────────
   rust-format:
     name: Rust Format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
-    strategy:
-      fail-fast: false
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - run: cargo fmt --all -- --check
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Rust build, lint (Clippy), and test
-  # ─────────────────────────────────────────────────────────────────────────────
   rust-build:
     name: Rust (Clippy + Test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
-    strategy:
-      fail-fast: false
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Cache system dependencies
-        id: cache-deps
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/*.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-apt-
+      - uses: actions/checkout@v4
 
       - name: Install system dependencies
         run: |
@@ -162,41 +119,35 @@ jobs:
             libgtk-3-dev \
             libwebkit2gtk-4.0-dev \
             libjavascriptcoregtk-4.0-dev \
+            libsoup2.4-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libsoup-2.4-dev
+            librsvg2-dev
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
           shared-key: rust-build
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Run Clippy (with warnings as errors)
+      - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Run Rust tests
+      - name: Run Tests
         run: cargo test --workspace --locked --all-features --no-fail-fast -- --nocapture
 
       - name: Show sccache stats
         if: always()
         run: sccache --show-stats
 
-  # ─────────────────────────────────────────────────────────────────────────────
-  # Aggregate results (always runs)
-  # ─────────────────────────────────────────────────────────────────────────────
   all-checks:
     name: All Checks Passed
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs:
       - frontend
@@ -204,14 +155,12 @@ jobs:
       - rust-build
     if: always()
     steps:
-      - name: Check results
-        id: check-results
+      - id: check-results
         run: |
           echo "Frontend: ${{ needs.frontend.result }}"
           echo "Rust Format: ${{ needs.rust-format.result }}"
           echo "Rust Build: ${{ needs.rust-build.result }}"
 
-          # Count failures (but ignore skipped)
           FAILED=0
           [[ "${{ needs.frontend.result }}" == "failure" ]] && FAILED=$((FAILED+1))
           [[ "${{ needs.rust-format.result }}" == "failure" ]] && FAILED=$((FAILED+1))
@@ -224,13 +173,11 @@ jobs:
             exit 1
           fi
 
-      - name: All checks passed
-        if: steps.check-results.outputs.failed_count == '0'
+      - if: steps.check-results.outputs.failed_count == '0'
         run: echo "✅ All checks passed successfully!"
 
-      - name: Summary annotation
+      - uses: actions/github-script@v7
         if: always()
-        uses: actions/github-script@v7
         with:
           script: |
             const jobs = {
@@ -238,32 +185,28 @@ jobs:
               'Rust Format': '${{ needs.rust-format.result }}',
               'Rust Build': '${{ needs.rust-build.result }}'
             };
-            
+
             const statusIcon = (status) => {
               if (status === 'success') return '✅ Pass';
               if (status === 'skipped') return '⏭️ Skipped';
               if (status === 'cancelled') return '🚫 Cancelled';
               return '❌ Fail';
             };
-            
+
             const allPassed = Object.values(jobs).every(
               status => status === 'success' || status === 'skipped'
             );
-            
+
             let summary = core.summary
               .addHeading(allPassed ? '✅ CI Summary - All Passed' : '❌ CI Summary - Some Failed')
               .addHeading('Job Results', 3)
               .addTable([
-                [{data: 'Job', header: true}, {data: 'Status', header: true}],
-                ...Object.entries(jobs).map(([name, status]) => [
-                  name,
-                  statusIcon(status)
-                ])
+                [{ data: 'Job', header: true }, { data: 'Status', header: true }],
+                ...Object.entries(jobs).map(([name, status]) => [name, statusIcon(status)])
               ]);
-            
-            // Add PR context if applicable
+
             if (context.eventName === 'pull_request') {
               summary.addRaw(`\n\n🔀 Triggered by: PR #${context.payload.pull_request.number}`);
             }
-            
+
             await summary.write();
