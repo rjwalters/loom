@@ -1,0 +1,9 @@
+[workspace]
+members = ["loom-daemon", "src-tauri"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.35", features = ["full"] }
+anyhow = "1.0"
