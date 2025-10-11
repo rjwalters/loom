@@ -6,12 +6,21 @@ import { open } from '@tauri-apps/api/dialog';
 import { invoke } from '@tauri-apps/api/tauri';
 import { homeDir } from '@tauri-apps/api/path';
 import { loadConfig, saveConfig, setConfigWorkspace } from './lib/config';
+import { getTerminalManager } from './lib/terminal-manager';
+import { getOutputPoller } from './lib/output-poller';
 
 // Initialize theme
 initTheme();
 
 // Initialize state (no agents until workspace is selected)
 const state = new AppState();
+
+// Get terminal manager and output poller
+const terminalManager = getTerminalManager();
+const outputPoller = getOutputPoller();
+
+// Track which terminal is currently attached
+let currentAttachedTerminalId: string | null = null;
 
 // Render function
 function render() {
@@ -25,6 +34,49 @@ function render() {
   if (!hasWorkspace) {
     attachWorkspaceEventListeners();
   }
+
+  // Initialize xterm.js terminal for primary terminal
+  const primary = state.getPrimary();
+  if (primary && hasWorkspace) {
+    initializeTerminalDisplay(primary.id);
+  }
+}
+
+// Initialize xterm.js terminal display
+function initializeTerminalDisplay(terminalId: string) {
+  const containerId = `terminal-content-${terminalId}`;
+
+  // Check if terminal already exists
+  if (terminalManager.getTerminal(terminalId)) {
+    // Terminal already exists, just ensure polling is active
+    if (currentAttachedTerminalId !== terminalId) {
+      // Stop polling previous terminal
+      if (currentAttachedTerminalId) {
+        outputPoller.stopPolling(currentAttachedTerminalId);
+      }
+      // Start polling new terminal
+      outputPoller.startPolling(terminalId);
+      currentAttachedTerminalId = terminalId;
+    }
+    return;
+  }
+
+  // Wait for DOM to be ready
+  setTimeout(() => {
+    const managed = terminalManager.createTerminal(terminalId, containerId);
+    if (managed) {
+      // Start polling for output
+      if (currentAttachedTerminalId !== terminalId) {
+        // Stop polling previous terminal
+        if (currentAttachedTerminalId) {
+          outputPoller.stopPolling(currentAttachedTerminalId);
+        }
+        // Start polling new terminal
+        outputPoller.startPolling(terminalId);
+        currentAttachedTerminalId = terminalId;
+      }
+    }
+  }, 0);
 }
 
 // Initial render
@@ -355,6 +407,16 @@ function setupEventListeners() {
           }
 
           if (confirm('Close this agent?')) {
+            // Stop polling and clean up xterm.js instance
+            outputPoller.stopPolling(id);
+            terminalManager.destroyTerminal(id);
+
+            // If this was the current attached terminal, clear it
+            if (currentAttachedTerminalId === id) {
+              currentAttachedTerminalId = null;
+            }
+
+            // Remove from state
             state.removeTerminal(id);
             saveCurrentConfig();
           }

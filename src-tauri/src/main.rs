@@ -1,10 +1,9 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::Path;
 use std::fs;
 use std::io;
-use serde_json;
+use std::path::Path;
 
 mod daemon_client;
 
@@ -73,6 +72,30 @@ async fn send_terminal_input(id: String, data: String) -> Result<(), String> {
 
     match response {
         Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct TerminalOutput {
+    output: String,
+    line_count: i32,
+}
+
+#[tauri::command]
+async fn get_terminal_output(
+    id: String,
+    start_line: Option<i32>,
+) -> Result<TerminalOutput, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::GetTerminalOutput { id, start_line })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::TerminalOutput { output, line_count } => Ok(TerminalOutput { output, line_count }),
         Response::Error { message } => Err(message),
         _ => Err("Unexpected response".to_string()),
     }
@@ -216,7 +239,8 @@ fn main() {
             create_terminal,
             list_terminals,
             destroy_terminal,
-            send_terminal_input
+            send_terminal_input,
+            get_terminal_output
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
