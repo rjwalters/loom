@@ -1,0 +1,42 @@
+# Cargo configuration for Loom project
+# https://doc.rust-lang.org/cargo/reference/config.html
+
+[build]
+# Warnings as errors in CI (controlled via environment variable)
+# Set RUSTFLAGS="-D warnings" in CI to enforce this
+
+[target.'cfg(all())']
+# Default clippy lints for all targets
+rustflags = [
+    # Deny clippy lints that indicate bugs or poor practices
+    "-D", "clippy::all",
+    "-D", "clippy::correctness",
+    "-D", "clippy::suspicious",
+    "-D", "clippy::complexity",
+
+    # Warn on pedantic lints (can be noisy but helpful)
+    "-W", "clippy::pedantic",
+
+    # Warn on performance issues
+    "-W", "clippy::perf",
+
+    # Warn on style issues
+    "-W", "clippy::style",
+
+    # Specific lints we want to enforce
+    "-W", "clippy::unwrap_used",
+    "-W", "clippy::expect_used",
+    "-W", "clippy::panic",
+    "-W", "clippy::todo",
+    "-W", "clippy::unimplemented",
+
+    # Allow some pedantic lints that are too noisy
+    "-A", "clippy::missing_errors_doc",
+    "-A", "clippy::missing_panics_doc",
+    "-A", "clippy::module_name_repetitions",
+]
+
+[alias]
+# Convenient aliases for common tasks
+clippy-all = "clippy --workspace --all-targets --all-features"
+clippy-fix = "clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged"

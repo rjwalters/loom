@@ -24,10 +24,10 @@ impl TerminalManager {
         let tmux_session = format!("loom-{}", &id[..8]);
 
         let mut cmd = Command::new("tmux");
-        cmd.args(&["new-session", "-d", "-s", &tmux_session]);
+        cmd.args(["new-session", "-d", "-s", &tmux_session]);
 
         if let Some(dir) = &working_dir {
-            cmd.args(&["-c", dir]);
+            cmd.args(["-c", dir]);
         }
 
         cmd.spawn()?.wait()?;
@@ -55,7 +55,7 @@ impl TerminalManager {
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
         Command::new("tmux")
-            .args(&["kill-session", "-t", &info.tmux_session])
+            .args(["kill-session", "-t", &info.tmux_session])
             .spawn()?
             .wait()?;
 
@@ -72,17 +72,17 @@ impl TerminalManager {
         match data {
             "\r" => {
                 Command::new("tmux")
-                    .args(&["send-keys", "-t", &info.tmux_session, "Enter"])
+                    .args(["send-keys", "-t", &info.tmux_session, "Enter"])
                     .spawn()?;
             }
             "\u{0003}" => {
                 Command::new("tmux")
-                    .args(&["send-keys", "-t", &info.tmux_session, "C-c"])
+                    .args(["send-keys", "-t", &info.tmux_session, "C-c"])
                     .spawn()?;
             }
             _ => {
                 Command::new("tmux")
-                    .args(&["send-keys", "-t", &info.tmux_session, "-l", data])
+                    .args(["send-keys", "-t", &info.tmux_session, "-l", data])
                     .spawn()?;
             }
         }
@@ -90,7 +90,11 @@ impl TerminalManager {
         Ok(())
     }
 
-    pub fn get_terminal_output(&self, id: &TerminalId, start_line: Option<i32>) -> Result<(String, i32)> {
+    pub fn get_terminal_output(
+        &self,
+        id: &TerminalId,
+        start_line: Option<i32>,
+    ) -> Result<(String, i32)> {
         let info = self
             .terminals
             .get(id)
@@ -98,7 +102,13 @@ impl TerminalManager {
 
         // First, get the total number of lines in the history
         let history_output = Command::new("tmux")
-            .args(&["display-message", "-t", &info.tmux_session, "-p", "#{history_size}"])
+            .args(&[
+                "display-message",
+                "-t",
+                &info.tmux_session,
+                "-p",
+                "#{history_size}",
+            ])
             .output()?;
 
         let total_lines: i32 = String::from_utf8_lossy(&history_output.stdout)
@@ -130,7 +140,7 @@ impl TerminalManager {
 
     pub fn restore_from_tmux(&mut self) -> Result<()> {
         let output = Command::new("tmux")
-            .args(&["list-sessions", "-F", "#{session_name}"])
+            .args(["list-sessions", "-F", "#{session_name}"])
             .output()?;
 
         let sessions = String::from_utf8_lossy(&output.stdout);
@@ -139,17 +149,15 @@ impl TerminalManager {
             if let Some(uuid_part) = session.strip_prefix("loom-") {
                 let id = uuid_part.to_string();
 
-                if !self.terminals.contains_key(&id) {
-                    let info = TerminalInfo {
+                self.terminals
+                    .entry(id.clone())
+                    .or_insert_with(|| TerminalInfo {
                         id: id.clone(),
-                        name: format!("Restored: {}", session),
+                        name: format!("Restored: {session}"),
                         tmux_session: session.to_string(),
                         working_dir: None,
                         created_at: chrono::Utc::now().timestamp(),
-                    };
-
-                    self.terminals.insert(id, info);
-                }
+                    });
             }
         }
 

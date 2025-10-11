@@ -1,7 +1,7 @@
-import { Terminal, TerminalStatus } from './state';
+import { type Terminal, TerminalStatus } from "./state";
 
 export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boolean): void {
-  const container = document.getElementById('workspace-name');
+  const container = document.getElementById("workspace-name");
   if (!container) return;
 
   if (hasWorkspace) {
@@ -10,19 +10,23 @@ export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boole
     container.innerHTML = `📂 ${escapeHtml(repoName)}`;
   } else {
     // Show "Loom" title when no workspace
-    container.innerHTML = 'Loom';
+    container.innerHTML = "Loom";
   }
 }
 
 function extractRepoName(path: string): string {
-  if (!path) return '';
+  if (!path) return "";
   // Get the last component of the path
-  const parts = path.split('/').filter(p => p.length > 0);
+  const parts = path.split("/").filter((p) => p.length > 0);
   return parts[parts.length - 1] || path;
 }
 
-export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: boolean, displayedWorkspacePath: string): void {
-  const container = document.getElementById('primary-terminal');
+export function renderPrimaryTerminal(
+  terminal: Terminal | null,
+  hasWorkspace: boolean,
+  displayedWorkspacePath: string
+): void {
+  const container = document.getElementById("primary-terminal");
   if (!container) return;
 
   if (!terminal) {
@@ -77,17 +81,17 @@ export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: b
 }
 
 export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean): void {
-  const container = document.getElementById('mini-terminal-row');
+  const container = document.getElementById("mini-terminal-row");
   if (!container) return;
 
-  const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join('');
+  const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join("");
 
   const addButtonClasses = hasWorkspace
-    ? 'bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 cursor-pointer'
-    : 'bg-gray-50 dark:bg-gray-800 cursor-not-allowed opacity-50';
+    ? "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 cursor-pointer"
+    : "bg-gray-50 dark:bg-gray-800 cursor-not-allowed opacity-50";
 
-  const addButtonDisabled = hasWorkspace ? '' : 'disabled';
-  const addButtonTitle = hasWorkspace ? 'Add agent' : 'Select a workspace first';
+  const addButtonDisabled = hasWorkspace ? "" : "disabled";
+  const addButtonTitle = hasWorkspace ? "Add agent" : "Select a workspace first";
 
   container.innerHTML = `
     <div class="h-full flex items-center gap-2 px-4 py-2 overflow-x-auto overflow-y-visible">
@@ -106,8 +110,8 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
 
 function createMiniTerminalHTML(terminal: Terminal, index: number): string {
   const activeClass = terminal.isPrimary
-    ? 'border-2 border-blue-500'
-    : 'border border-gray-200 dark:border-gray-700';
+    ? "border-2 border-blue-500"
+    : "border border-gray-200 dark:border-gray-700";
 
   return `
     <div class="p-1 flex-shrink-0">
@@ -140,17 +144,17 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
 
 export function getStatusColor(status: TerminalStatus): string {
   const colors = {
-    [TerminalStatus.Idle]: 'bg-green-500',
-    [TerminalStatus.Busy]: 'bg-blue-500',
-    [TerminalStatus.NeedsInput]: 'bg-yellow-500',
-    [TerminalStatus.Error]: 'bg-red-500',
-    [TerminalStatus.Stopped]: 'bg-gray-400'
+    [TerminalStatus.Idle]: "bg-green-500",
+    [TerminalStatus.Busy]: "bg-blue-500",
+    [TerminalStatus.NeedsInput]: "bg-yellow-500",
+    [TerminalStatus.Error]: "bg-red-500",
+    [TerminalStatus.Stopped]: "bg-gray-400",
   };
   return colors[status];
 }
 
 function escapeHtml(text: string): string {
-  const div = document.createElement('div');
+  const div = document.createElement("div");
   div.textContent = text;
   return div.innerHTML;
 }

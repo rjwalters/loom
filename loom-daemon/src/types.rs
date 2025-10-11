@@ -11,9 +11,17 @@ pub enum Request {
         working_dir: Option<String>,
     },
     ListTerminals,
-    DestroyTerminal { id: TerminalId },
-    SendInput { id: TerminalId, data: String },
-    GetTerminalOutput { id: TerminalId, start_line: Option<i32> },
+    DestroyTerminal {
+        id: TerminalId,
+    },
+    SendInput {
+        id: TerminalId,
+        data: String,
+    },
+    GetTerminalOutput {
+        id: TerminalId,
+        start_line: Option<i32>,
+    },
     Shutdown,
 }
 
