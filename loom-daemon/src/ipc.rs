@@ -66,10 +66,7 @@ async fn handle_client(
     Ok(())
 }
 
-fn handle_request(
-    request: Request,
-    terminal_manager: &Arc<Mutex<TerminalManager>>,
-) -> Response {
+fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager>>) -> Response {
     match request {
         Request::Ping => Response::Pong,
 

@@ -1,10 +1,10 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::path::Path;
+use serde_json;
 use std::fs;
 use std::io;
-use serde_json;
+use std::path::Path;
 
 mod daemon_client;
 
@@ -16,10 +16,7 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-async fn create_terminal(
-    name: String,
-    working_dir: Option<String>,
-) -> Result<String, String> {
+async fn create_terminal(name: String, working_dir: Option<String>) -> Result<String, String> {
     let client = DaemonClient::new().map_err(|e| e.to_string())?;
     let response = client
         .send_request(Request::CreateTerminal { name, working_dir })
@@ -185,8 +182,7 @@ fn read_config(workspace_path: String) -> Result<String, String> {
         return Err("Config file does not exist".to_string());
     }
 
-    fs::read_to_string(&config_path)
-        .map_err(|e| format!("Failed to read config: {}", e))
+    fs::read_to_string(&config_path).map_err(|e| format!("Failed to read config: {}", e))
 }
 
 #[tauri::command]
@@ -200,8 +196,7 @@ fn write_config(workspace_path: String, config_json: String) -> Result<(), Strin
             .map_err(|e| format!("Failed to create .loom directory: {}", e))?;
     }
 
-    fs::write(&config_path, config_json)
-        .map_err(|e| format!("Failed to write config: {}", e))
+    fs::write(&config_path, config_json).map_err(|e| format!("Failed to write config: {}", e))
 }
 
 fn main() {

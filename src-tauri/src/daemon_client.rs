@@ -15,8 +15,13 @@ pub enum Request {
         working_dir: Option<String>,
     },
     ListTerminals,
-    DestroyTerminal { id: TerminalId },
-    SendInput { id: TerminalId, data: String },
+    DestroyTerminal {
+        id: TerminalId,
+    },
+    SendInput {
+        id: TerminalId,
+        data: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
