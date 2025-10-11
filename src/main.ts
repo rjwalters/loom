@@ -10,36 +10,14 @@ import { loadConfig, saveConfig, setConfigWorkspace } from './lib/config';
 // Initialize theme
 initTheme();
 
-// Initialize state with mock data
+// Initialize state (no agents until workspace is selected)
 const state = new AppState();
-
-// Add some example terminals (initial mock data)
-// These use the counter, so the next agent created will be Agent 4
-state.addTerminal({
-  id: '1',
-  name: `Agent ${state.getNextAgentNumber()}`,
-  status: TerminalStatus.Idle,
-  isPrimary: true
-});
-
-state.addTerminal({
-  id: '2',
-  name: `Agent ${state.getNextAgentNumber()}`,
-  status: TerminalStatus.Busy,
-  isPrimary: false
-});
-
-state.addTerminal({
-  id: '3',
-  name: `Agent ${state.getNextAgentNumber()}`,
-  status: TerminalStatus.Idle,
-  isPrimary: false
-});
 
 // Render function
 function render() {
   renderHeader(state.getDisplayedWorkspace());
-  renderPrimaryTerminal(state.getPrimary());
+  const hasWorkspace = state.getWorkspace() !== null && state.getWorkspace() !== '';
+  renderPrimaryTerminal(state.getPrimary(), hasWorkspace);
   renderMiniTerminals(state.getTerminals());
 }
 

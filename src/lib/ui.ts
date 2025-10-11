@@ -7,14 +7,18 @@ export function renderHeader(displayedWorkspacePath: string): void {
   }
 }
 
-export function renderPrimaryTerminal(terminal: Terminal | null): void {
+export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: boolean): void {
   const container = document.getElementById('primary-terminal');
   if (!container) return;
 
   if (!terminal) {
+    const message = hasWorkspace
+      ? 'No agents. Click + to add an agent.'
+      : 'Open a git repository to begin';
+
     container.innerHTML = `
       <div class="h-full flex items-center justify-center text-gray-400">
-        <p>No agent selected. Click + to add an agent.</p>
+        <p class="text-lg">${message}</p>
       </div>
     `;
     return;
