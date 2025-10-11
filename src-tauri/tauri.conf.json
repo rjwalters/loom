@@ -22,13 +22,7 @@
         "all": true
       },
       "fs": {
-        "all": false,
-        "readFile": true,
-        "writeFile": true,
-        "exists": true,
-        "createDir": true,
-        "readDir": true,
-        "scope": ["**"]
+        "all": true
       }
     },
     "bundle": {
