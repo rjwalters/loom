@@ -173,6 +173,27 @@ you define goals, and the system builds, reviews, and learns from itself.
 
 ---
 
+### 🧩 Architecture Bot (Human-in-the-Loop Design)
+
+In Loom’s future ecosystem, an **Architecture Bot** will run periodically to scan the codebase, documentation, and open issues to surface structural opportunities — not tasks.
+
+It creates new GitHub issues labelled **`suggestion`**, which might include:
+
+- “Refactor terminal session handling into a reusable module”
+- “Extract common code between Claude and GPT workers”
+- “Add healthcheck endpoints to remote sandboxes”
+- “Document the worker orchestration state machine”
+
+These issues are **never acted on automatically**.
+
+They are **owned by the human** — the architect who defines the system’s intent and approves direction.  
+The **`suggestion`** label acts as a *safety interlock*:  
+
+- As long as `suggestion` is present, Loom’s Issue Bot will ignore the issue.  
+- Once the human removes the label (confirming it’s worth pursuing), the Issue Bot can refine and re-label it as `ready`, enabling the normal worker lifecycle.
+
+This keeps the feedback loop safe and directional:
+
 ## 🪪 License
 
 MIT License © 2025 [Robb Walters](https://github.com/rjwalters)
