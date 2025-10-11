@@ -1,0 +1,28 @@
+# Rustfmt configuration for Loom project
+# https://rust-lang.github.io/rustfmt/
+# Only stable features are used to ensure compatibility
+
+edition = "2021"
+
+# Maximum line width
+max_width = 100
+
+# Indentation
+hard_tabs = false
+tab_spaces = 4
+
+# Function formatting
+fn_params_layout = "Tall"
+fn_call_width = 80
+
+# Use field init shorthand
+use_field_init_shorthand = true
+
+# Use try shorthand
+use_try_shorthand = true
+
+# Newline formatting
+newline_style = "Unix"
+
+# Merge derives
+merge_derives = true

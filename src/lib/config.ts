@@ -1,5 +1,5 @@
-import { invoke } from '@tauri-apps/api/tauri';
-import { Terminal } from './state';
+import { invoke } from "@tauri-apps/api/tauri";
+import type { Terminal } from "./state";
 
 export interface LoomConfig {
   nextAgentNumber: number;
@@ -22,17 +22,17 @@ export function setConfigWorkspace(workspacePath: string): void {
 export async function loadConfig(): Promise<LoomConfig> {
   try {
     if (!cachedWorkspacePath) {
-      throw new Error('No workspace set - cannot load config');
+      throw new Error("No workspace set - cannot load config");
     }
 
-    const contents = await invoke<string>('read_config', {
-      workspacePath: cachedWorkspacePath
+    const contents = await invoke<string>("read_config", {
+      workspacePath: cachedWorkspacePath,
     });
 
     const config = JSON.parse(contents) as LoomConfig;
     return config;
   } catch (error) {
-    console.error('Failed to load config:', error);
+    console.error("Failed to load config:", error);
     throw error;
   }
 }
@@ -47,11 +47,11 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
     }
 
     const contents = JSON.stringify(config, null, 2);
-    await invoke('write_config', {
+    await invoke("write_config", {
       workspacePath: cachedWorkspacePath,
-      configJson: contents
+      configJson: contents,
     });
   } catch (error) {
-    console.error('Failed to save config:', error);
+    console.error("Failed to save config:", error);
   }
 }

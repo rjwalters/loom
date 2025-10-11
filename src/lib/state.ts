@@ -1,9 +1,9 @@
 export enum TerminalStatus {
-  Idle = 'idle',
-  Busy = 'busy',
-  NeedsInput = 'needs_input',
-  Error = 'error',
-  Stopped = 'stopped'
+  Idle = "idle",
+  Busy = "busy",
+  NeedsInput = "needs_input",
+  Error = "error",
+  Stopped = "stopped",
 }
 
 export interface Terminal {
@@ -19,7 +19,7 @@ export class AppState {
   private order: string[] = []; // Track display order of terminal IDs
   private listeners: Set<() => void> = new Set();
   private workspacePath: string | null = null; // Valid workspace path
-  private displayedWorkspacePath: string = ''; // Path shown in input (may be invalid)
+  private displayedWorkspacePath: string = ""; // Path shown in input (may be invalid)
   private nextAgentNumber: number = 1; // Counter for agent numbering (always increments)
 
   addTerminal(terminal: Terminal): void {
@@ -38,7 +38,7 @@ export class AppState {
     }
 
     this.terminals.delete(id);
-    this.order = this.order.filter(tid => tid !== id); // Remove from order
+    this.order = this.order.filter((tid) => tid !== id); // Remove from order
 
     // If we removed the primary, make the first remaining terminal primary
     if (this.primaryId === id) {
@@ -84,7 +84,7 @@ export class AppState {
   getTerminals(): Terminal[] {
     // Return terminals in display order
     return this.order
-      .map(id => this.terminals.get(id))
+      .map((id) => this.terminals.get(id))
       .filter((t): t is Terminal => t !== undefined);
   }
 
@@ -149,7 +149,7 @@ export class AppState {
     this.primaryId = null;
 
     // Add each terminal
-    agents.forEach(agent => {
+    agents.forEach((agent) => {
       this.addTerminal(agent);
     });
   }
@@ -160,6 +160,6 @@ export class AppState {
   }
 
   private notify(): void {
-    this.listeners.forEach(cb => cb());
+    this.listeners.forEach((cb) => cb());
   }
 }
