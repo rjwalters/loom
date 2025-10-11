@@ -5,6 +5,7 @@ import { renderHeader, renderPrimaryTerminal, renderMiniTerminals } from './lib/
 import { open } from '@tauri-apps/api/dialog';
 import { invoke } from '@tauri-apps/api/tauri';
 import { homeDir } from '@tauri-apps/api/path';
+import { loadConfig, saveConfig, setConfigWorkspace } from './lib/config';
 
 // Initialize theme
 initTheme();
@@ -12,24 +13,25 @@ initTheme();
 // Initialize state with mock data
 const state = new AppState();
 
-// Add some example terminals
+// Add some example terminals (initial mock data)
+// These use the counter, so the next agent created will be Agent 4
 state.addTerminal({
   id: '1',
-  name: 'Agent 1',
+  name: `Agent ${state.getNextAgentNumber()}`,
   status: TerminalStatus.Idle,
   isPrimary: true
 });
 
 state.addTerminal({
   id: '2',
-  name: 'Agent 2',
+  name: `Agent ${state.getNextAgentNumber()}`,
   status: TerminalStatus.Busy,
   isPrimary: false
 });
 
 state.addTerminal({
   id: '3',
-  name: 'Agent 3',
+  name: `Agent ${state.getNextAgentNumber()}`,
   status: TerminalStatus.Idle,
   isPrimary: false
 });
@@ -171,6 +173,12 @@ async function handleWorkspacePathInput(path: string) {
   if (isValid) {
     console.log('⌨️  Path is valid, setting workspace');
     state.setWorkspace(expandedPath);
+
+    // Load config from workspace .loom directory
+    setConfigWorkspace(expandedPath);
+    const config = await loadConfig();
+    state.setNextAgentNumber(config.nextAgentNumber);
+    console.log('⌨️  Loaded agent counter from config:', config.nextAgentNumber);
   } else {
     console.log('⌨️  Path is invalid, keeping in input but not setting in state');
     // Keep the path in the input field (don't clear it)
@@ -310,6 +318,9 @@ function setupEventListeners() {
           status: TerminalStatus.Idle,
           isPrimary: false
         });
+
+        // Save updated counter to config
+        saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
         return;
       }
 

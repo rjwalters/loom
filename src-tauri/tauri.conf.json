@@ -20,6 +20,14 @@
       },
       "path": {
         "all": true
+      },
+      "fs": {
+        "all": false,
+        "readFile": true,
+        "writeFile": true,
+        "exists": true,
+        "createDir": true,
+        "scope": ["$RESOURCE/**", "**"]
       }
     },
     "bundle": {

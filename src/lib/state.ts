@@ -28,16 +28,6 @@ export class AppState {
     if (terminal.isPrimary) {
       this.primaryId = terminal.id;
     }
-
-    // Update agent number counter if this terminal has an "Agent N" name
-    const match = terminal.name.match(/^Agent (\d+)$/);
-    if (match) {
-      const agentNum = parseInt(match[1], 10);
-      if (agentNum >= this.nextAgentNumber) {
-        this.nextAgentNumber = agentNum + 1;
-      }
-    }
-
     this.notify();
   }
 
@@ -142,6 +132,14 @@ export class AppState {
 
   getNextAgentNumber(): number {
     return this.nextAgentNumber++;
+  }
+
+  setNextAgentNumber(num: number): void {
+    this.nextAgentNumber = num;
+  }
+
+  getCurrentAgentNumber(): number {
+    return this.nextAgentNumber;
   }
 
   onChange(callback: () => void): () => void {
