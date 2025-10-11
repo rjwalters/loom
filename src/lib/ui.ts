@@ -25,7 +25,7 @@ export function renderPrimaryTerminal(terminal: Terminal | null): void {
       <div class="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700">
         <div class="flex items-center gap-2">
           <div class="w-2 h-2 rounded-full ${getStatusColor(terminal.status)}"></div>
-          <span class="font-medium text-sm">${escapeHtml(terminal.name)}</span>
+          <span class="terminal-name font-medium text-sm" data-terminal-id="${terminal.id}">${escapeHtml(terminal.name)}</span>
         </div>
       </div>
       <div class="flex-1 p-4 overflow-auto" id="terminal-content-${terminal.id}">
@@ -46,7 +46,7 @@ export function renderMiniTerminals(terminals: Terminal[]): void {
   const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join('');
 
   container.innerHTML = `
-    <div class="h-full flex items-center gap-2 px-4 overflow-x-auto">
+    <div class="h-full flex items-center gap-2 px-4 py-2 overflow-x-auto overflow-y-visible">
       ${terminalCards}
       <button
         id="add-terminal-btn"
@@ -61,19 +61,20 @@ export function renderMiniTerminals(terminals: Terminal[]): void {
 
 function createMiniTerminalHTML(terminal: Terminal, index: number): string {
   const activeClass = terminal.isPrimary
-    ? 'ring-2 ring-blue-500'
-    : '';
+    ? 'border-2 border-blue-500'
+    : 'border border-gray-200 dark:border-gray-700';
 
   return `
-    <div
-      class="terminal-card flex-shrink-0 w-40 h-32 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-grab hover:border-gray-300 dark:hover:border-gray-600 transition-all ${activeClass}"
-      data-terminal-id="${terminal.id}"
-      draggable="true"
-    >
-      <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 flex items-center justify-between">
+    <div class="p-1 flex-shrink-0">
+      <div
+        class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg ${activeClass} cursor-grab transition-all"
+        data-terminal-id="${terminal.id}"
+        draggable="true"
+      >
+      <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg">
         <div class="flex items-center gap-2 flex-1 min-w-0">
           <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
-          <span class="text-xs font-medium truncate">${escapeHtml(terminal.name)}</span>
+          <span class="terminal-name text-xs font-medium truncate">${escapeHtml(terminal.name)}</span>
         </div>
         <button
           class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
@@ -86,6 +87,7 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
       <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between">
         <span>${terminal.status}</span>
         <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+      </div>
       </div>
     </div>
   `;

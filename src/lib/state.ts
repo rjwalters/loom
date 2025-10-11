@@ -66,6 +66,14 @@ export class AppState {
     }
   }
 
+  renameTerminal(id: string, newName: string): void {
+    const terminal = this.terminals.get(id);
+    if (terminal && newName.trim()) {
+      terminal.name = newName.trim();
+      this.notify();
+    }
+  }
+
   getPrimary(): Terminal | null {
     return this.primaryId ? this.terminals.get(this.primaryId) || null : null;
   }
@@ -78,31 +86,24 @@ export class AppState {
   }
 
   reorderTerminal(draggedId: string, targetId: string, insertBefore: boolean): void {
-    console.log('🔄 reorderTerminal called:', { draggedId, targetId, insertBefore });
-    console.log('📊 Order before:', [...this.order]);
-
     const draggedIndex = this.order.indexOf(draggedId);
     const targetIndex = this.order.indexOf(targetId);
 
     if (draggedIndex === -1 || targetIndex === -1) {
-      console.log('❌ Invalid IDs - draggedIndex:', draggedIndex, 'targetIndex:', targetIndex);
       return; // Invalid IDs
     }
 
     // Remove dragged terminal from current position
     this.order.splice(draggedIndex, 1);
-    console.log('📊 After removing dragged:', [...this.order]);
 
     // Calculate new insertion index
     let newIndex = this.order.indexOf(targetId);
     if (!insertBefore) {
       newIndex++;
     }
-    console.log('📍 Inserting at index:', newIndex, 'insertBefore:', insertBefore);
 
     // Insert at new position
     this.order.splice(newIndex, 0, draggedId);
-    console.log('📊 Order after:', [...this.order]);
 
     this.notify();
   }

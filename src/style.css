@@ -2,10 +2,6 @@
 @tailwind components;
 @tailwind utilities;
 
-* {
-  transition: background-color 50ms, color 50ms, border-color 50ms;
-}
-
 /* Custom scrollbar for webkit browsers */
 ::-webkit-scrollbar {
   width: 8px;
@@ -30,6 +26,11 @@
 }
 
 /* Drag and drop styles */
+.terminal-card {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 .terminal-card.dragging {
   opacity: 0.4;
   cursor: grabbing;
@@ -41,7 +42,7 @@
 
 .drop-indicator {
   width: 3px;
-  height: 128px;
+  height: 136px; /* h-32 (128px) + p-1 top and bottom (8px) */
   @apply bg-blue-500;
   border-radius: 2px;
   flex-shrink: 0;

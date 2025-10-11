@@ -48,6 +48,58 @@ state.onChange(render);
 let draggedTerminalId: string | null = null;
 let dropTargetId: string | null = null;
 let dropInsertBefore: boolean = false;
+let isDragging: boolean = false;
+
+// Helper function to start renaming a terminal
+function startRename(terminalId: string, nameElement: HTMLElement) {
+  const terminal = state.getTerminals().find(t => t.id === terminalId);
+  if (!terminal) return;
+
+  const currentName = terminal.name;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.value = currentName;
+
+  // Match the font size of the original element
+  const fontSize = nameElement.classList.contains('text-sm') ? 'text-sm' : 'text-xs';
+  input.className = `px-1 bg-white dark:bg-gray-900 border border-blue-500 rounded ${fontSize} font-medium w-full`;
+
+  // Replace the name element with input
+  const parent = nameElement.parentElement;
+  if (!parent) return;
+
+  parent.replaceChild(input, nameElement);
+  input.focus();
+  input.select();
+
+  const commit = () => {
+    const newName = input.value.trim();
+    if (newName && newName !== currentName) {
+      state.renameTerminal(terminalId, newName);
+    } else {
+      // Just re-render to restore original state
+      render();
+    }
+  };
+
+  const cancel = () => {
+    render();
+  };
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commit();
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      cancel();
+    }
+  });
+
+  input.addEventListener('blur', () => {
+    commit();
+  });
+}
 
 // Set up event listeners (only once, since parent elements are static)
 function setupEventListeners() {
@@ -55,6 +107,22 @@ function setupEventListeners() {
   document.getElementById('theme-toggle')?.addEventListener('click', () => {
     toggleTheme();
   });
+
+  // Primary terminal - double-click to rename
+  const primaryTerminal = document.getElementById('primary-terminal');
+  if (primaryTerminal) {
+    primaryTerminal.addEventListener('dblclick', (e) => {
+      const target = e.target as HTMLElement;
+
+      if (target.classList.contains('terminal-name')) {
+        e.stopPropagation();
+        const id = target.getAttribute('data-terminal-id');
+        if (id) {
+          startRename(id, target);
+        }
+      }
+    });
+  }
 
   // Mini terminal row - event delegation for dynamic children
   const miniRow = document.getElementById('mini-terminal-row');
@@ -102,12 +170,51 @@ function setupEventListeners() {
       }
     });
 
-    // Drag and drop event handlers
+    // Handle mousedown to show immediate visual feedback
+    miniRow.addEventListener('mousedown', (e) => {
+      const target = e.target as HTMLElement;
+
+      // Don't handle if clicking close button
+      if (target.classList.contains('close-terminal-btn')) {
+        return;
+      }
+
+      const card = target.closest('.terminal-card');
+      if (card) {
+        // Remove selection from all cards and restore default border
+        document.querySelectorAll('.terminal-card').forEach(c => {
+          c.classList.remove('border-2', 'border-blue-500');
+          c.classList.add('border', 'border-gray-200', 'dark:border-gray-700');
+        });
+
+        // Add selection to clicked card immediately
+        card.classList.remove('border', 'border-gray-200', 'dark:border-gray-700');
+        card.classList.add('border-2', 'border-blue-500');
+      }
+    });
+
+    // Handle double-click to rename terminals
+    miniRow.addEventListener('dblclick', (e) => {
+      const target = e.target as HTMLElement;
+
+      // Check if double-clicking on the terminal name in mini cards
+      if (target.classList.contains('terminal-name')) {
+        e.stopPropagation();
+        const card = target.closest('[data-terminal-id]');
+        const id = card?.getAttribute('data-terminal-id');
+        if (id) {
+          startRename(id, target);
+        }
+      }
+    });
+
+    // HTML5 drag events for visual feedback
     miniRow.addEventListener('dragstart', (e) => {
       const target = e.target as HTMLElement;
       const card = target.closest('.terminal-card') as HTMLElement;
 
       if (card) {
+        isDragging = true;
         draggedTerminalId = card.getAttribute('data-terminal-id');
         card.classList.add('dragging');
 
@@ -119,26 +226,38 @@ function setupEventListeners() {
     });
 
     miniRow.addEventListener('dragend', (e) => {
+      // Perform reorder if valid
+      if (draggedTerminalId && dropTargetId && dropTargetId !== draggedTerminalId) {
+        state.reorderTerminal(draggedTerminalId, dropTargetId, dropInsertBefore);
+      }
+
+      // Select the terminal that was dragged
+      if (draggedTerminalId) {
+        state.setPrimary(draggedTerminalId);
+      }
+
+      // Cleanup
       const target = e.target as HTMLElement;
       const card = target.closest('.terminal-card');
-
       if (card) {
         card.classList.remove('dragging');
       }
 
-      // Cleanup all drag state
+      document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
       draggedTerminalId = null;
       dropTargetId = null;
       dropInsertBefore = false;
-
-      // Remove any insertion indicators
-      document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
+      isDragging = false;
     });
 
+    // dragover for tracking position and showing indicator
     miniRow.addEventListener('dragover', (e) => {
-      e.preventDefault(); // Allow drop
+      e.preventDefault();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'move';
+      }
 
-      if (!draggedTerminalId) return;
+      if (!isDragging || !draggedTerminalId) return;
 
       const target = e.target as HTMLElement;
       const card = target.closest('.terminal-card') as HTMLElement;
@@ -158,12 +277,13 @@ function setupEventListeners() {
         dropTargetId = targetId;
         dropInsertBefore = insertBefore;
 
-        // Create and position insertion indicator
+        // Create and position insertion indicator - insert at wrapper level
+        const wrapper = card.parentElement;
         const indicator = document.createElement('div');
         indicator.className = 'drop-indicator';
-        card.parentElement?.insertBefore(indicator, insertBefore ? card : card.nextSibling);
+        wrapper?.parentElement?.insertBefore(indicator, insertBefore ? wrapper : wrapper.nextSibling);
       } else if (!card) {
-        // Dragging in empty space - find all cards and determine position
+        // In empty space - find all cards and determine position
         const allCards = Array.from(miniRow.querySelectorAll('.terminal-card')) as HTMLElement[];
         const lastCard = allCards[allCards.length - 1];
 
@@ -177,43 +297,17 @@ function setupEventListeners() {
             dropTargetId = lastId;
             dropInsertBefore = false;
 
-            // Create and position insertion indicator after last card
+            // Create and position insertion indicator after last card - insert at wrapper level
+            const wrapper = lastCard.parentElement;
             const indicator = document.createElement('div');
             indicator.className = 'drop-indicator';
-            lastCard.parentElement?.insertBefore(indicator, lastCard.nextSibling);
+            wrapper?.parentElement?.insertBefore(indicator, wrapper?.nextSibling || null);
           }
         }
       }
-    });
-
-    miniRow.addEventListener('drop', (e) => {
-      e.preventDefault();
-
-      console.log('🎯 Drop event fired', { draggedTerminalId, dropTargetId, dropInsertBefore });
-
-      if (!draggedTerminalId) {
-        console.log('❌ No draggedTerminalId');
-        return;
-      }
-
-      // Use tracked drop target from dragover
-      if (dropTargetId && dropTargetId !== draggedTerminalId) {
-        console.log('✅ Calling reorderTerminal');
-        state.reorderTerminal(draggedTerminalId, dropTargetId, dropInsertBefore);
-      } else {
-        console.log('❌ No valid dropTargetId or same as dragged');
-      }
-
-      // Cleanup
-      document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
-      draggedTerminalId = null;
-      dropTargetId = null;
-      dropInsertBefore = false;
     });
   }
 }
 
 // Set up all event listeners once
 setupEventListeners();
-
-console.log('Loom initialized');
