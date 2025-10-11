@@ -16,9 +16,12 @@
 
 - ✅ Issue #1: Basic Tauri setup with TypeScript, TailwindCSS, dark/light theme
 - ✅ Issue #2: Layout structure with agent management and workspace selection
-- ⏳ Issue #3: Daemon architecture (planned)
-- ⏳ Issue #4: Terminal display integration (planned)
-- ⏳ Issue #5: AI agent integration (planned)
+- ✅ Issue #3: Daemon architecture with Rust and tmux
+- ✅ Issue #4: Terminal display with xterm.js
+- ✅ Issue #5: Worker launcher with Claude Code
+- ✅ Issue #8: Comprehensive linting, formatting, and CI/CD setup
+- ⏳ Issue #6: .loom/ directory configuration (planned)
+- ⏳ Issue #7: Workspace selector improvements (planned)
 
 ### Recent Features (Issue #2)
 
@@ -315,6 +318,77 @@ await saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
      return () => this.listeners.delete(callback); // Cleanup function
    }
    ```
+
+## Code Quality Tools (Issue #8)
+
+### Linting & Formatting Setup
+
+**Frontend (Biome)**:
+- Fast, comprehensive linter and formatter for TypeScript/JavaScript
+- Configured in `biome.json` with schema version 2.2.5
+- VCS integration enabled for git-aware linting
+- Rules: Recommended + custom overrides for project style
+- Commands: `npm run lint`, `npm run format`
+
+**Backend (rustfmt + clippy)**:
+- `rustfmt.toml`: Format configuration (100 char width, 4 space indent)
+- `.cargo/config.toml`: Clippy lint levels
+  - Deny: all, correctness, suspicious, complexity
+  - Warn: pedantic, perf, style, unwrap_used, expect_used
+- Commands: `npm run format:rust`, `npm run clippy`
+
+**Git Hooks (husky + lint-staged)**:
+- Pre-commit hook auto-formats staged files
+- TS/JS files: Biome formatting + linting
+- Rust files: rustfmt formatting
+- Configured in `.husky/pre-commit` and `package.json`
+
+**CI/CD (GitHub Actions)**:
+- Workflow: `.github/workflows/ci.yml`
+- Jobs run in parallel: frontend lint/format, rust format, rust clippy, builds
+- All warnings treated as errors (`-D warnings` for clippy)
+- Dependency caching for faster builds
+- Frontend build artifacts downloaded before Tauri compilation
+
+**VSCode Integration**:
+- Settings: `.vscode/settings.json`
+- Extensions: `.vscode/extensions.json`
+- Format on save enabled for all languages
+- Biome for TS/JS, rust-analyzer for Rust
+
+### Development Workflow
+
+1. **Make changes** - Edit code with format-on-save
+2. **Pre-commit hook** - Auto-formats on commit
+3. **Push** - Triggers CI checks
+4. **CI validates** - All linting/formatting/builds must pass
+5. **Manual check** - Run `npm run check:all` to verify locally
+
+### Clippy Configuration Details
+
+The `.cargo/config.toml` enforces strict linting:
+
+```toml
+rustflags = [
+    "-D", "clippy::all",           # Deny all warnings
+    "-D", "clippy::correctness",   # Deny correctness issues
+    "-D", "clippy::suspicious",    # Deny suspicious patterns
+    "-D", "clippy::complexity",    # Deny unnecessary complexity
+    "-W", "clippy::pedantic",      # Warn on pedantic issues
+    "-W", "clippy::unwrap_used",   # Warn on .unwrap()
+    "-W", "clippy::expect_used",   # Warn on .expect()
+]
+```
+
+**When to use `#[allow(clippy::expect_used)]`**:
+- Mutex locks (poisoning is panic-level, not recoverable)
+- Main function startup (Tauri failure is fatal)
+- Other truly exceptional scenarios
+
+**Handling expect/unwrap warnings**:
+- Prefer proper error handling with `Result` and `?` operator
+- Use `expect()` with descriptive messages only when panic is acceptable
+- Add `#[allow]` attribute with explanatory comment when necessary
 
 ## Styling Conventions
 
@@ -719,4 +793,4 @@ Keep this as a living document that helps both humans and AI understand the code
 
 ---
 
-Last updated: Issue #2 (Layout Structure) - Agent management, workspace selection, and drag-and-drop reordering complete
+Last updated: Issue #8 (Linting & Formatting) - Comprehensive code quality tools, git hooks, and CI/CD pipeline complete

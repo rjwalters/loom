@@ -180,6 +180,47 @@ loom/
 └── README.md
 ```
 
+## Development
+
+### Code Quality Tools
+
+This project uses comprehensive linting and formatting tools:
+
+**Frontend (TypeScript/JavaScript)**:
+```bash
+npm run lint          # Check for linting issues
+npm run lint:fix      # Auto-fix linting issues
+npm run format        # Check formatting
+npm run format:write  # Auto-format code
+```
+
+**Backend (Rust)**:
+```bash
+npm run format:rust         # Check Rust formatting
+npm run format:rust:write   # Auto-format Rust code
+npm run clippy              # Run clippy linter
+npm run clippy:fix          # Auto-fix clippy issues
+```
+
+**All Checks**:
+```bash
+npm run check:all    # Run all checks (lint, format, clippy, build)
+```
+
+### Git Hooks
+
+Pre-commit hooks automatically format your code before each commit. Commits will be blocked if auto-fixes fail.
+
+### CI/CD
+
+GitHub Actions runs all checks on every push and pull request:
+- Frontend linting & formatting
+- Rust formatting & clippy
+- TypeScript compilation
+- Full workspace build
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for detailed documentation of all development tools and workflows.
+
 ## Contributing
 
 This project is designed to be self-improving! Once Issue #5 is complete, Loom workers can submit PRs to enhance Loom itself.
