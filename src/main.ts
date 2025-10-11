@@ -18,7 +18,7 @@ function render() {
   renderHeader(state.getDisplayedWorkspace());
   const hasWorkspace = state.getWorkspace() !== null && state.getWorkspace() !== '';
   renderPrimaryTerminal(state.getPrimary(), hasWorkspace);
-  renderMiniTerminals(state.getTerminals());
+  renderMiniTerminals(state.getTerminals(), hasWorkspace);
 }
 
 // Initial render
@@ -374,6 +374,11 @@ function setupEventListeners() {
 
       // Handle add terminal button
       if (target.id === 'add-terminal-btn' || target.closest('#add-terminal-btn')) {
+        // Don't add if no workspace selected
+        if (!state.getWorkspace()) {
+          return;
+        }
+
         const agentNumber = state.getNextAgentNumber();
         state.addTerminal({
           id: String(Date.now()),

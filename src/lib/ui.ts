@@ -43,19 +43,27 @@ export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: b
   `;
 }
 
-export function renderMiniTerminals(terminals: Terminal[]): void {
+export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean): void {
   const container = document.getElementById('mini-terminal-row');
   if (!container) return;
 
   const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join('');
+
+  const addButtonClasses = hasWorkspace
+    ? 'bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 cursor-pointer'
+    : 'bg-gray-50 dark:bg-gray-800 cursor-not-allowed opacity-50';
+
+  const addButtonDisabled = hasWorkspace ? '' : 'disabled';
+  const addButtonTitle = hasWorkspace ? 'Add agent' : 'Select a workspace first';
 
   container.innerHTML = `
     <div class="h-full flex items-center gap-2 px-4 py-2 overflow-x-auto overflow-y-visible">
       ${terminalCards}
       <button
         id="add-terminal-btn"
-        class="flex-shrink-0 w-32 h-32 flex items-center justify-center bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
-        title="Add agent"
+        class="flex-shrink-0 w-32 h-32 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
+        title="${addButtonTitle}"
+        ${addButtonDisabled}
       >
         <span class="text-3xl text-gray-400">+</span>
       </button>
