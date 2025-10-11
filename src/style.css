@@ -3,7 +3,7 @@
 @tailwind utilities;
 
 * {
-  transition: background-color 300ms, color 300ms, border-color 300ms;
+  transition: background-color 50ms, color 50ms, border-color 50ms;
 }
 
 /* Custom scrollbar for webkit browsers */
