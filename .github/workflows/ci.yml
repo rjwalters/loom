@@ -6,14 +6,69 @@ on:
   pull_request:
     branches: [main]
 
+# Restrict permissions (principle of least privilege)
+permissions:
+  contents: read
+  pull-requests: write # for dependency review comments
+  security-events: write
+
+# Cancel in-progress runs when a new one starts
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  frontend-lint:
-    name: Frontend Linting (Biome)
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Detect what changed — so we only run needed jobs
+  # ─────────────────────────────────────────────────────────────────────────────
+  changes:
+    name: Detect Changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      rust: ${{ steps.filter.outputs.rust }}
+      ci: ${{ steps.filter.outputs.ci }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Filter changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            frontend:
+              - 'src/**/*.{ts,tsx,js,jsx,json,css,html}'
+              - 'package*.json'
+              - 'tsconfig.json'
+              - 'biome.json'
+            rust:
+              - 'src-tauri/**/*.rs'
+              - 'Cargo.{toml,lock}'
+            ci:
+              - '.github/workflows/**'
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Frontend checks: lint, format, types, and build
+  # ─────────────────────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend (Lint, Format, TypeScript, Build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -23,19 +78,47 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
+          cache-dependency-path: "package-lock.json"
 
       - name: Install dependencies
-        run: npm ci
+        uses: nick-fields/retry-action@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 5
+          command: npm ci --prefer-offline
 
-      - name: Run Biome linter
-        run: npm run lint
+      - name: Run parallel checks
+        run: |
+          set -e
+          npm run lint & 
+          npm run format &
+          npx tsc --noEmit &
+          wait
 
-      - name: Run Biome formatter check
-        run: npm run format
+      - name: Build frontend
+        run: npm run build
 
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist/
+          retention-days: 7
+          compression-level: 6 # default is 6, balance between speed and size
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Rust formatting (super fast)
+  # ─────────────────────────────────────────────────────────────────────────────
   rust-format:
-    name: Rust Formatting (rustfmt)
+    name: Rust Format
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -48,87 +131,202 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  rust-clippy:
-    name: Rust Linting (clippy)
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Rust build, lint (Clippy), and test
+  # ─────────────────────────────────────────────────────────────────────────────
+  rust-build:
+    name: Rust (Clippy + Test)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.ci == 'true'
+    strategy:
+      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Cache apt packages
-        uses: awalsh128/cache-apt-pkgs-action@latest
+      - name: Cache system dependencies
+        id: cache-deps
+        uses: actions/cache@v4
         with:
-          packages: libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev
-          version: 1.0
+          path: /var/cache/apt/archives
+          key: ${{ runner.os }}-apt-${{ hashFiles('.github/workflows/*.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-apt-
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup2.4-dev
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
-      - name: Rust Cache
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "rust-clippy"
+          shared-key: rust-build
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Run Clippy (with warnings as errors)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-  rust-check:
-    name: Rust Build Check
+      - name: Run Rust tests
+        run: cargo test --workspace --locked --all-features --no-fail-fast -- --nocapture
+
+      - name: Show sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Security audit
+  # ─────────────────────────────────────────────────────────────────────────────
+  security-audit:
+    name: Security Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Cache apt packages
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev
-          version: 1.0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo-audit binary
+        id: cache-cargo-audit
+        uses: actions/cache@v4
         with:
-          shared-key: "rust-check"
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Check workspace
-        run: cargo check --workspace --all-targets --all-features
+      - name: Install cargo-audit
+        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked
 
-  typescript-check:
-    name: TypeScript Build Check
+      - name: Run security audit
+        run: cargo audit --deny warnings
+
+      - name: Upload security audit results
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-audit-results
+          path: |
+            **/Cargo.lock
+          retention-days: 30
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Dependency review (only on PRs)
+  # ─────────────────────────────────────────────────────────────────────────────
+  dependency-review:
+    name: Dependency Review
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          fail-on-severity: moderate
+          comment-summary-in-pr: on-failure
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: TypeScript check
-        run: npx tsc --noEmit
-
-      - name: Build frontend
-        run: npm run build
-
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Aggregate results (always runs)
+  # ─────────────────────────────────────────────────────────────────────────────
   all-checks:
-    name: All Checks Passed
+    name: ✅ All Checks Passed
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs:
-      - frontend-lint
+      - frontend
       - rust-format
-      - rust-clippy
-      - rust-check
-      - typescript-check
+      - rust-build
+      - security-audit
+    if: always()
     steps:
+      - name: Check results
+        id: check-results
+        run: |
+          echo "Frontend: ${{ needs.frontend.result }}"
+          echo "Rust Format: ${{ needs.rust-format.result }}"
+          echo "Rust Build: ${{ needs.rust-build.result }}"
+          echo "Security Audit: ${{ needs.security-audit.result }}"
+          
+          # Count failures (but ignore skipped)
+          FAILED=0
+          [[ "${{ needs.frontend.result }}" == "failure" ]] && FAILED=$((FAILED+1))
+          [[ "${{ needs.rust-format.result }}" == "failure" ]] && FAILED=$((FAILED+1))
+          [[ "${{ needs.rust-build.result }}" == "failure" ]] && FAILED=$((FAILED+1))
+          [[ "${{ needs.security-audit.result }}" == "failure" ]] && FAILED=$((FAILED+1))
+          
+          echo "failed_count=$FAILED" >> $GITHUB_OUTPUT
+          
+          if [[ $FAILED -gt 0 ]]; then
+            echo "❌ $FAILED check(s) failed."
+            exit 1
+          fi
+
       - name: All checks passed
-        run: echo "All checks passed successfully!"
+        if: steps.check-results.outputs.failed_count == '0'
+        run: echo "✅ All checks passed successfully!"
+
+      - name: Summary annotation
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = {
+              'Frontend': '${{ needs.frontend.result }}',
+              'Rust Format': '${{ needs.rust-format.result }}',
+              'Rust Build': '${{ needs.rust-build.result }}',
+              'Security Audit': '${{ needs.security-audit.result }}'
+            };
+            
+            const statusIcon = (status) => {
+              if (status === 'success') return '✅ Pass';
+              if (status === 'skipped') return '⏭️ Skipped';
+              if (status === 'cancelled') return '🚫 Cancelled';
+              return '❌ Fail';
+            };
+            
+            const allPassed = Object.values(jobs).every(
+              status => status === 'success' || status === 'skipped'
+            );
+            
+            let summary = core.summary
+              .addHeading(allPassed ? '✅ CI Summary - All Passed' : '❌ CI Summary - Some Failed')
+              .addHeading('Job Results', 3)
+              .addTable([
+                [{data: 'Job', header: true}, {data: 'Status', header: true}],
+                ...Object.entries(jobs).map(([name, status]) => [
+                  name,
+                  statusIcon(status)
+                ])
+              ]);
+            
+            // Add PR context if applicable
+            if (context.eventName === 'pull_request') {
+              summary.addRaw(`\n\n🔀 Triggered by: PR #${context.payload.pull_request.number}`);
+            }
+            
+            await summary.write();
