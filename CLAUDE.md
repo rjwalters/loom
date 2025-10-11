@@ -24,10 +24,12 @@
 
 - **Agent Management**: Create, close, rename, and reorder agent terminals
 - **Workspace Selection**: Native folder picker with git repository validation
-- **Monotonic Numbering**: Agents always increment (e.g., create 1-5, delete 2-3, next is 6)
+- **Persistent Config**: Agent counter stored in `.loom/config.json` per workspace
+- **Monotonic Numbering**: Agents always increment, persists across app restarts
 - **Drag & Drop**: Reorder agent terminals in the mini row
-- **Inline Renaming**: Double-click agent names to rename
+- **Inline Renaming**: Double-click agent names to rename (doesn't affect numbering)
 - **Tilde Expansion**: Support for `~/path` notation in workspace paths
+- **Workspace-First**: Must select workspace before creating agents
 
 ## Technology Stack
 
@@ -63,12 +65,15 @@ loom/
 │   ├── style.css            # Global styles, Tailwind imports
 │   └── lib/
 │       ├── state.ts         # State management (agents, workspace, observer)
+│       ├── config.ts        # Config file I/O (.loom/config.json)
 │       ├── ui.ts            # UI rendering (pure functions)
 │       └── theme.ts         # Dark/light theme system
 ├── src-tauri/
 │   ├── src/main.rs          # Rust backend, Tauri IPC commands
 │   ├── tauri.conf.json      # Window config, allowlist, build settings
 │   └── Cargo.toml           # Rust dependencies (tauri features)
+├── .loom/                   # Workspace config (gitignored, per-workspace)
+│   └── config.json          # Persistent config (agent counter, etc.)
 ├── index.html               # HTML structure (header, primary, mini row)
 ├── tsconfig.json            # TypeScript strict mode config
 ├── tailwind.config.js       # Tailwind with dark mode: 'class'
@@ -221,6 +226,54 @@ if (isValid) {
 ```
 
 This allows showing invalid paths with error messages while preventing use of invalid workspace.
+
+### 6. Persistent Configuration
+
+**Files**: `src/lib/config.ts`, `.loom/config.json`
+
+Loom stores workspace-specific configuration in `.loom/config.json` within each git repository:
+
+```json
+{
+  "nextAgentNumber": 6
+}
+```
+
+**Why Workspace-Specific Config?**
+- Each git repo has independent agent numbering
+- Config persists across app restarts
+- No parsing of agent names (users can rename freely)
+- Stored in workspace, not in app directory
+
+**Config Lifecycle**:
+```typescript
+// 1. User selects workspace
+await handleWorkspacePathInput('/path/to/repo');
+
+// 2. Set config workspace path
+setConfigWorkspace('/path/to/repo');
+
+// 3. Load config from .loom/config.json
+const config = await loadConfig();  // { nextAgentNumber: 1 } or existing
+
+// 4. Initialize state counter
+state.setNextAgentNumber(config.nextAgentNumber);
+
+// 5. User creates agent
+const num = state.getNextAgentNumber();  // Returns 1, increments to 2
+state.addTerminal({ name: `Agent ${num}`, ... });
+
+// 6. Save updated counter
+await saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
+```
+
+**File Operations**:
+- Uses Tauri fs API (`readTextFile`, `writeTextFile`, `exists`, `createDir`)
+- Creates `.loom/` directory if it doesn't exist
+- Falls back to defaults if config file missing
+- Gracefully handles read/write errors
+
+**Important**: `.loom/` is gitignored - each developer has their own agent numbering.
 
 ## TypeScript Conventions
 
