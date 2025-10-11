@@ -28,3 +28,32 @@
 #mini-terminal-row > div {
   scroll-behavior: smooth;
 }
+
+/* Drag and drop styles */
+.terminal-card.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+.terminal-card:active {
+  cursor: grabbing;
+}
+
+.drop-indicator {
+  width: 3px;
+  height: 128px;
+  @apply bg-blue-500;
+  border-radius: 2px;
+  flex-shrink: 0;
+  pointer-events: none;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}

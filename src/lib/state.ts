@@ -16,10 +16,12 @@ export interface Terminal {
 export class AppState {
   private terminals: Map<string, Terminal> = new Map();
   private primaryId: string | null = null;
+  private order: string[] = []; // Track display order of terminal IDs
   private listeners: Set<() => void> = new Set();
 
   addTerminal(terminal: Terminal): void {
     this.terminals.set(terminal.id, terminal);
+    this.order.push(terminal.id); // Add to end of order
     if (terminal.isPrimary) {
       this.primaryId = terminal.id;
     }
@@ -33,12 +35,13 @@ export class AppState {
     }
 
     this.terminals.delete(id);
+    this.order = this.order.filter(tid => tid !== id); // Remove from order
 
     // If we removed the primary, make the first remaining terminal primary
     if (this.primaryId === id) {
-      const first = Array.from(this.terminals.values())[0];
-      if (first) {
-        this.setPrimary(first.id);
+      const firstId = this.order[0];
+      if (firstId) {
+        this.setPrimary(firstId);
       }
     }
 
@@ -68,7 +71,33 @@ export class AppState {
   }
 
   getTerminals(): Terminal[] {
-    return Array.from(this.terminals.values());
+    // Return terminals in display order
+    return this.order
+      .map(id => this.terminals.get(id))
+      .filter((t): t is Terminal => t !== undefined);
+  }
+
+  reorderTerminal(draggedId: string, targetId: string, insertBefore: boolean): void {
+    const draggedIndex = this.order.indexOf(draggedId);
+    const targetIndex = this.order.indexOf(targetId);
+
+    if (draggedIndex === -1 || targetIndex === -1) {
+      return; // Invalid IDs
+    }
+
+    // Remove dragged terminal from current position
+    this.order.splice(draggedIndex, 1);
+
+    // Calculate new insertion index
+    let newIndex = this.order.indexOf(targetId);
+    if (!insertBefore) {
+      newIndex++;
+    }
+
+    // Insert at new position
+    this.order.splice(newIndex, 0, draggedId);
+
+    this.notify();
   }
 
   onChange(callback: () => void): () => void {

@@ -66,8 +66,9 @@ function createMiniTerminalHTML(terminal: Terminal): string {
 
   return `
     <div
-      class="flex-shrink-0 w-40 h-32 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-pointer hover:border-gray-300 dark:hover:border-gray-600 transition-all ${activeClass}"
+      class="terminal-card flex-shrink-0 w-40 h-32 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden cursor-grab hover:border-gray-300 dark:hover:border-gray-600 transition-all ${activeClass}"
       data-terminal-id="${terminal.id}"
+      draggable="true"
     >
       <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 flex items-center justify-between">
         <div class="flex items-center gap-2 flex-1 min-w-0">
