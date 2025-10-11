@@ -124,7 +124,6 @@ async function browseWorkspace() {
     });
 
     if (selected && typeof selected === 'string') {
-      state.setDisplayedWorkspace(selected);
       await handleWorkspacePathInput(selected);
     }
   } catch (error) {
@@ -158,10 +157,8 @@ async function handleWorkspacePathInput(path: string) {
   // Expand tilde if present
   const expandedPath = await expandTildePath(path);
 
-  // Update displayed workspace with expanded path
-  if (expandedPath !== path) {
-    state.setDisplayedWorkspace(expandedPath);
-  }
+  // Always update displayed workspace so bad paths are visible with error message
+  state.setDisplayedWorkspace(expandedPath);
 
   const isValid = await validateWorkspacePath(expandedPath);
   if (!isValid) {
