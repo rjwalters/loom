@@ -27,7 +27,8 @@
         "writeFile": true,
         "exists": true,
         "createDir": true,
-        "scope": ["$RESOURCE/**", "**"]
+        "readDir": true,
+        "scope": ["**"]
       }
     },
     "bundle": {
