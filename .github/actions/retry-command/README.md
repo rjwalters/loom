@@ -88,11 +88,11 @@ Timeout per attempt: 5m
 
 We use a custom action instead of third-party alternatives for:
 
-1. **Control**: Full control over retry logic and updates
-2. **Security**: No external dependencies or supply chain risks
-3. **Simplicity**: Pure bash implementation, easy to understand
-4. **Maintenance**: Lives in our repository, versioned with our code
-5. **Reliability**: No risk of third-party actions being deprecated or removed
+1. **Reliability**: No risk of third-party actions being deprecated or removed
+2. **Control**: Full control over retry logic and updates
+3. **Simplicity**: Pure bash implementation, easy to understand and audit
+4. **Maintainability**: Lives in our repository, versioned with our code
+5. **Transparency**: Open source contributors can see exactly what it does
 
 ## License
 
