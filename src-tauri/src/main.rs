@@ -4,6 +4,7 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::process::Command;
 
 mod daemon_client;
 
@@ -224,10 +225,25 @@ fn write_config(workspace_path: &str, config_json: String) -> Result<(), String>
     fs::write(&config_path, config_json).map_err(|e| format!("Failed to write config: {e}"))
 }
 
-// Allow expect_used in main because if Tauri fails to start, the application cannot run
-#[allow(clippy::expect_used)]
+#[tauri::command]
+fn get_env_var(key: &str) -> Result<String, String> {
+    std::env::var(key).map_err(|_| format!("{key} not set in .env"))
+}
+
+#[tauri::command]
+fn check_claude_code() -> Result<bool, String> {
+    Command::new("which")
+        .arg("claude-code")
+        .output()
+        .map(|o| o.status.success())
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
-    tauri::Builder::default()
+    // Load .env file
+    dotenvy::dotenv().ok();
+
+    if let Err(e) = tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             greet,
             validate_git_repo,
@@ -239,8 +255,13 @@ fn main() {
             list_terminals,
             destroy_terminal,
             send_terminal_input,
-            get_terminal_output
+            get_terminal_output,
+            get_env_var,
+            check_claude_code
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    {
+        eprintln!("Error while running tauri application: {e}");
+        std::process::exit(1);
+    }
 }
