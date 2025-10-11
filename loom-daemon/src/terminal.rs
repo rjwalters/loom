@@ -102,7 +102,7 @@ impl TerminalManager {
 
         // First, get the total number of lines in the history
         let history_output = Command::new("tmux")
-            .args(&[
+            .args([
                 "display-message",
                 "-t",
                 &info.tmux_session,
@@ -118,13 +118,13 @@ impl TerminalManager {
 
         // Capture pane content from start_line to end
         let mut cmd = Command::new("tmux");
-        cmd.args(&["capture-pane", "-t", &info.tmux_session, "-p", "-e", "-J"]);
+        cmd.args(["capture-pane", "-t", &info.tmux_session, "-p", "-e", "-J"]);
 
         // If start_line is specified, only capture from that line onwards
         if let Some(start) = start_line {
             if start >= 0 && start < total_lines {
                 let lines_to_capture = total_lines - start;
-                cmd.args(&["-S", &format!("-{}", lines_to_capture)]);
+                cmd.args(["-S", &format!("-{lines_to_capture}")]);
             }
         } else {
             // Capture entire scrollback history

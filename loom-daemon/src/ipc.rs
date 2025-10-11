@@ -119,7 +119,9 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::GetTerminalOutput { id, start_line } => {
-            let tm = terminal_manager.lock().unwrap();
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
             match tm.get_terminal_output(&id, start_line) {
                 Ok((output, line_count)) => Response::TerminalOutput { output, line_count },
                 Err(e) => Response::Error {
