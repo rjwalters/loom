@@ -43,7 +43,7 @@ export function renderMiniTerminals(terminals: Terminal[]): void {
   const container = document.getElementById('mini-terminal-row');
   if (!container) return;
 
-  const terminalCards = terminals.map(t => createMiniTerminalHTML(t)).join('');
+  const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join('');
 
   container.innerHTML = `
     <div class="h-full flex items-center gap-2 px-4 overflow-x-auto">
@@ -59,7 +59,7 @@ export function renderMiniTerminals(terminals: Terminal[]): void {
   `;
 }
 
-function createMiniTerminalHTML(terminal: Terminal): string {
+function createMiniTerminalHTML(terminal: Terminal, index: number): string {
   const activeClass = terminal.isPrimary
     ? 'ring-2 ring-blue-500'
     : '';
@@ -83,8 +83,9 @@ function createMiniTerminalHTML(terminal: Terminal): string {
           ×
         </button>
       </div>
-      <div class="p-2 text-xs text-gray-500 dark:text-gray-400">
-        ${terminal.status}
+      <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between">
+        <span>${terminal.status}</span>
+        <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
       </div>
     </div>
   `;
