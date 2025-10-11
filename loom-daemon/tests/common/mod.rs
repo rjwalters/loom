@@ -132,10 +132,10 @@ impl TestClient {
 
     /// Helper: Send Ping request
     pub async fn ping(&mut self) -> Result<()> {
-        let request = serde_json::json!({"Ping": null});
+        let request = serde_json::json!({"type": "Ping"});
         let response = self.send_request(request).await?;
 
-        if response != serde_json::json!("Pong") {
+        if response != serde_json::json!({"type": "Pong"}) {
             anyhow::bail!("Expected Pong, got: {response:?}");
         }
 
@@ -149,7 +149,8 @@ impl TestClient {
         working_dir: Option<String>,
     ) -> Result<String> {
         let request = serde_json::json!({
-            "CreateTerminal": {
+            "type": "CreateTerminal",
+            "payload": {
                 "name": name.into(),
                 "working_dir": working_dir
             }
@@ -157,37 +158,37 @@ impl TestClient {
 
         let response = self.send_request(request).await?;
 
-        if let Some(id) = response.get("TerminalCreated").and_then(|v| v.get("id")) {
-            Ok(id.as_str().unwrap().to_string())
-        } else {
-            anyhow::bail!("Unexpected response: {response:?}");
+        if let Some(payload) = response.get("payload") {
+            if let Some(id) = payload.get("id") {
+                return Ok(id.as_str().unwrap().to_string());
+            }
         }
+        anyhow::bail!("Unexpected response: {response:?}");
     }
 
     /// Helper: List terminals
     pub async fn list_terminals(&mut self) -> Result<Vec<serde_json::Value>> {
-        let request = serde_json::json!({"ListTerminals": null});
+        let request = serde_json::json!({"type": "ListTerminals"});
         let response = self.send_request(request).await?;
 
-        if let Some(terminals) = response
-            .get("TerminalList")
-            .and_then(|v| v.get("terminals"))
-        {
-            Ok(terminals.as_array().unwrap().clone())
-        } else {
-            anyhow::bail!("Unexpected response: {response:?}");
+        if let Some(payload) = response.get("payload") {
+            if let Some(terminals) = payload.get("terminals") {
+                return Ok(terminals.as_array().unwrap().clone());
+            }
         }
+        anyhow::bail!("Unexpected response: {response:?}");
     }
 
     /// Helper: Destroy terminal
     pub async fn destroy_terminal(&mut self, id: &str) -> Result<()> {
         let request = serde_json::json!({
-            "DestroyTerminal": { "id": id }
+            "type": "DestroyTerminal",
+            "payload": { "id": id }
         });
 
         let response = self.send_request(request).await?;
 
-        if response != serde_json::json!("Success") {
+        if response != serde_json::json!({"type": "Success"}) {
             anyhow::bail!("Expected Success, got: {response:?}");
         }
 
@@ -197,12 +198,13 @@ impl TestClient {
     /// Helper: Send input to terminal
     pub async fn send_input(&mut self, id: &str, data: &str) -> Result<()> {
         let request = serde_json::json!({
-            "SendInput": { "id": id, "data": data }
+            "type": "SendInput",
+            "payload": { "id": id, "data": data }
         });
 
         let response = self.send_request(request).await?;
 
-        if response != serde_json::json!("Success") {
+        if response != serde_json::json!({"type": "Success"}) {
             anyhow::bail!("Expected Success, got: {response:?}");
         }
 
