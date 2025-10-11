@@ -17,7 +17,7 @@ const state = new AppState();
 function render() {
   const hasWorkspace = state.getWorkspace() !== null && state.getWorkspace() !== '';
   renderHeader(state.getDisplayedWorkspace(), hasWorkspace);
-  renderPrimaryTerminal(state.getPrimary(), hasWorkspace);
+  renderPrimaryTerminal(state.getPrimary(), hasWorkspace, state.getDisplayedWorkspace());
   renderMiniTerminals(state.getTerminals(), hasWorkspace);
 
   // Re-attach workspace event listeners if they were just rendered

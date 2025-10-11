@@ -1,36 +1,16 @@
 import { Terminal, TerminalStatus } from './state';
 
 export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boolean): void {
-  const container = document.getElementById('workspace-selector');
+  const container = document.getElementById('workspace-name');
   if (!container) return;
 
-  if (!hasWorkspace) {
-    // Show full workspace selector
-    container.innerHTML = `
-      <input
-        id="workspace-path"
-        type="text"
-        placeholder="Select or enter workspace path..."
-        value="${escapeHtml(displayedWorkspacePath)}"
-        class="px-3 py-1 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 w-96"
-      />
-      <button
-        id="browse-workspace"
-        class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-        title="Browse for folder"
-      >
-        📁
-      </button>
-      <div id="workspace-error" class="text-xs text-red-500 dark:text-red-400 hidden"></div>
-    `;
-  } else {
-    // Show locked-in repo name only
+  if (hasWorkspace) {
+    // Show repo name in header
     const repoName = extractRepoName(displayedWorkspacePath);
-    container.innerHTML = `
-      <div class="px-3 py-1 text-sm font-medium text-gray-700 dark:text-gray-300">
-        📂 ${escapeHtml(repoName)}
-      </div>
-    `;
+    container.innerHTML = `📂 ${escapeHtml(repoName)}`;
+  } else {
+    // Clear header workspace name
+    container.innerHTML = '';
   }
 }
 
@@ -41,20 +21,45 @@ function extractRepoName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: boolean): void {
+export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: boolean, displayedWorkspacePath: string): void {
   const container = document.getElementById('primary-terminal');
   if (!container) return;
 
   if (!terminal) {
-    const message = hasWorkspace
-      ? 'No agents. Click + to add an agent.'
-      : 'Open a git repository to begin';
-
-    container.innerHTML = `
-      <div class="h-full flex items-center justify-center text-gray-400">
-        <p class="text-lg">${message}</p>
-      </div>
-    `;
+    if (hasWorkspace) {
+      // Workspace set but no agents
+      container.innerHTML = `
+        <div class="h-full flex items-center justify-center text-gray-400">
+          <p class="text-lg">No agents. Click + to add an agent.</p>
+        </div>
+      `;
+    } else {
+      // No workspace - show selector in center
+      container.innerHTML = `
+        <div class="h-full flex items-center justify-center">
+          <div class="flex flex-col items-center gap-4">
+            <p class="text-lg text-gray-400">Open a git repository to begin</p>
+            <div class="flex items-center gap-2">
+              <input
+                id="workspace-path"
+                type="text"
+                placeholder="Select or enter workspace path..."
+                value="${escapeHtml(displayedWorkspacePath)}"
+                class="px-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 w-96"
+              />
+              <button
+                id="browse-workspace"
+                class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded border border-gray-300 dark:border-gray-600"
+                title="Browse for folder"
+              >
+                📁
+              </button>
+            </div>
+            <div id="workspace-error" class="text-sm text-red-500 dark:text-red-400"></div>
+          </div>
+        </div>
+      `;
+    }
     return;
   }
 
