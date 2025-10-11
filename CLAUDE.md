@@ -24,7 +24,7 @@
 
 - **Agent Management**: Create, close, rename, and reorder agent terminals
 - **Workspace Selection**: Native folder picker with git repository validation
-- **Smart Numbering**: Agents reuse lowest available numbers (e.g., Agent 1, Agent 3, Agent 5)
+- **Monotonic Numbering**: Agents always increment (e.g., create 1-5, delete 2-3, next is 6)
 - **Drag & Drop**: Reorder agent terminals in the mini row
 - **Inline Renaming**: Double-click agent names to rename
 - **Tilde Expansion**: Support for `~/path` notation in workspace paths
@@ -112,7 +112,7 @@ export class AppState {
 - Safety: Cannot remove last agent terminal
 - Auto-promotion: First terminal becomes primary when current removed
 - Workspace state: Separate valid workspace vs displayed path for error handling
-- Smart agent numbering: Reuses lowest available numbers
+- Monotonic agent numbering: Counter always increments, never reuses deleted numbers
 
 ### 2. Pure Functions (UI Rendering)
 
