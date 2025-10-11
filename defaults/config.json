@@ -1,3 +1,23 @@
 {
-  "nextAgentNumber": 1
+  "nextAgentNumber": 4,
+  "agents": [
+    {
+      "id": "1",
+      "name": "Agent 1",
+      "status": "idle",
+      "isPrimary": true
+    },
+    {
+      "id": "2",
+      "name": "Agent 2",
+      "status": "idle",
+      "isPrimary": false
+    },
+    {
+      "id": "3",
+      "name": "Agent 3",
+      "status": "idle",
+      "isPrimary": false
+    }
+  ]
 }

@@ -142,6 +142,18 @@ export class AppState {
     return this.nextAgentNumber;
   }
 
+  loadAgents(agents: Terminal[]): void {
+    // Clear existing terminals
+    this.terminals.clear();
+    this.order = [];
+    this.primaryId = null;
+
+    // Add each terminal
+    agents.forEach(agent => {
+      this.addTerminal(agent);
+    });
+  }
+
   onChange(callback: () => void): () => void {
     this.listeners.add(callback);
     return () => this.listeners.delete(callback);

@@ -33,6 +33,23 @@ let dropTargetId: string | null = null;
 let dropInsertBefore: boolean = false;
 let isDragging: boolean = false;
 
+// Save current state to config
+async function saveCurrentConfig() {
+  const workspace = state.getWorkspace();
+  if (!workspace) {
+    console.log('⚙️  No workspace, skipping config save');
+    return;
+  }
+
+  const config = {
+    nextAgentNumber: state.getCurrentAgentNumber(),
+    agents: state.getTerminals()
+  };
+
+  await saveConfig(config);
+  console.log('⚙️  Saved config with', config.agents.length, 'agents');
+}
+
 // Expand tilde (~) to home directory
 async function expandTildePath(path: string): Promise<string> {
   if (path.startsWith('~')) {
@@ -156,7 +173,13 @@ async function handleWorkspacePathInput(path: string) {
     setConfigWorkspace(expandedPath);
     const config = await loadConfig();
     state.setNextAgentNumber(config.nextAgentNumber);
-    console.log('⌨️  Loaded agent counter from config:', config.nextAgentNumber);
+    console.log('⌨️  Loaded config:', config);
+
+    // Load agents from config
+    if (config.agents && config.agents.length > 0) {
+      state.loadAgents(config.agents);
+      console.log('⌨️  Loaded', config.agents.length, 'agents from config');
+    }
   } else {
     console.log('⌨️  Path is invalid, keeping in input but not setting in state');
     // Keep the path in the input field (don't clear it)
@@ -191,6 +214,7 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
     const newName = input.value.trim();
     if (newName && newName !== currentName) {
       state.renameTerminal(terminalId, newName);
+      saveCurrentConfig();
     } else {
       // Just re-render to restore original state
       render();
@@ -282,6 +306,7 @@ function setupEventListeners() {
 
           if (confirm('Close this agent?')) {
             state.removeTerminal(id);
+            saveCurrentConfig();
           }
         }
         return;
@@ -297,8 +322,8 @@ function setupEventListeners() {
           isPrimary: false
         });
 
-        // Save updated counter to config
-        saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
+        // Save updated state to config
+        saveCurrentConfig();
         return;
       }
 
@@ -371,6 +396,7 @@ function setupEventListeners() {
       // Perform reorder if valid
       if (draggedTerminalId && dropTargetId && dropTargetId !== draggedTerminalId) {
         state.reorderTerminal(draggedTerminalId, dropTargetId, dropInsertBefore);
+        saveCurrentConfig();
       }
 
       // Select the terminal that was dragged

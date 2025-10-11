@@ -1,12 +1,34 @@
 import { writeTextFile, readTextFile, exists, createDir } from '@tauri-apps/api/fs';
 import { join } from '@tauri-apps/api/path';
+import { Terminal, TerminalStatus } from './state';
 
 export interface LoomConfig {
   nextAgentNumber: number;
+  agents: Terminal[];
 }
 
 const DEFAULT_CONFIG: LoomConfig = {
-  nextAgentNumber: 1
+  nextAgentNumber: 4,
+  agents: [
+    {
+      id: '1',
+      name: 'Agent 1',
+      status: TerminalStatus.Idle,
+      isPrimary: true
+    },
+    {
+      id: '2',
+      name: 'Agent 2',
+      status: TerminalStatus.Idle,
+      isPrimary: false
+    },
+    {
+      id: '3',
+      name: 'Agent 3',
+      status: TerminalStatus.Idle,
+      isPrimary: false
+    }
+  ]
 };
 
 let cachedWorkspacePath: string | null = null;
