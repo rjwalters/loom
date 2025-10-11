@@ -16,6 +16,7 @@ const state = new AppState();
 // Render function
 function render() {
   const hasWorkspace = state.getWorkspace() !== null && state.getWorkspace() !== '';
+  console.log('[render] hasWorkspace:', hasWorkspace, 'displayedWorkspace:', state.getDisplayedWorkspace());
   renderHeader(state.getDisplayedWorkspace(), hasWorkspace);
   renderPrimaryTerminal(state.getPrimary(), hasWorkspace, state.getDisplayedWorkspace());
   renderMiniTerminals(state.getTerminals(), hasWorkspace);
@@ -69,8 +70,11 @@ async function expandTildePath(path: string): Promise<string> {
 
 // Workspace error UI helpers
 function showWorkspaceError(message: string) {
+  console.log('[showWorkspaceError]', message);
   const input = document.getElementById('workspace-path') as HTMLInputElement;
   const errorDiv = document.getElementById('workspace-error');
+
+  console.log('[showWorkspaceError] input:', input, 'errorDiv:', errorDiv);
 
   if (input) {
     input.classList.remove('border-gray-300', 'dark:border-gray-600');
@@ -83,6 +87,7 @@ function showWorkspaceError(message: string) {
 }
 
 function clearWorkspaceError() {
+  console.log('[clearWorkspaceError]');
   const input = document.getElementById('workspace-path') as HTMLInputElement;
   const errorDiv = document.getElementById('workspace-error');
 
@@ -98,17 +103,21 @@ function clearWorkspaceError() {
 
 // Validate workspace path
 async function validateWorkspacePath(path: string): Promise<boolean> {
+  console.log('[validateWorkspacePath] path:', path);
   if (!path || path.trim() === '') {
+    console.log('[validateWorkspacePath] empty path, clearing error');
     clearWorkspaceError();
     return false;
   }
 
   try {
     await invoke<boolean>('validate_git_repo', { path });
+    console.log('[validateWorkspacePath] validation passed');
     clearWorkspaceError();
     return true;
   } catch (error) {
     const errorMessage = typeof error === 'string' ? error : (error as any)?.message || 'Invalid workspace path';
+    console.log('[validateWorkspacePath] validation failed:', errorMessage);
     showWorkspaceError(errorMessage);
     return false;
   }
@@ -154,21 +163,29 @@ async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> 
 
 // Handle manual workspace path entry
 async function handleWorkspacePathInput(path: string) {
+  console.log('[handleWorkspacePathInput] input path:', path);
+
   // Expand tilde if present
   const expandedPath = await expandTildePath(path);
+  console.log('[handleWorkspacePathInput] expanded path:', expandedPath);
 
   // Always update displayed workspace so bad paths are visible with error message
   state.setDisplayedWorkspace(expandedPath);
+  console.log('[handleWorkspacePathInput] set displayedWorkspace, triggering render...');
 
   const isValid = await validateWorkspacePath(expandedPath);
+  console.log('[handleWorkspacePathInput] isValid:', isValid);
+
   if (!isValid) {
     state.setWorkspace('');
+    console.log('[handleWorkspacePathInput] invalid path, cleared workspace');
     return;
   }
 
   // Check if Loom is initialized in this workspace
   try {
     const isInitialized = await invoke<boolean>('check_loom_initialized', { path: expandedPath });
+    console.log('[handleWorkspacePathInput] isInitialized:', isInitialized);
 
     if (!isInitialized) {
       // Ask user to confirm initialization
@@ -196,6 +213,7 @@ async function handleWorkspacePathInput(path: string) {
 
     // Now load config from workspace
     state.setWorkspace(expandedPath);
+    console.log('[handleWorkspacePathInput] set workspace, loading config...');
 
     setConfigWorkspace(expandedPath);
     const config = await loadConfig();
@@ -205,6 +223,7 @@ async function handleWorkspacePathInput(path: string) {
     if (config.agents && config.agents.length > 0) {
       state.loadAgents(config.agents);
     }
+    console.log('[handleWorkspacePathInput] workspace fully loaded');
   } catch (error) {
     console.error('Error handling workspace:', error);
     alert(`Error: ${error}`);
@@ -266,11 +285,14 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
 
 // Attach workspace event listeners (called dynamically when workspace selector is rendered)
 function attachWorkspaceEventListeners() {
+  console.log('[attachWorkspaceEventListeners] attaching listeners...');
   // Workspace path input - validate on Enter or blur
   const workspaceInput = document.getElementById('workspace-path') as HTMLInputElement;
+  console.log('[attachWorkspaceEventListeners] workspaceInput:', workspaceInput);
   if (workspaceInput) {
     workspaceInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
+        console.log('[workspaceInput keydown] Enter pressed, value:', workspaceInput.value);
         e.preventDefault();
         handleWorkspacePathInput(workspaceInput.value);
         workspaceInput.blur();
@@ -278,6 +300,7 @@ function attachWorkspaceEventListeners() {
     });
 
     workspaceInput.addEventListener('blur', () => {
+      console.log('[workspaceInput blur] value:', workspaceInput.value, 'workspace:', state.getWorkspace());
       if (workspaceInput.value !== state.getWorkspace()) {
         handleWorkspacePathInput(workspaceInput.value);
       }
@@ -285,7 +308,10 @@ function attachWorkspaceEventListeners() {
   }
 
   // Browse workspace button
-  document.getElementById('browse-workspace')?.addEventListener('click', () => {
+  const browseBtn = document.getElementById('browse-workspace');
+  console.log('[attachWorkspaceEventListeners] browseBtn:', browseBtn);
+  browseBtn?.addEventListener('click', () => {
+    console.log('[browseBtn click] clicked');
     browseWorkspace();
   });
 }

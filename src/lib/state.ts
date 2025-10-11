@@ -113,7 +113,7 @@ export class AppState {
 
   setWorkspace(path: string): void {
     this.workspacePath = path;
-    this.displayedWorkspacePath = path;
+    // Don't modify displayedWorkspacePath - it's managed separately via setDisplayedWorkspace
     this.notify();
   }
 
