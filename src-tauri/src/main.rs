@@ -6,9 +6,76 @@ use std::fs;
 use std::io;
 use serde_json;
 
+mod daemon_client;
+
+use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! Welcome to Loom.", name)
+}
+
+#[tauri::command]
+async fn create_terminal(
+    name: String,
+    working_dir: Option<String>,
+) -> Result<String, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::CreateTerminal { name, working_dir })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::TerminalCreated { id } => Ok(id),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn list_terminals() -> Result<Vec<TerminalInfo>, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::ListTerminals)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::TerminalList { terminals } => Ok(terminals),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn destroy_terminal(id: String) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::DestroyTerminal { id })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn send_terminal_input(id: String, data: String) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::SendInput { id, data })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -145,7 +212,11 @@ fn main() {
             check_loom_initialized,
             initialize_loom_workspace,
             read_config,
-            write_config
+            write_config,
+            create_terminal,
+            list_terminals,
+            destroy_terminal,
+            send_terminal_input
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -9,7 +9,12 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "daemon:dev": "cd loom-daemon && RUST_LOG=info cargo run",
+    "daemon:build": "cargo build --package loom-daemon --release",
+    "daemon:check": "cargo check --package loom-daemon",
+    "check": "cargo check --workspace",
+    "check:all": "npm run check && npm run build"
   },
   "repository": {
     "type": "git",
