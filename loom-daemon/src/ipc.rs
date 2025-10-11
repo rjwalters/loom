@@ -25,7 +25,7 @@ impl IpcServer {
         let _ = fs::remove_file(&self.socket_path).await;
 
         let listener = UnixListener::bind(&self.socket_path)?;
-        log::info!("IPC server listening at {:?}", self.socket_path);
+        log::info!("IPC server listening at {}", self.socket_path.display());
 
         loop {
             match listener.accept().await {
@@ -33,12 +33,12 @@ impl IpcServer {
                     let tm = self.terminal_manager.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_client(stream, tm).await {
-                            log::error!("Client error: {}", e);
+                            log::error!("Client error: {e}");
                         }
                     });
                 }
                 Err(e) => {
-                    log::error!("Accept error: {}", e);
+                    log::error!("Accept error: {e}");
                 }
             }
         }
@@ -54,7 +54,7 @@ async fn handle_client(
 
     while let Some(line) = lines.next_line().await? {
         let request: Request = serde_json::from_str(&line)?;
-        log::debug!("Request: {:?}", request);
+        log::debug!("Request: {request:?}");
 
         let response = handle_request(request, &terminal_manager);
 
@@ -66,12 +66,17 @@ async fn handle_client(
     Ok(())
 }
 
+// Allow expect_used because mutex poisoning is a panic-level error that indicates
+// a thread panicked while holding the lock. This is not recoverable and should crash.
+#[allow(clippy::expect_used)]
 fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager>>) -> Response {
     match request {
         Request::Ping => Response::Pong,
 
         Request::CreateTerminal { name, working_dir } => {
-            let mut tm = terminal_manager.lock().unwrap();
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
             match tm.create_terminal(name, working_dir) {
                 Ok(id) => Response::TerminalCreated { id },
                 Err(e) => Response::Error {
@@ -81,16 +86,20 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::ListTerminals => {
-            let tm = terminal_manager.lock().unwrap();
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
             Response::TerminalList {
                 terminals: tm.list_terminals(),
             }
         }
 
         Request::DestroyTerminal { id } => {
-            let mut tm = terminal_manager.lock().unwrap();
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
             match tm.destroy_terminal(&id) {
-                Ok(_) => Response::Success,
+                Ok(()) => Response::Success,
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },
@@ -98,9 +107,11 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::SendInput { id, data } => {
-            let tm = terminal_manager.lock().unwrap();
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
             match tm.send_input(&id, &data) {
-                Ok(_) => Response::Success,
+                Ok(()) => Response::Success,
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },

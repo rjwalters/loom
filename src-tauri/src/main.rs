@@ -11,7 +11,7 @@ use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
 #[tauri::command]
 fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to Loom.", name)
+    format!("Hello, {name}! Welcome to Loom.")
 }
 
 #[tauri::command]
@@ -75,8 +75,8 @@ async fn send_terminal_input(id: String, data: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn validate_git_repo(path: String) -> Result<bool, String> {
-    let workspace_path = Path::new(&path);
+fn validate_git_repo(path: &str) -> Result<bool, String> {
+    let workspace_path = Path::new(path);
 
     // Check if the path exists
     if !workspace_path.exists() {
@@ -98,11 +98,11 @@ fn validate_git_repo(path: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
-fn check_loom_initialized(path: String) -> Result<bool, String> {
-    let workspace_path = Path::new(&path);
+fn check_loom_initialized(path: &str) -> bool {
+    let workspace_path = Path::new(path);
     let loom_path = workspace_path.join(".loom");
 
-    Ok(loom_path.exists())
+    loom_path.exists()
 }
 
 // Helper function to copy directory recursively
@@ -126,8 +126,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 #[tauri::command]
-fn initialize_loom_workspace(path: String, defaults_path: String) -> Result<(), String> {
-    let workspace_path = Path::new(&path);
+fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), String> {
+    let workspace_path = Path::new(path);
     let loom_path = workspace_path.join(".loom");
 
     // Check if .loom already exists
@@ -136,13 +136,13 @@ fn initialize_loom_workspace(path: String, defaults_path: String) -> Result<(), 
     }
 
     // Copy defaults to .loom (symlink in src-tauri/ points to ../defaults/)
-    let defaults = Path::new(&defaults_path);
+    let defaults = Path::new(defaults_path);
     if !defaults.exists() {
-        return Err(format!("Defaults directory not found: {}", defaults_path));
+        return Err(format!("Defaults directory not found: {defaults_path}"));
     }
 
     copy_dir_recursive(defaults, &loom_path)
-        .map_err(|e| format!("Failed to copy defaults: {}", e))?;
+        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Add .loom/ to .gitignore
     let gitignore_path = workspace_path.join(".gitignore");
@@ -151,7 +151,7 @@ fn initialize_loom_workspace(path: String, defaults_path: String) -> Result<(), 
     // Check if .gitignore exists and if .loom/ is already in it
     if gitignore_path.exists() {
         let contents = fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {}", e))?;
+            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
 
         if !contents.contains(".loom/") {
             // Append .loom/ to .gitignore
@@ -162,42 +162,44 @@ fn initialize_loom_workspace(path: String, defaults_path: String) -> Result<(), 
             new_contents.push_str(loom_entry);
 
             fs::write(&gitignore_path, new_contents)
-                .map_err(|e| format!("Failed to write .gitignore: {}", e))?;
+                .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
     } else {
         // Create .gitignore with .loom/
         fs::write(&gitignore_path, loom_entry)
-            .map_err(|e| format!("Failed to create .gitignore: {}", e))?;
+            .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
     Ok(())
 }
 
 #[tauri::command]
-fn read_config(workspace_path: String) -> Result<String, String> {
-    let config_path = Path::new(&workspace_path).join(".loom").join("config.json");
+fn read_config(workspace_path: &str) -> Result<String, String> {
+    let config_path = Path::new(workspace_path).join(".loom").join("config.json");
 
     if !config_path.exists() {
         return Err("Config file does not exist".to_string());
     }
 
-    fs::read_to_string(&config_path).map_err(|e| format!("Failed to read config: {}", e))
+    fs::read_to_string(&config_path).map_err(|e| format!("Failed to read config: {e}"))
 }
 
 #[tauri::command]
-fn write_config(workspace_path: String, config_json: String) -> Result<(), String> {
-    let loom_dir = Path::new(&workspace_path).join(".loom");
+fn write_config(workspace_path: &str, config_json: String) -> Result<(), String> {
+    let loom_dir = Path::new(workspace_path).join(".loom");
     let config_path = loom_dir.join("config.json");
 
     // Ensure .loom directory exists
     if !loom_dir.exists() {
         fs::create_dir_all(&loom_dir)
-            .map_err(|e| format!("Failed to create .loom directory: {}", e))?;
+            .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
     }
 
-    fs::write(&config_path, config_json).map_err(|e| format!("Failed to write config: {}", e))
+    fs::write(&config_path, config_json).map_err(|e| format!("Failed to write config: {e}"))
 }
 
+// Allow expect_used in main because if Tauri fails to start, the application cannot run
+#[allow(clippy::expect_used)]
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
