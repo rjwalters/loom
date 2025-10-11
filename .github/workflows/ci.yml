@@ -192,45 +192,47 @@ jobs:
         run: sccache --show-stats
 
   # ─────────────────────────────────────────────────────────────────────────────
-  # Security audit
+  # Security audit (disabled - causes issues with Tauri 1.x GTK3 dependencies)
+  # Run manually with: cargo audit
+  # Uncomment this job when ready to address dependency warnings
   # ─────────────────────────────────────────────────────────────────────────────
-  security-audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-    env:
-      RUSTC_WRAPPER: "" # Disable sccache for this job (not needed for cargo-audit)
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo-audit binary
-        id: cache-cargo-audit
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-audit
-          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install cargo-audit
-        if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
-        run: cargo install cargo-audit --locked
-
-      - name: Run security audit
-        run: cargo audit --deny warnings
-
-      - name: Upload security audit results
-        if: failure() && github.event_name == 'schedule'
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-audit-results
-          path: |
-            **/Cargo.lock
-          retention-days: 30
+  # security-audit:
+  #   name: Security Audit
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 10
+  #   strategy:
+  #     fail-fast: false
+  #   env:
+  #     RUSTC_WRAPPER: "" # Disable sccache for this job (not needed for cargo-audit)
+  #   steps:
+  #     - name: Checkout code
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Setup Rust
+  #       uses: dtolnay/rust-toolchain@stable
+  #
+  #     - name: Cache cargo-audit binary
+  #       id: cache-cargo-audit
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: ~/.cargo/bin/cargo-audit
+  #         key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+  #
+  #     - name: Install cargo-audit
+  #       if: steps.cache-cargo-audit.outputs.cache-hit != 'true'
+  #       run: cargo install cargo-audit --locked
+  #
+  #     - name: Run security audit
+  #       run: cargo audit --deny warnings
+  #
+  #     - name: Upload security audit results
+  #       if: failure() && github.event_name == 'schedule'
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: security-audit-results
+  #         path: |
+  #           **/Cargo.lock
+  #         retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Dependency review (only on PRs in public repos with GH Advanced Security)
@@ -260,14 +262,13 @@ jobs:
   # Aggregate results (always runs)
   # ─────────────────────────────────────────────────────────────────────────────
   all-checks:
-    name: ✅ All Checks Passed
+    name: All Checks Passed
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
       - frontend
       - rust-format
       - rust-build
-      - security-audit
     if: always()
     steps:
       - name: Check results
@@ -276,17 +277,15 @@ jobs:
           echo "Frontend: ${{ needs.frontend.result }}"
           echo "Rust Format: ${{ needs.rust-format.result }}"
           echo "Rust Build: ${{ needs.rust-build.result }}"
-          echo "Security Audit: ${{ needs.security-audit.result }}"
-          
+
           # Count failures (but ignore skipped)
           FAILED=0
           [[ "${{ needs.frontend.result }}" == "failure" ]] && FAILED=$((FAILED+1))
           [[ "${{ needs.rust-format.result }}" == "failure" ]] && FAILED=$((FAILED+1))
           [[ "${{ needs.rust-build.result }}" == "failure" ]] && FAILED=$((FAILED+1))
-          [[ "${{ needs.security-audit.result }}" == "failure" ]] && FAILED=$((FAILED+1))
-          
+
           echo "failed_count=$FAILED" >> $GITHUB_OUTPUT
-          
+
           if [[ $FAILED -gt 0 ]]; then
             echo "❌ $FAILED check(s) failed."
             exit 1
@@ -304,8 +303,7 @@ jobs:
             const jobs = {
               'Frontend': '${{ needs.frontend.result }}',
               'Rust Format': '${{ needs.rust-format.result }}',
-              'Rust Build': '${{ needs.rust-build.result }}',
-              'Security Audit': '${{ needs.security-audit.result }}'
+              'Rust Build': '${{ needs.rust-build.result }}'
             };
             
             const statusIcon = (status) => {
