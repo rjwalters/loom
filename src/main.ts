@@ -46,6 +46,8 @@ state.onChange(render);
 
 // Drag and drop state
 let draggedTerminalId: string | null = null;
+let dropTargetId: string | null = null;
+let dropInsertBefore: boolean = false;
 
 // Set up event listeners (only once, since parent elements are static)
 function setupEventListeners() {
@@ -124,7 +126,10 @@ function setupEventListeners() {
         card.classList.remove('dragging');
       }
 
+      // Cleanup all drag state
       draggedTerminalId = null;
+      dropTargetId = null;
+      dropInsertBefore = false;
 
       // Remove any insertion indicators
       document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
@@ -139,6 +144,8 @@ function setupEventListeners() {
       const card = target.closest('.terminal-card') as HTMLElement;
 
       if (card && card.getAttribute('data-terminal-id') !== draggedTerminalId) {
+        const targetId = card.getAttribute('data-terminal-id');
+
         // Remove old indicators
         document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
 
@@ -147,37 +154,61 @@ function setupEventListeners() {
         const midpoint = rect.left + rect.width / 2;
         const insertBefore = e.clientX < midpoint;
 
+        // Store drop target info
+        dropTargetId = targetId;
+        dropInsertBefore = insertBefore;
+
         // Create and position insertion indicator
         const indicator = document.createElement('div');
         indicator.className = 'drop-indicator';
         card.parentElement?.insertBefore(indicator, insertBefore ? card : card.nextSibling);
+      } else if (!card) {
+        // Dragging in empty space - find all cards and determine position
+        const allCards = Array.from(miniRow.querySelectorAll('.terminal-card')) as HTMLElement[];
+        const lastCard = allCards[allCards.length - 1];
+
+        if (lastCard && !lastCard.classList.contains('dragging')) {
+          const lastId = lastCard.getAttribute('data-terminal-id');
+          if (lastId && lastId !== draggedTerminalId) {
+            // Remove old indicators
+            document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
+
+            // Drop after the last card
+            dropTargetId = lastId;
+            dropInsertBefore = false;
+
+            // Create and position insertion indicator after last card
+            const indicator = document.createElement('div');
+            indicator.className = 'drop-indicator';
+            lastCard.parentElement?.insertBefore(indicator, lastCard.nextSibling);
+          }
+        }
       }
     });
 
     miniRow.addEventListener('drop', (e) => {
       e.preventDefault();
 
-      if (!draggedTerminalId) return;
+      console.log('🎯 Drop event fired', { draggedTerminalId, dropTargetId, dropInsertBefore });
 
-      const target = e.target as HTMLElement;
-      const card = target.closest('.terminal-card') as HTMLElement;
+      if (!draggedTerminalId) {
+        console.log('❌ No draggedTerminalId');
+        return;
+      }
 
-      if (card) {
-        const targetId = card.getAttribute('data-terminal-id');
-
-        if (targetId && targetId !== draggedTerminalId) {
-          // Calculate if we should insert before or after
-          const rect = card.getBoundingClientRect();
-          const midpoint = rect.left + rect.width / 2;
-          const insertBefore = e.clientX < midpoint;
-
-          state.reorderTerminal(draggedTerminalId, targetId, insertBefore);
-        }
+      // Use tracked drop target from dragover
+      if (dropTargetId && dropTargetId !== draggedTerminalId) {
+        console.log('✅ Calling reorderTerminal');
+        state.reorderTerminal(draggedTerminalId, dropTargetId, dropInsertBefore);
+      } else {
+        console.log('❌ No valid dropTargetId or same as dragged');
       }
 
       // Cleanup
       document.querySelectorAll('.drop-indicator').forEach(el => el.remove());
       draggedTerminalId = null;
+      dropTargetId = null;
+      dropInsertBefore = false;
     });
   }
 }
