@@ -15,10 +15,15 @@ const state = new AppState();
 
 // Render function
 function render() {
-  renderHeader(state.getDisplayedWorkspace());
   const hasWorkspace = state.getWorkspace() !== null && state.getWorkspace() !== '';
+  renderHeader(state.getDisplayedWorkspace(), hasWorkspace);
   renderPrimaryTerminal(state.getPrimary(), hasWorkspace);
   renderMiniTerminals(state.getTerminals(), hasWorkspace);
+
+  // Re-attach workspace event listeners if they were just rendered
+  if (!hasWorkspace) {
+    attachWorkspaceEventListeners();
+  }
 }
 
 // Initial render
@@ -264,13 +269,8 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
   });
 }
 
-// Set up event listeners (only once, since parent elements are static)
-function setupEventListeners() {
-  // Theme toggle
-  document.getElementById('theme-toggle')?.addEventListener('click', () => {
-    toggleTheme();
-  });
-
+// Attach workspace event listeners (called dynamically when workspace selector is rendered)
+function attachWorkspaceEventListeners() {
   // Workspace path input - validate on Enter or blur
   const workspaceInput = document.getElementById('workspace-path') as HTMLInputElement;
   if (workspaceInput) {
@@ -292,6 +292,14 @@ function setupEventListeners() {
   // Browse workspace button
   document.getElementById('browse-workspace')?.addEventListener('click', () => {
     browseWorkspace();
+  });
+}
+
+// Set up event listeners (only once, since parent elements are static)
+function setupEventListeners() {
+  // Theme toggle
+  document.getElementById('theme-toggle')?.addEventListener('click', () => {
+    toggleTheme();
   });
 
   // Primary terminal - double-click to rename

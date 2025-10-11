@@ -1,10 +1,44 @@
 import { Terminal, TerminalStatus } from './state';
 
-export function renderHeader(displayedWorkspacePath: string): void {
-  const workspaceInput = document.getElementById('workspace-path') as HTMLInputElement;
-  if (workspaceInput) {
-    workspaceInput.value = displayedWorkspacePath;
+export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boolean): void {
+  const container = document.getElementById('workspace-selector');
+  if (!container) return;
+
+  if (!hasWorkspace) {
+    // Show full workspace selector
+    container.innerHTML = `
+      <input
+        id="workspace-path"
+        type="text"
+        placeholder="Select or enter workspace path..."
+        value="${escapeHtml(displayedWorkspacePath)}"
+        class="px-3 py-1 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 w-96"
+      />
+      <button
+        id="browse-workspace"
+        class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
+        title="Browse for folder"
+      >
+        📁
+      </button>
+      <div id="workspace-error" class="text-xs text-red-500 dark:text-red-400 hidden"></div>
+    `;
+  } else {
+    // Show locked-in repo name only
+    const repoName = extractRepoName(displayedWorkspacePath);
+    container.innerHTML = `
+      <div class="px-3 py-1 text-sm font-medium text-gray-700 dark:text-gray-300">
+        📂 ${escapeHtml(repoName)}
+      </div>
+    `;
   }
+}
+
+function extractRepoName(path: string): string {
+  if (!path) return '';
+  // Get the last component of the path
+  const parts = path.split('/').filter(p => p.length > 0);
+  return parts[parts.length - 1] || path;
 }
 
 export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: boolean): void {
