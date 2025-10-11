@@ -177,8 +177,7 @@ async function handleWorkspacePathInput(path: string) {
   console.log('[handleWorkspacePathInput] isValid:', isValid);
 
   if (!isValid) {
-    state.setWorkspace('');
-    console.log('[handleWorkspacePathInput] invalid path, cleared workspace');
+    console.log('[handleWorkspacePathInput] invalid path, stopping');
     return;
   }
 
@@ -199,14 +198,14 @@ async function handleWorkspacePathInput(path: string) {
       );
 
       if (!confirmed) {
-        state.setWorkspace('');
+        console.log('[handleWorkspacePathInput] user cancelled initialization');
         return;
       }
 
       // Initialize workspace
       const initialized = await initializeLoomWorkspace(expandedPath);
       if (!initialized) {
-        state.setWorkspace('');
+        console.log('[handleWorkspacePathInput] initialization failed');
         return;
       }
     }
@@ -227,7 +226,6 @@ async function handleWorkspacePathInput(path: string) {
   } catch (error) {
     console.error('Error handling workspace:', error);
     alert(`Error: ${error}`);
-    state.setWorkspace('');
   }
 }
 
