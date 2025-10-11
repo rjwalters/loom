@@ -53,33 +53,6 @@ let dropTargetId: string | null = null;
 let dropInsertBefore: boolean = false;
 let isDragging: boolean = false;
 
-// Find the next available agent number
-function getNextAgentNumber(): number {
-  const terminals = state.getTerminals();
-  const agentNumbers = terminals
-    .map(t => {
-      const match = t.name.match(/^Agent (\d+)$/);
-      return match ? parseInt(match[1], 10) : null;
-    })
-    .filter((n): n is number => n !== null);
-
-  // If no agents with default names, start at 1
-  if (agentNumbers.length === 0) {
-    return 1;
-  }
-
-  // Find the lowest available number starting from 1
-  const sortedNumbers = agentNumbers.sort((a, b) => a - b);
-  for (let i = 1; i <= sortedNumbers.length + 1; i++) {
-    if (!sortedNumbers.includes(i)) {
-      return i;
-    }
-  }
-
-  // Fallback (should never reach here)
-  return sortedNumbers.length + 1;
-}
-
 // Expand tilde (~) to home directory
 async function expandTildePath(path: string): Promise<string> {
   if (path.startsWith('~')) {
@@ -330,7 +303,7 @@ function setupEventListeners() {
 
       // Handle add terminal button
       if (target.id === 'add-terminal-btn' || target.closest('#add-terminal-btn')) {
-        const agentNumber = getNextAgentNumber();
+        const agentNumber = state.getNextAgentNumber();
         state.addTerminal({
           id: String(Date.now()),
           name: `Agent ${agentNumber}`,

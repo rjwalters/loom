@@ -20,6 +20,7 @@ export class AppState {
   private listeners: Set<() => void> = new Set();
   private workspacePath: string | null = null; // Valid workspace path
   private displayedWorkspacePath: string = ''; // Path shown in input (may be invalid)
+  private nextAgentNumber: number = 1; // Counter for agent numbering (always increments)
 
   addTerminal(terminal: Terminal): void {
     this.terminals.set(terminal.id, terminal);
@@ -27,6 +28,16 @@ export class AppState {
     if (terminal.isPrimary) {
       this.primaryId = terminal.id;
     }
+
+    // Update agent number counter if this terminal has an "Agent N" name
+    const match = terminal.name.match(/^Agent (\d+)$/);
+    if (match) {
+      const agentNum = parseInt(match[1], 10);
+      if (agentNum >= this.nextAgentNumber) {
+        this.nextAgentNumber = agentNum + 1;
+      }
+    }
+
     this.notify();
   }
 
@@ -127,6 +138,10 @@ export class AppState {
 
   getDisplayedWorkspace(): string {
     return this.displayedWorkspacePath;
+  }
+
+  getNextAgentNumber(): number {
+    return this.nextAgentNumber++;
   }
 
   onChange(callback: () => void): () => void {
