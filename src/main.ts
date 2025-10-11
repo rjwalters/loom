@@ -4,7 +4,7 @@ import { AppState, TerminalStatus } from './lib/state';
 import { renderHeader, renderPrimaryTerminal, renderMiniTerminals } from './lib/ui';
 import { open } from '@tauri-apps/api/dialog';
 import { invoke } from '@tauri-apps/api/tauri';
-import { homeDir } from '@tauri-apps/api/path';
+import { homeDir, join as pathJoin, resourceDir } from '@tauri-apps/api/path';
 import { loadConfig, saveConfig, setConfigWorkspace } from './lib/config';
 
 // Initialize theme
@@ -151,6 +151,30 @@ async function browseWorkspace() {
   }
 }
 
+// Initialize Loom in workspace
+async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> {
+  try {
+    console.log('🔧 Initializing Loom workspace...');
+
+    // Get defaults path (in dev mode, it's in the project root)
+    // TODO: For production, this should be bundled as a resource
+    const defaultsPath = await pathJoin(await resourceDir(), '..', '..', 'defaults');
+    console.log('🔧 Defaults path:', defaultsPath);
+
+    await invoke('initialize_loom_workspace', {
+      path: workspacePath,
+      defaultsPath: defaultsPath
+    });
+
+    console.log('✅ Workspace initialized successfully');
+    return true;
+  } catch (error) {
+    console.error('❌ Failed to initialize workspace:', error);
+    alert(`Failed to initialize workspace: ${error}`);
+    return false;
+  }
+}
+
 // Handle manual workspace path entry
 async function handleWorkspacePathInput(path: string) {
   console.log('⌨️  handleWorkspacePathInput called with:', path);
@@ -165,11 +189,48 @@ async function handleWorkspacePathInput(path: string) {
   }
 
   const isValid = await validateWorkspacePath(expandedPath);
-  if (isValid) {
-    console.log('⌨️  Path is valid, setting workspace');
+  if (!isValid) {
+    console.log('⌨️  Path is invalid, keeping in input but not setting in state');
+    state.setWorkspace('');
+    return;
+  }
+
+  console.log('⌨️  Path is valid git repository');
+
+  // Check if Loom is initialized in this workspace
+  try {
+    const isInitialized = await invoke<boolean>('check_loom_initialized', { path: expandedPath });
+    console.log('⌨️  Workspace initialized:', isInitialized);
+
+    if (!isInitialized) {
+      // Ask user to confirm initialization
+      const confirmed = confirm(
+        `Initialize Loom in this workspace?\n\n` +
+        `This will:\n` +
+        `• Create .loom/ directory with default configuration\n` +
+        `• Add .loom/ to .gitignore\n` +
+        `• Set up 3 default agents\n\n` +
+        `Continue?`
+      );
+
+      if (!confirmed) {
+        console.log('⌨️  User canceled initialization');
+        state.setWorkspace('');
+        return;
+      }
+
+      // Initialize workspace
+      const initialized = await initializeLoomWorkspace(expandedPath);
+      if (!initialized) {
+        state.setWorkspace('');
+        return;
+      }
+    }
+
+    // Now load config from workspace
+    console.log('⌨️  Setting workspace');
     state.setWorkspace(expandedPath);
 
-    // Load config from workspace .loom directory
     setConfigWorkspace(expandedPath);
     const config = await loadConfig();
     state.setNextAgentNumber(config.nextAgentNumber);
@@ -180,10 +241,9 @@ async function handleWorkspacePathInput(path: string) {
       state.loadAgents(config.agents);
       console.log('⌨️  Loaded', config.agents.length, 'agents from config');
     }
-  } else {
-    console.log('⌨️  Path is invalid, keeping in input but not setting in state');
-    // Keep the path in the input field (don't clear it)
-    // But clear it from state so it's not used
+  } catch (error) {
+    console.error('❌ Error handling workspace:', error);
+    alert(`Error: ${error}`);
     state.setWorkspace('');
   }
 }
