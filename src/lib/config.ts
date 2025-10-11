@@ -1,5 +1,4 @@
-import { writeTextFile, readTextFile, exists, createDir } from '@tauri-apps/api/fs';
-import { join } from '@tauri-apps/api/path';
+import { invoke } from '@tauri-apps/api/tauri';
 import { Terminal } from './state';
 
 export interface LoomConfig {
@@ -17,33 +16,19 @@ export function setConfigWorkspace(workspacePath: string): void {
 }
 
 /**
- * Get the path to the config file (.loom/config.json)
- */
-async function getConfigPath(): Promise<string | null> {
-  if (!cachedWorkspacePath) {
-    return null;
-  }
-  const loomDir = await join(cachedWorkspacePath, '.loom');
-  return await join(loomDir, 'config.json');
-}
-
-/**
  * Load config from .loom/config.json
  * Workspace must be initialized before calling this
  */
 export async function loadConfig(): Promise<LoomConfig> {
   try {
-    const configPath = await getConfigPath();
-    if (!configPath) {
+    if (!cachedWorkspacePath) {
       throw new Error('No workspace set - cannot load config');
     }
 
-    const fileExists = await exists(configPath);
-    if (!fileExists) {
-      throw new Error('Config file does not exist - workspace not initialized?');
-    }
+    const contents = await invoke<string>('read_config', {
+      workspacePath: cachedWorkspacePath
+    });
 
-    const contents = await readTextFile(configPath);
     const config = JSON.parse(contents) as LoomConfig;
     return config;
   } catch (error) {
@@ -57,20 +42,15 @@ export async function loadConfig(): Promise<LoomConfig> {
  */
 export async function saveConfig(config: LoomConfig): Promise<void> {
   try {
-    const configPath = await getConfigPath();
-    if (!configPath) {
+    if (!cachedWorkspacePath) {
       return;
     }
 
-    // Ensure .loom directory exists
-    const loomDir = await join(cachedWorkspacePath!, '.loom');
-    const loomDirExists = await exists(loomDir);
-    if (!loomDirExists) {
-      await createDir(loomDir, { recursive: true });
-    }
-
     const contents = JSON.stringify(config, null, 2);
-    await writeTextFile(configPath, contents);
+    await invoke('write_config', {
+      workspacePath: cachedWorkspacePath,
+      configJson: contents
+    });
   } catch (error) {
     console.error('Failed to save config:', error);
   }

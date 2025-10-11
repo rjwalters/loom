@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::fs;
 use std::io;
+use serde_json;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -109,13 +110,42 @@ fn initialize_loom_workspace(path: String, defaults_path: String) -> Result<(), 
     Ok(())
 }
 
+#[tauri::command]
+fn read_config(workspace_path: String) -> Result<String, String> {
+    let config_path = Path::new(&workspace_path).join(".loom").join("config.json");
+
+    if !config_path.exists() {
+        return Err("Config file does not exist".to_string());
+    }
+
+    fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config: {}", e))
+}
+
+#[tauri::command]
+fn write_config(workspace_path: String, config_json: String) -> Result<(), String> {
+    let loom_dir = Path::new(&workspace_path).join(".loom");
+    let config_path = loom_dir.join("config.json");
+
+    // Ensure .loom directory exists
+    if !loom_dir.exists() {
+        fs::create_dir_all(&loom_dir)
+            .map_err(|e| format!("Failed to create .loom directory: {}", e))?;
+    }
+
+    fs::write(&config_path, config_json)
+        .map_err(|e| format!("Failed to write config: {}", e))
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             greet,
             validate_git_repo,
             check_loom_initialized,
-            initialize_loom_workspace
+            initialize_loom_workspace,
+            read_config,
+            write_config
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
