@@ -2,6 +2,59 @@
 @tailwind components;
 @tailwind utilities;
 
-* {
-  transition: background-color 300ms, color 300ms, border-color 300ms;
+/* Custom scrollbar for webkit browsers */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-gray-100 dark:bg-gray-800;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-gray-300 dark:bg-gray-600 rounded;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-gray-400 dark:bg-gray-500;
+}
+
+/* Smooth scrolling */
+#mini-terminal-row > div {
+  scroll-behavior: smooth;
+}
+
+/* Drag and drop styles */
+.terminal-card {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.terminal-card.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+
+.terminal-card:active {
+  cursor: grabbing;
+}
+
+.drop-indicator {
+  width: 3px;
+  height: 136px; /* h-32 (128px) + p-1 top and bottom (8px) */
+  @apply bg-blue-500;
+  border-radius: 2px;
+  flex-shrink: 0;
+  pointer-events: none;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
 }

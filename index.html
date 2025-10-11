@@ -5,20 +5,31 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Loom</title>
   </head>
-  <body class="bg-gray-50 text-gray-900 dark:bg-gray-900 dark:text-gray-100">
-    <div id="app">
-      <div class="h-screen flex items-center justify-center">
-        <div class="text-center space-y-4">
-          <h1 class="text-4xl font-bold text-gray-900 dark:text-gray-100">Loom</h1>
-          <p class="text-gray-600 dark:text-gray-400">Multi-terminal AI orchestration</p>
-          <button
-            id="theme-toggle"
-            class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded"
-          >
-            Toggle Theme
+  <body class="bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100">
+    <div id="app" class="h-screen flex flex-col">
+      <!-- Header -->
+      <header id="header" class="h-16 px-6 flex items-center justify-between border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900">
+        <div class="flex items-center gap-4">
+          <div id="workspace-name" class="text-lg font-bold">
+            <!-- Dynamically rendered: "Loom" or repo name -->
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button id="theme-toggle" class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded">
+            <span id="theme-icon">🌓</span>
           </button>
         </div>
-      </div>
+      </header>
+
+      <!-- Primary Terminal -->
+      <main id="primary-terminal" class="flex-1 p-4 bg-gray-50 dark:bg-gray-900">
+        <!-- Terminal content here -->
+      </main>
+
+      <!-- Mini Terminal Row -->
+      <footer id="mini-terminal-row" class="h-40 border-t border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+        <!-- Mini terminals here -->
+      </footer>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

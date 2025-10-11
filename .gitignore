@@ -23,3 +23,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Loom config (workspace-specific, not committed)
+.loom/
