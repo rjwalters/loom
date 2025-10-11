@@ -50,28 +50,29 @@ client.ping().await?;
 let id = client.create_terminal("my-terminal", None).await?;
 ```
 
-## Known Issues
+## Test Status
 
-**Status: Tests currently failing with EOF errors**
+✅ **All 9 integration tests passing**
 
-The test infrastructure is complete but tests are failing because:
-- Daemon may not be starting properly in test environment
-- Need to capture daemon stderr/stdout for debugging
-- May need better synchronization for daemon startup
-
-This is work-in-progress. The test infrastructure is solid and provides a foundation for
-debugging and fixing the actual daemon initialization issues.
+The test infrastructure successfully validates:
+- Basic IPC communication (Ping/Pong)
+- Error handling (malformed requests)
+- Terminal lifecycle (create, list, destroy)
+- Working directory support
+- Input handling
+- Multiple concurrent clients
+- Error conditions (non-existent terminal)
 
 ## Requirements
 
 - `tmux` must be installed
 - Unix domain sockets (macOS/Linux only)
 
-## TODO
+## Future Enhancements
 
-- [ ] Fix daemon startup in test environment
-- [ ] Add better error messages and debugging output
-- [ ] Implement persistence tests (daemon restart, etc.)
-- [ ] Add concurrency tests
-- [ ] Add error condition tests
-- [ ] Integrate with CI
+- [ ] Implement persistence tests (daemon restart, session recovery)
+- [ ] Add concurrency/stress tests (many terminals, rapid operations)
+- [ ] Add output capture tests (when daemon supports it)
+- [ ] Integrate with CI (requires tmux on runners)
+- [ ] Add performance benchmarks
+- [ ] Test edge cases (long terminal names, special characters, etc.)
