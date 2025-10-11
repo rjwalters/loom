@@ -81,12 +81,12 @@ jobs:
           cache-dependency-path: "package-lock.json"
 
       - name: Install dependencies
-        uses: nick-fields/retry-action@v3
+        uses: ./.github/actions/retry-command
         with:
-          timeout_minutes: 5
+          command: npm ci --prefer-offline
           max_attempts: 3
           retry_wait_seconds: 5
-          command: npm ci --prefer-offline
+          timeout_minutes: 5
 
       - name: Run parallel checks
         run: |
