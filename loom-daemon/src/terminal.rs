@@ -90,6 +90,54 @@ impl TerminalManager {
         Ok(())
     }
 
+    pub fn get_terminal_output(
+        &self,
+        id: &TerminalId,
+        start_line: Option<i32>,
+    ) -> Result<(String, i32)> {
+        let info = self
+            .terminals
+            .get(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        // First, get the total number of lines in the history
+        let history_output = Command::new("tmux")
+            .args([
+                "display-message",
+                "-t",
+                &info.tmux_session,
+                "-p",
+                "#{history_size}",
+            ])
+            .output()?;
+
+        let total_lines: i32 = String::from_utf8_lossy(&history_output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0);
+
+        // Capture pane content from start_line to end
+        let mut cmd = Command::new("tmux");
+        cmd.args(["capture-pane", "-t", &info.tmux_session, "-p", "-e", "-J"]);
+
+        // If start_line is specified, only capture from that line onwards
+        if let Some(start) = start_line {
+            if start >= 0 && start < total_lines {
+                let lines_to_capture = total_lines - start;
+                cmd.args(["-S", &format!("-{lines_to_capture}")]);
+            }
+        } else {
+            // Capture entire scrollback history
+            cmd.arg("-S").arg("-");
+        }
+
+        let output = cmd.output()?;
+
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+
+        Ok((content, total_lines))
+    }
+
     pub fn restore_from_tmux(&mut self) -> Result<()> {
         let output = Command::new("tmux")
             .args(["list-sessions", "-F", "#{session_name}"])

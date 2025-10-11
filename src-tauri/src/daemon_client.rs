@@ -22,6 +22,10 @@ pub enum Request {
         id: TerminalId,
         data: String,
     },
+    GetTerminalOutput {
+        id: TerminalId,
+        start_line: Option<i32>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,6 +34,7 @@ pub enum Response {
     Pong,
     TerminalCreated { id: TerminalId },
     TerminalList { terminals: Vec<TerminalInfo> },
+    TerminalOutput { output: String, line_count: i32 },
     Success,
     Error { message: String },
 }

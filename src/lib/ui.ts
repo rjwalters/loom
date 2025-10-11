@@ -75,13 +75,7 @@ export function renderPrimaryTerminal(
           <span class="terminal-name font-medium text-sm" data-terminal-id="${terminal.id}">${escapeHtml(terminal.name)}</span>
         </div>
       </div>
-      <div class="flex-1 p-4 overflow-auto" id="terminal-content-${terminal.id}">
-        <div class="font-mono text-sm text-gray-600 dark:text-gray-400">
-          ${escapeHtml(terminal.name)}<br>
-          Status: ${terminal.status}<br>
-          (Agent terminal display will be implemented in Issue #4)
-        </div>
-      </div>
+      <div class="flex-1 overflow-hidden" id="terminal-content-${terminal.id}"></div>
     </div>
   `;
 }
