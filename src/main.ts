@@ -4,10 +4,11 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
-import { AppState, TerminalStatus } from "./lib/state";
+import { AppState } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
+import { showWorkerModal } from "./lib/worker-modal";
 
 // Initialize theme
 initTheme();
@@ -444,16 +445,8 @@ function setupEventListeners() {
           return;
         }
 
-        const agentNumber = state.getNextAgentNumber();
-        state.addTerminal({
-          id: String(Date.now()),
-          name: `Agent ${agentNumber}`,
-          status: TerminalStatus.Idle,
-          isPrimary: false,
-        });
-
-        // Save updated state to config
-        saveCurrentConfig();
+        // Show worker modal
+        showWorkerModal(state, render);
         return;
       }
 
