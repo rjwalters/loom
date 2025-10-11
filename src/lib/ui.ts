@@ -5,12 +5,12 @@ export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boole
   if (!container) return;
 
   if (hasWorkspace) {
-    // Show repo name in header
+    // Show repo name in header (no "Loom" title)
     const repoName = extractRepoName(displayedWorkspacePath);
     container.innerHTML = `📂 ${escapeHtml(repoName)}`;
   } else {
-    // Clear header workspace name
-    container.innerHTML = '';
+    // Show "Loom" title when no workspace
+    container.innerHTML = 'Loom';
   }
 }
 
