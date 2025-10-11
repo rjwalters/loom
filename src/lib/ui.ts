@@ -37,8 +37,8 @@ export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: b
       // No workspace - show selector in center
       container.innerHTML = `
         <div class="h-full flex items-center justify-center">
-          <div class="flex flex-col items-center gap-4">
-            <p class="text-lg text-gray-400">Open a git repository to begin</p>
+          <div class="flex flex-col items-center gap-3">
+            <p class="text-lg text-gray-400 mb-2">Open a git repository to begin</p>
             <div class="flex items-center gap-2">
               <input
                 id="workspace-path"
@@ -55,7 +55,7 @@ export function renderPrimaryTerminal(terminal: Terminal | null, hasWorkspace: b
                 📁
               </button>
             </div>
-            <div id="workspace-error" class="text-sm text-red-500 dark:text-red-400"></div>
+            <div id="workspace-error" class="text-sm text-red-500 dark:text-red-400 min-h-[20px]"></div>
           </div>
         </div>
       `;

@@ -79,7 +79,6 @@ function showWorkspaceError(message: string) {
 
   if (errorDiv) {
     errorDiv.textContent = message;
-    errorDiv.classList.remove('hidden');
   }
 }
 
@@ -94,7 +93,6 @@ function clearWorkspaceError() {
 
   if (errorDiv) {
     errorDiv.textContent = '';
-    errorDiv.classList.add('hidden');
   }
 }
 
