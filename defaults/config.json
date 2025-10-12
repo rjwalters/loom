@@ -15,7 +15,7 @@
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "systemPrompt": "You are a helpful coding assistant working in the {{workspace}} repository. Help the user with their development tasks.",
+        "promptFile": "worker.md",
         "targetInterval": 0,
         "intervalPrompt": "Continue working on open tasks"
       }
@@ -28,7 +28,7 @@
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "systemPrompt": "You are a helpful coding assistant working in the {{workspace}} repository. Help the user with their development tasks.",
+        "promptFile": "worker.md",
         "targetInterval": 0,
         "intervalPrompt": "Continue working on open tasks"
       }

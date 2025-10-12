@@ -11,7 +11,6 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   const role = terminal.role || "none";
   const roleConfig = terminal.roleConfig || {};
   const workerType = (roleConfig.workerType as string) || "claude";
-  const systemPrompt = (roleConfig.systemPrompt as string) || "";
   const targetInterval = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
   const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
   const autonomousEnabled = targetInterval > 0;
@@ -108,25 +107,17 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
           </div>
 
           <div>
-            <div class="flex items-center justify-between mb-1">
-              <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
-                System Prompt
-              </label>
-              <button
-                id="reset-prompt-btn"
-                class="text-xs text-blue-600 dark:text-blue-400 hover:underline"
-              >
-                Reset to Default
-              </button>
-            </div>
-            <textarea
-              id="system-prompt"
-              rows="12"
-              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs text-gray-900 dark:text-gray-100"
-              placeholder="Enter system prompt..."
-            >${escapeHtml(systemPrompt)}</textarea>
+            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+              System Prompt
+            </label>
+            <select
+              id="prompt-file"
+              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+            >
+              <option value="">Loading prompts...</option>
+            </select>
             <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              This prompt will be sent to the worker on startup
+              Prompt files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/prompts/</code>
             </div>
           </div>
         </div>
@@ -231,6 +222,36 @@ export async function showTerminalSettingsModal(
 
   // Show modal
   modal.classList.remove("hidden");
+
+  // Load available prompt files
+  const workspacePath = state.getWorkspace();
+  if (workspacePath) {
+    try {
+      const { invoke } = await import("@tauri-apps/api/tauri");
+      const promptFiles = await invoke<string[]>("list_prompt_files", { workspacePath });
+
+      const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
+      if (promptFileSelect && promptFiles.length > 0) {
+        const roleConfig = terminal.roleConfig || {};
+        const currentPromptFile = (roleConfig.promptFile as string) || "worker.md";
+
+        promptFileSelect.innerHTML = promptFiles
+          .map((file) => {
+            const selected = file === currentPromptFile ? "selected" : "";
+            return `<option value="${escapeHtml(file)}" ${selected}>${escapeHtml(file)}</option>`;
+          })
+          .join("");
+      } else if (promptFileSelect) {
+        promptFileSelect.innerHTML = '<option value="">No prompt files found</option>';
+      }
+    } catch (error) {
+      console.error("Failed to load prompt files:", error);
+      const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
+      if (promptFileSelect) {
+        promptFileSelect.innerHTML = '<option value="">Error loading prompts</option>';
+      }
+    }
+  }
 
   // Wire up tab switching
   const tabBtns = modal.querySelectorAll(".tab-btn");
@@ -338,7 +359,7 @@ async function applySettings(
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
     const roleSelect = modal.querySelector("#terminal-role") as HTMLSelectElement;
     const workerTypeRadios = modal.querySelectorAll('input[name="worker-type"]');
-    const systemPromptTextarea = modal.querySelector("#system-prompt") as HTMLTextAreaElement;
+    const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
     const autonomousCheckbox = modal.querySelector("#autonomous-enabled") as HTMLInputElement;
     const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
     const intervalPromptTextarea = modal.querySelector("#interval-prompt") as HTMLTextAreaElement;
@@ -363,7 +384,7 @@ async function applySettings(
     const roleConfig = role
       ? {
           workerType,
-          systemPrompt: systemPromptTextarea.value.trim(),
+          promptFile: promptFileSelect.value,
           targetInterval: autonomousCheckbox.checked
             ? Number.parseInt(targetIntervalInput.value, 10)
             : 0,

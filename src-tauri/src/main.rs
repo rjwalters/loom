@@ -287,6 +287,54 @@ fn write_config(workspace_path: &str, config_json: String) -> Result<(), String>
 }
 
 #[tauri::command]
+fn list_prompt_files(workspace_path: &str) -> Result<Vec<String>, String> {
+    let prompts_dir = Path::new(workspace_path).join(".loom").join("prompts");
+
+    if !prompts_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut prompt_files = Vec::new();
+
+    let entries =
+        fs::read_dir(&prompts_dir).map_err(|e| format!("Failed to read prompts directory: {e}"))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+
+        if path.is_file() {
+            if let Some(extension) = path.extension() {
+                if extension == "md" {
+                    if let Some(filename) = path.file_name() {
+                        if let Some(name) = filename.to_str() {
+                            prompt_files.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    prompt_files.sort();
+    Ok(prompt_files)
+}
+
+#[tauri::command]
+fn read_prompt_file(workspace_path: &str, filename: &str) -> Result<String, String> {
+    let prompt_path = Path::new(workspace_path)
+        .join(".loom")
+        .join("prompts")
+        .join(filename);
+
+    if !prompt_path.exists() {
+        return Err("Prompt file does not exist".to_string());
+    }
+
+    fs::read_to_string(&prompt_path).map_err(|e| format!("Failed to read prompt file: {e}"))
+}
+
+#[tauri::command]
 fn get_env_var(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|_| format!("{key} not set in .env"))
 }
@@ -436,6 +484,8 @@ fn main() {
             initialize_loom_workspace,
             read_config,
             write_config,
+            list_prompt_files,
+            read_prompt_file,
             create_terminal,
             list_terminals,
             destroy_terminal,

@@ -5,6 +5,7 @@ This directory contains default configuration files for Loom workspaces.
 ## Structure
 
 - `config.json` - Default configuration for new workspaces
+- `prompts/` - System prompt templates for different terminal roles
 
 ## Purpose
 
@@ -41,7 +42,7 @@ These files are committed to git to serve as:
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "systemPrompt": "You are a helpful coding assistant...",
+        "promptFile": "worker.md",
         "targetInterval": 300000,
         "intervalPrompt": "Continue working on open tasks"
       }
@@ -82,9 +83,10 @@ When `role` is set to "claude-code-worker" or "codex-worker", the following fiel
   - "claude": Uses Claude Code (Anthropic)
   - "codex": Uses OpenAI Codex
 
-- `systemPrompt` (string): Initial prompt sent to the worker on startup
-  - Supports `{{workspace}}` template variable (replaced with workspace path)
-  - Example: "You are a helpful coding assistant working in the {{workspace}} repository."
+- `promptFile` (string): Filename of the system prompt in `.loom/prompts/`
+  - Example: "worker.md", "issues.md", "reviewer.md"
+  - Prompt files support `{{workspace}}` template variable (replaced with workspace path)
+  - See `prompts/` directory for available prompt templates
 
 - `targetInterval` (number): Milliseconds between autonomous worker invocations
   - `0`: Autonomous mode disabled (manual interaction only)
@@ -95,3 +97,16 @@ When `role` is set to "claude-code-worker" or "codex-worker", the following fiel
   - Only used when `targetInterval > 0`
   - Example: "Continue working on open tasks"
   - Can be a simple nudge or specific instruction
+
+### System Prompts
+
+System prompts are stored as markdown files in `.loom/prompts/`:
+
+- **`default.md`** - Plain shell environment
+- **`worker.md`** - General development worker
+- **`issues.md`** - GitHub issue creation specialist
+- **`reviewer.md`** - Code review specialist
+- **`architect.md`** - System architecture and design
+- **`curator.md`** - Issue maintenance and enhancement
+
+You can create custom prompt files by adding `.md` files to `.loom/prompts/` in your workspace. All prompt files will automatically appear in the Terminal Settings dropdown.
