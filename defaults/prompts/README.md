@@ -4,6 +4,12 @@ This directory contains system prompt templates for different terminal roles in 
 
 ## Available Prompts
 
+Each prompt consists of two files:
+- **`.md`** - The system prompt text (markdown format)
+- **`.json`** - Metadata with default settings (optional)
+
+### Prompt Roles
+
 - **`default.md`** - Plain shell environment, no specialized role
 - **`worker.md`** - General development worker for features, bugs, and refactoring
 - **`issues.md`** - Specialist for creating well-structured GitHub issues
@@ -19,6 +25,43 @@ When configuring a terminal role in the Terminal Settings modal, select a prompt
 
 You can add your own prompt files to `.loom/prompts/` in any workspace. All `.md` files will automatically appear in the prompt selection dropdown.
 
+### Prompt File Structure
+
+Each prompt can have two files:
+
+**`my-prompt.md`** (required) - The system prompt text
+```markdown
+# My Custom Role
+
+You are a specialist in {{workspace}} repository...
+
+## Your Role
+...
+```
+
+**`my-prompt.json`** (optional) - Metadata with default settings
+```json
+{
+  "name": "My Custom Role",
+  "description": "Brief description of what this role does",
+  "defaultInterval": 300000,
+  "defaultIntervalPrompt": "The prompt to send at each interval...",
+  "autonomousRecommended": true,
+  "suggestedWorkerType": "claude"
+}
+```
+
+### Metadata Fields
+
+- **`name`** (string): Display name for this role
+- **`description`** (string): Brief description
+- **`defaultInterval`** (number): Default interval in milliseconds (0 = disabled)
+- **`defaultIntervalPrompt`** (string): Default prompt sent at each interval
+- **`autonomousRecommended`** (boolean): Whether autonomous mode is recommended
+- **`suggestedWorkerType`** (string): "claude" or "codex"
+
+When a user selects a prompt from the dropdown, if a metadata file exists, the form fields will be pre-populated with these defaults.
+
 ### Template Variables
 
 - `{{workspace}}` - Replaced with the absolute path to the workspace directory
@@ -31,30 +74,6 @@ A good prompt should include:
 2. **Responsibilities**: What tasks this role handles
 3. **Guidelines**: Best practices and working style
 4. **Examples**: Sample workflows or outputs (when helpful)
-
-### Example Custom Prompt
-
-```markdown
-# Frontend Specialist
-
-You are a frontend developer specializing in React and TypeScript in the {{workspace}} repository.
-
-## Your Role
-
-Focus on UI/UX implementation:
-- Building React components
-- Managing application state
-- Implementing responsive designs
-- Writing frontend tests
-
-## Guidelines
-
-- Follow React best practices and hooks patterns
-- Use TypeScript strictly (no `any` types)
-- Ensure accessibility (WCAG 2.1 AA compliance)
-- Test components with React Testing Library
-- Match existing component patterns and naming
-```
 
 ## Default vs Workspace Prompts
 

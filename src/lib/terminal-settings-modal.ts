@@ -283,10 +283,50 @@ export async function showTerminalSettingsModal(
     });
   });
 
-  // Wire up autonomous checkbox to enable/disable config
+  // Wire up prompt file dropdown to load metadata
+  const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
+  const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
+  const intervalPromptTextarea = modal.querySelector("#interval-prompt") as HTMLTextAreaElement;
   const autonomousCheckbox = modal.querySelector("#autonomous-enabled") as HTMLInputElement;
   const autonomousConfig = modal.querySelector("#autonomous-config") as HTMLElement;
 
+  promptFileSelect?.addEventListener("change", async () => {
+    const selectedFile = promptFileSelect.value;
+    if (!selectedFile || !workspacePath) return;
+
+    try {
+      const { invoke } = await import("@tauri-apps/api/tauri");
+      const metadataJson = await invoke<string | null>("read_prompt_metadata", {
+        workspacePath,
+        filename: selectedFile,
+      });
+
+      if (metadataJson) {
+        const metadata = JSON.parse(metadataJson) as {
+          defaultInterval?: number;
+          defaultIntervalPrompt?: string;
+          autonomousRecommended?: boolean;
+        };
+
+        // Populate interval settings from metadata
+        if (metadata.defaultInterval !== undefined) {
+          targetIntervalInput.value = metadata.defaultInterval.toString();
+        }
+        if (metadata.defaultIntervalPrompt !== undefined) {
+          intervalPromptTextarea.value = metadata.defaultIntervalPrompt;
+        }
+        if (metadata.autonomousRecommended !== undefined) {
+          autonomousCheckbox.checked = metadata.autonomousRecommended;
+          // Trigger change event to update UI
+          autonomousCheckbox.dispatchEvent(new Event("change"));
+        }
+      }
+    } catch (error) {
+      console.error("Failed to load prompt metadata:", error);
+    }
+  });
+
+  // Wire up autonomous checkbox to enable/disable config
   autonomousCheckbox?.addEventListener("change", () => {
     if (autonomousCheckbox.checked) {
       autonomousConfig?.classList.remove("opacity-50", "pointer-events-none");

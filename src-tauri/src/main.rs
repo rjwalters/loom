@@ -335,6 +335,29 @@ fn read_prompt_file(workspace_path: &str, filename: &str) -> Result<String, Stri
 }
 
 #[tauri::command]
+fn read_prompt_metadata(workspace_path: &str, filename: &str) -> Result<Option<String>, String> {
+    // Convert .md filename to .json filename
+    let json_filename = if let Some(stem) = filename.strip_suffix(".md") {
+        format!("{stem}.json")
+    } else {
+        return Ok(None);
+    };
+
+    let metadata_path = Path::new(workspace_path)
+        .join(".loom")
+        .join("prompts")
+        .join(&json_filename);
+
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(&metadata_path).map_err(|e| format!("Failed to read metadata: {e}"))?;
+    Ok(Some(content))
+}
+
+#[tauri::command]
 fn get_env_var(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|_| format!("{key} not set in .env"))
 }
@@ -486,6 +509,7 @@ fn main() {
             write_config,
             list_prompt_files,
             read_prompt_file,
+            read_prompt_metadata,
             create_terminal,
             list_terminals,
             destroy_terminal,
