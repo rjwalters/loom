@@ -68,7 +68,8 @@ async fn handle_client(
 
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
 // a thread panicked while holding the lock. This is not recoverable and should crash.
-#[allow(clippy::expect_used)]
+// Allow too_many_lines because this is a central request dispatcher that handles all IPC commands.
+#[allow(clippy::expect_used, clippy::too_many_lines)]
 fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager>>) -> Response {
     match request {
         Request::Ping => Response::Pong,
@@ -169,12 +170,8 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
-            match tm.list_available_sessions() {
-                Ok(sessions) => Response::AvailableSessions { sessions },
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
-            }
+            let sessions = tm.list_available_sessions();
+            Response::AvailableSessions { sessions }
         }
 
         Request::AttachToSession { id, session_name } => {

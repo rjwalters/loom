@@ -43,7 +43,7 @@ impl TerminalManager {
 
         // Set up pipe-pane to capture all output to a file
         let output_file = format!("/tmp/loom-{}.out", &id[..8]);
-        let pipe_cmd = format!("cat >> {}", output_file);
+        let pipe_cmd = format!("cat >> {output_file}");
 
         log::info!("Setting up pipe-pane for session {} to {}", tmux_session, output_file);
         let result = Command::new("tmux")
@@ -125,17 +125,17 @@ impl TerminalManager {
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::unused_self)]
     pub fn get_terminal_output(
         &self,
         id: &TerminalId,
         start_byte: Option<usize>,
     ) -> Result<(Vec<u8>, usize)> {
+        use std::fs;
+        use std::io::{Read, Seek};
+
         let output_file = format!("/tmp/loom-{}.out", &id[..8]);
         log::debug!("Reading terminal output from: {}", output_file);
-
-        // Read the output file
-        use std::fs;
-        use std::io::Read;
 
         let mut file = match fs::File::open(&output_file) {
             Ok(f) => f,
@@ -158,7 +158,6 @@ impl TerminalManager {
                 log::debug!("No new data (start_byte={} >= file_size={})", start, file_size);
                 return Ok((Vec::new(), file_size));
             }
-            use std::io::Seek;
             file.seek(std::io::SeekFrom::Start(start as u64))?;
             log::debug!("Seeking to byte {} and reading {} bytes", start, file_size - start);
             file_size - start
@@ -239,25 +238,23 @@ impl TerminalManager {
     }
 
     /// List all available loom tmux sessions
-    pub fn list_available_sessions(&self) -> Result<Vec<String>> {
+    #[allow(clippy::unused_self)]
+    pub fn list_available_sessions(&self) -> Vec<String> {
         let output = Command::new("tmux")
             .args(["list-sessions", "-F", "#{session_name}"])
             .output();
 
         // If tmux list-sessions fails (no server running), return empty vec
-        let output = match output {
-            Ok(o) => o,
-            Err(_) => return Ok(Vec::new()),
+        let Ok(output) = output else {
+            return Vec::new();
         };
 
         let sessions = String::from_utf8_lossy(&output.stdout);
-        let loom_sessions: Vec<String> = sessions
+        sessions
             .lines()
             .filter(|s| s.starts_with("loom-"))
-            .map(|s| s.to_string())
-            .collect();
-
-        Ok(loom_sessions)
+            .map(std::string::ToString::to_string)
+            .collect()
     }
 
     /// Attach an existing terminal record to a different tmux session
