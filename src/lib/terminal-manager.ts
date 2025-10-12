@@ -117,6 +117,26 @@ export class TerminalManager {
   }
 
   /**
+   * Clear terminal and write new content (for full-state updates)
+   */
+  clearAndWriteTerminal(terminalId: string, data: string): void {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      console.warn(`Terminal ${terminalId} not found`);
+      return;
+    }
+
+    // Clear the terminal display
+    managed.terminal.clear();
+
+    // Reset cursor to home position
+    managed.terminal.write("\x1b[H");
+
+    // Write the full terminal state
+    managed.terminal.write(data);
+  }
+
+  /**
    * Clear a terminal's output
    */
   clearTerminal(terminalId: string): void {

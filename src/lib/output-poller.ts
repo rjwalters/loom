@@ -89,18 +89,23 @@ export class OutputPoller {
    */
   private async pollOnce(state: PollerState): Promise<void> {
     try {
+      // Always fetch the full terminal state (no startLine parameter)
+      // This ensures we get the current view including any rewritten lines (like prompts)
       const result = await invoke<TerminalOutput>("get_terminal_output", {
         id: state.terminalId,
-        startLine: state.lastLineCount > 0 ? state.lastLineCount : null,
+        startLine: null, // Always get full pane content
       });
 
-      // Write output to xterm.js terminal
-      if (result.output && result.output.length > 0) {
+      // Get the full output from tmux
+      if (result.output) {
         const terminalManager = getTerminalManager();
-        terminalManager.writeToTerminal(state.terminalId, result.output);
+
+        // Clear the terminal and write the full current state
+        // This prevents accumulation and keeps xterm.js in sync with tmux
+        terminalManager.clearAndWriteTerminal(state.terminalId, result.output);
       }
 
-      // Update last line count
+      // Update last line count (for reference, though we're not using incremental fetching)
       state.lastLineCount = result.line_count;
     } catch (error) {
       console.error(`Error polling terminal ${state.terminalId}:`, error);
