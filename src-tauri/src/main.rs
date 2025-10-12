@@ -5,6 +5,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use tauri::{CustomMenuItem, Menu, MenuItem, Submenu};
 
 mod daemon_client;
 
@@ -96,6 +97,21 @@ async fn get_terminal_output(
         Response::TerminalOutput { output, line_count } => {
             Ok(TerminalOutput { output, line_count })
         }
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn resize_terminal(id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::ResizeTerminal { id, cols, rows })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
         Response::Error { message } => Err(message),
         _ => Err("Unexpected response".to_string()),
     }
@@ -239,11 +255,135 @@ fn check_claude_code() -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkspaceData {
+    last_workspace_path: String,
+    last_opened_at: i64,
+}
+
+fn get_workspace_file_path(app_handle: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    let app_data_dir = app_handle
+        .path_resolver()
+        .app_data_dir()
+        .ok_or_else(|| "Failed to get app data directory".to_string())?;
+
+    // Ensure app data directory exists
+    if !app_data_dir.exists() {
+        fs::create_dir_all(&app_data_dir)
+            .map_err(|e| format!("Failed to create app data directory: {e}"))?;
+    }
+
+    Ok(app_data_dir.join("workspace.json"))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn get_stored_workspace(app_handle: tauri::AppHandle) -> Result<Option<String>, String> {
+    let workspace_file = get_workspace_file_path(&app_handle)?;
+
+    if !workspace_file.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(&workspace_file)
+        .map_err(|e| format!("Failed to read workspace file: {e}"))?;
+
+    let workspace_data: WorkspaceData = serde_json::from_str(&contents)
+        .map_err(|e| format!("Failed to parse workspace file: {e}"))?;
+
+    Ok(Some(workspace_data.last_workspace_path))
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn set_stored_workspace(app_handle: tauri::AppHandle, path: &str) -> Result<(), String> {
+    // Validate path exists and is a git repo
+    validate_git_repo(path)?;
+
+    let workspace_file = get_workspace_file_path(&app_handle)?;
+
+    let workspace_data = WorkspaceData {
+        last_workspace_path: path.to_string(),
+        #[allow(clippy::cast_possible_truncation)]
+        last_opened_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("Failed to get current time: {e}"))?
+            .as_millis() as i64,
+    };
+
+    let json = serde_json::to_string_pretty(&workspace_data)
+        .map_err(|e| format!("Failed to serialize workspace data: {e}"))?;
+
+    fs::write(&workspace_file, json).map_err(|e| format!("Failed to write workspace file: {e}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn clear_stored_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let workspace_file = get_workspace_file_path(&app_handle)?;
+
+    if workspace_file.exists() {
+        fs::remove_file(&workspace_file)
+            .map_err(|e| format!("Failed to remove workspace file: {e}"))?;
+    }
+
+    Ok(())
+}
+
 fn main() {
     // Load .env file
     dotenvy::dotenv().ok();
 
+    // Build File menu
+    let close_workspace =
+        CustomMenuItem::new("close_workspace", "Close Workspace").accelerator("CmdOrCtrl+W");
+
+    let file_menu = Submenu::new(
+        "File",
+        Menu::new()
+            .add_item(close_workspace)
+            .add_native_item(MenuItem::Separator)
+            .add_native_item(MenuItem::Quit),
+    );
+
+    let menu = Menu::new().add_submenu(file_menu);
+
     if let Err(e) = tauri::Builder::default()
+        .menu(menu)
+        .on_menu_event(|event| {
+            if event.menu_item_id() == "close_workspace" {
+                // Emit event to frontend
+                if let Err(e) = event.window().emit("close-workspace", ()) {
+                    eprintln!("Failed to emit close-workspace event: {e}");
+                }
+            }
+        })
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
+                // App is quitting - clean up all loom tmux sessions
+                eprintln!("App closing - cleaning up tmux sessions...");
+
+                // Kill all loom- tmux sessions
+                let _ = Command::new("tmux")
+                    .args(["list-sessions", "-F", "#{session_name}"])
+                    .output()
+                    .map(|output| {
+                        let sessions = String::from_utf8_lossy(&output.stdout);
+                        for session in sessions.lines() {
+                            if session.starts_with("loom-") {
+                                eprintln!("Killing tmux session: {session}");
+                                let _ = Command::new("tmux")
+                                    .args(["kill-session", "-t", session])
+                                    .spawn();
+                            }
+                        }
+                    });
+
+                eprintln!("Cleanup complete");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             validate_git_repo,
@@ -256,8 +396,12 @@ fn main() {
             destroy_terminal,
             send_terminal_input,
             get_terminal_output,
+            resize_terminal,
             get_env_var,
-            check_claude_code
+            check_claude_code,
+            get_stored_workspace,
+            set_stored_workspace,
+            clear_stored_workspace
         ])
         .run(tauri::generate_context!())
     {

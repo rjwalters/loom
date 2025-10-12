@@ -11,6 +11,8 @@ export interface Terminal {
   name: string;
   status: TerminalStatus;
   isPrimary: boolean;
+  role?: string; // Optional: "claude-code-worker", "codex-worker", etc. Undefined = plain shell
+  roleConfig?: Record<string, unknown>; // Role-specific configuration (e.g., system prompt)
 }
 
 export class AppState {
@@ -32,19 +34,17 @@ export class AppState {
   }
 
   removeTerminal(id: string): void {
-    // Don't allow removing the last terminal
-    if (this.terminals.size <= 1) {
-      return;
-    }
-
     this.terminals.delete(id);
     this.order = this.order.filter((tid) => tid !== id); // Remove from order
 
-    // If we removed the primary, make the first remaining terminal primary
+    // If we removed the primary, make the first remaining terminal primary (if any)
     if (this.primaryId === id) {
       const firstId = this.order[0];
       if (firstId) {
         this.setPrimary(firstId);
+      } else {
+        // No terminals left - clear primary
+        this.primaryId = null;
       }
     }
 
@@ -73,6 +73,19 @@ export class AppState {
     const terminal = this.terminals.get(id);
     if (terminal && newName.trim()) {
       terminal.name = newName.trim();
+      this.notify();
+    }
+  }
+
+  setTerminalRole(
+    id: string,
+    role: string | undefined,
+    roleConfig?: Record<string, unknown>
+  ): void {
+    const terminal = this.terminals.get(id);
+    if (terminal) {
+      terminal.role = role;
+      terminal.roleConfig = roleConfig;
       this.notify();
     }
   }
@@ -152,6 +165,17 @@ export class AppState {
     agents.forEach((agent) => {
       this.addTerminal(agent);
     });
+  }
+
+  clearAll(): void {
+    // Clear all state
+    this.terminals.clear();
+    this.order = [];
+    this.primaryId = null;
+    this.workspacePath = null;
+    this.displayedWorkspacePath = "";
+    // Note: Don't reset nextAgentNumber - it persists across workspace changes
+    this.notify();
   }
 
   onChange(callback: () => void): () => void {

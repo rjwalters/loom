@@ -22,6 +22,11 @@ pub enum Request {
         id: TerminalId,
         start_line: Option<i32>,
     },
+    ResizeTerminal {
+        id: TerminalId,
+        cols: u16,
+        rows: u16,
+    },
     Shutdown,
 }
 

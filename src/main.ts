@@ -1,14 +1,14 @@
 import "./style.css";
 import { open } from "@tauri-apps/api/dialog";
+import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
-import { AppState } from "./lib/state";
+import { AppState, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
-import { showWorkerModal } from "./lib/worker-modal";
 
 // Initialize theme
 initTheme();
@@ -54,7 +54,7 @@ function initializeTerminalDisplay(terminalId: string) {
 
   // Check if terminal already exists
   if (terminalManager.getTerminal(terminalId)) {
-    // Terminal already exists, just ensure polling is active
+    // Terminal already exists, just ensure polling is active and resize to fit
     if (currentAttachedTerminalId !== terminalId) {
       // Stop polling previous terminal
       if (currentAttachedTerminalId) {
@@ -64,6 +64,11 @@ function initializeTerminalDisplay(terminalId: string) {
       outputPoller.startPolling(terminalId);
       currentAttachedTerminalId = terminalId;
     }
+
+    // Resize terminal to fit container after DOM updates
+    setTimeout(() => {
+      terminalManager.fitTerminal(terminalId);
+    }, 0);
     return;
   }
 
@@ -85,11 +90,71 @@ function initializeTerminalDisplay(terminalId: string) {
   }, 0);
 }
 
-// Initial render
-render();
+// Initialize app with auto-load workspace
+async function initializeApp() {
+  try {
+    // Check for stored workspace
+    const storedPath = await invoke<string | null>("get_stored_workspace");
+
+    if (storedPath) {
+      console.log("[initializeApp] Found stored workspace:", storedPath);
+
+      // Validate stored workspace is still valid
+      const isValid = await validateWorkspacePath(storedPath);
+
+      if (isValid) {
+        // Load workspace automatically
+        console.log("[initializeApp] Loading stored workspace");
+        await handleWorkspacePathInput(storedPath);
+        return;
+      }
+
+      // Path no longer valid - clear it and show picker
+      console.log("[initializeApp] Stored workspace invalid, clearing");
+      await invoke("clear_stored_workspace");
+    }
+  } catch (error) {
+    console.error("[initializeApp] Failed to load stored workspace:", error);
+  }
+
+  // No stored workspace or validation failed - show picker
+  console.log("[initializeApp] Showing workspace picker");
+  render();
+}
 
 // Re-render on state changes
 state.onChange(render);
+
+// Listen for close workspace events from menu
+listen("close-workspace", async () => {
+  console.log("[close-workspace] Closing workspace");
+
+  // Clear stored workspace
+  try {
+    await invoke("clear_stored_workspace");
+    console.log("[close-workspace] Cleared stored workspace");
+  } catch (error) {
+    console.error("Failed to clear stored workspace:", error);
+  }
+
+  // Stop all polling
+  outputPoller.stopAll();
+
+  // Destroy all xterm instances
+  terminalManager.destroyAll();
+
+  // Clear runtime state
+  state.clearAll();
+  setConfigWorkspace("");
+  currentAttachedTerminalId = null;
+
+  // Re-render to show workspace picker
+  console.log("[close-workspace] Rendering workspace picker");
+  render();
+});
+
+// Initialize app
+initializeApp();
 
 // Drag and drop state
 let draggedTerminalId: string | null = null;
@@ -222,6 +287,94 @@ async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> 
   }
 }
 
+// Create a plain shell terminal
+async function createPlainTerminal() {
+  const workspacePath = state.getWorkspace();
+  if (!workspacePath) {
+    alert("No workspace selected");
+    return;
+  }
+
+  // Generate terminal name
+  const terminalCount = state.getTerminals().length + 1;
+  const name = `Terminal ${terminalCount}`;
+
+  try {
+    // Create terminal in workspace directory
+    const terminalId = await invoke<string>("create_terminal", {
+      name,
+      workingDir: workspacePath,
+    });
+
+    // Add to state (no role assigned - plain shell)
+    state.addTerminal({
+      id: terminalId,
+      name,
+      status: TerminalStatus.Idle,
+      isPrimary: false,
+    });
+
+    // Save updated state to config
+    await saveCurrentConfig();
+
+    // Switch to new terminal
+    state.setPrimary(terminalId);
+
+    console.log(`[createPlainTerminal] Created terminal ${name} (${terminalId})`);
+  } catch (error) {
+    console.error("[createPlainTerminal] Failed to create terminal:", error);
+    alert(`Failed to create terminal: ${error}`);
+  }
+}
+
+// Reconnect terminals to daemon after loading config
+async function reconnectTerminals() {
+  console.log("[reconnectTerminals] Querying daemon for active terminals...");
+
+  try {
+    // Get list of active terminals from daemon
+    interface DaemonTerminalInfo {
+      id: string;
+      name: string;
+      tmux_session: string;
+      working_dir: string | null;
+      created_at: number;
+    }
+
+    const daemonTerminals = await invoke<DaemonTerminalInfo[]>("list_terminals");
+    console.log(`[reconnectTerminals] Found ${daemonTerminals.length} active daemon terminals`);
+
+    // Create a set of active terminal IDs for quick lookup
+    const activeTerminalIds = new Set(daemonTerminals.map((t) => t.id));
+
+    // Get all agents from state
+    const agents = state.getTerminals();
+    console.log(`[reconnectTerminals] Config has ${agents.length} agents`);
+
+    // For each agent in config, check if daemon has it
+    for (const agent of agents) {
+      if (activeTerminalIds.has(agent.id)) {
+        console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
+
+        // Initialize xterm for this terminal (will fetch full history)
+        initializeTerminalDisplay(agent.id);
+      } else {
+        console.log(
+          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, skipping`
+        );
+        // Terminal not found in daemon - either tmux session died or daemon restarted
+        // We could mark it as stopped, but for now just leave it in config
+        // User can recreate it or remove it manually
+      }
+    }
+
+    console.log("[reconnectTerminals] Reconnection complete");
+  } catch (error) {
+    console.error("[reconnectTerminals] Failed to reconnect terminals:", error);
+    // Non-fatal - workspace is still loaded
+  }
+}
+
 // Handle manual workspace path entry
 async function handleWorkspacePathInput(path: string) {
   console.log("[handleWorkspacePathInput] input path:", path);
@@ -282,8 +435,19 @@ async function handleWorkspacePathInput(path: string) {
     // Load agents from config
     if (config.agents && config.agents.length > 0) {
       state.loadAgents(config.agents);
+      // Reconnect agents to existing daemon terminals
+      await reconnectTerminals();
     }
     console.log("[handleWorkspacePathInput] workspace fully loaded");
+
+    // Store workspace path for next app launch
+    try {
+      await invoke("set_stored_workspace", { path: expandedPath });
+      console.log("[handleWorkspacePathInput] workspace path stored");
+    } catch (error) {
+      console.error("Failed to store workspace path:", error);
+      // Non-fatal - workspace is still loaded
+    }
   } catch (error) {
     console.error("Error handling workspace:", error);
     alert(`Error: ${error}`);
@@ -387,9 +551,40 @@ function setupEventListeners() {
     toggleTheme();
   });
 
-  // Primary terminal - double-click to rename
+  // Primary terminal - double-click to rename, click for settings/clear
   const primaryTerminal = document.getElementById("primary-terminal");
   if (primaryTerminal) {
+    // Button clicks (settings, clear)
+    primaryTerminal.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement;
+
+      // Settings button
+      const settingsBtn = target.closest("#terminal-settings-btn");
+      if (settingsBtn) {
+        e.stopPropagation();
+        const id = settingsBtn.getAttribute("data-terminal-id");
+        if (id) {
+          console.log(`[terminal-settings-btn] Opening settings for terminal ${id}`);
+          // TODO: Show terminal settings modal
+          alert("Terminal settings modal coming soon!");
+        }
+        return;
+      }
+
+      // Clear button
+      const clearBtn = target.closest("#terminal-clear-btn");
+      if (clearBtn) {
+        e.stopPropagation();
+        const id = clearBtn.getAttribute("data-terminal-id");
+        if (id) {
+          console.log(`[terminal-clear-btn] Clearing terminal ${id}`);
+          terminalManager.clearTerminal(id);
+        }
+        return;
+      }
+    });
+
+    // Double-click to rename
     primaryTerminal.addEventListener("dblclick", (e) => {
       const target = e.target as HTMLElement;
 
@@ -415,12 +610,7 @@ function setupEventListeners() {
         const id = target.getAttribute("data-terminal-id");
 
         if (id) {
-          if (state.getTerminals().length <= 1) {
-            alert("Cannot close the last agent");
-            return;
-          }
-
-          if (confirm("Close this agent?")) {
+          if (confirm("Close this terminal?")) {
             // Stop polling and clean up xterm.js instance
             outputPoller.stopPolling(id);
             terminalManager.destroyTerminal(id);
@@ -445,8 +635,8 @@ function setupEventListeners() {
           return;
         }
 
-        // Show worker modal
-        showWorkerModal(state, render);
+        // Create plain terminal
+        createPlainTerminal();
         return;
       }
 
