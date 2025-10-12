@@ -9,23 +9,31 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 ## Agent Types
 
 ### 1. Architect Bot
-**Role**: Proposes new features and architectural improvements
+**Role**: Proposes improvements across all domains (features, docs, quality, CI, security)
 
 **Watches for**:
 - `loom:refactor-suggestion` - Reviews refactoring suggestions from workers
 - `loom:bug-suggestion` - Reviews bug reports from reviewers
 
 **Creates**:
-- `loom:architect-suggestion` - New feature proposals and architectural changes
+- `loom:architect-suggestion` - Proposals for any type of improvement
 
 **Interval**: 15 minutes (recommended autonomous)
+
+**Scope**: The Architect scans for opportunities in all domains:
+- **Architecture & Features**: New features, API design, system improvements
+- **Code Quality**: Refactoring, consistency, duplication, unused code
+- **Documentation**: Outdated docs, missing explanations, API documentation
+- **Testing**: Missing coverage, flaky tests, edge cases
+- **CI/Build/Tooling**: Failing jobs, slow builds, outdated dependencies
+- **Performance & Security**: Optimizations, vulnerabilities, resource leaks
 
 **Workflow**:
 ```
 1. Review suggestions from other roles (refactors, bugs)
 2. Approve (remove label) or reject (close with explanation)
-3. Scan codebase for architectural opportunities
-4. Create new issues with loom:architect-suggestion
+3. Scan codebase across ALL domains for improvement opportunities
+4. Create new issues with loom:architect-suggestion (any domain)
 ```
 
 ### 2. Curator Bot
@@ -254,7 +262,7 @@ No automation. Used for manual git operations, system commands, etc.
 
 | Label | Created By | Reviewed By | Meaning |
 |-------|-----------|-------------|---------|
-| `loom:architect-suggestion` | Architect | User | New feature or architectural change proposal |
+| `loom:architect-suggestion` | Architect | User | Any improvement proposal (features, docs, quality, CI, security) |
 | `loom:refactor-suggestion` | Worker | Architect | Refactoring opportunity discovered during implementation |
 | `loom:bug-suggestion` | Reviewer | Architect | Bug discovered in existing code during review |
 | (no label) | User/Architect | Curator | Accepted suggestion awaiting enhancement |
@@ -278,7 +286,7 @@ gh issue edit <number> --remove-label "loom:refactor-suggestion"
 # Reject suggestion
 gh issue close <number> --comment "Explanation..."
 
-# Create new feature suggestion
+# Create new improvement suggestion (any domain: features, docs, CI, etc.)
 gh issue create --label "loom:architect-suggestion" --title "..." --body "..."
 ```
 

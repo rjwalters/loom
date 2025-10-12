@@ -1,5 +1,5 @@
 {
-  "nextAgentNumber": 4,
+  "nextAgentNumber": 7,
   "agents": [
     {
       "id": "1",
@@ -9,6 +9,45 @@
     },
     {
       "id": "2",
+      "name": "Architect",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "architect.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Scan codebase for improvement opportunities across features, docs, quality, CI, and security"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Curator",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "curator.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
+      }
+    },
+    {
+      "id": "4",
+      "name": "Reviewer",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "reviewer.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Find and review PRs with loom:review-requested label"
+      }
+    },
+    {
+      "id": "5",
       "name": "Worker 1",
       "status": "idle",
       "isPrimary": false,
@@ -17,11 +56,11 @@
         "workerType": "claude",
         "roleFile": "worker.md",
         "targetInterval": 0,
-        "intervalPrompt": "Continue working on open tasks"
+        "intervalPrompt": "Find and implement loom:ready issues"
       }
     },
     {
-      "id": "3",
+      "id": "6",
       "name": "Worker 2",
       "status": "idle",
       "isPrimary": false,
@@ -30,7 +69,7 @@
         "workerType": "claude",
         "roleFile": "worker.md",
         "targetInterval": 0,
-        "intervalPrompt": "Continue working on open tasks"
+        "intervalPrompt": "Find and implement loom:ready issues"
       }
     }
   ]
