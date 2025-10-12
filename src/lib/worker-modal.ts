@@ -77,8 +77,9 @@ export function createWorkerModal(_workspacePath: string): HTMLElement {
 }
 
 export async function showWorkerModal(state: AppState, renderFn: () => void): Promise<void> {
-  // Check prerequisites
+  // Check prerequisites (warn but don't block)
   try {
+    // Check for API key (warn if missing)
     const hasApiKey = await invoke<string>("get_env_var", {
       key: "ANTHROPIC_API_KEY",
     })
@@ -86,18 +87,24 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
       .catch(() => false);
 
     if (!hasApiKey) {
-      alert("ANTHROPIC_API_KEY not set in .env file.\n\nAdd it and restart Loom.");
-      return;
+      console.warn("ANTHROPIC_API_KEY not set in .env file");
+      alert(
+        "Warning: ANTHROPIC_API_KEY not set in .env file.\n\nWorkers won't function without it. Add the key to your .env file and restart Loom."
+      );
     }
 
+    // Get workspace path (needed for prompt template)
     const workspacePath = await invoke<string>("get_env_var", {
       key: "WORKSPACE_PATH",
     });
 
+    // Check for Claude Code (warn if missing)
     const hasClaudeCode = await invoke<boolean>("check_claude_code");
     if (!hasClaudeCode) {
-      alert("Claude Code not found.\n\nInstall with: npm install -g @anthropic-ai/claude-code");
-      return;
+      console.warn("Claude Code not found in PATH");
+      alert(
+        "Warning: Claude Code not found in PATH.\n\nWorkers won't function without it. Install with:\nnpm install -g @anthropic-ai/claude-code"
+      );
     }
 
     // Create modal
