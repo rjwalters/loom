@@ -92,7 +92,20 @@ export class TerminalManager {
     this.terminals.set(terminalId, managedTerminal);
 
     // Set up resize observer
-    this.setupResizeObserver(container, fitAddon);
+    this.setupResizeObserver(container, fitAddon, terminalId);
+
+    // Send initial size to daemon (fire and forget)
+    const cols = terminal.cols;
+    const rows = terminal.rows;
+    import("@tauri-apps/api/tauri")
+      .then(({ invoke }) => {
+        invoke("resize_terminal", { id: terminalId, cols, rows }).catch((e) => {
+          console.warn(`[createTerminal] Failed to send initial resize for ${terminalId}:`, e);
+        });
+      })
+      .catch((e) => {
+        console.warn(`[createTerminal] Failed to import tauri API:`, e);
+      });
 
     return managedTerminal;
   }
@@ -131,9 +144,9 @@ export class TerminalManager {
   }
 
   /**
-   * Fit terminal to its container size
+   * Fit terminal to its container size and notify daemon of resize
    */
-  fitTerminal(terminalId: string): void {
+  async fitTerminal(terminalId: string): Promise<void> {
     const managed = this.terminals.get(terminalId);
     if (!managed) {
       console.warn(`Terminal ${terminalId} not found`);
@@ -142,6 +155,16 @@ export class TerminalManager {
 
     try {
       managed.fitAddon.fit();
+
+      // After fitting, send new dimensions to daemon
+      const cols = managed.terminal.cols;
+      const rows = managed.terminal.rows;
+
+      // Dynamically import invoke to avoid circular dependencies
+      const { invoke } = await import("@tauri-apps/api/tauri");
+      await invoke("resize_terminal", { id: terminalId, cols, rows });
+
+      console.log(`[fitTerminal] Resized terminal ${terminalId} to ${cols}x${rows}`);
     } catch (e) {
       console.error(`Failed to fit terminal ${terminalId}:`, e);
     }
@@ -193,10 +216,24 @@ export class TerminalManager {
   /**
    * Set up resize observer to automatically fit terminal when container resizes
    */
-  private setupResizeObserver(container: HTMLElement, fitAddon: FitAddon): void {
+  private setupResizeObserver(
+    container: HTMLElement,
+    fitAddon: FitAddon,
+    terminalId: string
+  ): void {
     const resizeObserver = new ResizeObserver(() => {
       try {
         fitAddon.fit();
+
+        // Notify daemon of resize (fire and forget - don't block UI)
+        const cols = fitAddon.proposeDimensions()?.cols || 80;
+        const rows = fitAddon.proposeDimensions()?.rows || 24;
+
+        import("@tauri-apps/api/tauri").then(({ invoke }) => {
+          invoke("resize_terminal", { id: terminalId, cols, rows }).catch((_e) => {
+            // Ignore errors during resize (daemon might not be ready)
+          });
+        });
       } catch (_e) {
         // Ignore errors during resize (can happen during rapid resizing)
       }

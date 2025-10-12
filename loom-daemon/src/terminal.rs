@@ -138,6 +138,29 @@ impl TerminalManager {
         Ok((content, total_lines))
     }
 
+    pub fn resize_terminal(&self, id: &TerminalId, cols: u16, rows: u16) -> Result<()> {
+        let info = self
+            .terminals
+            .get(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        // Resize tmux pane
+        Command::new("tmux")
+            .args([
+                "resize-pane",
+                "-t",
+                &info.tmux_session,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+            ])
+            .spawn()?
+            .wait()?;
+
+        Ok(())
+    }
+
     pub fn restore_from_tmux(&mut self) -> Result<()> {
         let output = Command::new("tmux")
             .args(["list-sessions", "-F", "#{session_name}"])

@@ -54,7 +54,7 @@ function initializeTerminalDisplay(terminalId: string) {
 
   // Check if terminal already exists
   if (terminalManager.getTerminal(terminalId)) {
-    // Terminal already exists, just ensure polling is active
+    // Terminal already exists, just ensure polling is active and resize to fit
     if (currentAttachedTerminalId !== terminalId) {
       // Stop polling previous terminal
       if (currentAttachedTerminalId) {
@@ -64,6 +64,11 @@ function initializeTerminalDisplay(terminalId: string) {
       outputPoller.startPolling(terminalId);
       currentAttachedTerminalId = terminalId;
     }
+
+    // Resize terminal to fit container after DOM updates
+    setTimeout(() => {
+      terminalManager.fitTerminal(terminalId);
+    }, 0);
     return;
   }
 
@@ -546,14 +551,15 @@ function setupEventListeners() {
     toggleTheme();
   });
 
-  // Primary terminal - double-click to rename, click for settings
+  // Primary terminal - double-click to rename, click for settings/clear
   const primaryTerminal = document.getElementById("primary-terminal");
   if (primaryTerminal) {
-    // Settings button click
+    // Button clicks (settings, clear)
     primaryTerminal.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
-      const settingsBtn = target.closest("#terminal-settings-btn");
 
+      // Settings button
+      const settingsBtn = target.closest("#terminal-settings-btn");
       if (settingsBtn) {
         e.stopPropagation();
         const id = settingsBtn.getAttribute("data-terminal-id");
@@ -562,6 +568,19 @@ function setupEventListeners() {
           // TODO: Show terminal settings modal
           alert("Terminal settings modal coming soon!");
         }
+        return;
+      }
+
+      // Clear button
+      const clearBtn = target.closest("#terminal-clear-btn");
+      if (clearBtn) {
+        e.stopPropagation();
+        const id = clearBtn.getAttribute("data-terminal-id");
+        if (id) {
+          console.log(`[terminal-clear-btn] Clearing terminal ${id}`);
+          terminalManager.clearTerminal(id);
+        }
+        return;
       }
     });
 

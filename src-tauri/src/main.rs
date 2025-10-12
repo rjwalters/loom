@@ -103,6 +103,21 @@ async fn get_terminal_output(
 }
 
 #[tauri::command]
+async fn resize_terminal(id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::ResizeTerminal { id, cols, rows })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
 fn validate_git_repo(path: &str) -> Result<bool, String> {
     let workspace_path = Path::new(path);
 
@@ -381,6 +396,7 @@ fn main() {
             destroy_terminal,
             send_terminal_input,
             get_terminal_output,
+            resize_terminal,
             get_env_var,
             check_claude_code,
             get_stored_workspace,

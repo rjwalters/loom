@@ -130,6 +130,18 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             }
         }
 
+        Request::ResizeTerminal { id, cols, rows } => {
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.resize_terminal(&id, cols, rows) {
+                Ok(()) => Response::Success,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
