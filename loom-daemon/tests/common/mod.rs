@@ -1,3 +1,7 @@
+// Test infrastructure - expect/unwrap are acceptable here since tests should panic on failure
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -238,7 +242,7 @@ pub fn get_loom_tmux_sessions() -> Vec<String> {
         Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
             .lines()
             .filter(|line| line.starts_with("loom-"))
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect(),
         _ => Vec::new(),
     }

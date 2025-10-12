@@ -1,3 +1,7 @@
+// Integration tests - expect/unwrap are acceptable here since tests should panic on failure
+#![allow(clippy::expect_used)]
+#![allow(clippy::unwrap_used)]
+
 mod common;
 
 use common::{cleanup_all_loom_sessions, tmux_session_exists, TestClient, TestDaemon};
