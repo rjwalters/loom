@@ -345,6 +345,30 @@ fn main() {
                 }
             }
         })
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
+                // App is quitting - clean up all loom tmux sessions
+                eprintln!("App closing - cleaning up tmux sessions...");
+
+                // Kill all loom- tmux sessions
+                let _ = Command::new("tmux")
+                    .args(["list-sessions", "-F", "#{session_name}"])
+                    .output()
+                    .map(|output| {
+                        let sessions = String::from_utf8_lossy(&output.stdout);
+                        for session in sessions.lines() {
+                            if session.starts_with("loom-") {
+                                eprintln!("Killing tmux session: {session}");
+                                let _ = Command::new("tmux")
+                                    .args(["kill-session", "-t", session])
+                                    .spawn();
+                            }
+                        }
+                    });
+
+                eprintln!("Cleanup complete");
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             greet,
             validate_git_repo,

@@ -283,6 +283,54 @@ async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> 
   }
 }
 
+// Reconnect terminals to daemon after loading config
+async function reconnectTerminals() {
+  console.log("[reconnectTerminals] Querying daemon for active terminals...");
+
+  try {
+    // Get list of active terminals from daemon
+    interface DaemonTerminalInfo {
+      id: string;
+      name: string;
+      tmux_session: string;
+      working_dir: string | null;
+      created_at: number;
+    }
+
+    const daemonTerminals = await invoke<DaemonTerminalInfo[]>("list_terminals");
+    console.log(`[reconnectTerminals] Found ${daemonTerminals.length} active daemon terminals`);
+
+    // Create a set of active terminal IDs for quick lookup
+    const activeTerminalIds = new Set(daemonTerminals.map((t) => t.id));
+
+    // Get all agents from state
+    const agents = state.getTerminals();
+    console.log(`[reconnectTerminals] Config has ${agents.length} agents`);
+
+    // For each agent in config, check if daemon has it
+    for (const agent of agents) {
+      if (activeTerminalIds.has(agent.id)) {
+        console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
+
+        // Initialize xterm for this terminal (will fetch full history)
+        initializeTerminalDisplay(agent.id);
+      } else {
+        console.log(
+          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, skipping`
+        );
+        // Terminal not found in daemon - either tmux session died or daemon restarted
+        // We could mark it as stopped, but for now just leave it in config
+        // User can recreate it or remove it manually
+      }
+    }
+
+    console.log("[reconnectTerminals] Reconnection complete");
+  } catch (error) {
+    console.error("[reconnectTerminals] Failed to reconnect terminals:", error);
+    // Non-fatal - workspace is still loaded
+  }
+}
+
 // Handle manual workspace path entry
 async function handleWorkspacePathInput(path: string) {
   console.log("[handleWorkspacePathInput] input path:", path);
@@ -343,6 +391,8 @@ async function handleWorkspacePathInput(path: string) {
     // Load agents from config
     if (config.agents && config.agents.length > 0) {
       state.loadAgents(config.agents);
+      // Reconnect agents to existing daemon terminals
+      await reconnectTerminals();
     }
     console.log("[handleWorkspacePathInput] workspace fully loaded");
 
