@@ -20,6 +20,7 @@
 - ✅ Issue #4: Terminal display with xterm.js
 - ✅ Issue #5: Worker launcher with Claude Code
 - ✅ Issue #8: Comprehensive linting, formatting, and CI/CD setup
+- ✅ Issue #13: Daemon integration tests with full IPC coverage
 - ⏳ Issue #6: .loom/ directory configuration (planned)
 - ⏳ Issue #7: Workspace selector improvements (planned)
 
@@ -543,18 +544,44 @@ Minimal custom CSS in `src/style.css`:
 
 ## Testing Strategy
 
-### Current State (Manual Testing)
+### Daemon Integration Tests (Issue #13)
 
-- Launch app: `pnpm tauri:dev`
-- Manual interaction testing
-- TypeScript strict mode catches type errors
-- No runtime errors in console
+**Location**: `loom-daemon/tests/`
 
-### Future Testing (Planned)
+Comprehensive integration test suite for the daemon with 9 passing test cases:
+
+**Test Infrastructure** (`tests/common/mod.rs`):
+- `TestDaemon`: Manages isolated daemon instances with unique socket paths
+- `TestClient`: Async IPC client with helper methods for all operations
+- tmux helper functions for session management and cleanup
+- Proper isolation with `#[serial]` attribute to prevent race conditions
+
+**Test Coverage** (`tests/integration_basic.rs`):
+1. Basic IPC (Ping/Pong, malformed JSON handling)
+2. Terminal lifecycle (create, list, destroy)
+3. Working directory support
+4. Input handling
+5. Multiple concurrent clients
+6. Error conditions (non-existent terminals)
+
+**Running Tests**:
+```bash
+npm run daemon:test                    # Run all daemon tests
+npm run daemon:test:verbose           # With full output
+cargo test --test integration_basic   # Run specific test file
+```
+
+**Key Implementation Details**:
+- Daemon uses internally-tagged JSON: `{"type": "Ping"}`, `{"type": "CreateTerminal", "payload": {...}}`
+- Tests use `LOOM_SOCKET_PATH` env var for isolation
+- Each test spawns isolated daemon in temp directory
+- Automatic cleanup on test completion
+
+### Frontend Testing (Planned)
 
 1. **Unit Tests**: Vitest for pure functions (state.ts, ui.ts)
 2. **Integration Tests**: Playwright for E2E workflows
-3. **Type Tests**: TypeScript as first line of defense
+3. **Type Tests**: TypeScript strict mode as first line of defense
 
 ## Performance Considerations
 
@@ -793,4 +820,4 @@ Keep this as a living document that helps both humans and AI understand the code
 
 ---
 
-Last updated: Issue #8 (Linting & Formatting) - Comprehensive code quality tools, git hooks, and CI/CD pipeline complete
+Last updated: Issue #13 (Daemon Integration Tests) - Complete test infrastructure with 9 passing integration tests covering IPC, terminal lifecycle, and error handling

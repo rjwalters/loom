@@ -162,6 +162,24 @@ cargo run
 pnpm tauri dev
 ```
 
+### Running Tests
+
+```bash
+# Run all workspace tests
+cargo test --workspace
+
+# Run daemon integration tests
+npm run daemon:test
+
+# Run with verbose output (see logs)
+npm run daemon:test:verbose
+
+# Run specific test
+cargo test --test integration_basic test_ping_pong -- --nocapture
+```
+
+**Requirements**: Tests require `tmux` installed (`brew install tmux` on macOS)
+
 ---
 
 ## 🪄 Philosophy
