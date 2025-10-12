@@ -365,6 +365,38 @@ await saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
 4. **CI validates** - All linting/formatting/builds must pass
 5. **Manual check** - Run `npm run check:all` to verify locally
 
+### IMPORTANT: Always Use pnpm Scripts for CI Matching
+
+**Always use pnpm scripts** defined in `package.json` instead of running cargo/biome commands directly. This ensures your local checks match CI exactly.
+
+**Available Scripts**:
+```bash
+pnpm lint              # Biome linting
+pnpm format            # Biome formatting
+pnpm format:rust       # Rust formatting check
+pnpm format:rust:write # Rust formatting fix
+pnpm clippy            # Clippy with exact CI flags
+pnpm clippy:fix        # Clippy auto-fix
+pnpm check             # Cargo check
+pnpm build             # TypeScript + Vite build
+pnpm check:all         # Run everything (full CI simulation)
+```
+
+**Why This Matters**:
+- CI uses: `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- Direct `cargo clippy` might miss flags like `--all-targets` or `--all-features`
+- pnpm scripts guarantee the exact same command CI runs
+- Prevents "passes locally but fails in CI" issues
+
+**Before Opening a PR**:
+```bash
+pnpm check:all  # This runs the full CI suite locally
+```
+
+If this passes, CI should pass too.
+
+**Package Manager Preference**: Always use `pnpm` (not `npm`) as the package manager for this project.
+
 ### Clippy Configuration Details
 
 The `.cargo/config.toml` enforces strict linting:
