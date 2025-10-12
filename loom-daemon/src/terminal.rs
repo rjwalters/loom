@@ -144,10 +144,10 @@ impl TerminalManager {
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
-        // Resize tmux pane
+        // Resize tmux window (which resizes the pane when there's only one pane)
         Command::new("tmux")
             .args([
-                "resize-pane",
+                "resize-window",
                 "-t",
                 &info.tmux_session,
                 "-x",
