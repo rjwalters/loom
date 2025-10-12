@@ -77,6 +77,13 @@ export function createWorkerModal(_workspacePath: string): HTMLElement {
 }
 
 export async function showWorkerModal(state: AppState, renderFn: () => void): Promise<void> {
+  // Get workspace path from state
+  const workspacePath = state.getWorkspace();
+  if (!workspacePath) {
+    alert("No workspace selected");
+    return;
+  }
+
   // Check prerequisites (warn but don't block)
   try {
     // Check for API key (warn if missing)
@@ -92,11 +99,6 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
         "Warning: ANTHROPIC_API_KEY not set in .env file.\n\nWorkers won't function without it. Add the key to your .env file and restart Loom."
       );
     }
-
-    // Get workspace path (needed for prompt template)
-    const workspacePath = await invoke<string>("get_env_var", {
-      key: "WORKSPACE_PATH",
-    });
 
     // Check for Claude Code (warn if missing)
     const hasClaudeCode = await invoke<boolean>("check_claude_code");
