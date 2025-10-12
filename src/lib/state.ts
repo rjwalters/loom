@@ -154,6 +154,17 @@ export class AppState {
     });
   }
 
+  clearAll(): void {
+    // Clear all state
+    this.terminals.clear();
+    this.order = [];
+    this.primaryId = null;
+    this.workspacePath = null;
+    this.displayedWorkspacePath = "";
+    // Note: Don't reset nextAgentNumber - it persists across workspace changes
+    this.notify();
+  }
+
   onChange(callback: () => void): () => void {
     this.listeners.add(callback);
     return () => this.listeners.delete(callback);

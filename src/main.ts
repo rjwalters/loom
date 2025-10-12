@@ -1,5 +1,6 @@
 import "./style.css";
 import { open } from "@tauri-apps/api/dialog";
+import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
@@ -85,11 +86,71 @@ function initializeTerminalDisplay(terminalId: string) {
   }, 0);
 }
 
-// Initial render
-render();
+// Initialize app with auto-load workspace
+async function initializeApp() {
+  try {
+    // Check for stored workspace
+    const storedPath = await invoke<string | null>("get_stored_workspace");
+
+    if (storedPath) {
+      console.log("[initializeApp] Found stored workspace:", storedPath);
+
+      // Validate stored workspace is still valid
+      const isValid = await validateWorkspacePath(storedPath);
+
+      if (isValid) {
+        // Load workspace automatically
+        console.log("[initializeApp] Loading stored workspace");
+        await handleWorkspacePathInput(storedPath);
+        return;
+      }
+
+      // Path no longer valid - clear it and show picker
+      console.log("[initializeApp] Stored workspace invalid, clearing");
+      await invoke("clear_stored_workspace");
+    }
+  } catch (error) {
+    console.error("[initializeApp] Failed to load stored workspace:", error);
+  }
+
+  // No stored workspace or validation failed - show picker
+  console.log("[initializeApp] Showing workspace picker");
+  render();
+}
 
 // Re-render on state changes
 state.onChange(render);
+
+// Listen for close workspace events from menu
+listen("close-workspace", async () => {
+  console.log("[close-workspace] Closing workspace");
+
+  // Clear stored workspace
+  try {
+    await invoke("clear_stored_workspace");
+    console.log("[close-workspace] Cleared stored workspace");
+  } catch (error) {
+    console.error("Failed to clear stored workspace:", error);
+  }
+
+  // Stop all polling
+  outputPoller.stopAll();
+
+  // Destroy all xterm instances
+  terminalManager.destroyAll();
+
+  // Clear runtime state
+  state.clearAll();
+  setConfigWorkspace("");
+  currentAttachedTerminalId = null;
+
+  // Re-render to show workspace picker
+  console.log("[close-workspace] Rendering workspace picker");
+  render();
+});
+
+// Initialize app
+initializeApp();
 
 // Drag and drop state
 let draggedTerminalId: string | null = null;
@@ -284,6 +345,15 @@ async function handleWorkspacePathInput(path: string) {
       state.loadAgents(config.agents);
     }
     console.log("[handleWorkspacePathInput] workspace fully loaded");
+
+    // Store workspace path for next app launch
+    try {
+      await invoke("set_stored_workspace", { path: expandedPath });
+      console.log("[handleWorkspacePathInput] workspace path stored");
+    } catch (error) {
+      console.error("Failed to store workspace path:", error);
+      // Non-fatal - workspace is still loaded
+    }
   } catch (error) {
     console.error("Error handling workspace:", error);
     alert(`Error: ${error}`);
