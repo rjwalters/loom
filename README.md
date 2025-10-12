@@ -84,15 +84,14 @@ Loom uses GitHub labels to coordinate work between different agent roles:
 
 | Label | Created By | Reviewed By | Meaning |
 |-------|-----------|-------------|---------|
-| `loom:architect-suggestion` | Architect | User | New feature or architectural change proposal |
-| `loom:refactor-suggestion` | Worker | Architect | Refactoring opportunity discovered during implementation |
-| `loom:bug-suggestion` | Reviewer | Architect | Bug discovered in existing code during review |
-| (no label) | User/Architect | Curator | Accepted suggestion awaiting enhancement |
-| `loom:ready` | Curator | Worker | Issue ready for implementation |
-| `loom:in-progress` | Worker | - | Issue currently being implemented |
-| `loom:blocked` | Worker | User/Architect | Implementation blocked, needs help |
-| `loom:review-requested` | Worker | Reviewer | PR ready for code review |
-| `loom:reviewing` | Reviewer | - | PR currently under review |
+| (no label) | Anyone | Architect triages | Unreviewed issue |
+| `loom:architect-suggestion` | Architect | User accepts | Triaged, awaiting approval |
+| `loom:accepted` | User | Curator enhances | Approved, awaiting enhancement |
+| `loom:ready` | Curator | Worker implements | Enhanced, ready for work |
+| `loom:in-progress` | Worker | Worker completes | Being implemented |
+| `loom:blocked` | Worker | User/Worker resolves | Blocked, needs help |
+| `loom:review-requested` | Worker | Reviewer reviews | PR ready for review |
+| `loom:reviewing` | Reviewer | Reviewer completes | PR under review |
 
 For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
@@ -100,13 +99,14 @@ For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 ## 🧵 Example Workflow
 
-1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates a new issue:
+1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an unlabeled issue:
    > "Add search functionality to terminal history"
-   > Label: `loom:architect-suggestion`
 
-2. **You** review the suggestion, remove the `loom:architect-suggestion` label to approve it.
+   Then triages it by adding `loom:architect-suggestion` label.
 
-3. **Curator Bot** (autonomous, runs every 5 minutes) finds the unlabeled issue, adds implementation details, test plans, and code references. Marks it `loom:ready`.
+2. **You** review the suggestion and add `loom:accepted` label to approve it.
+
+3. **Curator Bot** (autonomous, runs every 5 minutes) finds the `loom:accepted` issue, adds implementation details, test plans, and code references. Removes `loom:accepted` and adds `loom:ready`.
 
 4. **Worker Bot** (manual or on-demand) finds `loom:ready` issues, claims it by adding `loom:in-progress`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
 

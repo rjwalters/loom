@@ -9,51 +9,54 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 ## Agent Types
 
 ### 1. Architect Bot
-**Role**: Proposes improvements across all domains (features, docs, quality, CI, security)
+**Role**: Universal triage gatekeeper + improvement proposal generator
 
 **Watches for**:
-- `loom:refactor-suggestion` - Reviews refactoring suggestions from workers
-- `loom:bug-suggestion` - Reviews bug reports from reviewers
+- Unlabeled issues (created by anyone - User, Worker, Reviewer, or Architect's own scans)
 
 **Creates**:
-- `loom:architect-suggestion` - Proposals for any type of improvement
+- Unlabeled issues from codebase scans
+- Adds `loom:architect-suggestion` label after triaging issues
 
 **Interval**: 15 minutes (recommended autonomous)
 
-**Scope**: The Architect scans for opportunities in all domains:
-- **Architecture & Features**: New features, API design, system improvements
-- **Code Quality**: Refactoring, consistency, duplication, unused code
-- **Documentation**: Outdated docs, missing explanations, API documentation
-- **Testing**: Missing coverage, flaky tests, edge cases
-- **CI/Build/Tooling**: Failing jobs, slow builds, outdated dependencies
-- **Performance & Security**: Optimizations, vulnerabilities, resource leaks
+**Scope**: The Architect has two activities:
+1. **Triage unlabeled issues**: Review ALL unlabeled issues, add `loom:architect-suggestion` if viable or close if not
+2. **Create new suggestions** (if no unlabeled issues exist): Scan codebase across all domains:
+   - **Architecture & Features**: New features, API design, system improvements
+   - **Code Quality**: Refactoring, consistency, duplication, unused code
+   - **Documentation**: Outdated docs, missing explanations, API documentation
+   - **Testing**: Missing coverage, flaky tests, edge cases
+   - **CI/Build/Tooling**: Failing jobs, slow builds, outdated dependencies
+   - **Performance & Security**: Optimizations, vulnerabilities, resource leaks
 
 **Workflow**:
 ```
-1. Review suggestions from other roles (refactors, bugs)
-2. Approve (remove label) or reject (close with explanation)
-3. Scan codebase across ALL domains for improvement opportunities
-4. Create new issues with loom:architect-suggestion (any domain)
+1. Check for unlabeled issues (gh issue list --label="")
+2. If found: Triage each one - add loom:architect-suggestion or close
+3. If none: Scan codebase and create new unlabeled issue
+4. Self-triage: Add loom:architect-suggestion to own issues
+5. Wait for user to add loom:accepted label
 ```
 
 ### 2. Curator Bot
-**Role**: Enhances unlabeled issues and marks them ready for implementation
+**Role**: Enhances accepted issues and marks them ready for implementation
 
 **Watches for**:
-- Issues with no labels (newly accepted by user)
+- `loom:accepted` - Issues approved by user
 
 **Creates**:
-- `loom:ready` - Issues ready for worker implementation
+- `loom:ready` - Issues ready for worker implementation (removes `loom:accepted`)
 
 **Interval**: 5 minutes (recommended autonomous)
 
 **Workflow**:
 ```
-1. Find unlabeled issues (user has accepted suggestion)
+1. Find loom:accepted issues (user has approved)
 2. Review issue description and requirements
 3. Add implementation details, test plans, code references
 4. Document multiple implementation options if complex
-5. Mark as loom:ready when enhancement complete
+5. Remove loom:accepted, add loom:ready when enhancement complete
 ```
 
 ### 3. Worker Bot
@@ -64,7 +67,7 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 
 **Creates**:
 - `loom:in-progress` - Claims issue for implementation
-- `loom:refactor-suggestion` - Refactoring opportunities discovered
+- Unlabeled issues - When discovering problems or opportunities during work
 - `loom:review-requested` - PRs ready for review
 - `loom:blocked` - When stuck on implementation
 
@@ -77,7 +80,7 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 3. Implement, test, commit
 4. Create PR with "Closes #X", add loom:review-requested
 5. If blocked: add loom:blocked with explanation
-6. If discover refactoring need: create loom:refactor-suggestion
+6. If discover issues: create unlabeled issue (Architect will triage)
 ```
 
 ### 4. Reviewer Bot
@@ -88,7 +91,7 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 
 **Creates**:
 - `loom:reviewing` - Claims PR for review
-- `loom:bug-suggestion` - Bugs discovered in existing code
+- Unlabeled issues - Bugs or problems discovered in existing code
 
 **Interval**: 5 minutes (recommended autonomous)
 
@@ -99,7 +102,7 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 3. Check out branch, run tests, review code
 4. Approve or request changes via gh pr review
 5. Remove loom:reviewing when complete
-6. If discover bug in existing code: create loom:bug-suggestion
+6. If discover bug in existing code: create unlabeled issue (Architect will triage)
 ```
 
 ### 5. Issues Bot
@@ -132,26 +135,27 @@ No automation. Used for manual git operations, system commands, etc.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ 1. ARCHITECT CREATES SUGGESTION                             │
-│    gh issue create --label "loom:architect-suggestion"      │
+│    gh issue create (no label)                               │
 │    Title: "Add search functionality to terminal history"    │
+│    gh issue edit <#> --add-label "loom:architect-suggestion"│
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 2. USER REVIEWS AND ACCEPTS                                 │
-│    Removes loom:architect-suggestion label                  │
-│    Issue becomes unlabeled                                  │
+│    Reviews issue with loom:architect-suggestion             │
+│    Adds loom:accepted label to proceed                      │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. CURATOR ENHANCES ISSUE                                   │
-│    Finds unlabeled issue #42                                │
+│    Finds loom:accepted issue #42                            │
 │    Adds implementation details:                             │
 │    - Multiple implementation options                        │
 │    - Dependencies and risks                                 │
 │    - Test plan checklist                                    │
-│    Marks as loom:ready                                      │
+│    Removes loom:accepted, adds loom:ready                   │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
@@ -193,25 +197,31 @@ No automation. Used for manual git operations, system commands, etc.
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Worker completes #42, then creates new issue:               │
-│ gh issue create --label "loom:refactor-suggestion"          │
+│ Worker completes #42, then creates unlabeled issue:         │
+│ gh issue create (no label)                                  │
 │ Title: "Refactor state management to use reducer pattern"   │
 │ Documents: problem, current code, proposed solution         │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Architect reviews loom:refactor-suggestion                  │
+│ Architect triages unlabeled issue                           │
 │ Evaluates priority and scope                                │
-│ Approves: removes loom:refactor-suggestion                  │
+│ Adds loom:architect-suggestion                              │
 │ Adds comment with guidance                                  │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Curator processes unlabeled refactor issue                  │
+│ User reviews loom:architect-suggestion                      │
+│ Adds loom:accepted to proceed                               │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Curator processes loom:accepted refactor issue              │
 │ Adds implementation details                                 │
-│ Marks as loom:ready                                         │
+│ Removes loom:accepted, adds loom:ready                      │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
@@ -232,23 +242,29 @@ No automation. Used for manual git operations, system commands, etc.
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Reviewer completes PR review, then creates new issue:       │
-│ gh issue create --label "loom:bug-suggestion"               │
+│ Reviewer completes PR review, then creates unlabeled issue: │
+│ gh issue create (no label)                                  │
 │ Documents: reproduction, impact, root cause analysis        │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Architect reviews loom:bug-suggestion                       │
+│ Architect triages unlabeled issue                           │
 │ Evaluates severity and priority                             │
-│ Approves: removes loom:bug-suggestion                       │
+│ Adds loom:architect-suggestion                              │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ Curator processes unlabeled bug issue                       │
+│ User reviews loom:architect-suggestion                      │
+│ Adds loom:accepted to proceed                               │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ Curator processes loom:accepted bug issue                   │
 │ Adds test cases, acceptance criteria                        │
-│ Marks as loom:ready                                         │
+│ Removes loom:accepted, adds loom:ready                      │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
@@ -260,43 +276,56 @@ No automation. Used for manual git operations, system commands, etc.
 
 ## Label Reference
 
-| Label | Created By | Reviewed By | Meaning |
-|-------|-----------|-------------|---------|
-| `loom:architect-suggestion` | Architect | User | Any improvement proposal (features, docs, quality, CI, security) |
-| `loom:refactor-suggestion` | Worker | Architect | Refactoring opportunity discovered during implementation |
-| `loom:bug-suggestion` | Reviewer | Architect | Bug discovered in existing code during review |
-| (no label) | User/Architect | Curator | Accepted suggestion awaiting enhancement |
-| `loom:ready` | Curator | Worker | Issue ready for implementation |
-| `loom:in-progress` | Worker | - | Issue currently being implemented |
-| `loom:blocked` | Worker | User/Architect | Implementation blocked, needs help |
-| `loom:review-requested` | Worker | Reviewer | PR ready for code review |
-| `loom:reviewing` | Reviewer | - | PR currently under review |
+| Label | Created By | Next Stage | Meaning |
+|-------|-----------|------------|---------|
+| (no label) | Anyone | Architect triages | Unreviewed issue - created by User, Worker, Reviewer, or Architect's scan |
+| `loom:architect-suggestion` | Architect | User accepts | Triaged issue awaiting user approval |
+| `loom:accepted` | User | Curator enhances | User-approved issue awaiting enhancement |
+| `loom:ready` | Curator | Worker implements | Enhanced issue ready for implementation |
+| `loom:in-progress` | Worker | Worker completes | Issue currently being implemented |
+| `loom:blocked` | Worker | User/Worker resolves | Implementation blocked, needs help |
+| `loom:review-requested` | Worker | Reviewer reviews | PR ready for code review |
+| `loom:reviewing` | Reviewer | Reviewer completes | PR currently under review |
+
+**Key insight**: The workflow is a pipeline where each role adds/removes labels to move work forward. Users control the flow by adding `loom:accepted` to approved suggestions.
 
 ## Commands Reference
 
 ### Architect
 ```bash
-# Review suggestions from other roles
-gh issue list --label="loom:refactor-suggestion" --state=open
-gh issue list --label="loom:bug-suggestion" --state=open
+# Find unlabeled issues to triage
+gh issue list --label="" --state=open
 
-# Approve suggestion (remove label)
-gh issue edit <number> --remove-label "loom:refactor-suggestion"
+# Triage an issue (mark as suggestion)
+gh issue edit <number> --add-label "loom:architect-suggestion"
 
-# Reject suggestion
-gh issue close <number> --comment "Explanation..."
+# Reject non-viable issue
+gh issue close <number> --comment "Explanation of why not viable"
 
-# Create new improvement suggestion (any domain: features, docs, CI, etc.)
-gh issue create --label "loom:architect-suggestion" --title "..." --body "..."
+# Create new improvement suggestion (any domain)
+gh issue create --title "..." --body "..."
+gh issue edit <number> --add-label "loom:architect-suggestion"
+```
+
+### User (Manual)
+```bash
+# Find suggestions awaiting approval
+gh issue list --label="loom:architect-suggestion" --state=open
+
+# Accept a suggestion
+gh issue edit <number> --add-label "loom:accepted"
+
+# Reject a suggestion
+gh issue close <number> --comment "Not needed because..."
 ```
 
 ### Curator
 ```bash
-# Find unlabeled issues to enhance
-gh issue list --label="" --state=open
+# Find accepted issues to enhance
+gh issue list --label="loom:accepted" --state=open
 
-# Mark issue as ready
-gh issue edit <number> --add-label "loom:ready"
+# Mark issue as ready (remove accepted, add ready)
+gh issue edit <number> --remove-label "loom:accepted" --add-label "loom:ready"
 ```
 
 ### Worker
@@ -314,8 +343,8 @@ gh pr create --title "..." --body "Closes #X" --label "loom:review-requested"
 gh issue edit <number> --add-label "loom:blocked"
 gh issue comment <number> --body "Blocked because..."
 
-# Create refactor suggestion
-gh issue create --label "loom:refactor-suggestion" --title "..." --body "..."
+# Discover new issue during work (Architect will triage)
+gh issue create --title "..." --body "..."
 ```
 
 ### Reviewer
@@ -337,8 +366,8 @@ gh pr review <number> --request-changes --body "Issues found..."
 # Complete review
 gh pr edit <number> --remove-label "loom:reviewing"
 
-# Create bug suggestion
-gh issue create --label "loom:bug-suggestion" --title "..." --body "..."
+# Discover bug in existing code (Architect will triage)
+gh issue create --title "..." --body "..."
 ```
 
 ## Configuration

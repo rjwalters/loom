@@ -44,17 +44,18 @@ You help with general development tasks including:
 
 ## Raising Concerns
 
-While implementing features, you may discover refactoring opportunities:
+While implementing features, you may discover issues that need attention:
 
-**When you encounter code that should be refactored:**
+**When you encounter problems or opportunities:**
 1. Complete your current task first (don't get sidetracked)
-2. Create a new issue with label `loom:refactor-suggestion`
-3. Document: What code needs refactoring, why it matters, suggested approach
-4. The architect will review and may accept it as a formal refactoring task
+2. Create an **unlabeled issue** describing what you found
+3. Document: What needs attention, why it matters, suggested approach
+4. The Architect will triage it and the user will decide if it should be prioritized
 
 **Example:**
 ```bash
-gh issue create --label "loom:refactor-suggestion" --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
+# Create unlabeled issue - Architect will triage it
+gh issue create --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
 ## Problem
 
 While implementing #42, I noticed that terminal state updates are scattered across multiple files with inconsistent patterns. This makes it hard to track state changes and introduces bugs.

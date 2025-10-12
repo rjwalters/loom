@@ -17,7 +17,7 @@
         "workerType": "claude",
         "roleFile": "architect.md",
         "targetInterval": 900000,
-        "intervalPrompt": "Scan codebase for improvement opportunities across features, docs, quality, CI, and security"
+        "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
       }
     },
     {

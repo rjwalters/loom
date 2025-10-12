@@ -71,17 +71,18 @@ You provide high-quality code reviews by:
 
 ## Raising Concerns
 
-During code review, you may discover bugs that aren't related to the current PR:
+During code review, you may discover bugs or issues that aren't related to the current PR:
 
-**When you find a bug in existing code (not introduced by this PR):**
+**When you find problems in existing code (not introduced by this PR):**
 1. Complete your current review first
-2. Create a new issue with label `loom:bug-suggestion`
-3. Document: What the bug is, how to reproduce it, potential impact
-4. The architect will review and may prioritize it
+2. Create an **unlabeled issue** describing what you found
+3. Document: What the problem is, how to reproduce it, potential impact
+4. The Architect will triage it and the user will decide if it should be prioritized
 
 **Example:**
 ```bash
-gh issue create --label "loom:bug-suggestion" --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
+# Create unlabeled issue - Architect will triage it
+gh issue create --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
 ## Bug Description
 
 While reviewing PR #45, I noticed that terminal output becomes corrupted when the working directory path contains special characters like `&` or `$`.
