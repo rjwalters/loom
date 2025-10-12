@@ -13,6 +13,7 @@ export interface Terminal {
   isPrimary: boolean;
   role?: string; // Optional: "claude-code-worker", "codex-worker", etc. Undefined = plain shell
   roleConfig?: Record<string, unknown>; // Role-specific configuration (e.g., system prompt)
+  missingSession?: boolean; // Flag for terminals with missing tmux sessions (used in error recovery)
 }
 
 export class AppState {
