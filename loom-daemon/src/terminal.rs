@@ -125,9 +125,12 @@ impl TerminalManager {
             .parse()
             .unwrap_or(0);
 
-        // Capture pane content from start_line to end
+        // Capture pane content with escape sequences
+        // -p: print to stdout
+        // -e: include escape sequences
+        // -C: use control mode (preserves cursor positioning)
         let mut cmd = Command::new("tmux");
-        cmd.args(["capture-pane", "-t", &info.tmux_session, "-p", "-e", "-J"]);
+        cmd.args(["capture-pane", "-t", &info.tmux_session, "-p", "-e"]);
 
         // If start_line is specified, only capture from that line onwards
         if let Some(start) = start_line {
@@ -136,8 +139,9 @@ impl TerminalManager {
                 cmd.args(["-S", &format!("-{lines_to_capture}")]);
             }
         } else {
-            // Capture entire scrollback history
-            cmd.arg("-S").arg("-");
+            // Capture visible pane only (not all scrollback)
+            // This gives us clean current state without accumulation
+            // No -S flag means current visible pane
         }
 
         let output = cmd.output()?;

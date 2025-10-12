@@ -29,7 +29,7 @@ export class OutputPoller {
 
     const state: PollerState = {
       terminalId,
-      lastLineCount: 0,
+      lastLineCount: -1, // -1 means first poll - get only visible pane
       polling: true,
       intervalId: null,
     };
@@ -89,19 +89,30 @@ export class OutputPoller {
    */
   private async pollOnce(state: PollerState): Promise<void> {
     try {
-      // Fetch only new output since last poll (incremental)
+      // First poll: get visible pane only (clean state)
+      // Subsequent polls: get only new lines (incremental)
+      const startLine =
+        state.lastLineCount === -1 ? null : state.lastLineCount > 0 ? state.lastLineCount : null;
+
       const result = await invoke<TerminalOutput>("get_terminal_output", {
         id: state.terminalId,
-        startLine: state.lastLineCount > 0 ? state.lastLineCount : null,
+        startLine,
       });
 
-      // Write new output to xterm.js terminal (append)
+      // Write output to xterm.js terminal
       if (result.output && result.output.length > 0) {
         const terminalManager = getTerminalManager();
-        terminalManager.writeToTerminal(state.terminalId, result.output);
+
+        // On first poll, clear and write to start fresh
+        if (state.lastLineCount === -1) {
+          terminalManager.clearAndWriteTerminal(state.terminalId, result.output);
+        } else {
+          // Subsequent polls: append new content
+          terminalManager.writeToTerminal(state.terminalId, result.output);
+        }
       }
 
-      // Update last line count
+      // Update last line count (after first poll, this will be > 0)
       state.lastLineCount = result.line_count;
     } catch (error) {
       console.error(`Error polling terminal ${state.terminalId}:`, error);
