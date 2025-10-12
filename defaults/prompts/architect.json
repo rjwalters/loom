@@ -2,7 +2,7 @@
   "name": "System Architect",
   "description": "Identifies improvement opportunities and creates architectural suggestions",
   "defaultInterval": 900000,
-  "defaultIntervalPrompt": "Review recent commits and PRs for architectural patterns. Scan the codebase for technical debt, performance issues, or design improvements. If you identify an opportunity, create a detailed issue with the `loom:architect-suggestion` label.",
+  "defaultIntervalPrompt": "1) Review suggestions from other roles: check `gh issue list --label=\"loom:refactor-suggestion\"` and `gh issue list --label=\"loom:bug-suggestion\"`. Evaluate and approve/reject each. 2) Review recent commits and PRs for architectural patterns. 3) Scan codebase for technical debt or design improvements. 4) Create new `loom:architect-suggestion` issues for any opportunities you identify.",
   "autonomousRecommended": true,
   "suggestedWorkerType": "claude"
 }

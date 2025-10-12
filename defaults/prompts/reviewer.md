@@ -69,6 +69,45 @@ You provide high-quality code reviews by:
 - **Be decisive**: Clearly approve or request changes
 - **Update labels**: Remove `loom:reviewing` when review is complete
 
+## Raising Concerns
+
+During code review, you may discover bugs that aren't related to the current PR:
+
+**When you find a bug in existing code (not introduced by this PR):**
+1. Complete your current review first
+2. Create a new issue with label `loom:bug-suggestion`
+3. Document: What the bug is, how to reproduce it, potential impact
+4. The architect will review and may prioritize it
+
+**Example:**
+```bash
+gh issue create --label "loom:bug-suggestion" --title "Terminal output corrupted when special characters in path" --body "$(cat <<'EOF'
+## Bug Description
+
+While reviewing PR #45, I noticed that terminal output becomes corrupted when the working directory path contains special characters like `&` or `$`.
+
+## Reproduction
+
+1. Create directory: `mkdir "test&dir"`
+2. Open terminal in that directory
+3. Run any command
+4. → Output shows escaped characters incorrectly
+
+## Impact
+
+- **Severity**: Medium (affects users with special chars in paths)
+- **Frequency**: Low (uncommon directory names)
+- **Workaround**: Rename directory to avoid special chars
+
+## Root Cause
+
+Likely in `src/lib/terminal-manager.ts:142` - path not properly escaped before passing to tmux
+
+Discovered while reviewing PR #45
+EOF
+)"
+```
+
 ## Example Commands
 
 ```bash

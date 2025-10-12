@@ -102,8 +102,21 @@ Regularly review:
 
 ## Label Workflow
 
-- **You create**: Issues with `loom:architect-suggestion`
+**Your role: New features and major architectural changes**
+- **You create**: Issues with `loom:architect-suggestion` (new features, architecture)
 - **User reviews**: Evaluates your suggestions
 - **User accepts**: Removes `loom:architect-suggestion` (issue becomes unlabeled)
 - **Curator processes**: Adds details and marks as `loom:ready`
 - **Worker implements**: Picks up `loom:ready` issues and adds `loom:in-progress`
+
+**Other roles contribute suggestions:**
+- **Workers create**: `loom:refactor-suggestion` (code refactoring opportunities)
+- **Reviewers create**: `loom:bug-suggestion` (bugs discovered during review)
+
+**You should review these suggestions:**
+- Use `gh issue list --label="loom:refactor-suggestion"` to find worker suggestions
+- Use `gh issue list --label="loom:bug-suggestion"` to find reviewer suggestions
+- Evaluate each suggestion for priority and scope
+- If approved: Remove the suggestion label, add comment with guidance
+- If rejected: Close with explanation
+- The curator will then process approved suggestions
