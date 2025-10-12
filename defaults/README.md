@@ -5,7 +5,7 @@ This directory contains default configuration files for Loom workspaces.
 ## Structure
 
 - `config.json` - Default configuration for new workspaces
-- `prompts/` - System prompt templates for different terminal roles
+- `roles/` - System prompt templates for different terminal roles
 
 ## Purpose
 
@@ -42,7 +42,7 @@ These files are committed to git to serve as:
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "promptFile": "worker.md",
+        "roleFile": "worker.md",
         "targetInterval": 300000,
         "intervalPrompt": "Continue working on open tasks"
       }
@@ -83,10 +83,10 @@ When `role` is set to "claude-code-worker" or "codex-worker", the following fiel
   - "claude": Uses Claude Code (Anthropic)
   - "codex": Uses OpenAI Codex
 
-- `promptFile` (string): Filename of the system prompt in `.loom/prompts/`
+- `roleFile` (string): Filename of the system prompt in `.loom/roles/`
   - Example: "worker.md", "issues.md", "reviewer.md"
   - Prompt files support `{{workspace}}` template variable (replaced with workspace path)
-  - See `prompts/` directory for available prompt templates
+  - See `roles/` directory for available prompt templates
 
 - `targetInterval` (number): Milliseconds between autonomous worker invocations
   - `0`: Autonomous mode disabled (manual interaction only)
@@ -100,7 +100,7 @@ When `role` is set to "claude-code-worker" or "codex-worker", the following fiel
 
 ### System Prompts
 
-System prompts are stored as markdown files in `.loom/prompts/`:
+System prompts are stored as markdown files in `.loom/roles/`:
 
 - **`default.md`** - Plain shell environment
 - **`worker.md`** - General development worker
@@ -109,4 +109,4 @@ System prompts are stored as markdown files in `.loom/prompts/`:
 - **`architect.md`** - System architecture and design
 - **`curator.md`** - Issue maintenance and enhancement
 
-You can create custom prompt files by adding `.md` files to `.loom/prompts/` in your workspace. All prompt files will automatically appear in the Terminal Settings dropdown.
+You can create custom prompt files by adding `.md` files to `.loom/roles/` in your workspace. All prompt files will automatically appear in the Terminal Settings dropdown.

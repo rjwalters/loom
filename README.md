@@ -22,12 +22,19 @@ Everything else — branching, running tests, managing terminals, tracking progr
 
 ## 🧠 Core Concepts
 
-| Concept | Description |
-|----------|-------------|
-| **Issue Bot** | Improves user-created issues, applies labels like `ready`, `needs-info`, `blocked`. |
-| **Worker Bot** | Claims `ready` issues, creates isolated git worktrees, writes code, opens PRs. |
-| **Review Bot** | Reviews open PRs, comments inline, and marks them `approved` or `changes-requested`. |
-| **Coordinator** | Monitors the repo and spawns or retires workers dynamically as workload changes. |
+**Current Implementation:**
+
+Loom provides a **multi-terminal GUI** with configurable AI worker roles. Each terminal can be assigned a role that defines its behavior and automation level.
+
+| Concept | Description | Status |
+|---------|-------------|--------|
+| **Terminal Roles** | Define specialized behaviors for each terminal (Worker, Reviewer, Architect, Curator, Issues) | ✅ Implemented |
+| **File-based Configuration** | Role definitions stored as `.md` files in `.loom/roles/` with optional `.json` metadata | ✅ Implemented |
+| **Label-based Workflow** | GitHub labels coordinate work between different agent types | ✅ Implemented |
+| **Autonomous Mode** | Terminals can run at intervals (e.g., every 5 minutes) with configured prompts | ✅ Implemented |
+| **Multi-terminal GUI** | Tauri-based app with xterm.js terminals, theme support, and persistent state | ✅ Implemented |
+
+See [WORKFLOWS.md](WORKFLOWS.md) for detailed documentation of the agent coordination system.
 
 ---
 
@@ -71,35 +78,43 @@ Goal: **scale Loom beyond your laptop** — one repo, many AI workers, distribut
 
 ---
 
-## ⚙️ Agent State Machine
+## ⚙️ Label Workflow
 
-| Label         | Meaning                                | Next State                       | Responsible Agent |
-| ------------- | -------------------------------------- | -------------------------------- | ----------------- |
-| `new`         | User-created issue                     | `draft`                          | Issue Bot         |
-| `draft`       | Being clarified/refined                | `ready`                          | Issue Bot         |
-| `ready`       | Ready for implementation               | `in-progress`                    | Worker Bot        |
-| `in-progress` | Being worked on                        | `review`                         | Worker Bot        |
-| `review`      | PR created, pending review             | `approved` / `changes-requested` | Review Bot        |
-| `approved`    | Passed automated + AI review           | `merged`                         | Human             |
-| `blocked`     | Waiting on clarification or dependency | `ready`                          | Issue Bot         |
+Loom uses GitHub labels to coordinate work between different agent roles:
+
+| Label | Created By | Reviewed By | Meaning |
+|-------|-----------|-------------|---------|
+| `loom:architect-suggestion` | Architect | User | New feature or architectural change proposal |
+| `loom:refactor-suggestion` | Worker | Architect | Refactoring opportunity discovered during implementation |
+| `loom:bug-suggestion` | Reviewer | Architect | Bug discovered in existing code during review |
+| (no label) | User/Architect | Curator | Accepted suggestion awaiting enhancement |
+| `loom:ready` | Curator | Worker | Issue ready for implementation |
+| `loom:in-progress` | Worker | - | Issue currently being implemented |
+| `loom:blocked` | Worker | User/Architect | Implementation blocked, needs help |
+| `loom:review-requested` | Worker | Reviewer | PR ready for code review |
+| `loom:reviewing` | Reviewer | - | PR currently under review |
+
+For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 ---
 
 ## 🧵 Example Workflow
 
-1. **You** create a new GitHub issue:
+1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates a new issue:
+   > "Add search functionality to terminal history"
+   > Label: `loom:architect-suggestion`
 
-   > “Add dark mode toggle to the terminal panel.”
+2. **You** review the suggestion, remove the `loom:architect-suggestion` label to approve it.
 
-2. **Issue Bot** improves the description, labels it `ready`.
+3. **Curator Bot** (autonomous, runs every 5 minutes) finds the unlabeled issue, adds implementation details, test plans, and code references. Marks it `loom:ready`.
 
-3. **Worker Bot** spins up a sandbox, checks out a new worktree, writes the implementation, commits, and opens a PR.
+4. **Worker Bot** (manual or on-demand) finds `loom:ready` issues, claims it by adding `loom:in-progress`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
 
-4. **Review Bot** comments and marks it `approved`.
+5. **Reviewer Bot** (autonomous, runs every 5 minutes) finds the PR, reviews the code, runs tests, and approves or requests changes. Removes `loom:reviewing` when complete.
 
-5. **You** merge the PR. Loom marks the issue `done` and closes the worker session.
+6. **You** merge the approved PR. GitHub automatically closes the linked issue.
 
-GitHub shows the whole lifecycle — but Loom orchestrates it behind the scenes.
+GitHub shows the whole lifecycle — Loom orchestrates it through labels and autonomous terminals.
 
 ---
 
@@ -128,12 +143,21 @@ GitHub shows the whole lifecycle — but Loom orchestrates it behind the scenes.
 
 ## 🚀 Roadmap
 
+**Completed:**
 * [x] Multi-terminal GUI (Tauri + xterm.js)
+* [x] Terminal configuration with role-based system
+* [x] File-based role definitions (`.loom/roles/*.md`)
+* [x] Autonomous mode with configurable intervals
+* [x] Label-based workflow coordination
 * [x] Persistent daemon with tmux
 * [x] Linting, formatting, and CI setup
+
+**In Progress:**
 * [ ] GitHub issue polling + label state machine
 * [ ] Worker spawn automation
-* [ ] PR review loop
+
+**Planned:**
+* [ ] PR review loop integration
 * [ ] Remote sandbox execution
 * [ ] Cost tracking and dashboard
 * [ ] Self-improving loop: Loom workers improving Loom
@@ -161,6 +185,19 @@ cargo run
 # Start GUI (Terminal 2)
 pnpm tauri dev
 ```
+
+### Configuring Terminal Roles
+
+After launching Loom, you can configure each terminal with a specific role:
+
+1. Click the **settings icon** (⚙️) next to any terminal in the mini terminal row
+2. Choose a role from the dropdown (Worker, Reviewer, Architect, Curator, Issues, or Default)
+3. Configure autonomous mode:
+   - **Autonomous**: Terminal runs at intervals (e.g., every 5 minutes)
+   - **Interval Prompt**: The message sent at each interval (e.g., "Continue working on open tasks")
+4. Click **Save** to apply the configuration
+
+**Role Files**: All role definitions are stored in `.loom/roles/` as markdown files with optional JSON metadata. See [defaults/roles/README.md](defaults/roles/README.md) for details on creating custom roles.
 
 ### Running Tests
 

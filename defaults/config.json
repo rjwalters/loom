@@ -15,7 +15,7 @@
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "promptFile": "worker.md",
+        "roleFile": "worker.md",
         "targetInterval": 0,
         "intervalPrompt": "Continue working on open tasks"
       }
@@ -28,7 +28,7 @@
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "promptFile": "worker.md",
+        "roleFile": "worker.md",
         "targetInterval": 0,
         "intervalPrompt": "Continue working on open tasks"
       }

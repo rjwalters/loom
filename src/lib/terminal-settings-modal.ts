@@ -108,16 +108,16 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
 
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              System Prompt
+              Role
             </label>
             <select
-              id="prompt-file"
+              id="role-file"
               class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
             >
-              <option value="">Loading prompts...</option>
+              <option value="">Loading roles...</option>
             </select>
             <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              Prompt files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/prompts/</code>
+              Role files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/roles/</code>
             </div>
           </div>
         </div>
@@ -223,32 +223,32 @@ export async function showTerminalSettingsModal(
   // Show modal
   modal.classList.remove("hidden");
 
-  // Load available prompt files
+  // Load available role files
   const workspacePath = state.getWorkspace();
   if (workspacePath) {
     try {
       const { invoke } = await import("@tauri-apps/api/tauri");
-      const promptFiles = await invoke<string[]>("list_prompt_files", { workspacePath });
+      const roleFiles = await invoke<string[]>("list_role_files", { workspacePath });
 
-      const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
-      if (promptFileSelect && promptFiles.length > 0) {
+      const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
+      if (roleFileSelect && roleFiles.length > 0) {
         const roleConfig = terminal.roleConfig || {};
-        const currentPromptFile = (roleConfig.promptFile as string) || "worker.md";
+        const currentRoleFile = (roleConfig.roleFile as string) || "worker.md";
 
-        promptFileSelect.innerHTML = promptFiles
+        roleFileSelect.innerHTML = roleFiles
           .map((file) => {
-            const selected = file === currentPromptFile ? "selected" : "";
+            const selected = file === currentRoleFile ? "selected" : "";
             return `<option value="${escapeHtml(file)}" ${selected}>${escapeHtml(file)}</option>`;
           })
           .join("");
-      } else if (promptFileSelect) {
-        promptFileSelect.innerHTML = '<option value="">No prompt files found</option>';
+      } else if (roleFileSelect) {
+        roleFileSelect.innerHTML = '<option value="">No role files found</option>';
       }
     } catch (error) {
-      console.error("Failed to load prompt files:", error);
-      const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
-      if (promptFileSelect) {
-        promptFileSelect.innerHTML = '<option value="">Error loading prompts</option>';
+      console.error("Failed to load role files:", error);
+      const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
+      if (roleFileSelect) {
+        roleFileSelect.innerHTML = '<option value="">Error loading roles</option>';
       }
     }
   }
@@ -283,20 +283,20 @@ export async function showTerminalSettingsModal(
     });
   });
 
-  // Wire up prompt file dropdown to load metadata
-  const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
+  // Wire up role file dropdown to load metadata
+  const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
   const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
   const intervalPromptTextarea = modal.querySelector("#interval-prompt") as HTMLTextAreaElement;
   const autonomousCheckbox = modal.querySelector("#autonomous-enabled") as HTMLInputElement;
   const autonomousConfig = modal.querySelector("#autonomous-config") as HTMLElement;
 
-  promptFileSelect?.addEventListener("change", async () => {
-    const selectedFile = promptFileSelect.value;
+  roleFileSelect?.addEventListener("change", async () => {
+    const selectedFile = roleFileSelect.value;
     if (!selectedFile || !workspacePath) return;
 
     try {
       const { invoke } = await import("@tauri-apps/api/tauri");
-      const metadataJson = await invoke<string | null>("read_prompt_metadata", {
+      const metadataJson = await invoke<string | null>("read_role_metadata", {
         workspacePath,
         filename: selectedFile,
       });
@@ -322,7 +322,7 @@ export async function showTerminalSettingsModal(
         }
       }
     } catch (error) {
-      console.error("Failed to load prompt metadata:", error);
+      console.error("Failed to load role metadata:", error);
     }
   });
 
@@ -399,7 +399,7 @@ async function applySettings(
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
     const roleSelect = modal.querySelector("#terminal-role") as HTMLSelectElement;
     const workerTypeRadios = modal.querySelectorAll('input[name="worker-type"]');
-    const promptFileSelect = modal.querySelector("#prompt-file") as HTMLSelectElement;
+    const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
     const autonomousCheckbox = modal.querySelector("#autonomous-enabled") as HTMLInputElement;
     const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
     const intervalPromptTextarea = modal.querySelector("#interval-prompt") as HTMLTextAreaElement;
@@ -424,7 +424,7 @@ async function applySettings(
     const roleConfig = role
       ? {
           workerType,
-          promptFile: promptFileSelect.value,
+          roleFile: roleFileSelect.value,
           targetInterval: autonomousCheckbox.checked
             ? Number.parseInt(targetIntervalInput.value, 10)
             : 0,

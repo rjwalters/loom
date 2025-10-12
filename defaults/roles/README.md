@@ -1,11 +1,11 @@
-# Loom System Prompts
+# Loom Role Definitions
 
-This directory contains system prompt templates for different terminal roles in Loom.
+This directory contains role definition templates for different terminal roles in Loom.
 
 ## Available Prompts
 
 Each prompt consists of two files:
-- **`.md`** - The system prompt text (markdown format)
+- **`.md`** - The role definition text (markdown format)
 - **`.json`** - Metadata with default settings (optional)
 
 ### Prompt Roles
@@ -23,13 +23,13 @@ When configuring a terminal role in the Terminal Settings modal, select a prompt
 
 ## Creating Custom Prompts
 
-You can add your own prompt files to `.loom/prompts/` in any workspace. All `.md` files will automatically appear in the prompt selection dropdown.
+You can add your own prompt files to `.loom/roles/` in any workspace. All `.md` files will automatically appear in the prompt selection dropdown.
 
 ### Prompt File Structure
 
 Each prompt can have two files:
 
-**`my-prompt.md`** (required) - The system prompt text
+**`my-prompt.md`** (required) - The role definition text
 ```markdown
 # My Custom Role
 
@@ -77,7 +77,7 @@ A good prompt should include:
 
 ## Default vs Workspace Prompts
 
-- **`defaults/prompts/`** (this directory): Committed to git, serves as examples and fallbacks
-- **`.loom/prompts/`** (in each workspace): Gitignored, workspace-specific customizations
+- **`defaults/roles/`** (this directory): Committed to git, serves as examples and fallbacks
+- **`.loom/roles/`** (in each workspace): Gitignored, workspace-specific customizations
 
 When a prompt file exists in both locations, the workspace version takes precedence.

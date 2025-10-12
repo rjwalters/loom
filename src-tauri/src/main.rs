@@ -287,17 +287,17 @@ fn write_config(workspace_path: &str, config_json: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn list_prompt_files(workspace_path: &str) -> Result<Vec<String>, String> {
-    let prompts_dir = Path::new(workspace_path).join(".loom").join("prompts");
+fn list_role_files(workspace_path: &str) -> Result<Vec<String>, String> {
+    let roles_dir = Path::new(workspace_path).join(".loom").join("roles");
 
-    if !prompts_dir.exists() {
+    if !roles_dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut prompt_files = Vec::new();
+    let mut role_files = Vec::new();
 
     let entries =
-        fs::read_dir(&prompts_dir).map_err(|e| format!("Failed to read prompts directory: {e}"))?;
+        fs::read_dir(&roles_dir).map_err(|e| format!("Failed to read roles directory: {e}"))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
@@ -308,7 +308,7 @@ fn list_prompt_files(workspace_path: &str) -> Result<Vec<String>, String> {
                 if extension == "md" {
                     if let Some(filename) = path.file_name() {
                         if let Some(name) = filename.to_str() {
-                            prompt_files.push(name.to_string());
+                            role_files.push(name.to_string());
                         }
                     }
                 }
@@ -316,26 +316,26 @@ fn list_prompt_files(workspace_path: &str) -> Result<Vec<String>, String> {
         }
     }
 
-    prompt_files.sort();
-    Ok(prompt_files)
+    role_files.sort();
+    Ok(role_files)
 }
 
 #[tauri::command]
-fn read_prompt_file(workspace_path: &str, filename: &str) -> Result<String, String> {
-    let prompt_path = Path::new(workspace_path)
+fn read_role_file(workspace_path: &str, filename: &str) -> Result<String, String> {
+    let role_path = Path::new(workspace_path)
         .join(".loom")
-        .join("prompts")
+        .join("roles")
         .join(filename);
 
-    if !prompt_path.exists() {
-        return Err("Prompt file does not exist".to_string());
+    if !role_path.exists() {
+        return Err("Role file does not exist".to_string());
     }
 
-    fs::read_to_string(&prompt_path).map_err(|e| format!("Failed to read prompt file: {e}"))
+    fs::read_to_string(&role_path).map_err(|e| format!("Failed to read role file: {e}"))
 }
 
 #[tauri::command]
-fn read_prompt_metadata(workspace_path: &str, filename: &str) -> Result<Option<String>, String> {
+fn read_role_metadata(workspace_path: &str, filename: &str) -> Result<Option<String>, String> {
     // Convert .md filename to .json filename
     let json_filename = if let Some(stem) = filename.strip_suffix(".md") {
         format!("{stem}.json")
@@ -345,7 +345,7 @@ fn read_prompt_metadata(workspace_path: &str, filename: &str) -> Result<Option<S
 
     let metadata_path = Path::new(workspace_path)
         .join(".loom")
-        .join("prompts")
+        .join("roles")
         .join(&json_filename);
 
     if !metadata_path.exists() {
@@ -507,9 +507,9 @@ fn main() {
             initialize_loom_workspace,
             read_config,
             write_config,
-            list_prompt_files,
-            read_prompt_file,
-            read_prompt_metadata,
+            list_role_files,
+            read_role_file,
+            read_role_metadata,
             create_terminal,
             list_terminals,
             destroy_terminal,
