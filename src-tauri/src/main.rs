@@ -482,8 +482,8 @@ fn build_menu() -> Menu {
     // Build View menu
     let toggle_theme =
         CustomMenuItem::new("toggle_theme", "Toggle Theme").accelerator("CmdOrCtrl+Shift+T");
-    let zoom_in = CustomMenuItem::new("zoom_in", "Zoom In").accelerator("CmdOrCtrl+Plus");
-    let zoom_out = CustomMenuItem::new("zoom_out", "Zoom Out").accelerator("CmdOrCtrl+Minus");
+    let zoom_in = CustomMenuItem::new("zoom_in", "Zoom In").accelerator("CmdOrCtrl+=");
+    let zoom_out = CustomMenuItem::new("zoom_out", "Zoom Out").accelerator("CmdOrCtrl+-");
     let reset_zoom = CustomMenuItem::new("reset_zoom", "Reset Zoom").accelerator("CmdOrCtrl+0");
 
     let view_menu = Submenu::new(
