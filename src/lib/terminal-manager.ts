@@ -82,6 +82,20 @@ export class TerminalManager {
     // Open terminal in container
     terminal.open(container);
 
+    // Hook up input handler - send user input to daemon
+    terminal.onData((data) => {
+      // Send input to daemon via Tauri command
+      import("@tauri-apps/api/tauri")
+        .then(({ invoke }) => {
+          invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {
+            console.error(`[terminal-input] Failed to send input for ${terminalId}:`, e);
+          });
+        })
+        .catch((e) => {
+          console.error(`[terminal-input] Failed to import tauri API:`, e);
+        });
+    });
+
     // Store managed terminal
     const managedTerminal: ManagedTerminal = {
       terminal,
