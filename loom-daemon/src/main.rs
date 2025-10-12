@@ -16,11 +16,17 @@ async fn main() -> Result<()> {
     // Check tmux
     check_tmux_installed()?;
 
-    // Setup loom directory
-    let loom_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow!("No home directory"))?
-        .join(".loom");
-    fs::create_dir_all(&loom_dir)?;
+    // Setup loom directory and socket path
+    // For testing, allow override via LOOM_SOCKET_PATH env var
+    let socket_path = if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        std::path::PathBuf::from(path)
+    } else {
+        let loom_dir = dirs::home_dir()
+            .ok_or_else(|| anyhow!("No home directory"))?
+            .join(".loom");
+        fs::create_dir_all(&loom_dir)?;
+        loom_dir.join("daemon.sock")
+    };
 
     // Initialize terminal manager
     let mut tm = TerminalManager::new();
@@ -30,7 +36,6 @@ async fn main() -> Result<()> {
     let tm = Arc::new(Mutex::new(tm));
 
     // Start IPC server
-    let socket_path = loom_dir.join("daemon.sock");
     let server = IpcServer::new(socket_path, tm);
 
     log::info!("Loom daemon starting...");
