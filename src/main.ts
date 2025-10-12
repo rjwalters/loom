@@ -591,12 +591,7 @@ function setupEventListeners() {
         const id = target.getAttribute("data-terminal-id");
 
         if (id) {
-          if (state.getTerminals().length <= 1) {
-            alert("Cannot close the last agent");
-            return;
-          }
-
-          if (confirm("Close this agent?")) {
+          if (confirm("Close this terminal?")) {
             // Stop polling and clean up xterm.js instance
             outputPoller.stopPolling(id);
             terminalManager.destroyTerminal(id);

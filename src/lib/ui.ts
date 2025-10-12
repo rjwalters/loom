@@ -31,10 +31,10 @@ export function renderPrimaryTerminal(
 
   if (!terminal) {
     if (hasWorkspace) {
-      // Workspace set but no agents
+      // Workspace set but no terminals
       container.innerHTML = `
         <div class="h-full flex items-center justify-center text-gray-400">
-          <p class="text-lg">No agents. Click + to add an agent.</p>
+          <p class="text-lg">No terminals. Click + to add a terminal.</p>
         </div>
       `;
     } else {
@@ -105,7 +105,7 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
     : "bg-gray-50 dark:bg-gray-800 cursor-not-allowed opacity-50";
 
   const addButtonDisabled = hasWorkspace ? "" : "disabled";
-  const addButtonTitle = hasWorkspace ? "Add agent" : "Select a workspace first";
+  const addButtonTitle = hasWorkspace ? "Add terminal" : "Select a workspace first";
 
   container.innerHTML = `
     <div class="h-full flex items-center gap-2 px-4 py-2 overflow-x-auto overflow-y-visible">
@@ -142,7 +142,7 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
         <button
           class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
           data-terminal-id="${terminal.id}"
-          title="Close agent"
+          title="Close terminal"
         >
           ×
         </button>

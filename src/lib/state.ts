@@ -34,19 +34,17 @@ export class AppState {
   }
 
   removeTerminal(id: string): void {
-    // Don't allow removing the last terminal
-    if (this.terminals.size <= 1) {
-      return;
-    }
-
     this.terminals.delete(id);
     this.order = this.order.filter((tid) => tid !== id); // Remove from order
 
-    // If we removed the primary, make the first remaining terminal primary
+    // If we removed the primary, make the first remaining terminal primary (if any)
     if (this.primaryId === id) {
       const firstId = this.order[0];
       if (firstId) {
         this.setPrimary(firstId);
+      } else {
+        // No terminals left - clear primary
+        this.primaryId = null;
       }
     }
 
