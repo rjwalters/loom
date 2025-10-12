@@ -45,15 +45,15 @@ impl TerminalManager {
         let output_file = format!("/tmp/loom-{}.out", &id[..8]);
         let pipe_cmd = format!("cat >> {output_file}");
 
-        log::info!("Setting up pipe-pane for session {} to {}", tmux_session, output_file);
+        log::info!("Setting up pipe-pane for session {tmux_session} to {output_file}");
         let result = Command::new("tmux")
             .args(["pipe-pane", "-t", &tmux_session, "-o", &pipe_cmd])
             .output()?;
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            log::error!("pipe-pane failed: {}", stderr);
-            return Err(anyhow!("Failed to set up pipe-pane: {}", stderr));
+            log::error!("pipe-pane failed: {stderr}");
+            return Err(anyhow!("Failed to set up pipe-pane: {stderr}"));
         }
         log::info!("pipe-pane setup successful");
 
@@ -135,13 +135,13 @@ impl TerminalManager {
         use std::io::{Read, Seek};
 
         let output_file = format!("/tmp/loom-{}.out", &id[..8]);
-        log::debug!("Reading terminal output from: {}", output_file);
+        log::debug!("Reading terminal output from: {output_file}");
 
         let mut file = match fs::File::open(&output_file) {
             Ok(f) => f,
             Err(e) => {
                 // File doesn't exist yet, return empty
-                log::debug!("Output file doesn't exist yet: {}", e);
+                log::debug!("Output file doesn't exist yet: {e}");
                 return Ok((Vec::new(), 0));
             }
         };
@@ -149,21 +149,22 @@ impl TerminalManager {
         // Get file size
         let metadata = file.metadata()?;
         let file_size = metadata.len() as usize;
-        log::debug!("Output file size: {} bytes", file_size);
+        log::debug!("Output file size: {file_size} bytes");
 
         // If start_byte is specified, seek to that position and read from there
         let bytes_to_read = if let Some(start) = start_byte {
             if start >= file_size {
                 // No new data
-                log::debug!("No new data (start_byte={} >= file_size={})", start, file_size);
+                log::debug!("No new data (start_byte={start} >= file_size={file_size})");
                 return Ok((Vec::new(), file_size));
             }
             file.seek(std::io::SeekFrom::Start(start as u64))?;
-            log::debug!("Seeking to byte {} and reading {} bytes", start, file_size - start);
+            let bytes = file_size - start;
+            log::debug!("Seeking to byte {start} and reading {bytes} bytes");
             file_size - start
         } else {
             // Read entire file
-            log::debug!("Reading entire file ({} bytes)", file_size);
+            log::debug!("Reading entire file ({file_size} bytes)");
             file_size
         };
 
@@ -270,7 +271,7 @@ impl TerminalManager {
             .output()?;
 
         if !output.status.success() {
-            return Err(anyhow!("Tmux session '{}' does not exist", session_name));
+            return Err(anyhow!("Tmux session '{session_name}' does not exist"));
         }
 
         // Update the terminal info to point to the new session
