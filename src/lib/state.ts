@@ -77,6 +77,14 @@ export class AppState {
     }
   }
 
+  updateTerminal(id: string, updates: Partial<Terminal>): void {
+    const terminal = this.terminals.get(id);
+    if (terminal) {
+      Object.assign(terminal, updates);
+      this.notify();
+    }
+  }
+
   setTerminalRole(
     id: string,
     role: string | undefined,

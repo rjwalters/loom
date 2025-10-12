@@ -49,8 +49,31 @@ function render() {
 }
 
 // Initialize xterm.js terminal display
-function initializeTerminalDisplay(terminalId: string) {
+async function initializeTerminalDisplay(terminalId: string) {
   const containerId = `terminal-content-${terminalId}`;
+
+  // Check session health before initializing
+  try {
+    const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
+
+    if (!hasSession) {
+      console.warn(`[initializeTerminalDisplay] Terminal ${terminalId} has no tmux session`);
+
+      // Mark terminal as having missing session
+      const terminal = state.getTerminals().find((t) => t.id === terminalId);
+      if (terminal) {
+        state.updateTerminal(terminalId, {
+          status: TerminalStatus.Error,
+          missingSession: true,
+        } as any);
+      }
+
+      return; // Don't create xterm instance - error UI will show instead
+    }
+  } catch (error) {
+    console.error(`[initializeTerminalDisplay] Failed to check session health:`, error);
+    // Continue anyway - better to try than not
+  }
 
   // Check if terminal already exists
   if (terminalManager.getTerminal(terminalId)) {
@@ -506,6 +529,93 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
   });
 }
 
+// Recovery handlers for terminals with missing sessions
+async function handleRecoverNewSession(terminalId: string) {
+  console.log(`[handleRecoverNewSession] Creating new session for terminal ${terminalId}`);
+
+  try {
+    const workspacePath = state.getWorkspace();
+    const terminal = state.getTerminals().find((t) => t.id === terminalId);
+
+    if (!terminal || !workspacePath) {
+      alert("Cannot recover: terminal or workspace not found");
+      return;
+    }
+
+    // Create a new terminal in the daemon
+    const newTerminalId = await invoke<string>("create_terminal", {
+      name: terminal.name,
+      workingDir: workspacePath,
+    });
+
+    console.log(`[handleRecoverNewSession] Created new terminal ${newTerminalId}`);
+
+    // Update the terminal in state with the new ID
+    state.removeTerminal(terminalId);
+    state.addTerminal({
+      ...terminal,
+      id: newTerminalId,
+      status: TerminalStatus.Idle,
+      missingSession: undefined,
+    } as any);
+
+    // Set as primary
+    state.setPrimary(newTerminalId);
+
+    // Save config
+    await saveCurrentConfig();
+
+    console.log(`[handleRecoverNewSession] Recovery complete`);
+  } catch (error) {
+    console.error(`[handleRecoverNewSession] Failed to recover:`, error);
+    alert(`Failed to create new session: ${error}`);
+  }
+}
+
+async function handleRecoverAttachSession(terminalId: string) {
+  console.log(`[handleRecoverAttachSession] Loading available sessions for terminal ${terminalId}`);
+
+  try {
+    const sessions = await invoke<string[]>("list_available_sessions");
+    console.log(`[handleRecoverAttachSession] Found ${sessions.length} sessions:`, sessions);
+
+    // Import renderAvailableSessionsList
+    const { renderAvailableSessionsList } = await import("./lib/ui");
+    renderAvailableSessionsList(terminalId, sessions);
+  } catch (error) {
+    console.error(`[handleRecoverAttachSession] Failed to list sessions:`, error);
+    alert(`Failed to list available sessions: ${error}`);
+  }
+}
+
+async function handleAttachToSession(terminalId: string, sessionName: string) {
+  console.log(`[handleAttachToSession] Attaching terminal ${terminalId} to session ${sessionName}`);
+
+  try {
+    await invoke("attach_to_session", {
+      id: terminalId,
+      sessionName,
+    });
+
+    // Update terminal status
+    const terminal = state.getTerminals().find((t) => t.id === terminalId);
+    if (terminal) {
+      state.updateTerminal(terminalId, {
+        status: TerminalStatus.Idle,
+        missingSession: undefined,
+      } as any);
+    }
+
+    // Save config
+    await saveCurrentConfig();
+
+    console.log(`[handleAttachToSession] Attached successfully`);
+  } catch (error) {
+    console.error(`[handleAttachToSession] Failed to attach:`, error);
+    alert(`Failed to attach to session: ${error}`);
+  }
+}
+
 // Attach workspace event listeners (called dynamically when workspace selector is rendered)
 function attachWorkspaceEventListeners() {
   console.log("[attachWorkspaceEventListeners] attaching listeners...");
@@ -579,6 +689,40 @@ function setupEventListeners() {
         if (id) {
           console.log(`[terminal-clear-btn] Clearing terminal ${id}`);
           terminalManager.clearTerminal(id);
+        }
+        return;
+      }
+
+      // Recovery - Create new session
+      const recoverNewBtn = target.closest("#recover-new-session-btn");
+      if (recoverNewBtn) {
+        e.stopPropagation();
+        const id = recoverNewBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRecoverNewSession(id);
+        }
+        return;
+      }
+
+      // Recovery - Attach to existing session
+      const recoverAttachBtn = target.closest("#recover-attach-session-btn");
+      if (recoverAttachBtn) {
+        e.stopPropagation();
+        const id = recoverAttachBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRecoverAttachSession(id);
+        }
+        return;
+      }
+
+      // Recovery - Attach to specific session
+      const attachSessionItem = target.closest(".attach-session-item");
+      if (attachSessionItem) {
+        e.stopPropagation();
+        const id = attachSessionItem.getAttribute("data-terminal-id");
+        const sessionName = attachSessionItem.getAttribute("data-session-name");
+        if (id && sessionName) {
+          handleAttachToSession(id, sessionName);
         }
         return;
       }

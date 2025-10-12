@@ -142,6 +142,42 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             }
         }
 
+        Request::CheckSessionHealth { id } => {
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.has_tmux_session(&id) {
+                Ok(has_session) => Response::SessionHealth { has_session },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::ListAvailableSessions => {
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.list_available_sessions() {
+                Ok(sessions) => Response::AvailableSessions { sessions },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::AttachToSession { id, session_name } => {
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.attach_to_session(&id, session_name) {
+                Ok(()) => Response::Success,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);

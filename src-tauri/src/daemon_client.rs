@@ -31,6 +31,14 @@ pub enum Request {
         cols: u16,
         rows: u16,
     },
+    CheckSessionHealth {
+        id: TerminalId,
+    },
+    ListAvailableSessions,
+    AttachToSession {
+        id: TerminalId,
+        session_name: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +48,8 @@ pub enum Response {
     TerminalCreated { id: TerminalId },
     TerminalList { terminals: Vec<TerminalInfo> },
     TerminalOutput { output: String, line_count: i32 },
+    SessionHealth { has_session: bool },
+    AvailableSessions { sessions: Vec<String> },
     Success,
     Error { message: String },
 }

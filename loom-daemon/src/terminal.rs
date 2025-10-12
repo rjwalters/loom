@@ -186,4 +186,62 @@ impl TerminalManager {
 
         Ok(())
     }
+
+    /// Check if a tmux session exists for the given terminal ID
+    pub fn has_tmux_session(&self, id: &TerminalId) -> Result<bool> {
+        let info = self
+            .terminals
+            .get(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        let output = Command::new("tmux")
+            .args(["has-session", "-t", &info.tmux_session])
+            .output()?;
+
+        Ok(output.status.success())
+    }
+
+    /// List all available loom tmux sessions
+    pub fn list_available_sessions(&self) -> Result<Vec<String>> {
+        let output = Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output();
+
+        // If tmux list-sessions fails (no server running), return empty vec
+        let output = match output {
+            Ok(o) => o,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let sessions = String::from_utf8_lossy(&output.stdout);
+        let loom_sessions: Vec<String> = sessions
+            .lines()
+            .filter(|s| s.starts_with("loom-"))
+            .map(|s| s.to_string())
+            .collect();
+
+        Ok(loom_sessions)
+    }
+
+    /// Attach an existing terminal record to a different tmux session
+    pub fn attach_to_session(&mut self, id: &TerminalId, session_name: String) -> Result<()> {
+        let info = self
+            .terminals
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        // Verify the session exists
+        let output = Command::new("tmux")
+            .args(["has-session", "-t", &session_name])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(anyhow!("Tmux session '{}' does not exist", session_name));
+        }
+
+        // Update the terminal info to point to the new session
+        info.tmux_session = session_name;
+
+        Ok(())
+    }
 }

@@ -67,7 +67,15 @@ export function renderPrimaryTerminal(
     return;
   }
 
+  // Check if this terminal has a missing session flag
+  const hasMissingSession =
+    terminal.status === TerminalStatus.Error && (terminal as any).missingSession === true;
+
   const roleLabel = terminal.role ? getRoleLabel(terminal.role) : "Shell";
+
+  const contentHTML = hasMissingSession
+    ? `<div class="flex-1 overflow-hidden" id="terminal-content-${terminal.id}"></div>`
+    : `<div class="flex-1 overflow-hidden" id="terminal-content-${terminal.id}"></div>`;
 
   container.innerHTML = `
     <div class="h-full flex flex-col bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
@@ -101,7 +109,88 @@ export function renderPrimaryTerminal(
           </button>
         </div>
       </div>
-      <div class="flex-1 overflow-hidden" id="terminal-content-${terminal.id}"></div>
+      ${contentHTML}
+    </div>
+  `;
+
+  // If missing session, render error UI inside the content container after DOM update
+  if (hasMissingSession) {
+    setTimeout(() => {
+      renderMissingSessionError(terminal.id);
+    }, 0);
+  }
+}
+
+export function renderMissingSessionError(terminalId: string): void {
+  const container = document.getElementById(`terminal-content-${terminalId}`);
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="h-full flex items-center justify-center bg-red-50 dark:bg-red-900/20">
+      <div class="max-w-2xl mx-auto p-6 text-center">
+        <div class="mb-4 flex justify-center">
+          <svg class="w-16 h-16 text-red-500 dark:text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+          </svg>
+        </div>
+        <h3 class="text-lg font-semibold text-red-700 dark:text-red-300 mb-2">Terminal Session Missing</h3>
+        <p class="text-sm text-red-600 dark:text-red-400 mb-6">
+          The tmux session for this terminal no longer exists. This can happen if the daemon was restarted or the session was killed.
+        </p>
+        <div class="flex flex-col gap-3 items-center">
+          <button
+            id="recover-new-session-btn"
+            data-terminal-id="${terminalId}"
+            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
+          >
+            Create New Session
+          </button>
+          <button
+            id="recover-attach-session-btn"
+            data-terminal-id="${terminalId}"
+            class="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg font-medium transition-colors"
+          >
+            Attach to Existing Session
+          </button>
+          <div id="available-sessions-${terminalId}" class="mt-4 w-full max-w-md"></div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+export function renderAvailableSessionsList(terminalId: string, sessions: string[]): void {
+  const container = document.getElementById(`available-sessions-${terminalId}`);
+  if (!container) return;
+
+  if (sessions.length === 0) {
+    container.innerHTML = `
+      <p class="text-sm text-gray-500 dark:text-gray-400">No available loom sessions found</p>
+    `;
+    return;
+  }
+
+  const sessionItems = sessions
+    .map(
+      (session) => `
+      <button
+        class="attach-session-item w-full px-4 py-2 text-left bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 border border-gray-300 dark:border-gray-600 rounded transition-colors"
+        data-terminal-id="${terminalId}"
+        data-session-name="${escapeHtml(session)}"
+      >
+        <div class="flex items-center justify-between">
+          <span class="text-sm font-mono">${escapeHtml(session)}</span>
+          <span class="text-xs text-gray-500 dark:text-gray-400">Attach</span>
+        </div>
+      </button>
+    `
+    )
+    .join("");
+
+  container.innerHTML = `
+    <div class="flex flex-col gap-2">
+      <p class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Available Sessions:</p>
+      ${sessionItems}
     </div>
   `;
 }
