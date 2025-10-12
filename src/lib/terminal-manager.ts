@@ -31,8 +31,10 @@ export class TerminalManager {
       return existing;
     }
 
-    // Create xterm.js Terminal instance
+    // Create xterm.js Terminal instance with fixed size matching tmux
     const terminal = new Terminal({
+      cols: 80, // Standard width to match tmux
+      rows: 24, // Standard height to match tmux
       cursorBlink: true,
       fontSize: 14,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
@@ -59,10 +61,11 @@ export class TerminalManager {
         brightWhite: "#e5e5e5",
       },
       allowProposedApi: true,
+      scrollback: 10000, // Keep plenty of scrollback
     });
 
     // Create and load addons
-    const fitAddon = new FitAddon();
+    const fitAddon = new FitAddon(); // Keep for compatibility but don't use for resizing
     const webLinksAddon = new WebLinksAddon();
 
     terminal.loadAddon(fitAddon);
@@ -79,8 +82,18 @@ export class TerminalManager {
     // Open terminal in container
     terminal.open(container);
 
-    // Fit terminal to container size
-    fitAddon.fit();
+    // Hook up input handler - send user input directly to daemon
+    terminal.onData((data) => {
+      import("@tauri-apps/api/tauri")
+        .then(({ invoke }) => {
+          invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {
+            console.error(`[terminal-input] Failed to send input for ${terminalId}:`, e);
+          });
+        })
+        .catch((e) => {
+          console.error(`[terminal-input] Failed to import tauri API:`, e);
+        });
+    });
 
     // Store managed terminal
     const managedTerminal: ManagedTerminal = {
@@ -91,24 +104,7 @@ export class TerminalManager {
     };
     this.terminals.set(terminalId, managedTerminal);
 
-    // Set up resize observer
-    this.setupResizeObserver(container, fitAddon, terminalId);
-
-    // Send initial size to daemon after a delay to let shell initialize
-    // Without this delay, resizing can clear the initial prompt
-    setTimeout(() => {
-      const cols = terminal.cols;
-      const rows = terminal.rows;
-      import("@tauri-apps/api/tauri")
-        .then(({ invoke }) => {
-          invoke("resize_terminal", { id: terminalId, cols, rows }).catch((e) => {
-            console.warn(`[createTerminal] Failed to send initial resize for ${terminalId}:`, e);
-          });
-        })
-        .catch((e) => {
-          console.warn(`[createTerminal] Failed to import tauri API:`, e);
-        });
-    }, 1000); // 1 second delay for shell initialization
+    // No resize needed - using fixed size that matches tmux session
 
     return managedTerminal;
   }
@@ -134,6 +130,26 @@ export class TerminalManager {
   }
 
   /**
+   * Clear terminal and write new content (for full-state updates)
+   */
+  clearAndWriteTerminal(terminalId: string, data: string): void {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      console.warn(`Terminal ${terminalId} not found`);
+      return;
+    }
+
+    // Clear the terminal display
+    managed.terminal.clear();
+
+    // Reset cursor to home position
+    managed.terminal.write("\x1b[H");
+
+    // Write the full terminal state
+    managed.terminal.write(data);
+  }
+
+  /**
    * Clear a terminal's output
    */
   clearTerminal(terminalId: string): void {
@@ -147,39 +163,20 @@ export class TerminalManager {
   }
 
   /**
-   * Fit terminal to its container size and notify daemon of resize
+   * Fit terminal to its container size (no-op for fixed size terminals)
+   * Kept for API compatibility
    */
   async fitTerminal(terminalId: string): Promise<void> {
-    const managed = this.terminals.get(terminalId);
-    if (!managed) {
-      console.warn(`Terminal ${terminalId} not found`);
-      return;
-    }
-
-    try {
-      managed.fitAddon.fit();
-
-      // After fitting, send new dimensions to daemon
-      const cols = managed.terminal.cols;
-      const rows = managed.terminal.rows;
-
-      // Dynamically import invoke to avoid circular dependencies
-      const { invoke } = await import("@tauri-apps/api/tauri");
-      await invoke("resize_terminal", { id: terminalId, cols, rows });
-
-      console.log(`[fitTerminal] Resized terminal ${terminalId} to ${cols}x${rows}`);
-    } catch (e) {
-      console.error(`Failed to fit terminal ${terminalId}:`, e);
-    }
+    // No-op: using fixed terminal size
+    console.log(`[fitTerminal] Skipping resize for ${terminalId} (using fixed size)`);
   }
 
   /**
-   * Fit all terminals to their container sizes
+   * Fit all terminals (no-op for fixed size terminals)
+   * Kept for API compatibility
    */
   fitAllTerminals(): void {
-    for (const [id] of this.terminals) {
-      this.fitTerminal(id);
-    }
+    // No-op: using fixed terminal size
   }
 
   /**
@@ -214,38 +211,6 @@ export class TerminalManager {
   isAttached(terminalId: string): boolean {
     const managed = this.terminals.get(terminalId);
     return managed?.attached ?? false;
-  }
-
-  /**
-   * Set up resize observer to automatically fit terminal when container resizes
-   */
-  private setupResizeObserver(
-    container: HTMLElement,
-    fitAddon: FitAddon,
-    terminalId: string
-  ): void {
-    const resizeObserver = new ResizeObserver(() => {
-      try {
-        fitAddon.fit();
-
-        // Notify daemon of resize (fire and forget - don't block UI)
-        const cols = fitAddon.proposeDimensions()?.cols || 80;
-        const rows = fitAddon.proposeDimensions()?.rows || 24;
-
-        import("@tauri-apps/api/tauri").then(({ invoke }) => {
-          invoke("resize_terminal", { id: terminalId, cols, rows }).catch((_e) => {
-            // Ignore errors during resize (daemon might not be ready)
-          });
-        });
-      } catch (_e) {
-        // Ignore errors during resize (can happen during rapid resizing)
-      }
-    });
-
-    resizeObserver.observe(container);
-
-    // Store observer to clean up later if needed
-    // (In practice, the observer will be garbage collected when terminal is destroyed)
   }
 
   /**

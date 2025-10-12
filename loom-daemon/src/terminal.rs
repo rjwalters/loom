@@ -24,13 +24,38 @@ impl TerminalManager {
         let tmux_session = format!("loom-{}", &id[..8]);
 
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-session", "-d", "-s", &tmux_session]);
+        cmd.args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_session,
+            "-x",
+            "80", // Standard width: 80 columns
+            "-y",
+            "24", // Standard height: 24 rows
+        ]);
 
         if let Some(dir) = &working_dir {
             cmd.args(["-c", dir]);
         }
 
         cmd.spawn()?.wait()?;
+
+        // Set up pipe-pane to capture all output to a file
+        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        let pipe_cmd = format!("cat >> {output_file}");
+
+        log::info!("Setting up pipe-pane for session {tmux_session} to {output_file}");
+        let result = Command::new("tmux")
+            .args(["pipe-pane", "-t", &tmux_session, "-o", &pipe_cmd])
+            .output()?;
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            log::error!("pipe-pane failed: {stderr}");
+            return Err(anyhow!("Failed to set up pipe-pane: {stderr}"));
+        }
+        log::info!("pipe-pane setup successful");
 
         let info = TerminalInfo {
             id: id.clone(),
@@ -54,10 +79,20 @@ impl TerminalManager {
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
+        // Stop pipe-pane (passing no command closes the pipe)
+        let _ = Command::new("tmux")
+            .args(["pipe-pane", "-t", &info.tmux_session])
+            .spawn();
+
+        // Kill the tmux session
         Command::new("tmux")
             .args(["kill-session", "-t", &info.tmux_session])
             .spawn()?
             .wait()?;
+
+        // Clean up the output file
+        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        let _ = std::fs::remove_file(output_file);
 
         self.terminals.remove(id);
         Ok(())
@@ -90,52 +125,54 @@ impl TerminalManager {
         Ok(())
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::unused_self)]
     pub fn get_terminal_output(
         &self,
         id: &TerminalId,
-        start_line: Option<i32>,
-    ) -> Result<(String, i32)> {
-        let info = self
-            .terminals
-            .get(id)
-            .ok_or_else(|| anyhow!("Terminal not found"))?;
+        start_byte: Option<usize>,
+    ) -> Result<(Vec<u8>, usize)> {
+        use std::fs;
+        use std::io::{Read, Seek};
 
-        // First, get the total number of lines in the history
-        let history_output = Command::new("tmux")
-            .args([
-                "display-message",
-                "-t",
-                &info.tmux_session,
-                "-p",
-                "#{history_size}",
-            ])
-            .output()?;
+        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        log::debug!("Reading terminal output from: {output_file}");
 
-        let total_lines: i32 = String::from_utf8_lossy(&history_output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-
-        // Capture pane content from start_line to end
-        let mut cmd = Command::new("tmux");
-        cmd.args(["capture-pane", "-t", &info.tmux_session, "-p", "-e", "-J"]);
-
-        // If start_line is specified, only capture from that line onwards
-        if let Some(start) = start_line {
-            if start >= 0 && start < total_lines {
-                let lines_to_capture = total_lines - start;
-                cmd.args(["-S", &format!("-{lines_to_capture}")]);
+        let mut file = match fs::File::open(&output_file) {
+            Ok(f) => f,
+            Err(e) => {
+                // File doesn't exist yet, return empty
+                log::debug!("Output file doesn't exist yet: {e}");
+                return Ok((Vec::new(), 0));
             }
+        };
+
+        // Get file size
+        let metadata = file.metadata()?;
+        let file_size = metadata.len() as usize;
+        log::debug!("Output file size: {file_size} bytes");
+
+        // If start_byte is specified, seek to that position and read from there
+        let bytes_to_read = if let Some(start) = start_byte {
+            if start >= file_size {
+                // No new data
+                log::debug!("No new data (start_byte={start} >= file_size={file_size})");
+                return Ok((Vec::new(), file_size));
+            }
+            file.seek(std::io::SeekFrom::Start(start as u64))?;
+            let bytes = file_size - start;
+            log::debug!("Seeking to byte {start} and reading {bytes} bytes");
+            file_size - start
         } else {
-            // Capture entire scrollback history
-            cmd.arg("-S").arg("-");
-        }
+            // Read entire file
+            log::debug!("Reading entire file ({file_size} bytes)");
+            file_size
+        };
 
-        let output = cmd.output()?;
+        let mut buffer = vec![0u8; bytes_to_read];
+        file.read_exact(&mut buffer)?;
+        log::debug!("Read {} bytes successfully", buffer.len());
 
-        let content = String::from_utf8_lossy(&output.stdout).to_string();
-
-        Ok((content, total_lines))
+        Ok((buffer, file_size))
     }
 
     pub fn resize_terminal(&self, id: &TerminalId, cols: u16, rows: u16) -> Result<()> {
@@ -183,6 +220,62 @@ impl TerminalManager {
                     });
             }
         }
+
+        Ok(())
+    }
+
+    /// Check if a tmux session exists for the given terminal ID
+    pub fn has_tmux_session(&self, id: &TerminalId) -> Result<bool> {
+        let info = self
+            .terminals
+            .get(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        let output = Command::new("tmux")
+            .args(["has-session", "-t", &info.tmux_session])
+            .output()?;
+
+        Ok(output.status.success())
+    }
+
+    /// List all available loom tmux sessions
+    #[allow(clippy::unused_self)]
+    pub fn list_available_sessions(&self) -> Vec<String> {
+        let output = Command::new("tmux")
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output();
+
+        // If tmux list-sessions fails (no server running), return empty vec
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+
+        let sessions = String::from_utf8_lossy(&output.stdout);
+        sessions
+            .lines()
+            .filter(|s| s.starts_with("loom-"))
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+
+    /// Attach an existing terminal record to a different tmux session
+    pub fn attach_to_session(&mut self, id: &TerminalId, session_name: String) -> Result<()> {
+        let info = self
+            .terminals
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        // Verify the session exists
+        let output = Command::new("tmux")
+            .args(["has-session", "-t", &session_name])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(anyhow!("Tmux session '{session_name}' does not exist"));
+        }
+
+        // Update the terminal info to point to the new session
+        info.tmux_session = session_name;
 
         Ok(())
     }

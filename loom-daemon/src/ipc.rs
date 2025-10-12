@@ -68,7 +68,8 @@ async fn handle_client(
 
 // Allow expect_used because mutex poisoning is a panic-level error that indicates
 // a thread panicked while holding the lock. This is not recoverable and should crash.
-#[allow(clippy::expect_used)]
+// Allow too_many_lines because this is a central request dispatcher that handles all IPC commands.
+#[allow(clippy::expect_used, clippy::too_many_lines)]
 fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager>>) -> Response {
     match request {
         Request::Ping => Response::Pong,
@@ -118,12 +119,23 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             }
         }
 
-        Request::GetTerminalOutput { id, start_line } => {
+        Request::GetTerminalOutput { id, start_byte } => {
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
-            match tm.get_terminal_output(&id, start_line) {
-                Ok((output, line_count)) => Response::TerminalOutput { output, line_count },
+            match tm.get_terminal_output(&id, start_byte) {
+                Ok((output_bytes, byte_count)) => {
+                    // Encode bytes as base64 for JSON transmission
+                    use base64::{engine::general_purpose, Engine as _};
+                    let output = general_purpose::STANDARD.encode(&output_bytes);
+                    log::debug!(
+                        "GetTerminalOutput: {} raw bytes -> {} base64 chars, total byte_count={}",
+                        output_bytes.len(),
+                        output.len(),
+                        byte_count
+                    );
+                    Response::TerminalOutput { output, byte_count }
+                }
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },
@@ -135,6 +147,38 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.resize_terminal(&id, cols, rows) {
+                Ok(()) => Response::Success,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::CheckSessionHealth { id } => {
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.has_tmux_session(&id) {
+                Ok(has_session) => Response::SessionHealth { has_session },
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::ListAvailableSessions => {
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            let sessions = tm.list_available_sessions();
+            Response::AvailableSessions { sessions }
+        }
+
+        Request::AttachToSession { id, session_name } => {
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.attach_to_session(&id, session_name) {
                 Ok(()) => Response::Success,
                 Err(e) => Response::Error {
                     message: e.to_string(),

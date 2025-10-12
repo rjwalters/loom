@@ -23,8 +23,11 @@
     "format:rust": "cargo fmt --all -- --check",
     "format:rust:write": "cargo fmt --all",
     "clippy": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+    "clippy:locked": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
     "clippy:fix": "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged",
+    "test": "cargo test --workspace --locked --all-features --no-fail-fast -- --nocapture",
     "check:all": "npm run lint && npm run format:rust && npm run clippy && npm run check && npm run build",
+    "check:ci": "npm run lint && npm run format:rust && npm run clippy:locked && npm run check && npm run build && npm run test",
     "prepare": "husky"
   },
   "repository": {
