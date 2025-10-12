@@ -77,7 +77,7 @@ async function initializeTerminalDisplay(terminalId: string) {
 
   // Check if terminal already exists
   if (terminalManager.getTerminal(terminalId)) {
-    // Terminal already exists, just ensure polling is active and resize to fit
+    // Terminal already exists, just ensure polling is active
     if (currentAttachedTerminalId !== terminalId) {
       // Stop polling previous terminal
       if (currentAttachedTerminalId) {
@@ -87,11 +87,6 @@ async function initializeTerminalDisplay(terminalId: string) {
       outputPoller.startPolling(terminalId);
       currentAttachedTerminalId = terminalId;
     }
-
-    // Resize terminal to fit container after DOM updates
-    setTimeout(() => {
-      terminalManager.fitTerminal(terminalId);
-    }, 0);
     return;
   }
 

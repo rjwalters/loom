@@ -24,7 +24,16 @@ impl TerminalManager {
         let tmux_session = format!("loom-{}", &id[..8]);
 
         let mut cmd = Command::new("tmux");
-        cmd.args(["new-session", "-d", "-s", &tmux_session]);
+        cmd.args([
+            "new-session",
+            "-d",
+            "-s",
+            &tmux_session,
+            "-x",
+            "120", // Fixed width: 120 columns
+            "-y",
+            "30", // Fixed height: 30 rows
+        ]);
 
         if let Some(dir) = &working_dir {
             cmd.args(["-c", dir]);

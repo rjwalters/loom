@@ -73,9 +73,7 @@ export function renderPrimaryTerminal(
 
   const roleLabel = terminal.role ? getRoleLabel(terminal.role) : "Shell";
 
-  const contentHTML = hasMissingSession
-    ? `<div class="flex-1 overflow-hidden" id="terminal-content-${terminal.id}"></div>`
-    : `<div class="flex-1 overflow-hidden" id="terminal-content-${terminal.id}"></div>`;
+  const contentHTML = `<div class="flex-1 overflow-auto" id="terminal-content-${terminal.id}"></div>`;
 
   container.innerHTML = `
     <div class="h-full flex flex-col bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
