@@ -546,9 +546,26 @@ function setupEventListeners() {
     toggleTheme();
   });
 
-  // Primary terminal - double-click to rename
+  // Primary terminal - double-click to rename, click for settings
   const primaryTerminal = document.getElementById("primary-terminal");
   if (primaryTerminal) {
+    // Settings button click
+    primaryTerminal.addEventListener("click", (e) => {
+      const target = e.target as HTMLElement;
+      const settingsBtn = target.closest("#terminal-settings-btn");
+
+      if (settingsBtn) {
+        e.stopPropagation();
+        const id = settingsBtn.getAttribute("data-terminal-id");
+        if (id) {
+          console.log(`[terminal-settings-btn] Opening settings for terminal ${id}`);
+          // TODO: Show terminal settings modal
+          alert("Terminal settings modal coming soon!");
+        }
+      }
+    });
+
+    // Double-click to rename
     primaryTerminal.addEventListener("dblclick", (e) => {
       const target = e.target as HTMLElement;
 
