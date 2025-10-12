@@ -3,21 +3,35 @@
   "agents": [
     {
       "id": "1",
-      "name": "Agent 1",
+      "name": "Shell",
       "status": "idle",
       "isPrimary": true
     },
     {
       "id": "2",
-      "name": "Agent 2",
+      "name": "Worker 1",
       "status": "idle",
-      "isPrimary": false
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "systemPrompt": "You are a helpful coding assistant working in the {{workspace}} repository. Help the user with their development tasks.",
+        "targetInterval": 0,
+        "intervalPrompt": "Continue working on open tasks"
+      }
     },
     {
       "id": "3",
-      "name": "Agent 3",
+      "name": "Worker 2",
       "status": "idle",
-      "isPrimary": false
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "systemPrompt": "You are a helpful coding assistant working in the {{workspace}} repository. Help the user with their development tasks.",
+        "targetInterval": 0,
+        "intervalPrompt": "Continue working on open tasks"
+      }
     }
   ]
 }

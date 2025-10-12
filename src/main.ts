@@ -7,6 +7,7 @@ import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
+import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
 
@@ -65,7 +66,7 @@ async function initializeTerminalDisplay(terminalId: string) {
         state.updateTerminal(terminalId, {
           status: TerminalStatus.Error,
           missingSession: true,
-        } as any);
+        });
       }
 
       return; // Don't create xterm instance - error UI will show instead
@@ -552,7 +553,7 @@ async function handleRecoverNewSession(terminalId: string) {
       id: newTerminalId,
       status: TerminalStatus.Idle,
       missingSession: undefined,
-    } as any);
+    });
 
     // Set as primary
     state.setPrimary(newTerminalId);
@@ -598,7 +599,7 @@ async function handleAttachToSession(terminalId: string, sessionName: string) {
       state.updateTerminal(terminalId, {
         status: TerminalStatus.Idle,
         missingSession: undefined,
-      } as any);
+      });
     }
 
     // Save config
@@ -670,8 +671,10 @@ function setupEventListeners() {
         const id = settingsBtn.getAttribute("data-terminal-id");
         if (id) {
           console.log(`[terminal-settings-btn] Opening settings for terminal ${id}`);
-          // TODO: Show terminal settings modal
-          alert("Terminal settings modal coming soon!");
+          const terminal = state.getTerminals().find((t) => t.id === id);
+          if (terminal) {
+            showTerminalSettingsModal(terminal, state, render);
+          }
         }
         return;
       }
