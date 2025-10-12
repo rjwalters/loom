@@ -30,9 +30,9 @@ impl TerminalManager {
             "-s",
             &tmux_session,
             "-x",
-            "120", // Fixed width: 120 columns
+            "80", // Standard width: 80 columns
             "-y",
-            "30", // Fixed height: 30 rows
+            "24", // Standard height: 24 rows
         ]);
 
         if let Some(dir) = &working_dir {

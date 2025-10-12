@@ -33,8 +33,8 @@ export class TerminalManager {
 
     // Create xterm.js Terminal instance with fixed size matching tmux
     const terminal = new Terminal({
-      cols: 120, // Fixed width to match tmux
-      rows: 30, // Fixed height to match tmux
+      cols: 80, // Standard width to match tmux
+      rows: 24, // Standard height to match tmux
       cursorBlink: true,
       fontSize: 14,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
