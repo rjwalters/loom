@@ -82,9 +82,8 @@ export class TerminalManager {
     // Open terminal in container
     terminal.open(container);
 
-    // Hook up input handler - send user input to daemon
+    // Hook up input handler - send user input directly to daemon
     terminal.onData((data) => {
-      // Send input to daemon via Tauri command
       import("@tauri-apps/api/tauri")
         .then(({ invoke }) => {
           invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {

@@ -24,7 +24,7 @@ pub enum Request {
     },
     GetTerminalOutput {
         id: TerminalId,
-        start_line: Option<i32>,
+        start_byte: Option<usize>,
     },
     ResizeTerminal {
         id: TerminalId,
@@ -47,7 +47,7 @@ pub enum Response {
     Pong,
     TerminalCreated { id: TerminalId },
     TerminalList { terminals: Vec<TerminalInfo> },
-    TerminalOutput { output: String, line_count: i32 },
+    TerminalOutput { output: String, byte_count: usize },
     SessionHealth { has_session: bool },
     AvailableSessions { sessions: Vec<String> },
     Success,

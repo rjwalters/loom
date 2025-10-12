@@ -41,6 +41,22 @@ impl TerminalManager {
 
         cmd.spawn()?.wait()?;
 
+        // Set up pipe-pane to capture all output to a file
+        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        let pipe_cmd = format!("cat >> {}", output_file);
+
+        log::info!("Setting up pipe-pane for session {} to {}", tmux_session, output_file);
+        let result = Command::new("tmux")
+            .args(["pipe-pane", "-t", &tmux_session, "-o", &pipe_cmd])
+            .output()?;
+
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            log::error!("pipe-pane failed: {}", stderr);
+            return Err(anyhow!("Failed to set up pipe-pane: {}", stderr));
+        }
+        log::info!("pipe-pane setup successful");
+
         let info = TerminalInfo {
             id: id.clone(),
             name,
@@ -63,10 +79,20 @@ impl TerminalManager {
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
+        // Stop pipe-pane (passing no command closes the pipe)
+        let _ = Command::new("tmux")
+            .args(["pipe-pane", "-t", &info.tmux_session])
+            .spawn();
+
+        // Kill the tmux session
         Command::new("tmux")
             .args(["kill-session", "-t", &info.tmux_session])
             .spawn()?
             .wait()?;
+
+        // Clean up the output file
+        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        let _ = std::fs::remove_file(output_file);
 
         self.terminals.remove(id);
         Ok(())
@@ -102,53 +128,51 @@ impl TerminalManager {
     pub fn get_terminal_output(
         &self,
         id: &TerminalId,
-        start_line: Option<i32>,
-    ) -> Result<(String, i32)> {
-        let info = self
-            .terminals
-            .get(id)
-            .ok_or_else(|| anyhow!("Terminal not found"))?;
+        start_byte: Option<usize>,
+    ) -> Result<(Vec<u8>, usize)> {
+        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        log::debug!("Reading terminal output from: {}", output_file);
 
-        // First, get the total number of lines in the history
-        let history_output = Command::new("tmux")
-            .args([
-                "display-message",
-                "-t",
-                &info.tmux_session,
-                "-p",
-                "#{history_size}",
-            ])
-            .output()?;
+        // Read the output file
+        use std::fs;
+        use std::io::Read;
 
-        let total_lines: i32 = String::from_utf8_lossy(&history_output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0);
-
-        // Capture pane content with escape sequences
-        // -p: print to stdout
-        // -e: include escape sequences
-        // -C: use control mode (preserves cursor positioning)
-        let mut cmd = Command::new("tmux");
-        cmd.args(["capture-pane", "-t", &info.tmux_session, "-p", "-e"]);
-
-        // If start_line is specified, only capture from that line onwards
-        if let Some(start) = start_line {
-            if start >= 0 && start < total_lines {
-                let lines_to_capture = total_lines - start;
-                cmd.args(["-S", &format!("-{lines_to_capture}")]);
+        let mut file = match fs::File::open(&output_file) {
+            Ok(f) => f,
+            Err(e) => {
+                // File doesn't exist yet, return empty
+                log::debug!("Output file doesn't exist yet: {}", e);
+                return Ok((Vec::new(), 0));
             }
+        };
+
+        // Get file size
+        let metadata = file.metadata()?;
+        let file_size = metadata.len() as usize;
+        log::debug!("Output file size: {} bytes", file_size);
+
+        // If start_byte is specified, seek to that position and read from there
+        let bytes_to_read = if let Some(start) = start_byte {
+            if start >= file_size {
+                // No new data
+                log::debug!("No new data (start_byte={} >= file_size={})", start, file_size);
+                return Ok((Vec::new(), file_size));
+            }
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(start as u64))?;
+            log::debug!("Seeking to byte {} and reading {} bytes", start, file_size - start);
+            file_size - start
         } else {
-            // Capture visible pane only (not all scrollback)
-            // This gives us clean current state without accumulation
-            // No -S flag means current visible pane
-        }
+            // Read entire file
+            log::debug!("Reading entire file ({} bytes)", file_size);
+            file_size
+        };
 
-        let output = cmd.output()?;
+        let mut buffer = vec![0u8; bytes_to_read];
+        file.read_exact(&mut buffer)?;
+        log::debug!("Read {} bytes successfully", buffer.len());
 
-        let content = String::from_utf8_lossy(&output.stdout).to_string();
-
-        Ok((content, total_lines))
+        Ok((buffer, file_size))
     }
 
     pub fn resize_terminal(&self, id: &TerminalId, cols: u16, rows: u16) -> Result<()> {

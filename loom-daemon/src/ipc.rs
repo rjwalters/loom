@@ -118,12 +118,23 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             }
         }
 
-        Request::GetTerminalOutput { id, start_line } => {
+        Request::GetTerminalOutput { id, start_byte } => {
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
-            match tm.get_terminal_output(&id, start_line) {
-                Ok((output, line_count)) => Response::TerminalOutput { output, line_count },
+            match tm.get_terminal_output(&id, start_byte) {
+                Ok((output_bytes, byte_count)) => {
+                    // Encode bytes as base64 for JSON transmission
+                    use base64::{engine::general_purpose, Engine as _};
+                    let output = general_purpose::STANDARD.encode(&output_bytes);
+                    log::debug!(
+                        "GetTerminalOutput: {} raw bytes -> {} base64 chars, total byte_count={}",
+                        output_bytes.len(),
+                        output.len(),
+                        byte_count
+                    );
+                    Response::TerminalOutput { output, byte_count }
+                }
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },

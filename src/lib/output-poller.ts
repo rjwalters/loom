@@ -3,19 +3,19 @@ import { getTerminalManager } from "./terminal-manager";
 
 interface TerminalOutput {
   output: string;
-  line_count: number;
+  byte_count: number;
 }
 
 interface PollerState {
   terminalId: string;
-  lastLineCount: number;
+  lastByteCount: number;
   polling: boolean;
   intervalId: number | null;
 }
 
 export class OutputPoller {
   private pollers: Map<string, PollerState> = new Map();
-  private pollInterval: number = 500; // Poll every 500ms
+  private pollInterval: number = 50; // Poll every 50ms for responsive feel
 
   /**
    * Start polling for a terminal's output
@@ -29,7 +29,7 @@ export class OutputPoller {
 
     const state: PollerState = {
       terminalId,
-      lastLineCount: -1, // -1 means first poll - get only visible pane
+      lastByteCount: 0, // Start from beginning of file
       polling: true,
       intervalId: null,
     };
@@ -89,35 +89,67 @@ export class OutputPoller {
    */
   private async pollOnce(state: PollerState): Promise<void> {
     try {
-      // First poll: get visible pane only (clean state)
-      // Subsequent polls: get only new lines (incremental)
-      const startLine =
-        state.lastLineCount === -1 ? null : state.lastLineCount > 0 ? state.lastLineCount : null;
+      // Get new bytes since last poll (or all bytes on first poll)
+      const startByte = state.lastByteCount > 0 ? state.lastByteCount : null;
+
+      console.log(
+        `[poller] Polling terminal ${state.terminalId}, startByte=${startByte}, lastByteCount=${state.lastByteCount}`
+      );
 
       const result = await invoke<TerminalOutput>("get_terminal_output", {
         id: state.terminalId,
-        startLine,
+        startByte,
       });
 
-      // Write output to xterm.js terminal
+      console.log(
+        `[poller] Received: output.length=${result.output.length}, byte_count=${result.byte_count}`
+      );
+
+      // Decode base64 output and write to xterm.js terminal
       if (result.output && result.output.length > 0) {
+        // Decode base64 to raw bytes
+        const decodedBytes = this.base64ToBytes(result.output);
+        console.log(`[poller] Decoded ${decodedBytes.length} bytes from base64`);
+
+        // Convert bytes to string (UTF-8)
+        const text = new TextDecoder("utf-8").decode(decodedBytes);
+        console.log(
+          `[poller] Decoded text length: ${text.length}, preview: ${text.substring(0, 100).replace(/\n/g, "\\n").replace(/\r/g, "\\r")}`
+        );
+
         const terminalManager = getTerminalManager();
 
-        // On first poll, clear and write to start fresh
-        if (state.lastLineCount === -1) {
-          terminalManager.clearAndWriteTerminal(state.terminalId, result.output);
+        // First poll: clear and write fresh state
+        if (state.lastByteCount === 0) {
+          console.log(`[poller] First poll - clearing and writing to terminal ${state.terminalId}`);
+          terminalManager.clearAndWriteTerminal(state.terminalId, text);
         } else {
-          // Subsequent polls: append new content
-          terminalManager.writeToTerminal(state.terminalId, result.output);
+          // Subsequent polls: append new content incrementally
+          console.log(`[poller] Incremental update - writing to terminal ${state.terminalId}`);
+          terminalManager.writeToTerminal(state.terminalId, text);
         }
+      } else {
+        console.log(`[poller] No output to write (empty or null)`);
       }
 
-      // Update last line count (after first poll, this will be > 0)
-      state.lastLineCount = result.line_count;
+      // Update byte offset for next poll
+      state.lastByteCount = result.byte_count;
     } catch (error) {
       console.error(`Error polling terminal ${state.terminalId}:`, error);
       // Don't stop polling on error - the daemon might be temporarily unavailable
     }
+  }
+
+  /**
+   * Decode base64 string to Uint8Array
+   */
+  private base64ToBytes(base64: string): Uint8Array {
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
   }
 
   /**
