@@ -94,18 +94,21 @@ export class TerminalManager {
     // Set up resize observer
     this.setupResizeObserver(container, fitAddon, terminalId);
 
-    // Send initial size to daemon (fire and forget)
-    const cols = terminal.cols;
-    const rows = terminal.rows;
-    import("@tauri-apps/api/tauri")
-      .then(({ invoke }) => {
-        invoke("resize_terminal", { id: terminalId, cols, rows }).catch((e) => {
-          console.warn(`[createTerminal] Failed to send initial resize for ${terminalId}:`, e);
+    // Send initial size to daemon after a delay to let shell initialize
+    // Without this delay, resizing can clear the initial prompt
+    setTimeout(() => {
+      const cols = terminal.cols;
+      const rows = terminal.rows;
+      import("@tauri-apps/api/tauri")
+        .then(({ invoke }) => {
+          invoke("resize_terminal", { id: terminalId, cols, rows }).catch((e) => {
+            console.warn(`[createTerminal] Failed to send initial resize for ${terminalId}:`, e);
+          });
+        })
+        .catch((e) => {
+          console.warn(`[createTerminal] Failed to import tauri API:`, e);
         });
-      })
-      .catch((e) => {
-        console.warn(`[createTerminal] Failed to import tauri API:`, e);
-      });
+    }, 1000); // 1 second delay for shell initialization
 
     return managedTerminal;
   }
