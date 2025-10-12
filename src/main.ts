@@ -5,11 +5,10 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
-import { AppState } from "./lib/state";
+import { AppState, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
-import { showWorkerModal } from "./lib/worker-modal";
 
 // Initialize theme
 initTheme();
@@ -280,6 +279,46 @@ async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> 
     console.error("Failed to initialize workspace:", error);
     alert(`Failed to initialize workspace: ${error}`);
     return false;
+  }
+}
+
+// Create a plain shell terminal
+async function createPlainTerminal() {
+  const workspacePath = state.getWorkspace();
+  if (!workspacePath) {
+    alert("No workspace selected");
+    return;
+  }
+
+  // Generate terminal name
+  const terminalCount = state.getTerminals().length + 1;
+  const name = `Terminal ${terminalCount}`;
+
+  try {
+    // Create terminal in workspace directory
+    const terminalId = await invoke<string>("create_terminal", {
+      name,
+      workingDir: workspacePath,
+    });
+
+    // Add to state (no role assigned - plain shell)
+    state.addTerminal({
+      id: terminalId,
+      name,
+      status: TerminalStatus.Idle,
+      isPrimary: false,
+    });
+
+    // Save updated state to config
+    await saveCurrentConfig();
+
+    // Switch to new terminal
+    state.setPrimary(terminalId);
+
+    console.log(`[createPlainTerminal] Created terminal ${name} (${terminalId})`);
+  } catch (error) {
+    console.error("[createPlainTerminal] Failed to create terminal:", error);
+    alert(`Failed to create terminal: ${error}`);
   }
 }
 
@@ -565,8 +604,8 @@ function setupEventListeners() {
           return;
         }
 
-        // Show worker modal
-        showWorkerModal(state, render);
+        // Create plain terminal
+        createPlainTerminal();
         return;
       }
 

@@ -11,6 +11,8 @@ export interface Terminal {
   name: string;
   status: TerminalStatus;
   isPrimary: boolean;
+  role?: string; // Optional: "claude-code-worker", "codex-worker", etc. Undefined = plain shell
+  roleConfig?: Record<string, unknown>; // Role-specific configuration (e.g., system prompt)
 }
 
 export class AppState {
@@ -73,6 +75,19 @@ export class AppState {
     const terminal = this.terminals.get(id);
     if (terminal && newName.trim()) {
       terminal.name = newName.trim();
+      this.notify();
+    }
+  }
+
+  setTerminalRole(
+    id: string,
+    role: string | undefined,
+    roleConfig?: Record<string, unknown>
+  ): void {
+    const terminal = this.terminals.get(id);
+    if (terminal) {
+      terminal.role = role;
+      terminal.roleConfig = roleConfig;
       this.notify();
     }
   }
