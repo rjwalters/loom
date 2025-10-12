@@ -287,6 +287,77 @@ fn write_config(workspace_path: &str, config_json: String) -> Result<(), String>
 }
 
 #[tauri::command]
+fn list_role_files(workspace_path: &str) -> Result<Vec<String>, String> {
+    let roles_dir = Path::new(workspace_path).join(".loom").join("roles");
+
+    if !roles_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut role_files = Vec::new();
+
+    let entries =
+        fs::read_dir(&roles_dir).map_err(|e| format!("Failed to read roles directory: {e}"))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {e}"))?;
+        let path = entry.path();
+
+        if path.is_file() {
+            if let Some(extension) = path.extension() {
+                if extension == "md" {
+                    if let Some(filename) = path.file_name() {
+                        if let Some(name) = filename.to_str() {
+                            role_files.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    role_files.sort();
+    Ok(role_files)
+}
+
+#[tauri::command]
+fn read_role_file(workspace_path: &str, filename: &str) -> Result<String, String> {
+    let role_path = Path::new(workspace_path)
+        .join(".loom")
+        .join("roles")
+        .join(filename);
+
+    if !role_path.exists() {
+        return Err("Role file does not exist".to_string());
+    }
+
+    fs::read_to_string(&role_path).map_err(|e| format!("Failed to read role file: {e}"))
+}
+
+#[tauri::command]
+fn read_role_metadata(workspace_path: &str, filename: &str) -> Result<Option<String>, String> {
+    // Convert .md filename to .json filename
+    let json_filename = if let Some(stem) = filename.strip_suffix(".md") {
+        format!("{stem}.json")
+    } else {
+        return Ok(None);
+    };
+
+    let metadata_path = Path::new(workspace_path)
+        .join(".loom")
+        .join("roles")
+        .join(&json_filename);
+
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+
+    let content =
+        fs::read_to_string(&metadata_path).map_err(|e| format!("Failed to read metadata: {e}"))?;
+    Ok(Some(content))
+}
+
+#[tauri::command]
 fn get_env_var(key: &str) -> Result<String, String> {
     std::env::var(key).map_err(|_| format!("{key} not set in .env"))
 }
@@ -436,6 +507,9 @@ fn main() {
             initialize_loom_workspace,
             read_config,
             write_config,
+            list_role_files,
+            read_role_file,
+            read_role_metadata,
             create_terminal,
             list_terminals,
             destroy_terminal,

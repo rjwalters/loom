@@ -24,8 +24,16 @@
 - ⏳ Issue #6: .loom/ directory configuration (planned)
 - ⏳ Issue #7: Workspace selector improvements (planned)
 
-### Recent Features (Issue #2)
+### Recent Features
 
+**Issue #19: Terminal Configuration System**
+- **Role-based Terminals**: Each terminal can be assigned a specialized role (Worker, Reviewer, Architect, Curator, Issues, Default)
+- **File-based Configuration**: Role definitions stored as `.md` files in `.loom/roles/` with optional `.json` metadata
+- **Autonomous Mode**: Terminals can run at intervals (e.g., every 5 minutes) with configured prompts
+- **Terminal Settings Modal**: Configure role, worker type, interval, and prompts via UI
+- **Label-based Workflow**: GitHub labels coordinate work between different agent types (see [WORKFLOWS.md](WORKFLOWS.md))
+
+**Issue #2: Multi-terminal Layout**
 - **Agent Management**: Create, close, rename, and reorder agent terminals
 - **Workspace Selection**: Native folder picker with git repository validation
 - **Persistent Config**: Agent counter stored in `.loom/config.json` per workspace
@@ -47,8 +55,11 @@
 ### Backend
 - **Rust**: Tauri backend with IPC commands
   - `validate_git_repo`: Validates git repository paths
+  - `list_role_files`: Lists available role files from `.loom/roles/` and `defaults/roles/`
+  - `read_role_file`: Reads role definition markdown files
+  - `read_role_metadata`: Reads optional JSON metadata for roles
   - `greet`: Example command (will be removed)
-- **Tauri APIs**: Dialog (file picker), Path (tilde expansion)
+- **Tauri APIs**: Dialog (file picker), Path (tilde expansion), Filesystem (role files)
 - **Node.js**: For terminal process management (future)
 - **Anthropic Claude**: AI agent integration (future)
 
@@ -65,19 +76,32 @@ We deliberately chose vanilla TS over React/Vue/Svelte for:
 ```
 loom/
 ├── src/
-│   ├── main.ts              # Entry point, state init, events, workspace logic
-│   ├── style.css            # Global styles, Tailwind imports
+│   ├── main.ts                      # Entry point, state init, events, workspace logic
+│   ├── style.css                    # Global styles, Tailwind imports
 │   └── lib/
-│       ├── state.ts         # State management (agents, workspace, observer)
-│       ├── config.ts        # Config file I/O (.loom/config.json)
-│       ├── ui.ts            # UI rendering (pure functions)
-│       └── theme.ts         # Dark/light theme system
+│       ├── state.ts                 # State management (agents, workspace, observer)
+│       ├── config.ts                # Config file I/O (.loom/config.json)
+│       ├── ui.ts                    # UI rendering (pure functions)
+│       ├── theme.ts                 # Dark/light theme system
+│       └── terminal-settings-modal.ts # Terminal configuration modal
 ├── src-tauri/
 │   ├── src/main.rs          # Rust backend, Tauri IPC commands
 │   ├── tauri.conf.json      # Window config, allowlist, build settings
 │   └── Cargo.toml           # Rust dependencies (tauri features)
 ├── .loom/                   # Workspace config (gitignored, per-workspace)
-│   └── config.json          # Persistent config (agent counter, etc.)
+│   ├── config.json          # Persistent config (agent counter, roles, etc.)
+│   └── roles/               # Custom role definitions (optional)
+│       ├── my-role.md       # Role definition markdown
+│       └── my-role.json     # Role metadata (optional)
+├── defaults/                # Default configuration files (committed to git)
+│   ├── config.json          # Default configuration template
+│   └── roles/               # System role templates
+│       ├── default.md       # Plain shell environment
+│       ├── worker.md        # General development worker
+│       ├── issues.md        # GitHub issue creation specialist
+│       ├── reviewer.md      # Code review specialist
+│       ├── architect.md     # System architecture and design
+│       └── curator.md       # Issue maintenance and enhancement
 ├── index.html               # HTML structure (header, primary, mini row)
 ├── tsconfig.json            # TypeScript strict mode config
 ├── tailwind.config.js       # Tailwind with dark mode: 'class'
@@ -239,15 +263,37 @@ Loom stores workspace-specific configuration in `.loom/config.json` within each 
 
 ```json
 {
-  "nextAgentNumber": 6
+  "nextAgentNumber": 4,
+  "agents": [
+    {
+      "id": "1",
+      "name": "Shell",
+      "status": "idle",
+      "isPrimary": true
+    },
+    {
+      "id": "2",
+      "name": "Worker 1",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "worker.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Continue working on open tasks"
+      }
+    }
+  ]
 }
 ```
 
 **Why Workspace-Specific Config?**
-- Each git repo has independent agent numbering
+- Each git repo has independent agent numbering and terminal configurations
 - Config persists across app restarts
 - No parsing of agent names (users can rename freely)
 - Stored in workspace, not in app directory
+- Role assignments and autonomous settings preserved
 
 **Config Lifecycle**:
 ```typescript
@@ -258,17 +304,29 @@ await handleWorkspacePathInput('/path/to/repo');
 setConfigWorkspace('/path/to/repo');
 
 // 3. Load config from .loom/config.json
-const config = await loadConfig();  // { nextAgentNumber: 1 } or existing
+const config = await loadConfig();  // { nextAgentNumber: 1, agents: [...] } or existing
 
-// 4. Initialize state counter
+// 4. Initialize state
 state.setNextAgentNumber(config.nextAgentNumber);
+state.restoreAgents(config.agents);
 
 // 5. User creates agent
 const num = state.getNextAgentNumber();  // Returns 1, increments to 2
 state.addTerminal({ name: `Agent ${num}`, ... });
 
-// 6. Save updated counter
-await saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
+// 6. User configures terminal role via settings modal
+state.updateTerminalRole(id, 'claude-code-worker', {
+  workerType: 'claude',
+  roleFile: 'worker.md',
+  targetInterval: 300000,
+  intervalPrompt: 'Continue working on open tasks'
+});
+
+// 7. Save updated config
+await saveConfig({
+  nextAgentNumber: state.getCurrentAgentNumber(),
+  agents: state.getTerminals()
+});
 ```
 
 **File Operations**:
@@ -277,7 +335,127 @@ await saveConfig({ nextAgentNumber: state.getCurrentAgentNumber() });
 - Falls back to defaults if config file missing
 - Gracefully handles read/write errors
 
-**Important**: `.loom/` is gitignored - each developer has their own agent numbering.
+**Important**: `.loom/` is gitignored - each developer has their own agent numbering and terminal configurations.
+
+### 7. Terminal Configuration System
+
+**Files**: `src/lib/terminal-settings-modal.ts`, `src-tauri/src/main.rs` (role file commands)
+
+The terminal configuration system allows users to assign specialized roles to each terminal through a settings modal.
+
+**Role Definition Structure**:
+
+Each role consists of two files:
+- **`.md` file** (required): The role definition text with markdown formatting
+- **`.json` file** (optional): Metadata with default settings
+
+**Role Metadata Schema**:
+```json
+{
+  "name": "Worker Bot",
+  "description": "General development worker for features, bugs, and refactoring",
+  "defaultInterval": 0,
+  "defaultIntervalPrompt": "Continue working on open tasks",
+  "autonomousRecommended": false,
+  "suggestedWorkerType": "claude"
+}
+```
+
+**Role File Resolution**:
+1. Check workspace-specific: `.loom/roles/<filename>`
+2. Fall back to defaults: `defaults/roles/<filename>`
+3. List command merges both, workspace files take precedence
+
+**Available Roles** (from `defaults/roles/`):
+
+| Role | File | Autonomous | Interval | Description |
+|------|------|-----------|----------|-------------|
+| **Default** | `default.md` | No | N/A | Plain shell environment, no specialized role |
+| **Worker** | `worker.md` | No | 0 (manual) | General development worker for features, bugs, and refactoring |
+| **Issues** | `issues.md` | No | 0 (manual) | Specialist for creating well-structured GitHub issues |
+| **Reviewer** | `reviewer.md` | Yes | 5 min | Code review specialist for thorough PR reviews |
+| **Architect** | `architect.md` | Yes | 15 min | System architecture and technical decision making |
+| **Curator** | `curator.md` | Yes | 5 min | Issue maintenance and quality improvement |
+
+**Autonomous Mode**:
+- When `targetInterval > 0`, the terminal will automatically execute the `intervalPrompt` at regular intervals
+- Example: Reviewer bot runs every 5 minutes with prompt "Find and review open PRs with loom:review-requested label"
+- Allows terminals to work autonomously without user intervention
+- Recommended for Curator, Reviewer, and Architect roles
+
+**Label-based Workflow Coordination**:
+
+Roles coordinate work through GitHub labels (see [WORKFLOWS.md](WORKFLOWS.md) for complete details):
+
+1. **Architect** creates issues with `loom:architect-suggestion` label
+2. User reviews and removes label to approve
+3. **Curator** finds unlabeled issues, enhances them, marks as `loom:ready`
+4. **Worker** claims `loom:ready` issues, implements, creates PR with `loom:review-requested`
+5. **Reviewer** finds `loom:review-requested` PRs, reviews, approves/requests changes
+6. User merges approved PRs
+
+**Terminal Settings Modal UI**:
+
+The modal provides:
+- Role file dropdown (populated from both workspace and default roles)
+- Worker type selection (Claude or Codex)
+- Autonomous mode checkbox
+- Interval configuration (milliseconds)
+- Interval prompt textarea
+- Save/Cancel buttons
+
+**Implementation Pattern**:
+```typescript
+// 1. User clicks settings icon on terminal card
+openTerminalSettings(terminalId);
+
+// 2. Modal loads available role files via Tauri command
+const roleFiles = await invoke<string[]>('list_role_files', { workspacePath });
+
+// 3. User selects role file, modal loads metadata if available
+const metadata = await invoke<string | null>('read_role_metadata', {
+  workspacePath,
+  filename: selectedFile
+});
+
+// 4. Form pre-populates with metadata defaults or current config
+populateFormFromMetadata(metadata);
+
+// 5. User configures settings and saves
+state.updateTerminalRole(terminalId, role, roleConfig);
+await saveConfig({ /* ... */ });
+```
+
+**Custom Roles**:
+
+Users can create custom roles by adding files to `.loom/roles/` in their workspace:
+
+```markdown
+<!-- .loom/roles/my-custom-role.md -->
+# My Custom Role
+
+You are a specialist in the {{workspace}} repository.
+
+## Your Role
+...
+```
+
+```json
+// .loom/roles/my-custom-role.json
+{
+  "name": "My Custom Role",
+  "description": "Brief description",
+  "defaultInterval": 600000,
+  "defaultIntervalPrompt": "The prompt to send at each interval",
+  "autonomousRecommended": true,
+  "suggestedWorkerType": "claude"
+}
+```
+
+Template variables:
+- `{{workspace}}`: Replaced with absolute path to workspace directory
+
+See [defaults/roles/README.md](defaults/roles/README.md) for detailed guidance on creating custom roles.
 
 ## TypeScript Conventions
 
@@ -852,4 +1030,4 @@ Keep this as a living document that helps both humans and AI understand the code
 
 ---
 
-Last updated: Issue #13 (Daemon Integration Tests) - Complete test infrastructure with 9 passing integration tests covering IPC, terminal lifecycle, and error handling
+Last updated: Issue #19 (Terminal Configuration System) - Complete role-based terminal configuration with file-based role definitions, autonomous mode, and label-based workflow coordination

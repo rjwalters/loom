@@ -69,7 +69,7 @@ export function renderPrimaryTerminal(
 
   // Check if this terminal has a missing session flag
   const hasMissingSession =
-    terminal.status === TerminalStatus.Error && (terminal as any).missingSession === true;
+    terminal.status === TerminalStatus.Error && terminal.missingSession === true;
 
   const roleLabel = terminal.role ? getRoleLabel(terminal.role) : "Shell";
 

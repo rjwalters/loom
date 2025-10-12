@@ -1,0 +1,8 @@
+{
+  "name": "Development Worker",
+  "description": "Implements issues labeled loom:ready",
+  "defaultInterval": 0,
+  "defaultIntervalPrompt": "Check for issues labeled `loom:ready` using `gh issue list --label=\"loom:ready\" --state=open`. If you find any, claim one by updating its label to `loom:in-progress` and begin implementation.",
+  "autonomousRecommended": false,
+  "suggestedWorkerType": "claude"
+}
