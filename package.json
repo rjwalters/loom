@@ -22,7 +22,7 @@
     "format:write": "biome format --write .",
     "format:rust": "cargo fmt --all -- --check",
     "format:rust:write": "cargo fmt --all",
-    "clippy": "cargo clippy --workspace --all-targets --all-features",
+    "clippy": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "clippy:fix": "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged",
     "check:all": "npm run lint && npm run format:rust && npm run clippy && npm run check && npm run build",
     "prepare": "husky"
