@@ -337,6 +337,27 @@ export async function showTerminalSettingsModal(
     const selectedFile = roleFileSelect.value;
     if (!selectedFile || !workspacePath) return;
 
+    // Auto-assign theme based on role file
+    const { getThemeForRole } = await import("./themes");
+    const autoTheme = getThemeForRole(selectedFile);
+    selectedTheme = autoTheme;
+
+    // Update theme card selection in UI
+    modal.querySelectorAll(".theme-card").forEach((c) => {
+      const themeId = c.getAttribute("data-theme-id");
+      if (themeId === autoTheme) {
+        c.className = c.className.replace(
+          "border-gray-300 dark:border-gray-600",
+          "border-blue-500"
+        );
+      } else {
+        c.className = c.className.replace(
+          "border-blue-500",
+          "border-gray-300 dark:border-gray-600"
+        );
+      }
+    });
+
     try {
       const { invoke } = await import("@tauri-apps/api/tauri");
       const metadataJson = await invoke<string | null>("read_role_metadata", {

@@ -123,3 +123,23 @@ function adjustColorBrightness(color: string, percent: number): string {
 export function isDarkMode(): boolean {
   return document.documentElement.classList.contains("dark");
 }
+
+/**
+ * Get theme based on terminal role
+ * Maps role files to consistent theme colors
+ */
+export function getThemeForRole(roleFile?: string): string {
+  if (!roleFile) {
+    return "default"; // Plain shell terminals
+  }
+
+  // Map role files to themes
+  const roleThemeMap: Record<string, string> = {
+    "architect.md": "lavender",
+    "curator.md": "ocean",
+    "reviewer.md": "rose",
+    "worker.md": "forest",
+  };
+
+  return roleThemeMap[roleFile] || "default";
+}

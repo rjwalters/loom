@@ -11,11 +11,15 @@ interface PollerState {
   lastByteCount: number;
   polling: boolean;
   intervalId: number | null;
+  consecutiveErrors: number;
+  lastErrorTime: number | null;
 }
 
 export class OutputPoller {
   private pollers: Map<string, PollerState> = new Map();
   private pollInterval: number = 50; // Poll every 50ms for responsive feel
+  private maxConsecutiveErrors: number = 5; // Stop polling after this many consecutive errors
+  private errorCallback?: (terminalId: string, error: string) => void;
 
   /**
    * Start polling for a terminal's output
@@ -32,6 +36,8 @@ export class OutputPoller {
       lastByteCount: 0, // Start from beginning of file
       polling: true,
       intervalId: null,
+      consecutiveErrors: 0,
+      lastErrorTime: null,
     };
 
     // Initial fetch to get current state
@@ -134,9 +140,40 @@ export class OutputPoller {
 
       // Update byte offset for next poll
       state.lastByteCount = result.byte_count;
+
+      // Reset error counter on successful poll
+      state.consecutiveErrors = 0;
+      state.lastErrorTime = null;
     } catch (error) {
-      console.error(`Error polling terminal ${state.terminalId}:`, error);
-      // Don't stop polling on error - the daemon might be temporarily unavailable
+      // Track consecutive errors
+      state.consecutiveErrors++;
+      state.lastErrorTime = Date.now();
+
+      const errorMessage =
+        typeof error === "string" ? error : (error as Error)?.message || "Unknown error";
+
+      // Only log errors occasionally to avoid spam (every 5th error, or first error)
+      if (state.consecutiveErrors === 1 || state.consecutiveErrors % 5 === 0) {
+        console.error(
+          `Error polling terminal ${state.terminalId} (${state.consecutiveErrors} consecutive errors):`,
+          errorMessage
+        );
+      }
+
+      // Stop polling after max consecutive errors
+      if (state.consecutiveErrors >= this.maxConsecutiveErrors) {
+        console.error(
+          `Stopping polling for terminal ${state.terminalId} after ${this.maxConsecutiveErrors} consecutive errors`
+        );
+
+        // Notify error callback if registered
+        if (this.errorCallback) {
+          this.errorCallback(state.terminalId, errorMessage);
+        }
+
+        // Stop polling this terminal
+        this.stopPolling(state.terminalId);
+      }
     }
   }
 
@@ -185,6 +222,36 @@ export class OutputPoller {
    */
   getPolledTerminals(): string[] {
     return Array.from(this.pollers.keys());
+  }
+
+  /**
+   * Register a callback to be called when a terminal encounters fatal errors
+   */
+  onError(callback: (terminalId: string, error: string) => void): void {
+    this.errorCallback = callback;
+  }
+
+  /**
+   * Get error state for a terminal
+   */
+  getErrorState(
+    terminalId: string
+  ): { consecutiveErrors: number; lastErrorTime: number | null } | null {
+    const state = this.pollers.get(terminalId);
+    if (!state) {
+      return null;
+    }
+    return {
+      consecutiveErrors: state.consecutiveErrors,
+      lastErrorTime: state.lastErrorTime,
+    };
+  }
+
+  /**
+   * Set the maximum number of consecutive errors before stopping polling
+   */
+  setMaxConsecutiveErrors(max: number): void {
+    this.maxConsecutiveErrors = max;
   }
 }
 

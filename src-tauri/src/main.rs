@@ -8,6 +8,7 @@ use std::process::Command;
 use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
 
 mod daemon_client;
+mod daemon_manager;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
@@ -129,6 +130,60 @@ async fn check_session_health(id: String) -> Result<bool, String> {
         Response::SessionHealth { has_session } => Ok(has_session),
         Response::Error { message } => Err(message),
         _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn check_daemon_health() -> Result<bool, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::Ping)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Pong => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DaemonStatus {
+    running: bool,
+    socket_path: String,
+    error: Option<String>,
+}
+
+#[tauri::command]
+async fn get_daemon_status() -> DaemonStatus {
+    let socket_path = dirs::home_dir()
+        .map(|h| h.join(".loom/daemon.sock"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    match DaemonClient::new() {
+        Ok(client) => match client.send_request(Request::Ping).await {
+            Ok(Response::Pong) => DaemonStatus {
+                running: true,
+                socket_path,
+                error: None,
+            },
+            Ok(_) => DaemonStatus {
+                running: false,
+                socket_path,
+                error: Some("Daemon responded with unexpected response".to_string()),
+            },
+            Err(e) => DaemonStatus {
+                running: false,
+                socket_path,
+                error: Some(format!("Failed to ping daemon: {}", e)),
+            },
+        },
+        Err(e) => DaemonStatus {
+            running: false,
+            socket_path,
+            error: Some(format!("Failed to create client: {}", e)),
+        },
     }
 }
 
@@ -561,6 +616,7 @@ fn build_menu() -> Menu {
     let documentation = CustomMenuItem::new("documentation", "Documentation");
     let view_github = CustomMenuItem::new("view_github", "View on GitHub");
     let report_issue = CustomMenuItem::new("report_issue", "Report Issue");
+    let daemon_status = CustomMenuItem::new("daemon_status", "Daemon Status...");
     let keyboard_shortcuts =
         CustomMenuItem::new("keyboard_shortcuts", "Keyboard Shortcuts").accelerator("CmdOrCtrl+/");
 
@@ -571,6 +627,7 @@ fn build_menu() -> Menu {
             .add_item(view_github)
             .add_item(report_issue)
             .add_native_item(MenuItem::Separator)
+            .add_item(daemon_status)
             .add_item(keyboard_shortcuts),
     );
 
@@ -634,6 +691,9 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         "keyboard_shortcuts" => {
             let _ = event.window().emit("show-shortcuts", ());
         }
+        "daemon_status" => {
+            let _ = event.window().emit("show-daemon-status", ());
+        }
         _ => {}
     }
 }
@@ -645,30 +705,79 @@ fn main() {
     let menu = build_menu();
 
     if let Err(e) = tauri::Builder::default()
+        .setup(|app| {
+            // Check if we're in development or production mode
+            let is_production = !cfg!(debug_assertions);
+
+            eprintln!(
+                "[Loom] Starting in {} mode",
+                if is_production {
+                    "production"
+                } else {
+                    "development"
+                }
+            );
+
+            // Initialize daemon manager
+            let mut daemon_manager = daemon_manager::DaemonManager::new()
+                .map_err(|e| format!("Failed to create daemon manager: {}", e))?;
+
+            // Ensure daemon is running
+            tauri::async_runtime::block_on(async {
+                daemon_manager.ensure_daemon_running(is_production).await
+            })
+            .map_err(|e| format!("Failed to start/connect to daemon: {}", e))?;
+
+            // Store daemon manager in app state for cleanup on quit
+            app.manage(std::sync::Mutex::new(daemon_manager));
+
+            Ok(())
+        })
         .menu(menu)
         .on_menu_event(|event| handle_menu_event(&event))
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
-                // App is quitting - clean up all loom tmux sessions
-                eprintln!("App closing - cleaning up tmux sessions...");
+                // App is quitting - clean up resources
+                eprintln!("[Loom] App closing - cleaning up...");
 
-                // Kill all loom- tmux sessions
-                let _ = Command::new("tmux")
-                    .args(["list-sessions", "-F", "#{session_name}"])
-                    .output()
-                    .map(|output| {
-                        let sessions = String::from_utf8_lossy(&output.stdout);
-                        for session in sessions.lines() {
-                            if session.starts_with("loom-") {
-                                eprintln!("Killing tmux session: {session}");
-                                let _ = Command::new("tmux")
-                                    .args(["kill-session", "-t", session])
-                                    .spawn();
+                let is_production = !cfg!(debug_assertions);
+
+                // Get daemon manager from app state
+                if let Some(daemon_manager_mutex) = event
+                    .window()
+                    .try_state::<std::sync::Mutex<daemon_manager::DaemonManager>>()
+                {
+                    if let Ok(mut daemon_manager) = daemon_manager_mutex.lock() {
+                        // Kill daemon if we spawned it (production mode only)
+                        daemon_manager.kill_daemon();
+                    }
+                }
+
+                // Only kill tmux sessions in production mode
+                // In development, keep sessions alive for frontend hot reload reconnection
+                if is_production {
+                    eprintln!("[Loom] Production mode - cleaning up tmux sessions");
+                    let _ = Command::new("tmux")
+                        .args(["list-sessions", "-F", "#{session_name}"])
+                        .output()
+                        .map(|output| {
+                            let sessions = String::from_utf8_lossy(&output.stdout);
+                            for session in sessions.lines() {
+                                if session.starts_with("loom-") {
+                                    eprintln!("[Loom] Killing tmux session: {session}");
+                                    let _ = Command::new("tmux")
+                                        .args(["kill-session", "-t", session])
+                                        .spawn();
+                                }
                             }
-                        }
-                    });
+                        });
+                } else {
+                    eprintln!(
+                        "[Loom] Development mode - keeping tmux sessions alive for hot reload"
+                    );
+                }
 
-                eprintln!("Cleanup complete");
+                eprintln!("[Loom] Cleanup complete");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -688,6 +797,8 @@ fn main() {
             get_terminal_output,
             resize_terminal,
             check_session_health,
+            check_daemon_health,
+            get_daemon_status,
             list_available_sessions,
             attach_to_session,
             get_env_var,

@@ -1,5 +1,5 @@
 import "./style.css";
-import { open } from "@tauri-apps/api/dialog";
+import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
@@ -20,6 +20,22 @@ const state = new AppState();
 // Get terminal manager and output poller
 const terminalManager = getTerminalManager();
 const outputPoller = getOutputPoller();
+
+// Register error callback for polling failures
+outputPoller.onError((terminalId, errorMessage) => {
+  console.warn(
+    `[outputPoller] Terminal ${terminalId} encountered fatal errors (${errorMessage}), marking as error state`
+  );
+
+  // Mark terminal as having connection issues
+  const terminal = state.getTerminals().find((t) => t.id === terminalId);
+  if (terminal) {
+    state.updateTerminal(terminalId, {
+      status: TerminalStatus.Error,
+      missingSession: true,
+    });
+  }
+});
 
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
@@ -151,10 +167,15 @@ listen("new-terminal", () => {
   }
 });
 
-listen("close-terminal", () => {
+listen("close-terminal", async () => {
   const primary = state.getPrimary();
   if (primary) {
-    if (confirm("Close this terminal?")) {
+    const confirmed = await ask("Are you sure you want to close this terminal?", {
+      title: "Close Terminal",
+      type: "warning",
+    });
+
+    if (confirmed) {
       outputPoller.stopPolling(primary.id);
       terminalManager.destroyTerminal(primary.id);
       if (currentAttachedTerminalId === primary.id) {
@@ -197,15 +218,18 @@ listen("factory-reset-workspace", async () => {
   const workspace = state.getWorkspace();
   if (!workspace) return;
 
-  const confirmed = confirm(
-    "⚠️ FACTORY RESET WARNING\n\n" +
-      "This will:\n" +
+  const confirmed = await ask(
+    "This will:\n" +
       "• Delete all terminal configurations\n" +
       "• Reset all roles to defaults\n" +
       "• Close all current terminals\n" +
       "• Recreate 6 default terminals\n\n" +
       "This action CANNOT be undone!\n\n" +
-      "Continue with factory reset?"
+      "Continue with factory reset?",
+    {
+      title: "⚠️ Factory Reset Warning",
+      type: "warning",
+    }
   );
 
   if (!confirmed) return;
@@ -319,6 +343,54 @@ listen("show-shortcuts", () => {
       "  Cmd+/ - Show Shortcuts"
   );
 });
+
+listen("show-daemon-status", async () => {
+  showDaemonStatusDialog();
+});
+
+// Show daemon status dialog with reconnect option
+async function showDaemonStatusDialog() {
+  try {
+    interface DaemonStatus {
+      running: boolean;
+      socket_path: string;
+      error: string | null;
+    }
+
+    const status = await invoke<DaemonStatus>("get_daemon_status");
+
+    const statusText = status.running
+      ? "✅ Running"
+      : "❌ Not Running" + (status.error ? `\n\nError: ${status.error}` : "");
+
+    const workspace = state.getWorkspace();
+    const hasWorkspace = workspace !== null && workspace !== "";
+
+    // Show different dialog based on whether daemon is running and workspace is loaded
+    if (status.running && hasWorkspace) {
+      const shouldReconnect = await ask(
+        `Daemon Status\n\n${statusText}\n\nSocket: ${status.socket_path}\n\n` +
+          `Would you like to reconnect terminals to the daemon?\n\n` +
+          `This is useful if you hot-reloaded the frontend and lost connection to terminals.`,
+        {
+          title: "Daemon Status",
+          type: "info",
+        }
+      );
+
+      if (shouldReconnect) {
+        console.log("[show-daemon-status] User requested reconnection");
+        await reconnectTerminals();
+        alert("Terminal reconnection complete! Check the console for details.");
+      }
+    } else {
+      // Just show status without reconnect option
+      alert(`Daemon Status\n\n${statusText}\n\nSocket: ${status.socket_path}`);
+    }
+  } catch (error) {
+    alert(`Failed to get daemon status: ${error}`);
+  }
+}
 
 // Initialize app
 initializeApp();
@@ -459,6 +531,7 @@ async function createPlainTerminal() {
       name,
       status: TerminalStatus.Idle,
       isPrimary: false,
+      theme: "default",
     });
 
     // Save updated state to config
@@ -498,27 +571,60 @@ async function reconnectTerminals() {
     const agents = state.getTerminals();
     console.log(`[reconnectTerminals] Config has ${agents.length} agents`);
 
+    let reconnectedCount = 0;
+    let missingCount = 0;
+
     // For each agent in config, check if daemon has it
     for (const agent of agents) {
       if (activeTerminalIds.has(agent.id)) {
         console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
 
+        // Clear any error state from previous connection issues
+        if (agent.missingSession) {
+          state.updateTerminal(agent.id, {
+            status: TerminalStatus.Idle,
+            missingSession: undefined,
+          });
+        }
+
         // Initialize xterm for this terminal (will fetch full history)
-        initializeTerminalDisplay(agent.id);
+        // Only initialize if this is the primary terminal to avoid creating too many instances
+        if (agent.isPrimary) {
+          initializeTerminalDisplay(agent.id);
+        }
+
+        reconnectedCount++;
       } else {
         console.log(
-          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, skipping`
+          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, marking as missing`
         );
-        // Terminal not found in daemon - either tmux session died or daemon restarted
-        // We could mark it as stopped, but for now just leave it in config
-        // User can recreate it or remove it manually
+
+        // Mark terminal as having missing session so user can see it needs recovery
+        state.updateTerminal(agent.id, {
+          status: TerminalStatus.Error,
+          missingSession: true,
+        });
+
+        missingCount++;
       }
     }
 
-    console.log("[reconnectTerminals] Reconnection complete");
+    console.log(
+      `[reconnectTerminals] Reconnection complete: ${reconnectedCount} reconnected, ${missingCount} missing`
+    );
+
+    // If we reconnected at least some terminals, save the updated state
+    if (reconnectedCount > 0) {
+      await saveCurrentConfig();
+    }
   } catch (error) {
     console.error("[reconnectTerminals] Failed to reconnect terminals:", error);
     // Non-fatal - workspace is still loaded
+    alert(
+      `Warning: Could not reconnect to daemon terminals.\n\n` +
+        `Error: ${error}\n\n` +
+        `Terminals may need to be recreated. Check Help → Daemon Status for more info.`
+    );
   }
 }
 
@@ -549,9 +655,8 @@ async function handleWorkspacePathInput(path: string) {
 
     if (!isInitialized) {
       // Ask user to confirm initialization with detailed information
-      const confirmed = confirm(
-        `Initialize Loom in this workspace?\n\n` +
-          `This will create:\n\n` +
+      const confirmed = await ask(
+        `This will create:\n\n` +
           `📁 .loom/ directory with:\n` +
           `  • config.json - Terminal configuration\n` +
           `  • roles/ - Agent role definitions\n\n` +
@@ -563,7 +668,11 @@ async function handleWorkspacePathInput(path: string) {
           `  • Worker 1 - Claude Code worker\n` +
           `  • Worker 2 - Claude Code worker\n\n` +
           `📝 .loom/ will be added to .gitignore\n\n` +
-          `Continue?`
+          `Continue?`,
+        {
+          title: "Initialize Loom in this workspace?",
+          type: "info",
+        }
       );
 
       if (!confirmed) {
@@ -894,20 +1003,25 @@ function setupEventListeners() {
         const id = target.getAttribute("data-terminal-id");
 
         if (id) {
-          if (confirm("Close this terminal?")) {
-            // Stop polling and clean up xterm.js instance
-            outputPoller.stopPolling(id);
-            terminalManager.destroyTerminal(id);
+          ask("Are you sure you want to close this terminal?", {
+            title: "Close Terminal",
+            type: "warning",
+          }).then((confirmed) => {
+            if (confirmed) {
+              // Stop polling and clean up xterm.js instance
+              outputPoller.stopPolling(id);
+              terminalManager.destroyTerminal(id);
 
-            // If this was the current attached terminal, clear it
-            if (currentAttachedTerminalId === id) {
-              currentAttachedTerminalId = null;
+              // If this was the current attached terminal, clear it
+              if (currentAttachedTerminalId === id) {
+                currentAttachedTerminalId = null;
+              }
+
+              // Remove from state
+              state.removeTerminal(id);
+              saveCurrentConfig();
             }
-
-            // Remove from state
-            state.removeTerminal(id);
-            saveCurrentConfig();
-          }
+          });
         }
         return;
       }

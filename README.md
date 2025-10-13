@@ -174,17 +174,14 @@ cd loom
 # Install dependencies
 pnpm install
 
-# Configure environment
-cp .env.example .env
-# Edit with your API keys and workspace path
+# Terminal 1: Start daemon with live monitoring
+pnpm run daemon:dev
 
-# Start daemon (Terminal 1)
-cd loom-daemon
-cargo run
-
-# Start GUI (Terminal 2)
-pnpm tauri dev
+# Terminal 2: Start Tauri dev mode
+pnpm run tauri:dev
 ```
+
+**For detailed development workflow, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
 
 ### Configuring Terminal Roles
 
