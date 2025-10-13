@@ -27,5 +27,12 @@ Thumbs.db
 .daemon.pid
 .daemon.log
 
-# Loom config (workspace-specific, not committed)
-.loom/
+# Loom runtime state (don't commit these)
+.loom/.daemon.pid
+.loom/.daemon.log
+.loom/daemon.sock
+.loom/worktrees/
+
+# Loom workspace config (DO commit for team sharing)
+# - config.json: Agent configurations
+# - roles/: Custom role definitions

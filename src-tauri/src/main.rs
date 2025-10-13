@@ -322,6 +322,14 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
     copy_dir_recursive(defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
+    // Copy workspace-specific README (overwriting defaults/README.md)
+    let loom_readme_src = defaults.join(".loom-README.md");
+    let loom_readme_dst = loom_path.join("README.md");
+    if loom_readme_src.exists() {
+        fs::copy(&loom_readme_src, &loom_readme_dst)
+            .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
+    }
+
     // Add .loom/ to .gitignore
     let gitignore_path = workspace_path.join(".gitignore");
     let loom_entry = ".loom/\n";
@@ -556,6 +564,14 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
 
     copy_dir_recursive(defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+
+    // Copy workspace-specific README (overwriting defaults/README.md)
+    let loom_readme_src = defaults.join(".loom-README.md");
+    let loom_readme_dst = loom_path.join("README.md");
+    if loom_readme_src.exists() {
+        fs::copy(&loom_readme_src, &loom_readme_dst)
+            .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
+    }
 
     // Add .loom/ to .gitignore (ensures it's present on both initialization and factory reset)
     let gitignore_path = workspace.join(".gitignore");
