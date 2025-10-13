@@ -509,12 +509,18 @@ async function applySettings(
       if (workspacePath && roleConfig.roleFile) {
         const { launchAgentInTerminal } = await import("./agent-launcher");
         try {
-          await launchAgentInTerminal(
+          // Use worktree for isolation (creates one if doesn't exist)
+          const useWorktree = true;
+          const worktreePath = await launchAgentInTerminal(
             terminal.id,
             roleConfig.roleFile as string,
             workspacePath,
-            terminal.worktreePath
+            terminal.worktreePath,
+            useWorktree
           );
+
+          // Store worktree path in terminal state
+          state.updateTerminal(terminal.id, { worktreePath });
         } catch (error) {
           console.error("Failed to launch agent:", error);
           alert(`Failed to launch agent: ${error}`);

@@ -17,21 +17,23 @@ export async function launchAgentInTerminal(
   terminalId: string,
   roleFile: string,
   workspacePath: string,
-  worktreePath?: string
-): Promise<void> {
+  worktreePath?: string,
+  useWorktree = false
+): Promise<string> {
+  // Set up worktree if requested
+  let agentWorkingDir = workspacePath;
+  if (useWorktree && !worktreePath) {
+    const { setupWorktreeForAgent } = await import("./worktree-manager");
+    agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath);
+  } else if (worktreePath) {
+    agentWorkingDir = worktreePath;
+  }
+
   // Read role file content from workspace
   const roleContent = await invoke<string>("read_role_file", {
     workspacePath,
     filename: roleFile,
   });
-
-  // Use worktree path if provided, otherwise use workspace
-  const agentWorkingDir = worktreePath || workspacePath;
-
-  // TODO: Set up git worktree before launching Claude
-  // Currently, worktree setup is handled in Rust daemon via create_terminal_with_worktree.
-  // We should investigate moving this to TypeScript for consistency with our terminal-first approach.
-  // See issue #58 for investigation and refactor plan.
 
   // Replace template variables in role content
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
@@ -54,6 +56,9 @@ export async function launchAgentInTerminal(
     id: terminalId,
     data: "\r",
   });
+
+  // Return the working directory that was used
+  return agentWorkingDir;
 }
 
 /**
