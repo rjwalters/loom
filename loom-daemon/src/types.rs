@@ -65,4 +65,28 @@ pub struct TerminalInfo {
     pub tmux_session: String,
     pub working_dir: Option<String>,
     pub created_at: i64,
+    // Agent-specific fields
+    pub worktree_path: Option<String>,
+    pub agent_pid: Option<u32>,
+    #[serde(default)]
+    pub agent_status: AgentStatus,
+    pub last_interval_run: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStatus {
+    NotStarted,
+    Initializing,
+    Ready,
+    Busy,
+    WaitingForInput,
+    Error,
+    Stopped,
+}
+
+impl Default for AgentStatus {
+    fn default() -> Self {
+        Self::NotStarted
+    }
 }

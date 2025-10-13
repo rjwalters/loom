@@ -65,6 +65,10 @@ impl TerminalManager {
             tmux_session,
             working_dir,
             created_at: chrono::Utc::now().timestamp(),
+            worktree_path: None,
+            agent_pid: None,
+            agent_status: crate::types::AgentStatus::default(),
+            last_interval_run: None,
         };
 
         self.terminals.insert(id.clone(), info);
@@ -105,7 +109,14 @@ impl TerminalManager {
         log::info!("Git worktree created successfully");
 
         // Create terminal with worktree as working directory
-        self.create_terminal(name, Some(worktree_path.to_string_lossy().to_string()))
+        let id = self.create_terminal(name, Some(worktree_path.to_string_lossy().to_string()))?;
+
+        // Update the terminal with worktree path
+        if let Some(terminal) = self.terminals.get_mut(&id) {
+            terminal.worktree_path = Some(worktree_path.to_string_lossy().to_string());
+        }
+
+        Ok(id)
     }
 
     pub fn list_terminals(&self) -> Vec<TerminalInfo> {
@@ -289,6 +300,10 @@ impl TerminalManager {
                         tmux_session: session.to_string(),
                         working_dir: None,
                         created_at: chrono::Utc::now().timestamp(),
+                        worktree_path: None,
+                        agent_pid: None,
+                        agent_status: crate::types::AgentStatus::default(),
+                        last_interval_run: None,
                     });
             }
         }
