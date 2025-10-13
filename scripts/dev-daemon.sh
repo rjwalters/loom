@@ -69,7 +69,7 @@ get_connection_count() {
 
 # Function to get terminal count from logs
 get_terminal_count() {
-  grep -i "restored.*terminals" "$DAEMON_LOG_FILE" 2>/dev/null | tail -1 | grep -oE '[0-9]+' || echo "0"
+  grep -i "restored.*terminals" "$DAEMON_LOG_FILE" 2>/dev/null | tail -1 | sed -n 's/.*Restored \([0-9]*\) terminals.*/\1/p' || echo "0"
 }
 
 # Function to count recent errors

@@ -2,14 +2,14 @@
   "nextAgentNumber": 7,
   "agents": [
     {
-      "id": "1",
+      "id": "__unassigned__",
       "name": "Shell",
       "status": "idle",
       "isPrimary": true,
       "theme": "default"
     },
     {
-      "id": "2",
+      "id": "__unassigned__",
       "name": "Architect",
       "status": "idle",
       "isPrimary": false,
@@ -23,7 +23,7 @@
       "theme": "lavender"
     },
     {
-      "id": "3",
+      "id": "__unassigned__",
       "name": "Curator",
       "status": "idle",
       "isPrimary": false,
@@ -37,7 +37,7 @@
       "theme": "ocean"
     },
     {
-      "id": "4",
+      "id": "__unassigned__",
       "name": "Reviewer",
       "status": "idle",
       "isPrimary": false,
@@ -51,7 +51,7 @@
       "theme": "rose"
     },
     {
-      "id": "5",
+      "id": "__unassigned__",
       "name": "Worker 1",
       "status": "idle",
       "isPrimary": false,
@@ -65,7 +65,7 @@
       "theme": "forest"
     },
     {
-      "id": "6",
+      "id": "__unassigned__",
       "name": "Worker 2",
       "status": "idle",
       "isPrimary": false,

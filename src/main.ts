@@ -576,6 +576,22 @@ async function reconnectTerminals() {
 
     // For each agent in config, check if daemon has it
     for (const agent of agents) {
+      // Check if agent has placeholder ID (shouldn't happen after proper initialization)
+      if (agent.id === "__unassigned__") {
+        console.log(
+          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, marking as missing`
+        );
+
+        // Mark terminal as having missing session so user can see it needs recovery
+        state.updateTerminal(agent.id, {
+          status: TerminalStatus.Error,
+          missingSession: true,
+        });
+
+        missingCount++;
+        continue;
+      }
+
       if (activeTerminalIds.has(agent.id)) {
         console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
 
@@ -692,22 +708,61 @@ async function handleWorkspacePathInput(path: string) {
         alert(`Failed to initialize workspace: ${error}`);
         return;
       }
+
+      // After initialization, create terminals for the default config
+      setConfigWorkspace(expandedPath);
+      const config = await loadConfig();
+      state.setNextAgentNumber(config.nextAgentNumber);
+
+      if (config.agents && config.agents.length > 0) {
+        console.log("[handleWorkspacePathInput] Creating terminals for fresh workspace");
+
+        // Create terminal sessions for each agent in the config
+        for (const agent of config.agents) {
+          try {
+            // Create terminal in daemon
+            const terminalId = await invoke<string>("create_terminal", {
+              name: agent.name,
+              workingDir: expandedPath,
+            });
+
+            // Update agent ID to match the newly created terminal
+            agent.id = terminalId;
+            console.log(
+              `[handleWorkspacePathInput] Created terminal ${agent.name} (${terminalId})`
+            );
+          } catch (error) {
+            console.error(
+              `[handleWorkspacePathInput] Failed to create terminal ${agent.name}:`,
+              error
+            );
+            alert(`Failed to create terminal ${agent.name}: ${error}`);
+          }
+        }
+
+        // Load agents into state with their new IDs
+        state.loadAgents(config.agents);
+
+        // Save the updated config with real terminal IDs
+        await saveConfig(config);
+        console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
+      }
+    } else {
+      // Workspace already initialized - load existing config
+      setConfigWorkspace(expandedPath);
+      const config = await loadConfig();
+      state.setNextAgentNumber(config.nextAgentNumber);
+
+      // Load agents from config
+      if (config.agents && config.agents.length > 0) {
+        state.loadAgents(config.agents);
+        // Reconnect agents to existing daemon terminals
+        await reconnectTerminals();
+      }
     }
 
-    // Now load config from workspace
+    // Now set workspace as active
     state.setWorkspace(expandedPath);
-    console.log("[handleWorkspacePathInput] set workspace, loading config...");
-
-    setConfigWorkspace(expandedPath);
-    const config = await loadConfig();
-    state.setNextAgentNumber(config.nextAgentNumber);
-
-    // Load agents from config
-    if (config.agents && config.agents.length > 0) {
-      state.loadAgents(config.agents);
-      // Reconnect agents to existing daemon terminals
-      await reconnectTerminals();
-    }
     console.log("[handleWorkspacePathInput] workspace fully loaded");
 
     // Store workspace path for next app launch
