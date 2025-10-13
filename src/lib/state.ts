@@ -6,6 +6,13 @@ export enum TerminalStatus {
   Stopped = "stopped",
 }
 
+export interface ColorTheme {
+  name: string;
+  primary: string;
+  background?: string;
+  border: string;
+}
+
 export interface Terminal {
   id: string;
   name: string;
@@ -14,6 +21,8 @@ export interface Terminal {
   role?: string; // Optional: "claude-code-worker", "codex-worker", etc. Undefined = plain shell
   roleConfig?: Record<string, unknown>; // Role-specific configuration (e.g., system prompt)
   missingSession?: boolean; // Flag for terminals with missing tmux sessions (used in error recovery)
+  theme?: string; // Theme ID (e.g., "ocean", "forest") or "default"
+  customTheme?: ColorTheme; // For custom colors
 }
 
 export class AppState {
@@ -95,6 +104,24 @@ export class AppState {
     if (terminal) {
       terminal.role = role;
       terminal.roleConfig = roleConfig;
+      this.notify();
+    }
+  }
+
+  setTerminalTheme(id: string, themeId: string): void {
+    const terminal = this.terminals.get(id);
+    if (terminal) {
+      terminal.theme = themeId;
+      delete terminal.customTheme; // Clear custom if using preset
+      this.notify();
+    }
+  }
+
+  setTerminalCustomTheme(id: string, theme: ColorTheme): void {
+    const terminal = this.terminals.get(id);
+    if (terminal) {
+      terminal.theme = "custom";
+      terminal.customTheme = theme;
       this.notify();
     }
   }
