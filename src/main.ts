@@ -5,7 +5,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
-import { AppState, TerminalStatus } from "./lib/state";
+import { AppState, setAppState, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
@@ -16,6 +16,7 @@ initTheme();
 
 // Initialize state (no agents until workspace is selected)
 const state = new AppState();
+setAppState(state); // Register singleton so terminal-manager can access it
 
 // Get terminal manager and output poller
 const terminalManager = getTerminalManager();

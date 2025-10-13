@@ -234,31 +234,40 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
   const borderWidth = terminal.isPrimary ? "3" : "2";
   const borderColor = terminal.isPrimary ? styles.activeColor : styles.borderColor;
 
+  // Show notification badge when terminal needs input
+  const needsInputBadge =
+    terminal.status === TerminalStatus.NeedsInput
+      ? `<div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-white dark:border-gray-900 animate-pulse"></div>`
+      : "";
+
   return `
     <div class="p-1 flex-shrink-0">
-      <div
-        class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
-        style="border: ${borderWidth}px solid ${borderColor}"
-        data-terminal-id="${terminal.id}"
-        draggable="true"
-      >
-      <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
-        <div class="flex items-center gap-2 flex-1 min-w-0">
-          <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
-          <span class="terminal-name text-xs font-medium truncate">${escapeHtml(terminal.name)}</span>
-        </div>
-        <button
-          class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
+      <div class="relative">
+        ${needsInputBadge}
+        <div
+          class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+          style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
-          title="Close terminal"
+          draggable="true"
         >
-          ×
-        </button>
-      </div>
-      <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between">
-        <span>${terminal.status}</span>
-        <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
-      </div>
+        <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
+          <div class="flex items-center gap-2 flex-1 min-w-0">
+            <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
+            <span class="terminal-name text-xs font-medium truncate">${escapeHtml(terminal.name)}</span>
+          </div>
+          <button
+            class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
+            data-terminal-id="${terminal.id}"
+            title="Close terminal"
+          >
+            ×
+          </button>
+        </div>
+        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between">
+          <span>${terminal.status}</span>
+          <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+        </div>
+        </div>
       </div>
     </div>
   `;

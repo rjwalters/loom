@@ -245,3 +245,17 @@ export class AppState {
     this.listeners.forEach((cb) => cb());
   }
 }
+
+// Singleton instance for accessing state from anywhere
+let appStateInstance: AppState | null = null;
+
+export function getAppState(): AppState {
+  if (!appStateInstance) {
+    appStateInstance = new AppState();
+  }
+  return appStateInstance;
+}
+
+export function setAppState(state: AppState): void {
+  appStateInstance = state;
+}
