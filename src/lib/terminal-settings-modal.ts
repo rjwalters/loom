@@ -207,27 +207,19 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
       </div>
 
       <!-- Buttons -->
-      <div class="flex justify-between items-center mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
+      <div class="flex justify-end items-center gap-2 mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
         <button
-          id="factory-reset-btn"
-          class="px-4 py-2 bg-yellow-600 hover:bg-yellow-500 rounded text-white font-medium"
+          id="cancel-settings-btn"
+          class="px-4 py-2 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 rounded text-gray-900 dark:text-gray-100"
         >
-          Factory Reset
+          Cancel
         </button>
-        <div class="flex gap-2">
-          <button
-            id="cancel-settings-btn"
-            class="px-4 py-2 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 rounded text-gray-900 dark:text-gray-100"
-          >
-            Cancel
-          </button>
-          <button
-            id="apply-settings-btn"
-            class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-white font-medium"
-          >
-            Apply
-          </button>
-        </div>
+        <button
+          id="apply-settings-btn"
+          class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-white font-medium"
+        >
+          Apply
+        </button>
       </div>
     </div>
   `;
@@ -345,6 +337,27 @@ export async function showTerminalSettingsModal(
     const selectedFile = roleFileSelect.value;
     if (!selectedFile || !workspacePath) return;
 
+    // Auto-assign theme based on role file
+    const { getThemeForRole } = await import("./themes");
+    const autoTheme = getThemeForRole(selectedFile);
+    selectedTheme = autoTheme;
+
+    // Update theme card selection in UI
+    modal.querySelectorAll(".theme-card").forEach((c) => {
+      const themeId = c.getAttribute("data-theme-id");
+      if (themeId === autoTheme) {
+        c.className = c.className.replace(
+          "border-gray-300 dark:border-gray-600",
+          "border-blue-500"
+        );
+      } else {
+        c.className = c.className.replace(
+          "border-blue-500",
+          "border-gray-300 dark:border-gray-600"
+        );
+      }
+    });
+
     try {
       const { invoke } = await import("@tauri-apps/api/tauri");
       const metadataJson = await invoke<string | null>("read_role_metadata", {
@@ -404,22 +417,11 @@ export async function showTerminalSettingsModal(
   // Wire up buttons
   const cancelBtn = modal.querySelector("#cancel-settings-btn");
   const applyBtn = modal.querySelector("#apply-settings-btn");
-  const factoryResetBtn = modal.querySelector("#factory-reset-btn");
 
   cancelBtn?.addEventListener("click", () => modal.remove());
 
   applyBtn?.addEventListener("click", async () => {
     await applySettings(modal, terminal, state, renderFn, selectedTheme);
-  });
-
-  factoryResetBtn?.addEventListener("click", async () => {
-    if (
-      confirm(
-        "Are you sure you want to reset this terminal to factory defaults?\n\nThis will clear all custom configuration."
-      )
-    ) {
-      await factoryReset(modal, terminal, state, renderFn);
-    }
   });
 
   // Close on background click
@@ -501,34 +503,5 @@ async function applySettings(
     renderFn();
   } catch (error) {
     alert(`Failed to apply settings: ${error}`);
-  }
-}
-
-async function factoryReset(
-  modal: HTMLElement,
-  terminal: Terminal,
-  state: AppState,
-  renderFn: () => void
-): Promise<void> {
-  try {
-    // Reset to defaults: plain shell, no role, default theme
-    state.updateTerminal(terminal.id, {
-      name: `Terminal ${terminal.id.substring(0, 8)}`,
-    });
-    state.setTerminalRole(terminal.id, undefined, undefined);
-    state.setTerminalTheme(terminal.id, "default");
-
-    // Save config
-    const config = {
-      nextAgentNumber: state.getCurrentAgentNumber(),
-      agents: state.getTerminals(),
-    };
-    await saveConfig(config);
-
-    // Close modal and re-render
-    modal.remove();
-    renderFn();
-  } catch (error) {
-    alert(`Failed to reset terminal: ${error}`);
   }
 }

@@ -17,7 +17,7 @@ tauri-build = { version = "1.5.5", features = [] }
 [dependencies]
 serde_json = { workspace = true }
 serde = { workspace = true }
-tauri = { version = "1.8.1", features = [ "fs-all", "path-all", "dialog-message", "dialog-open", "shell-open-api"] }
+tauri = { version = "1.8.1", features = [ "dialog-ask", "fs-all", "path-all", "dialog-message", "dialog-open", "shell-open-api"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 dirs = "5.0"

@@ -91,7 +91,8 @@ impl TerminalManager {
             .wait()?;
 
         // Clean up the output file
-        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        let id_prefix = if id.len() >= 8 { &id[..8] } else { id };
+        let output_file = format!("/tmp/loom-{id_prefix}.out");
         let _ = std::fs::remove_file(output_file);
 
         self.terminals.remove(id);
@@ -134,7 +135,9 @@ impl TerminalManager {
         use std::fs;
         use std::io::{Read, Seek};
 
-        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        // Use first 8 chars of ID for filename, or entire ID if shorter
+        let id_prefix = if id.len() >= 8 { &id[..8] } else { id };
+        let output_file = format!("/tmp/loom-{id_prefix}.out");
         log::debug!("Reading terminal output from: {output_file}");
 
         let mut file = match fs::File::open(&output_file) {

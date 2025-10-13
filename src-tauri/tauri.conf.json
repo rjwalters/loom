@@ -16,7 +16,8 @@
       "dialog": {
         "all": false,
         "open": true,
-        "message": true
+        "message": true,
+        "ask": true
       },
       "path": {
         "all": true

@@ -1,5 +1,5 @@
 import "./style.css";
-import { open } from "@tauri-apps/api/dialog";
+import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
@@ -20,6 +20,22 @@ const state = new AppState();
 // Get terminal manager and output poller
 const terminalManager = getTerminalManager();
 const outputPoller = getOutputPoller();
+
+// Register error callback for polling failures
+outputPoller.onError((terminalId, errorMessage) => {
+  console.warn(
+    `[outputPoller] Terminal ${terminalId} encountered fatal errors (${errorMessage}), marking as error state`
+  );
+
+  // Mark terminal as having connection issues
+  const terminal = state.getTerminals().find((t) => t.id === terminalId);
+  if (terminal) {
+    state.updateTerminal(terminalId, {
+      status: TerminalStatus.Error,
+      missingSession: true,
+    });
+  }
+});
 
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
@@ -151,10 +167,15 @@ listen("new-terminal", () => {
   }
 });
 
-listen("close-terminal", () => {
+listen("close-terminal", async () => {
   const primary = state.getPrimary();
   if (primary) {
-    if (confirm("Close this terminal?")) {
+    const confirmed = await ask("Are you sure you want to close this terminal?", {
+      title: "Close Terminal",
+      type: "warning",
+    });
+
+    if (confirmed) {
       outputPoller.stopPolling(primary.id);
       terminalManager.destroyTerminal(primary.id);
       if (currentAttachedTerminalId === primary.id) {
@@ -190,6 +211,101 @@ listen("close-workspace", async () => {
 
   // Re-render to show workspace picker
   console.log("[close-workspace] Rendering workspace picker");
+  render();
+});
+
+listen("factory-reset-workspace", async () => {
+  const workspace = state.getWorkspace();
+  if (!workspace) return;
+
+  const confirmed = await ask(
+    "This will:\n" +
+      "• Delete all terminal configurations\n" +
+      "• Reset all roles to defaults\n" +
+      "• Close all current terminals\n" +
+      "• Recreate 6 default terminals\n\n" +
+      "This action CANNOT be undone!\n\n" +
+      "Continue with factory reset?",
+    {
+      title: "⚠️ Factory Reset Warning",
+      type: "warning",
+    }
+  );
+
+  if (!confirmed) return;
+
+  console.log("[factory-reset-workspace] Resetting workspace to defaults");
+
+  // Stop all polling
+  const terminals = state.getTerminals();
+  terminals.forEach((t) => outputPoller.stopPolling(t.id));
+
+  // Destroy all xterm instances
+  terminalManager.destroyAll();
+
+  // Call backend reset
+  try {
+    await invoke("reset_workspace_to_defaults", {
+      workspacePath: workspace,
+      defaultsPath: "defaults",
+    });
+    console.log("[factory-reset-workspace] Backend reset complete");
+  } catch (error) {
+    console.error("Failed to reset workspace:", error);
+    alert(`Failed to reset workspace: ${error}`);
+    return;
+  }
+
+  // Clear state
+  state.clearAll();
+  currentAttachedTerminalId = null;
+
+  // Reload config and recreate terminals
+  try {
+    setConfigWorkspace(workspace);
+    const config = await loadConfig();
+    state.setNextAgentNumber(config.nextAgentNumber);
+
+    // Load agents from fresh config and create terminal sessions for each
+    if (config.agents && config.agents.length > 0) {
+      // Create new terminal sessions for each agent in the config
+      for (const agent of config.agents) {
+        try {
+          // Create terminal in daemon
+          const terminalId = await invoke<string>("create_terminal", {
+            name: agent.name,
+            workingDir: workspace,
+          });
+
+          // Update agent ID to match the newly created terminal
+          agent.id = terminalId;
+          console.log(`[factory-reset-workspace] Created terminal ${agent.name} (${terminalId})`);
+        } catch (error) {
+          console.error(
+            `[factory-reset-workspace] Failed to create terminal ${agent.name}:`,
+            error
+          );
+          alert(`Failed to create terminal ${agent.name}: ${error}`);
+        }
+      }
+
+      // Now load the agents into state with their new IDs
+      state.loadAgents(config.agents);
+
+      // Save the updated config with new terminal IDs
+      await saveCurrentConfig();
+    }
+
+    // Set workspace as active (so render() shows terminals instead of picker)
+    state.setWorkspace(workspace);
+
+    console.log("[factory-reset-workspace] Workspace reset complete");
+  } catch (error) {
+    console.error("Failed to reload config after reset:", error);
+    alert(`Failed to reload config: ${error}`);
+  }
+
+  // Re-render
   render();
 });
 
@@ -230,6 +346,54 @@ listen("show-shortcuts", () => {
       "  Cmd+/ - Show Shortcuts"
   );
 });
+
+listen("show-daemon-status", async () => {
+  showDaemonStatusDialog();
+});
+
+// Show daemon status dialog with reconnect option
+async function showDaemonStatusDialog() {
+  try {
+    interface DaemonStatus {
+      running: boolean;
+      socket_path: string;
+      error: string | null;
+    }
+
+    const status = await invoke<DaemonStatus>("get_daemon_status");
+
+    const statusText = status.running
+      ? "✅ Running"
+      : `❌ Not Running${status.error ? `\n\nError: ${status.error}` : ""}`;
+
+    const workspace = state.getWorkspace();
+    const hasWorkspace = workspace !== null && workspace !== "";
+
+    // Show different dialog based on whether daemon is running and workspace is loaded
+    if (status.running && hasWorkspace) {
+      const shouldReconnect = await ask(
+        `Daemon Status\n\n${statusText}\n\nSocket: ${status.socket_path}\n\n` +
+          `Would you like to reconnect terminals to the daemon?\n\n` +
+          `This is useful if you hot-reloaded the frontend and lost connection to terminals.`,
+        {
+          title: "Daemon Status",
+          type: "info",
+        }
+      );
+
+      if (shouldReconnect) {
+        console.log("[show-daemon-status] User requested reconnection");
+        await reconnectTerminals();
+        alert("Terminal reconnection complete! Check the console for details.");
+      }
+    } else {
+      // Just show status without reconnect option
+      alert(`Daemon Status\n\n${statusText}\n\nSocket: ${status.socket_path}`);
+    }
+  } catch (error) {
+    alert(`Failed to get daemon status: ${error}`);
+  }
+}
 
 // Initialize app
 initializeApp();
@@ -345,26 +509,6 @@ async function browseWorkspace() {
   }
 }
 
-// Initialize Loom in workspace
-async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> {
-  try {
-    // In dev mode, use relative path from cwd (project root)
-    // TODO: For production, bundle defaults as a resource
-    const defaultsPath = "defaults";
-
-    await invoke("initialize_loom_workspace", {
-      path: workspacePath,
-      defaultsPath: defaultsPath,
-    });
-
-    return true;
-  } catch (error) {
-    console.error("Failed to initialize workspace:", error);
-    alert(`Failed to initialize workspace: ${error}`);
-    return false;
-  }
-}
-
 // Create a plain shell terminal
 async function createPlainTerminal() {
   const workspacePath = state.getWorkspace();
@@ -390,6 +534,7 @@ async function createPlainTerminal() {
       name,
       status: TerminalStatus.Idle,
       isPrimary: false,
+      theme: "default",
     });
 
     // Save updated state to config
@@ -429,27 +574,76 @@ async function reconnectTerminals() {
     const agents = state.getTerminals();
     console.log(`[reconnectTerminals] Config has ${agents.length} agents`);
 
+    let reconnectedCount = 0;
+    let missingCount = 0;
+
     // For each agent in config, check if daemon has it
     for (const agent of agents) {
+      // Check if agent has placeholder ID (shouldn't happen after proper initialization)
+      if (agent.id === "__unassigned__") {
+        console.log(
+          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, marking as missing`
+        );
+
+        // Mark terminal as having missing session so user can see it needs recovery
+        state.updateTerminal(agent.id, {
+          status: TerminalStatus.Error,
+          missingSession: true,
+        });
+
+        missingCount++;
+        continue;
+      }
+
       if (activeTerminalIds.has(agent.id)) {
         console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
 
+        // Clear any error state from previous connection issues
+        if (agent.missingSession) {
+          state.updateTerminal(agent.id, {
+            status: TerminalStatus.Idle,
+            missingSession: undefined,
+          });
+        }
+
         // Initialize xterm for this terminal (will fetch full history)
-        initializeTerminalDisplay(agent.id);
+        // Only initialize if this is the primary terminal to avoid creating too many instances
+        if (agent.isPrimary) {
+          initializeTerminalDisplay(agent.id);
+        }
+
+        reconnectedCount++;
       } else {
         console.log(
-          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, skipping`
+          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, marking as missing`
         );
-        // Terminal not found in daemon - either tmux session died or daemon restarted
-        // We could mark it as stopped, but for now just leave it in config
-        // User can recreate it or remove it manually
+
+        // Mark terminal as having missing session so user can see it needs recovery
+        state.updateTerminal(agent.id, {
+          status: TerminalStatus.Error,
+          missingSession: true,
+        });
+
+        missingCount++;
       }
     }
 
-    console.log("[reconnectTerminals] Reconnection complete");
+    console.log(
+      `[reconnectTerminals] Reconnection complete: ${reconnectedCount} reconnected, ${missingCount} missing`
+    );
+
+    // If we reconnected at least some terminals, save the updated state
+    if (reconnectedCount > 0) {
+      await saveCurrentConfig();
+    }
   } catch (error) {
     console.error("[reconnectTerminals] Failed to reconnect terminals:", error);
     // Non-fatal - workspace is still loaded
+    alert(
+      `Warning: Could not reconnect to daemon terminals.\n\n` +
+        `Error: ${error}\n\n` +
+        `Terminals may need to be recreated. Check Help → Daemon Status for more info.`
+    );
   }
 }
 
@@ -479,14 +673,25 @@ async function handleWorkspacePathInput(path: string) {
     console.log("[handleWorkspacePathInput] isInitialized:", isInitialized);
 
     if (!isInitialized) {
-      // Ask user to confirm initialization
-      const confirmed = confirm(
-        `Initialize Loom in this workspace?\n\n` +
-          `This will:\n` +
-          `• Create .loom/ directory with default configuration\n` +
-          `• Add .loom/ to .gitignore\n` +
-          `• Set up 3 default agents\n\n` +
-          `Continue?`
+      // Ask user to confirm initialization with detailed information
+      const confirmed = await ask(
+        `This will create:\n\n` +
+          `📁 .loom/ directory with:\n` +
+          `  • config.json - Terminal configuration\n` +
+          `  • roles/ - Agent role definitions\n\n` +
+          `🤖 6 Default Terminals:\n` +
+          `  • Shell - Plain shell (primary)\n` +
+          `  • Architect - Claude Code worker\n` +
+          `  • Curator - Claude Code worker\n` +
+          `  • Reviewer - Claude Code worker\n` +
+          `  • Worker 1 - Claude Code worker\n` +
+          `  • Worker 2 - Claude Code worker\n\n` +
+          `📝 .loom/ will be added to .gitignore\n\n` +
+          `Continue?`,
+        {
+          title: "Initialize Loom in this workspace?",
+          type: "info",
+        }
       );
 
       if (!confirmed) {
@@ -494,28 +699,73 @@ async function handleWorkspacePathInput(path: string) {
         return;
       }
 
-      // Initialize workspace
-      const initialized = await initializeLoomWorkspace(expandedPath);
-      if (!initialized) {
-        console.log("[handleWorkspacePathInput] initialization failed");
+      // Initialize workspace using reset_workspace_to_defaults
+      try {
+        await invoke("reset_workspace_to_defaults", {
+          workspacePath: expandedPath,
+          defaultsPath: "defaults",
+        });
+        console.log("[handleWorkspacePathInput] Workspace initialized");
+      } catch (error) {
+        console.error("Failed to initialize workspace:", error);
+        alert(`Failed to initialize workspace: ${error}`);
         return;
+      }
+
+      // After initialization, create terminals for the default config
+      setConfigWorkspace(expandedPath);
+      const config = await loadConfig();
+      state.setNextAgentNumber(config.nextAgentNumber);
+
+      if (config.agents && config.agents.length > 0) {
+        console.log("[handleWorkspacePathInput] Creating terminals for fresh workspace");
+
+        // Create terminal sessions for each agent in the config
+        for (const agent of config.agents) {
+          try {
+            // Create terminal in daemon
+            const terminalId = await invoke<string>("create_terminal", {
+              name: agent.name,
+              workingDir: expandedPath,
+            });
+
+            // Update agent ID to match the newly created terminal
+            agent.id = terminalId;
+            console.log(
+              `[handleWorkspacePathInput] Created terminal ${agent.name} (${terminalId})`
+            );
+          } catch (error) {
+            console.error(
+              `[handleWorkspacePathInput] Failed to create terminal ${agent.name}:`,
+              error
+            );
+            alert(`Failed to create terminal ${agent.name}: ${error}`);
+          }
+        }
+
+        // Load agents into state with their new IDs
+        state.loadAgents(config.agents);
+
+        // Save the updated config with real terminal IDs
+        await saveConfig(config);
+        console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
+      }
+    } else {
+      // Workspace already initialized - load existing config
+      setConfigWorkspace(expandedPath);
+      const config = await loadConfig();
+      state.setNextAgentNumber(config.nextAgentNumber);
+
+      // Load agents from config
+      if (config.agents && config.agents.length > 0) {
+        state.loadAgents(config.agents);
+        // Reconnect agents to existing daemon terminals
+        await reconnectTerminals();
       }
     }
 
-    // Now load config from workspace
+    // Now set workspace as active
     state.setWorkspace(expandedPath);
-    console.log("[handleWorkspacePathInput] set workspace, loading config...");
-
-    setConfigWorkspace(expandedPath);
-    const config = await loadConfig();
-    state.setNextAgentNumber(config.nextAgentNumber);
-
-    // Load agents from config
-    if (config.agents && config.agents.length > 0) {
-      state.loadAgents(config.agents);
-      // Reconnect agents to existing daemon terminals
-      await reconnectTerminals();
-    }
     console.log("[handleWorkspacePathInput] workspace fully loaded");
 
     // Store workspace path for next app launch
@@ -811,20 +1061,25 @@ function setupEventListeners() {
         const id = target.getAttribute("data-terminal-id");
 
         if (id) {
-          if (confirm("Close this terminal?")) {
-            // Stop polling and clean up xterm.js instance
-            outputPoller.stopPolling(id);
-            terminalManager.destroyTerminal(id);
+          ask("Are you sure you want to close this terminal?", {
+            title: "Close Terminal",
+            type: "warning",
+          }).then((confirmed) => {
+            if (confirmed) {
+              // Stop polling and clean up xterm.js instance
+              outputPoller.stopPolling(id);
+              terminalManager.destroyTerminal(id);
 
-            // If this was the current attached terminal, clear it
-            if (currentAttachedTerminalId === id) {
-              currentAttachedTerminalId = null;
+              // If this was the current attached terminal, clear it
+              if (currentAttachedTerminalId === id) {
+                currentAttachedTerminalId = null;
+              }
+
+              // Remove from state
+              state.removeTerminal(id);
+              saveCurrentConfig();
             }
-
-            // Remove from state
-            state.removeTerminal(id);
-            saveCurrentConfig();
-          }
+          });
         }
         return;
       }

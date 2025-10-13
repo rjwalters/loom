@@ -8,6 +8,7 @@ use std::process::Command;
 use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
 
 mod daemon_client;
+mod daemon_manager;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
@@ -129,6 +130,59 @@ async fn check_session_health(id: String) -> Result<bool, String> {
         Response::SessionHealth { has_session } => Ok(has_session),
         Response::Error { message } => Err(message),
         _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn check_daemon_health() -> Result<bool, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::Ping)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Pong => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DaemonStatus {
+    running: bool,
+    socket_path: String,
+    error: Option<String>,
+}
+
+#[tauri::command]
+async fn get_daemon_status() -> DaemonStatus {
+    let socket_path = dirs::home_dir()
+        .map(|h| h.join(".loom/daemon.sock"))
+        .map_or_else(|| "Unknown".to_string(), |p| p.display().to_string());
+
+    match DaemonClient::new() {
+        Ok(client) => match client.send_request(Request::Ping).await {
+            Ok(Response::Pong) => DaemonStatus {
+                running: true,
+                socket_path,
+                error: None,
+            },
+            Ok(_) => DaemonStatus {
+                running: false,
+                socket_path,
+                error: Some("Daemon responded with unexpected response".to_string()),
+            },
+            Err(e) => DaemonStatus {
+                running: false,
+                socket_path,
+                error: Some(format!("Failed to ping daemon: {e}")),
+            },
+        },
+        Err(e) => DaemonStatus {
+            running: false,
+            socket_path,
+            error: Some(format!("Failed to create client: {e}")),
+        },
     }
 }
 
@@ -448,6 +502,54 @@ fn clear_stored_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Result<(), String> {
+    let workspace = Path::new(workspace_path);
+    let loom_path = workspace.join(".loom");
+
+    // Delete existing .loom directory
+    if loom_path.exists() {
+        fs::remove_dir_all(&loom_path).map_err(|e| format!("Failed to delete .loom: {e}"))?;
+    }
+
+    // Copy defaults back
+    let defaults = Path::new(defaults_path);
+    if !defaults.exists() {
+        return Err(format!("Defaults directory not found: {defaults_path}"));
+    }
+
+    copy_dir_recursive(defaults, &loom_path)
+        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+
+    // Add .loom/ to .gitignore (ensures it's present on both initialization and factory reset)
+    let gitignore_path = workspace.join(".gitignore");
+    let loom_entry = ".loom/\n";
+
+    // Check if .gitignore exists and if .loom/ is already in it
+    if gitignore_path.exists() {
+        let contents = fs::read_to_string(&gitignore_path)
+            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
+
+        if !contents.contains(".loom/") {
+            // Append .loom/ to .gitignore
+            let mut new_contents = contents;
+            if !new_contents.ends_with('\n') {
+                new_contents.push('\n');
+            }
+            new_contents.push_str(loom_entry);
+
+            fs::write(&gitignore_path, new_contents)
+                .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        }
+    } else {
+        // Create .gitignore with .loom/
+        fs::write(&gitignore_path, loom_entry)
+            .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
+    }
+
+    Ok(())
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -456,6 +558,8 @@ fn build_menu() -> Menu {
         CustomMenuItem::new("close_terminal", "Close Terminal").accelerator("CmdOrCtrl+Shift+W");
     let close_workspace =
         CustomMenuItem::new("close_workspace", "Close Workspace").accelerator("CmdOrCtrl+W");
+    let factory_reset_workspace =
+        CustomMenuItem::new("factory_reset_workspace", "Factory Reset Workspace...");
 
     let file_menu = Submenu::new(
         "File",
@@ -464,6 +568,7 @@ fn build_menu() -> Menu {
             .add_item(close_terminal)
             .add_native_item(MenuItem::Separator)
             .add_item(close_workspace)
+            .add_item(factory_reset_workspace)
             .add_native_item(MenuItem::Separator)
             .add_native_item(MenuItem::Quit),
     );
@@ -510,6 +615,7 @@ fn build_menu() -> Menu {
     let documentation = CustomMenuItem::new("documentation", "Documentation");
     let view_github = CustomMenuItem::new("view_github", "View on GitHub");
     let report_issue = CustomMenuItem::new("report_issue", "Report Issue");
+    let daemon_status = CustomMenuItem::new("daemon_status", "Daemon Status...");
     let keyboard_shortcuts =
         CustomMenuItem::new("keyboard_shortcuts", "Keyboard Shortcuts").accelerator("CmdOrCtrl+/");
 
@@ -520,6 +626,7 @@ fn build_menu() -> Menu {
             .add_item(view_github)
             .add_item(report_issue)
             .add_native_item(MenuItem::Separator)
+            .add_item(daemon_status)
             .add_item(keyboard_shortcuts),
     );
 
@@ -543,6 +650,9 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         }
         "close_workspace" => {
             let _ = event.window().emit("close-workspace", ());
+        }
+        "factory_reset_workspace" => {
+            let _ = event.window().emit("factory-reset-workspace", ());
         }
         "toggle_theme" => {
             let _ = event.window().emit("toggle-theme", ());
@@ -580,6 +690,9 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         "keyboard_shortcuts" => {
             let _ = event.window().emit("show-shortcuts", ());
         }
+        "daemon_status" => {
+            let _ = event.window().emit("show-daemon-status", ());
+        }
         _ => {}
     }
 }
@@ -591,30 +704,79 @@ fn main() {
     let menu = build_menu();
 
     if let Err(e) = tauri::Builder::default()
+        .setup(|app| {
+            // Check if we're in development or production mode
+            let is_production = !cfg!(debug_assertions);
+
+            eprintln!(
+                "[Loom] Starting in {} mode",
+                if is_production {
+                    "production"
+                } else {
+                    "development"
+                }
+            );
+
+            // Initialize daemon manager
+            let mut daemon_manager = daemon_manager::DaemonManager::new()
+                .map_err(|e| format!("Failed to create daemon manager: {e}"))?;
+
+            // Ensure daemon is running
+            tauri::async_runtime::block_on(async {
+                daemon_manager.ensure_daemon_running(is_production).await
+            })
+            .map_err(|e| format!("Failed to start/connect to daemon: {e}"))?;
+
+            // Store daemon manager in app state for cleanup on quit
+            app.manage(std::sync::Mutex::new(daemon_manager));
+
+            Ok(())
+        })
         .menu(menu)
         .on_menu_event(|event| handle_menu_event(&event))
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
-                // App is quitting - clean up all loom tmux sessions
-                eprintln!("App closing - cleaning up tmux sessions...");
+                // App is quitting - clean up resources
+                eprintln!("[Loom] App closing - cleaning up...");
 
-                // Kill all loom- tmux sessions
-                let _ = Command::new("tmux")
-                    .args(["list-sessions", "-F", "#{session_name}"])
-                    .output()
-                    .map(|output| {
-                        let sessions = String::from_utf8_lossy(&output.stdout);
-                        for session in sessions.lines() {
-                            if session.starts_with("loom-") {
-                                eprintln!("Killing tmux session: {session}");
-                                let _ = Command::new("tmux")
-                                    .args(["kill-session", "-t", session])
-                                    .spawn();
+                let is_production = !cfg!(debug_assertions);
+
+                // Get daemon manager from app state
+                if let Some(daemon_manager_mutex) = event
+                    .window()
+                    .try_state::<std::sync::Mutex<daemon_manager::DaemonManager>>()
+                {
+                    if let Ok(mut daemon_manager) = daemon_manager_mutex.lock() {
+                        // Kill daemon if we spawned it (production mode only)
+                        daemon_manager.kill_daemon();
+                    }
+                }
+
+                // Only kill tmux sessions in production mode
+                // In development, keep sessions alive for frontend hot reload reconnection
+                if is_production {
+                    eprintln!("[Loom] Production mode - cleaning up tmux sessions");
+                    let _ = Command::new("tmux")
+                        .args(["list-sessions", "-F", "#{session_name}"])
+                        .output()
+                        .map(|output| {
+                            let sessions = String::from_utf8_lossy(&output.stdout);
+                            for session in sessions.lines() {
+                                if session.starts_with("loom-") {
+                                    eprintln!("[Loom] Killing tmux session: {session}");
+                                    let _ = Command::new("tmux")
+                                        .args(["kill-session", "-t", session])
+                                        .spawn();
+                                }
                             }
-                        }
-                    });
+                        });
+                } else {
+                    eprintln!(
+                        "[Loom] Development mode - keeping tmux sessions alive for hot reload"
+                    );
+                }
 
-                eprintln!("Cleanup complete");
+                eprintln!("[Loom] Cleanup complete");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -634,13 +796,16 @@ fn main() {
             get_terminal_output,
             resize_terminal,
             check_session_health,
+            check_daemon_health,
+            get_daemon_status,
             list_available_sessions,
             attach_to_session,
             get_env_var,
             check_claude_code,
             get_stored_workspace,
             set_stored_workspace,
-            clear_stored_workspace
+            clear_stored_workspace,
+            reset_workspace_to_defaults
         ])
         .run(tauri::generate_context!())
     {

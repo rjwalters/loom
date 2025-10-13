@@ -23,5 +23,9 @@ Thumbs.db
 # Logs
 *.log
 
+# Daemon management
+.daemon.pid
+.daemon.log
+
 # Loom config (workspace-specific, not committed)
 .loom/
