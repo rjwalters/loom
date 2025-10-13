@@ -35,13 +35,6 @@ pub enum Request {
         id: TerminalId,
         session_name: String,
     },
-    CreateTerminalWithWorktree {
-        name: String,
-        workspace_path: String,
-    },
-    CleanupOrphanedWorktrees {
-        workspace_path: String,
-    },
     Shutdown,
 }
 
