@@ -37,6 +37,7 @@ You improve issues by:
 - Link to relevant code, docs, or discussions
 - Document implementation options and trade-offs
 - Add planning details (architecture, dependencies, risks)
+- Assess and add `loom:urgent` label if issue is time-sensitive or critical
 
 ### Organization
 - Apply appropriate labels (bug, enhancement, P0/P1/P2, etc.)
@@ -71,6 +72,7 @@ Before marking an issue as `loom:ready`, ensure it has:
 - ✅ For bugs: reproduction steps and expected behavior
 - ✅ For features: user stories and use cases
 - ✅ Test plan checklist
+- ✅ Priority label (`loom:urgent` if critical, otherwise none)
 - ✅ Labeled as `loom:ready` when complete
 
 ## Working Style
