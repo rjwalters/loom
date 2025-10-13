@@ -24,8 +24,8 @@
     "clippy:locked": "cargo clippy --workspace --all-targets --all-features --locked -- -D warnings",
     "clippy:fix": "cargo clippy --workspace --all-targets --all-features --fix --allow-dirty --allow-staged",
     "test": "cargo test --workspace --locked --all-features --no-fail-fast -- --nocapture",
-    "check:all": "npm run lint && npm run format:rust && npm run clippy && npm run check && npm run build",
-    "check:ci": "npm run lint && npm run format:rust && npm run clippy:locked && npm run check && npm run build && npm run test",
+    "check:all": "pnpm lint && pnpm format:rust && pnpm clippy && pnpm check && pnpm build",
+    "check:ci": "pnpm lint && pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm build && pnpm test",
     "prepare": "husky"
   },
   "repository": {

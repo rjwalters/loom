@@ -217,6 +217,42 @@ async fn attach_to_session(id: String, session_name: String) -> Result<(), Strin
 }
 
 #[tauri::command]
+async fn create_terminal_with_worktree(
+    name: String,
+    workspace_path: String,
+) -> Result<String, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::CreateTerminalWithWorktree {
+            name,
+            workspace_path,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::TerminalCreated { id } => Ok(id),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn cleanup_orphaned_worktrees(workspace_path: String) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::CleanupOrphanedWorktrees { workspace_path })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
 fn validate_git_repo(path: &str) -> Result<bool, String> {
     let workspace_path = Path::new(path);
 
@@ -800,6 +836,8 @@ fn main() {
             get_daemon_status,
             list_available_sessions,
             attach_to_session,
+            create_terminal_with_worktree,
+            cleanup_orphaned_worktrees,
             get_env_var,
             check_claude_code,
             get_stored_workspace,

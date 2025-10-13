@@ -1,6 +1,8 @@
 use crate::types::{TerminalId, TerminalInfo};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
@@ -69,6 +71,43 @@ impl TerminalManager {
         Ok(id)
     }
 
+    /// Create a terminal with its own git worktree for isolation
+    pub fn create_terminal_with_worktree(
+        &mut self,
+        name: String,
+        workspace_path: &Path,
+    ) -> Result<TerminalId> {
+        let id = Uuid::new_v4().to_string();
+
+        // Create worktree directory
+        let worktrees_dir = workspace_path.join(".loom/worktrees");
+        fs::create_dir_all(&worktrees_dir)?;
+
+        let worktree_path = worktrees_dir.join(&id);
+
+        log::info!("Creating git worktree at {}", worktree_path.display());
+
+        // Create git worktree
+        let worktree_path_str = worktree_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid worktree path: cannot convert to string"))?;
+        let output = Command::new("git")
+            .args(["worktree", "add", worktree_path_str, "HEAD"])
+            .current_dir(workspace_path)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("Failed to create worktree: {stderr}");
+            return Err(anyhow!("Failed to create git worktree: {stderr}"));
+        }
+
+        log::info!("Git worktree created successfully");
+
+        // Create terminal with worktree as working directory
+        self.create_terminal(name, Some(worktree_path.to_string_lossy().to_string()))
+    }
+
     pub fn list_terminals(&self) -> Vec<TerminalInfo> {
         self.terminals.values().cloned().collect()
     }
@@ -78,6 +117,36 @@ impl TerminalManager {
             .terminals
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        // If terminal has a worktree working directory, clean it up
+        if let Some(ref working_dir) = info.working_dir {
+            let path = PathBuf::from(working_dir);
+            // Check if this looks like a worktree path (.loom/worktrees/<id>)
+            if path.to_string_lossy().contains(".loom/worktrees") {
+                log::info!("Removing git worktree at {}", path.display());
+
+                // First try to remove the worktree via git
+                let output = Command::new("git")
+                    .args(["worktree", "remove", working_dir])
+                    .output();
+
+                if let Ok(output) = output {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        log::warn!("git worktree remove failed: {stderr}");
+                        log::info!("Attempting force removal...");
+
+                        // Try force removal
+                        let _ = Command::new("git")
+                            .args(["worktree", "remove", "--force", working_dir])
+                            .output();
+                    }
+                }
+
+                // Also try to remove directory manually as fallback
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
 
         // Stop pipe-pane (passing no command closes the pipe)
         let _ = Command::new("tmux")
@@ -223,6 +292,69 @@ impl TerminalManager {
                     });
             }
         }
+
+        Ok(())
+    }
+
+    /// Clean up orphaned worktrees (worktrees without matching terminal IDs)
+    pub fn cleanup_orphaned_worktrees(&self, workspace_path: &Path) -> Result<()> {
+        let worktrees_dir = workspace_path.join(".loom/worktrees");
+
+        // If worktrees directory doesn't exist, nothing to clean
+        if !worktrees_dir.exists() {
+            return Ok(());
+        }
+
+        log::info!("Scanning for orphaned worktrees in {}", worktrees_dir.display());
+
+        // Get list of known terminal IDs
+        let terminal_ids: std::collections::HashSet<String> =
+            self.terminals.keys().cloned().collect();
+
+        // Scan worktrees directory
+        let entries = fs::read_dir(&worktrees_dir)?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+
+            if path.is_dir() {
+                if let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Check if this worktree ID matches any terminal
+                    if !terminal_ids.contains(dir_name) {
+                        log::info!("Found orphaned worktree: {}", path.display());
+                        log::info!("Removing orphaned worktree...");
+
+                        // Try to remove via git first
+                        let path_str = path.to_string_lossy();
+                        let output = Command::new("git")
+                            .args(["worktree", "remove", "--force", &path_str])
+                            .current_dir(workspace_path)
+                            .output();
+
+                        if let Ok(output) = output {
+                            if !output.status.success() {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                log::warn!("git worktree remove failed: {stderr}");
+                            }
+                        }
+
+                        // Remove directory as fallback
+                        if path.exists() {
+                            let _ = fs::remove_dir_all(&path);
+                        }
+
+                        log::info!("Orphaned worktree removed");
+                    }
+                }
+            }
+        }
+
+        // Also prune stale worktree references in git
+        let _ = Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(workspace_path)
+            .output();
 
         Ok(())
     }
