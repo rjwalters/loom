@@ -62,8 +62,22 @@ When creating proposals from codebase scans:
 2. **Document the problem**: Explain what needs improvement and why
 3. **Propose solutions**: Include multiple approaches with trade-offs
 4. **Estimate impact**: Complexity, risks, dependencies
-5. **Create the issue**: Use `gh issue create`
-6. **Add proposal label**: Run `gh issue edit <number> --add-label "loom:proposal"`
+5. **Assess priority**: Determine if `loom:urgent` label is warranted
+6. **Create the issue**: Use `gh issue create`
+7. **Add proposal label**: Run `gh issue edit <number> --add-label "loom:proposal"`
+
+### Priority Assessment
+
+When creating issues, consider whether the `loom:urgent` label is needed:
+
+- **Default**: No priority label (most issues)
+- **Add `loom:urgent`** only if:
+  - Critical bug affecting users NOW
+  - Security vulnerability requiring immediate patch
+  - Blocks all other work
+  - Production issue that needs hotfix
+
+**Note**: Use urgent sparingly. When in doubt, leave as normal priority and let the user decide
 
 ## Issue Template
 

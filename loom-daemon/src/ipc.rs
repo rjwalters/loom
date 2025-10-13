@@ -186,35 +186,6 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             }
         }
 
-        Request::CreateTerminalWithWorktree {
-            name,
-            workspace_path,
-        } => {
-            let mut tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            let path = std::path::Path::new(&workspace_path);
-            match tm.create_terminal_with_worktree(name, path) {
-                Ok(id) => Response::TerminalCreated { id },
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
-            }
-        }
-
-        Request::CleanupOrphanedWorktrees { workspace_path } => {
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
-            let path = std::path::Path::new(&workspace_path);
-            match tm.cleanup_orphaned_worktrees(path) {
-                Ok(()) => Response::Success,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
-            }
-        }
-
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);

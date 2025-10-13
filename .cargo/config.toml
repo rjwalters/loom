@@ -30,6 +30,9 @@ rustflags = [
     "-W", "clippy::todo",
     "-W", "clippy::unimplemented",
 
+    # Warn on dead code (unused functions, variables, etc.)
+    "-W", "dead_code",
+
     # Allow some pedantic lints that are too noisy
     "-A", "clippy::missing_errors_doc",
     "-A", "clippy::missing_panics_doc",

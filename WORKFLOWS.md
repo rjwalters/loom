@@ -14,6 +14,32 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 
 See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed documentation.
 
+## Priority System
+
+Issues can have an optional priority label to ensure urgent work gets immediate attention:
+
+| Priority | Label | Worker Behavior |
+|----------|-------|-----------------|
+| 🔴 **Urgent** | `loom:urgent` | Workers check first, before all other issues |
+| 🟢 **Normal** | *(no priority label)* | Workers use FIFO (oldest first) |
+
+### Who Can Add Priority Labels?
+
+- **User**: Ultimate authority, can add any time
+- **Architect**: Can suggest during triage
+- **Curator**: Can add when enhancing issues
+- **Worker**: Should NOT add (conflict of interest)
+
+### When to Use Urgent Priority
+
+Use `loom:urgent` sparingly for:
+- Security vulnerabilities requiring immediate patches
+- Critical bugs affecting users or blocking all other work
+- Production issues that need hotfixes
+- Time-sensitive work that cannot wait
+
+**Most issues should be normal priority** (no label). Urgent means "must be done NOW, before anything else."
+
 ## Agent Types
 
 ### 1. Architect Bot

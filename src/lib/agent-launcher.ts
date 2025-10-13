@@ -11,7 +11,8 @@ import { invoke } from "@tauri-apps/api/tauri";
  * @param roleFile - The role file to use (e.g., "worker.md")
  * @param workspacePath - The workspace path for the agent
  * @param worktreePath - Optional worktree path for isolated work (defaults to workspace)
- * @returns Promise that resolves when the command is sent
+ * @param useWorktree - Whether to create a worktree for isolation (default: false)
+ * @returns Promise that resolves with the working directory path that was used
  */
 export async function launchAgentInTerminal(
   terminalId: string,
