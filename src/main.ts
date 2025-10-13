@@ -364,7 +364,7 @@ async function showDaemonStatusDialog() {
 
     const statusText = status.running
       ? "✅ Running"
-      : "❌ Not Running" + (status.error ? `\n\nError: ${status.error}` : "");
+      : `❌ Not Running${status.error ? `\n\nError: ${status.error}` : ""}`;
 
     const workspace = state.getWorkspace();
     const hasWorkspace = workspace !== null && workspace !== "";

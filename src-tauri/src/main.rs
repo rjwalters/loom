@@ -158,8 +158,7 @@ struct DaemonStatus {
 async fn get_daemon_status() -> DaemonStatus {
     let socket_path = dirs::home_dir()
         .map(|h| h.join(".loom/daemon.sock"))
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
+        .map_or_else(|| "Unknown".to_string(), |p| p.display().to_string());
 
     match DaemonClient::new() {
         Ok(client) => match client.send_request(Request::Ping).await {
@@ -176,13 +175,13 @@ async fn get_daemon_status() -> DaemonStatus {
             Err(e) => DaemonStatus {
                 running: false,
                 socket_path,
-                error: Some(format!("Failed to ping daemon: {}", e)),
+                error: Some(format!("Failed to ping daemon: {e}")),
             },
         },
         Err(e) => DaemonStatus {
             running: false,
             socket_path,
-            error: Some(format!("Failed to create client: {}", e)),
+            error: Some(format!("Failed to create client: {e}")),
         },
     }
 }
@@ -720,13 +719,13 @@ fn main() {
 
             // Initialize daemon manager
             let mut daemon_manager = daemon_manager::DaemonManager::new()
-                .map_err(|e| format!("Failed to create daemon manager: {}", e))?;
+                .map_err(|e| format!("Failed to create daemon manager: {e}"))?;
 
             // Ensure daemon is running
             tauri::async_runtime::block_on(async {
                 daemon_manager.ensure_daemon_running(is_production).await
             })
-            .map_err(|e| format!("Failed to start/connect to daemon: {}", e))?;
+            .map_err(|e| format!("Failed to start/connect to daemon: {e}"))?;
 
             // Store daemon manager in app state for cleanup on quit
             app.manage(std::sync::Mutex::new(daemon_manager));

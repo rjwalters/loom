@@ -26,10 +26,7 @@ impl DaemonManager {
     /// Check if daemon is already running by attempting to ping it
     pub async fn is_daemon_running(&self) -> bool {
         match DaemonClient::new() {
-            Ok(client) => match client.send_request(Request::Ping).await {
-                Ok(Response::Pong) => true,
-                _ => false,
-            },
+            Ok(client) => matches!(client.send_request(Request::Ping).await, Ok(Response::Pong)),
             Err(_) => false,
         }
     }
@@ -40,12 +37,12 @@ impl DaemonManager {
 
         let child = Command::new(daemon_path)
             .spawn()
-            .map_err(|e| anyhow!("Failed to spawn daemon: {}", e))?;
+            .map_err(|e| anyhow!("Failed to spawn daemon: {e}"))?;
 
         self.daemon_process = Some(child);
         eprintln!(
             "[DaemonManager] Daemon process spawned with PID: {:?}",
-            self.daemon_process.as_ref().map(|p| p.id())
+            self.daemon_process.as_ref().map(std::process::Child::id)
         );
 
         Ok(())
@@ -60,7 +57,7 @@ impl DaemonManager {
 
         loop {
             if start.elapsed() > timeout {
-                return Err(anyhow!("Daemon failed to start within {} seconds", timeout_secs));
+                return Err(anyhow!("Daemon failed to start within {timeout_secs} seconds"));
             }
 
             // Check if socket exists
