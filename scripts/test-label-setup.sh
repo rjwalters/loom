@@ -28,10 +28,10 @@ fi
 echo "✅ Prerequisites check passed"
 echo
 
-# Test labels (from WORKFLOWS.md)
-declare -a LABEL_NAMES=("loom:architect-suggestion" "loom:accepted" "loom:ready" "loom:in-progress" "loom:blocked" "loom:review-requested" "loom:reviewing")
-declare -a LABEL_DESCS=("Triaged issue awaiting user approval" "User-approved issue awaiting Curator enhancement" "Enhanced issue ready for Worker implementation" "Issue currently being implemented by Worker" "Implementation blocked, needs help or clarification" "PR ready for Reviewer code review" "PR currently under Reviewer code review")
-declare -a LABEL_COLORS=("8B5CF6" "10B981" "3B82F6" "F59E0B" "EF4444" "06B6D4" "8B5CF6")
+# Test labels (from scripts/LABEL_WORKFLOW.md)
+declare -a LABEL_NAMES=("loom:issue" "loom:ready" "loom:in-progress" "loom:pr" "loom:blocked")
+declare -a LABEL_DESCS=("New issue awaiting user triage/approval" "Issue ready for Worker OR PR ready for Reviewer" "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback" "PR approved by Reviewer, ready for human to merge" "Implementation blocked, needs help or clarification")
+declare -a LABEL_COLORS=("3B82F6" "10B981" "F59E0B" "3B82F6" "EF4444")
 
 echo "=== Checking Existing Labels ==="
 for i in "${!LABEL_NAMES[@]}"; do

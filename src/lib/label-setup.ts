@@ -14,43 +14,42 @@ export interface LabelDefinition {
 }
 
 /**
- * Standard Loom workflow labels based on WORKFLOWS.md
+ * Standard Loom workflow labels
+ *
+ * See scripts/LABEL_WORKFLOW.md for complete documentation.
+ *
+ * Color semantics:
+ * - Blue: Human action needed
+ * - Green: Loom bot action needed
+ * - Amber: Work in progress
+ * - Red: Blocked/needs help
  */
 export const LOOM_LABELS: LabelDefinition[] = [
   {
-    name: "loom:architect-suggestion",
-    description: "Triaged issue awaiting user approval",
-    color: "8B5CF6", // Purple - suggestions/ideas
-  },
-  {
-    name: "loom:accepted",
-    description: "User-approved issue awaiting Curator enhancement",
-    color: "10B981", // Green - approved/ready to proceed
+    name: "loom:issue",
+    description: "New issue awaiting user triage/approval",
+    color: "3B82F6", // Blue - human action needed
   },
   {
     name: "loom:ready",
-    description: "Enhanced issue ready for Worker implementation",
-    color: "3B82F6", // Blue - ready for work
+    description: "Issue ready for Worker OR PR ready for Reviewer",
+    color: "10B981", // Green - Loom bot action needed
   },
   {
     name: "loom:in-progress",
-    description: "Issue currently being implemented by Worker",
-    color: "F59E0B", // Amber - active work
+    description:
+      "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback",
+    color: "F59E0B", // Amber - work in progress
+  },
+  {
+    name: "loom:pr",
+    description: "PR approved by Reviewer, ready for human to merge",
+    color: "3B82F6", // Blue - human action needed
   },
   {
     name: "loom:blocked",
     description: "Implementation blocked, needs help or clarification",
     color: "EF4444", // Red - attention needed
-  },
-  {
-    name: "loom:review-requested",
-    description: "PR ready for Reviewer code review",
-    color: "06B6D4", // Cyan - review stage
-  },
-  {
-    name: "loom:reviewing",
-    description: "PR currently under Reviewer code review",
-    color: "8B5CF6", // Purple - review in progress
   },
 ];
 
