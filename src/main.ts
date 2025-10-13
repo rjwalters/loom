@@ -94,8 +94,19 @@ async function initializeTerminalDisplay(terminalId: string) {
   }
 
   // Check if terminal already exists
-  if (terminalManager.getTerminal(terminalId)) {
-    // Terminal already exists, just ensure polling is active
+  const existingManaged = terminalManager.getTerminal(terminalId);
+  if (existingManaged) {
+    // Terminal already exists - need to re-attach xterm to new DOM element
+    const newContainer = document.getElementById(containerId);
+    if (newContainer) {
+      console.log(
+        `[initializeTerminalDisplay] Re-attaching xterm to new DOM element for terminal ${terminalId}`
+      );
+      existingManaged.terminal.open(newContainer);
+      existingManaged.fitAddon.fit();
+    }
+
+    // Ensure polling is active for this terminal
     if (currentAttachedTerminalId !== terminalId) {
       // Stop polling previous terminal
       if (currentAttachedTerminalId) {
@@ -253,6 +264,18 @@ listen("factory-reset-workspace", async () => {
 
   // Destroy all xterm instances
   terminalManager.destroyAll();
+
+  // Destroy all terminal sessions in daemon (clean up tmux sessions)
+  console.log(`[factory-reset-workspace] Destroying ${terminals.length} terminal sessions`);
+  for (const terminal of terminals) {
+    try {
+      await invoke("destroy_terminal", { id: terminal.id });
+      console.log(`[factory-reset-workspace] Destroyed terminal ${terminal.name} (${terminal.id})`);
+    } catch (error) {
+      console.warn(`[factory-reset-workspace] Failed to destroy terminal ${terminal.id}:`, error);
+      // Continue anyway - we'll create fresh terminals
+    }
+  }
 
   // Call backend reset
   try {

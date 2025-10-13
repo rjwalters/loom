@@ -248,6 +248,29 @@ impl TerminalManager {
             if let Some(uuid_part) = session.strip_prefix("loom-") {
                 let id = uuid_part.to_string();
 
+                // Clear any existing pipe-pane for this session to avoid duplicates
+                log::debug!("Clearing existing pipe-pane for session {session}");
+                let _ = Command::new("tmux")
+                    .args(["pipe-pane", "-t", session])
+                    .spawn();
+
+                // Set up fresh pipe-pane to capture output
+                let output_file = format!("/tmp/loom-{uuid_part}.out");
+                let pipe_cmd = format!("cat >> {output_file}");
+
+                log::info!("Setting up pipe-pane for session {session} to {output_file}");
+                let result = Command::new("tmux")
+                    .args(["pipe-pane", "-t", session, "-o", &pipe_cmd])
+                    .output()?;
+
+                if !result.status.success() {
+                    let stderr = String::from_utf8_lossy(&result.stderr);
+                    log::warn!("pipe-pane setup failed for {session}: {stderr}");
+                    // Continue anyway - terminal is still usable
+                } else {
+                    log::info!("pipe-pane setup successful for {session}");
+                }
+
                 self.terminals
                     .entry(id.clone())
                     .or_insert_with(|| TerminalInfo {

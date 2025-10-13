@@ -98,18 +98,10 @@ export class OutputPoller {
       // Get new bytes since last poll (or all bytes on first poll)
       const startByte = state.lastByteCount > 0 ? state.lastByteCount : null;
 
-      console.log(
-        `[poller] Polling terminal ${state.terminalId}, startByte=${startByte}, lastByteCount=${state.lastByteCount}`
-      );
-
       const result = await invoke<TerminalOutput>("get_terminal_output", {
         id: state.terminalId,
         startByte,
       });
-
-      console.log(
-        `[poller] Received: output.length=${result.output.length}, byte_count=${result.byte_count}`
-      );
 
       // Decode base64 output and write to xterm.js terminal
       if (result.output && result.output.length > 0) {
@@ -134,9 +126,8 @@ export class OutputPoller {
           console.log(`[poller] Incremental update - writing to terminal ${state.terminalId}`);
           terminalManager.writeToTerminal(state.terminalId, text);
         }
-      } else {
-        console.log(`[poller] No output to write (empty or null)`);
       }
+      // Silently ignore empty polls - this is normal and expected
 
       // Update byte offset for next poll
       state.lastByteCount = result.byte_count;
