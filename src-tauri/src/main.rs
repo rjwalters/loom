@@ -450,7 +450,8 @@ fn clear_stored_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Result<(), String> {
-    let loom_path = Path::new(workspace_path).join(".loom");
+    let workspace = Path::new(workspace_path);
+    let loom_path = workspace.join(".loom");
 
     // Delete existing .loom directory
     if loom_path.exists() {
@@ -465,6 +466,32 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
 
     copy_dir_recursive(defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+
+    // Add .loom/ to .gitignore (ensures it's present on both initialization and factory reset)
+    let gitignore_path = workspace.join(".gitignore");
+    let loom_entry = ".loom/\n";
+
+    // Check if .gitignore exists and if .loom/ is already in it
+    if gitignore_path.exists() {
+        let contents = fs::read_to_string(&gitignore_path)
+            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
+
+        if !contents.contains(".loom/") {
+            // Append .loom/ to .gitignore
+            let mut new_contents = contents;
+            if !new_contents.ends_with('\n') {
+                new_contents.push('\n');
+            }
+            new_contents.push_str(loom_entry);
+
+            fs::write(&gitignore_path, new_contents)
+                .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
+        }
+    } else {
+        // Create .gitignore with .loom/
+        fs::write(&gitignore_path, loom_entry)
+            .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
+    }
 
     Ok(())
 }

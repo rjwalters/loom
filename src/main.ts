@@ -411,26 +411,6 @@ async function browseWorkspace() {
   }
 }
 
-// Initialize Loom in workspace
-async function initializeLoomWorkspace(workspacePath: string): Promise<boolean> {
-  try {
-    // In dev mode, use relative path from cwd (project root)
-    // TODO: For production, bundle defaults as a resource
-    const defaultsPath = "defaults";
-
-    await invoke("initialize_loom_workspace", {
-      path: workspacePath,
-      defaultsPath: defaultsPath,
-    });
-
-    return true;
-  } catch (error) {
-    console.error("Failed to initialize workspace:", error);
-    alert(`Failed to initialize workspace: ${error}`);
-    return false;
-  }
-}
-
 // Create a plain shell terminal
 async function createPlainTerminal() {
   const workspacePath = state.getWorkspace();
@@ -545,13 +525,21 @@ async function handleWorkspacePathInput(path: string) {
     console.log("[handleWorkspacePathInput] isInitialized:", isInitialized);
 
     if (!isInitialized) {
-      // Ask user to confirm initialization
+      // Ask user to confirm initialization with detailed information
       const confirmed = confirm(
         `Initialize Loom in this workspace?\n\n` +
-          `This will:\n` +
-          `• Create .loom/ directory with default configuration\n` +
-          `• Add .loom/ to .gitignore\n` +
-          `• Set up 3 default agents\n\n` +
+          `This will create:\n\n` +
+          `📁 .loom/ directory with:\n` +
+          `  • config.json - Terminal configuration\n` +
+          `  • roles/ - Agent role definitions\n\n` +
+          `🤖 6 Default Terminals:\n` +
+          `  • Shell - Plain shell (primary)\n` +
+          `  • Architect - Claude Code worker\n` +
+          `  • Curator - Claude Code worker\n` +
+          `  • Reviewer - Claude Code worker\n` +
+          `  • Worker 1 - Claude Code worker\n` +
+          `  • Worker 2 - Claude Code worker\n\n` +
+          `📝 .loom/ will be added to .gitignore\n\n` +
           `Continue?`
       );
 
@@ -560,10 +548,16 @@ async function handleWorkspacePathInput(path: string) {
         return;
       }
 
-      // Initialize workspace
-      const initialized = await initializeLoomWorkspace(expandedPath);
-      if (!initialized) {
-        console.log("[handleWorkspacePathInput] initialization failed");
+      // Initialize workspace using reset_workspace_to_defaults
+      try {
+        await invoke("reset_workspace_to_defaults", {
+          workspacePath: expandedPath,
+          defaultsPath: "defaults",
+        });
+        console.log("[handleWorkspacePathInput] Workspace initialized");
+      } catch (error) {
+        console.error("Failed to initialize workspace:", error);
+        alert(`Failed to initialize workspace: ${error}`);
         return;
       }
     }
