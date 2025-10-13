@@ -17,41 +17,40 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed document
 ## Agent Types
 
 ### 1. Architect Bot
-**Role**: Universal triage gatekeeper + improvement proposal generator
+**Role**: Improvement proposal generator
 
-**Watches for**:
-- Unlabeled issues (created by anyone - User, Worker, Reviewer, or Architect's own scans)
+**Watches for**: N/A (proactively scans codebase)
 
 **Creates**:
-- Unlabeled issues from codebase scans
-- Adds `loom:issue` label after triaging issues
+- Issues with `loom:proposal` label (blue badge - awaiting user approval)
 
 **Interval**: 15 minutes (recommended autonomous)
 
-**Scope**: The Architect has two activities:
-1. **Triage unlabeled issues**: Review ALL unlabeled issues, add `loom:issue` if viable or close if not
-2. **Create new suggestions** (if no unlabeled issues exist): Scan codebase across all domains:
-   - **Architecture & Features**: New features, API design, system improvements
-   - **Code Quality**: Refactoring, consistency, duplication, unused code
-   - **Documentation**: Outdated docs, missing explanations, API documentation
-   - **Testing**: Missing coverage, flaky tests, edge cases
-   - **CI/Build/Tooling**: Failing jobs, slow builds, outdated dependencies
-   - **Performance & Security**: Optimizations, vulnerabilities, resource leaks
+**Scope**: Scans codebase across all domains:
+- **Architecture & Features**: New features, API design, system improvements
+- **Code Quality**: Refactoring, consistency, duplication, unused code
+- **Documentation**: Outdated docs, missing explanations, API documentation
+- **Testing**: Missing coverage, flaky tests, edge cases
+- **CI/Build/Tooling**: Failing jobs, slow builds, outdated dependencies
+- **Performance & Security**: Optimizations, vulnerabilities, resource leaks
 
 **Workflow**:
 ```
-1. Check for unlabeled issues (gh issue list --label="")
-2. If found: Triage each one - add loom:issue or close
-3. If none: Scan codebase and create new unlabeled issue
-4. Self-triage: Add loom:issue to own issues
-5. Wait for user to remove loom:issue label (approval)
+1. Check if there are already 3+ open proposals (don't spam)
+2. If < 3 proposals: Scan codebase for improvement opportunities
+3. Create comprehensive issue with proposal
+4. Add loom:proposal label immediately (blue badge)
+5. Wait for user to remove loom:proposal label (approval)
 ```
+
+**Important**: Architect does NOT triage issues created by others. Only creates proposals.
 
 ### 2. Curator Bot
 **Role**: Enhances approved issues and marks them ready for implementation
 
 **Watches for**:
-- Unlabeled issues (no `loom:issue` label = user approved)
+- Issues without `loom:proposal` label (user has approved them)
+- Excludes issues already marked `loom:ready` or `loom:in-progress`
 
 **Creates**:
 - `loom:ready` - Issues ready for worker implementation
@@ -60,7 +59,7 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed document
 
 **Workflow**:
 ```
-1. Find unlabeled issues (user has removed loom:issue = approved)
+1. Find approved issues (no loom:proposal label, not yet ready/in-progress)
 2. Review issue description and requirements
 3. Add implementation details, test plans, code references
 4. Document multiple implementation options if complex
@@ -75,7 +74,6 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed document
 
 **Creates**:
 - `loom:in-progress` - Claims issue for implementation
-- Unlabeled issues - When discovering problems or opportunities during work
 - `loom:ready` - PRs ready for Reviewer
 - `loom:blocked` - When stuck on implementation
 
@@ -89,7 +87,6 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed document
 4. Create PR with "Closes #X", add loom:ready (green - ready for Reviewer)
 5. Monitor PR and address Reviewer feedback
 6. If blocked: add loom:blocked with explanation
-7. If discover issues: create unlabeled issue (Architect will triage)
 ```
 
 ### 4. Reviewer Bot
@@ -101,7 +98,6 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed document
 **Creates**:
 - `loom:in-progress` - Claims PR for review (amber)
 - `loom:pr` - Approved PRs ready for human to merge (blue)
-- Unlabeled issues - Bugs or problems discovered in existing code
 
 **Interval**: 5 minutes (recommended autonomous)
 
@@ -112,7 +108,6 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed document
 3. Check out branch, run tests, review code
 4. If changes needed: gh pr review --request-changes, keep loom:in-progress
 5. If approved: gh pr review --approve, remove loom:in-progress, add loom:pr (blue)
-6. If discover bug in existing code: create unlabeled issue (Architect will triage)
 ```
 
 ### 5. Issues Bot
@@ -144,143 +139,62 @@ No automation. Used for manual git operations, system commands, etc.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ 1. ARCHITECT CREATES SUGGESTION                             │
-│    gh issue create (no label)                               │
+│ 1. ARCHITECT CREATES PROPOSAL                               │
+│    gh issue create                                          │
 │    Title: "Add search functionality to terminal history"    │
-│    gh issue edit <#> --add-label "loom:architect-suggestion"│
+│    gh issue edit <#> --add-label "loom:proposal"            │
+│    (Blue badge - awaiting user approval)                    │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ 2. USER REVIEWS AND ACCEPTS                                 │
-│    Reviews issue with loom:architect-suggestion             │
-│    Adds loom:accepted label to proceed                      │
+│ 2. USER REVIEWS AND APPROVES                                │
+│    Reviews issue with loom:proposal (blue badge)            │
+│    Removes loom:proposal label to approve                   │
+│    (Or closes issue to reject)                              │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 3. CURATOR ENHANCES ISSUE                                   │
-│    Finds loom:accepted issue #42                            │
+│    Finds approved issue #42 (no loom:proposal)              │
 │    Adds implementation details:                             │
 │    - Multiple implementation options                        │
 │    - Dependencies and risks                                 │
 │    - Test plan checklist                                    │
-│    Removes loom:accepted, adds loom:ready                   │
+│    Adds loom:ready (green badge)                            │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 4. WORKER IMPLEMENTS                                        │
-│    Finds loom:ready issue #42                               │
-│    Updates: removes loom:ready, adds loom:in-progress      │
+│    Finds loom:ready issue #42 (green badge)                 │
+│    Updates: removes loom:ready, adds loom:in-progress       │
+│    (Amber badge)                                            │
 │    Implements feature, writes tests                         │
-│    Creates PR: "Closes #42", adds loom:review-requested    │
+│    Creates PR: "Closes #42", adds loom:ready                │
+│    (Green badge - ready for review)                         │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 5. REVIEWER REVIEWS PR                                      │
-│    Finds loom:review-requested PR #50                       │
-│    Updates: removes loom:review-requested, adds reviewing   │
+│    Finds loom:ready PR #50 (green badge)                    │
+│    Updates: removes loom:ready, adds loom:in-progress       │
+│    (Amber badge - reviewing)                                │
 │    Checks out branch, runs tests                            │
 │    Reviews code, provides feedback                          │
 │    Approves: gh pr review --approve                         │
-│    Removes loom:reviewing                                   │
+│    Removes loom:in-progress, adds loom:pr                   │
+│    (Blue badge - ready for user to merge)                   │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 6. USER MERGES PR                                           │
-│    Reviews approved PR                                      │
+│    Reviews loom:pr PR (blue badge)                          │
 │    Merges to main                                           │
 │    Issue #42 automatically closes                           │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Feedback Loop: Worker Discovers Refactoring Opportunity
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Worker implements issue #42                                 │
-│ Discovers: State management scattered across files         │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Worker completes #42, then creates unlabeled issue:         │
-│ gh issue create (no label)                                  │
-│ Title: "Refactor state management to use reducer pattern"   │
-│ Documents: problem, current code, proposed solution         │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Architect triages unlabeled issue                           │
-│ Evaluates priority and scope                                │
-│ Adds loom:architect-suggestion                              │
-│ Adds comment with guidance                                  │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ User reviews loom:architect-suggestion                      │
-│ Adds loom:accepted to proceed                               │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Curator processes loom:accepted refactor issue              │
-│ Adds implementation details                                 │
-│ Removes loom:accepted, adds loom:ready                      │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Another worker picks up loom:ready refactor                 │
-│ Implements, creates PR, requests review...                  │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Feedback Loop: Reviewer Discovers Bug
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Reviewer reviews PR #50                                     │
-│ Discovers bug in existing code (not introduced by this PR)  │
-│ Bug: Terminal output corrupted with special characters      │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Reviewer completes PR review, then creates unlabeled issue: │
-│ gh issue create (no label)                                  │
-│ Documents: reproduction, impact, root cause analysis        │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Architect triages unlabeled issue                           │
-│ Evaluates severity and priority                             │
-│ Adds loom:architect-suggestion                              │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ User reviews loom:architect-suggestion                      │
-│ Adds loom:accepted to proceed                               │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Curator processes loom:accepted bug issue                   │
-│ Adds test cases, acceptance criteria                        │
-│ Removes loom:accepted, adds loom:ready                      │
-└─────────────────────┬───────────────────────────────────────┘
-                      │
-                      ↓
-┌─────────────────────────────────────────────────────────────┐
-│ Worker picks up loom:ready bug fix                          │
-│ Fixes bug, adds tests, creates PR...                        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -288,46 +202,41 @@ No automation. Used for manual git operations, system commands, etc.
 
 | Label | Color | Used On | Created By | Meaning |
 |-------|-------|---------|-----------|---------|
-| (no label) | - | Issues | Anyone | Unreviewed issue - created by User, Worker, Reviewer, or Architect's scan |
-| `loom:issue` | 🔵 Blue | Issues | Architect | Triaged issue awaiting user approval |
+| `loom:proposal` | 🔵 Blue | Issues | Architect | Proposal awaiting user approval |
 | `loom:ready` | 🟢 Green | Issues & PRs | Curator (issues) / Worker (PRs) | Issue ready for Worker OR PR ready for Reviewer |
 | `loom:in-progress` | 🟡 Amber | Issues & PRs | Worker / Reviewer | Issue: Worker implementing<br>PR: Reviewer reviewing OR Worker addressing feedback |
 | `loom:pr` | 🔵 Blue | PRs | Reviewer | Approved PR ready for human to merge |
 | `loom:blocked` | 🔴 Red | Issues | Worker | Implementation blocked, needs help |
 
 **Key insights**:
-- **Blue badges** = Human action needed
-- **Green badges** = Bot action needed
-- **Amber badges** = Work in progress
-- Users control the flow by removing `loom:issue` to approve suggestions.
+- **Blue badges** (`loom:proposal`, `loom:pr`) = Human action needed
+- **Green badges** (`loom:ready`) = Bot action needed
+- **Amber badges** (`loom:in-progress`) = Work in progress
+- Users control the flow by removing `loom:proposal` to approve Architect suggestions.
 
 ## Commands Reference
 
 ### Architect
 ```bash
-# Find unlabeled issues to triage
-gh issue list --label="" --state=open
+# Check existing proposals (don't spam)
+gh issue list --label="loom:proposal" --state=open
 
-# Triage an issue (add blue badge)
-gh issue edit <number> --add-label "loom:issue"
-
-# Reject non-viable issue
-gh issue close <number> --comment "Explanation of why not viable"
-
-# Create new improvement suggestion (any domain)
+# Create new improvement proposal (any domain)
 gh issue create --title "..." --body "..."
-gh issue edit <number> --add-label "loom:issue"
+
+# Add proposal label (blue badge - awaiting user approval)
+gh issue edit <number> --add-label "loom:proposal"
 ```
 
 ### User (Manual)
 ```bash
-# Find issues awaiting approval (blue badges)
-gh issue list --label="loom:issue" --state=open
+# Find proposals awaiting approval (blue badges)
+gh issue list --label="loom:proposal" --state=open
 
-# Approve an issue (remove blue badge)
-gh issue edit <number> --remove-label "loom:issue"
+# Approve a proposal (remove blue badge)
+gh issue edit <number> --remove-label "loom:proposal"
 
-# Reject an issue
+# Reject a proposal
 gh issue close <number> --comment "Not needed because..."
 
 # Find PRs ready to merge (blue badges)
@@ -339,8 +248,9 @@ gh pr merge <number>
 
 ### Curator
 ```bash
-# Find approved issues (unlabeled, not loom:issue)
-gh issue list --state=open | grep -v "loom:"
+# Find approved issues (no loom:proposal, not yet ready/in-progress)
+gh issue list --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name] | inside(["loom:proposal", "loom:ready", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 
 # Mark issue as ready (add green badge)
 gh issue edit <number> --add-label "loom:ready"
@@ -360,9 +270,6 @@ gh pr create --title "..." --body "Closes #X" --label "loom:ready"
 # Mark blocked (amber → red)
 gh issue edit <number> --add-label "loom:blocked"
 gh issue comment <number> --body "Blocked because..."
-
-# Discover new issue during work (Architect will triage)
-gh issue create --title "..." --body "..."
 ```
 
 ### Reviewer
@@ -377,15 +284,13 @@ gh pr edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"
 gh pr checkout <number>
 pnpm check:all
 
-# Provide review
+# Approve PR
 gh pr review <number> --approve --body "LGTM!"
 gh pr edit <number> --remove-label "loom:in-progress" --add-label "loom:pr"
 
+# Request changes
 gh pr review <number> --request-changes --body "Issues found..."
 # Keep loom:in-progress - Worker will address
-
-# Discover bug in existing code (Architect will triage)
-gh issue create --title "..." --body "..."
 ```
 
 ## Configuration
