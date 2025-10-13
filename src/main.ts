@@ -144,7 +144,28 @@ async function initializeApp() {
 // Re-render on state changes
 state.onChange(render);
 
-// Listen for close workspace events from menu
+// Listen for menu events
+listen("new-terminal", () => {
+  if (state.getWorkspace()) {
+    createPlainTerminal();
+  }
+});
+
+listen("close-terminal", () => {
+  const primary = state.getPrimary();
+  if (primary) {
+    if (confirm("Close this terminal?")) {
+      outputPoller.stopPolling(primary.id);
+      terminalManager.destroyTerminal(primary.id);
+      if (currentAttachedTerminalId === primary.id) {
+        currentAttachedTerminalId = null;
+      }
+      state.removeTerminal(primary.id);
+      saveCurrentConfig();
+    }
+  }
+});
+
 listen("close-workspace", async () => {
   console.log("[close-workspace] Closing workspace");
 
@@ -170,6 +191,44 @@ listen("close-workspace", async () => {
   // Re-render to show workspace picker
   console.log("[close-workspace] Rendering workspace picker");
   render();
+});
+
+listen("toggle-theme", () => {
+  toggleTheme();
+});
+
+listen("zoom-in", () => {
+  terminalManager.adjustAllFontSizes(2);
+});
+
+listen("zoom-out", () => {
+  terminalManager.adjustAllFontSizes(-2);
+});
+
+listen("reset-zoom", () => {
+  terminalManager.resetAllFontSizes();
+});
+
+listen("show-shortcuts", () => {
+  // TODO: Implement keyboard shortcuts dialog
+  alert(
+    "Keyboard Shortcuts:\n\n" +
+      "File:\n" +
+      "  Cmd+T - New Terminal\n" +
+      "  Cmd+Shift+W - Close Terminal\n" +
+      "  Cmd+W - Close Workspace\n\n" +
+      "Edit:\n" +
+      "  Cmd+C - Copy\n" +
+      "  Cmd+V - Paste\n" +
+      "  Cmd+A - Select All\n\n" +
+      "View:\n" +
+      "  Cmd+Shift+T - Toggle Theme\n" +
+      "  Cmd++ - Zoom In\n" +
+      "  Cmd+- - Zoom Out\n" +
+      "  Cmd+0 - Reset Zoom\n\n" +
+      "Help:\n" +
+      "  Cmd+/ - Show Shortcuts"
+  );
 });
 
 // Initialize app

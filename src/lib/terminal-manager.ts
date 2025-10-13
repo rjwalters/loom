@@ -31,12 +31,15 @@ export class TerminalManager {
       return existing;
     }
 
+    // Get saved font size or use default
+    const fontSize = this.getSavedFontSize();
+
     // Create xterm.js Terminal instance with fixed size matching tmux
     const terminal = new Terminal({
       cols: 80, // Standard width to match tmux
       rows: 24, // Standard height to match tmux
       cursorBlink: true,
-      fontSize: 14,
+      fontSize,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       theme: {
         background: "#1e1e1e",
@@ -269,6 +272,79 @@ export class TerminalManager {
     for (const [id] of this.terminals) {
       this.destroyTerminal(id);
     }
+  }
+
+  /**
+   * Adjust font size for a specific terminal
+   */
+  adjustFontSize(terminalId: string, delta: number): void {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      return;
+    }
+
+    const currentSize = managed.terminal.options.fontSize || 14;
+    const newSize = Math.max(8, Math.min(32, currentSize + delta));
+    managed.terminal.options.fontSize = newSize;
+
+    // Save to localStorage
+    localStorage.setItem("terminal-font-size", newSize.toString());
+  }
+
+  /**
+   * Adjust font size for all terminals
+   */
+  adjustAllFontSizes(delta: number): void {
+    if (this.terminals.size === 0) {
+      return;
+    }
+
+    // Get current size from first terminal or default
+    const firstTerminal = this.terminals.values().next().value as ManagedTerminal | undefined;
+    const currentSize = firstTerminal?.terminal.options.fontSize || 14;
+    const newSize = Math.max(8, Math.min(32, currentSize + delta));
+
+    // Update all terminals
+    for (const [id] of this.terminals) {
+      const managed = this.terminals.get(id);
+      if (managed) {
+        managed.terminal.options.fontSize = newSize;
+      }
+    }
+
+    // Save to localStorage
+    localStorage.setItem("terminal-font-size", newSize.toString());
+  }
+
+  /**
+   * Reset font size for all terminals to default
+   */
+  resetAllFontSizes(): void {
+    const defaultSize = 14;
+
+    for (const [id] of this.terminals) {
+      const managed = this.terminals.get(id);
+      if (managed) {
+        managed.terminal.options.fontSize = defaultSize;
+      }
+    }
+
+    // Remove from localStorage
+    localStorage.removeItem("terminal-font-size");
+  }
+
+  /**
+   * Get saved font size from localStorage
+   */
+  getSavedFontSize(): number {
+    const saved = localStorage.getItem("terminal-font-size");
+    if (saved) {
+      const size = parseInt(saved, 10);
+      if (!Number.isNaN(size) && size >= 8 && size <= 32) {
+        return size;
+      }
+    }
+    return 14; // default
   }
 }
 
