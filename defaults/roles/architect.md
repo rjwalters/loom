@@ -174,9 +174,10 @@ Regularly review:
 - **Curator marks ready**: Removes `loom:accepted`, adds `loom:ready`
 
 ### Stage 4+: Implementation (Curator → Worker → Reviewer)
-- **Worker implements**: Picks up `loom:ready` issues
-- **Worker creates PR**: Adds `loom:review-requested` to PR
-- **Reviewer reviews**: Reviews PRs with `loom:review-requested`
+- **Worker implements**: Picks up `loom:ready` issues, changes to `loom:in-progress`
+- **Worker creates PR**: Adds `loom:ready` label to PR (ready for Reviewer)
+- **Reviewer reviews**: Reviews PRs with `loom:ready` label
+- **Reviewer approves**: Updates issue to `loom:pr` label (ready for owner to merge)
 
 **Key commands:**
 ```bash
