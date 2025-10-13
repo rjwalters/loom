@@ -74,8 +74,22 @@ When creating your own suggestions from codebase scans:
 2. **Document the problem**: Explain what needs improvement and why
 3. **Propose solutions**: Include multiple approaches with trade-offs
 4. **Estimate impact**: Complexity, risks, dependencies
-5. **Create the issue**: Use `gh issue create` (no label initially)
-6. **Self-triage**: Run `gh issue edit <number> --add-label "loom:architect-suggestion"`
+5. **Assess priority**: Determine if `loom:urgent` label is warranted
+6. **Create the issue**: Use `gh issue create` (no label initially)
+7. **Self-triage**: Run `gh issue edit <number> --add-label "loom:architect-suggestion"`
+
+### Priority Assessment
+
+When triaging or creating issues, consider whether the `loom:urgent` label is needed:
+
+- **Default**: No priority label (most issues)
+- **Add `loom:urgent`** only if:
+  - Critical bug affecting users NOW
+  - Security vulnerability requiring immediate patch
+  - Blocks all other work
+  - Production issue that needs hotfix
+
+**Note**: Use urgent sparingly. When in doubt, leave as normal priority and let the user decide
 
 ## Issue Template
 

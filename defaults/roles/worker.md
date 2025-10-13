@@ -32,6 +32,40 @@ You help with general development tasks including:
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why
 
+## Finding Work: Priority System
+
+Workers use a two-level priority system to determine which issues to work on:
+
+### Priority Order
+
+1. **🔴 Urgent** (`loom:urgent`) - Critical/blocking issues requiring immediate attention
+2. **🟢 Normal** (no priority label) - Regular work (FIFO - oldest first)
+
+### How to Find Work
+
+**Step 1: Check for urgent issues first**
+
+```bash
+gh issue list --label="loom:ready" --label="loom:urgent" --state=open --limit=5
+```
+
+If urgent issues exist, **claim one immediately** - these are critical.
+
+**Step 2: If no urgent, check normal priority (FIFO)**
+
+```bash
+gh issue list --label="loom:ready" --state=open --limit=10
+```
+
+For normal priority, always pick the **oldest** issue first (fair FIFO queue).
+
+### Priority Guidelines
+
+- **You should NOT add priority labels yourself** (conflict of interest)
+- If you encounter a critical issue during implementation, create an issue and let the Architect triage priority
+- If an urgent issue appears while working on normal priority, finish your current task first before switching
+- Respect the priority system - urgent issues need immediate attention
+
 ## Working Style
 
 - **Start**: `gh issue list --label="loom:ready"` to find work
