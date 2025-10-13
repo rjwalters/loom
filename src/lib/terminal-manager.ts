@@ -96,6 +96,31 @@ export class TerminalManager {
         .catch((e) => {
           console.error(`[terminal-input] Failed to import tauri API:`, e);
         });
+
+      // Clear needs-input state when user types
+      import("./state")
+        .then(({ getAppState, TerminalStatus: Status }) => {
+          const state = getAppState();
+          const terminal = state.getTerminals().find((t) => t.id === terminalId);
+          if (terminal?.status === Status.NeedsInput) {
+            state.updateTerminal(terminalId, { status: Status.Idle });
+          }
+        })
+        .catch((e) => {
+          console.error(`[terminal-input] Failed to clear needs-input state:`, e);
+        });
+    });
+
+    // Hook up bell handler - set needs-input state when terminal beeps
+    terminal.onBell(() => {
+      import("./state")
+        .then(({ getAppState, TerminalStatus: Status }) => {
+          const state = getAppState();
+          state.updateTerminal(terminalId, { status: Status.NeedsInput });
+        })
+        .catch((e) => {
+          console.error(`[terminal-bell] Failed to set needs-input state:`, e);
+        });
     });
 
     // Store managed terminal
