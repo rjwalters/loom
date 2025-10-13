@@ -296,6 +296,9 @@ listen("factory-reset-workspace", async () => {
       await saveCurrentConfig();
     }
 
+    // Set workspace as active (so render() shows terminals instead of picker)
+    state.setWorkspace(workspace);
+
     console.log("[factory-reset-workspace] Workspace reset complete");
   } catch (error) {
     console.error("Failed to reload config after reset:", error);
