@@ -602,6 +602,95 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
     Ok(())
 }
 
+/// Check if the current directory has a GitHub remote
+#[tauri::command]
+fn check_github_remote() -> Result<bool, String> {
+    let output = Command::new("git")
+        .args(["remote", "-v"])
+        .output()
+        .map_err(|e| format!("Failed to run git remote: {e}"))?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    let remotes = String::from_utf8_lossy(&output.stdout);
+    Ok(remotes.contains("github.com"))
+}
+
+/// Check if a GitHub label exists
+#[tauri::command]
+fn check_label_exists(name: &str) -> Result<bool, String> {
+    let output = Command::new("gh")
+        .args([
+            "label",
+            "list",
+            "--json",
+            "name",
+            "--jq",
+            &format!(".[].name | select(. == \"{name}\")"),
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run gh label list: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh label list failed: {stderr}"));
+    }
+
+    let result = String::from_utf8_lossy(&output.stdout);
+    Ok(!result.trim().is_empty())
+}
+
+/// Create a GitHub label
+#[tauri::command]
+fn create_github_label(name: &str, description: &str, color: &str) -> Result<(), String> {
+    let output = Command::new("gh")
+        .args([
+            "label",
+            "create",
+            name,
+            "--description",
+            description,
+            "--color",
+            color,
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run gh label create: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh label create failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
+/// Update a GitHub label (requires --force flag equivalent)
+#[tauri::command]
+fn update_github_label(name: &str, description: &str, color: &str) -> Result<(), String> {
+    let output = Command::new("gh")
+        .args([
+            "label",
+            "create",
+            name,
+            "--description",
+            description,
+            "--color",
+            color,
+            "--force",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to run gh label create --force: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh label update failed: {stderr}"));
+    }
+
+    Ok(())
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -859,7 +948,11 @@ fn main() {
             get_stored_workspace,
             set_stored_workspace,
             clear_stored_workspace,
-            reset_workspace_to_defaults
+            reset_workspace_to_defaults,
+            check_github_remote,
+            check_label_exists,
+            create_github_label,
+            update_github_label
         ])
         .run(tauri::generate_context!())
     {

@@ -1,0 +1,82 @@
+{
+  "nextAgentNumber": 7,
+  "agents": [
+    {
+      "id": "__unassigned__",
+      "name": "Shell",
+      "status": "idle",
+      "isPrimary": true,
+      "theme": "default"
+    },
+    {
+      "id": "__unassigned__",
+      "name": "Architect",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "architect.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
+      },
+      "theme": "lavender"
+    },
+    {
+      "id": "__unassigned__",
+      "name": "Curator",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "curator.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
+      },
+      "theme": "ocean"
+    },
+    {
+      "id": "__unassigned__",
+      "name": "Reviewer",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "reviewer.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Find and review PRs with loom:review-requested label"
+      },
+      "theme": "rose"
+    },
+    {
+      "id": "__unassigned__",
+      "name": "Worker 1",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "worker.md",
+        "targetInterval": 0,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "theme": "forest"
+    },
+    {
+      "id": "__unassigned__",
+      "name": "Worker 2",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "worker.md",
+        "targetInterval": 0,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "theme": "forest"
+    }
+  ]
+}
