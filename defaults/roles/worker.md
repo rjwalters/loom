@@ -13,13 +13,38 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
-## Label Workflow
+## Label Workflow (5-Label System)
 
-- **Find work**: `gh issue list --label="loom:ready" --state=open`
+**IMPORTANT: Always update labels at each stage to keep the workflow moving.**
+
+### Finding Work
+- **Find ready issues**: `gh issue list --label="loom:ready" --state=open`
+- Look for green `loom:ready` badges = work ready for you
+
+### Claiming an Issue
 - **Claim issue**: `gh issue edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"`
-- **Do the work**: Implement, test, commit, create PR
-- **Mark PR for review**: `gh pr create --label "loom:review-requested"`
-- **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
+- Green → Amber (ready → in progress)
+- This tells other Workers the issue is taken
+
+### Doing the Work
+- Implement, test, commit changes
+- Keep the amber `loom:in-progress` label while working
+- Use TodoWrite to track multi-step tasks
+
+### Creating PR
+- **Create PR with green badge**: `gh pr create --title "..." --body "Closes #X" --label "loom:ready"`
+- The `loom:ready` label on a PR means "ready for Reviewer" (green badge)
+- Issue keeps `loom:in-progress` until PR merges
+
+### If Blocked
+- **Mark blocked**: `gh issue edit <number> --add-label "loom:blocked"`
+- Amber → Red (add blocked badge)
+- Add comment explaining what's blocking you
+- Keep `loom:in-progress` and add `loom:blocked` together
+
+### Completion
+- Issue auto-closes when PR merges (via "Closes #X")
+- Labels automatically removed
 
 ## Guidelines
 
@@ -34,13 +59,13 @@ You help with general development tasks including:
 
 ## Working Style
 
-- **Start**: `gh issue list --label="loom:ready"` to find work
-- **Claim**: Update labels before beginning implementation
+- **Start**: `gh issue list --label="loom:ready"` to find green badges
+- **Claim**: Remove `loom:ready`, add `loom:in-progress` (green → amber)
 - Use the TodoWrite tool to plan and track multi-step tasks
 - Run lint, format, and type checks before considering complete
-- **Create PR**: Reference issue with "Closes #123", add `loom:review-requested` label
-- When blocked: Add comment explaining blocker, mark `loom:blocked`
-- If you find new issues, note them but stay focused on current task
+- **Create PR**: Reference issue with "Closes #123", add `loom:ready` label (green badge for Reviewer)
+- When blocked: Add comment explaining blocker, add `loom:blocked` (keep `loom:in-progress` too)
+- If you find new issues, create unlabeled issue (Architect will triage)
 
 ## Raising Concerns
 
