@@ -242,11 +242,34 @@ listen("factory-reset-workspace", async () => {
     const config = await loadConfig();
     state.setNextAgentNumber(config.nextAgentNumber);
 
-    // Load agents from fresh config
+    // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
+      // Create new terminal sessions for each agent in the config
+      for (const agent of config.agents) {
+        try {
+          // Create terminal in daemon
+          const terminalId = await invoke<string>("create_terminal", {
+            name: agent.name,
+            workingDir: workspace,
+          });
+
+          // Update agent ID to match the newly created terminal
+          agent.id = terminalId;
+          console.log(`[factory-reset-workspace] Created terminal ${agent.name} (${terminalId})`);
+        } catch (error) {
+          console.error(
+            `[factory-reset-workspace] Failed to create terminal ${agent.name}:`,
+            error
+          );
+          alert(`Failed to create terminal ${agent.name}: ${error}`);
+        }
+      }
+
+      // Now load the agents into state with their new IDs
       state.loadAgents(config.agents);
-      // Reconnect agents to existing daemon terminals
-      await reconnectTerminals();
+
+      // Save the updated config with new terminal IDs
+      await saveCurrentConfig();
     }
 
     console.log("[factory-reset-workspace] Workspace reset complete");

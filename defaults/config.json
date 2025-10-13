@@ -5,7 +5,8 @@
       "id": "1",
       "name": "Shell",
       "status": "idle",
-      "isPrimary": true
+      "isPrimary": true,
+      "theme": "default"
     },
     {
       "id": "2",
@@ -18,7 +19,8 @@
         "roleFile": "architect.md",
         "targetInterval": 900000,
         "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
-      }
+      },
+      "theme": "lavender"
     },
     {
       "id": "3",
@@ -31,7 +33,8 @@
         "roleFile": "curator.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
-      }
+      },
+      "theme": "ocean"
     },
     {
       "id": "4",
@@ -44,7 +47,8 @@
         "roleFile": "reviewer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
-      }
+      },
+      "theme": "rose"
     },
     {
       "id": "5",
@@ -57,7 +61,8 @@
         "roleFile": "worker.md",
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:ready issues"
-      }
+      },
+      "theme": "forest"
     },
     {
       "id": "6",
@@ -70,7 +75,8 @@
         "roleFile": "worker.md",
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:ready issues"
-      }
+      },
+      "theme": "sunset"
     }
   ]
 }
