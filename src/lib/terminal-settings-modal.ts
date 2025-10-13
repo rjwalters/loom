@@ -1,5 +1,6 @@
 import { saveConfig } from "./config";
 import type { AppState, Terminal } from "./state";
+import { TERMINAL_THEMES } from "./themes";
 
 export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   const modal = document.createElement("div");
@@ -26,6 +27,12 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
           class="tab-btn px-4 py-2 font-medium text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 dark:border-blue-400"
         >
           Basic
+        </button>
+        <button
+          data-tab="theme"
+          class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+        >
+          Theme
         </button>
         <button
           data-tab="worker"
@@ -73,6 +80,28 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
             <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
               Select worker role for this terminal
             </div>
+          </div>
+        </div>
+
+        <!-- Theme Tab -->
+        <div data-tab-content="theme" class="space-y-4 hidden">
+          <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
+            Choose a color theme to visually distinguish this terminal
+          </p>
+          <div class="grid grid-cols-4 gap-3">
+            ${Object.entries(TERMINAL_THEMES)
+              .map(
+                ([id, theme]) => `
+              <button
+                class="theme-card flex flex-col items-center gap-2 p-4 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
+                data-theme-id="${id}"
+              >
+                <div class="w-16 h-16 rounded-lg" style="background-color: ${theme.primary}"></div>
+                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
+              </button>
+            `
+              )
+              .join("")}
           </div>
         </div>
 
@@ -283,6 +312,28 @@ export async function showTerminalSettingsModal(
     });
   });
 
+  // Wire up theme cards
+  let selectedTheme = terminal.theme || "default";
+  modal.querySelectorAll(".theme-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      const themeId = card.getAttribute("data-theme-id");
+      if (themeId) {
+        selectedTheme = themeId;
+        // Update visual selection
+        modal.querySelectorAll(".theme-card").forEach((c) => {
+          c.className = c.className.replace(
+            "border-blue-500",
+            "border-gray-300 dark:border-gray-600"
+          );
+        });
+        card.className = card.className.replace(
+          "border-gray-300 dark:border-gray-600",
+          "border-blue-500"
+        );
+      }
+    });
+  });
+
   // Wire up role file dropdown to load metadata
   const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
   const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
@@ -358,7 +409,7 @@ export async function showTerminalSettingsModal(
   cancelBtn?.addEventListener("click", () => modal.remove());
 
   applyBtn?.addEventListener("click", async () => {
-    await applySettings(modal, terminal, state, renderFn);
+    await applySettings(modal, terminal, state, renderFn, selectedTheme);
   });
 
   factoryResetBtn?.addEventListener("click", async () => {
@@ -392,7 +443,8 @@ async function applySettings(
   modal: HTMLElement,
   terminal: Terminal,
   state: AppState,
-  renderFn: () => void
+  renderFn: () => void,
+  selectedTheme: string
 ): Promise<void> {
   try {
     // Get values from form
@@ -435,6 +487,7 @@ async function applySettings(
     // Update terminal in state
     state.updateTerminal(terminal.id, { name });
     state.setTerminalRole(terminal.id, role, roleConfig);
+    state.setTerminalTheme(terminal.id, selectedTheme);
 
     // Save config
     const config = {
@@ -458,11 +511,12 @@ async function factoryReset(
   renderFn: () => void
 ): Promise<void> {
   try {
-    // Reset to defaults: plain shell, no role
+    // Reset to defaults: plain shell, no role, default theme
     state.updateTerminal(terminal.id, {
       name: `Terminal ${terminal.id.substring(0, 8)}`,
     });
     state.setTerminalRole(terminal.id, undefined, undefined);
+    state.setTerminalTheme(terminal.id, "default");
 
     // Save config
     const config = {

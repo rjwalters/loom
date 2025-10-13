@@ -1,4 +1,5 @@
 import { type Terminal, TerminalStatus } from "./state";
+import { getTheme, getThemeStyles, isDarkMode } from "./themes";
 
 export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boolean): void {
   const container = document.getElementById("workspace-name");
@@ -73,11 +74,15 @@ export function renderPrimaryTerminal(
 
   const roleLabel = terminal.role ? getRoleLabel(terminal.role) : "Shell";
 
+  // Get theme colors
+  const theme = getTheme(terminal.theme, terminal.customTheme);
+  const styles = getThemeStyles(theme, isDarkMode());
+
   const contentHTML = `<div class="flex-1 overflow-auto" id="terminal-content-${terminal.id}"></div>`;
 
   container.innerHTML = `
-    <div class="h-full flex flex-col bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
-      <div class="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700">
+    <div class="h-full flex flex-col bg-white dark:bg-gray-800 rounded-lg border-l-4 border-r border-t border-b border-gray-200 dark:border-gray-700 overflow-hidden" style="border-left-color: ${styles.borderColor}">
+      <div class="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700" style="background-color: ${styles.backgroundColor}">
         <div class="flex items-center gap-2">
           <div class="w-2 h-2 rounded-full ${getStatusColor(terminal.status)}"></div>
           <span class="terminal-name font-medium text-sm" data-terminal-id="${terminal.id}">${escapeHtml(terminal.name)}</span>
@@ -222,18 +227,22 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
 }
 
 function createMiniTerminalHTML(terminal: Terminal, index: number): string {
-  const activeClass = terminal.isPrimary
-    ? "border-2 border-blue-500"
-    : "border border-gray-200 dark:border-gray-700";
+  // Get theme colors
+  const theme = getTheme(terminal.theme, terminal.customTheme);
+  const styles = getThemeStyles(theme, isDarkMode());
+
+  const borderWidth = terminal.isPrimary ? "3" : "2";
+  const borderColor = terminal.isPrimary ? styles.activeColor : styles.borderColor;
 
   return `
     <div class="p-1 flex-shrink-0">
       <div
-        class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg ${activeClass} cursor-grab transition-all"
+        class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+        style="border: ${borderWidth}px solid ${borderColor}"
         data-terminal-id="${terminal.id}"
         draggable="true"
       >
-      <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg">
+      <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
         <div class="flex items-center gap-2 flex-1 min-w-0">
           <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
           <span class="terminal-name text-xs font-medium truncate">${escapeHtml(terminal.name)}</span>
