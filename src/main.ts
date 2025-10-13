@@ -176,6 +176,11 @@ listen("close-terminal", async () => {
     });
 
     if (confirmed) {
+      // Stop autonomous mode if running
+      const { getAutonomousManager } = await import("./lib/autonomous-manager");
+      const autonomousManager = getAutonomousManager();
+      autonomousManager.stopAutonomous(primary.id);
+
       outputPoller.stopPolling(primary.id);
       terminalManager.destroyTerminal(primary.id);
       if (currentAttachedTerminalId === primary.id) {
@@ -197,6 +202,11 @@ listen("close-workspace", async () => {
   } catch (error) {
     console.error("Failed to clear stored workspace:", error);
   }
+
+  // Stop all autonomous intervals
+  const { getAutonomousManager } = await import("./lib/autonomous-manager");
+  const autonomousManager = getAutonomousManager();
+  autonomousManager.stopAll();
 
   // Stop all polling
   outputPoller.stopAll();
@@ -764,6 +774,12 @@ async function handleWorkspacePathInput(path: string) {
       }
     }
 
+    // Start autonomous mode for eligible terminals
+    const { getAutonomousManager } = await import("./lib/autonomous-manager");
+    const autonomousManager = getAutonomousManager();
+    autonomousManager.startAllAutonomous(state);
+    console.log("[handleWorkspacePathInput] Started autonomous agents");
+
     // Now set workspace as active
     state.setWorkspace(expandedPath);
     console.log("[handleWorkspacePathInput] workspace fully loaded");
@@ -1064,8 +1080,13 @@ function setupEventListeners() {
           ask("Are you sure you want to close this terminal?", {
             title: "Close Terminal",
             type: "warning",
-          }).then((confirmed) => {
+          }).then(async (confirmed) => {
             if (confirmed) {
+              // Stop autonomous mode if running
+              const { getAutonomousManager } = await import("./lib/autonomous-manager");
+              const autonomousManager = getAutonomousManager();
+              autonomousManager.stopAutonomous(id);
+
               // Stop polling and clean up xterm.js instance
               outputPoller.stopPolling(id);
               terminalManager.destroyTerminal(id);

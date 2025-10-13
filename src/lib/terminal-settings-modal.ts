@@ -486,6 +486,11 @@ async function applySettings(
         }
       : undefined;
 
+    // Check if role changed and we need to launch agent
+    const previousRole = terminal.role;
+    const roleChanged = previousRole !== role;
+    const hasNewRole = role !== undefined && roleConfig !== undefined;
+
     // Update terminal in state
     state.updateTerminal(terminal.id, { name });
     state.setTerminalRole(terminal.id, role, roleConfig);
@@ -497,6 +502,40 @@ async function applySettings(
       agents: state.getTerminals(),
     };
     await saveConfig(config);
+
+    // Launch agent if role was set/changed
+    if (roleChanged && hasNewRole) {
+      const workspacePath = state.getWorkspace();
+      if (workspacePath && roleConfig.roleFile) {
+        const { launchAgentInTerminal } = await import("./agent-launcher");
+        try {
+          await launchAgentInTerminal(
+            terminal.id,
+            roleConfig.roleFile as string,
+            workspacePath,
+            terminal.worktreePath
+          );
+        } catch (error) {
+          console.error("Failed to launch agent:", error);
+          alert(`Failed to launch agent: ${error}`);
+        }
+      }
+    }
+
+    // Handle autonomous mode based on configuration
+    const { getAutonomousManager } = await import("./autonomous-manager");
+    const autonomousManager = getAutonomousManager();
+
+    if (hasNewRole && roleConfig.targetInterval && (roleConfig.targetInterval as number) > 0) {
+      // Start or restart autonomous mode
+      const updatedTerminal = state.getTerminals().find((t) => t.id === terminal.id);
+      if (updatedTerminal) {
+        autonomousManager.restartAutonomous(updatedTerminal);
+      }
+    } else {
+      // Stop autonomous mode if disabled
+      autonomousManager.stopAutonomous(terminal.id);
+    }
 
     // Close modal and re-render
     modal.remove();
