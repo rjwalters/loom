@@ -448,6 +448,27 @@ fn clear_stored_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Result<(), String> {
+    let loom_path = Path::new(workspace_path).join(".loom");
+
+    // Delete existing .loom directory
+    if loom_path.exists() {
+        fs::remove_dir_all(&loom_path).map_err(|e| format!("Failed to delete .loom: {e}"))?;
+    }
+
+    // Copy defaults back
+    let defaults = Path::new(defaults_path);
+    if !defaults.exists() {
+        return Err(format!("Defaults directory not found: {defaults_path}"));
+    }
+
+    copy_dir_recursive(defaults, &loom_path)
+        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+
+    Ok(())
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -456,6 +477,8 @@ fn build_menu() -> Menu {
         CustomMenuItem::new("close_terminal", "Close Terminal").accelerator("CmdOrCtrl+Shift+W");
     let close_workspace =
         CustomMenuItem::new("close_workspace", "Close Workspace").accelerator("CmdOrCtrl+W");
+    let factory_reset_workspace =
+        CustomMenuItem::new("factory_reset_workspace", "Factory Reset Workspace...");
 
     let file_menu = Submenu::new(
         "File",
@@ -464,6 +487,7 @@ fn build_menu() -> Menu {
             .add_item(close_terminal)
             .add_native_item(MenuItem::Separator)
             .add_item(close_workspace)
+            .add_item(factory_reset_workspace)
             .add_native_item(MenuItem::Separator)
             .add_native_item(MenuItem::Quit),
     );
@@ -543,6 +567,9 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         }
         "close_workspace" => {
             let _ = event.window().emit("close-workspace", ());
+        }
+        "factory_reset_workspace" => {
+            let _ = event.window().emit("factory-reset-workspace", ());
         }
         "toggle_theme" => {
             let _ = event.window().emit("toggle-theme", ());
@@ -640,7 +667,8 @@ fn main() {
             check_claude_code,
             get_stored_workspace,
             set_stored_workspace,
-            clear_stored_workspace
+            clear_stored_workspace,
+            reset_workspace_to_defaults
         ])
         .run(tauri::generate_context!())
     {

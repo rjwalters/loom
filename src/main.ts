@@ -193,6 +193,72 @@ listen("close-workspace", async () => {
   render();
 });
 
+listen("factory-reset-workspace", async () => {
+  const workspace = state.getWorkspace();
+  if (!workspace) return;
+
+  const confirmed = confirm(
+    "⚠️ FACTORY RESET WARNING\n\n" +
+      "This will:\n" +
+      "• Delete all terminal configurations\n" +
+      "• Reset all roles to defaults\n" +
+      "• Close all current terminals\n" +
+      "• Recreate 6 default terminals\n\n" +
+      "This action CANNOT be undone!\n\n" +
+      "Continue with factory reset?"
+  );
+
+  if (!confirmed) return;
+
+  console.log("[factory-reset-workspace] Resetting workspace to defaults");
+
+  // Stop all polling
+  const terminals = state.getTerminals();
+  terminals.forEach((t) => outputPoller.stopPolling(t.id));
+
+  // Destroy all xterm instances
+  terminalManager.destroyAll();
+
+  // Call backend reset
+  try {
+    await invoke("reset_workspace_to_defaults", {
+      workspacePath: workspace,
+      defaultsPath: "defaults",
+    });
+    console.log("[factory-reset-workspace] Backend reset complete");
+  } catch (error) {
+    console.error("Failed to reset workspace:", error);
+    alert(`Failed to reset workspace: ${error}`);
+    return;
+  }
+
+  // Clear state
+  state.clearAll();
+  currentAttachedTerminalId = null;
+
+  // Reload config and recreate terminals
+  try {
+    setConfigWorkspace(workspace);
+    const config = await loadConfig();
+    state.setNextAgentNumber(config.nextAgentNumber);
+
+    // Load agents from fresh config
+    if (config.agents && config.agents.length > 0) {
+      state.loadAgents(config.agents);
+      // Reconnect agents to existing daemon terminals
+      await reconnectTerminals();
+    }
+
+    console.log("[factory-reset-workspace] Workspace reset complete");
+  } catch (error) {
+    console.error("Failed to reload config after reset:", error);
+    alert(`Failed to reload config: ${error}`);
+  }
+
+  // Re-render
+  render();
+});
+
 listen("toggle-theme", () => {
   toggleTheme();
 });
