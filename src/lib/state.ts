@@ -6,11 +6,27 @@ export enum TerminalStatus {
   Stopped = "stopped",
 }
 
+export enum AgentStatus {
+  NotStarted = "not_started",
+  Initializing = "initializing",
+  Ready = "ready",
+  Busy = "busy",
+  WaitingForInput = "waiting_for_input",
+  Error = "error",
+  Stopped = "stopped",
+}
+
 export interface ColorTheme {
   name: string;
   primary: string;
   background?: string;
   border: string;
+}
+
+export interface InputRequest {
+  id: string; // Unique request ID
+  prompt: string; // Question from Claude
+  timestamp: number; // When requested (ms)
 }
 
 export interface Terminal {
@@ -23,6 +39,12 @@ export interface Terminal {
   missingSession?: boolean; // Flag for terminals with missing tmux sessions (used in error recovery)
   theme?: string; // Theme ID (e.g., "ocean", "forest") or "default"
   customTheme?: ColorTheme; // For custom colors
+  // Agent-specific fields
+  worktreePath?: string; // Path to git worktree
+  agentPid?: number; // Claude process ID
+  agentStatus?: AgentStatus; // Agent state machine
+  lastIntervalRun?: number; // Timestamp (ms)
+  pendingInputRequests?: InputRequest[]; // Queue of input requests
 }
 
 export class AppState {
