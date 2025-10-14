@@ -74,6 +74,12 @@ function render() {
 async function initializeTerminalDisplay(terminalId: string) {
   const containerId = `xterm-container-${terminalId}`;
 
+  // Skip placeholder IDs - they're already broken and will show error UI
+  if (terminalId === "__unassigned__") {
+    console.warn(`[initializeTerminalDisplay] Skipping placeholder terminal ID`);
+    return;
+  }
+
   // Check session health before initializing
   try {
     const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
@@ -377,13 +383,39 @@ listen("factory-reset-workspace", async () => {
       state.setWorkspace(workspace);
 
       // Now load the agents into state with their new IDs
+      console.log(
+        `[factory-reset-workspace] Loading agents into state:`,
+        config.agents.map((a) => `${a.name}=${a.id}`)
+      );
       state.loadAgents(config.agents);
+      console.log(
+        `[factory-reset-workspace] State after loadAgents:`,
+        state.getTerminals().map((a) => `${a.name}=${a.id}`)
+      );
+
+      // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
+      // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
+      console.log(`[factory-reset-workspace] Saving config with real terminal IDs...`);
+      await saveConfig({
+        nextAgentNumber: state.getCurrentAgentNumber(),
+        agents: state.getTerminals(),
+      });
+      console.log(`[factory-reset-workspace] Config saved`);
 
       // Launch agents for terminals with role configs
+      console.log(`[factory-reset-workspace] Launching agents...`);
       await launchAgentsForTerminals(workspace, config.agents);
+      console.log(
+        `[factory-reset-workspace] State after launchAgentsForTerminals:`,
+        state.getTerminals().map((a) => `${a.name}=${a.id}`)
+      );
 
-      // Save the updated config with new terminal IDs (including worktree paths)
-      await saveCurrentConfig();
+      // Save again with worktree paths added by agent launch
+      console.log(`[factory-reset-workspace] Saving config with worktree paths...`);
+      await saveConfig({
+        nextAgentNumber: state.getCurrentAgentNumber(),
+        agents: state.getTerminals(),
+      });
 
       console.log("[factory-reset-workspace] Workspace reset complete");
     } else {
@@ -778,15 +810,11 @@ async function reconnectTerminals() {
       // Check if agent has placeholder ID (shouldn't happen after proper initialization)
       if (agent.id === "__unassigned__") {
         console.log(
-          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, marking as missing`
+          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, skipping (already in error state)`
         );
 
-        // Mark terminal as having missing session so user can see it needs recovery
-        state.updateTerminal(agent.id, {
-          status: TerminalStatus.Error,
-          missingSession: true,
-        });
-
+        // Don't call state.updateTerminal() here - it triggers infinite render loop
+        // The terminal already shows as missing because check_session_health will fail for "__unassigned__"
         missingCount++;
         continue;
       }
@@ -962,7 +990,15 @@ async function handleWorkspacePathInput(path: string) {
 
       // Load agents from config
       if (config.agents && config.agents.length > 0) {
+        console.log(
+          `[handleWorkspacePathInput] Config agents before loadAgents:`,
+          config.agents.map((a) => `${a.name}=${a.id}`)
+        );
         state.loadAgents(config.agents);
+        console.log(
+          `[handleWorkspacePathInput] State after loadAgents:`,
+          state.getTerminals().map((a) => `${a.name}=${a.id}`)
+        );
         // Reconnect agents to existing daemon terminals
         await reconnectTerminals();
       }
