@@ -42,17 +42,16 @@ export async function launchAgentInTerminal(
   // Replace template variables in role content
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
 
-  // Write prompt to a temporary file in the worktree/workspace
-  // We'll read from this file to avoid command line length limits
-  const promptFile = `${agentWorkingDir}/.loom-prompt-${terminalId}.md`;
+  // Write the system prompt to CLAUDE.md in the worktree/workspace
+  // Claude Code automatically loads CLAUDE.md from the repository root
+  const claudeMdPath = `${agentWorkingDir}/CLAUDE.md`;
   await invoke("write_file", {
-    path: promptFile,
+    path: claudeMdPath,
     content: processedPrompt,
   });
 
-  // Build Claude CLI command that reads the prompt from the file
-  // Using command substitution with cat to pass large prompts without hitting shell limits
-  const command = `claude --system-prompt "$(cat "${promptFile}")" --permission-mode bypassPermissions --session-id ${terminalId}`;
+  // Build Claude CLI command - CLAUDE.md will be automatically loaded
+  const command = `claude --permission-mode bypassPermissions --session-id ${terminalId}`;
 
   // Send command to terminal
   await invoke("send_terminal_input", {
