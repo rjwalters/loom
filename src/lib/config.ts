@@ -18,6 +18,7 @@ export function setConfigWorkspace(workspacePath: string): void {
 /**
  * Load config from .loom/config.json
  * Workspace must be initialized before calling this
+ * Returns default config if file doesn't exist
  */
 export async function loadConfig(): Promise<LoomConfig> {
   try {
@@ -32,6 +33,15 @@ export async function loadConfig(): Promise<LoomConfig> {
     const config = JSON.parse(contents) as LoomConfig;
     return config;
   } catch (error) {
+    // If config file doesn't exist, return default config
+    if (error instanceof Error && error.message.includes("Config file does not exist")) {
+      console.log("Config file not found - returning default config");
+      return {
+        nextAgentNumber: 1,
+        agents: [],
+      };
+    }
+
     console.error("Failed to load config:", error);
     throw error;
   }
