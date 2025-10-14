@@ -5,6 +5,11 @@ export default defineConfig({
   server: {
     port: 1420,
     strictPort: true,
+    watch: {
+      // Ignore .loom directory to prevent hot reload when config files change
+      // This prevents factory reset and other operations from being interrupted
+      ignored: ["**/.loom/**"],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
   build: {

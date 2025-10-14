@@ -42,12 +42,16 @@ export async function launchAgentInTerminal(
   // Replace template variables in role content
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
 
-  // Escape quotes for shell (double quotes need to be escaped)
-  const escapedPrompt = processedPrompt.replace(/"/g, '\\"');
+  // Write the system prompt to CLAUDE.md in the worktree/workspace
+  // Claude Code automatically loads CLAUDE.md from the repository root
+  const claudeMdPath = `${agentWorkingDir}/CLAUDE.md`;
+  await invoke("write_file", {
+    path: claudeMdPath,
+    content: processedPrompt,
+  });
 
-  // Build Claude CLI command
-  // Note: Using double quotes around prompt, so internal quotes are escaped above
-  const command = `claude --system-prompt "${escapedPrompt}" --permission-mode bypassPermissions --session-id ${terminalId}`;
+  // Build Claude CLI command - CLAUDE.md will be automatically loaded
+  const command = `claude --permission-mode bypassPermissions --session-id ${terminalId}`;
 
   // Send command to terminal
   await invoke("send_terminal_input", {
