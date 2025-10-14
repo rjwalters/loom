@@ -78,6 +78,57 @@ gh issue list --state=open --limit=20
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
+## Checking Dependencies
+
+Before marking an issue as `loom:ready`, check if it has a **Dependencies** section with a task list.
+
+### How to Check Dependencies
+
+Look for a section like this in the issue:
+
+```markdown
+## Dependencies
+
+- [ ] #123: Prerequisite feature
+- [ ] #456: Required infrastructure
+
+This issue cannot proceed until dependencies are complete.
+```
+
+### Decision Logic
+
+**If Dependencies section exists:**
+1. Check if all task list boxes are checked (✅)
+2. **All checked** → Safe to mark `loom:ready`
+3. **Any unchecked** → Add/keep `loom:blocked` label, do NOT mark `loom:ready`
+
+**If NO Dependencies section:**
+- Issue has no blockers → Safe to mark `loom:ready`
+
+### Adding Dependencies
+
+If you discover dependencies during curation:
+
+```markdown
+## Dependencies
+
+- [ ] #100: Brief description why this is needed
+
+This issue requires [dependency] to be implemented first.
+```
+
+Then add `loom:blocked` label:
+```bash
+gh issue edit <number> --add-label "loom:blocked"
+```
+
+### When Dependencies Complete
+
+GitHub automatically checks boxes when issues close. When you see all boxes checked:
+1. Remove `loom:blocked` label
+2. Add `loom:ready` label
+3. Issue is now available for Workers
+
 ## Issue Quality Checklist
 
 Before marking an issue as `loom:ready`, ensure it has:
@@ -89,6 +140,7 @@ Before marking an issue as `loom:ready`, ensure it has:
 - ✅ For bugs: reproduction steps and expected behavior
 - ✅ For features: user stories and use cases
 - ✅ Test plan checklist
+- ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
 - ✅ Priority label (`loom:urgent` if critical, otherwise none)
 - ✅ Labeled as `loom:ready` when complete
 

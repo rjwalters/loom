@@ -40,6 +40,201 @@ Use `loom:urgent` sparingly for:
 
 **Most issues should be normal priority** (no label). Urgent means "must be done NOW, before anything else."
 
+## Dependency Tracking with Task Lists
+
+Loom uses GitHub's native task list feature to track issue dependencies explicitly. This allows issues to declare prerequisites and automatically updates when dependencies are completed.
+
+### How It Works
+
+Issues can include a **Dependencies** section with a GitHub task list linking to prerequisite issues:
+
+```markdown
+## Dependencies
+
+- [ ] #123: Database migration system
+- [ ] #456: User authentication API
+
+This issue cannot proceed until all dependencies above are complete.
+```
+
+**Key Benefits:**
+- ✅ GitHub automatically checks boxes when linked issues close
+- ✅ Visual progress indicator in issue cards
+- ✅ Clear "ready to start" signal when all boxes checked
+- ✅ Machine-readable for agent decision-making
+
+### Agent Responsibilities
+
+#### Architect: Adding Dependencies
+
+When creating proposals, Architect should add Dependencies sections for issues that require prerequisite work:
+
+```bash
+gh issue create --title "Implement user profile page" --body "$(cat <<'EOF'
+## Problem
+Users need a way to view and edit their profile information.
+
+## Dependencies
+
+- [ ] #100: User authentication system
+- [ ] #101: Database schema for user profiles
+
+This feature requires authentication and database schema to be complete first.
+
+## Proposed Solution
+...
+EOF
+)"
+```
+
+**When to add dependencies:**
+- Issue requires infrastructure/framework not yet built
+- Implementation must wait for other features
+- Multi-phase feature with sequential steps
+
+#### Curator: Checking Dependencies
+
+Before marking an issue as `loom:ready`, Curator must verify all dependencies are complete:
+
+**Decision Logic:**
+
+1. **If Dependencies section exists:**
+   - Check if all task list items are checked (✅)
+   - **All checked** → Safe to mark `loom:ready`
+   - **Any unchecked** → Add `loom:blocked` label, do NOT mark `loom:ready`
+
+2. **If NO Dependencies section:**
+   - Issue has no blockers → Safe to mark `loom:ready`
+
+**Example workflow:**
+```bash
+# View issue to check dependencies
+gh issue view 42
+
+# If all dependencies checked:
+gh issue edit 42 --add-label "loom:ready"
+
+# If unchecked dependencies exist:
+gh issue edit 42 --add-label "loom:blocked"
+gh issue comment 42 --body "Blocked by unchecked dependencies: #100, #101"
+```
+
+When Curator discovers new dependencies during enhancement, they should:
+1. Add Dependencies section to the issue
+2. Add `loom:blocked` label
+3. Leave comment explaining the blocker
+
+#### Worker: Verifying Before Claiming
+
+Before claiming a `loom:ready` issue, Worker must check for dependencies:
+
+```bash
+# View issue to check Dependencies section
+gh issue view 42
+
+# If Dependencies section exists with unchecked boxes:
+gh issue edit 42 --remove-label "loom:ready" --add-label "loom:blocked"
+gh issue comment 42 --body "Cannot claim - blocked by unchecked dependencies"
+
+# If all dependencies checked (or no Dependencies section):
+gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
+# Proceed with implementation
+```
+
+If Worker discovers a dependency during implementation:
+1. Add Dependencies section to the issue
+2. Add `loom:blocked` label to issue
+3. Create comment explaining the blocker
+4. Either wait or switch to another issue
+
+### Dependency Lifecycle Example
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. ARCHITECT CREATES DEPENDENT ISSUE                        │
+│    Issue #42: "Implement user profile page"                │
+│    Body includes:                                           │
+│    ## Dependencies                                          │
+│    - [ ] #100: User authentication system                  │
+│    - [ ] #101: Database schema for user profiles          │
+│    Label: loom:proposal                                     │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2. USER APPROVES                                            │
+│    Removes loom:proposal label                              │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3. CURATOR CHECKS DEPENDENCIES                              │
+│    Views issue #42                                          │
+│    Sees unchecked boxes for #100, #101                     │
+│    Decision: Dependencies not complete                      │
+│    Action: gh issue edit 42 --add-label "loom:blocked"     │
+│    (Does NOT add loom:ready)                                │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 4. DEPENDENCIES COMPLETE                                    │
+│    Worker closes #100 → GitHub auto-checks box             │
+│    Worker closes #101 → GitHub auto-checks box             │
+│    Issue #42 now shows: [x] #100, [x] #101                │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 5. CURATOR UNBLOCKS                                         │
+│    Sees all dependency boxes checked on #42                 │
+│    gh issue edit 42 --remove-label "loom:blocked"          │
+│    gh issue edit 42 --add-label "loom:ready"               │
+└─────────────────────┬───────────────────────────────────────┘
+                      │
+                      ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 6. WORKER CLAIMS AND IMPLEMENTS                             │
+│    Verifies all dependencies checked                        │
+│    Claims issue #42                                         │
+│    Implements feature                                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Best Practices
+
+**For Architects:**
+- Only add Dependencies for true blockers (not nice-to-haves)
+- Keep dependency descriptions brief but clear
+- Explain why the dependency exists if not obvious
+- For independent work, explicitly state "No dependencies"
+
+**For Curators:**
+- Always check Dependencies section before marking `loom:ready`
+- Use `loom:blocked` label when dependencies are incomplete
+- Add comment explaining what's blocking when marking as blocked
+- Monitor blocked issues and unblock when dependencies complete
+
+**For Workers:**
+- Always verify dependencies before claiming `loom:ready` issues
+- If you discover a blocker mid-implementation, add it to the issue immediately
+- Don't try to implement dependencies yourself - create separate issues
+- Mark as `loom:blocked` and explain the situation in a comment
+
+### Troubleshooting
+
+**Issue has unchecked dependencies but is marked loom:ready**
+→ Worker should mark as `loom:blocked` when they discover this
+→ Curator should re-check and correct the labeling
+
+**Dependency is complete but checkbox not checked**
+→ GitHub auto-checks when issues close via PR merge
+→ Manually check box if issue was closed directly
+
+**Circular dependencies between issues**
+→ This is a design problem - escalate to User for manual resolution
+→ Architect should avoid creating circular dependencies
+
 ## Agent Types
 
 ### 1. Architect Bot
