@@ -35,6 +35,11 @@ echo -e "${BOLD}${CYAN}║     Loom Daemon - Development Mode    ║${NC}"
 echo -e "${BOLD}${CYAN}╚════════════════════════════════════════╝${NC}"
 echo ""
 
+# Clean up any orphaned tmux sessions for consistent test state
+echo -e "${BLUE}🧹 Cleaning orphaned tmux sessions...${NC}"
+./scripts/clean-tmux.sh
+echo ""
+
 # Check if daemon already running
 if [ -f "$DAEMON_PID_FILE" ]; then
   PID=$(cat "$DAEMON_PID_FILE")

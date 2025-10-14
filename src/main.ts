@@ -338,10 +338,15 @@ listen("factory-reset-workspace", async () => {
     // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
       // Create new terminal sessions for each agent in the config
+      console.log(`[factory-reset-workspace] Creating ${config.agents.length} terminals...`);
       for (const agent of config.agents) {
         try {
           // Get instance number
           const instanceNumber = state.getNextAgentNumber();
+
+          console.log(
+            `[factory-reset-workspace] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspace}`
+          );
 
           // Create terminal in daemon
           const terminalId = await invoke<string>("create_terminal", {
@@ -353,15 +358,23 @@ listen("factory-reset-workspace", async () => {
 
           // Update agent ID to match the newly created terminal
           agent.id = terminalId;
-          console.log(`[factory-reset-workspace] Created terminal ${agent.name} (${terminalId})`);
+          console.log(`[factory-reset-workspace] ✓ Created terminal ${agent.name} (${terminalId})`);
         } catch (error) {
           console.error(
-            `[factory-reset-workspace] Failed to create terminal ${agent.name}:`,
+            `[factory-reset-workspace] ✗ Failed to create terminal ${agent.name}:`,
             error
           );
           alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
       }
+
+      console.log(
+        `[factory-reset-workspace] All terminals created, agents array:`,
+        config.agents.map((a) => `${a.name}=${a.id}`)
+      );
+
+      // Set workspace as active BEFORE loading agents (needed for proper initialization)
+      state.setWorkspace(workspace);
 
       // Now load the agents into state with their new IDs
       state.loadAgents(config.agents);
@@ -371,12 +384,12 @@ listen("factory-reset-workspace", async () => {
 
       // Save the updated config with new terminal IDs (including worktree paths)
       await saveCurrentConfig();
+
+      console.log("[factory-reset-workspace] Workspace reset complete");
+    } else {
+      // No agents in config - still set workspace as active
+      state.setWorkspace(workspace);
     }
-
-    // Set workspace as active (so render() shows terminals instead of picker)
-    state.setWorkspace(workspace);
-
-    console.log("[factory-reset-workspace] Workspace reset complete");
   } catch (error) {
     console.error("Failed to reload config after reset:", error);
     alert(`Failed to reload config: ${error}`);
