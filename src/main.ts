@@ -363,6 +363,9 @@ listen("factory-reset-workspace", async () => {
         }
       }
 
+      // Set workspace as active BEFORE loading agents (needed for proper initialization)
+      state.setWorkspace(workspace);
+
       // Now load the agents into state with their new IDs
       state.loadAgents(config.agents);
 
@@ -371,12 +374,12 @@ listen("factory-reset-workspace", async () => {
 
       // Save the updated config with new terminal IDs (including worktree paths)
       await saveCurrentConfig();
+
+      console.log("[factory-reset-workspace] Workspace reset complete");
+    } else {
+      // No agents in config - still set workspace as active
+      state.setWorkspace(workspace);
     }
-
-    // Set workspace as active (so render() shows terminals instead of picker)
-    state.setWorkspace(workspace);
-
-    console.log("[factory-reset-workspace] Workspace reset complete");
   } catch (error) {
     console.error("Failed to reload config after reset:", error);
     alert(`Failed to reload config: ${error}`);
