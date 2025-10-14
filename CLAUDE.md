@@ -457,6 +457,103 @@ Template variables:
 
 See [defaults/roles/README.md](defaults/roles/README.md) for detailed guidance on creating custom roles.
 
+### 8. Git Worktrees and Sandbox Compatibility
+
+**Files**: `src/lib/worktree-manager.ts`, `src/lib/agent-launcher.ts`, `loom-daemon/src/terminal.rs`
+
+Loom uses git worktrees to provide isolated working directories for each agent terminal. This allows multiple agents to work on different features simultaneously without conflicts.
+
+**Worktree Path Configuration**:
+
+All agent worktrees are created inside the workspace at:
+```
+${workspacePath}/.loom/worktrees/${terminalId}
+```
+
+This design is **sandbox-compatible** because:
+- Worktrees stay inside the workspace directory (no external paths)
+- Already gitignored via `.gitignore` line 34: `.loom/worktrees/`
+- Each terminal gets its own isolated working directory
+- No shared state or conflicts between agents
+
+**Automatic Worktree Lifecycle** (`src/lib/worktree-manager.ts:28`):
+
+When an agent terminal is created with worktree mode enabled:
+
+```typescript
+// 1. Create worktree directory
+const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
+
+// 2. Execute setup commands via terminal
+mkdir -p "${worktreePath}"
+git worktree add "${worktreePath}" HEAD
+cd "${worktreePath}"
+
+// 3. Optional: Configure git identity
+git config user.name "Agent Name"
+git config user.email "agent@example.com"
+
+// 4. Show success message
+echo "✓ Worktree ready at ${worktreePath}"
+```
+
+**Daemon Auto-Cleanup** (`loom-daemon/src/terminal.rs:87-102`):
+
+When a terminal is destroyed, the daemon automatically detects and removes worktrees:
+
+```rust
+// Check if working directory is a Loom worktree
+if working_directory.contains("/.loom/worktrees/") {
+    // Remove from git worktrees
+    Command::new("git")
+        .arg("worktree")
+        .arg("remove")
+        .arg(&working_directory)
+        .arg("--force")
+        .output()
+        .ok();
+}
+```
+
+**Manual Worktree Creation for Development**:
+
+When working on issues manually (not through the app), create worktrees using the same path pattern:
+
+```bash
+# CORRECT - Sandbox-compatible, inside workspace
+git worktree add .loom/worktrees/issue-84 -b feature/issue-84-test-coverage main
+
+# WRONG - Creates directory outside workspace
+git worktree add ../loom-issue-84 -b feature/issue-84-test-coverage main
+```
+
+**Benefits of This Approach**:
+
+1. **Isolation**: Each agent has its own working directory and branch
+2. **No Conflicts**: Agents can't interfere with each other's work
+3. **Clean Workspace**: Main working directory remains unaffected
+4. **Auto-Cleanup**: Daemon removes worktrees when terminals are destroyed
+5. **Gitignored**: Worktrees don't clutter git status
+6. **Sandbox-Safe**: All worktrees inside workspace, no filesystem escapes
+
+**TypeScript Worktree Setup** (`src/lib/agent-launcher.ts:27-34`):
+
+```typescript
+let agentWorkingDir = workspacePath;
+if (useWorktree && !worktreePath) {
+  const { setupWorktreeForAgent } = await import("./worktree-manager");
+  agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath, gitIdentity);
+}
+```
+
+**Testing**: See `src/lib/worktree-manager.test.ts` for comprehensive test coverage including:
+- Directory structure creation
+- Git worktree creation from HEAD
+- Git identity configuration
+- Command execution ordering
+- Path handling with spaces and special characters
+- Terminal input simulation
+
 ## TypeScript Conventions
 
 ### Strict Mode

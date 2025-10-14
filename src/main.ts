@@ -5,7 +5,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
-import { AppState, setAppState, TerminalStatus } from "./lib/state";
+import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
@@ -366,7 +366,10 @@ listen("factory-reset-workspace", async () => {
       // Now load the agents into state with their new IDs
       state.loadAgents(config.agents);
 
-      // Save the updated config with new terminal IDs
+      // Launch agents for terminals with role configs
+      await launchAgentsForTerminals(workspace, config.agents);
+
+      // Save the updated config with new terminal IDs (including worktree paths)
       await saveCurrentConfig();
     }
 
@@ -629,6 +632,107 @@ async function createPlainTerminal() {
   }
 }
 
+/**
+ * Launch agents for terminals that have role configurations
+ *
+ * This function is called after workspace initialization or factory reset
+ * to automatically start Claude agents for terminals with roleConfig.
+ *
+ * @param workspacePath - The workspace directory path
+ * @param terminals - Array of terminal configurations
+ */
+async function launchAgentsForTerminals(workspacePath: string, terminals: Terminal[]) {
+  console.log("[launchAgentsForTerminals] Launching agents for configured terminals");
+
+  // Filter terminals that have Claude Code worker role
+  const workersToLaunch = terminals.filter(
+    (t) => t.role === "claude-code-worker" && t.roleConfig && t.roleConfig.roleFile
+  );
+
+  console.log(
+    `[launchAgentsForTerminals] Found ${workersToLaunch.length} terminals with role configs`
+  );
+
+  // Launch each worker
+  for (const terminal of workersToLaunch) {
+    try {
+      const roleConfig = terminal.roleConfig;
+      if (!roleConfig || !roleConfig.roleFile) {
+        continue;
+      }
+
+      console.log(`[launchAgentsForTerminals] Launching ${terminal.name} (${terminal.id})`);
+
+      // Get worker type from config (default to claude)
+      const workerType = (roleConfig.workerType as string) || "claude";
+
+      // Load git identity from role metadata if available
+      let gitIdentity: { name: string; email: string } | undefined;
+      try {
+        const metadataJson = await invoke<string | null>("read_role_metadata", {
+          workspacePath,
+          filename: roleConfig.roleFile as string,
+        });
+
+        if (metadataJson) {
+          const metadata = JSON.parse(metadataJson) as {
+            gitIdentity?: { name: string; email: string };
+          };
+          gitIdentity = metadata.gitIdentity;
+        }
+      } catch (error) {
+        console.warn(
+          `[launchAgentsForTerminals] Failed to load git identity for ${terminal.name}:`,
+          error
+        );
+      }
+
+      // Launch based on worker type
+      if (workerType === "github-copilot") {
+        const { launchGitHubCopilotAgent } = await import("./lib/agent-launcher");
+        await launchGitHubCopilotAgent(terminal.id);
+      } else if (workerType === "gemini") {
+        const { launchGeminiCLIAgent } = await import("./lib/agent-launcher");
+        await launchGeminiCLIAgent(terminal.id);
+      } else if (workerType === "deepseek") {
+        const { launchDeepSeekAgent } = await import("./lib/agent-launcher");
+        await launchDeepSeekAgent(terminal.id);
+      } else if (workerType === "grok") {
+        const { launchGrokAgent } = await import("./lib/agent-launcher");
+        await launchGrokAgent(terminal.id);
+      } else {
+        // Claude or Codex with worktree support
+        const { launchAgentInTerminal } = await import("./lib/agent-launcher");
+
+        // Create worktree for isolation
+        const useWorktree = true;
+        const worktreePath = await launchAgentInTerminal(
+          terminal.id,
+          roleConfig.roleFile as string,
+          workspacePath,
+          undefined, // No existing worktree path
+          useWorktree,
+          gitIdentity
+        );
+
+        // Store worktree path in terminal state
+        state.updateTerminal(terminal.id, { worktreePath });
+        console.log(`[launchAgentsForTerminals] Created worktree at ${worktreePath}`);
+      }
+
+      console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
+    } catch (error) {
+      console.error(
+        `[launchAgentsForTerminals] Failed to launch agent for ${terminal.name}:`,
+        error
+      );
+      // Continue with other terminals even if one fails
+    }
+  }
+
+  console.log("[launchAgentsForTerminals] Agent launch complete");
+}
+
 // Reconnect terminals to daemon after loading config
 async function reconnectTerminals() {
   console.log("[reconnectTerminals] Querying daemon for active terminals...");
@@ -830,7 +934,10 @@ async function handleWorkspacePathInput(path: string) {
         // Load agents into state with their new IDs
         state.loadAgents(config.agents);
 
-        // Save the updated config with real terminal IDs
+        // Launch agents for terminals with role configs
+        await launchAgentsForTerminals(expandedPath, config.agents);
+
+        // Save the updated config with real terminal IDs (including worktree paths)
         await saveConfig(config);
         console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
       }
@@ -1405,7 +1512,8 @@ function setupEventListeners() {
         // Create and position insertion indicator - insert at wrapper level
         const wrapper = card.parentElement;
         const indicator = document.createElement("div");
-        indicator.className = "drop-indicator";
+        indicator.className =
+          "w-1 h-32 my-1 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
         wrapper?.parentElement?.insertBefore(
           indicator,
           insertBefore ? wrapper : wrapper.nextSibling
@@ -1428,7 +1536,8 @@ function setupEventListeners() {
             // Create and position insertion indicator after last card - insert at wrapper level
             const wrapper = lastCard.parentElement;
             const indicator = document.createElement("div");
-            indicator.className = "drop-indicator";
+            indicator.className =
+              "w-1 h-32 my-1 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
             wrapper?.parentElement?.insertBefore(indicator, wrapper?.nextSibling || null);
           }
         }
