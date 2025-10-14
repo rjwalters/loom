@@ -158,6 +158,7 @@ jobs:
     runs-on: ubuntu-22.04
     timeout-minutes: 5
     needs:
+      - changes
       - frontend
       - rust-format
       - rust-build
@@ -188,6 +189,11 @@ jobs:
         if: always()
         with:
           script: |
+            // Get change detection outputs
+            const frontendChanged = '${{ needs.changes.outputs.frontend }}' === 'true';
+            const rustChanged = '${{ needs.changes.outputs.rust }}' === 'true';
+            const ciChanged = '${{ needs.changes.outputs.ci }}' === 'true';
+
             const jobs = {
               'Frontend': '${{ needs.frontend.result }}',
               'Rust Format': '${{ needs.rust-format.result }}',
@@ -201,6 +207,26 @@ jobs:
               return '❌ Fail';
             };
 
+            const getReason = (jobName, status) => {
+              if (status === 'success') {
+                return 'Files changed';
+              }
+
+              if (status === 'skipped') {
+                if (jobName === 'Frontend') {
+                  return 'No frontend changes detected';
+                } else {
+                  return 'No Rust changes detected';
+                }
+              }
+
+              if (status === 'failure') {
+                return 'Job failed';
+              }
+
+              return '';
+            };
+
             const allPassed = Object.values(jobs).every(
               status => status === 'success' || status === 'skipped'
             );
@@ -209,9 +235,32 @@ jobs:
               .addHeading(allPassed ? '✅ CI Summary - All Passed' : '❌ CI Summary - Some Failed')
               .addHeading('Job Results', 3)
               .addTable([
-                [{ data: 'Job', header: true }, { data: 'Status', header: true }],
-                ...Object.entries(jobs).map(([name, status]) => [name, statusIcon(status)])
+                [
+                  { data: 'Job', header: true },
+                  { data: 'Status', header: true },
+                  { data: 'Reason', header: true }
+                ],
+                ...Object.entries(jobs).map(([name, status]) => [
+                  name,
+                  statusIcon(status),
+                  getReason(name, status)
+                ])
               ]);
+
+            // Add collapsible change detection details
+            const detailsContent = `
+            **Path Filters Evaluated:**
+
+            ${frontendChanged ? '✅' : '❌'} Frontend changes (filters: \`src/**/*.{ts,tsx,js,jsx,json,css,html}\`, \`package*.json\`, \`tsconfig.json\`, \`biome.json\`)
+
+            ${rustChanged ? '✅' : '❌'} Rust changes (filters: \`src-tauri/**/*.rs\`, \`Cargo.{toml,lock}\`)
+
+            ${ciChanged ? '✅' : '❌'} CI workflow changes (filters: \`.github/workflows/**\`)
+
+            **Note:** CI workflow changes force all jobs to run for validation.
+            `;
+
+            summary.addDetails('Change Detection Details', detailsContent);
 
             if (context.eventName === 'pull_request') {
               summary.addRaw(`\n\n🔀 Triggered by: PR #${context.payload.pull_request.number}`);
