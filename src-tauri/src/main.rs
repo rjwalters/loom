@@ -10,6 +10,7 @@ use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
 
 mod daemon_client;
 mod daemon_manager;
+mod dependency_checker;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
@@ -871,6 +872,11 @@ fn init_loom_directory(project_path: &Path) -> Result<(), String> {
 }
 
 /// Generate license content based on license type
+#[tauri::command]
+fn check_system_dependencies() -> dependency_checker::DependencyStatus {
+    dependency_checker::check_dependencies()
+}
+
 fn generate_license_content(license_type: &str, project_name: &str) -> Result<String, String> {
     let year = chrono::Local::now().year();
 
@@ -1070,6 +1076,7 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     // Load .env file
     dotenvy::dotenv().ok();
@@ -1154,6 +1161,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            check_system_dependencies,
             validate_git_repo,
             check_loom_initialized,
             initialize_loom_workspace,

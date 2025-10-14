@@ -150,8 +150,30 @@ async function initializeTerminalDisplay(terminalId: string) {
   }, 0);
 }
 
+// Check dependencies on startup
+async function checkDependenciesOnStartup(): Promise<boolean> {
+  const { checkAndReportDependencies } = await import("./lib/dependency-checker");
+  const hasAllDependencies = await checkAndReportDependencies();
+
+  if (!hasAllDependencies) {
+    // User chose not to retry, close the app gracefully
+    console.error("[checkDependenciesOnStartup] Missing dependencies, exiting");
+    const { exit } = await import("@tauri-apps/api/process");
+    await exit(1);
+    return false;
+  }
+
+  return true;
+}
+
 // Initialize app with auto-load workspace
 async function initializeApp() {
+  // Check dependencies first
+  const hasAllDependencies = await checkDependenciesOnStartup();
+  if (!hasAllDependencies) {
+    return; // Exit early if dependencies are missing
+  }
+
   try {
     // Check for stored workspace
     const storedPath = await invoke<string | null>("get_stored_workspace");
