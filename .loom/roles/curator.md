@@ -44,6 +44,67 @@ gh issue list --state=open --limit=20
 # Then manually check which ones need curation
 ```
 
+## Triage: Ready or Needs Enhancement?
+
+When you find an unlabeled issue, **first assess if it's already implementation-ready**:
+
+### Quick Quality Checklist
+
+- ✅ **Clear problem statement** - Explains "why" this matters
+- ✅ **Acceptance criteria** - Testable success metrics or checklist
+- ✅ **Test plan or guidance** - How to verify the solution works
+- ✅ **No obvious blockers** - No unresolved dependencies mentioned
+
+### Decision Tree
+
+**If ALL checkboxes pass:**
+✅ **Mark it `loom:ready` immediately** - the issue is already complete:
+
+```bash
+gh issue edit <number> --add-label "loom:ready"
+```
+
+**If ANY checkboxes fail:**
+⚠️ **Enhance first, then mark ready:**
+
+1. Add missing problem context or acceptance criteria
+2. Include implementation guidance or options
+3. Add test plan checklist
+4. Check/add dependencies section if needed
+5. Then mark `loom:ready`
+
+### Examples
+
+**Already Ready** (mark immediately):
+```markdown
+Issue #84: "Expand frontend unit test coverage"
+- ✅ Detailed problem statement (low coverage creates risk)
+- ✅ Lists specific acceptance criteria (which files to test)
+- ✅ Includes test plan (Phase 1, 2, 3 approach)
+- ✅ No dependencies mentioned
+
+→ Action: `gh issue edit 84 --add-label "loom:ready"`
+→ Result: Worker can start immediately
+```
+
+**Needs Enhancement** (improve first):
+```markdown
+Issue #99: "fix the crash bug"
+- ❌ Vague title and description
+- ❌ No reproduction steps
+- ❌ No acceptance criteria
+
+→ Action: Ask for reproduction steps, add acceptance criteria
+→ Then: Mark `loom:ready` after enhancement complete
+```
+
+### Why This Matters
+
+1. **Faster Workflow**: Well-formed issues move to implementation without delay
+2. **Quality Gate**: Every `loom:ready` issue has been explicitly reviewed
+3. **Prevents Bypass**: Workers can trust `loom:ready` issues are truly ready
+4. **Clear Standards**: Establishes what "ready" means
+
 ## Curation Activities
 
 ### Enhancement
@@ -78,6 +139,57 @@ gh issue list --state=open --limit=20
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
+## Checking Dependencies
+
+Before marking an issue as `loom:ready`, check if it has a **Dependencies** section with a task list.
+
+### How to Check Dependencies
+
+Look for a section like this in the issue:
+
+```markdown
+## Dependencies
+
+- [ ] #123: Prerequisite feature
+- [ ] #456: Required infrastructure
+
+This issue cannot proceed until dependencies are complete.
+```
+
+### Decision Logic
+
+**If Dependencies section exists:**
+1. Check if all task list boxes are checked (✅)
+2. **All checked** → Safe to mark `loom:ready`
+3. **Any unchecked** → Add/keep `loom:blocked` label, do NOT mark `loom:ready`
+
+**If NO Dependencies section:**
+- Issue has no blockers → Safe to mark `loom:ready`
+
+### Adding Dependencies
+
+If you discover dependencies during curation:
+
+```markdown
+## Dependencies
+
+- [ ] #100: Brief description why this is needed
+
+This issue requires [dependency] to be implemented first.
+```
+
+Then add `loom:blocked` label:
+```bash
+gh issue edit <number> --add-label "loom:blocked"
+```
+
+### When Dependencies Complete
+
+GitHub automatically checks boxes when issues close. When you see all boxes checked:
+1. Remove `loom:blocked` label
+2. Add `loom:ready` label
+3. Issue is now available for Workers
+
 ## Issue Quality Checklist
 
 Before marking an issue as `loom:ready`, ensure it has:
@@ -89,6 +201,7 @@ Before marking an issue as `loom:ready`, ensure it has:
 - ✅ For bugs: reproduction steps and expected behavior
 - ✅ For features: user stories and use cases
 - ✅ Test plan checklist
+- ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
 - ✅ Priority label (`loom:urgent` if critical, otherwise none)
 - ✅ Labeled as `loom:ready` when complete
 
