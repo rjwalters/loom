@@ -56,7 +56,58 @@ export class OutputPoller {
   }
 
   /**
-   * Stop polling for a terminal's output
+   * Pause polling for a terminal's output (keeps state for resume)
+   */
+  pausePolling(terminalId: string): void {
+    const state = this.pollers.get(terminalId);
+    if (!state) {
+      return;
+    }
+
+    state.polling = false;
+
+    if (state.intervalId !== null) {
+      window.clearInterval(state.intervalId);
+      state.intervalId = null;
+    }
+
+    // Don't delete from map - keep state for resume
+  }
+
+  /**
+   * Resume polling for a terminal (continues from last byte count)
+   */
+  resumePolling(terminalId: string): void {
+    const state = this.pollers.get(terminalId);
+    if (!state) {
+      // If no state exists, start fresh
+      this.startPolling(terminalId);
+      return;
+    }
+
+    // Already polling?
+    if (state.polling && state.intervalId !== null) {
+      console.warn(`Terminal ${terminalId} is already actively polling`);
+      return;
+    }
+
+    // Resume polling with existing state
+    state.polling = true;
+
+    // Do immediate poll then start interval
+    this.pollOnce(state).then(() => {
+      const intervalId = window.setInterval(() => {
+        if (state.polling) {
+          this.pollOnce(state);
+        }
+      }, this.pollInterval);
+
+      state.intervalId = intervalId;
+    });
+  }
+
+  /**
+   * Stop polling for a terminal's output (clears state)
    */
   stopPolling(terminalId: string): void {
     const state = this.pollers.get(terminalId);
