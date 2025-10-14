@@ -1,5 +1,7 @@
 # Loom Workspace Configuration
 
+> **This project uses [Loom](https://github.com/rjwalters/loom)** - A multi-terminal desktop application that orchestrates AI-powered development agents using git worktrees and GitHub as the coordination layer.
+
 This directory contains workspace-specific Loom configuration that should be committed to version control for team sharing.
 
 ## Files in This Directory
