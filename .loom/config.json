@@ -2,14 +2,14 @@
   "nextAgentNumber": 13,
   "agents": [
     {
-      "id": "a2f4c581-0988-4ac9-a60c-99f8788357a8",
+      "id": "ebf3946a-ea1c-4dad-9b85-2e2850f6d389",
       "name": "Shell",
       "status": "idle",
       "isPrimary": true,
       "theme": "default"
     },
     {
-      "id": "333ddd9c-d16a-44b7-bb48-d005aa3bc2e6",
+      "id": "5d5e411f-d564-4a5a-9c05-6577becd8e0a",
       "name": "Architect",
       "status": "idle",
       "isPrimary": false,
@@ -21,10 +21,10 @@
         "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
       },
       "theme": "lavender",
-      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/333ddd9c-d16a-44b7-bb48-d005aa3bc2e6"
+      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/5d5e411f-d564-4a5a-9c05-6577becd8e0a"
     },
     {
-      "id": "188b611d-0834-46d8-a0a6-d564648b8bc5",
+      "id": "9c98d6b9-8911-4ae6-b220-f7aa0a19dc8d",
       "name": "Curator",
       "status": "idle",
       "isPrimary": false,
@@ -36,10 +36,10 @@
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
       },
       "theme": "ocean",
-      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/188b611d-0834-46d8-a0a6-d564648b8bc5"
+      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/9c98d6b9-8911-4ae6-b220-f7aa0a19dc8d"
     },
     {
-      "id": "e49efb4d-7139-442a-bc25-58511bf7481e",
+      "id": "7f88294f-64ae-4c60-8667-4eb10cb15856",
       "name": "Reviewer",
       "status": "idle",
       "isPrimary": false,
@@ -51,10 +51,10 @@
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
       },
       "theme": "rose",
-      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/e49efb4d-7139-442a-bc25-58511bf7481e"
+      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/7f88294f-64ae-4c60-8667-4eb10cb15856"
     },
     {
-      "id": "6d28fba8-5e4f-4f83-9b0c-20a233f9ef5b",
+      "id": "2a037605-5c96-4b7b-89f9-6d48dd013d2f",
       "name": "Worker 1",
       "status": "idle",
       "isPrimary": false,
@@ -67,13 +67,13 @@
       },
       "theme": "forest",
       "agentStatus": "not_started",
-      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/6d28fba8-5e4f-4f83-9b0c-20a233f9ef5b",
+      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/2a037605-5c96-4b7b-89f9-6d48dd013d2f",
       "agentPid": null,
       "lastIntervalRun": null,
       "pendingInputRequests": []
     },
     {
-      "id": "ddb60d48-77d8-4b43-87f9-2f2a63f0a0ba",
+      "id": "cc4f6da9-ea91-466b-b603-2c89c30f35e1",
       "name": "Worker 2",
       "status": "idle",
       "isPrimary": false,
@@ -85,7 +85,7 @@
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest",
-      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/ddb60d48-77d8-4b43-87f9-2f2a63f0a0ba"
+      "worktreePath": "/Users/rwalters/GitHub/loom/.loom/worktrees/cc4f6da9-ea91-466b-b603-2c89c30f35e1"
     }
   ]
 }

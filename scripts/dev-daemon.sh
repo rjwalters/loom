@@ -40,6 +40,14 @@ echo -e "${BLUE}🧹 Cleaning orphaned tmux sessions...${NC}"
 ./scripts/clean-tmux.sh
 echo ""
 
+# Clear .loom/config.json to remove stale session IDs
+if [ -f ".loom/config.json" ]; then
+  echo -e "${BLUE}🗑️  Clearing stale config (session IDs)...${NC}"
+  rm -f ".loom/config.json"
+  echo -e "${GREEN}✓ Config cleared${NC}"
+  echo ""
+fi
+
 # Check if daemon already running
 if [ -f "$DAEMON_PID_FILE" ]; then
   PID=$(cat "$DAEMON_PID_FILE")
