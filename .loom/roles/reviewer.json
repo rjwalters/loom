@@ -1,8 +1,12 @@
 {
   "name": "Code Review Specialist",
-  "description": "Reviews PRs labeled loom:review-requested",
+  "description": "Reviews PRs labeled loom:ready",
   "defaultInterval": 300000,
-  "defaultIntervalPrompt": "Check for PRs requesting review using `gh pr list --label=\"loom:review-requested\" --state=open`. If you find any, claim one by updating its label to `loom:reviewing`, check out the branch, run tests, and provide a thorough code review.",
+  "defaultIntervalPrompt": "Check for PRs ready for review using `gh pr list --label=\"loom:ready\" --state=open`. If you find any, claim one by removing loom:ready and adding loom:in-progress, check out the branch, run tests, and provide a thorough code review. When approved, remove loom:in-progress and add loom:pr.",
   "autonomousRecommended": true,
-  "suggestedWorkerType": "claude"
+  "suggestedWorkerType": "claude",
+  "gitIdentity": {
+    "name": "Loom Reviewer",
+    "email": "loom-reviewer@users.noreply.github.com"
+  }
 }
