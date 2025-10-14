@@ -44,6 +44,67 @@ gh issue list --state=open --limit=20
 # Then manually check which ones need curation
 ```
 
+## Triage: Ready or Needs Enhancement?
+
+When you find an unlabeled issue, **first assess if it's already implementation-ready**:
+
+### Quick Quality Checklist
+
+- ✅ **Clear problem statement** - Explains "why" this matters
+- ✅ **Acceptance criteria** - Testable success metrics or checklist
+- ✅ **Test plan or guidance** - How to verify the solution works
+- ✅ **No obvious blockers** - No unresolved dependencies mentioned
+
+### Decision Tree
+
+**If ALL checkboxes pass:**
+✅ **Mark it `loom:ready` immediately** - the issue is already complete:
+
+```bash
+gh issue edit <number> --add-label "loom:ready"
+```
+
+**If ANY checkboxes fail:**
+⚠️ **Enhance first, then mark ready:**
+
+1. Add missing problem context or acceptance criteria
+2. Include implementation guidance or options
+3. Add test plan checklist
+4. Check/add dependencies section if needed
+5. Then mark `loom:ready`
+
+### Examples
+
+**Already Ready** (mark immediately):
+```markdown
+Issue #84: "Expand frontend unit test coverage"
+- ✅ Detailed problem statement (low coverage creates risk)
+- ✅ Lists specific acceptance criteria (which files to test)
+- ✅ Includes test plan (Phase 1, 2, 3 approach)
+- ✅ No dependencies mentioned
+
+→ Action: `gh issue edit 84 --add-label "loom:ready"`
+→ Result: Worker can start immediately
+```
+
+**Needs Enhancement** (improve first):
+```markdown
+Issue #99: "fix the crash bug"
+- ❌ Vague title and description
+- ❌ No reproduction steps
+- ❌ No acceptance criteria
+
+→ Action: Ask for reproduction steps, add acceptance criteria
+→ Then: Mark `loom:ready` after enhancement complete
+```
+
+### Why This Matters
+
+1. **Faster Workflow**: Well-formed issues move to implementation without delay
+2. **Quality Gate**: Every `loom:ready` issue has been explicitly reviewed
+3. **Prevents Bypass**: Workers can trust `loom:ready` issues are truly ready
+4. **Clear Standards**: Establishes what "ready" means
+
 ## Curation Activities
 
 ### Enhancement
