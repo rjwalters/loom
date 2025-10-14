@@ -231,7 +231,15 @@ export class AppState {
     this.primaryId = null;
 
     // Add each terminal
+    // IMPORTANT: If agents have placeholder IDs (__unassigned__), we need to skip them
+    // because they all have the same ID and would overwrite each other in the Map
     agents.forEach((agent) => {
+      if (agent.id === "__unassigned__") {
+        console.warn(
+          `[loadAgents] Skipping terminal "${agent.name}" with placeholder ID - this should not happen after proper initialization`
+        );
+        return;
+      }
       this.addTerminal(agent);
     });
   }

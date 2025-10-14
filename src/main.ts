@@ -383,17 +383,38 @@ listen("factory-reset-workspace", async () => {
       state.setWorkspace(workspace);
 
       // Now load the agents into state with their new IDs
+      console.log(
+        `[factory-reset-workspace] Loading agents into state:`,
+        config.agents.map((a) => `${a.name}=${a.id}`)
+      );
       state.loadAgents(config.agents);
+      console.log(
+        `[factory-reset-workspace] State after loadAgents:`,
+        state.getTerminals().map((a) => `${a.name}=${a.id}`)
+      );
 
-      // Launch agents for terminals with role configs
-      await launchAgentsForTerminals(workspace, config.agents);
-
-      // Save the updated config with new terminal IDs (including worktree paths)
-      // IMPORTANT: Use saveConfig directly with the modified config.agents array
-      // (not saveCurrentConfig which reads from state and might not have worktree paths yet)
+      // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
+      // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
+      console.log(`[factory-reset-workspace] Saving config with real terminal IDs...`);
       await saveConfig({
         nextAgentNumber: state.getCurrentAgentNumber(),
-        agents: state.getTerminals(), // Get from state which now has the real IDs and any worktree paths
+        agents: state.getTerminals(),
+      });
+      console.log(`[factory-reset-workspace] Config saved`);
+
+      // Launch agents for terminals with role configs
+      console.log(`[factory-reset-workspace] Launching agents...`);
+      await launchAgentsForTerminals(workspace, config.agents);
+      console.log(
+        `[factory-reset-workspace] State after launchAgentsForTerminals:`,
+        state.getTerminals().map((a) => `${a.name}=${a.id}`)
+      );
+
+      // Save again with worktree paths added by agent launch
+      console.log(`[factory-reset-workspace] Saving config with worktree paths...`);
+      await saveConfig({
+        nextAgentNumber: state.getCurrentAgentNumber(),
+        agents: state.getTerminals(),
       });
 
       console.log("[factory-reset-workspace] Workspace reset complete");
@@ -969,7 +990,15 @@ async function handleWorkspacePathInput(path: string) {
 
       // Load agents from config
       if (config.agents && config.agents.length > 0) {
+        console.log(
+          `[handleWorkspacePathInput] Config agents before loadAgents:`,
+          config.agents.map((a) => `${a.name}=${a.id}`)
+        );
         state.loadAgents(config.agents);
+        console.log(
+          `[handleWorkspacePathInput] State after loadAgents:`,
+          state.getTerminals().map((a) => `${a.name}=${a.id}`)
+        );
         // Reconnect agents to existing daemon terminals
         await reconnectTerminals();
       }
