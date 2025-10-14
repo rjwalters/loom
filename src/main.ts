@@ -68,7 +68,7 @@ function render() {
 
 // Initialize xterm.js terminal display
 async function initializeTerminalDisplay(terminalId: string) {
-  const containerId = `terminal-content-${terminalId}`;
+  const containerId = `xterm-container-${terminalId}`;
 
   // Check session health before initializing
   try {
@@ -94,34 +94,54 @@ async function initializeTerminalDisplay(terminalId: string) {
   }
 
   // Check if terminal already exists
-  if (terminalManager.getTerminal(terminalId)) {
-    // Terminal already exists, just ensure polling is active
-    if (currentAttachedTerminalId !== terminalId) {
-      // Stop polling previous terminal
-      if (currentAttachedTerminalId) {
-        outputPoller.stopPolling(currentAttachedTerminalId);
-      }
-      // Start polling new terminal
-      outputPoller.startPolling(terminalId);
-      currentAttachedTerminalId = terminalId;
+  const existingManaged = terminalManager.getTerminal(terminalId);
+  if (existingManaged) {
+    // Terminal exists - just show/hide as needed
+    console.log(
+      `[initializeTerminalDisplay] Terminal ${terminalId} already exists, using show/hide`
+    );
+
+    // Hide previous terminal (if different)
+    if (currentAttachedTerminalId && currentAttachedTerminalId !== terminalId) {
+      console.log(`[initializeTerminalDisplay] Hiding terminal ${currentAttachedTerminalId}`);
+      terminalManager.hideTerminal(currentAttachedTerminalId);
+      outputPoller.pausePolling(currentAttachedTerminalId);
     }
+
+    // Show current terminal
+    console.log(`[initializeTerminalDisplay] Showing terminal ${terminalId}`);
+    terminalManager.showTerminal(terminalId);
+
+    // Resume polling for current terminal
+    console.log(`[initializeTerminalDisplay] Resuming polling for ${terminalId}`);
+    outputPoller.resumePolling(terminalId);
+
+    currentAttachedTerminalId = terminalId;
     return;
   }
 
+  // Terminal doesn't exist yet - create it
+  console.log(`[initializeTerminalDisplay] Creating new terminal ${terminalId}`);
+
   // Wait for DOM to be ready
   setTimeout(() => {
+    // Hide all other terminals first
+    if (currentAttachedTerminalId) {
+      terminalManager.hideTerminal(currentAttachedTerminalId);
+      outputPoller.pausePolling(currentAttachedTerminalId);
+    }
+
+    // Create new terminal (will be shown by default in createTerminal)
     const managed = terminalManager.createTerminal(terminalId, containerId);
     if (managed) {
+      // Show this terminal
+      terminalManager.showTerminal(terminalId);
+
       // Start polling for output
-      if (currentAttachedTerminalId !== terminalId) {
-        // Stop polling previous terminal
-        if (currentAttachedTerminalId) {
-          outputPoller.stopPolling(currentAttachedTerminalId);
-        }
-        // Start polling new terminal
-        outputPoller.startPolling(terminalId);
-        currentAttachedTerminalId = terminalId;
-      }
+      outputPoller.startPolling(terminalId);
+      currentAttachedTerminalId = terminalId;
+
+      console.log(`[initializeTerminalDisplay] Created and showing terminal ${terminalId}`);
     }
   }, 0);
 }
@@ -253,6 +273,18 @@ listen("factory-reset-workspace", async () => {
 
   // Destroy all xterm instances
   terminalManager.destroyAll();
+
+  // Destroy all terminal sessions in daemon (clean up tmux sessions)
+  console.log(`[factory-reset-workspace] Destroying ${terminals.length} terminal sessions`);
+  for (const terminal of terminals) {
+    try {
+      await invoke("destroy_terminal", { id: terminal.id });
+      console.log(`[factory-reset-workspace] Destroyed terminal ${terminal.name} (${terminal.id})`);
+    } catch (error) {
+      console.warn(`[factory-reset-workspace] Failed to destroy terminal ${terminal.id}:`, error);
+      // Continue anyway - we'll create fresh terminals
+    }
+  }
 
   // Call backend reset
   try {

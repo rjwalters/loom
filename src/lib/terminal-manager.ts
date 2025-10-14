@@ -15,21 +15,30 @@ export class TerminalManager {
   private terminals: Map<string, ManagedTerminal> = new Map();
 
   /**
-   * Create a new xterm.js terminal instance and attach it to a DOM element
+   * Create a new xterm.js terminal instance and attach it to a persistent container
+   * The container is created inside #persistent-xterm-containers and shown/hidden via display style
    */
-  createTerminal(terminalId: string, containerId: string): ManagedTerminal | null {
-    const container = document.getElementById(containerId);
-    if (!container) {
-      console.error(`Container ${containerId} not found`);
-      return null;
-    }
-
+  createTerminal(terminalId: string, _containerId: string): ManagedTerminal | null {
     // Check if terminal already exists
     const existing = this.terminals.get(terminalId);
     if (existing) {
       console.warn(`Terminal ${terminalId} already exists`);
       return existing;
     }
+
+    // Find or create the persistent container
+    const persistentArea = document.getElementById("persistent-xterm-containers");
+    if (!persistentArea) {
+      console.error("persistent-xterm-containers not found - UI not initialized");
+      return null;
+    }
+
+    // Create a new persistent container for this terminal
+    const container = document.createElement("div");
+    container.id = `xterm-container-${terminalId}`;
+    container.className = "absolute inset-0"; // Full size, positioned absolutely
+    container.style.display = "none"; // Hidden by default
+    persistentArea.appendChild(container);
 
     // Get saved font size or use default
     const fontSize = this.getSavedFontSize();
@@ -142,6 +151,43 @@ export class TerminalManager {
    */
   getTerminal(terminalId: string): ManagedTerminal | undefined {
     return this.terminals.get(terminalId);
+  }
+
+  /**
+   * Show a terminal (make it visible in the primary view)
+   */
+  showTerminal(terminalId: string): void {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      console.warn(`Terminal ${terminalId} not found`);
+      return;
+    }
+
+    managed.container.style.display = "block";
+    console.log(`[terminal-manager] Showing terminal ${terminalId}`);
+  }
+
+  /**
+   * Hide a terminal (remove it from primary view but keep state)
+   */
+  hideTerminal(terminalId: string): void {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      console.warn(`Terminal ${terminalId} not found`);
+      return;
+    }
+
+    managed.container.style.display = "none";
+    console.log(`[terminal-manager] Hiding terminal ${terminalId}`);
+  }
+
+  /**
+   * Hide all terminals
+   */
+  hideAllTerminals(): void {
+    for (const [id] of this.terminals) {
+      this.hideTerminal(id);
+    }
   }
 
   /**
