@@ -18,7 +18,7 @@ export class TerminalManager {
    * Create a new xterm.js terminal instance and attach it to a persistent container
    * The container is created inside #persistent-xterm-containers and shown/hidden via display style
    */
-  createTerminal(terminalId: string, containerId: string): ManagedTerminal | null {
+  createTerminal(terminalId: string, _containerId: string): ManagedTerminal | null {
     // Check if terminal already exists
     const existing = this.terminals.get(terminalId);
     if (existing) {
