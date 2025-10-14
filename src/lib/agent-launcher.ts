@@ -101,3 +101,108 @@ export async function sendPromptToAgent(terminalId: string, prompt: string): Pro
     data: "\r",
   });
 }
+
+/**
+ * Launch GitHub Copilot in a terminal
+ *
+ * This uses the gh CLI's copilot extension to start an interactive chat session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Copilot in
+ * @returns Promise that resolves when Copilot is launched
+ */
+export async function launchGitHubCopilotAgent(terminalId: string): Promise<void> {
+  // Build GitHub Copilot CLI command
+  // Using 'gh copilot' for interactive chat mode
+  const command = "gh copilot";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}
+
+/**
+ * Launch Google Gemini CLI in a terminal
+ *
+ * This uses the Gemini CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Gemini in
+ * @returns Promise that resolves when Gemini is launched
+ */
+export async function launchGeminiCLIAgent(terminalId: string): Promise<void> {
+  // Build Gemini CLI command for interactive mode
+  const command = "gemini chat";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}
+
+/**
+ * Launch DeepSeek CLI in a terminal
+ *
+ * This uses the DeepSeek CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch DeepSeek in
+ * @returns Promise that resolves when DeepSeek is launched
+ */
+export async function launchDeepSeekAgent(terminalId: string): Promise<void> {
+  // Build DeepSeek CLI command for interactive mode
+  const command = "deepseek chat";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}
+
+/**
+ * Launch xAI Grok CLI in a terminal
+ *
+ * This uses the Grok CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Grok in
+ * @returns Promise that resolves when Grok is launched
+ */
+export async function launchGrokAgent(terminalId: string): Promise<void> {
+  // Build Grok CLI command for interactive mode
+  const command = "grok chat";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}

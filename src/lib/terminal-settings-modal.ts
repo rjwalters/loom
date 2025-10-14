@@ -10,7 +10,6 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
 
   // Determine current role config
   const roleConfig = terminal.roleConfig || {};
-  const workerType = (roleConfig.workerType as string) || "claude";
   const targetIntervalMs = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
   const targetIntervalSeconds = Math.floor(targetIntervalMs / 1000); // Convert to seconds for display
   const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
@@ -92,7 +91,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
             </label>
             <select
               id="role-file"
-              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+              class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
             >
               <option value="">Loading roles...</option>
             </select>
@@ -105,21 +104,14 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Worker Type
             </label>
-            <div class="flex items-center gap-3">
-              <span class="text-sm text-gray-600 dark:text-gray-400">
-                Current: <strong id="worker-type-name" class="text-gray-900 dark:text-gray-100">${workerType === "claude" ? "Claude Code" : "Codex"}</strong>
-              </span>
-              <button
-                id="switch-worker-type-btn"
-                type="button"
-                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors text-sm"
-                data-current-type="${workerType}"
-              >
-                Switch to ${workerType === "claude" ? "Codex" : "Claude Code"}
-              </button>
-            </div>
+            <select
+              id="worker-type-select"
+              class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
+            >
+              <option value="">Loading available agents...</option>
+            </select>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-              Switching worker type will quit the current agent and restart with the new type.
+              Only installed AI coding agents are shown
             </p>
           </div>
         </div>
@@ -216,6 +208,30 @@ export async function showTerminalSettingsModal(
 
   // Show modal
   modal.classList.remove("hidden");
+
+  // Load available worker types
+  const workerTypeSelect = modal.querySelector("#worker-type-select") as HTMLSelectElement;
+  const roleConfig = terminal.roleConfig || {};
+  const currentWorkerType = (roleConfig.workerType as string) || "claude";
+
+  try {
+    const { getAvailableWorkerTypes } = await import("./dependency-checker");
+    const availableWorkers = await getAvailableWorkerTypes();
+
+    if (availableWorkers.length > 0) {
+      workerTypeSelect.innerHTML = availableWorkers
+        .map((worker) => {
+          const selected = worker.value === currentWorkerType ? "selected" : "";
+          return `<option value="${worker.value}" ${selected}>${worker.label}</option>`;
+        })
+        .join("");
+    } else {
+      workerTypeSelect.innerHTML = '<option value="">No agents available</option>';
+    }
+  } catch (error) {
+    console.error("Failed to load available worker types:", error);
+    workerTypeSelect.innerHTML = '<option value="">Error loading agents</option>';
+  }
 
   // Load available role files
   const workspacePath = state.getWorkspace();
@@ -372,34 +388,7 @@ export async function showTerminalSettingsModal(
     }
   });
 
-  // Wire up worker type switcher button
-  const switchWorkerTypeBtn = modal.querySelector("#switch-worker-type-btn");
-  let currentWorkerType = (terminal.roleConfig?.workerType as string) || "claude";
-
-  switchWorkerTypeBtn?.addEventListener("click", async () => {
-    await handleWorkerTypeSwitch(
-      terminal.id,
-      currentWorkerType as "claude" | "codex",
-      state,
-      (newType) => {
-        // Update local state
-        currentWorkerType = newType;
-
-        // Update UI
-        const nameEl = modal.querySelector("#worker-type-name");
-        const btnEl = modal.querySelector("#switch-worker-type-btn");
-
-        if (nameEl) {
-          nameEl.textContent = newType === "claude" ? "Claude Code" : "Codex";
-        }
-
-        if (btnEl) {
-          btnEl.textContent = newType === "claude" ? "Switch to Codex" : "Switch to Claude Code";
-          btnEl.setAttribute("data-current-type", newType);
-        }
-      }
-    );
-  });
+  // Worker type dropdown is now handled in applySettings
 
   // Wire up reset prompt button
   const resetPromptBtn = modal.querySelector("#reset-prompt-btn");
@@ -443,66 +432,6 @@ export async function showTerminalSettingsModal(
   document.addEventListener("keydown", escapeHandler);
 }
 
-async function handleWorkerTypeSwitch(
-  terminalId: string,
-  currentType: "claude" | "codex",
-  state: AppState,
-  onSuccess: (newType: "claude" | "codex") => void
-): Promise<void> {
-  const newType = currentType === "claude" ? "codex" : "claude";
-
-  // Confirm with user
-  const { ask } = await import("@tauri-apps/api/dialog");
-  const confirmed = await ask(
-    `Switch worker type from ${currentType === "claude" ? "Claude Code" : "Codex"} to ${newType === "claude" ? "Claude Code" : "Codex"}?\n\nThis will quit the current agent and restart it.`,
-    {
-      title: "Switch Worker Type",
-      type: "warning",
-    }
-  );
-
-  if (!confirmed) {
-    return;
-  }
-
-  try {
-    const { invoke } = await import("@tauri-apps/api/tauri");
-
-    // Quit current agent (send Ctrl+C, then quit command)
-    await invoke("send_terminal_input", {
-      id: terminalId,
-      data: "\u{0003}", // Ctrl+C
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // Send appropriate quit command based on current type
-    const quitCommand = currentType === "claude" ? "/quit\r" : ":exit\r";
-    await invoke("send_terminal_input", {
-      id: terminalId,
-      data: quitCommand,
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // Start new agent
-    const startCommand = newType === "claude" ? "claude\r" : "codex\r";
-    await invoke("send_terminal_input", {
-      id: terminalId,
-      data: startCommand,
-    });
-
-    // Update state
-    state.updateTerminalWorkerType(terminalId, newType);
-
-    // Call success callback to update UI
-    onSuccess(newType);
-  } catch (error) {
-    console.error("Failed to switch worker type:", error);
-    alert(`Failed to switch worker type: ${error}`);
-  }
-}
-
 async function applySettings(
   modal: HTMLElement,
   terminal: Terminal,
@@ -514,7 +443,7 @@ async function applySettings(
     // Get values from form
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
     const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
-    const switchWorkerTypeBtn = modal.querySelector("#switch-worker-type-btn");
+    const workerTypeSelect = modal.querySelector("#worker-type-select") as HTMLSelectElement;
     const autonomousCheckbox = modal.querySelector("#autonomous-enabled") as HTMLInputElement;
     const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
     const intervalPromptTextarea = modal.querySelector("#interval-prompt") as HTMLTextAreaElement;
@@ -527,8 +456,8 @@ async function applySettings(
       return;
     }
 
-    // Get current worker type from button's data attribute
-    const workerType = switchWorkerTypeBtn?.getAttribute("data-current-type") || "claude";
+    // Get current worker type from dropdown
+    const workerType = workerTypeSelect?.value || "claude";
 
     // Determine role based on role file selection
     const role = roleFile ? "claude-code-worker" : undefined;
@@ -566,41 +495,61 @@ async function applySettings(
     if (roleChanged && hasNewRole) {
       const workspacePath = state.getWorkspace();
       if (workspacePath && roleConfig.roleFile) {
-        const { launchAgentInTerminal } = await import("./agent-launcher");
         try {
-          // Load role metadata to get git identity
-          const { invoke } = await import("@tauri-apps/api/tauri");
-          let gitIdentity: { name: string; email: string } | undefined;
+          if (workerType === "github-copilot") {
+            // Launch GitHub Copilot (no worktree support for now)
+            const { launchGitHubCopilotAgent } = await import("./agent-launcher");
+            await launchGitHubCopilotAgent(terminal.id);
+          } else if (workerType === "gemini") {
+            // Launch Google Gemini CLI (no worktree support for now)
+            const { launchGeminiCLIAgent } = await import("./agent-launcher");
+            await launchGeminiCLIAgent(terminal.id);
+          } else if (workerType === "deepseek") {
+            // Launch DeepSeek CLI (no worktree support for now)
+            const { launchDeepSeekAgent } = await import("./agent-launcher");
+            await launchDeepSeekAgent(terminal.id);
+          } else if (workerType === "grok") {
+            // Launch xAI Grok CLI (no worktree support for now)
+            const { launchGrokAgent } = await import("./agent-launcher");
+            await launchGrokAgent(terminal.id);
+          } else {
+            // Launch Claude or Codex with full worktree support
+            const { launchAgentInTerminal } = await import("./agent-launcher");
 
-          try {
-            const metadataJson = await invoke<string | null>("read_role_metadata", {
-              workspacePath,
-              filename: roleConfig.roleFile,
-            });
+            // Load role metadata to get git identity
+            const { invoke } = await import("@tauri-apps/api/tauri");
+            let gitIdentity: { name: string; email: string } | undefined;
 
-            if (metadataJson) {
-              const metadata = JSON.parse(metadataJson) as {
-                gitIdentity?: { name: string; email: string };
-              };
-              gitIdentity = metadata.gitIdentity;
+            try {
+              const metadataJson = await invoke<string | null>("read_role_metadata", {
+                workspacePath,
+                filename: roleConfig.roleFile,
+              });
+
+              if (metadataJson) {
+                const metadata = JSON.parse(metadataJson) as {
+                  gitIdentity?: { name: string; email: string };
+                };
+                gitIdentity = metadata.gitIdentity;
+              }
+            } catch (error) {
+              console.warn("Failed to load git identity from role metadata:", error);
             }
-          } catch (error) {
-            console.warn("Failed to load git identity from role metadata:", error);
+
+            // Use worktree for isolation (creates one if doesn't exist)
+            const useWorktree = true;
+            const worktreePath = await launchAgentInTerminal(
+              terminal.id,
+              roleConfig.roleFile as string,
+              workspacePath,
+              terminal.worktreePath,
+              useWorktree,
+              gitIdentity
+            );
+
+            // Store worktree path in terminal state
+            state.updateTerminal(terminal.id, { worktreePath });
           }
-
-          // Use worktree for isolation (creates one if doesn't exist)
-          const useWorktree = true;
-          const worktreePath = await launchAgentInTerminal(
-            terminal.id,
-            roleConfig.roleFile as string,
-            workspacePath,
-            terminal.worktreePath,
-            useWorktree,
-            gitIdentity
-          );
-
-          // Store worktree path in terminal state
-          state.updateTerminal(terminal.id, { worktreePath });
         } catch (error) {
           console.error("Failed to launch agent:", error);
           alert(`Failed to launch agent: ${error}`);
