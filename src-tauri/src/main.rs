@@ -738,6 +738,85 @@ fn create_local_project(
     Ok(project_path.to_string_lossy().to_string())
 }
 
+/// Create a GitHub repository and push the local project
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn create_github_repository(
+    project_path: &str,
+    name: &str,
+    description: Option<String>,
+    is_private: bool,
+) -> Result<String, String> {
+    let project = Path::new(project_path);
+
+    // Check if project directory exists
+    if !project.exists() {
+        return Err(format!("Project directory does not exist: {project_path}"));
+    }
+
+    // Check if gh CLI is available
+    let which_output = Command::new("which")
+        .arg("gh")
+        .output()
+        .map_err(|e| format!("Failed to check for gh CLI: {e}"))?;
+
+    if !which_output.status.success() {
+        return Err(
+            "GitHub CLI (gh) is not installed. Please install it from https://cli.github.com/"
+                .to_string(),
+        );
+    }
+
+    // Check if gh is authenticated
+    let auth_status = Command::new("gh")
+        .args(["auth", "status"])
+        .output()
+        .map_err(|e| format!("Failed to check gh auth status: {e}"))?;
+
+    if !auth_status.status.success() {
+        return Err(
+            "Not authenticated with GitHub CLI. Please run 'gh auth login' first.".to_string()
+        );
+    }
+
+    // Build gh repo create command
+    let mut args = vec!["repo", "create", name];
+
+    // Add description if provided
+    let desc_arg;
+    if let Some(ref desc) = description {
+        desc_arg = format!("--description={desc}");
+        args.push(&desc_arg);
+    }
+
+    // Add visibility flag
+    if is_private {
+        args.push("--private");
+    } else {
+        args.push("--public");
+    }
+
+    // Add source flag to push existing local repo
+    args.push("--source=.");
+    args.push("--remote=origin");
+    args.push("--push");
+
+    // Create GitHub repository
+    let create_output = Command::new("gh")
+        .args(&args)
+        .current_dir(project)
+        .output()
+        .map_err(|e| format!("Failed to run gh repo create: {e}"))?;
+
+    if !create_output.status.success() {
+        let stderr = String::from_utf8_lossy(&create_output.stderr);
+        return Err(format!("GitHub repository creation failed: {stderr}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&create_output.stdout);
+    Ok(stdout.to_string())
+}
+
 /// Initialize .loom directory with default configuration
 fn init_loom_directory(project_path: &Path) -> Result<(), String> {
     let loom_dir = project_path.join(".loom");
@@ -1079,7 +1158,8 @@ fn main() {
             check_label_exists,
             create_github_label,
             update_github_label,
-            create_local_project
+            create_local_project,
+            create_github_repository
         ])
         .run(tauri::generate_context!())
     {
