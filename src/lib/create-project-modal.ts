@@ -91,6 +91,50 @@ export async function showCreateProjectModal(
         </select>
       </div>
 
+      <!-- GitHub Integration -->
+      <div class="border-t border-gray-200 dark:border-gray-700 pt-4">
+        <div class="flex items-center gap-2 mb-3">
+          <input
+            id="create-github-repo"
+            type="checkbox"
+            class="w-4 h-4 text-blue-600 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-600 rounded focus:ring-2 focus:ring-blue-500"
+          />
+          <label for="create-github-repo" class="text-sm font-medium text-gray-700 dark:text-gray-300">
+            Create GitHub repository
+          </label>
+        </div>
+
+        <div id="github-options" class="ml-6 space-y-3 hidden">
+          <!-- Visibility -->
+          <div>
+            <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              Visibility
+            </label>
+            <div class="flex gap-4">
+              <label class="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="github-visibility"
+                  value="public"
+                  checked
+                  class="w-4 h-4 text-blue-600 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-600 focus:ring-2 focus:ring-blue-500"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-300">Public</span>
+              </label>
+              <label class="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="github-visibility"
+                  value="private"
+                  class="w-4 h-4 text-blue-600 bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-600 focus:ring-2 focus:ring-blue-500"
+                />
+                <span class="text-sm text-gray-700 dark:text-gray-300">Private</span>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Error Message -->
       <div id="create-project-error" class="text-sm text-red-500 dark:text-red-400 min-h-[20px]"></div>
     </form>
@@ -122,6 +166,8 @@ export async function showCreateProjectModal(
   const locationInput = document.getElementById("project-location") as HTMLInputElement;
   const descriptionInput = document.getElementById("project-description") as HTMLTextAreaElement;
   const licenseSelect = document.getElementById("project-license") as HTMLSelectElement;
+  const createGithubCheckbox = document.getElementById("create-github-repo") as HTMLInputElement;
+  const githubOptions = document.getElementById("github-options");
   const browseBtn = document.getElementById("browse-location-btn");
   const cancelBtn = document.getElementById("cancel-create-project-btn");
   const errorDiv = document.getElementById("create-project-error");
@@ -156,6 +202,13 @@ export async function showCreateProjectModal(
     }
   });
 
+  // Toggle GitHub options visibility
+  createGithubCheckbox.addEventListener("change", () => {
+    if (githubOptions) {
+      githubOptions.classList.toggle("hidden", !createGithubCheckbox.checked);
+    }
+  });
+
   // Real-time validation
   nameInput.addEventListener("input", () => {
     const error = validateProjectName(nameInput.value);
@@ -172,6 +225,11 @@ export async function showCreateProjectModal(
     const location = locationInput.value.trim();
     const description = descriptionInput.value.trim() || null;
     const license = licenseSelect.value || null;
+    const createGithub = createGithubCheckbox.checked;
+    const githubVisibility = createGithub
+      ? (document.querySelector('input[name="github-visibility"]:checked') as HTMLInputElement)
+          ?.value || "public"
+      : null;
 
     // Validate
     const nameError = validateProjectName(name);
@@ -193,7 +251,7 @@ export async function showCreateProjectModal(
       // Disable form while creating
       const createBtn = document.getElementById("create-project-btn");
       if (createBtn) {
-        createBtn.textContent = "Creating...";
+        createBtn.textContent = createGithub ? "Creating (local + GitHub)..." : "Creating...";
         (createBtn as HTMLButtonElement).disabled = true;
       }
 
@@ -206,6 +264,33 @@ export async function showCreateProjectModal(
       });
 
       console.log(`[createProjectModal] Project created at: ${projectPath}`);
+
+      // If GitHub checkbox is selected, create GitHub repository
+      if (createGithub) {
+        try {
+          await invoke<string>("create_github_repository", {
+            projectPath,
+            name,
+            description,
+            isPrivate: githubVisibility === "private",
+          });
+          console.log(`[createProjectModal] GitHub repository created`);
+        } catch (githubError) {
+          console.error("[createProjectModal] Failed to create GitHub repository:", githubError);
+          if (errorDiv) {
+            errorDiv.textContent = `Local project created, but GitHub creation failed: ${
+              typeof githubError === "string" ? githubError : "Unknown error"
+            }`;
+          }
+          // Re-enable button but keep modal open for user to see error
+          const createBtn = document.getElementById("create-project-btn");
+          if (createBtn) {
+            createBtn.textContent = "Create";
+            (createBtn as HTMLButtonElement).disabled = false;
+          }
+          return;
+        }
+      }
 
       // Close modal
       backdrop.remove();
