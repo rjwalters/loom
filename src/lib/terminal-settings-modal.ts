@@ -10,7 +10,6 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
 
   // Determine current role config
   const roleConfig = terminal.roleConfig || {};
-  const workerType = (roleConfig.workerType as string) || "claude";
   const targetIntervalMs = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
   const targetIntervalSeconds = Math.floor(targetIntervalMs / 1000); // Convert to seconds for display
   const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
@@ -109,12 +108,10 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
               id="worker-type-select"
               class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
             >
-              <option value="claude" ${workerType === "claude" ? "selected" : ""}>Claude Code</option>
-              <option value="codex" ${workerType === "codex" ? "selected" : ""}>Codex</option>
-              <option value="github-copilot" ${workerType === "github-copilot" ? "selected" : ""}>GitHub Copilot</option>
+              <option value="">Loading available agents...</option>
             </select>
             <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-              Choose the AI coding agent for this terminal
+              Only installed AI coding agents are shown
             </p>
           </div>
         </div>
@@ -211,6 +208,30 @@ export async function showTerminalSettingsModal(
 
   // Show modal
   modal.classList.remove("hidden");
+
+  // Load available worker types
+  const workerTypeSelect = modal.querySelector("#worker-type-select") as HTMLSelectElement;
+  const roleConfig = terminal.roleConfig || {};
+  const currentWorkerType = (roleConfig.workerType as string) || "claude";
+
+  try {
+    const { getAvailableWorkerTypes } = await import("./dependency-checker");
+    const availableWorkers = await getAvailableWorkerTypes();
+
+    if (availableWorkers.length > 0) {
+      workerTypeSelect.innerHTML = availableWorkers
+        .map((worker) => {
+          const selected = worker.value === currentWorkerType ? "selected" : "";
+          return `<option value="${worker.value}" ${selected}>${worker.label}</option>`;
+        })
+        .join("");
+    } else {
+      workerTypeSelect.innerHTML = '<option value="">No agents available</option>';
+    }
+  } catch (error) {
+    console.error("Failed to load available worker types:", error);
+    workerTypeSelect.innerHTML = '<option value="">Error loading agents</option>';
+  }
 
   // Load available role files
   const workspacePath = state.getWorkspace();
