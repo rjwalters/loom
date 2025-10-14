@@ -383,7 +383,12 @@ listen("factory-reset-workspace", async () => {
       await launchAgentsForTerminals(workspace, config.agents);
 
       // Save the updated config with new terminal IDs (including worktree paths)
-      await saveCurrentConfig();
+      // IMPORTANT: Use saveConfig directly with the modified config.agents array
+      // (not saveCurrentConfig which reads from state and might not have worktree paths yet)
+      await saveConfig({
+        nextAgentNumber: state.getCurrentAgentNumber(),
+        agents: state.getTerminals(), // Get from state which now has the real IDs and any worktree paths
+      });
 
       console.log("[factory-reset-workspace] Workspace reset complete");
     } else {
