@@ -9,6 +9,7 @@ import { AppState, setAppState, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
+import { getTooltipManager } from "./lib/tooltip";
 import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
 
 // Initialize theme
@@ -58,6 +59,9 @@ function render() {
   if (!hasWorkspace) {
     attachWorkspaceEventListeners();
   }
+
+  // Set up tooltips for all elements with data-tooltip attributes
+  setupTooltips();
 
   // Initialize xterm.js terminal for primary terminal
   const primary = state.getPrimary();
@@ -1005,6 +1009,33 @@ function attachWorkspaceEventListeners() {
   browseBtn?.addEventListener("click", () => {
     console.log("[browseBtn click] clicked");
     browseWorkspace();
+  });
+}
+
+// Set up tooltips for all elements with data-tooltip attributes
+function setupTooltips() {
+  const tooltipManager = getTooltipManager();
+
+  // Find all elements with data-tooltip attribute
+  const elements = document.querySelectorAll<HTMLElement>("[data-tooltip]");
+
+  elements.forEach((element) => {
+    const text = element.getAttribute("data-tooltip");
+    const position = element.getAttribute("data-tooltip-position") as
+      | "top"
+      | "bottom"
+      | "left"
+      | "right"
+      | "auto"
+      | null;
+
+    if (text) {
+      tooltipManager.attach(element, {
+        text,
+        position: position || "auto",
+        delay: 500,
+      });
+    }
   });
 }
 

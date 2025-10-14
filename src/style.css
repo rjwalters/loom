@@ -88,3 +88,37 @@
 .animate-scale-in {
   animation: scale-in 0.2s ease-out;
 }
+
+/* Tooltip styles */
+.tooltip {
+  position: fixed;
+  z-index: 9999;
+  padding: 6px 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  pointer-events: none;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 150ms ease-in-out;
+  max-width: 300px;
+}
+
+.tooltip.show {
+  opacity: 1;
+}
+
+/* Dark theme (default) */
+.tooltip {
+  background-color: rgba(30, 30, 30, 0.95);
+  color: #e5e5e5;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* Light theme */
+:root:not(.dark) .tooltip {
+  background-color: rgba(255, 255, 255, 0.95);
+  color: #333333;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}

@@ -50,10 +50,14 @@ export function renderPrimaryTerminal(
                 type="text"
                 placeholder="Select or enter workspace path..."
                 value="${escapeHtml(displayedWorkspacePath)}"
+                data-tooltip="Enter path to git repository"
+                data-tooltip-position="bottom"
                 class="px-3 py-2 text-sm bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 w-96"
               />
               <button
                 id="browse-workspace"
+                data-tooltip="Browse for folder"
+                data-tooltip-position="bottom"
                 class="p-2 hover:bg-gray-100 dark:hover:bg-gray-700 rounded border border-gray-300 dark:border-gray-600"
                 title="Browse for folder"
               >
@@ -100,13 +104,15 @@ export function renderPrimaryTerminal(
     headerContainer.innerHTML = `
       <div class="flex items-center gap-2">
         <div class="w-2 h-2 rounded-full ${getStatusColor(terminal.status)}"></div>
-        <span class="terminal-name font-medium text-sm" data-terminal-id="${terminal.id}">${escapeHtml(terminal.name)}</span>
+        <span class="terminal-name font-medium text-sm" data-terminal-id="${terminal.id}" data-tooltip="Double-click to rename" data-tooltip-position="bottom">${escapeHtml(terminal.name)}</span>
         <span class="text-xs text-gray-500 dark:text-gray-400">• ${roleLabel}</span>
       </div>
       <div class="flex items-center gap-1">
         <button
           id="terminal-clear-btn"
           data-terminal-id="${terminal.id}"
+          data-tooltip="Clear terminal history"
+          data-tooltip-position="bottom"
           class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
           title="Clear terminal"
         >
@@ -117,6 +123,8 @@ export function renderPrimaryTerminal(
         <button
           id="terminal-settings-btn"
           data-terminal-id="${terminal.id}"
+          data-tooltip="Configure terminal role and settings"
+          data-tooltip-position="bottom"
           class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
           title="Terminal settings"
         >
@@ -236,6 +244,8 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
       ${terminalCards}
       <button
         id="add-terminal-btn"
+        data-tooltip="${addButtonTitle}"
+        data-tooltip-position="auto"
         class="flex-shrink-0 w-32 h-32 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
         title="${addButtonTitle}"
         ${addButtonDisabled}
@@ -273,11 +283,13 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
         <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
           <div class="flex items-center gap-2 flex-1 min-w-0">
             <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
-            <span class="terminal-name text-xs font-medium truncate">${escapeHtml(terminal.name)}</span>
+            <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
           </div>
           <button
             class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
             data-terminal-id="${terminal.id}"
+            data-tooltip="Close terminal"
+            data-tooltip-position="top"
             title="Close terminal"
           >
             ×
