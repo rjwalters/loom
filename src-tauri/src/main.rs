@@ -478,6 +478,21 @@ fn check_claude_code() -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn write_file(path: &str, content: &str) -> Result<(), String> {
+    let file_path = Path::new(path);
+
+    // Ensure parent directory exists
+    if let Some(parent) = file_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent directory: {e}"))?;
+        }
+    }
+
+    fs::write(file_path, content).map_err(|e| format!("Failed to write file: {e}"))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WorkspaceData {
     last_workspace_path: String,
@@ -1200,6 +1215,7 @@ fn main() {
             initialize_loom_workspace,
             read_config,
             write_config,
+            write_file,
             list_role_files,
             read_role_file,
             read_role_metadata,
