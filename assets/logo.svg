@@ -1,6 +1,14 @@
 <svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
-  <!-- Background circle for better standalone rendering -->
-  <circle cx="256" cy="256" r="256" fill="#1E293B"/>
+  <!-- macOS-style rounded rectangle background with gradient -->
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E3A8A;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0F172A;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded rectangle background (macOS style ~22% radius) -->
+  <rect width="512" height="512" rx="113" ry="113" fill="url(#bgGradient)"/>
 
   <!-- Spool body - main cylinder -->
   <rect x="176" y="120" width="160" height="272" rx="12" fill="#3B82F6"/>
