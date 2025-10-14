@@ -263,12 +263,12 @@ impl TerminalManager {
                     .args(["pipe-pane", "-t", session, "-o", &pipe_cmd])
                     .output()?;
 
-                if !result.status.success() {
+                if result.status.success() {
+                    log::info!("pipe-pane setup successful for {session}");
+                } else {
                     let stderr = String::from_utf8_lossy(&result.stderr);
                     log::warn!("pipe-pane setup failed for {session}: {stderr}");
                     // Continue anyway - terminal is still usable
-                } else {
-                    log::info!("pipe-pane setup successful for {session}");
                 }
 
                 self.terminals
