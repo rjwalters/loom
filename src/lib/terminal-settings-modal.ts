@@ -11,9 +11,10 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   // Determine current role config
   const roleConfig = terminal.roleConfig || {};
   const workerType = (roleConfig.workerType as string) || "claude";
-  const targetInterval = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
+  const targetIntervalMs = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
+  const targetIntervalSeconds = Math.floor(targetIntervalMs / 1000); // Convert to seconds for display
   const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
-  const autonomousEnabled = targetInterval > 0;
+  const autonomousEnabled = targetIntervalMs > 0;
 
   modal.innerHTML = `
     <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] min-w-[600px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
@@ -145,18 +146,18 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
           <div id="autonomous-config" ${autonomousEnabled ? "" : 'class="opacity-50 pointer-events-none"'}>
             <div class="mb-4">
               <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-                Target Interval (milliseconds)
+                Target Interval (seconds)
               </label>
               <input
                 type="number"
                 id="target-interval"
-                value="${targetInterval}"
+                value="${targetIntervalSeconds}"
                 min="0"
-                step="1000"
+                step="1"
                 class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
               />
               <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                Default: 300000 (5 minutes)
+                Default: 300 (5 minutes)
               </div>
             </div>
 
@@ -344,9 +345,9 @@ export async function showTerminalSettingsModal(
           autonomousRecommended?: boolean;
         };
 
-        // Populate interval settings from metadata
+        // Populate interval settings from metadata (convert ms to seconds)
         if (metadata.defaultInterval !== undefined) {
-          targetIntervalInput.value = metadata.defaultInterval.toString();
+          targetIntervalInput.value = Math.floor(metadata.defaultInterval / 1000).toString();
         }
         if (metadata.defaultIntervalPrompt !== undefined) {
           intervalPromptTextarea.value = metadata.defaultIntervalPrompt;
@@ -532,13 +533,13 @@ async function applySettings(
     // Determine role based on role file selection
     const role = roleFile ? "claude-code-worker" : undefined;
 
-    // Build role config
+    // Build role config (convert seconds to milliseconds for storage)
     const roleConfig = roleFile
       ? {
           workerType,
           roleFile,
           targetInterval: autonomousCheckbox.checked
-            ? Number.parseInt(targetIntervalInput.value, 10)
+            ? Number.parseInt(targetIntervalInput.value, 10) * 1000
             : 0,
           intervalPrompt: intervalPromptTextarea.value.trim(),
         }
