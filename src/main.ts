@@ -1010,6 +1010,19 @@ function attachWorkspaceEventListeners() {
     console.log("[browseBtn click] clicked");
     browseWorkspace();
   });
+
+  // Create new project button
+  const createProjectBtn = document.getElementById("create-new-project-btn");
+  console.log("[attachWorkspaceEventListeners] createProjectBtn:", createProjectBtn);
+  createProjectBtn?.addEventListener("click", async () => {
+    console.log("[createProjectBtn click] clicked");
+    const { showCreateProjectModal } = await import("./lib/create-project-modal");
+    showCreateProjectModal(async (projectPath: string) => {
+      console.log(`[createProjectModal] Project created at: ${projectPath}`);
+      // Load the newly created project as the workspace
+      await handleWorkspacePathInput(projectPath);
+    });
+  });
 }
 
 // Set up tooltips for all elements with data-tooltip attributes

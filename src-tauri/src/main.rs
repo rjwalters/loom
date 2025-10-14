@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use chrono::Datelike;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -655,6 +656,169 @@ fn update_github_label(name: &str, description: &str, color: &str) -> Result<(),
     Ok(())
 }
 
+/// Create a new local git repository with Loom configuration
+#[tauri::command]
+fn create_local_project(
+    name: &str,
+    location: &str,
+    description: Option<String>,
+    license: Option<String>,
+) -> Result<String, String> {
+    let project_path = Path::new(location).join(name);
+
+    // Check if directory already exists
+    if project_path.exists() {
+        return Err(format!("Directory already exists: {}", project_path.display()));
+    }
+
+    // Create project directory
+    fs::create_dir_all(&project_path)
+        .map_err(|e| format!("Failed to create project directory: {e}"))?;
+
+    // Initialize git repository
+    let init_output = Command::new("git")
+        .args(["init"])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("Failed to run git init: {e}"))?;
+
+    if !init_output.status.success() {
+        let stderr = String::from_utf8_lossy(&init_output.stderr);
+        return Err(format!("git init failed: {stderr}"));
+    }
+
+    // Create README.md
+    let readme_content = if let Some(desc) = description {
+        format!("# {name}\n\n{desc}\n")
+    } else {
+        format!("# {name}\n")
+    };
+
+    fs::write(project_path.join("README.md"), readme_content)
+        .map_err(|e| format!("Failed to create README.md: {e}"))?;
+
+    // Create LICENSE file if specified
+    if let Some(license_type) = license {
+        let license_content = generate_license_content(&license_type, name)?;
+        fs::write(project_path.join("LICENSE"), license_content)
+            .map_err(|e| format!("Failed to create LICENSE: {e}"))?;
+    }
+
+    // Initialize .loom directory with defaults
+    init_loom_directory(&project_path)?;
+
+    // Create initial .gitignore with .loom/
+    let gitignore_content = ".loom/\n";
+    fs::write(project_path.join(".gitignore"), gitignore_content)
+        .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
+
+    // Create initial git commit
+    let add_output = Command::new("git")
+        .args(["add", "."])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("Failed to run git add: {e}"))?;
+
+    if !add_output.status.success() {
+        let stderr = String::from_utf8_lossy(&add_output.stderr);
+        return Err(format!("git add failed: {stderr}"));
+    }
+
+    let commit_output = Command::new("git")
+        .args(["commit", "-m", "Initial commit"])
+        .current_dir(&project_path)
+        .output()
+        .map_err(|e| format!("Failed to run git commit: {e}"))?;
+
+    if !commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+        return Err(format!("git commit failed: {stderr}"));
+    }
+
+    Ok(project_path.to_string_lossy().to_string())
+}
+
+/// Initialize .loom directory with default configuration
+fn init_loom_directory(project_path: &Path) -> Result<(), String> {
+    let loom_dir = project_path.join(".loom");
+
+    // Create .loom directory
+    fs::create_dir_all(&loom_dir).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+
+    // Copy default config from defaults directory
+    let defaults_dir = Path::new("defaults");
+    if !defaults_dir.exists() {
+        return Err("Defaults directory not found".to_string());
+    }
+
+    // Copy entire defaults directory structure to .loom
+    copy_dir_recursive(defaults_dir, &loom_dir)
+        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+
+    // Copy .loom-README.md to .loom/README.md if it exists
+    let loom_readme_src = defaults_dir.join(".loom-README.md");
+    let loom_readme_dst = loom_dir.join("README.md");
+    if loom_readme_src.exists() {
+        fs::copy(&loom_readme_src, &loom_readme_dst)
+            .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Generate license content based on license type
+fn generate_license_content(license_type: &str, project_name: &str) -> Result<String, String> {
+    let year = chrono::Local::now().year();
+
+    match license_type {
+        "MIT" => Ok(format!(
+            r#"MIT License
+
+Copyright (c) {year} {project_name}
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"#
+        )),
+        "Apache-2.0" => Ok(format!(
+            r#"                                 Apache License
+                           Version 2.0, January 2004
+                        http://www.apache.org/licenses/
+
+   Copyright {year} {project_name}
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.
+"#
+        )),
+        _ => Err(format!("Unsupported license type: {license_type}")),
+    }
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -914,7 +1078,8 @@ fn main() {
             check_github_remote,
             check_label_exists,
             create_github_label,
-            update_github_label
+            update_github_label,
+            create_local_project
         ])
         .run(tauri::generate_context!())
     {
