@@ -42,9 +42,9 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
       </div>
 
       <!-- Tab Content Container -->
-      <div class="flex-1 overflow-y-auto h-[400px]">
+      <div class="flex-1 overflow-y-auto">
         <!-- Appearance Tab -->
-        <div data-tab-content="appearance" class="space-y-4">
+        <div data-tab-content="appearance" class="space-y-4 h-full">
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Terminal Name
@@ -84,7 +84,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
         </div>
 
         <!-- Agent Configuration Tab -->
-        <div data-tab-content="agent" class="space-y-4 hidden">
+        <div data-tab-content="agent" class="space-y-4 h-full hidden">
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Role
@@ -124,7 +124,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
         </div>
 
         <!-- Interval Mode Tab -->
-        <div data-tab-content="interval" class="space-y-4 hidden">
+        <div data-tab-content="interval" class="space-y-4 h-full hidden">
           <div>
             <label class="flex items-center">
               <input
