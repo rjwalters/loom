@@ -42,7 +42,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
       </div>
 
       <!-- Tab Content Container -->
-      <div class="flex-1 overflow-y-auto">
+      <div class="flex-1 overflow-y-auto h-[400px]">
         <!-- Appearance Tab -->
         <div data-tab-content="appearance" class="space-y-4">
           <div>
