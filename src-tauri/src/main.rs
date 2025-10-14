@@ -19,10 +19,20 @@ fn greet(name: &str) -> String {
 }
 
 #[tauri::command]
-async fn create_terminal(name: String, working_dir: Option<String>) -> Result<String, String> {
+async fn create_terminal(
+    name: String,
+    working_dir: Option<String>,
+    role: Option<String>,
+    instance_number: Option<u32>,
+) -> Result<String, String> {
     let client = DaemonClient::new().map_err(|e| e.to_string())?;
     let response = client
-        .send_request(Request::CreateTerminal { name, working_dir })
+        .send_request(Request::CreateTerminal {
+            name,
+            working_dir,
+            role,
+            instance_number,
+        })
         .await
         .map_err(|e| e.to_string())?;
 
@@ -207,6 +217,21 @@ async fn attach_to_session(id: String, session_name: String) -> Result<(), Strin
     let client = DaemonClient::new().map_err(|e| e.to_string())?;
     let response = client
         .send_request(Request::AttachToSession { id, session_name })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn kill_session(session_name: String) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::KillSession { session_name })
         .await
         .map_err(|e| e.to_string())?;
 
@@ -1148,6 +1173,7 @@ fn main() {
             get_daemon_status,
             list_available_sessions,
             attach_to_session,
+            kill_session,
             get_env_var,
             check_claude_code,
             get_stored_workspace,

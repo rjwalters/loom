@@ -21,9 +21,14 @@ impl TerminalManager {
         &mut self,
         name: String,
         working_dir: Option<String>,
+        role: Option<&String>,
+        instance_number: Option<u32>,
     ) -> Result<TerminalId> {
         let id = Uuid::new_v4().to_string();
-        let tmux_session = format!("loom-{}", &id[..8]);
+        let uuid_short = &id[..8];
+        let role_part = role.map_or("default", String::as_str);
+        let instance_part = instance_number.unwrap_or(0);
+        let tmux_session = format!("loom-{uuid_short}-{role_part}-{instance_part}");
 
         let mut cmd = Command::new("tmux");
         cmd.args([
@@ -343,6 +348,28 @@ impl TerminalManager {
         // Update the terminal info to point to the new session
         info.tmux_session = session_name;
 
+        Ok(())
+    }
+
+    /// Kill a tmux session by name
+    #[allow(clippy::unused_self)]
+    pub fn kill_session(&self, session_name: &str) -> Result<()> {
+        // Verify the session exists
+        let check_output = Command::new("tmux")
+            .args(["has-session", "-t", session_name])
+            .output()?;
+
+        if !check_output.status.success() {
+            return Err(anyhow!("Tmux session '{session_name}' does not exist"));
+        }
+
+        // Kill the session
+        Command::new("tmux")
+            .args(["kill-session", "-t", session_name])
+            .spawn()?
+            .wait()?;
+
+        log::info!("Killed tmux session: {session_name}");
         Ok(())
     }
 }
