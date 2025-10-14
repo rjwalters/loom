@@ -12,10 +12,30 @@ Each prompt consists of two files:
 
 - **`default.md`** - Plain shell environment, no specialized role
 - **`worker.md`** - General development worker for features, bugs, and refactoring
-- **`issues.md`** - Specialist for creating well-structured GitHub issues
+- **`issues.md`** - Specialist for creating well-structured GitHub issues (manual, user-driven)
 - **`reviewer.md`** - Code review specialist for thorough PR reviews
-- **`architect.md`** - System architecture and technical decision making
+- **`architect.md`** - System architecture and technical decision making (autonomous, proactive)
 - **`curator.md`** - Issue maintenance and quality improvement
+
+### Issues vs Architect: What's the Difference?
+
+These roles serve different purposes and are both valuable:
+
+**Issues Bot** (issues.md):
+- **Trigger**: Manual invocation by user
+- **Purpose**: Helps users format their requests into well-structured GitHub issues
+- **Input**: Takes what the user wants and structures it properly
+- **Scope**: Single issue at a time, user-directed
+- **Use case**: "I want feature X" → Issues Bot creates a proper GitHub issue
+
+**Architect Bot** (architect.md):
+- **Trigger**: Autonomous (runs every 15 minutes)
+- **Purpose**: Proactively scans codebase to identify improvement opportunities
+- **Input**: Analyzes code, docs, tests, CI/CD, security, performance
+- **Scope**: Entire codebase across all domains
+- **Use case**: Discovers problems you didn't know existed and proposes comprehensive solutions
+
+**Think of it this way**: Issues Bot is your secretary formatting memos you dictate, while Architect Bot is your technical advisor who reviews everything and suggests improvements.
 
 ## Usage
 

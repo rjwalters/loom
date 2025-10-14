@@ -397,7 +397,10 @@ fn list_role_files(workspace_path: &str) -> Result<Vec<String>, String> {
                 if extension == "md" {
                     if let Some(filename) = path.file_name() {
                         if let Some(name) = filename.to_str() {
-                            role_files.push(name.to_string());
+                            // Filter out README.md - it's documentation, not a role
+                            if name != "README.md" {
+                                role_files.push(name.to_string());
+                            }
                         }
                     }
                 }
