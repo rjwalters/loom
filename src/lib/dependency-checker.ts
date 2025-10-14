@@ -5,6 +5,8 @@ interface DependencyStatus {
   tmux_available: boolean;
   git_available: boolean;
   claude_code_available: boolean;
+  gh_available: boolean;
+  gh_copilot_available: boolean;
 }
 
 export async function checkAndReportDependencies(): Promise<boolean> {
@@ -14,6 +16,8 @@ export async function checkAndReportDependencies(): Promise<boolean> {
   if (!status.tmux_available) missing.push("tmux");
   if (!status.git_available) missing.push("git");
   if (!status.claude_code_available) missing.push("claude");
+  if (!status.gh_available) missing.push("gh");
+  if (status.gh_available && !status.gh_copilot_available) missing.push("gh-copilot");
 
   if (missing.length === 0) {
     return true; // All dependencies available
@@ -35,6 +39,14 @@ export async function checkAndReportDependencies(): Promise<boolean> {
   if (!status.claude_code_available) {
     message += "❌ claude - Claude Code CLI\n";
     message += "   Install: npm install -g @anthropic-ai/claude-code\n\n";
+  }
+
+  if (!status.gh_available) {
+    message += "❌ gh - GitHub CLI\n";
+    message += "   Install: brew install gh\n\n";
+  } else if (!status.gh_copilot_available) {
+    message += "❌ gh copilot - GitHub Copilot CLI extension\n";
+    message += "   Install: gh extension install github/gh-copilot\n\n";
   }
 
   message += "Would you like to retry after installation?";

@@ -101,3 +101,30 @@ export async function sendPromptToAgent(terminalId: string, prompt: string): Pro
     data: "\r",
   });
 }
+
+/**
+ * Launch GitHub Copilot in a terminal
+ *
+ * This uses the gh CLI's copilot extension to start an interactive chat session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Copilot in
+ * @returns Promise that resolves when Copilot is launched
+ */
+export async function launchGitHubCopilotAgent(terminalId: string): Promise<void> {
+  // Build GitHub Copilot CLI command
+  // Using 'gh copilot' for interactive chat mode
+  const command = "gh copilot";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}

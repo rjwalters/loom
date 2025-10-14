@@ -148,7 +148,7 @@ export class AppState {
     }
   }
 
-  updateTerminalWorkerType(id: string, workerType: "claude" | "codex"): void {
+  updateTerminalWorkerType(id: string, workerType: "claude" | "codex" | "github-copilot"): void {
     const terminal = this.terminals.get(id);
     if (terminal?.roleConfig) {
       terminal.roleConfig.workerType = workerType;
