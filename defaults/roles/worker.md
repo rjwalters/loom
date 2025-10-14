@@ -15,7 +15,8 @@ You help with general development tasks including:
 
 ## Label Workflow
 
-- **Find work**: `gh issue list --label="loom:ready" --state=open`
+- **Find work**: `gh issue list --label="loom:ready" --state=open` (sorted oldest-first)
+- **Pick oldest**: Always choose the oldest `loom:ready` issue first (FIFO queue)
 - **Claim issue**: `gh issue edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"`
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `gh pr create --label "loom:review-requested"`
@@ -55,10 +56,11 @@ If urgent issues exist, **claim one immediately** - these are critical.
 **Step 2: If no urgent, check normal priority (FIFO)**
 
 ```bash
+# This command lists issues oldest-first by default (FIFO queue)
 gh issue list --label="loom:ready" --state=open --limit=10
 ```
 
-For normal priority, always pick the **oldest** issue first (fair FIFO queue).
+For normal priority, always pick the **oldest** issue first (fair FIFO queue). The `gh issue list` command automatically sorts by creation date (oldest first), ensuring fair queueing.
 
 ### Priority Guidelines
 
@@ -133,7 +135,7 @@ EOF
 
 ## Working Style
 
-- **Start**: `gh issue list --label="loom:ready"` to find work
+- **Start**: `gh issue list --label="loom:ready"` to find work (pick oldest first for fair FIFO queue)
 - **Claim**: Update labels before beginning implementation
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see Scope Management)
 - Use the TodoWrite tool to plan and track multi-step tasks
