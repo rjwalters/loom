@@ -1,0 +1,37 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background circle for better standalone rendering -->
+  <circle cx="256" cy="256" r="256" fill="#1E293B"/>
+
+  <!-- Spool body - main cylinder -->
+  <rect x="176" y="120" width="160" height="272" rx="12" fill="#3B82F6"/>
+
+  <!-- Spool top rim -->
+  <ellipse cx="256" cy="120" rx="100" ry="24" fill="#2563EB"/>
+  <ellipse cx="256" cy="120" rx="100" ry="20" fill="#3B82F6"/>
+
+  <!-- Spool bottom rim -->
+  <ellipse cx="256" cy="392" rx="100" ry="24" fill="#1E40AF"/>
+  <ellipse cx="256" cy="392" rx="100" ry="20" fill="#2563EB"/>
+
+  <!-- Thread wrapping around spool (golden/amber color) -->
+  <!-- Top thread loops -->
+  <path d="M 156,160 Q 256,150 356,160" fill="none" stroke="#F59E0B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 156,168 Q 256,178 356,168" fill="none" stroke="#F59E0B" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Middle thread loops -->
+  <path d="M 156,210 Q 256,200 356,210" fill="none" stroke="#FBBF24" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 156,218 Q 256,228 356,218" fill="none" stroke="#FBBF24" stroke-width="6" stroke-linecap="round"/>
+
+  <path d="M 156,256 Q 256,246 356,256" fill="none" stroke="#F59E0B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 156,264 Q 256,274 356,264" fill="none" stroke="#F59E0B" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Lower thread loops -->
+  <path d="M 156,302 Q 256,292 356,302" fill="none" stroke="#FBBF24" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 156,310 Q 256,320 356,310" fill="none" stroke="#FBBF24" stroke-width="6" stroke-linecap="round"/>
+
+  <path d="M 156,344 Q 256,334 356,344" fill="none" stroke="#F59E0B" stroke-width="6" stroke-linecap="round"/>
+  <path d="M 156,352 Q 256,362 356,352" fill="none" stroke="#F59E0B" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- Highlight on spool body for depth -->
+  <ellipse cx="220" cy="256" rx="20" ry="80" fill="#60A5FA" opacity="0.3"/>
+</svg>
