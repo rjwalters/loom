@@ -74,6 +74,12 @@ function render() {
 async function initializeTerminalDisplay(terminalId: string) {
   const containerId = `xterm-container-${terminalId}`;
 
+  // Skip placeholder IDs - they're already broken and will show error UI
+  if (terminalId === "__unassigned__") {
+    console.warn(`[initializeTerminalDisplay] Skipping placeholder terminal ID`);
+    return;
+  }
+
   // Check session health before initializing
   try {
     const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
@@ -783,15 +789,11 @@ async function reconnectTerminals() {
       // Check if agent has placeholder ID (shouldn't happen after proper initialization)
       if (agent.id === "__unassigned__") {
         console.log(
-          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, marking as missing`
+          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, skipping (already in error state)`
         );
 
-        // Mark terminal as having missing session so user can see it needs recovery
-        state.updateTerminal(agent.id, {
-          status: TerminalStatus.Error,
-          missingSession: true,
-        });
-
+        // Don't call state.updateTerminal() here - it triggers infinite render loop
+        // The terminal already shows as missing because check_session_health will fail for "__unassigned__"
         missingCount++;
         continue;
       }
