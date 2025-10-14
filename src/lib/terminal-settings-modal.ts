@@ -16,7 +16,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   const autonomousEnabled = targetInterval > 0;
 
   modal.innerHTML = `
-    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] min-w-[600px] min-h-[500px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
+    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] min-w-[600px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
       <h2 class="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">Terminal Settings: ${escapeHtml(terminal.name)}</h2>
 
       <!-- Tabs -->
@@ -42,9 +42,9 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
       </div>
 
       <!-- Tab Content Container -->
-      <div class="flex-1 overflow-y-auto">
+      <div class="overflow-y-auto h-[420px]">
         <!-- Appearance Tab -->
-        <div data-tab-content="appearance" class="space-y-4 h-full">
+        <div data-tab-content="appearance" class="space-y-4">
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Terminal Name
@@ -84,7 +84,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
         </div>
 
         <!-- Agent Configuration Tab -->
-        <div data-tab-content="agent" class="space-y-4 h-full hidden">
+        <div data-tab-content="agent" class="space-y-4 hidden">
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Role
@@ -124,7 +124,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
         </div>
 
         <!-- Interval Mode Tab -->
-        <div data-tab-content="interval" class="space-y-4 h-full hidden">
+        <div data-tab-content="interval" class="space-y-4 hidden">
           <div>
             <label class="flex items-center">
               <input
