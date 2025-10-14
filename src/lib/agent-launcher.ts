@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import type { GitIdentity } from "./worktree-manager";
 
 /**
  * Launch a Claude agent in a terminal by sending the Claude CLI command
@@ -12,6 +13,7 @@ import { invoke } from "@tauri-apps/api/tauri";
  * @param workspacePath - The workspace path for the agent
  * @param worktreePath - Optional worktree path for isolated work (defaults to workspace)
  * @param useWorktree - Whether to create a worktree for isolation (default: false)
+ * @param gitIdentity - Optional git identity to configure in the worktree
  * @returns Promise that resolves with the working directory path that was used
  */
 export async function launchAgentInTerminal(
@@ -19,13 +21,14 @@ export async function launchAgentInTerminal(
   roleFile: string,
   workspacePath: string,
   worktreePath?: string,
-  useWorktree = false
+  useWorktree = false,
+  gitIdentity?: GitIdentity
 ): Promise<string> {
   // Set up worktree if requested
   let agentWorkingDir = workspacePath;
   if (useWorktree && !worktreePath) {
     const { setupWorktreeForAgent } = await import("./worktree-manager");
-    agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath);
+    agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath, gitIdentity);
   } else if (worktreePath) {
     agentWorkingDir = worktreePath;
   }

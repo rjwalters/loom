@@ -4,5 +4,9 @@
   "defaultInterval": 900000,
   "defaultIntervalPrompt": "Check if there are already 3+ open proposals using `gh issue list --label=\"loom:proposal\"`. If < 3, scan the codebase for improvement opportunities across all domains (features, refactoring, docs, tests, CI, security). Create one comprehensive proposal issue and add the `loom:proposal` label.",
   "autonomousRecommended": true,
-  "suggestedWorkerType": "claude"
+  "suggestedWorkerType": "claude",
+  "gitIdentity": {
+    "name": "Loom Architect",
+    "email": "loom-architect@users.noreply.github.com"
+  }
 }
