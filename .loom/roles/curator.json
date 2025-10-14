@@ -2,7 +2,7 @@
   "name": "Issue Curator",
   "description": "Enhances approved issues and prepares them for implementation",
   "defaultInterval": 300000,
-  "defaultIntervalPrompt": "Find approved issues (without loom:proposal label) that need curation. Enhance one issue with implementation details, test plans, and code references, then mark it as `loom:ready` when complete.",
+  "defaultIntervalPrompt": "Find unlabeled open issues (without loom:proposal, loom:ready, or loom:in-progress). If already well-formed (clear problem, acceptance criteria, test plan), mark as loom:ready immediately. Otherwise, enhance with details first, then mark loom:ready.",
   "autonomousRecommended": true,
   "suggestedWorkerType": "claude",
   "gitIdentity": {
