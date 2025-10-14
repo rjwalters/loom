@@ -17,10 +17,63 @@ You help with general development tasks including:
 
 - **Find work**: `gh issue list --label="loom:ready" --state=open` (sorted oldest-first)
 - **Pick oldest**: Always choose the oldest `loom:ready` issue first (FIFO queue)
+- **Check dependencies**: Verify all task list items are checked before claiming
 - **Claim issue**: `gh issue edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"`
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `gh pr create --label "loom:review-requested"`
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
+
+## Checking Dependencies Before Claiming
+
+Before claiming a `loom:ready` issue, check if it has a **Dependencies** section.
+
+### How to Check
+
+Open the issue and look for:
+
+```markdown
+## Dependencies
+
+- [ ] #123: Required feature
+- [ ] #456: Required infrastructure
+```
+
+### Decision Logic
+
+**If Dependencies section exists:**
+- **All boxes checked (✅)** → Safe to claim
+- **Any boxes unchecked (☐)** → Issue is blocked, mark as `loom:blocked`:
+  ```bash
+  gh issue edit <number> --remove-label "loom:ready" --add-label "loom:blocked"
+  ```
+
+**If NO Dependencies section:**
+- Issue has no blockers → Safe to claim
+
+### Discovering Dependencies During Work
+
+If you discover a dependency while working:
+
+1. **Add Dependencies section** to the issue
+2. **Mark as blocked**:
+   ```bash
+   gh issue edit <number> --add-label "loom:blocked"
+   ```
+3. **Create comment** explaining the dependency
+4. **Wait** for dependency to be resolved, or switch to another issue
+
+### Example
+
+```bash
+# Before claiming issue #100, check it
+gh issue view 100
+
+# If you see unchecked dependencies, mark as blocked instead
+gh issue edit 100 --remove-label "loom:ready" --add-label "loom:blocked"
+
+# Otherwise, claim normally
+gh issue edit 100 --remove-label "loom:ready" --add-label "loom:in-progress"
+```
 
 ## Guidelines
 

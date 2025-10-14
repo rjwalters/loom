@@ -133,6 +133,57 @@ EOF
 gh issue edit <number> --add-label "loom:proposal"
 ```
 
+## Tracking Dependencies with Task Lists
+
+When an issue depends on other issues being completed first, use GitHub task lists to make dependencies explicit and trackable.
+
+### When to Add Dependencies
+
+Add a Dependencies section if:
+- Issue requires prerequisite work from other issues
+- Implementation must wait for infrastructure/framework to be in place
+- Issue is part of a multi-phase feature with sequential steps
+
+### Task List Format
+
+```markdown
+## Dependencies
+
+- [ ] #123: Brief description of what's needed
+- [ ] #456: Another prerequisite issue
+
+This issue cannot proceed until all dependencies above are complete.
+```
+
+### Benefits of Task Lists
+
+- ✅ GitHub automatically checks boxes when issues close
+- ✅ Visual progress indicator in issue cards
+- ✅ Clear "ready to start" signal when all boxes checked
+- ✅ Curator can programmatically check completion status
+
+### Example: Multi-Phase Feature
+
+```markdown
+## Dependencies
+
+**Phase 1 (must complete first):**
+- [ ] #100: Database migration system
+- [ ] #101: Add users table schema
+
+**Phase 2 (current):**
+- This issue implements user authentication
+
+This issue requires the users table from Phase 1.
+```
+
+### Guidelines
+
+- Use task lists for blocking dependencies only (not nice-to-haves)
+- Keep dependency descriptions brief but clear
+- Mention why the dependency exists if not obvious
+- For independent work, explicitly state "No dependencies"
+
 ## Guidelines
 
 - **Be proactive**: Don't wait to be asked; scan for opportunities
