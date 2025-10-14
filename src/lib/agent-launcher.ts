@@ -128,3 +128,81 @@ export async function launchGitHubCopilotAgent(terminalId: string): Promise<void
     data: "\r",
   });
 }
+
+/**
+ * Launch Google Gemini CLI in a terminal
+ *
+ * This uses the Gemini CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Gemini in
+ * @returns Promise that resolves when Gemini is launched
+ */
+export async function launchGeminiCLIAgent(terminalId: string): Promise<void> {
+  // Build Gemini CLI command for interactive mode
+  const command = "gemini chat";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}
+
+/**
+ * Launch DeepSeek CLI in a terminal
+ *
+ * This uses the DeepSeek CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch DeepSeek in
+ * @returns Promise that resolves when DeepSeek is launched
+ */
+export async function launchDeepSeekAgent(terminalId: string): Promise<void> {
+  // Build DeepSeek CLI command for interactive mode
+  const command = "deepseek chat";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}
+
+/**
+ * Launch xAI Grok CLI in a terminal
+ *
+ * This uses the Grok CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Grok in
+ * @returns Promise that resolves when Grok is launched
+ */
+export async function launchGrokAgent(terminalId: string): Promise<void> {
+  // Build Grok CLI command for interactive mode
+  const command = "grok chat";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}

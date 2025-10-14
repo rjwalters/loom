@@ -62,7 +62,12 @@
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
-      "theme": "forest"
+      "theme": "forest",
+      "agentStatus": "not_started",
+      "worktreePath": null,
+      "agentPid": null,
+      "lastIntervalRun": null,
+      "pendingInputRequests": []
     },
     {
       "id": "__unassigned__",

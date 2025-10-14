@@ -9,6 +9,9 @@ pub struct DependencyStatus {
     pub claude_code_available: bool,
     pub gh_available: bool,
     pub gh_copilot_available: bool,
+    pub gemini_cli_available: bool,
+    pub deepseek_cli_available: bool,
+    pub grok_cli_available: bool,
 }
 
 pub fn check_dependencies() -> DependencyStatus {
@@ -18,6 +21,9 @@ pub fn check_dependencies() -> DependencyStatus {
         claude_code_available: check_command("claude"),
         gh_available: check_command("gh"),
         gh_copilot_available: check_gh_copilot(),
+        gemini_cli_available: check_command("gemini"),
+        deepseek_cli_available: check_command("deepseek"),
+        grok_cli_available: check_command("grok"),
     }
 }
 

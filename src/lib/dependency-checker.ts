@@ -7,6 +7,9 @@ interface DependencyStatus {
   claude_code_available: boolean;
   gh_available: boolean;
   gh_copilot_available: boolean;
+  gemini_cli_available: boolean;
+  deepseek_cli_available: boolean;
+  grok_cli_available: boolean;
 }
 
 export async function checkAndReportDependencies(): Promise<boolean> {
@@ -19,7 +22,11 @@ export async function checkAndReportDependencies(): Promise<boolean> {
 
   // Check if at least one agent is available
   const hasAtLeastOneAgent =
-    status.claude_code_available || (status.gh_available && status.gh_copilot_available);
+    status.claude_code_available ||
+    (status.gh_available && status.gh_copilot_available) ||
+    status.gemini_cli_available ||
+    status.deepseek_cli_available ||
+    status.grok_cli_available;
 
   // If we have critical deps and at least one agent, we're good
   if (criticalMissing.length === 0 && hasAtLeastOneAgent) {
@@ -56,6 +63,21 @@ export async function checkAndReportDependencies(): Promise<boolean> {
     } else if (!status.gh_copilot_available) {
       message += "   • gh copilot - GitHub Copilot CLI extension\n";
       message += "     Install: gh extension install github/gh-copilot\n\n";
+    }
+
+    if (!status.gemini_cli_available) {
+      message += "   • gemini - Google Gemini CLI\n";
+      message += "     Install: npm install -g @google/generative-ai-cli\n\n";
+    }
+
+    if (!status.deepseek_cli_available) {
+      message += "   • deepseek - DeepSeek CLI\n";
+      message += "     Install: npm install -g deepseek-cli\n\n";
+    }
+
+    if (!status.grok_cli_available) {
+      message += "   • grok - xAI Grok CLI\n";
+      message += "     Install: brew install xai/tap/grok-cli\n\n";
     }
   }
 
@@ -94,6 +116,18 @@ export async function getAvailableWorkerTypes(): Promise<Array<{ value: string; 
 
   if (status.gh_available && status.gh_copilot_available) {
     available.push({ value: "github-copilot", label: "GitHub Copilot" });
+  }
+
+  if (status.gemini_cli_available) {
+    available.push({ value: "gemini", label: "Google Gemini" });
+  }
+
+  if (status.deepseek_cli_available) {
+    available.push({ value: "deepseek", label: "DeepSeek Coder" });
+  }
+
+  if (status.grok_cli_available) {
+    available.push({ value: "grok", label: "xAI Grok" });
   }
 
   return available;

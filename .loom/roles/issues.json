@@ -4,5 +4,9 @@
   "defaultInterval": 0,
   "defaultIntervalPrompt": "",
   "autonomousRecommended": false,
-  "suggestedWorkerType": "claude"
+  "suggestedWorkerType": "claude",
+  "gitIdentity": {
+    "name": "Loom Issues",
+    "email": "loom-issues@users.noreply.github.com"
+  }
 }

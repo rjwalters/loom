@@ -500,6 +500,18 @@ async function applySettings(
             // Launch GitHub Copilot (no worktree support for now)
             const { launchGitHubCopilotAgent } = await import("./agent-launcher");
             await launchGitHubCopilotAgent(terminal.id);
+          } else if (workerType === "gemini") {
+            // Launch Google Gemini CLI (no worktree support for now)
+            const { launchGeminiCLIAgent } = await import("./agent-launcher");
+            await launchGeminiCLIAgent(terminal.id);
+          } else if (workerType === "deepseek") {
+            // Launch DeepSeek CLI (no worktree support for now)
+            const { launchDeepSeekAgent } = await import("./agent-launcher");
+            await launchDeepSeekAgent(terminal.id);
+          } else if (workerType === "grok") {
+            // Launch xAI Grok CLI (no worktree support for now)
+            const { launchGrokAgent } = await import("./agent-launcher");
+            await launchGrokAgent(terminal.id);
           } else {
             // Launch Claude or Codex with full worktree support
             const { launchAgentInTerminal } = await import("./agent-launcher");
