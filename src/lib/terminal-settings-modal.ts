@@ -8,50 +8,44 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   modal.className =
     "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden";
 
-  // Determine current role and config
-  const role = terminal.role || "none";
+  // Determine current role config
   const roleConfig = terminal.roleConfig || {};
   const workerType = (roleConfig.workerType as string) || "claude";
-  const targetInterval = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
+  const targetIntervalMs = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
+  const targetIntervalSeconds = Math.floor(targetIntervalMs / 1000); // Convert to seconds for display
   const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
-  const autonomousEnabled = targetInterval > 0;
+  const autonomousEnabled = targetIntervalMs > 0;
 
   modal.innerHTML = `
-    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
+    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] min-w-[600px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
       <h2 class="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">Terminal Settings: ${escapeHtml(terminal.name)}</h2>
 
       <!-- Tabs -->
       <div class="flex border-b border-gray-200 dark:border-gray-700 mb-4">
         <button
-          data-tab="basic"
+          data-tab="appearance"
           class="tab-btn px-4 py-2 font-medium text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 dark:border-blue-400"
         >
-          Basic
+          Appearance
         </button>
         <button
-          data-tab="theme"
+          data-tab="agent"
           class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
         >
-          Theme
+          Agent
         </button>
         <button
-          data-tab="worker"
+          data-tab="interval"
           class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
         >
-          Worker Config
-        </button>
-        <button
-          data-tab="autonomous"
-          class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-        >
-          Autonomous
+          Interval Mode
         </button>
       </div>
 
       <!-- Tab Content Container -->
-      <div class="flex-1 overflow-y-auto">
-        <!-- Basic Settings Tab -->
-        <div data-tab-content="basic" class="space-y-4">
+      <div class="overflow-y-auto h-[420px]">
+        <!-- Appearance Tab -->
+        <div data-tab-content="appearance" class="space-y-4">
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Terminal Name
@@ -67,74 +61,31 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
 
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              Role
+              Color Theme
             </label>
-            <select
-              id="terminal-role"
-              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
-            >
-              <option value="none" ${role === "none" ? "selected" : ""}>None (Plain Shell)</option>
-              <option value="claude-code-worker" ${role === "claude-code-worker" ? "selected" : ""}>Claude Code Worker</option>
-              <option value="codex-worker" ${role === "codex-worker" ? "selected" : ""}>Codex Worker</option>
-            </select>
-            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              Select worker role for this terminal
+            <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">
+              Choose a color theme to visually distinguish this terminal
+            </p>
+            <div class="grid grid-cols-4 gap-2">
+              ${Object.entries(TERMINAL_THEMES)
+                .map(
+                  ([id, theme]) => `
+                <button
+                  class="theme-card flex flex-col items-center gap-1 p-2 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
+                  data-theme-id="${id}"
+                >
+                  <div class="w-8 h-8 rounded" style="background-color: ${theme.primary}"></div>
+                  <span class="text-xs font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
+                </button>
+              `
+                )
+                .join("")}
             </div>
           </div>
         </div>
 
-        <!-- Theme Tab -->
-        <div data-tab-content="theme" class="space-y-4 hidden">
-          <p class="text-sm text-gray-600 dark:text-gray-400 mb-4">
-            Choose a color theme to visually distinguish this terminal
-          </p>
-          <div class="grid grid-cols-4 gap-3">
-            ${Object.entries(TERMINAL_THEMES)
-              .map(
-                ([id, theme]) => `
-              <button
-                class="theme-card flex flex-col items-center gap-2 p-4 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
-                data-theme-id="${id}"
-              >
-                <div class="w-16 h-16 rounded-lg" style="background-color: ${theme.primary}"></div>
-                <span class="text-sm font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
-              </button>
-            `
-              )
-              .join("")}
-          </div>
-        </div>
-
-        <!-- Worker Configuration Tab -->
-        <div data-tab-content="worker" class="space-y-4 hidden">
-          <div>
-            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              Worker Type
-            </label>
-            <div class="space-y-2">
-              <label class="flex items-center">
-                <input
-                  type="radio"
-                  name="worker-type"
-                  value="claude"
-                  ${workerType === "claude" ? "checked" : ""}
-                  class="mr-2"
-                />
-                <span class="text-gray-900 dark:text-gray-100">Claude Code</span>
-              </label>
-              <label class="flex items-center">
-                <input
-                  type="radio"
-                  name="worker-type"
-                  value="codex"
-                  ${workerType === "codex" ? "checked" : ""}
-                  class="mr-2"
-                />
-                <span class="text-gray-900 dark:text-gray-100">Codex (OpenAI)</span>
-              </label>
-            </div>
-          </div>
-
+        <!-- Agent Configuration Tab -->
+        <div data-tab-content="agent" class="space-y-4 hidden">
           <div>
             <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
               Role
@@ -149,10 +100,32 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
               Role files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/roles/</code>
             </div>
           </div>
+
+          <div>
+            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+              Worker Type
+            </label>
+            <div class="flex items-center gap-3">
+              <span class="text-sm text-gray-600 dark:text-gray-400">
+                Current: <strong id="worker-type-name" class="text-gray-900 dark:text-gray-100">${workerType === "claude" ? "Claude Code" : "Codex"}</strong>
+              </span>
+              <button
+                id="switch-worker-type-btn"
+                type="button"
+                class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors text-sm"
+                data-current-type="${workerType}"
+              >
+                Switch to ${workerType === "claude" ? "Codex" : "Claude Code"}
+              </button>
+            </div>
+            <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
+              Switching worker type will quit the current agent and restart with the new type.
+            </p>
+          </div>
         </div>
 
-        <!-- Autonomous Operation Tab -->
-        <div data-tab-content="autonomous" class="space-y-4 hidden">
+        <!-- Interval Mode Tab -->
+        <div data-tab-content="interval" class="space-y-4 hidden">
           <div>
             <label class="flex items-center">
               <input
@@ -173,18 +146,18 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
           <div id="autonomous-config" ${autonomousEnabled ? "" : 'class="opacity-50 pointer-events-none"'}>
             <div class="mb-4">
               <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-                Target Interval (milliseconds)
+                Target Interval (seconds)
               </label>
               <input
                 type="number"
                 id="target-interval"
-                value="${targetInterval}"
+                value="${targetIntervalSeconds}"
                 min="0"
-                step="1000"
+                step="1"
                 class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
               />
               <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                Default: 300000 (5 minutes)
+                Default: 300 (5 minutes)
               </div>
             </div>
 
@@ -372,9 +345,9 @@ export async function showTerminalSettingsModal(
           autonomousRecommended?: boolean;
         };
 
-        // Populate interval settings from metadata
+        // Populate interval settings from metadata (convert ms to seconds)
         if (metadata.defaultInterval !== undefined) {
-          targetIntervalInput.value = metadata.defaultInterval.toString();
+          targetIntervalInput.value = Math.floor(metadata.defaultInterval / 1000).toString();
         }
         if (metadata.defaultIntervalPrompt !== undefined) {
           intervalPromptTextarea.value = metadata.defaultIntervalPrompt;
@@ -397,6 +370,35 @@ export async function showTerminalSettingsModal(
     } else {
       autonomousConfig?.classList.add("opacity-50", "pointer-events-none");
     }
+  });
+
+  // Wire up worker type switcher button
+  const switchWorkerTypeBtn = modal.querySelector("#switch-worker-type-btn");
+  let currentWorkerType = (terminal.roleConfig?.workerType as string) || "claude";
+
+  switchWorkerTypeBtn?.addEventListener("click", async () => {
+    await handleWorkerTypeSwitch(
+      terminal.id,
+      currentWorkerType as "claude" | "codex",
+      state,
+      (newType) => {
+        // Update local state
+        currentWorkerType = newType;
+
+        // Update UI
+        const nameEl = modal.querySelector("#worker-type-name");
+        const btnEl = modal.querySelector("#switch-worker-type-btn");
+
+        if (nameEl) {
+          nameEl.textContent = newType === "claude" ? "Claude Code" : "Codex";
+        }
+
+        if (btnEl) {
+          btnEl.textContent = newType === "claude" ? "Switch to Codex" : "Switch to Claude Code";
+          btnEl.setAttribute("data-current-type", newType);
+        }
+      }
+    );
   });
 
   // Wire up reset prompt button
@@ -441,6 +443,66 @@ export async function showTerminalSettingsModal(
   document.addEventListener("keydown", escapeHandler);
 }
 
+async function handleWorkerTypeSwitch(
+  terminalId: string,
+  currentType: "claude" | "codex",
+  state: AppState,
+  onSuccess: (newType: "claude" | "codex") => void
+): Promise<void> {
+  const newType = currentType === "claude" ? "codex" : "claude";
+
+  // Confirm with user
+  const { ask } = await import("@tauri-apps/api/dialog");
+  const confirmed = await ask(
+    `Switch worker type from ${currentType === "claude" ? "Claude Code" : "Codex"} to ${newType === "claude" ? "Claude Code" : "Codex"}?\n\nThis will quit the current agent and restart it.`,
+    {
+      title: "Switch Worker Type",
+      type: "warning",
+    }
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    const { invoke } = await import("@tauri-apps/api/tauri");
+
+    // Quit current agent (send Ctrl+C, then quit command)
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: "\u{0003}", // Ctrl+C
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Send appropriate quit command based on current type
+    const quitCommand = currentType === "claude" ? "/quit\r" : ":exit\r";
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: quitCommand,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Start new agent
+    const startCommand = newType === "claude" ? "claude\r" : "codex\r";
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: startCommand,
+    });
+
+    // Update state
+    state.updateTerminalWorkerType(terminalId, newType);
+
+    // Call success callback to update UI
+    onSuccess(newType);
+  } catch (error) {
+    console.error("Failed to switch worker type:", error);
+    alert(`Failed to switch worker type: ${error}`);
+  }
+}
+
 async function applySettings(
   modal: HTMLElement,
   terminal: Terminal,
@@ -451,36 +513,33 @@ async function applySettings(
   try {
     // Get values from form
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
-    const roleSelect = modal.querySelector("#terminal-role") as HTMLSelectElement;
-    const workerTypeRadios = modal.querySelectorAll('input[name="worker-type"]');
     const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
+    const switchWorkerTypeBtn = modal.querySelector("#switch-worker-type-btn");
     const autonomousCheckbox = modal.querySelector("#autonomous-enabled") as HTMLInputElement;
     const targetIntervalInput = modal.querySelector("#target-interval") as HTMLInputElement;
     const intervalPromptTextarea = modal.querySelector("#interval-prompt") as HTMLTextAreaElement;
 
     const name = nameInput.value.trim();
-    const role = roleSelect.value === "none" ? undefined : roleSelect.value;
+    const roleFile = roleFileSelect.value;
 
     if (!name) {
       alert("Please enter a terminal name");
       return;
     }
 
-    // Get selected worker type
-    let workerType = "claude";
-    workerTypeRadios.forEach((radio) => {
-      if ((radio as HTMLInputElement).checked) {
-        workerType = (radio as HTMLInputElement).value;
-      }
-    });
+    // Get current worker type from button's data attribute
+    const workerType = switchWorkerTypeBtn?.getAttribute("data-current-type") || "claude";
 
-    // Build role config
-    const roleConfig = role
+    // Determine role based on role file selection
+    const role = roleFile ? "claude-code-worker" : undefined;
+
+    // Build role config (convert seconds to milliseconds for storage)
+    const roleConfig = roleFile
       ? {
           workerType,
-          roleFile: roleFileSelect.value,
+          roleFile,
           targetInterval: autonomousCheckbox.checked
-            ? Number.parseInt(targetIntervalInput.value, 10)
+            ? Number.parseInt(targetIntervalInput.value, 10) * 1000
             : 0,
           intervalPrompt: intervalPromptTextarea.value.trim(),
         }

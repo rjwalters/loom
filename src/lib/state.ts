@@ -148,6 +148,14 @@ export class AppState {
     }
   }
 
+  updateTerminalWorkerType(id: string, workerType: "claude" | "codex"): void {
+    const terminal = this.terminals.get(id);
+    if (terminal?.roleConfig) {
+      terminal.roleConfig.workerType = workerType;
+      this.notify();
+    }
+  }
+
   getPrimary(): Terminal | null {
     return this.primaryId ? this.terminals.get(this.primaryId) || null : null;
   }
