@@ -91,7 +91,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
             </label>
             <select
               id="role-file"
-              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+              class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
             >
               <option value="">Loading roles...</option>
             </select>
@@ -106,7 +106,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
             </label>
             <select
               id="worker-type-select"
-              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+              class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
             >
               <option value="">Loading available agents...</option>
             </select>
