@@ -65,6 +65,19 @@ export function renderPrimaryTerminal(
               </button>
             </div>
             <div id="workspace-error" class="text-sm text-red-500 dark:text-red-400 min-h-[20px]"></div>
+            <div class="flex items-center gap-2 mt-2">
+              <div class="flex-1 h-px bg-gray-300 dark:bg-gray-600"></div>
+              <span class="text-sm text-gray-500 dark:text-gray-400">or</span>
+              <div class="flex-1 h-px bg-gray-300 dark:bg-gray-600"></div>
+            </div>
+            <button
+              id="create-new-project-btn"
+              data-tooltip="Create a new git repository with Loom configuration"
+              data-tooltip-position="bottom"
+              class="px-4 py-2 text-sm font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition-colors"
+            >
+              Create New Project
+            </button>
           </div>
         </div>
       `;
