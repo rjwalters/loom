@@ -321,29 +321,44 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
     }
 
-    // Add .loom/ to .gitignore
+    // Add .loom/ and .loom/worktrees/ to .gitignore
     let gitignore_path = workspace_path.join(".gitignore");
-    let loom_entry = ".loom/\n";
 
-    // Check if .gitignore exists and if .loom/ is already in it
+    // Check if .gitignore exists
     if gitignore_path.exists() {
         let contents = fs::read_to_string(&gitignore_path)
             .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
 
+        let mut new_contents = contents.clone();
+        let mut modified = false;
+
+        // Add .loom/ if not present
         if !contents.contains(".loom/") {
-            // Append .loom/ to .gitignore
-            let mut new_contents = contents;
             if !new_contents.ends_with('\n') {
                 new_contents.push('\n');
             }
-            new_contents.push_str(loom_entry);
+            new_contents.push_str(".loom/\n");
+            modified = true;
+        }
 
+        // Add .loom/worktrees/ if not present
+        if !contents.contains(".loom/worktrees/") {
+            if !new_contents.ends_with('\n') {
+                new_contents.push('\n');
+            }
+            new_contents.push_str(".loom/worktrees/\n");
+            modified = true;
+        }
+
+        // Write back if we made changes
+        if modified {
             fs::write(&gitignore_path, new_contents)
                 .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
     } else {
-        // Create .gitignore with .loom/
-        fs::write(&gitignore_path, loom_entry)
+        // Create .gitignore with both entries
+        let loom_entries = ".loom/\n.loom/worktrees/\n";
+        fs::write(&gitignore_path, loom_entries)
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
@@ -567,29 +582,44 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
     }
 
-    // Add .loom/ to .gitignore (ensures it's present on both initialization and factory reset)
+    // Add .loom/ and .loom/worktrees/ to .gitignore (ensures both entries are present on factory reset)
     let gitignore_path = workspace.join(".gitignore");
-    let loom_entry = ".loom/\n";
 
-    // Check if .gitignore exists and if .loom/ is already in it
+    // Check if .gitignore exists
     if gitignore_path.exists() {
         let contents = fs::read_to_string(&gitignore_path)
             .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
 
+        let mut new_contents = contents.clone();
+        let mut modified = false;
+
+        // Add .loom/ if not present
         if !contents.contains(".loom/") {
-            // Append .loom/ to .gitignore
-            let mut new_contents = contents;
             if !new_contents.ends_with('\n') {
                 new_contents.push('\n');
             }
-            new_contents.push_str(loom_entry);
+            new_contents.push_str(".loom/\n");
+            modified = true;
+        }
 
+        // Add .loom/worktrees/ if not present
+        if !contents.contains(".loom/worktrees/") {
+            if !new_contents.ends_with('\n') {
+                new_contents.push('\n');
+            }
+            new_contents.push_str(".loom/worktrees/\n");
+            modified = true;
+        }
+
+        // Write back if we made changes
+        if modified {
             fs::write(&gitignore_path, new_contents)
                 .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
     } else {
-        // Create .gitignore with .loom/
-        fs::write(&gitignore_path, loom_entry)
+        // Create .gitignore with both entries
+        let loom_entries = ".loom/\n.loom/worktrees/\n";
+        fs::write(&gitignore_path, loom_entries)
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
@@ -736,8 +766,8 @@ fn create_local_project(
     // Initialize .loom directory with defaults
     init_loom_directory(&project_path)?;
 
-    // Create initial .gitignore with .loom/
-    let gitignore_content = ".loom/\n";
+    // Create initial .gitignore with .loom/ and .loom/worktrees/
+    let gitignore_content = ".loom/\n.loom/worktrees/\n";
     fs::write(project_path.join(".gitignore"), gitignore_content)
         .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
 
