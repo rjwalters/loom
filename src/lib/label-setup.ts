@@ -23,33 +23,53 @@ export interface LabelDefinition {
  * - Green: Loom bot action needed
  * - Amber: Work in progress
  * - Red: Blocked/needs help
+ *
+ * Labels are separated into Issue labels and PR labels:
+ * - Issue labels: loom:proposal, loom:ready, loom:in-progress, loom:blocked, loom:urgent
+ * - PR labels: loom:review-requested, loom:reviewing, loom:approved
  */
 export const LOOM_LABELS: LabelDefinition[] = [
+  // Issue Labels
   {
-    name: "loom:issue",
-    description: "New issue awaiting user triage/approval",
+    name: "loom:proposal",
+    description: "Architect suggestion awaiting user approval",
     color: "3B82F6", // Blue - human action needed
   },
   {
     name: "loom:ready",
-    description: "Issue ready for Worker OR PR ready for Reviewer",
+    description: "Issue ready for Worker to claim and implement",
     color: "10B981", // Green - Loom bot action needed
   },
   {
     name: "loom:in-progress",
-    description:
-      "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback",
+    description: "Worker actively implementing this issue",
     color: "F59E0B", // Amber - work in progress
-  },
-  {
-    name: "loom:pr",
-    description: "PR approved by Reviewer, ready for human to merge",
-    color: "3B82F6", // Blue - human action needed
   },
   {
     name: "loom:blocked",
     description: "Implementation blocked, needs help or clarification",
     color: "EF4444", // Red - attention needed
+  },
+  {
+    name: "loom:urgent",
+    description: "High priority issue requiring immediate attention",
+    color: "DC2626", // Dark red - urgent
+  },
+  // PR Labels
+  {
+    name: "loom:review-requested",
+    description: "PR ready for Reviewer to review",
+    color: "10B981", // Green - Loom bot action needed
+  },
+  {
+    name: "loom:reviewing",
+    description: "Reviewer actively reviewing this PR",
+    color: "F59E0B", // Amber - work in progress
+  },
+  {
+    name: "loom:approved",
+    description: "PR approved by Reviewer, ready for human to merge",
+    color: "3B82F6", // Blue - human action needed
   },
 ];
 

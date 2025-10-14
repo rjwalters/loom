@@ -7,10 +7,18 @@ This document describes the label-based workflows that coordinate multiple AI ag
 Loom uses GitHub labels as a coordination protocol. Each agent type has a specific role and watches for issues/PRs with particular labels. This creates a complete pipeline from idea generation through implementation to code review.
 
 **Color-coded workflow:**
-- 🔵 **Blue** (`loom:issue`, `loom:pr`) = Human action needed
-- 🟢 **Green** (`loom:ready`) = Loom bot action needed
-- 🟡 **Amber** (`loom:in-progress`) = Work in progress
-- 🔴 **Red** (`loom:blocked`) = Blocked, needs help
+- 🔵 **Blue** = Human action needed
+  - Issues: `loom:proposal` (Architect suggestion awaiting approval)
+  - PRs: `loom:approved` (Approved PR ready to merge)
+- 🟢 **Green** = Loom bot action needed
+  - Issues: `loom:ready` (Issue ready for Worker)
+  - PRs: `loom:review-requested` (PR ready for Reviewer)
+- 🟡 **Amber** = Work in progress
+  - Issues: `loom:in-progress` (Worker implementing)
+  - PRs: `loom:reviewing` (Reviewer reviewing)
+- 🔴 **Red** = Blocked or urgent
+  - `loom:blocked` (Blocked, needs help)
+  - `loom:urgent` (High priority)
 
 See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed documentation.
 
@@ -295,7 +303,7 @@ If Worker discovers a dependency during implementation:
 
 **Creates**:
 - `loom:in-progress` - Claims issue for implementation
-- `loom:ready` - PRs ready for Reviewer
+- `loom:review-requested` - PRs ready for Reviewer
 - `loom:blocked` - When stuck on implementation
 
 **Interval**: Disabled by default (on-demand, one Worker per PR)
@@ -305,7 +313,7 @@ If Worker discovers a dependency during implementation:
 1. Find loom:ready issues (green badges)
 2. Claim by removing loom:ready, adding loom:in-progress
 3. Implement, test, commit
-4. Create PR with "Closes #X", add loom:ready (green - ready for Reviewer)
+4. Create PR with "Closes #X", add loom:review-requested (green - ready for Reviewer)
 5. Monitor PR and address Reviewer feedback
 6. If blocked: add loom:blocked with explanation
 ```
@@ -314,21 +322,21 @@ If Worker discovers a dependency during implementation:
 **Role**: Reviews pull requests
 
 **Watches for**:
-- `loom:ready` - PRs ready for review (green badges)
+- `loom:review-requested` - PRs ready for review (green badges)
 
 **Creates**:
-- `loom:in-progress` - Claims PR for review (amber)
-- `loom:pr` - Approved PRs ready for human to merge (blue)
+- `loom:reviewing` - Claims PR for review (amber)
+- `loom:approved` - Approved PRs ready for human to merge (blue)
 
 **Interval**: 5 minutes (recommended autonomous)
 
 **Workflow**:
 ```
-1. Find loom:ready PRs (green badges)
-2. Claim by removing loom:ready, adding loom:in-progress (amber)
+1. Find loom:review-requested PRs (green badges)
+2. Claim by removing loom:review-requested, adding loom:reviewing (amber)
 3. Check out branch, run tests, review code
-4. If changes needed: gh pr review --request-changes, keep loom:in-progress
-5. If approved: gh pr review --approve, remove loom:in-progress, add loom:pr (blue)
+4. If changes needed: gh pr review --request-changes, keep loom:reviewing
+5. If approved: gh pr review --approve, remove loom:reviewing, add loom:approved (blue)
 ```
 
 ### 5. Issues Bot
@@ -393,27 +401,27 @@ No automation. Used for manual git operations, system commands, etc.
 │    Updates: removes loom:ready, adds loom:in-progress       │
 │    (Amber badge)                                            │
 │    Implements feature, writes tests                         │
-│    Creates PR: "Closes #42", adds loom:ready                │
+│    Creates PR: "Closes #42", adds loom:review-requested     │
 │    (Green badge - ready for review)                         │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 5. REVIEWER REVIEWS PR                                      │
-│    Finds loom:ready PR #50 (green badge)                    │
-│    Updates: removes loom:ready, adds loom:in-progress       │
+│    Finds loom:review-requested PR #50 (green badge)         │
+│    Updates: removes loom:review-requested, adds loom:reviewing│
 │    (Amber badge - reviewing)                                │
 │    Checks out branch, runs tests                            │
 │    Reviews code, provides feedback                          │
 │    Approves: gh pr review --approve                         │
-│    Removes loom:in-progress, adds loom:pr                   │
+│    Removes loom:reviewing, adds loom:approved               │
 │    (Blue badge - ready for user to merge)                   │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 6. USER MERGES PR                                           │
-│    Reviews loom:pr PR (blue badge)                          │
+│    Reviews loom:approved PR (blue badge)                    │
 │    Merges to main                                           │
 │    Issue #42 automatically closes                           │
 └─────────────────────────────────────────────────────────────┘
@@ -421,19 +429,30 @@ No automation. Used for manual git operations, system commands, etc.
 
 ## Label Reference
 
-| Label | Color | Used On | Created By | Meaning |
-|-------|-------|---------|-----------|---------|
-| `loom:proposal` | 🔵 Blue | Issues | Architect | Proposal awaiting user approval |
-| `loom:ready` | 🟢 Green | Issues & PRs | Curator (issues) / Worker (PRs) | Issue ready for Worker OR PR ready for Reviewer |
-| `loom:in-progress` | 🟡 Amber | Issues & PRs | Worker / Reviewer | Issue: Worker implementing<br>PR: Reviewer reviewing OR Worker addressing feedback |
-| `loom:pr` | 🔵 Blue | PRs | Reviewer | Approved PR ready for human to merge |
-| `loom:blocked` | 🔴 Red | Issues | Worker | Implementation blocked, needs help |
+### Issue Labels
+
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:proposal` | 🔵 Blue | Architect | Proposal awaiting user approval |
+| `loom:ready` | 🟢 Green | Curator | Issue ready for Worker to implement |
+| `loom:in-progress` | 🟡 Amber | Worker | Worker actively implementing |
+| `loom:blocked` | 🔴 Red | Worker | Implementation blocked, needs help |
+| `loom:urgent` | 🔴 Dark Red | User/Architect/Curator | High priority, work on first |
+
+### PR Labels
+
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:review-requested` | 🟢 Green | Worker | PR ready for Reviewer |
+| `loom:reviewing` | 🟡 Amber | Reviewer | Reviewer actively reviewing |
+| `loom:approved` | 🔵 Blue | Reviewer | Approved PR ready for human to merge |
 
 **Key insights**:
-- **Blue badges** (`loom:proposal`, `loom:pr`) = Human action needed
-- **Green badges** (`loom:ready`) = Bot action needed
-- **Amber badges** (`loom:in-progress`) = Work in progress
-- Users control the flow by removing `loom:proposal` to approve Architect suggestions.
+- **Blue badges** = Human action needed
+- **Green badges** = Bot action needed
+- **Amber badges** = Work in progress
+- **Red badges** = Blocked or urgent
+- Users control the flow by removing `loom:proposal` to approve Architect suggestions
 
 ## Commands Reference
 
@@ -461,7 +480,7 @@ gh issue edit <number> --remove-label "loom:proposal"
 gh issue close <number> --comment "Not needed because..."
 
 # Find PRs ready to merge (blue badges)
-gh pr list --label="loom:pr" --state=open
+gh pr list --label="loom:approved" --state=open
 
 # Merge approved PR
 gh pr merge <number>
@@ -486,7 +505,7 @@ gh issue list --label="loom:ready" --state=open
 gh issue edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"
 
 # Create PR with green badge (ready for Reviewer)
-gh pr create --title "..." --body "Closes #X" --label "loom:ready"
+gh pr create --title "..." --body "Closes #X" --label "loom:review-requested"
 
 # Mark blocked (amber → red)
 gh issue edit <number> --add-label "loom:blocked"
@@ -496,10 +515,10 @@ gh issue comment <number> --body "Blocked because..."
 ### Reviewer
 ```bash
 # Find PRs ready to review (green badges)
-gh pr list --label="loom:ready" --state=open
+gh pr list --label="loom:review-requested" --state=open
 
 # Claim PR for review (green → amber)
-gh pr edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"
+gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:reviewing"
 
 # Check out and test
 gh pr checkout <number>
@@ -507,11 +526,11 @@ pnpm check:all
 
 # Approve PR
 gh pr review <number> --approve --body "LGTM!"
-gh pr edit <number> --remove-label "loom:in-progress" --add-label "loom:pr"
+gh pr edit <number> --remove-label "loom:reviewing" --add-label "loom:approved"
 
 # Request changes
 gh pr review <number> --request-changes --body "Issues found..."
-# Keep loom:in-progress - Worker will address
+# Keep loom:reviewing - Worker will address
 ```
 
 ## Configuration
