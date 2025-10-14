@@ -16,7 +16,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   const autonomousEnabled = targetInterval > 0;
 
   modal.innerHTML = `
-    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
+    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] min-w-[600px] min-h-[500px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
       <h2 class="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">Terminal Settings: ${escapeHtml(terminal.name)}</h2>
 
       <!-- Tabs -->
@@ -65,16 +65,16 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
             <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">
               Choose a color theme to visually distinguish this terminal
             </p>
-            <div class="grid grid-cols-4 gap-3">
+            <div class="grid grid-cols-4 gap-2">
               ${Object.entries(TERMINAL_THEMES)
                 .map(
                   ([id, theme]) => `
                 <button
-                  class="theme-card flex flex-col items-center gap-2 p-4 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
+                  class="theme-card flex flex-col items-center gap-1 p-2 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
                   data-theme-id="${id}"
                 >
-                  <div class="w-16 h-16 rounded-lg" style="background-color: ${theme.primary}"></div>
-                  <span class="text-sm font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
+                  <div class="w-8 h-8 rounded" style="background-color: ${theme.primary}"></div>
+                  <span class="text-xs font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
                 </button>
               `
                 )
