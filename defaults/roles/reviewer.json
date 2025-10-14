@@ -4,5 +4,9 @@
   "defaultInterval": 300000,
   "defaultIntervalPrompt": "Check for PRs requesting review using `gh pr list --label=\"loom:review-requested\" --state=open`. If you find any, claim one by updating its label to `loom:reviewing`, check out the branch, run tests, and provide a thorough code review.",
   "autonomousRecommended": true,
-  "suggestedWorkerType": "claude"
+  "suggestedWorkerType": "claude",
+  "gitIdentity": {
+    "name": "Loom Reviewer",
+    "email": "loom-reviewer@users.noreply.github.com"
+  }
 }

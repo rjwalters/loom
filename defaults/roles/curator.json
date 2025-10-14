@@ -4,5 +4,9 @@
   "defaultInterval": 300000,
   "defaultIntervalPrompt": "Find approved issues (without loom:proposal label) that need curation. Enhance one issue with implementation details, test plans, and code references, then mark it as `loom:ready` when complete.",
   "autonomousRecommended": true,
-  "suggestedWorkerType": "claude"
+  "suggestedWorkerType": "claude",
+  "gitIdentity": {
+    "name": "Loom Curator",
+    "email": "loom-curator@users.noreply.github.com"
+  }
 }

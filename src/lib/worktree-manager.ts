@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/tauri";
 
+export interface GitIdentity {
+  name: string;
+  email: string;
+}
+
 /**
  * Set up a git worktree for an agent terminal
  *
@@ -11,11 +16,13 @@ import { invoke } from "@tauri-apps/api/tauri";
  *
  * @param terminalId - The terminal ID to set up the worktree in
  * @param workspacePath - The main workspace path (git repository root)
+ * @param gitIdentity - Optional git identity to configure in the worktree
  * @returns Promise that resolves with the worktree path
  */
 export async function setupWorktreeForAgent(
   terminalId: string,
-  workspacePath: string
+  workspacePath: string,
+  gitIdentity?: GitIdentity
 ): Promise<string> {
   // Worktree path: .loom/worktrees/{terminalId}
   const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
@@ -29,6 +36,16 @@ export async function setupWorktreeForAgent(
 
   // Change to worktree directory
   await sendCommand(terminalId, `cd "${worktreePath}"`);
+
+  // Configure git identity if provided
+  if (gitIdentity) {
+    await sendCommand(terminalId, `git config user.name "${gitIdentity.name}"`);
+    await sendCommand(terminalId, `git config user.email "${gitIdentity.email}"`);
+    await sendCommand(
+      terminalId,
+      `echo "✓ Git identity configured: ${gitIdentity.name} <${gitIdentity.email}>"`
+    );
+  }
 
   // Log success message
   await sendCommand(terminalId, `echo "✓ Worktree ready at ${worktreePath}"`);

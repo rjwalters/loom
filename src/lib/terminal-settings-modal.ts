@@ -509,6 +509,26 @@ async function applySettings(
       if (workspacePath && roleConfig.roleFile) {
         const { launchAgentInTerminal } = await import("./agent-launcher");
         try {
+          // Load role metadata to get git identity
+          const { invoke } = await import("@tauri-apps/api/tauri");
+          let gitIdentity: { name: string; email: string } | undefined;
+
+          try {
+            const metadataJson = await invoke<string | null>("read_role_metadata", {
+              workspacePath,
+              filename: roleConfig.roleFile,
+            });
+
+            if (metadataJson) {
+              const metadata = JSON.parse(metadataJson) as {
+                gitIdentity?: { name: string; email: string };
+              };
+              gitIdentity = metadata.gitIdentity;
+            }
+          } catch (error) {
+            console.warn("Failed to load git identity from role metadata:", error);
+          }
+
           // Use worktree for isolation (creates one if doesn't exist)
           const useWorktree = true;
           const worktreePath = await launchAgentInTerminal(
@@ -516,7 +536,8 @@ async function applySettings(
             roleConfig.roleFile as string,
             workspacePath,
             terminal.worktreePath,
-            useWorktree
+            useWorktree,
+            gitIdentity
           );
 
           // Store worktree path in terminal state
