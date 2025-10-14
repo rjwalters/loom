@@ -36,3 +36,8 @@ Thumbs.db
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Agent configurations
 # - roles/: Custom role definitions
+
+# Claude Code settings
+# - settings.json: Team-wide permissions (DO commit)
+# - settings.local.json: Personal preferences (gitignored)
+.claude/settings.local.json
