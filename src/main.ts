@@ -318,10 +318,15 @@ listen("factory-reset-workspace", async () => {
       // Create new terminal sessions for each agent in the config
       for (const agent of config.agents) {
         try {
+          // Get instance number
+          const instanceNumber = state.getNextAgentNumber();
+
           // Create terminal in daemon
           const terminalId = await invoke<string>("create_terminal", {
             name: agent.name,
             workingDir: workspace,
+            role: agent.role || "default",
+            instanceNumber,
           });
 
           // Update agent ID to match the newly created terminal
@@ -569,10 +574,15 @@ async function createPlainTerminal() {
   const name = `Terminal ${terminalCount}`;
 
   try {
+    // Get instance number for this terminal
+    const instanceNumber = state.getNextAgentNumber();
+
     // Create terminal in workspace directory
     const terminalId = await invoke<string>("create_terminal", {
       name,
       workingDir: workspacePath,
+      role: "default",
+      instanceNumber,
     });
 
     // Add to state (no role assigned - plain shell)
@@ -770,10 +780,15 @@ async function handleWorkspacePathInput(path: string) {
         // Create terminal sessions for each agent in the config
         for (const agent of config.agents) {
           try {
+            // Get instance number
+            const instanceNumber = state.getNextAgentNumber();
+
             // Create terminal in daemon
             const terminalId = await invoke<string>("create_terminal", {
               name: agent.name,
               workingDir: expandedPath,
+              role: agent.role || "default",
+              instanceNumber,
             });
 
             // Update agent ID to match the newly created terminal
@@ -900,10 +915,15 @@ async function handleRecoverNewSession(terminalId: string) {
       return;
     }
 
+    // Get instance number
+    const instanceNumber = state.getNextAgentNumber();
+
     // Create a new terminal in the daemon
     const newTerminalId = await invoke<string>("create_terminal", {
       name: terminal.name,
       workingDir: workspacePath,
+      role: terminal.role || "default",
+      instanceNumber,
     });
 
     console.log(`[handleRecoverNewSession] Created new terminal ${newTerminalId}`);
@@ -971,6 +991,43 @@ async function handleAttachToSession(terminalId: string, sessionName: string) {
   } catch (error) {
     console.error(`[handleAttachToSession] Failed to attach:`, error);
     alert(`Failed to attach to session: ${error}`);
+  }
+}
+
+async function handleKillSession(sessionName: string) {
+  console.log(`[handleKillSession] Killing session ${sessionName}`);
+
+  const confirmed = await ask(
+    `Are you sure you want to kill session "${sessionName}"?\n\nThis will permanently terminate the session and cannot be undone.`,
+    {
+      title: "Kill Session",
+      type: "warning",
+    }
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    await invoke("kill_session", { sessionName });
+    console.log(`[handleKillSession] Session killed successfully`);
+
+    // Refresh the available sessions list
+    // Find which terminal is showing the session list
+    const availableSessionsContainers = document.querySelectorAll("[id^='available-sessions-']");
+    for (const container of availableSessionsContainers) {
+      const terminalId = container.id.replace("available-sessions-", "");
+      if (terminalId) {
+        // Reload sessions for this terminal
+        const sessions = await invoke<string[]>("list_available_sessions");
+        const { renderAvailableSessionsList } = await import("./lib/ui");
+        renderAvailableSessionsList(terminalId, sessions);
+      }
+    }
+  } catch (error) {
+    console.error(`[handleKillSession] Failed to kill session:`, error);
+    alert(`Failed to kill session: ${error}`);
   }
 }
 
@@ -1123,6 +1180,17 @@ function setupEventListeners() {
         const sessionName = attachSessionItem.getAttribute("data-session-name");
         if (id && sessionName) {
           handleAttachToSession(id, sessionName);
+        }
+        return;
+      }
+
+      // Recovery - Kill session
+      const killSessionBtn = target.closest(".kill-session-btn");
+      if (killSessionBtn) {
+        e.stopPropagation();
+        const sessionName = killSessionBtn.getAttribute("data-session-name");
+        if (sessionName) {
+          handleKillSession(sessionName);
         }
         return;
       }

@@ -13,6 +13,8 @@ pub enum Request {
     CreateTerminal {
         name: String,
         working_dir: Option<String>,
+        role: Option<String>,
+        instance_number: Option<u32>,
     },
     ListTerminals,
     DestroyTerminal {
@@ -37,6 +39,9 @@ pub enum Request {
     ListAvailableSessions,
     AttachToSession {
         id: TerminalId,
+        session_name: String,
+    },
+    KillSession {
         session_name: String,
     },
 }

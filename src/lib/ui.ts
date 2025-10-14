@@ -217,16 +217,27 @@ export function renderAvailableSessionsList(terminalId: string, sessions: string
   const sessionItems = sessions
     .map(
       (session) => `
-      <button
-        class="attach-session-item w-full px-4 py-2 text-left bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 border border-gray-300 dark:border-gray-600 rounded transition-colors"
-        data-terminal-id="${terminalId}"
-        data-session-name="${escapeHtml(session)}"
-      >
-        <div class="flex items-center justify-between">
-          <span class="text-sm font-mono">${escapeHtml(session)}</span>
-          <span class="text-xs text-gray-500 dark:text-gray-400">Attach</span>
-        </div>
-      </button>
+      <div class="flex items-center gap-2">
+        <button
+          class="attach-session-item flex-1 px-4 py-2 text-left bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 border border-gray-300 dark:border-gray-600 rounded transition-colors"
+          data-terminal-id="${terminalId}"
+          data-session-name="${escapeHtml(session)}"
+        >
+          <div class="flex items-center justify-between">
+            <span class="text-sm font-mono">${escapeHtml(session)}</span>
+            <span class="text-xs text-gray-500 dark:text-gray-400">Attach</span>
+          </div>
+        </button>
+        <button
+          class="kill-session-btn px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
+          data-session-name="${escapeHtml(session)}"
+          title="Kill session"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+          </svg>
+        </button>
+      </div>
     `
     )
     .join("");

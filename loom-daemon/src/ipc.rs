@@ -74,11 +74,16 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
     match request {
         Request::Ping => Response::Pong,
 
-        Request::CreateTerminal { name, working_dir } => {
+        Request::CreateTerminal {
+            name,
+            working_dir,
+            role,
+            instance_number,
+        } => {
             let mut tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
-            match tm.create_terminal(name, working_dir) {
+            match tm.create_terminal(name, working_dir, role.as_ref(), instance_number) {
                 Ok(id) => Response::TerminalCreated { id },
                 Err(e) => Response::Error {
                     message: e.to_string(),
@@ -179,6 +184,18 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.attach_to_session(&id, session_name) {
+                Ok(()) => Response::Success,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::KillSession { session_name } => {
+            let tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.kill_session(&session_name) {
                 Ok(()) => Response::Success,
                 Err(e) => Response::Error {
                     message: e.to_string(),

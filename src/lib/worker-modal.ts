@@ -179,10 +179,15 @@ async function launchWorker(
   }
 
   try {
+    // Get instance number
+    const instanceNumber = state.getNextAgentNumber();
+
     // Create terminal in workspace directory
     const terminalId = await invoke<string>("create_terminal", {
       name,
       workingDir: workspacePath,
+      role: "worker",
+      instanceNumber,
     });
 
     // Add to state
@@ -191,6 +196,7 @@ async function launchWorker(
       name,
       status: TerminalStatus.Busy,
       isPrimary: false,
+      role: "worker",
     });
 
     // Save updated state to config
