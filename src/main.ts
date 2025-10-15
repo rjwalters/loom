@@ -369,6 +369,17 @@ listen("factory-reset-workspace", async () => {
     }
   }
 
+  // Kill ALL loom tmux sessions to ensure clean slate
+  // This is necessary because daemon may restore old sessions on startup
+  console.log("[factory-reset-workspace] Killing all loom tmux sessions...");
+  try {
+    await invoke("kill_all_loom_sessions");
+    console.log("[factory-reset-workspace] All loom sessions killed");
+  } catch (error) {
+    console.warn("[factory-reset-workspace] Failed to kill loom sessions:", error);
+    // Continue anyway - we'll try to create fresh terminals
+  }
+
   // Call backend reset
   try {
     await invoke("reset_workspace_to_defaults", {
