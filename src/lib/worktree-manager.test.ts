@@ -85,10 +85,10 @@ describe("worktree-manager", () => {
         data: 'git config user.name "Test User"',
       });
 
-      // Check git config user.email
+      // Check git config user.email (with --replace-all)
       expect(invoke).toHaveBeenCalledWith("send_terminal_input", {
         id: "test-terminal-4",
-        data: 'git config user.email "test@example.com"',
+        data: 'git config --replace-all user.email "test@example.com"',
       });
 
       // Check identity confirmation message
@@ -154,11 +154,12 @@ describe("worktree-manager", () => {
 
       // Expected order of commands
       const expectedCommands = [
+        "git worktree prune",
         'mkdir -p "/path/to/workspace/.loom/worktrees/test-terminal-7"',
         'git worktree add "/path/to/workspace/.loom/worktrees/test-terminal-7" HEAD',
         'cd "/path/to/workspace/.loom/worktrees/test-terminal-7"',
         'git config user.name "Test User"',
-        'git config user.email "test@example.com"',
+        'git config --replace-all user.email "test@example.com"',
         'echo "✓ Git identity configured: Test User <test@example.com>"',
         'echo "✓ Worktree ready at /path/to/workspace/.loom/worktrees/test-terminal-7"',
       ];
@@ -215,7 +216,7 @@ describe("worktree-manager", () => {
 
       expect(invoke).toHaveBeenCalledWith("send_terminal_input", {
         id: "test-terminal-10",
-        data: 'git config user.email "test+tag@example.com"',
+        data: 'git config --replace-all user.email "test+tag@example.com"',
       });
     });
 
@@ -231,8 +232,8 @@ describe("worktree-manager", () => {
           call[1] && typeof call[1] === "object" && "data" in call[1] && call[1].data === "\r"
       );
 
-      // Should have Enter for: mkdir, git worktree, cd, echo success
-      expect(enterCalls.length).toBeGreaterThanOrEqual(4);
+      // Should have Enter for: git worktree prune, mkdir, git worktree, cd, echo success
+      expect(enterCalls.length).toBeGreaterThanOrEqual(5);
     });
 
     it("should return the correct worktree path", async () => {

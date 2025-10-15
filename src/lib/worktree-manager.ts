@@ -35,6 +35,9 @@ export async function setupWorktreeForAgent(
   // Worktree path: .loom/worktrees/{terminalId}
   const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
 
+  // Prune orphaned worktrees before creating new ones
+  await sendCommand(terminalId, `git worktree prune`);
+
   // Create worktrees directory if it doesn't exist
   await sendCommand(terminalId, `mkdir -p "${worktreePath}"`);
 
@@ -48,7 +51,8 @@ export async function setupWorktreeForAgent(
   // Configure git identity if provided
   if (gitIdentity) {
     await sendCommand(terminalId, `git config user.name "${gitIdentity.name}"`);
-    await sendCommand(terminalId, `git config user.email "${gitIdentity.email}"`);
+    // Use --replace-all to handle multiple values
+    await sendCommand(terminalId, `git config --replace-all user.email "${gitIdentity.email}"`);
     await sendCommand(
       terminalId,
       `echo "✓ Git identity configured: ${gitIdentity.name} <${gitIdentity.email}>"`
@@ -90,5 +94,6 @@ async function sendCommand(terminalId: string, command: string): Promise<void> {
 
   // Delay to allow command to fully execute before sending next command
   // This prevents command concatenation in the terminal
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  // Increased to 500ms to ensure reliable separation (was 300ms, caused failures)
+  await new Promise((resolve) => setTimeout(resolve, 500));
 }
