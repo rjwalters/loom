@@ -40,7 +40,7 @@ export interface Terminal {
   theme?: string; // Theme ID (e.g., "ocean", "forest") or "default"
   customTheme?: ColorTheme; // For custom colors
   // Agent-specific fields
-  worktreePath?: string; // Path to git worktree
+  worktreePath?: string; // Path to git worktree (automatically created at .loom/worktrees/{id})
   agentPid?: number; // Claude process ID
   agentStatus?: AgentStatus; // Agent state machine
   lastIntervalRun?: number; // Timestamp (ms)
