@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import { saveConfig } from "./config";
+import { saveConfig, saveState, splitTerminals } from "./config";
 import { DEFAULT_WORKER_PROMPT, formatPrompt } from "./prompts";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
@@ -216,12 +216,15 @@ async function launchWorker(
       role: "worker",
     });
 
-    // Save updated state to config
-    const config = {
-      nextAgentNumber: state.getNextAgentNumber(),
-      agents: state.getTerminals(),
-    };
-    await saveConfig(config);
+    // Save updated state to config and state files
+    const terminals = state.getTerminals();
+    const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
+
+    await saveConfig({ terminals: terminalConfigs });
+    await saveState({
+      nextAgentNumber: state.getCurrentAgentNumber(),
+      terminals: terminalStates,
+    });
 
     // Launch Claude Code by sending commands to terminal
     await invoke("send_terminal_input", {

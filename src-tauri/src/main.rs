@@ -391,6 +391,31 @@ fn write_config(workspace_path: &str, config_json: String) -> Result<(), String>
 }
 
 #[tauri::command]
+fn read_state(workspace_path: &str) -> Result<String, String> {
+    let state_path = Path::new(workspace_path).join(".loom").join("state.json");
+
+    if !state_path.exists() {
+        return Err("State file does not exist".to_string());
+    }
+
+    fs::read_to_string(&state_path).map_err(|e| format!("Failed to read state: {e}"))
+}
+
+#[tauri::command]
+fn write_state(workspace_path: &str, state_json: String) -> Result<(), String> {
+    let loom_dir = Path::new(workspace_path).join(".loom");
+    let state_path = loom_dir.join("state.json");
+
+    // Ensure .loom directory exists
+    if !loom_dir.exists() {
+        fs::create_dir_all(&loom_dir)
+            .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+    }
+
+    fs::write(&state_path, state_json).map_err(|e| format!("Failed to write state: {e}"))
+}
+
+#[tauri::command]
 fn list_role_files(workspace_path: &str) -> Result<Vec<String>, String> {
     let roles_dir = Path::new(workspace_path).join(".loom").join("roles");
 
@@ -1215,6 +1240,8 @@ fn main() {
             initialize_loom_workspace,
             read_config,
             write_config,
+            read_state,
+            write_state,
             write_file,
             list_role_files,
             read_role_file,

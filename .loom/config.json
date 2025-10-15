@@ -1,19 +1,13 @@
 {
-  "nextAgentNumber": 7,
-  "agents": [
+  "terminals": [
     {
-      "id": "516caf26-3fa6-492d-ba7d-bb0fc3ec0e84",
+      "id": "terminal-1",
       "name": "Shell",
-      "status": "idle",
-      "isPrimary": true,
-      "theme": "default",
-      "configId": "terminal-1"
+      "theme": "default"
     },
     {
-      "id": "dcbc8449-aba5-444a-8a48-6431c6b07211",
+      "id": "terminal-2",
       "name": "Architect",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -21,14 +15,11 @@
         "targetInterval": 900000,
         "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
       },
-      "theme": "lavender",
-      "configId": "terminal-2"
+      "theme": "lavender"
     },
     {
-      "id": "3ea00670-97fa-4310-a587-faed960fde77",
+      "id": "terminal-3",
       "name": "Curator",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -36,14 +27,11 @@
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
       },
-      "theme": "ocean",
-      "configId": "terminal-3"
+      "theme": "ocean"
     },
     {
-      "id": "b48b365c-fc9f-4279-a9c6-4246fa654a1b",
+      "id": "terminal-4",
       "name": "Reviewer",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -51,14 +39,11 @@
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
       },
-      "theme": "rose",
-      "configId": "terminal-4"
+      "theme": "rose"
     },
     {
-      "id": "a5a63aec-a0b8-4f9e-a65b-b0a13ccb48e7",
+      "id": "terminal-5",
       "name": "Worker 1",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -66,19 +51,11 @@
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
-      "theme": "forest",
-      "agentStatus": "not_started",
-      "worktreePath": null,
-      "agentPid": null,
-      "lastIntervalRun": null,
-      "pendingInputRequests": [],
-      "configId": "terminal-5"
+      "theme": "forest"
     },
     {
-      "id": "7e95d31a-93e6-4f33-bbaa-24632068d330",
+      "id": "terminal-6",
       "name": "Worker 2",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -86,8 +63,7 @@
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
-      "theme": "forest",
-      "configId": "terminal-6"
+      "theme": "forest"
     }
   ]
 }

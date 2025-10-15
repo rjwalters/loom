@@ -3,7 +3,13 @@ import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
-import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
+import {
+  loadWorkspaceConfig,
+  saveConfig,
+  saveState,
+  setConfigWorkspace,
+  splitTerminals,
+} from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
@@ -341,7 +347,7 @@ listen("factory-reset-workspace", async () => {
   // Reload config and recreate terminals
   try {
     setConfigWorkspace(workspace);
-    const config = await loadConfig();
+    const config = await loadWorkspaceConfig();
     state.setNextAgentNumber(config.nextAgentNumber);
 
     // Load agents from fresh config and create terminal sessions for each
@@ -399,9 +405,12 @@ listen("factory-reset-workspace", async () => {
       // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
       // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
       console.log(`[factory-reset-workspace] Saving config with real terminal IDs...`);
-      await saveConfig({
+      const terminalsToSave1 = state.getTerminals();
+      const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
+      await saveConfig({ terminals: terminalConfigs1 });
+      await saveState({
         nextAgentNumber: state.getCurrentAgentNumber(),
-        agents: state.getTerminals(),
+        terminals: terminalStates1,
       });
       console.log(`[factory-reset-workspace] Config saved`);
 
@@ -415,9 +424,12 @@ listen("factory-reset-workspace", async () => {
 
       // Save again with worktree paths added by agent launch
       console.log(`[factory-reset-workspace] Saving config with worktree paths...`);
-      await saveConfig({
+      const terminalsToSave2 = state.getTerminals();
+      const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
+      await saveConfig({ terminals: terminalConfigs2 });
+      await saveState({
         nextAgentNumber: state.getCurrentAgentNumber(),
-        agents: state.getTerminals(),
+        terminals: terminalStates2,
       });
 
       console.log("[factory-reset-workspace] Workspace reset complete");
@@ -529,19 +541,21 @@ let dropTargetConfigId: string | null = null;
 let dropInsertBefore: boolean = false;
 let isDragging: boolean = false;
 
-// Save current state to config
+// Save current state to config and state files
 async function saveCurrentConfig() {
   const workspace = state.getWorkspace();
   if (!workspace) {
     return;
   }
 
-  const config = {
-    nextAgentNumber: state.getCurrentAgentNumber(),
-    agents: state.getTerminals(),
-  };
+  const terminals = state.getTerminals();
+  const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
 
-  await saveConfig(config);
+  await saveConfig({ terminals: terminalConfigs });
+  await saveState({
+    nextAgentNumber: state.getCurrentAgentNumber(),
+    terminals: terminalStates,
+  });
 }
 
 // Expand tilde (~) to home directory
@@ -958,7 +972,7 @@ async function handleWorkspacePathInput(path: string) {
 
       // After initialization, create terminals for the default config
       setConfigWorkspace(expandedPath);
-      const config = await loadConfig();
+      const config = await loadWorkspaceConfig();
       state.setNextAgentNumber(config.nextAgentNumber);
 
       if (config.agents && config.agents.length > 0) {
@@ -999,13 +1013,19 @@ async function handleWorkspacePathInput(path: string) {
         await launchAgentsForTerminals(expandedPath, config.agents);
 
         // Save the updated config with real terminal IDs (including worktree paths)
-        await saveConfig(config);
+        const terminalsToSave = state.getTerminals();
+        const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminalsToSave);
+        await saveConfig({ terminals: terminalConfigs });
+        await saveState({
+          nextAgentNumber: state.getCurrentAgentNumber(),
+          terminals: terminalStates,
+        });
         console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
       }
     } else {
       // Workspace already initialized - load existing config
       setConfigWorkspace(expandedPath);
-      const config = await loadConfig();
+      const config = await loadWorkspaceConfig();
       state.setNextAgentNumber(config.nextAgentNumber);
 
       // Load agents from config
@@ -1073,7 +1093,14 @@ async function handleWorkspacePathInput(path: string) {
 
         // If we created sessions, save the updated config with real IDs
         if (createdSessionCount > 0) {
-          await saveConfig(config);
+          const terminalsToSave = state.getTerminals();
+          const { config: terminalConfigs, state: terminalStates } =
+            splitTerminals(terminalsToSave);
+          await saveConfig({ terminals: terminalConfigs });
+          await saveState({
+            nextAgentNumber: state.getCurrentAgentNumber(),
+            terminals: terminalStates,
+          });
           console.log(
             `[handleWorkspacePathInput] Saved config with ${createdSessionCount} new session IDs`
           );

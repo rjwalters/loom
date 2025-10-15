@@ -32,9 +32,10 @@ Thumbs.db
 .loom/.daemon.log
 .loom/daemon.sock
 .loom/worktrees/
+.loom/state.json
 
 # Loom workspace config (DO commit for team sharing)
-# - config.json: Agent configurations
+# - config.json: Persistent terminal configurations (roles, themes, intervals)
 # - roles/: Custom role definitions
 
 # Claude Code settings
