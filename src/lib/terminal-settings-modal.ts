@@ -539,19 +539,25 @@ async function applySettings(
               console.warn("Failed to load git identity from role metadata:", error);
             }
 
-            // Use worktree for isolation (creates one if doesn't exist)
-            const useWorktree = true;
-            const worktreePath = await launchAgentInTerminal(
+            // Verify terminal has worktree, create if it doesn't exist yet
+            let worktreePath = terminal.worktreePath;
+            if (!worktreePath) {
+              console.log(
+                `[terminal-settings-modal] Terminal ${terminal.name} missing worktree, creating now...`
+              );
+              const { setupWorktreeForAgent } = await import("./worktree-manager");
+              worktreePath = await setupWorktreeForAgent(terminal.id, workspacePath, gitIdentity);
+              // Store worktree path in terminal state
+              state.updateTerminal(terminal.id, { worktreePath });
+            }
+
+            // Launch agent using existing/new worktree
+            await launchAgentInTerminal(
               terminal.id,
               roleConfig.roleFile as string,
               workspacePath,
-              terminal.worktreePath,
-              useWorktree,
-              gitIdentity
+              worktreePath
             );
-
-            // Store worktree path in terminal state (use configId for state operations)
-            state.updateTerminal(terminal.id, { worktreePath });
           }
         } catch (error) {
           console.error("Failed to launch agent:", error);

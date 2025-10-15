@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import type { GitIdentity } from "./worktree-manager";
 
 /**
  * agent-launcher.ts - Functions for launching AI agents in terminals
@@ -16,39 +15,28 @@ import type { GitIdentity } from "./worktree-manager";
  * with the appropriate role prompt and configuration. The agent runs visibly
  * in the terminal where users can see output and interact if needed.
  *
+ * NOTE: All terminals now have worktrees automatically created during terminal creation.
+ * This function expects worktreePath to be provided from terminal.worktreePath.
+ *
  * @param terminalId - The terminal ID to launch the agent in
  * @param roleFile - The role file to use (e.g., "worker.md")
- * @param workspacePath - The workspace path for the agent
- * @param worktreePath - Optional worktree path for isolated work (defaults to workspace)
- * @param useWorktree - Whether to create a worktree for isolation (default: false)
- * @param gitIdentity - Optional git identity to configure in the worktree
- * @returns Promise that resolves with the working directory path that was used
+ * @param workspacePath - The workspace path (used for reading role files)
+ * @param worktreePath - The worktree path for this terminal (required, created during terminal setup)
+ * @returns Promise that resolves when the agent is launched
  */
 export async function launchAgentInTerminal(
   terminalId: string,
   roleFile: string,
   workspacePath: string,
-  worktreePath?: string,
-  useWorktree = false,
-  gitIdentity?: GitIdentity
-): Promise<string> {
+  worktreePath: string
+): Promise<void> {
   console.log(
-    `[launchAgentInTerminal] START - terminalId=${terminalId}, roleFile=${roleFile}, workspacePath=${workspacePath}, useWorktree=${useWorktree}`
+    `[launchAgentInTerminal] START - terminalId=${terminalId}, roleFile=${roleFile}, workspacePath=${workspacePath}, worktreePath=${worktreePath}`
   );
 
-  // Set up worktree if requested
-  let agentWorkingDir = workspacePath;
-  if (useWorktree && !worktreePath) {
-    console.log(`[launchAgentInTerminal] Setting up worktree for ${terminalId}...`);
-    const { setupWorktreeForAgent } = await import("./worktree-manager");
-    agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath, gitIdentity);
-    console.log(
-      `[launchAgentInTerminal] Worktree setup complete, agentWorkingDir=${agentWorkingDir}`
-    );
-  } else if (worktreePath) {
-    agentWorkingDir = worktreePath;
-    console.log(`[launchAgentInTerminal] Using existing worktreePath=${worktreePath}`);
-  }
+  // Use the provided worktree path as the working directory
+  const agentWorkingDir = worktreePath;
+  console.log(`[launchAgentInTerminal] Using worktree at ${agentWorkingDir}`);
 
   // Read role file content from workspace
   console.log(`[launchAgentInTerminal] Reading role file ${roleFile}...`);
@@ -138,10 +126,7 @@ export async function launchAgentInTerminal(
     }
   }
 
-  console.log(`[launchAgentInTerminal] COMPLETE - returning agentWorkingDir=${agentWorkingDir}`);
-
-  // Return the working directory that was used
-  return agentWorkingDir;
+  console.log(`[launchAgentInTerminal] COMPLETE - agent launched in ${agentWorkingDir}`);
 }
 
 /**

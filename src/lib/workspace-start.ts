@@ -116,6 +116,13 @@ export async function startWorkspaceEngine(
           // Update agent ID to match the newly created terminal
           agent.id = terminalId;
           console.log(`[${logPrefix}] ✓ Created terminal ${agent.name} (${terminalId})`);
+
+          // Create worktree for this terminal
+          console.log(`[${logPrefix}] Creating worktree for ${agent.name} (${terminalId})...`);
+          const { setupWorktreeForAgent } = await import("./worktree-manager");
+          const worktreePath = await setupWorktreeForAgent(terminalId, workspacePath);
+          agent.worktreePath = worktreePath;
+          console.log(`[${logPrefix}] ✓ Created worktree at ${worktreePath}`);
         } catch (error) {
           console.error(`[${logPrefix}] ✗ Failed to create terminal ${agent.name}:`, error);
           alert(`Failed to create terminal ${agent.name}: ${error}`);
@@ -160,8 +167,8 @@ export async function startWorkspaceEngine(
         state.getTerminals().map((a) => `${a.name}=${a.id}`)
       );
 
-      // Save again with worktree paths added by agent launch
-      console.log(`[${logPrefix}] Saving config with worktree paths...`);
+      // Save final state after agent launch
+      console.log(`[${logPrefix}] Saving final config...`);
       const terminalsToSave2 = state.getTerminals();
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
       await saveConfig({ terminals: terminalConfigs2 });

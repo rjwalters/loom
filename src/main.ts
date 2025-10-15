@@ -676,10 +676,19 @@ async function createPlainTerminal() {
       instanceNumber,
     });
 
+    console.log(`[createPlainTerminal] Created terminal ${name} (id: ${id}, tmux: ${terminalId})`);
+
+    // Create worktree for this terminal
+    console.log(`[createPlainTerminal] Creating worktree for ${name}...`);
+    const { setupWorktreeForAgent } = await import("./lib/worktree-manager");
+    const worktreePath = await setupWorktreeForAgent(id, workspacePath);
+    console.log(`[createPlainTerminal] ✓ Created worktree at ${worktreePath}`);
+
     // Add to state (no role assigned - plain shell)
     state.addTerminal({
       id,
       name,
+      worktreePath,
       status: TerminalStatus.Idle,
       isPrimary: false,
       theme: "default",
@@ -690,8 +699,6 @@ async function createPlainTerminal() {
 
     // Switch to new terminal
     state.setPrimary(id);
-
-    console.log(`[createPlainTerminal] Created terminal ${name} (id: ${id}, tmux: ${terminalId})`);
   } catch (error) {
     console.error("[createPlainTerminal] Failed to create terminal:", error);
     alert(`Failed to create terminal: ${error}`);
@@ -738,27 +745,6 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
       // Get worker type from config (default to claude)
       const workerType = (roleConfig.workerType as string) || "claude";
 
-      // Load git identity from role metadata if available
-      let gitIdentity: { name: string; email: string } | undefined;
-      try {
-        const metadataJson = await invoke<string | null>("read_role_metadata", {
-          workspacePath,
-          filename: roleConfig.roleFile as string,
-        });
-
-        if (metadataJson) {
-          const metadata = JSON.parse(metadataJson) as {
-            gitIdentity?: { name: string; email: string };
-          };
-          gitIdentity = metadata.gitIdentity;
-        }
-      } catch (error) {
-        console.warn(
-          `[launchAgentsForTerminals] Failed to load git identity for ${terminal.name}:`,
-          error
-        );
-      }
-
       // Launch based on worker type
       if (workerType === "github-copilot") {
         const { launchGitHubCopilotAgent } = await import("./lib/agent-launcher");
@@ -777,29 +763,26 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
         console.log(`[launchAgentsForTerminals] Importing agent-launcher for ${terminal.name}...`);
         const { launchAgentInTerminal } = await import("./lib/agent-launcher");
 
-        // Create worktree for isolation
-        const useWorktree = true;
+        // Verify worktreePath exists (should have been created during terminal creation)
+        if (!terminal.worktreePath) {
+          throw new Error(
+            `Terminal ${terminal.name} (${terminal.id}) is missing worktreePath - this should have been created during terminal setup`
+          );
+        }
+
         console.log(
-          `[launchAgentsForTerminals] Calling launchAgentInTerminal for ${terminal.name} (id=${terminal.id})...`
+          `[launchAgentsForTerminals] Launching agent for ${terminal.name} (id=${terminal.id}) in worktree ${terminal.worktreePath}...`
         );
-        const worktreePath = await launchAgentInTerminal(
+
+        // Launch agent using existing worktree
+        await launchAgentInTerminal(
           terminal.id,
           roleConfig.roleFile as string,
           workspacePath,
-          undefined, // No existing worktree path
-          useWorktree,
-          gitIdentity
-        );
-        console.log(
-          `[launchAgentsForTerminals] launchAgentInTerminal returned worktreePath=${worktreePath}`
+          terminal.worktreePath
         );
 
-        // Store worktree path in terminal state (use configId for state operations)
-        state.updateTerminal(terminal.id, { worktreePath });
-        console.log(
-          `[launchAgentsForTerminals] Updated state with worktree path for ${terminal.name}`
-        );
-        console.log(`[launchAgentsForTerminals] Created worktree at ${worktreePath}`);
+        console.log(`[launchAgentsForTerminals] Agent launched in ${terminal.worktreePath}`);
       }
 
       console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
