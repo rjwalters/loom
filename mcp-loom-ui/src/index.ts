@@ -44,28 +44,51 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Trigger a Tauri menu event
+ * Trigger a factory reset via Tauri IPC
  */
-async function triggerMenuEvent(eventName: string): Promise<string> {
+async function triggerFactoryReset(): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Use osascript to trigger menu items via macOS accessibility
-    // This requires the Loom app to be running and focused
-
+    // Use osascript to simulate menu click in Loom app
     const script = `
       tell application "System Events"
-        tell process "loom"
+        tell process "Loom"
           set frontmost to true
-          -- Simulate menu navigation based on event name
-          -- This is a placeholder - actual implementation would need to map
-          -- event names to specific menu paths
+          delay 0.2
+          click menu item "Factory Reset (Testing)" of menu "Workspace" of menu bar 1
         end tell
       end tell
     `;
 
-    // For now, just return a message indicating the limitation
-    resolve(
-      `Menu event triggering not yet implemented. Event: ${eventName}\n\nTo implement this, we need to either:\n1. Add Tauri IPC endpoints for triggering events\n2. Use macOS accessibility API via osascript\n3. Use a Chrome DevTools Protocol connection`
-    );
+    const osascript = spawn("osascript", ["-e", script]);
+
+    let stdout = "";
+    let stderr = "";
+
+    osascript.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    osascript.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    osascript.on("close", (code) => {
+      if (code === 0) {
+        resolve("Factory reset triggered successfully via menu click");
+      } else {
+        reject(
+          new Error(
+            `Failed to trigger factory reset (exit code ${code}): ${stderr || "No error message"}`
+          )
+        );
+      }
+    });
+
+    // Timeout after 5 seconds
+    setTimeout(() => {
+      osascript.kill();
+      reject(new Error("Factory reset trigger timed out after 5 seconds"));
+    }, 5000);
   });
 }
 
@@ -142,7 +165,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_factory_reset",
         description:
-          "Trigger a factory reset of the current workspace (WARNING: This is a placeholder and doesn't work yet)",
+          "Trigger a factory reset of the current workspace using macOS accessibility to click the menu item. This resets the workspace to defaults with 6 terminals and launches all agents. Requires the Loom app to be running.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -190,7 +213,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "trigger_factory_reset": {
-        const result = await triggerMenuEvent("factory-reset-workspace");
+        const result = await triggerFactoryReset();
         return {
           content: [
             {
