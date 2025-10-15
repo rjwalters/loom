@@ -64,7 +64,7 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest",
@@ -84,7 +84,7 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest"
