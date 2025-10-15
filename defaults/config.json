@@ -1,5 +1,5 @@
 {
-  "nextAgentNumber": 8,
+  "nextAgentNumber": 9,
   "agents": [
     {
       "configId": "terminal-1",
@@ -25,7 +25,7 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "curator.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
@@ -41,7 +41,7 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "reviewer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
@@ -84,23 +84,39 @@
     {
       "configId": "terminal-6",
       "id": "__needs_session__",
-      "name": "Worker 3",
+      "name": "Fluffer",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "codex",
-        "roleFile": "worker.md",
-        "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
+        "workerType": "claude",
+        "roleFile": "fluffer.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Check for PRs with review feedback: gh pr list --label=\"loom:reviewing\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
       },
       "worktreePath": "",
-      "theme": "crimson"
+      "theme": "amber"
     },
     {
       "configId": "terminal-7",
       "id": "__needs_session__",
-      "name": "Worker 4",
+      "name": "Critic",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "critic.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:critic-suggestion label if you find something concrete"
+      },
+      "worktreePath": "",
+      "theme": "gray"
+    },
+    {
+      "configId": "terminal-8",
+      "id": "__needs_session__",
+      "name": "Worker 3",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
