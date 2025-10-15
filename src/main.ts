@@ -394,6 +394,28 @@ listen("start-workspace", async () => {
     return;
   }
 
+  // Reset GitHub labels to clean state
+  console.log("[start-workspace] Resetting GitHub labels...");
+  try {
+    interface LabelResetResult {
+      issues_cleaned: number;
+      prs_updated: number;
+      errors: string[];
+    }
+
+    const labelResult = await invoke<LabelResetResult>("reset_github_labels");
+    console.log(
+      `[start-workspace] Label reset complete: ${labelResult.issues_cleaned} issues cleaned, ${labelResult.prs_updated} PRs updated`
+    );
+
+    if (labelResult.errors.length > 0) {
+      console.warn("[start-workspace] Label reset errors:", labelResult.errors);
+    }
+  } catch (error) {
+    console.warn("[start-workspace] Failed to reset GitHub labels:", error);
+    // Continue anyway - label reset is non-critical
+  }
+
   // Clear state
   state.clearAll();
   currentAttachedTerminalId = null;
@@ -546,6 +568,28 @@ listen("force-start-workspace", async () => {
     console.error("Failed to reset workspace:", error);
     alert(`Failed to reset workspace: ${error}`);
     return;
+  }
+
+  // Reset GitHub labels to clean state
+  console.log("[force-start-workspace] Resetting GitHub labels...");
+  try {
+    interface LabelResetResult {
+      issues_cleaned: number;
+      prs_updated: number;
+      errors: string[];
+    }
+
+    const labelResult = await invoke<LabelResetResult>("reset_github_labels");
+    console.log(
+      `[force-start-workspace] Label reset complete: ${labelResult.issues_cleaned} issues cleaned, ${labelResult.prs_updated} PRs updated`
+    );
+
+    if (labelResult.errors.length > 0) {
+      console.warn("[force-start-workspace] Label reset errors:", labelResult.errors);
+    }
+  } catch (error) {
+    console.warn("[force-start-workspace] Failed to reset GitHub labels:", error);
+    // Continue anyway - label reset is non-critical
   }
 
   // Clear state

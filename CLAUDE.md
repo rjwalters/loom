@@ -246,6 +246,12 @@ fn validate_git_repo(path: String) -> Result<bool, String> {
   - Checks path exists and is a directory
   - Verifies `.git` directory exists
   - Returns `Result<bool, String>` with specific error messages
+- `reset_github_labels()`: Resets GitHub label state machine during workspace restart
+  - Removes `loom:in-progress` from all open issues
+  - Replaces `loom:reviewing` with `loom:review-requested` on all open PRs
+  - Returns `LabelResetResult` with counts and errors
+  - Called automatically during both start-workspace and force-start-workspace
+  - Non-critical operation - continues on error
 
 **Workspace Validation Pattern**:
 ```typescript

@@ -71,11 +71,11 @@ async function invokeTauriCommand(
     `;
 
     const proc = spawn("osascript", ["-e", script]);
-    let stdout = "";
+    let _stdout = "";
     let stderr = "";
 
     proc.stdout.on("data", (data) => {
-      stdout += data.toString();
+      _stdout += data.toString();
     });
 
     proc.stderr.on("data", (data) => {

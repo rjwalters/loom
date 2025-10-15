@@ -88,7 +88,13 @@ Interact with the Loom application UI and state:
 - `read_console_log` - View browser console output (JavaScript errors, console.log statements)
 - `read_state_file` - Read current application state (.loom/state.json)
 - `read_config_file` - Read terminal configurations (.loom/config.json)
-- `trigger_factory_reset` - Trigger factory reset (placeholder, not yet functional)
+- `trigger_start` - Trigger workspace start with confirmation dialog (factory reset with 6 terminals)
+- `trigger_force_start` - Trigger force start without confirmation (immediate reset)
+
+**Label State Machine Reset**: When workspace is started (via `trigger_start` or `trigger_force_start`), the `reset_github_labels` Tauri command automatically resets the GitHub label state machine:
+- Removes `loom:in-progress` from all open issues (workers can reclaim them)
+- Replaces `loom:reviewing` with `loom:review-requested` on all open PRs (reviewer can re-review)
+- This ensures a clean state when restarting the workspace with fresh agent terminals
 
 **Note**: When you first open the project, Claude Code will prompt you to approve these MCP servers. You can also enable them automatically by setting `"enableAllProjectMcpServers": true` in your `.claude/settings.local.json`.
 
