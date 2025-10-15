@@ -33,6 +33,7 @@ Thumbs.db
 .loom/daemon.sock
 .loom/worktrees/
 .loom/state.json
+.loom/mcp-command.json
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)

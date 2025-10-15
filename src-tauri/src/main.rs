@@ -11,6 +11,7 @@ use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
 mod daemon_client;
 mod daemon_manager;
 mod dependency_checker;
+mod mcp_watcher;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
@@ -1407,6 +1408,13 @@ fn main() {
 
             // Store daemon manager in app state for cleanup on quit
             app.manage(std::sync::Mutex::new(daemon_manager));
+
+            // Start MCP command file watcher
+            let window = app
+                .get_window("main")
+                .ok_or_else(|| "Failed to get main window".to_string())?;
+            mcp_watcher::start_mcp_watcher(window);
+            eprintln!("[Loom] MCP command watcher started");
 
             Ok(())
         })

@@ -44,80 +44,44 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Invoke a Tauri command using AppleScript + JavaScript injection
+ * Write MCP command to control file for Loom to pick up
+ * This is a simple file-based IPC mechanism that doesn't require AppleScript
  */
-async function invokeTauriCommand(
-  command: string,
-  args: Record<string, unknown> = {}
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const argsJson = JSON.stringify(args).replace(/"/g, '\\"');
-    const script = `
-      tell application "Loom"
-        activate
-        tell application "System Events"
-          tell process "Loom"
-            set frontmost to true
-          end tell
-        end tell
-      end tell
+async function writeMCPCommand(command: string): Promise<string> {
+  const { writeFile, mkdir } = await import("node:fs/promises");
+  const loomDir = join(homedir(), ".loom");
+  const commandFile = join(loomDir, "mcp-command.json");
 
-      tell application "System Events"
-        keystroke "j" using {command down, option down}
-        delay 0.5
-        keystroke "window.__TAURI__.invoke('${command}', JSON.parse(\\"${argsJson}\\")).then(r => console.log('SUCCESS:', r)).catch(e => console.error('ERROR:', e))"
-        keystroke return
-      end tell
-    `;
+  // Ensure .loom directory exists
+  try {
+    await mkdir(loomDir, { recursive: true });
+  } catch (error) {
+    // Directory might already exist, that's fine
+  }
 
-    const proc = spawn("osascript", ["-e", script]);
-    let _stdout = "";
-    let stderr = "";
+  // Write command with timestamp
+  const commandData = {
+    command,
+    timestamp: new Date().toISOString(),
+  };
 
-    proc.stdout.on("data", (data) => {
-      _stdout += data.toString();
-    });
+  await writeFile(commandFile, JSON.stringify(commandData, null, 2));
 
-    proc.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    proc.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(`AppleScript failed (exit ${code}): ${stderr}`));
-      } else {
-        resolve(`Tauri command '${command}' invoked successfully`);
-      }
-    });
-  });
+  return `MCP command '${command}' written to ${commandFile}. Note: File-based IPC is not yet implemented in Loom app. This command will not execute until file watcher is added.`;
 }
 
 /**
  * Trigger workspace start (normal reset with confirmation)
  */
 async function triggerStart(): Promise<string> {
-  try {
-    await invokeTauriCommand("trigger_start");
-    return "Workspace start triggered successfully";
-  } catch (error) {
-    throw new Error(
-      `Failed to trigger start: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
+  return await writeMCPCommand("trigger_start");
 }
 
 /**
  * Trigger force start (bypass confirmation)
  */
 async function triggerForceStart(): Promise<string> {
-  try {
-    await invokeTauriCommand("trigger_force_start");
-    return "Force start triggered successfully";
-  } catch (error) {
-    throw new Error(
-      `Failed to trigger force start: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
+  return await writeMCPCommand("trigger_force_start");
 }
 
 /**
