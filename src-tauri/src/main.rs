@@ -1045,6 +1045,49 @@ fn append_to_console_log(content: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Kill all loom tmux sessions
+#[tauri::command]
+fn kill_all_loom_sessions() -> Result<(), String> {
+    eprintln!("[kill_all_loom_sessions] Killing all loom tmux sessions");
+
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .map_err(|e| format!("Failed to list tmux sessions: {e}"))?;
+
+    if !output.status.success() {
+        // tmux list-sessions fails if no sessions exist - this is OK
+        eprintln!("[kill_all_loom_sessions] No tmux sessions found");
+        return Ok(());
+    }
+
+    let sessions = String::from_utf8_lossy(&output.stdout);
+    let mut killed_count = 0;
+
+    for session in sessions.lines() {
+        if session.starts_with("loom-") {
+            eprintln!("[kill_all_loom_sessions] Killing tmux session: {session}");
+
+            let kill_output = Command::new("tmux")
+                .args(["kill-session", "-t", session])
+                .output()
+                .map_err(|e| format!("Failed to kill session {session}: {e}"))?;
+
+            if kill_output.status.success() {
+                killed_count += 1;
+            } else {
+                eprintln!(
+                    "[kill_all_loom_sessions] Failed to kill {session}: {}",
+                    String::from_utf8_lossy(&kill_output.stderr)
+                );
+            }
+        }
+    }
+
+    eprintln!("[kill_all_loom_sessions] Killed {killed_count} sessions");
+    Ok(())
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -1314,7 +1357,8 @@ fn main() {
             create_local_project,
             create_github_repository,
             emit_menu_event,
-            append_to_console_log
+            append_to_console_log,
+            kill_all_loom_sessions
         ])
         .run(tauri::generate_context!())
     {
