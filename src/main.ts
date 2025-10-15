@@ -724,6 +724,11 @@ async function createPlainTerminal() {
  */
 async function launchAgentsForTerminals(workspacePath: string, terminals: Terminal[]) {
   console.log("[launchAgentsForTerminals] Launching agents for configured terminals");
+  console.log("[launchAgentsForTerminals] workspacePath:", workspacePath);
+  console.log(
+    "[launchAgentsForTerminals] terminals:",
+    terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`)
+  );
 
   // Filter terminals that have Claude Code worker role
   const workersToLaunch = terminals.filter(
@@ -731,7 +736,8 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
   );
 
   console.log(
-    `[launchAgentsForTerminals] Found ${workersToLaunch.length} terminals with role configs`
+    `[launchAgentsForTerminals] Found ${workersToLaunch.length} terminals with role configs`,
+    workersToLaunch.map((t) => `${t.name}=${t.id}`)
   );
 
   // Launch each worker
@@ -783,10 +789,14 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
         await launchGrokAgent(terminal.id);
       } else {
         // Claude or Codex with worktree support
+        console.log(`[launchAgentsForTerminals] Importing agent-launcher for ${terminal.name}...`);
         const { launchAgentInTerminal } = await import("./lib/agent-launcher");
 
         // Create worktree for isolation
         const useWorktree = true;
+        console.log(
+          `[launchAgentsForTerminals] Calling launchAgentInTerminal for ${terminal.name} (id=${terminal.id})...`
+        );
         const worktreePath = await launchAgentInTerminal(
           terminal.id,
           roleConfig.roleFile as string,
@@ -795,18 +805,26 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
           useWorktree,
           gitIdentity
         );
+        console.log(
+          `[launchAgentsForTerminals] launchAgentInTerminal returned worktreePath=${worktreePath}`
+        );
 
         // Store worktree path in terminal state (use configId for state operations)
         state.updateTerminal(terminal.id, { worktreePath });
+        console.log(
+          `[launchAgentsForTerminals] Updated state with worktree path for ${terminal.name}`
+        );
         console.log(`[launchAgentsForTerminals] Created worktree at ${worktreePath}`);
       }
 
       console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
     } catch (error) {
-      console.error(
-        `[launchAgentsForTerminals] Failed to launch agent for ${terminal.name}:`,
-        error
-      );
+      const errorMessage = `Failed to launch agent for ${terminal.name}: ${error}`;
+      console.error(`[launchAgentsForTerminals] ${errorMessage}`);
+
+      // Show error to user so they know what failed
+      alert(errorMessage);
+
       // Continue with other terminals even if one fails
     }
   }

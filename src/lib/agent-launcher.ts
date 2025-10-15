@@ -32,46 +32,64 @@ export async function launchAgentInTerminal(
   useWorktree = false,
   gitIdentity?: GitIdentity
 ): Promise<string> {
+  console.log(
+    `[launchAgentInTerminal] START - terminalId=${terminalId}, roleFile=${roleFile}, workspacePath=${workspacePath}, useWorktree=${useWorktree}`
+  );
+
   // Set up worktree if requested
   let agentWorkingDir = workspacePath;
   if (useWorktree && !worktreePath) {
+    console.log(`[launchAgentInTerminal] Setting up worktree for ${terminalId}...`);
     const { setupWorktreeForAgent } = await import("./worktree-manager");
     agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath, gitIdentity);
+    console.log(
+      `[launchAgentInTerminal] Worktree setup complete, agentWorkingDir=${agentWorkingDir}`
+    );
   } else if (worktreePath) {
     agentWorkingDir = worktreePath;
+    console.log(`[launchAgentInTerminal] Using existing worktreePath=${worktreePath}`);
   }
 
   // Read role file content from workspace
+  console.log(`[launchAgentInTerminal] Reading role file ${roleFile}...`);
   const roleContent = await invoke<string>("read_role_file", {
     workspacePath,
     filename: roleFile,
   });
+  console.log(`[launchAgentInTerminal] Role file read successfully, length=${roleContent.length}`);
 
   // Replace template variables in role content
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
+  console.log(`[launchAgentInTerminal] Processed prompt with workspace=${agentWorkingDir}`);
 
   // Write the system prompt to CLAUDE.md in the worktree/workspace
   // Claude Code automatically loads CLAUDE.md from the repository root
   const claudeMdPath = `${agentWorkingDir}/CLAUDE.md`;
+  console.log(`[launchAgentInTerminal] Writing CLAUDE.md to ${claudeMdPath}...`);
   await invoke("write_file", {
     path: claudeMdPath,
     content: processedPrompt,
   });
+  console.log(`[launchAgentInTerminal] CLAUDE.md written successfully`);
 
   // Build Claude CLI command - CLAUDE.md will be automatically loaded
   const command = `claude --permission-mode bypassPermissions --session-id ${terminalId}`;
+  console.log(`[launchAgentInTerminal] Sending command to terminal: ${command}`);
 
   // Send command to terminal
   await invoke("send_terminal_input", {
     id: terminalId,
     data: command,
   });
+  console.log(`[launchAgentInTerminal] Command sent`);
 
   // Press Enter to execute
+  console.log(`[launchAgentInTerminal] Sending Enter to execute`);
   await invoke("send_terminal_input", {
     id: terminalId,
     data: "\r",
   });
+  console.log(`[launchAgentInTerminal] COMPLETE - returning agentWorkingDir=${agentWorkingDir}`);
 
   // Return the working directory that was used
   return agentWorkingDir;
