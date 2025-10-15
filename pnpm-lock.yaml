@@ -87,6 +87,19 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
+  mcp-loom-ui:
+    dependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.20.0
+        version: 1.20.0
+    devDependencies:
+      '@types/node':
+        specifier: ^22.18.10
+        version: 22.18.10
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
 packages:
 
   '@alloc/quick-lru@5.2.0':

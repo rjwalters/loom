@@ -1,0 +1,20 @@
+{
+  "name": "@loom/mcp-ui",
+  "version": "0.1.0",
+  "description": "MCP server for interacting with Loom UI (console logs, events, actions)",
+  "type": "module",
+  "bin": {
+    "mcp-loom-ui": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.10",
+    "typescript": "^5.9.3"
+  }
+}
