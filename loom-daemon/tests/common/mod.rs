@@ -152,9 +152,13 @@ impl TestClient {
         name: impl Into<String>,
         working_dir: Option<String>,
     ) -> Result<String> {
+        // Generate a unique config_id for this test terminal
+        let config_id = format!("test-{}", uuid::Uuid::new_v4());
+
         let request = serde_json::json!({
             "type": "CreateTerminal",
             "payload": {
+                "config_id": config_id,
                 "name": name.into(),
                 "working_dir": working_dir
             }

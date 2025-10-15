@@ -11,6 +11,13 @@ export interface ManagedTerminal {
   attached: boolean;
 }
 
+/**
+ * TerminalManager - Manages xterm.js terminal instances
+ *
+ * IMPORTANT: This class operates on terminal IDs (stable identifiers like "terminal-1").
+ * - terminalId parameters are used for both state management and IPC operations with the daemon
+ * - xterm.js instances are keyed by terminal ID and recreated if the daemon restarts
+ */
 export class TerminalManager {
   private terminals: Map<string, ManagedTerminal> = new Map();
 
@@ -110,9 +117,10 @@ export class TerminalManager {
       import("./state")
         .then(({ getAppState, TerminalStatus: Status }) => {
           const state = getAppState();
-          const terminal = state.getTerminals().find((t) => t.id === terminalId);
+          // Find terminal by id
+          const terminal = state.getTerminal(terminalId);
           if (terminal?.status === Status.NeedsInput) {
-            state.updateTerminal(terminalId, { status: Status.Idle });
+            state.updateTerminal(terminal.id, { status: Status.Idle });
           }
         })
         .catch((e) => {
@@ -125,7 +133,11 @@ export class TerminalManager {
       import("./state")
         .then(({ getAppState, TerminalStatus: Status }) => {
           const state = getAppState();
-          state.updateTerminal(terminalId, { status: Status.NeedsInput });
+          // Find terminal by id
+          const terminal = state.getTerminal(terminalId);
+          if (terminal) {
+            state.updateTerminal(terminal.id, { status: Status.NeedsInput });
+          }
         })
         .catch((e) => {
           console.error(`[terminal-bell] Failed to set needs-input state:`, e);

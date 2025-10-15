@@ -1,18 +1,13 @@
 {
-  "nextAgentNumber": 7,
-  "agents": [
+  "terminals": [
     {
-      "id": "__unassigned__",
+      "id": "terminal-1",
       "name": "Shell",
-      "status": "idle",
-      "isPrimary": true,
       "theme": "default"
     },
     {
-      "id": "__unassigned__",
+      "id": "terminal-2",
       "name": "Architect",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -23,10 +18,8 @@
       "theme": "lavender"
     },
     {
-      "id": "__unassigned__",
+      "id": "terminal-3",
       "name": "Curator",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -37,10 +30,8 @@
       "theme": "ocean"
     },
     {
-      "id": "__unassigned__",
+      "id": "terminal-4",
       "name": "Reviewer",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -51,10 +42,8 @@
       "theme": "rose"
     },
     {
-      "id": "__unassigned__",
+      "id": "terminal-5",
       "name": "Worker 1",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -62,18 +51,11 @@
         "targetInterval": 0,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
-      "theme": "forest",
-      "agentStatus": "not_started",
-      "worktreePath": null,
-      "agentPid": null,
-      "lastIntervalRun": null,
-      "pendingInputRequests": []
+      "theme": "forest"
     },
     {
-      "id": "__unassigned__",
+      "id": "terminal-6",
       "name": "Worker 2",
-      "status": "idle",
-      "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",

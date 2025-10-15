@@ -6,10 +6,13 @@ import type { AppState, Terminal } from "./state";
  *
  * This module maintains a registry of active interval timers and provides
  * methods to start, stop, and manage autonomous operation for terminals.
+ *
+ * IMPORTANT: This manager uses terminal ID (stable) as the key for intervals,
+ * ensuring that autonomous mode survives daemon restarts.
  */
 
 interface AutonomousInterval {
-  terminalId: string;
+  terminalId: string; // Stable terminal ID (survives daemon restarts)
   intervalId: number;
   targetInterval: number;
   lastRun: number;
@@ -31,7 +34,7 @@ class AutonomousManager {
       return;
     }
 
-    // Stop existing interval if running
+    // Stop existing interval if running (use configId)
     this.stopAutonomous(terminal.id);
 
     const intervalPrompt = (terminal.roleConfig.intervalPrompt as string) || "Continue working";
@@ -43,10 +46,11 @@ class AutonomousManager {
     // Set up interval to send prompts
     const intervalId = window.setInterval(async () => {
       try {
+        // Use sessionId for IPC call to send prompt
         await sendPromptToAgent(terminal.id, intervalPrompt);
-        console.log(`Sent autonomous prompt to ${terminal.id}`);
+        console.log(`Sent autonomous prompt to ${terminal.id} (sessionId: ${terminal.id})`);
 
-        // Update last run timestamp in the interval record
+        // Update last run timestamp in the interval record (use configId for lookup)
         const interval = this.intervals.get(terminal.id);
         if (interval) {
           interval.lastRun = Date.now();
@@ -56,7 +60,7 @@ class AutonomousManager {
       }
     }, targetInterval);
 
-    // Store interval info
+    // Store interval info (use terminal ID as key)
     this.intervals.set(terminal.id, {
       terminalId: terminal.id,
       intervalId,

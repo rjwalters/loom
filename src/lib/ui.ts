@@ -160,13 +160,13 @@ export function renderPrimaryTerminal(
   // If missing session, render error UI inside the content container after DOM update
   if (hasMissingSession) {
     setTimeout(() => {
-      renderMissingSessionError(terminal.id);
+      renderMissingSessionError(terminal.id, terminal.id);
     }, 0);
   }
 }
 
-export function renderMissingSessionError(terminalId: string): void {
-  const container = document.getElementById(`xterm-container-${terminalId}`);
+export function renderMissingSessionError(sessionId: string, configId: string): void {
+  const container = document.getElementById(`xterm-container-${sessionId}`);
   if (!container) return;
 
   container.innerHTML = `
@@ -184,27 +184,31 @@ export function renderMissingSessionError(terminalId: string): void {
         <div class="flex flex-col gap-3 items-center">
           <button
             id="recover-new-session-btn"
-            data-terminal-id="${terminalId}"
+            data-terminal-id="${configId}"
             class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
           >
             Create New Session
           </button>
           <button
             id="recover-attach-session-btn"
-            data-terminal-id="${terminalId}"
+            data-terminal-id="${configId}"
             class="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg font-medium transition-colors"
           >
             Attach to Existing Session
           </button>
-          <div id="available-sessions-${terminalId}" class="mt-4 w-full max-w-md"></div>
+          <div id="available-sessions-${sessionId}" class="mt-4 w-full max-w-md"></div>
         </div>
       </div>
     </div>
   `;
 }
 
-export function renderAvailableSessionsList(terminalId: string, sessions: string[]): void {
-  const container = document.getElementById(`available-sessions-${terminalId}`);
+export function renderAvailableSessionsList(
+  sessionId: string,
+  configId: string,
+  sessions: string[]
+): void {
+  const container = document.getElementById(`available-sessions-${sessionId}`);
   if (!container) return;
 
   if (sessions.length === 0) {
@@ -220,7 +224,7 @@ export function renderAvailableSessionsList(terminalId: string, sessions: string
       <div class="flex items-center gap-2">
         <button
           class="attach-session-item flex-1 px-4 py-2 text-left bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 border border-gray-300 dark:border-gray-600 rounded transition-colors"
-          data-terminal-id="${terminalId}"
+          data-terminal-id="${configId}"
           data-session-name="${escapeHtml(session)}"
         >
           <div class="flex items-center justify-between">

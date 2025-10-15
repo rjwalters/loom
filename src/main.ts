@@ -3,7 +3,13 @@ import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
-import { loadConfig, saveConfig, setConfigWorkspace } from "./lib/config";
+import {
+  loadWorkspaceConfig,
+  saveConfig,
+  saveState,
+  setConfigWorkspace,
+  splitTerminals,
+} from "./lib/config";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
@@ -29,10 +35,10 @@ outputPoller.onError((terminalId, errorMessage) => {
     `[outputPoller] Terminal ${terminalId} encountered fatal errors (${errorMessage}), marking as error state`
   );
 
-  // Mark terminal as having connection issues
-  const terminal = state.getTerminals().find((t) => t.id === terminalId);
+  // Update terminal state
+  const terminal = state.getTerminal(terminalId);
   if (terminal) {
-    state.updateTerminal(terminalId, {
+    state.updateTerminal(terminal.id, {
       status: TerminalStatus.Error,
       missingSession: true,
     });
@@ -88,9 +94,9 @@ async function initializeTerminalDisplay(terminalId: string) {
       console.warn(`[initializeTerminalDisplay] Terminal ${terminalId} has no tmux session`);
 
       // Mark terminal as having missing session
-      const terminal = state.getTerminals().find((t) => t.id === terminalId);
+      const terminal = state.getTerminal(terminalId);
       if (terminal) {
-        state.updateTerminal(terminalId, {
+        state.updateTerminal(terminal.id, {
           status: TerminalStatus.Error,
           missingSession: true,
         });
@@ -234,11 +240,14 @@ listen("close-terminal", async () => {
       const autonomousManager = getAutonomousManager();
       autonomousManager.stopAutonomous(primary.id);
 
+      // Stop polling and destroy terminal
       outputPoller.stopPolling(primary.id);
       terminalManager.destroyTerminal(primary.id);
       if (currentAttachedTerminalId === primary.id) {
         currentAttachedTerminalId = null;
       }
+
+      // Remove from state
       state.removeTerminal(primary.id);
       saveCurrentConfig();
     }
@@ -338,7 +347,7 @@ listen("factory-reset-workspace", async () => {
   // Reload config and recreate terminals
   try {
     setConfigWorkspace(workspace);
-    const config = await loadConfig();
+    const config = await loadWorkspaceConfig();
     state.setNextAgentNumber(config.nextAgentNumber);
 
     // Load agents from fresh config and create terminal sessions for each
@@ -396,9 +405,12 @@ listen("factory-reset-workspace", async () => {
       // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
       // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
       console.log(`[factory-reset-workspace] Saving config with real terminal IDs...`);
-      await saveConfig({
+      const terminalsToSave1 = state.getTerminals();
+      const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
+      await saveConfig({ terminals: terminalConfigs1 });
+      await saveState({
         nextAgentNumber: state.getCurrentAgentNumber(),
-        agents: state.getTerminals(),
+        terminals: terminalStates1,
       });
       console.log(`[factory-reset-workspace] Config saved`);
 
@@ -412,9 +424,12 @@ listen("factory-reset-workspace", async () => {
 
       // Save again with worktree paths added by agent launch
       console.log(`[factory-reset-workspace] Saving config with worktree paths...`);
-      await saveConfig({
+      const terminalsToSave2 = state.getTerminals();
+      const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
+      await saveConfig({ terminals: terminalConfigs2 });
+      await saveState({
         nextAgentNumber: state.getCurrentAgentNumber(),
-        agents: state.getTerminals(),
+        terminals: terminalStates2,
       });
 
       console.log("[factory-reset-workspace] Workspace reset complete");
@@ -520,25 +535,27 @@ async function showDaemonStatusDialog() {
 // Initialize app
 initializeApp();
 
-// Drag and drop state
-let draggedTerminalId: string | null = null;
-let dropTargetId: string | null = null;
+// Drag and drop state (uses configId for stable identification)
+let draggedConfigId: string | null = null;
+let dropTargetConfigId: string | null = null;
 let dropInsertBefore: boolean = false;
 let isDragging: boolean = false;
 
-// Save current state to config
+// Save current state to config and state files
 async function saveCurrentConfig() {
   const workspace = state.getWorkspace();
   if (!workspace) {
     return;
   }
 
-  const config = {
-    nextAgentNumber: state.getCurrentAgentNumber(),
-    agents: state.getTerminals(),
-  };
+  const terminals = state.getTerminals();
+  const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
 
-  await saveConfig(config);
+  await saveConfig({ terminals: terminalConfigs });
+  await saveState({
+    nextAgentNumber: state.getCurrentAgentNumber(),
+    terminals: terminalStates,
+  });
 }
 
 // Expand tilde (~) to home directory
@@ -631,6 +648,20 @@ async function browseWorkspace() {
   }
 }
 
+// Helper to generate next config ID
+function generateNextConfigId(): string {
+  const terminals = state.getTerminals();
+  const existingIds = new Set(terminals.map((t) => t.id));
+
+  // Find the next available terminal-N ID
+  let i = 1;
+  while (existingIds.has(`terminal-${i}`)) {
+    i++;
+  }
+
+  return `terminal-${i}`;
+}
+
 // Create a plain shell terminal
 async function createPlainTerminal() {
   const workspacePath = state.getWorkspace();
@@ -655,9 +686,12 @@ async function createPlainTerminal() {
       instanceNumber,
     });
 
+    // Generate stable ID
+    const id = generateNextConfigId();
+
     // Add to state (no role assigned - plain shell)
     state.addTerminal({
-      id: terminalId,
+      id,
       name,
       status: TerminalStatus.Idle,
       isPrimary: false,
@@ -668,9 +702,9 @@ async function createPlainTerminal() {
     await saveCurrentConfig();
 
     // Switch to new terminal
-    state.setPrimary(terminalId);
+    state.setPrimary(id);
 
-    console.log(`[createPlainTerminal] Created terminal ${name} (${terminalId})`);
+    console.log(`[createPlainTerminal] Created terminal ${name} (id: ${id}, tmux: ${terminalId})`);
   } catch (error) {
     console.error("[createPlainTerminal] Failed to create terminal:", error);
     alert(`Failed to create terminal: ${error}`);
@@ -760,7 +794,7 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
           gitIdentity
         );
 
-        // Store worktree path in terminal state
+        // Store worktree path in terminal state (use configId for state operations)
         state.updateTerminal(terminal.id, { worktreePath });
         console.log(`[launchAgentsForTerminals] Created worktree at ${worktreePath}`);
       }
@@ -822,7 +856,7 @@ async function reconnectTerminals() {
       if (activeTerminalIds.has(agent.id)) {
         console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
 
-        // Clear any error state from previous connection issues
+        // Clear any error state from previous connection issues (use configId for state)
         if (agent.missingSession) {
           state.updateTerminal(agent.id, {
             status: TerminalStatus.Idle,
@@ -842,7 +876,7 @@ async function reconnectTerminals() {
           `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, marking as missing`
         );
 
-        // Mark terminal as having missing session so user can see it needs recovery
+        // Mark terminal as having missing session so user can see it needs recovery (use configId for state)
         state.updateTerminal(agent.id, {
           status: TerminalStatus.Error,
           missingSession: true,
@@ -938,7 +972,7 @@ async function handleWorkspacePathInput(path: string) {
 
       // After initialization, create terminals for the default config
       setConfigWorkspace(expandedPath);
-      const config = await loadConfig();
+      const config = await loadWorkspaceConfig();
       state.setNextAgentNumber(config.nextAgentNumber);
 
       if (config.agents && config.agents.length > 0) {
@@ -979,17 +1013,74 @@ async function handleWorkspacePathInput(path: string) {
         await launchAgentsForTerminals(expandedPath, config.agents);
 
         // Save the updated config with real terminal IDs (including worktree paths)
-        await saveConfig(config);
+        const terminalsToSave = state.getTerminals();
+        const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminalsToSave);
+        await saveConfig({ terminals: terminalConfigs });
+        await saveState({
+          nextAgentNumber: state.getCurrentAgentNumber(),
+          terminals: terminalStates,
+        });
         console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
       }
     } else {
       // Workspace already initialized - load existing config
       setConfigWorkspace(expandedPath);
-      const config = await loadConfig();
+      const config = await loadWorkspaceConfig();
       state.setNextAgentNumber(config.nextAgentNumber);
 
       // Load agents from config
       if (config.agents && config.agents.length > 0) {
+        console.log(
+          `[handleWorkspacePathInput] Config agents before session creation:`,
+          config.agents.map((a) => `${a.name}=${a.id}`)
+        );
+
+        // IMPORTANT: Create sessions for migrated terminals with placeholder IDs
+        // After migration, terminals have configId but id="__needs_session__"
+        let createdSessionCount = 0;
+        for (const agent of config.agents) {
+          if (agent.id === "__needs_session__") {
+            try {
+              // Get instance number
+              const instanceNumber = state.getNextAgentNumber();
+
+              console.log(
+                `[handleWorkspacePathInput] Creating session for migrated terminal "${agent.name}" (${agent.id})`
+              );
+
+              // Create terminal session in daemon
+              const sessionId = await invoke<string>("create_terminal", {
+                name: agent.name,
+                workingDir: expandedPath,
+                role: agent.role || "default",
+                instanceNumber,
+              });
+
+              // Update agent with real session ID (keep configId stable)
+              agent.id = sessionId;
+              createdSessionCount++;
+
+              console.log(
+                `[handleWorkspacePathInput] ✓ Created session for ${agent.name}: ${sessionId}`
+              );
+            } catch (error) {
+              console.error(
+                `[handleWorkspacePathInput] Failed to create session for ${agent.name}:`,
+                error
+              );
+              // Keep placeholder ID - terminal will show as missing session
+              // User can use recovery options
+            }
+          }
+        }
+
+        if (createdSessionCount > 0) {
+          console.log(
+            `[handleWorkspacePathInput] Created ${createdSessionCount} sessions for migrated terminals`
+          );
+        }
+
+        // Now load agents into state with their session IDs
         console.log(
           `[handleWorkspacePathInput] Config agents before loadAgents:`,
           config.agents.map((a) => `${a.name}=${a.id}`)
@@ -999,6 +1090,22 @@ async function handleWorkspacePathInput(path: string) {
           `[handleWorkspacePathInput] State after loadAgents:`,
           state.getTerminals().map((a) => `${a.name}=${a.id}`)
         );
+
+        // If we created sessions, save the updated config with real IDs
+        if (createdSessionCount > 0) {
+          const terminalsToSave = state.getTerminals();
+          const { config: terminalConfigs, state: terminalStates } =
+            splitTerminals(terminalsToSave);
+          await saveConfig({ terminals: terminalConfigs });
+          await saveState({
+            nextAgentNumber: state.getCurrentAgentNumber(),
+            terminals: terminalStates,
+          });
+          console.log(
+            `[handleWorkspacePathInput] Saved config with ${createdSessionCount} new session IDs`
+          );
+        }
+
         // Reconnect agents to existing daemon terminals
         await reconnectTerminals();
       }
@@ -1128,16 +1235,23 @@ async function handleRecoverNewSession(terminalId: string) {
   }
 }
 
-async function handleRecoverAttachSession(terminalId: string) {
-  console.log(`[handleRecoverAttachSession] Loading available sessions for terminal ${terminalId}`);
+async function handleRecoverAttachSession(id: string) {
+  console.log(`[handleRecoverAttachSession] Loading available sessions for terminal ${id}`);
 
   try {
+    // Find terminal by id
+    const terminal = state.getTerminal(id);
+    if (!terminal) {
+      console.error(`[handleRecoverAttachSession] Terminal ${id} not found`);
+      return;
+    }
+
     const sessions = await invoke<string[]>("list_available_sessions");
     console.log(`[handleRecoverAttachSession] Found ${sessions.length} sessions:`, sessions);
 
     // Import renderAvailableSessionsList
     const { renderAvailableSessionsList } = await import("./lib/ui");
-    renderAvailableSessionsList(terminalId, sessions);
+    renderAvailableSessionsList(terminal.id, id, sessions);
   } catch (error) {
     console.error(`[handleRecoverAttachSession] Failed to list sessions:`, error);
     alert(`Failed to list available sessions: ${error}`);
@@ -1197,10 +1311,14 @@ async function handleKillSession(sessionName: string) {
     for (const container of availableSessionsContainers) {
       const terminalId = container.id.replace("available-sessions-", "");
       if (terminalId) {
-        // Reload sessions for this terminal
-        const sessions = await invoke<string[]>("list_available_sessions");
-        const { renderAvailableSessionsList } = await import("./lib/ui");
-        renderAvailableSessionsList(terminalId, sessions);
+        // Find terminal by id
+        const terminal = state.getTerminal(terminalId);
+        if (terminal) {
+          // Reload sessions for this terminal
+          const sessions = await invoke<string[]>("list_available_sessions");
+          const { renderAvailableSessionsList } = await import("./lib/ui");
+          renderAvailableSessionsList(terminalId, terminal.id, sessions);
+        }
       }
     }
   } catch (error) {
@@ -1405,17 +1523,24 @@ function setupEventListeners() {
             type: "warning",
           }).then(async (confirmed) => {
             if (confirmed) {
+              // Look up the terminal
+              const terminal = state.getTerminal(id);
+              if (!terminal) {
+                console.error(`Terminal with id ${id} not found`);
+                return;
+              }
+
               // Stop autonomous mode if running
               const { getAutonomousManager } = await import("./lib/autonomous-manager");
               const autonomousManager = getAutonomousManager();
               autonomousManager.stopAutonomous(id);
 
               // Stop polling and clean up xterm.js instance
-              outputPoller.stopPolling(id);
-              terminalManager.destroyTerminal(id);
+              outputPoller.stopPolling(terminal.id);
+              terminalManager.destroyTerminal(terminal.id);
 
               // If this was the current attached terminal, clear it
-              if (currentAttachedTerminalId === id) {
+              if (currentAttachedTerminalId === terminal.id) {
                 currentAttachedTerminalId = null;
               }
 
@@ -1495,7 +1620,7 @@ function setupEventListeners() {
 
       if (card) {
         isDragging = true;
-        draggedTerminalId = card.getAttribute("data-terminal-id");
+        draggedConfigId = card.getAttribute("data-terminal-id"); // Will be configId after Phase 3
         card.classList.add("dragging");
 
         if (e.dataTransfer) {
@@ -1506,15 +1631,15 @@ function setupEventListeners() {
     });
 
     miniRow.addEventListener("dragend", (e) => {
-      // Perform reorder if valid
-      if (draggedTerminalId && dropTargetId && dropTargetId !== draggedTerminalId) {
-        state.reorderTerminal(draggedTerminalId, dropTargetId, dropInsertBefore);
+      // Perform reorder if valid (uses configId for state operation)
+      if (draggedConfigId && dropTargetConfigId && dropTargetConfigId !== draggedConfigId) {
+        state.reorderTerminal(draggedConfigId, dropTargetConfigId, dropInsertBefore);
         saveCurrentConfig();
       }
 
-      // Select the terminal that was dragged
-      if (draggedTerminalId) {
-        state.setPrimary(draggedTerminalId);
+      // Select the terminal that was dragged (uses configId for state operation)
+      if (draggedConfigId) {
+        state.setPrimary(draggedConfigId);
       }
 
       // Cleanup
@@ -1525,8 +1650,8 @@ function setupEventListeners() {
       }
 
       document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
-      draggedTerminalId = null;
-      dropTargetId = null;
+      draggedConfigId = null;
+      dropTargetConfigId = null;
       dropInsertBefore = false;
       isDragging = false;
     });
@@ -1538,13 +1663,13 @@ function setupEventListeners() {
         e.dataTransfer.dropEffect = "move";
       }
 
-      if (!isDragging || !draggedTerminalId) return;
+      if (!isDragging || !draggedConfigId) return;
 
       const target = e.target as HTMLElement;
       const card = target.closest(".terminal-card") as HTMLElement;
 
-      if (card && card.getAttribute("data-terminal-id") !== draggedTerminalId) {
-        const targetId = card.getAttribute("data-terminal-id");
+      if (card && card.getAttribute("data-terminal-id") !== draggedConfigId) {
+        const targetId = card.getAttribute("data-terminal-id"); // Will be configId after Phase 3
 
         // Remove old indicators
         document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
@@ -1554,8 +1679,8 @@ function setupEventListeners() {
         const midpoint = rect.left + rect.width / 2;
         const insertBefore = e.clientX < midpoint;
 
-        // Store drop target info
-        dropTargetId = targetId;
+        // Store drop target info (configId)
+        dropTargetConfigId = targetId;
         dropInsertBefore = insertBefore;
 
         // Create and position insertion indicator - insert at wrapper level
@@ -1573,13 +1698,13 @@ function setupEventListeners() {
         const lastCard = allCards[allCards.length - 1];
 
         if (lastCard && !lastCard.classList.contains("dragging")) {
-          const lastId = lastCard.getAttribute("data-terminal-id");
-          if (lastId && lastId !== draggedTerminalId) {
+          const lastId = lastCard.getAttribute("data-terminal-id"); // Will be configId after Phase 3
+          if (lastId && lastId !== draggedConfigId) {
             // Remove old indicators
             document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
 
             // Drop after the last card
-            dropTargetId = lastId;
+            dropTargetConfigId = lastId;
             dropInsertBefore = false;
 
             // Create and position insertion indicator after last card - insert at wrapper level

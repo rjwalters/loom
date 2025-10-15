@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use uuid::Uuid;
 
 pub struct TerminalManager {
     terminals: HashMap<TerminalId, TerminalInfo>,
@@ -19,16 +18,17 @@ impl TerminalManager {
 
     pub fn create_terminal(
         &mut self,
+        config_id: &str,
         name: String,
         working_dir: Option<String>,
         role: Option<&String>,
         instance_number: Option<u32>,
     ) -> Result<TerminalId> {
-        let id = Uuid::new_v4().to_string();
-        let uuid_short = &id[..8];
+        // Use config_id directly as the terminal ID
+        let id = config_id.to_string();
         let role_part = role.map_or("default", String::as_str);
         let instance_part = instance_number.unwrap_or(0);
-        let tmux_session = format!("loom-{uuid_short}-{role_part}-{instance_part}");
+        let tmux_session = format!("loom-{id}-{role_part}-{instance_part}");
 
         let mut cmd = Command::new("tmux");
         cmd.args([
@@ -49,7 +49,7 @@ impl TerminalManager {
         cmd.spawn()?.wait()?;
 
         // Set up pipe-pane to capture all output to a file
-        let output_file = format!("/tmp/loom-{}.out", &id[..8]);
+        let output_file = format!("/tmp/loom-{id}.out");
         let pipe_cmd = format!("cat >> {output_file}");
 
         log::info!("Setting up pipe-pane for session {tmux_session} to {output_file}");
@@ -132,8 +132,7 @@ impl TerminalManager {
             .wait()?;
 
         // Clean up the output file
-        let id_prefix = if id.len() >= 8 { &id[..8] } else { id };
-        let output_file = format!("/tmp/loom-{id_prefix}.out");
+        let output_file = format!("/tmp/loom-{id}.out");
         let _ = std::fs::remove_file(output_file);
 
         self.terminals.remove(id);
@@ -176,9 +175,8 @@ impl TerminalManager {
         use std::fs;
         use std::io::{Read, Seek};
 
-        // Use first 8 chars of ID for filename, or entire ID if shorter
-        let id_prefix = if id.len() >= 8 { &id[..8] } else { id };
-        let output_file = format!("/tmp/loom-{id_prefix}.out");
+        // Use config_id directly for filename
+        let output_file = format!("/tmp/loom-{id}.out");
         log::debug!("Reading terminal output from: {output_file}");
 
         let mut file = match fs::File::open(&output_file) {
@@ -250,8 +248,14 @@ impl TerminalManager {
         let sessions = String::from_utf8_lossy(&output.stdout);
 
         for session in sessions.lines() {
-            if let Some(uuid_part) = session.strip_prefix("loom-") {
-                let id = uuid_part.to_string();
+            if let Some(remainder) = session.strip_prefix("loom-") {
+                // Session format: loom-{config_id}-{role}-{instance}
+                // Extract config_id (everything before the first hyphen after "loom-")
+                // For backwards compatibility, if no hyphens, use entire remainder as ID
+                let id = remainder.split_once('-').map_or_else(
+                    || remainder.to_string(),
+                    |(config_id, _rest)| config_id.to_string(),
+                );
 
                 // Clear any existing pipe-pane for this session to avoid duplicates
                 log::debug!("Clearing existing pipe-pane for session {session}");
@@ -260,7 +264,7 @@ impl TerminalManager {
                     .spawn();
 
                 // Set up fresh pipe-pane to capture output
-                let output_file = format!("/tmp/loom-{uuid_part}.out");
+                let output_file = format!("/tmp/loom-{id}.out");
                 let pipe_cmd = format!("cat >> {output_file}");
 
                 log::info!("Setting up pipe-pane for session {session} to {output_file}");

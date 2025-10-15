@@ -127,7 +127,7 @@ describe("autonomous-manager", () => {
       // Fast forward time by 1000ms (one interval)
       await vi.advanceTimersByTimeAsync(1000);
 
-      // Check that sendPromptToAgent was called
+      // Check that sendPromptToAgent was called (uses sessionId for IPC)
       expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledWith("test-5", "Work on tasks");
     });
 
@@ -380,7 +380,7 @@ describe("autonomous-manager", () => {
   describe("startAllAutonomous", () => {
     it("should start autonomous mode for all eligible terminals", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Autonomous 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -392,7 +392,7 @@ describe("autonomous-manager", () => {
       });
 
       state.addTerminal({
-        id: "2",
+        id: "terminal-2",
         name: "Manual",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -404,7 +404,7 @@ describe("autonomous-manager", () => {
       });
 
       state.addTerminal({
-        id: "3",
+        id: "terminal-3",
         name: "Autonomous 2",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -417,14 +417,14 @@ describe("autonomous-manager", () => {
 
       manager.startAllAutonomous(state);
 
-      expect(manager.isAutonomous("1")).toBe(true);
-      expect(manager.isAutonomous("2")).toBe(false);
-      expect(manager.isAutonomous("3")).toBe(true);
+      expect(manager.isAutonomous("terminal-1")).toBe(true);
+      expect(manager.isAutonomous("terminal-2")).toBe(false);
+      expect(manager.isAutonomous("terminal-3")).toBe(true);
     });
 
     it("should skip terminals without role", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "No Role",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -432,7 +432,7 @@ describe("autonomous-manager", () => {
 
       manager.startAllAutonomous(state);
 
-      expect(manager.isAutonomous("1")).toBe(false);
+      expect(manager.isAutonomous("terminal-1")).toBe(false);
     });
 
     it("should handle empty state", () => {

@@ -11,7 +11,7 @@ describe("AppState", () => {
   describe("Terminal Management", () => {
     it("should add a terminal", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Test Terminal",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -24,7 +24,7 @@ describe("AppState", () => {
 
     it("should set terminal as primary when isPrimary is true", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: true,
@@ -32,72 +32,72 @@ describe("AppState", () => {
 
       const primary = state.getPrimary();
       expect(primary).not.toBeNull();
-      expect(primary?.id).toBe("1");
+      expect(primary?.id).toBe("terminal-1");
     });
 
     it("should remove a terminal", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.removeTerminal("1");
+      state.removeTerminal("terminal-1");
       expect(state.getTerminals()).toHaveLength(0);
     });
 
     it("should promote first terminal to primary when primary is removed", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: true,
       });
       state.addTerminal({
-        id: "2",
+        id: "terminal-2",
         name: "Terminal 2",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.removeTerminal("1");
+      state.removeTerminal("terminal-1");
 
       const primary = state.getPrimary();
-      expect(primary?.id).toBe("2");
+      expect(primary?.id).toBe("terminal-2");
       expect(primary?.isPrimary).toBe(true);
     });
 
     it("should set primary terminal", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: true,
       });
       state.addTerminal({
-        id: "2",
+        id: "terminal-2",
         name: "Terminal 2",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.setPrimary("2");
+      state.setPrimary("terminal-2");
 
       const terminals = state.getTerminals();
-      expect(terminals.find((t) => t.id === "1")?.isPrimary).toBe(false);
-      expect(terminals.find((t) => t.id === "2")?.isPrimary).toBe(true);
+      expect(terminals.find((t) => t.id === "terminal-1")?.isPrimary).toBe(false);
+      expect(terminals.find((t) => t.id === "terminal-2")?.isPrimary).toBe(true);
     });
 
     it("should rename a terminal", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Old Name",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.renameTerminal("1", "New Name");
+      state.renameTerminal("terminal-1", "New Name");
 
       const terminal = state.getTerminals()[0];
       expect(terminal.name).toBe("New Name");
@@ -105,13 +105,13 @@ describe("AppState", () => {
 
     it("should update terminal properties", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.updateTerminal("1", {
+      state.updateTerminal("terminal-1", {
         status: TerminalStatus.Busy,
         agentStatus: AgentStatus.Ready,
       });
@@ -125,19 +125,19 @@ describe("AppState", () => {
   describe("Terminal Ordering", () => {
     it("should maintain terminal order", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "First",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
       state.addTerminal({
-        id: "2",
+        id: "terminal-2",
         name: "Second",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
       state.addTerminal({
-        id: "3",
+        id: "terminal-3",
         name: "Third",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -149,26 +149,26 @@ describe("AppState", () => {
 
     it("should reorder terminals", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "First",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
       state.addTerminal({
-        id: "2",
+        id: "terminal-2",
         name: "Second",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
       state.addTerminal({
-        id: "3",
+        id: "terminal-3",
         name: "Third",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
       // Move "First" to after "Third"
-      state.reorderTerminal("1", "3", false);
+      state.reorderTerminal("terminal-1", "terminal-3", false);
 
       const terminals = state.getTerminals();
       expect(terminals.map((t) => t.name)).toEqual(["Second", "Third", "First"]);
@@ -181,7 +181,7 @@ describe("AppState", () => {
       state.onChange(callback);
 
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -192,7 +192,7 @@ describe("AppState", () => {
 
     it("should notify listeners when terminal is removed", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -201,7 +201,7 @@ describe("AppState", () => {
       const callback = vi.fn();
       state.onChange(callback);
 
-      state.removeTerminal("1");
+      state.removeTerminal("terminal-1");
 
       expect(callback).toHaveBeenCalledTimes(1);
     });
@@ -211,7 +211,7 @@ describe("AppState", () => {
       const unsubscribe = state.onChange(callback);
 
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -222,7 +222,7 @@ describe("AppState", () => {
       unsubscribe();
 
       state.addTerminal({
-        id: "2",
+        id: "terminal-2",
         name: "Terminal 2",
         status: TerminalStatus.Idle,
         isPrimary: false,
@@ -272,13 +272,13 @@ describe("AppState", () => {
   describe("Role Management", () => {
     it("should set terminal role", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.setTerminalRole("1", "worker", {
+      state.setTerminalRole("terminal-1", "worker", {
         roleFile: "worker.md",
         targetInterval: 0,
       });
@@ -293,13 +293,13 @@ describe("AppState", () => {
 
     it("should set terminal theme", () => {
       state.addTerminal({
-        id: "1",
+        id: "terminal-1",
         name: "Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: false,
       });
 
-      state.setTerminalTheme("1", "ocean");
+      state.setTerminalTheme("terminal-1", "ocean");
 
       const terminal = state.getTerminals()[0];
       expect(terminal.theme).toBe("ocean");

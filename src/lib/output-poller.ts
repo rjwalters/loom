@@ -15,6 +15,14 @@ interface PollerState {
   lastErrorTime: number | null;
 }
 
+/**
+ * OutputPoller - Polls daemon for terminal output and writes to xterm.js
+ *
+ * IMPORTANT: This class operates on terminal IDs (stable identifiers like "terminal-1").
+ * - terminalId parameters are used for both state management and IPC operations
+ * - Error callback receives terminal ID - caller can use state.getTerminal(id) to look it up
+ * - Pollers are keyed by terminal ID and must be restarted if daemon restarts
+ */
 export class OutputPoller {
   private pollers: Map<string, PollerState> = new Map();
   private pollInterval: number = 50; // Poll every 50ms for responsive feel

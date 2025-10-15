@@ -2,6 +2,14 @@ import { invoke } from "@tauri-apps/api/tauri";
 import type { GitIdentity } from "./worktree-manager";
 
 /**
+ * agent-launcher.ts - Functions for launching AI agents in terminals
+ *
+ * IMPORTANT: All functions in this module operate on sessionIds (ephemeral tmux session IDs).
+ * - terminalId parameters are sessionIds used for IPC operations (send_input, etc.)
+ * - Callers should use configId for state management, look up sessionId for launching
+ */
+
+/**
  * Launch a Claude agent in a terminal by sending the Claude CLI command
  *
  * This uses the existing terminal input mechanism to send a Claude command

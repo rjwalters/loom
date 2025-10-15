@@ -1,4 +1,4 @@
-import { saveConfig } from "./config";
+import { saveConfig, saveState, splitTerminals } from "./config";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
 
@@ -479,17 +479,20 @@ async function applySettings(
     const roleChanged = previousRole !== role;
     const hasNewRole = role !== undefined && roleConfig !== undefined;
 
-    // Update terminal in state
+    // Update terminal in state (use configId for state operations)
     state.updateTerminal(terminal.id, { name });
     state.setTerminalRole(terminal.id, role, roleConfig);
     state.setTerminalTheme(terminal.id, selectedTheme);
 
-    // Save config
-    const config = {
+    // Save config and state files
+    const terminals = state.getTerminals();
+    const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
+
+    await saveConfig({ terminals: terminalConfigs });
+    await saveState({
       nextAgentNumber: state.getCurrentAgentNumber(),
-      agents: state.getTerminals(),
-    };
-    await saveConfig(config);
+      terminals: terminalStates,
+    });
 
     // Launch agent if role was set/changed
     if (roleChanged && hasNewRole) {
@@ -547,7 +550,7 @@ async function applySettings(
               gitIdentity
             );
 
-            // Store worktree path in terminal state
+            // Store worktree path in terminal state (use configId for state operations)
             state.updateTerminal(terminal.id, { worktreePath });
           }
         } catch (error) {
@@ -563,7 +566,7 @@ async function applySettings(
 
     if (hasNewRole && roleConfig.targetInterval && (roleConfig.targetInterval as number) > 0) {
       // Start or restart autonomous mode
-      const updatedTerminal = state.getTerminals().find((t) => t.id === terminal.id);
+      const updatedTerminal = state.getTerminal(terminal.id);
       if (updatedTerminal) {
         autonomousManager.restartAutonomous(updatedTerminal);
       }
