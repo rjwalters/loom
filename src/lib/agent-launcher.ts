@@ -78,6 +78,11 @@ export async function launchAgentInTerminal(
   const command = "claude --dangerously-skip-permissions";
   console.log(`[launchAgentInTerminal] Sending command to terminal: ${command}`);
 
+  // Wait for any previous commands to fully complete
+  // This prevents command concatenation with worktree setup commands
+  console.log(`[launchAgentInTerminal] Waiting 500ms for previous commands to complete...`);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
   // Send command to terminal
   await invoke("send_terminal_input", {
     id: terminalId,
