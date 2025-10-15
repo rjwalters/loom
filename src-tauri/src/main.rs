@@ -297,6 +297,37 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Helper function to resolve defaults directory path
+// Tries development path first, then falls back to bundled resource path
+fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+
+    // Try the provided path first (development mode)
+    let dev_path = PathBuf::from(defaults_path);
+    if dev_path.exists() {
+        return Ok(dev_path);
+    }
+
+    // Try resolving as bundled resource (production mode)
+    // In production, resources are in .app/Contents/Resources/
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Get the app bundle Resources directory
+        if let Some(exe_dir) = exe_path.parent() {
+            // exe is in Contents/MacOS/, resources are in Contents/Resources/
+            if let Some(contents_dir) = exe_dir.parent() {
+                let resources_path = contents_dir.join("Resources").join(defaults_path);
+                if resources_path.exists() {
+                    return Ok(resources_path);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "Defaults directory not found: tried {defaults_path} and bundled resources"
+    ))
+}
+
 #[tauri::command]
 fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), String> {
     let workspace_path = Path::new(path);
@@ -307,13 +338,10 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
         return Err("Workspace already initialized (.loom directory exists)".to_string());
     }
 
-    // Copy defaults to .loom (symlink in src-tauri/ points to ../defaults/)
-    let defaults = Path::new(defaults_path);
-    if !defaults.exists() {
-        return Err(format!("Defaults directory not found: {defaults_path}"));
-    }
+    // Copy defaults to .loom
+    let defaults = resolve_defaults_path(defaults_path)?;
 
-    copy_dir_recursive(defaults, &loom_path)
+    copy_dir_recursive(&defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Copy workspace-specific README (overwriting defaults/README.md)
@@ -609,12 +637,9 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
     }
 
     // Copy defaults back
-    let defaults = Path::new(defaults_path);
-    if !defaults.exists() {
-        return Err(format!("Defaults directory not found: {defaults_path}"));
-    }
+    let defaults = resolve_defaults_path(defaults_path)?;
 
-    copy_dir_recursive(defaults, &loom_path)
+    copy_dir_recursive(&defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Copy workspace-specific README (overwriting defaults/README.md)
@@ -1042,13 +1067,10 @@ fn init_loom_directory(project_path: &Path) -> Result<(), String> {
     fs::create_dir_all(&loom_dir).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
     // Copy default config from defaults directory
-    let defaults_dir = Path::new("defaults");
-    if !defaults_dir.exists() {
-        return Err("Defaults directory not found".to_string());
-    }
+    let defaults_dir = resolve_defaults_path("defaults")?;
 
     // Copy entire defaults directory structure to .loom
-    copy_dir_recursive(defaults_dir, &loom_dir)
+    copy_dir_recursive(&defaults_dir, &loom_dir)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Copy .loom-README.md to .loom/README.md if it exists
