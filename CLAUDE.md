@@ -947,7 +947,7 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
 1. **`read_console_log`**
    - Reads browser console output from `~/.loom/console.log`
    - Returns recent log entries with timestamps
-   - Use for debugging factory reset, agent launch, worktree setup
+   - Use for debugging workspace start, agent launch, worktree setup
 
 2. **`read_state_file`**
    - Reads current application state from `.loom/state.json`
@@ -959,10 +959,22 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
    - Shows terminal roles, intervals, prompts
    - Use for verifying configuration persistence
 
-4. **`trigger_factory_reset`**
-   - Programmatically triggers factory reset via Tauri IPC
-   - Emits menu event to reset workspace to defaults
-   - Use for automated testing and setup
+4. **`trigger_start`**
+   - Start engine with EXISTING config (shows confirmation dialog)
+   - Uses current `.loom/config.json` to create terminals and launch agents
+   - Does NOT reset or overwrite configuration
+   - Use for restarting terminals after app restart or crash
+
+5. **`trigger_force_start`**
+   - Start engine with existing config WITHOUT confirmation
+   - Same as trigger_start but bypasses confirmation prompt
+   - Use for MCP automation and testing
+
+6. **`trigger_factory_reset`**
+   - Reset workspace to factory defaults (shows confirmation dialog)
+   - Overwrites `.loom/config.json` with `defaults/config.json`
+   - Does NOT auto-start the engine - must run trigger_start/force_start after
+   - Use for resetting configuration to clean state
 
 **MCP Configuration** (`.mcp.json`):
 ```json
@@ -981,25 +993,31 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
 
 **Usage Example** (from Claude Code):
 ```bash
-# Read recent console logs to see factory reset progress
+# Read recent console logs to see workspace start progress
 mcp__loom-ui__read_console_log
 
-# Check terminal state after factory reset
+# Check terminal state after start
 mcp__loom-ui__read_state_file
 
-# Trigger factory reset programmatically
+# Check terminal configuration
+mcp__loom-ui__read_config_file
+
+# Start engine with existing config (bypasses confirmation for MCP automation)
+mcp__loom-ui__trigger_force_start
+
+# Reset workspace to defaults (requires separate start command after)
 mcp__loom-ui__trigger_factory_reset
 ```
 
-### Testing Factory Reset with MCP
+### Testing Workspace Start with MCP
 
-**Goal**: Verify factory reset creates 6 terminals with Claude Code agents running autonomously
+**Goal**: Verify workspace start creates 7 terminals with Claude Code agents running autonomously
 
 **Test Procedure**:
 
-1. **Trigger Reset**:
+1. **Start Engine** (use force_start for MCP automation):
    ```bash
-   mcp__loom-ui__trigger_factory_reset
+   mcp__loom-ui__trigger_force_start
    ```
 
 2. **Monitor Console Logs**:
@@ -1007,41 +1025,42 @@ mcp__loom-ui__trigger_factory_reset
    mcp__loom-ui__read_console_log
    ```
    Look for:
-   - `[factory-reset-workspace] Killing all loom tmux sessions`
-   - `[factory-reset-workspace] ✓ Created terminal X`
+   - `[start-workspace] Killing all loom tmux sessions`
+   - `[start-workspace] ✓ Created terminal X`
    - `[launchAgentInTerminal] Worktree setup complete`
-   - `[launchAgentInTerminal] Attempt N: Sending "2" to accept warning`
+   - `[launchAgentInTerminal] Sending "2" to accept warning`
 
 3. **Verify State**:
    ```bash
    mcp__loom-ui__read_state_file
    ```
-   Confirm 6 terminals exist with correct session IDs and worktree paths
+   Confirm 7 terminals exist with correct session IDs and worktree paths
 
-4. **Check Terminal Outputs**:
-   ```bash
-   cat /tmp/loom-terminal-2.out  # Architect
-   cat /tmp/loom-terminal-3.out  # Curator
-   cat /tmp/loom-terminal-4.out  # Reviewer
-   cat /tmp/loom-terminal-5.out  # Worker 1
-   cat /tmp/loom-terminal-6.out  # Worker 2
-   ```
-   Look for Claude Code prompt interface (not error messages)
-
-5. **Verify Worktrees**:
+4. **Verify Worktrees**:
    ```bash
    ls -la .loom/worktrees/
    git worktree list
    ```
-   Confirm 5 worktrees created (terminals 2-6)
+   Confirm 7 worktrees created (one for each terminal)
 
 **Expected Success Criteria**:
-- ✅ 6 terminals created (terminal-1 through terminal-6)
-- ✅ 5 worktrees created at `.loom/worktrees/terminal-{2-6}`
-- ✅ Claude Code running in terminals 2-6 (bypass permissions accepted)
-- ✅ Terminal 1 (Shell) has plain shell prompt
+- ✅ 7 terminals created (terminal-1 through terminal-7)
+- ✅ 7 worktrees created at `.loom/worktrees/terminal-{1-7}` (automatic for all terminals)
+- ✅ Claude Code running in all 7 terminals (bypass permissions accepted)
 - ✅ No "command not found" or "duplicate session" errors
 - ✅ Console logs show successful agent launch sequence
+
+**Factory Reset + Start Workflow**:
+
+To reset configuration AND start the engine:
+
+```bash
+# Step 1: Reset config to defaults (does NOT auto-start)
+mcp__loom-ui__trigger_factory_reset
+
+# Step 2: Start engine with reset config
+mcp__loom-ui__trigger_force_start
+```
 
 ### Debugging Common Issues
 

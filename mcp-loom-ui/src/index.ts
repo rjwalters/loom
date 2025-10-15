@@ -70,17 +70,25 @@ async function writeMCPCommand(command: string): Promise<string> {
 }
 
 /**
- * Trigger workspace start (normal reset with confirmation)
+ * Trigger workspace start with existing config (shows confirmation dialog)
  */
 async function triggerStart(): Promise<string> {
   return await writeMCPCommand("trigger_start");
 }
 
 /**
- * Trigger force start (bypass confirmation)
+ * Trigger force start with existing config (no confirmation dialog)
  */
 async function triggerForceStart(): Promise<string> {
   return await writeMCPCommand("trigger_force_start");
+}
+
+/**
+ * Trigger factory reset - overwrites config with defaults (shows confirmation dialog)
+ * Note: Factory reset does NOT auto-start. User must run "Start" after reset.
+ */
+async function triggerFactoryReset(): Promise<string> {
+  return await writeMCPCommand("trigger_factory_reset");
 }
 
 /**
@@ -237,7 +245,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_start",
         description:
-          "Trigger workspace start (factory reset) with confirmation dialog. Shows the user a confirmation modal before resetting workspace to defaults with 6 terminals. Requires the Loom app to be running and a workspace to be selected.",
+          "Start the Loom engine using EXISTING workspace config (.loom/config.json). Shows confirmation dialog before creating terminals and launching agents. Does NOT reset or overwrite config. Use this to restart terminals with current configuration (e.g., after app restart or crash). Requires workspace to be selected.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -246,7 +254,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_force_start",
         description:
-          "Trigger force start of the current workspace. This resets the workspace to defaults with 6 terminals and launches all agents WITHOUT confirmation dialog. Use this for automated testing or when you're certain the user wants to reset. Requires the Loom app to be running.",
+          "Start the Loom engine using existing config WITHOUT confirmation dialog. Same as trigger_start but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to start. Does NOT reset config. Requires workspace to be selected.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "trigger_factory_reset",
+        description:
+          "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. Use this to reset configuration to clean state for testing.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -316,6 +333,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "trigger_force_start": {
         const result = await triggerForceStart();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "trigger_factory_reset": {
+        const result = await triggerFactoryReset();
         return {
           content: [
             {
