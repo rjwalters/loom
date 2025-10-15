@@ -91,6 +91,24 @@ export async function launchAgentInTerminal(
     id: terminalId,
     data: "\r",
   });
+
+  // Wait for the bypass permissions prompt to appear (1 second)
+  console.log(`[launchAgentInTerminal] Waiting for bypass permissions prompt...`);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  // Accept the bypass permissions warning by selecting option 2
+  console.log(`[launchAgentInTerminal] Accepting bypass permissions warning`);
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "2",
+  });
+
+  // Press Enter to confirm selection
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+
   console.log(`[launchAgentInTerminal] COMPLETE - returning agentWorkingDir=${agentWorkingDir}`);
 
   // Return the working directory that was used
