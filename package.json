@@ -13,7 +13,7 @@
     "tauri:build": "tauri build",
     "daemon:dev": "./scripts/dev-daemon.sh",
     "daemon:preview": "cargo run --package loom-daemon --release",
-    "daemon:build": "cargo build --package loom-daemon --release",
+    "daemon:build": "cargo build --package loom-daemon --release && rm -f target/release/loom-daemon-aarch64-apple-darwin && cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin",
     "daemon:test": "cargo test --package loom-daemon",
     "app:dev": "pnpm daemon:dev & sleep 2 && pnpm tauri:dev",
     "app:preview": "RUST_LOG=info pnpm daemon:preview & sleep 2 && pnpm tauri:preview",

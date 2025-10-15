@@ -1201,6 +1201,15 @@ fn trigger_force_start(window: tauri::Window) -> Result<(), String> {
         .map_err(|e| format!("Failed to emit force-start-workspace event: {e}"))
 }
 
+/// Trigger factory reset programmatically (for MCP/testing)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn trigger_factory_reset(window: tauri::Window) -> Result<(), String> {
+    window
+        .emit("factory-reset-workspace", ())
+        .map_err(|e| format!("Failed to emit factory-reset-workspace event: {e}"))
+}
+
 /// Kill all loom tmux sessions
 #[tauri::command]
 fn kill_all_loom_sessions() -> Result<(), String> {
@@ -1256,6 +1265,8 @@ fn build_menu() -> Menu {
         CustomMenuItem::new("start_workspace", "Start...").accelerator("CmdOrCtrl+Shift+R");
     let force_start_workspace = CustomMenuItem::new("force_start_workspace", "Force Start")
         .accelerator("CmdOrCtrl+Shift+Alt+R");
+    let factory_reset_workspace =
+        CustomMenuItem::new("factory_reset_workspace", "Factory Reset...");
 
     let file_menu = Submenu::new(
         "File",
@@ -1266,6 +1277,7 @@ fn build_menu() -> Menu {
             .add_item(close_workspace)
             .add_item(start_workspace)
             .add_item(force_start_workspace)
+            .add_item(factory_reset_workspace)
             .add_native_item(MenuItem::Separator)
             .add_native_item(MenuItem::Quit),
     );
@@ -1353,6 +1365,9 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         }
         "force_start_workspace" => {
             let _ = event.window().emit("force-start-workspace", ());
+        }
+        "factory_reset_workspace" => {
+            let _ = event.window().emit("factory-reset-workspace", ());
         }
         "toggle_theme" => {
             let _ = event.window().emit("toggle-theme", ());
@@ -1530,6 +1545,7 @@ fn main() {
             append_to_console_log,
             trigger_start,
             trigger_force_start,
+            trigger_factory_reset,
             kill_all_loom_sessions
         ])
         .run(tauri::generate_context!())

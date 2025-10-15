@@ -328,30 +328,29 @@ listen("close-workspace", async () => {
   render();
 });
 
-// Start workspace - with confirmation dialog
+// Start engine - create sessions for existing config (with confirmation)
 listen("start-workspace", async () => {
   const workspace = state.getWorkspace();
   if (!workspace) return;
 
   const confirmed = await ask(
     "This will:\n" +
-      "• Delete all terminal configurations\n" +
-      "• Reset all roles to defaults\n" +
-      "• Close all current terminals\n" +
-      "• Recreate 6 default terminals\n\n" +
-      "This action CANNOT be undone!\n\n" +
-      "Continue with Start?",
+      "• Close all current terminal sessions\n" +
+      "• Create new sessions for configured terminals\n" +
+      "• Launch agents as configured\n\n" +
+      "Your configuration will NOT be changed.\n\n" +
+      "Continue?",
     {
-      title: "⚠️ Start Workspace Warning",
-      type: "warning",
+      title: "Start Loom Engine",
+      type: "info",
     }
   );
 
   if (!confirmed) return;
 
-  // Use the extracted workspace reset module
-  const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
-  await resetWorkspaceToDefaults(
+  // Use the workspace start module (reads existing config)
+  const { startWorkspaceEngine } = await import("./lib/workspace-start");
+  await startWorkspaceEngine(
     workspace,
     {
       state,
@@ -367,14 +366,55 @@ listen("start-workspace", async () => {
   );
 });
 
-// Force Start workspace - NO confirmation dialog (for MCP automation)
+// Force Start engine - NO confirmation dialog (for MCP automation)
 listen("force-start-workspace", async () => {
   const workspace = state.getWorkspace();
   if (!workspace) return;
 
-  console.log("[force-start-workspace] Resetting workspace to defaults (no confirmation)");
+  console.log("[force-start-workspace] Starting engine (no confirmation)");
 
-  // Use the extracted workspace reset module (no confirmation)
+  // Use the workspace start module (no confirmation)
+  const { startWorkspaceEngine } = await import("./lib/workspace-start");
+  await startWorkspaceEngine(
+    workspace,
+    {
+      state,
+      outputPoller,
+      terminalManager,
+      setCurrentAttachedTerminalId: (id) => {
+        currentAttachedTerminalId = id;
+      },
+      launchAgentsForTerminals,
+      render,
+    },
+    "force-start-workspace"
+  );
+});
+
+// Factory Reset - overwrite config with defaults (with confirmation)
+listen("factory-reset-workspace", async () => {
+  const workspace = state.getWorkspace();
+  if (!workspace) return;
+
+  const confirmed = await ask(
+    "⚠️ WARNING: Factory Reset ⚠️\n\n" +
+      "This will:\n" +
+      "• DELETE all terminal configurations\n" +
+      "• OVERWRITE .loom/ with default config\n" +
+      "• Reset all roles to defaults\n" +
+      "• Close all current terminals\n" +
+      "• Recreate 6 default terminals\n\n" +
+      "This action CANNOT be undone!\n\n" +
+      "Continue with Factory Reset?",
+    {
+      title: "⚠️ Factory Reset Warning",
+      type: "warning",
+    }
+  );
+
+  if (!confirmed) return;
+
+  // Use the workspace reset module (overwrites config with defaults)
   const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
   await resetWorkspaceToDefaults(
     workspace,
@@ -388,7 +428,7 @@ listen("force-start-workspace", async () => {
       launchAgentsForTerminals,
       render,
     },
-    "force-start-workspace"
+    "factory-reset-workspace"
   );
 });
 

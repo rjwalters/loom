@@ -37,15 +37,29 @@ pub fn start_mcp_watcher(window: Window) {
                             if let Ok(content) = fs::read_to_string(&command_file) {
                                 if let Ok(mcp_cmd) = serde_json::from_str::<MCPCommand>(&content) {
                                     eprintln!(
-                                        "[MCP Watcher] Received command: {}",
-                                        mcp_cmd.command
+                                        "[MCP Watcher] Received command: {} (timestamp: {})",
+                                        mcp_cmd.command, mcp_cmd.timestamp
                                     );
 
                                     // Execute the command
                                     let result = match mcp_cmd.command.as_str() {
-                                        "trigger_start" => window.emit("start-workspace", ()),
+                                        "trigger_start" => {
+                                            eprintln!(
+                                                "[MCP Watcher] Emitting start-workspace event"
+                                            );
+                                            window.emit("start-workspace", ())
+                                        }
                                         "trigger_force_start" => {
+                                            eprintln!(
+                                                "[MCP Watcher] Emitting force-start-workspace event"
+                                            );
                                             window.emit("force-start-workspace", ())
+                                        }
+                                        "trigger_factory_reset" => {
+                                            eprintln!(
+                                                "[MCP Watcher] Emitting factory-reset-workspace event"
+                                            );
+                                            window.emit("factory-reset-workspace", ())
                                         }
                                         _ => {
                                             eprintln!(
@@ -58,6 +72,8 @@ pub fn start_mcp_watcher(window: Window) {
 
                                     if let Err(e) = result {
                                         eprintln!("[MCP Watcher] Failed to execute command: {e}");
+                                    } else {
+                                        eprintln!("[MCP Watcher] Command executed successfully");
                                     }
 
                                     // Update last processed time
