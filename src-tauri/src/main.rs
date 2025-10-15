@@ -757,6 +757,121 @@ fn update_github_label(name: &str, description: &str, color: &str) -> Result<(),
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct LabelResetResult {
+    issues_cleaned: usize,
+    prs_updated: usize,
+    errors: Vec<String>,
+}
+
+/// Reset GitHub label state machine by cleaning up in-progress labels
+#[tauri::command]
+fn reset_github_labels() -> Result<LabelResetResult, String> {
+    let mut result = LabelResetResult {
+        issues_cleaned: 0,
+        prs_updated: 0,
+        errors: Vec::new(),
+    };
+
+    // Step 1: Remove loom:in-progress from all open issues
+    let issues_output = Command::new("gh")
+        .args([
+            "issue",
+            "list",
+            "--label",
+            "loom:in-progress",
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--jq",
+            ".[].number",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to list issues: {e}"))?;
+
+    if issues_output.status.success() {
+        let issue_numbers = String::from_utf8_lossy(&issues_output.stdout);
+        for issue_num in issue_numbers.lines() {
+            if issue_num.trim().is_empty() {
+                continue;
+            }
+
+            let remove_output = Command::new("gh")
+                .args([
+                    "issue",
+                    "edit",
+                    issue_num,
+                    "--remove-label",
+                    "loom:in-progress",
+                ])
+                .output()
+                .map_err(|e| format!("Failed to remove label: {e}"))?;
+
+            if remove_output.status.success() {
+                result.issues_cleaned += 1;
+            } else {
+                let error = format!(
+                    "Failed to remove loom:in-progress from issue {issue_num}: {}",
+                    String::from_utf8_lossy(&remove_output.stderr)
+                );
+                result.errors.push(error);
+            }
+        }
+    }
+
+    // Step 2: Replace loom:reviewing with loom:review-requested on PRs
+    let prs_output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--label",
+            "loom:reviewing",
+            "--state",
+            "open",
+            "--json",
+            "number",
+            "--jq",
+            ".[].number",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to list PRs: {e}"))?;
+
+    if prs_output.status.success() {
+        let pr_numbers = String::from_utf8_lossy(&prs_output.stdout);
+        for pr_num in pr_numbers.lines() {
+            if pr_num.trim().is_empty() {
+                continue;
+            }
+
+            let edit_output = Command::new("gh")
+                .args([
+                    "pr",
+                    "edit",
+                    pr_num,
+                    "--remove-label",
+                    "loom:reviewing",
+                    "--add-label",
+                    "loom:review-requested",
+                ])
+                .output()
+                .map_err(|e| format!("Failed to update PR labels: {e}"))?;
+
+            if edit_output.status.success() {
+                result.prs_updated += 1;
+            } else {
+                let error = format!(
+                    "Failed to update labels on PR {pr_num}: {}",
+                    String::from_utf8_lossy(&edit_output.stderr)
+                );
+                result.errors.push(error);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 /// Create a new local git repository with Loom configuration
 #[tauri::command]
 fn create_local_project(
@@ -1378,6 +1493,7 @@ fn main() {
             check_label_exists,
             create_github_label,
             update_github_label,
+            reset_github_labels,
             create_local_project,
             create_github_repository,
             emit_menu_event,
