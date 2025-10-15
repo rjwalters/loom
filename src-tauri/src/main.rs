@@ -1013,6 +1013,38 @@ fn emit_menu_event(window: tauri::Window, event_name: &str) -> Result<(), String
         .map_err(|e| format!("Failed to emit event: {e}"))
 }
 
+/// Append console log message to file for MCP access
+#[tauri::command]
+fn append_to_console_log(content: String) -> Result<(), String> {
+    use std::io::Write;
+
+    let log_path = dirs::home_dir()
+        .ok_or_else(|| "Could not get home directory".to_string())?
+        .join(".loom")
+        .join("console.log");
+
+    // Ensure .loom directory exists
+    if let Some(parent) = log_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+        }
+    }
+
+    // Open file in append mode (create if doesn't exist)
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open log file: {e}"))?;
+
+    // Write content
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Failed to write to log: {e}"))?;
+
+    Ok(())
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -1281,7 +1313,8 @@ fn main() {
             update_github_label,
             create_local_project,
             create_github_repository,
-            emit_menu_event
+            emit_menu_event,
+            append_to_console_log
         ])
         .run(tauri::generate_context!())
     {
