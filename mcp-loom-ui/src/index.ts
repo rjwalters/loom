@@ -9,7 +9,6 @@
  * - Monitor application state
  */
 
-import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -55,7 +54,7 @@ async function writeMCPCommand(command: string): Promise<string> {
   // Ensure .loom directory exists
   try {
     await mkdir(loomDir, { recursive: true });
-  } catch (error) {
+  } catch (_error) {
     // Directory might already exist, that's fine
   }
 
