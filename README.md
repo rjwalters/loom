@@ -183,6 +183,33 @@ pnpm run tauri:dev
 
 **For detailed development workflow, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
 
+### MCP Servers for Testing and Automation
+
+Loom provides three Model Context Protocol (MCP) servers that enable AI agents like Claude Code to interact with the application programmatically:
+
+- **[mcp-loom-ui](docs/mcp/loom-ui.md)** - Interact with UI, console logs, and workspace state
+- **[mcp-loom-logs](docs/mcp/loom-logs.md)** - Access daemon, Tauri, and terminal logs
+- **[mcp-loom-terminals](docs/mcp/loom-terminals.md)** - Control terminals via daemon IPC
+
+**Use Cases**:
+- Testing factory reset and agent launches
+- Monitoring agent activity in real-time
+- Debugging terminal and IPC issues
+- Automating workspace operations
+
+**Quick Start**:
+```bash
+# Build MCP servers
+pnpm build
+
+# Configure in .mcp.json (already included)
+# Use from Claude Code:
+mcp__loom-ui__read_console_log({ lines: 100 })
+mcp__loom-terminals__list_terminals()
+```
+
+**Full documentation**: [docs/mcp/README.md](docs/mcp/README.md)
+
 ### Configuring Terminal Roles
 
 After launching Loom, you can configure each terminal with a specific role:

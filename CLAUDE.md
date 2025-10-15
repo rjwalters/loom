@@ -904,9 +904,16 @@ cargo test --test integration_basic   # Run specific test file
 
 ## MCP Testing and Instrumentation
 
-**Location**: `mcp-loom-ui/`, `.mcp.json`
+**Location**: `mcp-loom-ui/`, `mcp-loom-logs/`, `mcp-loom-terminals/`, `.mcp.json`
 
-Loom provides MCP (Model Context Protocol) servers that enable AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
+Loom provides three MCP (Model Context Protocol) servers that enable AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
+
+**📖 Full API Documentation**: [docs/mcp/README.md](docs/mcp/README.md)
+
+**Available Servers**:
+- **[mcp-loom-ui](docs/mcp/loom-ui.md)** - UI interaction, console logs, workspace state (7 tools)
+- **[mcp-loom-logs](docs/mcp/loom-logs.md)** - Daemon, Tauri, and terminal logs (4 tools)
+- **[mcp-loom-terminals](docs/mcp/loom-terminals.md)** - Terminal management and IPC (4 tools)
 
 ### Console Logging to File
 
