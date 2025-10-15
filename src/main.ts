@@ -18,6 +18,48 @@ import { initTheme, toggleTheme } from "./lib/theme";
 import { getTooltipManager } from "./lib/tooltip";
 import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
 
+// =================================================================
+// CONSOLE LOGGING TO FILE - For MCP access to browser console
+// =================================================================
+// Intercept console methods and write to ~/.loom/console.log
+// This allows MCP tools to read console output for debugging
+
+const originalConsoleLog = console.log;
+const originalConsoleError = console.error;
+const originalConsoleWarn = console.warn;
+
+async function writeToConsoleLog(level: string, ...args: unknown[]) {
+  const timestamp = new Date().toISOString();
+  const message = args
+    .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : String(arg)))
+    .join(" ");
+  const logLine = `[${timestamp}] [${level}] ${message}\n`;
+
+  try {
+    await invoke("append_to_console_log", { content: logLine });
+  } catch (error) {
+    // Silent fail - don't want logging errors to break the app
+    // Only log to original console if something goes wrong
+    originalConsoleError("[console-logger] Failed to write to log file:", error);
+  }
+}
+
+// Override console methods
+console.log = (...args: unknown[]) => {
+  originalConsoleLog(...args);
+  writeToConsoleLog("INFO", ...args);
+};
+
+console.error = (...args: unknown[]) => {
+  originalConsoleError(...args);
+  writeToConsoleLog("ERROR", ...args);
+};
+
+console.warn = (...args: unknown[]) => {
+  originalConsoleWarn(...args);
+  writeToConsoleLog("WARN", ...args);
+};
+
 // Initialize theme
 initTheme();
 
