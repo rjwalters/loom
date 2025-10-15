@@ -74,7 +74,8 @@ export async function launchAgentInTerminal(
 
   // Build Claude CLI command - CLAUDE.md will be automatically loaded
   // Note: --session-id removed because Claude Code requires UUID format, not our terminal IDs
-  const command = "claude --permission-mode bypassPermissions";
+  // Using --dangerously-skip-permissions to bypass the interactive warning prompt
+  const command = "claude --dangerously-skip-permissions";
   console.log(`[launchAgentInTerminal] Sending command to terminal: ${command}`);
 
   // Send command to terminal
