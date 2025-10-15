@@ -156,6 +156,20 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
   }
 }
 
+// Helper to generate next config ID
+function generateNextConfigId(state: AppState): string {
+  const terminals = state.getTerminals();
+  const existingIds = new Set(terminals.map((t) => t.id));
+
+  // Find the next available terminal-N ID
+  let i = 1;
+  while (existingIds.has(`terminal-${i}`)) {
+    i++;
+  }
+
+  return `terminal-${i}`;
+}
+
 async function launchWorker(
   modal: HTMLElement,
   state: AppState,
@@ -190,9 +204,12 @@ async function launchWorker(
       instanceNumber,
     });
 
+    // Generate stable ID
+    const id = generateNextConfigId(state);
+
     // Add to state
     state.addTerminal({
-      id: terminalId,
+      id,
       name,
       status: TerminalStatus.Busy,
       isPrimary: false,
@@ -201,7 +218,7 @@ async function launchWorker(
 
     // Save updated state to config
     const config = {
-      nextAgentNumber: state.getCurrentAgentNumber(),
+      nextAgentNumber: state.getNextAgentNumber(),
       agents: state.getTerminals(),
     };
     await saveConfig(config);
@@ -230,7 +247,7 @@ async function launchWorker(
     modal.remove();
 
     // Switch to new terminal
-    state.setPrimary(terminalId);
+    state.setPrimary(id);
     renderFn();
   } catch (error) {
     alert(`Failed to launch worker: ${error}`);

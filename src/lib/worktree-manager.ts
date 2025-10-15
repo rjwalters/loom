@@ -6,6 +6,14 @@ export interface GitIdentity {
 }
 
 /**
+ * worktree-manager.ts - Functions for setting up git worktrees for agent isolation
+ *
+ * IMPORTANT: All functions in this module operate on sessionIds (ephemeral tmux session IDs).
+ * - terminalId parameters are sessionIds used for terminal IPC operations (send_input)
+ * - Returns worktreePath which caller stores in state using configId
+ */
+
+/**
  * Set up a git worktree for an agent terminal
  *
  * This creates an isolated git worktree for the agent to work in, preventing

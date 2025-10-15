@@ -30,7 +30,7 @@ export interface InputRequest {
 }
 
 export interface Terminal {
-  id: string;
+  id: string; // Stable terminal ID (e.g., "terminal-1"), used for both config and runtime
   name: string;
   status: TerminalStatus;
   isPrimary: boolean;
@@ -48,9 +48,9 @@ export interface Terminal {
 }
 
 export class AppState {
-  private terminals: Map<string, Terminal> = new Map();
-  private primaryId: string | null = null;
-  private order: string[] = []; // Track display order of terminal IDs
+  private terminals: Map<string, Terminal> = new Map(); // Key is terminal id
+  private primaryId: string | null = null; // Store primary terminal id
+  private order: string[] = []; // Track display order of terminal ids
   private listeners: Set<() => void> = new Set();
   private workspacePath: string | null = null; // Valid workspace path
   private displayedWorkspacePath: string = ""; // Path shown in input (may be invalid)
@@ -231,13 +231,10 @@ export class AppState {
     this.primaryId = null;
 
     // Add each terminal
-    // IMPORTANT: If agents have placeholder IDs (__unassigned__), we need to skip them
-    // because they all have the same ID and would overwrite each other in the Map
     agents.forEach((agent) => {
-      if (agent.id === "__unassigned__") {
-        console.warn(
-          `[loadAgents] Skipping terminal "${agent.name}" with placeholder ID - this should not happen after proper initialization`
-        );
+      // Check if agent has id
+      if (!agent.id) {
+        console.warn(`[loadAgents] Skipping terminal "${agent.name}" without id`);
         return;
       }
       this.addTerminal(agent);
@@ -253,6 +250,11 @@ export class AppState {
     this.displayedWorkspacePath = "";
     // Note: Don't reset nextAgentNumber - it persists across workspace changes
     this.notify();
+  }
+
+  // Helper method to get terminal by ID
+  getTerminal(id: string): Terminal | null {
+    return this.terminals.get(id) || null;
   }
 
   onChange(callback: () => void): () => void {

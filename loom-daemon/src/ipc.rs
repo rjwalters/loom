@@ -75,6 +75,7 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         Request::Ping => Response::Pong,
 
         Request::CreateTerminal {
+            config_id,
             name,
             working_dir,
             role,
@@ -83,7 +84,8 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             let mut tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
-            match tm.create_terminal(name, working_dir, role.as_ref(), instance_number) {
+            match tm.create_terminal(&config_id, name, working_dir, role.as_ref(), instance_number)
+            {
                 Ok(id) => Response::TerminalCreated { id },
                 Err(e) => Response::Error {
                     message: e.to_string(),

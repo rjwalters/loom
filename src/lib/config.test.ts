@@ -29,13 +29,13 @@ describe("config", () => {
         nextAgentNumber: 5,
         agents: [
           {
-            id: "1",
+            id: "terminal-1",
             name: "Agent 1",
             status: TerminalStatus.Idle,
             isPrimary: true,
           },
           {
-            id: "2",
+            id: "terminal-2",
             name: "Agent 2",
             status: TerminalStatus.Idle,
             isPrimary: false,
@@ -92,7 +92,7 @@ describe("config", () => {
         nextAgentNumber: 2,
         agents: [
           {
-            id: "1",
+            id: "terminal-1",
             name: "Worker Bot",
             status: TerminalStatus.Idle,
             isPrimary: true,
@@ -126,7 +126,7 @@ describe("config", () => {
         nextAgentNumber: 3,
         agents: [
           {
-            id: "1",
+            id: "terminal-1",
             name: "Agent 1",
             status: TerminalStatus.Idle,
             isPrimary: true,
@@ -190,19 +190,19 @@ describe("config", () => {
         nextAgentNumber: 5,
         agents: [
           {
-            id: "1",
+            id: "terminal-1",
             name: "Agent 1",
             status: TerminalStatus.Idle,
             isPrimary: true,
           },
           {
-            id: "2",
+            id: "terminal-2",
             name: "Agent 2",
             status: TerminalStatus.Busy,
             isPrimary: false,
           },
           {
-            id: "3",
+            id: "terminal-3",
             name: "Agent 3",
             status: TerminalStatus.Error,
             isPrimary: false,
@@ -225,7 +225,7 @@ describe("config", () => {
         nextAgentNumber: 2,
         agents: [
           {
-            id: "1",
+            id: "terminal-1",
             name: "Themed Worker",
             status: TerminalStatus.Idle,
             isPrimary: true,
@@ -251,13 +251,107 @@ describe("config", () => {
     });
   });
 
+  describe("config migration", () => {
+    it("should migrate dual-ID config (configId + UUID sessionId)", async () => {
+      const legacyConfig = {
+        nextAgentNumber: 3,
+        agents: [
+          {
+            configId: "terminal-1",
+            id: "abc-123-def-456", // old UUID session ID
+            name: "Agent 1",
+            status: TerminalStatus.Idle,
+            isPrimary: true,
+          },
+          {
+            configId: "terminal-2",
+            id: "xyz-789-uvw-012", // old UUID session ID
+            name: "Agent 2",
+            status: TerminalStatus.Idle,
+            isPrimary: false,
+          },
+        ],
+      };
+
+      vi.mocked(invoke).mockResolvedValue(JSON.stringify(legacyConfig));
+      setConfigWorkspace("/path/to/workspace");
+
+      const config = await loadConfig();
+
+      // Should use configId as the new single ID
+      expect(config.agents[0].id).toBe("terminal-1");
+      expect(config.agents[1].id).toBe("terminal-2");
+      // configId should be removed
+      expect(config.agents[0]).not.toHaveProperty("configId");
+      expect(config.agents[1]).not.toHaveProperty("configId");
+    });
+
+    it("should migrate UUID-only config to terminal-N IDs", async () => {
+      const legacyConfig = {
+        nextAgentNumber: 3,
+        agents: [
+          {
+            id: "abc-123-def-456", // old UUID
+            name: "Agent 1",
+            status: TerminalStatus.Idle,
+            isPrimary: true,
+          },
+          {
+            id: "xyz-789-uvw-012", // old UUID
+            name: "Agent 2",
+            status: TerminalStatus.Idle,
+            isPrimary: false,
+          },
+        ],
+      };
+
+      vi.mocked(invoke).mockResolvedValue(JSON.stringify(legacyConfig));
+      setConfigWorkspace("/path/to/workspace");
+
+      const config = await loadConfig();
+
+      // Should generate stable terminal-N IDs based on index
+      expect(config.agents[0].id).toBe("terminal-1");
+      expect(config.agents[1].id).toBe("terminal-2");
+    });
+
+    it("should not migrate already-migrated config", async () => {
+      const currentConfig: LoomConfig = {
+        nextAgentNumber: 3,
+        agents: [
+          {
+            id: "terminal-1",
+            name: "Agent 1",
+            status: TerminalStatus.Idle,
+            isPrimary: true,
+          },
+          {
+            id: "terminal-2",
+            name: "Agent 2",
+            status: TerminalStatus.Idle,
+            isPrimary: false,
+          },
+        ],
+      };
+
+      vi.mocked(invoke).mockResolvedValue(JSON.stringify(currentConfig));
+      setConfigWorkspace("/path/to/workspace");
+
+      const config = await loadConfig();
+
+      // Should keep existing stable IDs unchanged
+      expect(config.agents[0].id).toBe("terminal-1");
+      expect(config.agents[1].id).toBe("terminal-2");
+    });
+  });
+
   describe("loadConfig and saveConfig integration", () => {
     it("should round-trip config data correctly", async () => {
       const originalConfig: LoomConfig = {
         nextAgentNumber: 10,
         agents: [
           {
-            id: "1",
+            id: "terminal-1",
             name: "Test Agent",
             status: TerminalStatus.Busy,
             isPrimary: true,

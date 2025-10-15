@@ -2,14 +2,16 @@
   "nextAgentNumber": 7,
   "agents": [
     {
-      "id": "__unassigned__",
+      "configId": "terminal-1",
+      "id": "__needs_session__",
       "name": "Shell",
       "status": "idle",
       "isPrimary": true,
       "theme": "default"
     },
     {
-      "id": "__unassigned__",
+      "configId": "terminal-2",
+      "id": "__needs_session__",
       "name": "Architect",
       "status": "idle",
       "isPrimary": false,
@@ -23,7 +25,8 @@
       "theme": "lavender"
     },
     {
-      "id": "__unassigned__",
+      "configId": "terminal-3",
+      "id": "__needs_session__",
       "name": "Curator",
       "status": "idle",
       "isPrimary": false,
@@ -37,7 +40,8 @@
       "theme": "ocean"
     },
     {
-      "id": "__unassigned__",
+      "configId": "terminal-4",
+      "id": "__needs_session__",
       "name": "Reviewer",
       "status": "idle",
       "isPrimary": false,
@@ -51,7 +55,8 @@
       "theme": "rose"
     },
     {
-      "id": "__unassigned__",
+      "configId": "terminal-5",
+      "id": "__needs_session__",
       "name": "Worker 1",
       "status": "idle",
       "isPrimary": false,
@@ -70,7 +75,8 @@
       "pendingInputRequests": []
     },
     {
-      "id": "__unassigned__",
+      "configId": "terminal-6",
+      "id": "__needs_session__",
       "name": "Worker 2",
       "status": "idle",
       "isPrimary": false,

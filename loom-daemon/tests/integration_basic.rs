@@ -73,8 +73,9 @@ async fn test_create_terminal() {
     assert!(!terminal_id.is_empty(), "Terminal ID should not be empty");
 
     // Verify tmux session exists
-    // Terminal ID format: UUID, tmux session: loom-{first 8 chars of UUID}
-    let session_name = format!("loom-{}", &terminal_id[..8]);
+    // Terminal ID format: config_id, tmux session: loom-{config_id}-{role}-{instance}
+    // For default role and instance 0: loom-{config_id}-default-0
+    let session_name = format!("loom-{terminal_id}-default-0");
     assert!(tmux_session_exists(&session_name), "tmux session {session_name} should exist");
 
     // Cleanup
@@ -105,7 +106,7 @@ async fn test_create_terminal_with_working_dir() {
     assert!(!terminal_id.is_empty());
 
     // Verify tmux session exists
-    let session_name = format!("loom-{}", &terminal_id[..8]);
+    let session_name = format!("loom-{terminal_id}-default-0");
     assert!(tmux_session_exists(&session_name));
 
     // TODO: Verify working directory (would need output capture)
@@ -194,7 +195,7 @@ async fn test_destroy_terminal() {
         .await
         .expect("Failed to create terminal");
 
-    let session_name = format!("loom-{}", &terminal_id[..8]);
+    let session_name = format!("loom-{terminal_id}-default-0");
     assert!(tmux_session_exists(&session_name));
 
     // Destroy terminal
