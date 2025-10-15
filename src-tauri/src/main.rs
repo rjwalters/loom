@@ -21,6 +21,7 @@ fn greet(name: &str) -> String {
 
 #[tauri::command]
 async fn create_terminal(
+    config_id: String,
     name: String,
     working_dir: Option<String>,
     role: Option<String>,
@@ -29,6 +30,7 @@ async fn create_terminal(
     let client = DaemonClient::new().map_err(|e| e.to_string())?;
     let response = client
         .send_request(Request::CreateTerminal {
+            config_id,
             name,
             working_dir,
             role,

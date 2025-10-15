@@ -365,6 +365,7 @@ listen("factory-reset-workspace", async () => {
 
           // Create terminal in daemon
           const terminalId = await invoke<string>("create_terminal", {
+            configId: agent.id,
             name: agent.name,
             workingDir: workspace,
             role: agent.role || "default",
@@ -675,19 +676,20 @@ async function createPlainTerminal() {
   const name = `Terminal ${terminalCount}`;
 
   try {
+    // Generate stable ID first
+    const id = generateNextConfigId();
+
     // Get instance number for this terminal
     const instanceNumber = state.getNextAgentNumber();
 
     // Create terminal in workspace directory
     const terminalId = await invoke<string>("create_terminal", {
+      configId: id,
       name,
       workingDir: workspacePath,
       role: "default",
       instanceNumber,
     });
-
-    // Generate stable ID
-    const id = generateNextConfigId();
 
     // Add to state (no role assigned - plain shell)
     state.addTerminal({
@@ -986,6 +988,7 @@ async function handleWorkspacePathInput(path: string) {
 
             // Create terminal in daemon
             const terminalId = await invoke<string>("create_terminal", {
+              configId: agent.id,
               name: agent.name,
               workingDir: expandedPath,
               role: agent.role || "default",
@@ -1050,6 +1053,7 @@ async function handleWorkspacePathInput(path: string) {
 
               // Create terminal session in daemon
               const sessionId = await invoke<string>("create_terminal", {
+                configId: agent.id,
                 name: agent.name,
                 workingDir: expandedPath,
                 role: agent.role || "default",
@@ -1203,8 +1207,12 @@ async function handleRecoverNewSession(terminalId: string) {
     // Get instance number
     const instanceNumber = state.getNextAgentNumber();
 
+    // Generate a new config ID for the recovered terminal
+    const newConfigId = generateNextConfigId();
+
     // Create a new terminal in the daemon
     const newTerminalId = await invoke<string>("create_terminal", {
+      configId: newConfigId,
       name: terminal.name,
       workingDir: workspacePath,
       role: terminal.role || "default",

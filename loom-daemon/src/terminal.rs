@@ -30,6 +30,8 @@ impl TerminalManager {
         let instance_part = instance_number.unwrap_or(0);
         let tmux_session = format!("loom-{id}-{role_part}-{instance_part}");
 
+        log::info!("Creating tmux session: {tmux_session}, working_dir: {working_dir:?}");
+
         let mut cmd = Command::new("tmux");
         cmd.args([
             "new-session",
@@ -46,7 +48,13 @@ impl TerminalManager {
             cmd.args(["-c", dir]);
         }
 
-        cmd.spawn()?.wait()?;
+        log::info!("About to spawn tmux command...");
+        let result = cmd.spawn()?.wait()?;
+        log::info!("Tmux command completed with status: {}", result);
+
+        if !result.success() {
+            return Err(anyhow!("Failed to create tmux session"));
+        }
 
         // Set up pipe-pane to capture all output to a file
         let output_file = format!("/tmp/loom-{id}.out");
