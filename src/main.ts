@@ -758,8 +758,33 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
       } else if (workerType === "grok") {
         const { launchGrokAgent } = await import("./lib/agent-launcher");
         await launchGrokAgent(terminal.id);
+      } else if (workerType === "codex") {
+        // Codex with worktree support
+        console.log(`[launchAgentsForTerminals] Launching Codex for ${terminal.name}...`);
+        const { launchCodexAgent } = await import("./lib/agent-launcher");
+
+        // Verify worktreePath exists
+        if (!terminal.worktreePath) {
+          throw new Error(
+            `Terminal ${terminal.name} (${terminal.id}) is missing worktreePath - this should have been created during terminal setup`
+          );
+        }
+
+        console.log(
+          `[launchAgentsForTerminals] Launching Codex agent for ${terminal.name} (id=${terminal.id}) in worktree ${terminal.worktreePath}...`
+        );
+
+        // Launch Codex agent using existing worktree
+        await launchCodexAgent(
+          terminal.id,
+          roleConfig.roleFile as string,
+          workspacePath,
+          terminal.worktreePath
+        );
+
+        console.log(`[launchAgentsForTerminals] Codex agent launched in ${terminal.worktreePath}`);
       } else {
-        // Claude or Codex with worktree support
+        // Claude with worktree support
         console.log(`[launchAgentsForTerminals] Importing agent-launcher for ${terminal.name}...`);
         const { launchAgentInTerminal } = await import("./lib/agent-launcher");
 
