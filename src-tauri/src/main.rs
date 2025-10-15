@@ -1433,6 +1433,29 @@ fn main() {
                 }
             );
 
+            // Handle CLI arguments
+            match app.get_cli_matches() {
+                Ok(matches) => {
+                    // Check for --workspace argument
+                    if let Some(workspace_arg) = matches.args.get("workspace") {
+                        if let serde_json::Value::String(workspace_path) = &workspace_arg.value {
+                            eprintln!("[Loom] CLI workspace argument: {workspace_path}");
+
+                            // Get the main window
+                            if let Some(window) = app.get_window("main") {
+                                // Emit event to frontend with workspace path
+                                window.emit("cli-workspace", workspace_path).map_err(|e| {
+                                    format!("Failed to emit cli-workspace event: {e}")
+                                })?;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Loom] Warning: Failed to parse CLI arguments: {e}");
+                }
+            }
+
             // Initialize daemon manager
             let mut daemon_manager = daemon_manager::DaemonManager::new()
                 .map_err(|e| format!("Failed to create daemon manager: {e}"))?;

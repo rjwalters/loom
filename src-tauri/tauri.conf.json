@@ -26,6 +26,17 @@
         "all": true
       }
     },
+    "cli": {
+      "description": "Loom - AI-powered development orchestration",
+      "args": [
+        {
+          "name": "workspace",
+          "short": "w",
+          "takesValue": true,
+          "description": "Path to git repository workspace"
+        }
+      ]
+    },
     "bundle": {
       "active": true,
       "category": "DeveloperTool",
