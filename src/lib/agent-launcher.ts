@@ -92,9 +92,10 @@ export async function launchAgentInTerminal(
     data: "\r",
   });
 
-  // Wait for the bypass permissions prompt to appear (1 second)
+  // Wait for the bypass permissions prompt to appear (3 seconds)
+  // Claude Code needs time to initialize and render the interactive prompt
   console.log(`[launchAgentInTerminal] Waiting for bypass permissions prompt...`);
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  await new Promise((resolve) => setTimeout(resolve, 3000));
 
   // Accept the bypass permissions warning by selecting option 2
   console.log(`[launchAgentInTerminal] Accepting bypass permissions warning`);
