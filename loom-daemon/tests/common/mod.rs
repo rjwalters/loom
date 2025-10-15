@@ -223,7 +223,7 @@ impl TestClient {
 /// Helper: Check if a tmux session exists
 pub fn tmux_session_exists(session_name: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", session_name])
+        .args(["-L", "loom", "has-session", "-t", session_name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -232,14 +232,14 @@ pub fn tmux_session_exists(session_name: &str) -> bool {
 /// Helper: Kill a tmux session (for cleanup)
 pub fn kill_tmux_session(session_name: &str) {
     let _ = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
+        .args(["-L", "loom", "kill-session", "-t", session_name])
         .output();
 }
 
 /// Helper: Get list of all loom-* tmux sessions
 pub fn get_loom_tmux_sessions() -> Vec<String> {
     let output = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
         .output();
 
     match output {
