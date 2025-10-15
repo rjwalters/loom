@@ -40,7 +40,7 @@ export interface TerminalState {
 
 export interface LoomState {
   daemonPid?: number; // Running daemon process ID
-  nextAgentNumber: number; // Counter for terminal numbering
+  nextAgentNumber: number; // Counter for terminal numbering (legacy name for compatibility)
   terminals: TerminalState[];
 }
 

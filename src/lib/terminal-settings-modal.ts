@@ -490,7 +490,7 @@ async function applySettings(
 
     await saveConfig({ terminals: terminalConfigs });
     await saveState({
-      nextAgentNumber: state.getCurrentAgentNumber(),
+      nextAgentNumber: state.getCurrentTerminalNumber(),
       terminals: terminalStates,
     });
 

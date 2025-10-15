@@ -665,7 +665,7 @@ async function createPlainTerminal() {
     const id = generateNextConfigId();
 
     // Get instance number for this terminal
-    const instanceNumber = state.getNextAgentNumber();
+    const instanceNumber = state.getNextTerminalNumber();
 
     // Create terminal in workspace directory
     const terminalId = await invoke<string>("create_terminal", {
@@ -961,7 +961,7 @@ async function handleWorkspacePathInput(path: string) {
       // After initialization, create terminals for the default config
       setConfigWorkspace(expandedPath);
       const config = await loadWorkspaceConfig();
-      state.setNextAgentNumber(config.nextAgentNumber);
+      state.setNextTerminalNumber(config.nextAgentNumber);
 
       if (config.agents && config.agents.length > 0) {
         console.log("[handleWorkspacePathInput] Creating terminals for fresh workspace");
@@ -970,7 +970,7 @@ async function handleWorkspacePathInput(path: string) {
         for (const agent of config.agents) {
           try {
             // Get instance number
-            const instanceNumber = state.getNextAgentNumber();
+            const instanceNumber = state.getNextTerminalNumber();
 
             // Create terminal in daemon
             const terminalId = await invoke<string>("create_terminal", {
@@ -1006,7 +1006,7 @@ async function handleWorkspacePathInput(path: string) {
         const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminalsToSave);
         await saveConfig({ terminals: terminalConfigs });
         await saveState({
-          nextAgentNumber: state.getCurrentAgentNumber(),
+          nextAgentNumber: state.getCurrentTerminalNumber(),
           terminals: terminalStates,
         });
         console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
@@ -1015,7 +1015,7 @@ async function handleWorkspacePathInput(path: string) {
       // Workspace already initialized - load existing config
       setConfigWorkspace(expandedPath);
       const config = await loadWorkspaceConfig();
-      state.setNextAgentNumber(config.nextAgentNumber);
+      state.setNextTerminalNumber(config.nextAgentNumber);
 
       // Load agents from config
       if (config.agents && config.agents.length > 0) {
@@ -1031,7 +1031,7 @@ async function handleWorkspacePathInput(path: string) {
           if (agent.id === "__needs_session__") {
             try {
               // Get instance number
-              const instanceNumber = state.getNextAgentNumber();
+              const instanceNumber = state.getNextTerminalNumber();
 
               console.log(
                 `[handleWorkspacePathInput] Creating session for migrated terminal "${agent.name}" (${agent.id})`
@@ -1088,7 +1088,7 @@ async function handleWorkspacePathInput(path: string) {
             splitTerminals(terminalsToSave);
           await saveConfig({ terminals: terminalConfigs });
           await saveState({
-            nextAgentNumber: state.getCurrentAgentNumber(),
+            nextAgentNumber: state.getCurrentTerminalNumber(),
             terminals: terminalStates,
           });
           console.log(
@@ -1191,7 +1191,7 @@ async function handleRecoverNewSession(terminalId: string) {
     }
 
     // Get instance number
-    const instanceNumber = state.getNextAgentNumber();
+    const instanceNumber = state.getNextTerminalNumber();
 
     // Generate a new config ID for the recovered terminal
     const newConfigId = generateNextConfigId();
