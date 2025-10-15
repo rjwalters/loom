@@ -1,6 +1,4 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 /* Custom scrollbar for webkit browsers */
 ::-webkit-scrollbar {
