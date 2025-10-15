@@ -25,7 +25,7 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "curator.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
@@ -41,7 +41,7 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "reviewer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
