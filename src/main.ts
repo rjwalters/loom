@@ -301,6 +301,13 @@ async function initializeApp() {
 // Re-render on state changes
 state.onChange(render);
 
+// Listen for CLI workspace argument from Rust backend
+listen("cli-workspace", (event) => {
+  const workspacePath = event.payload as string;
+  console.log(`[CLI] Loading workspace from CLI argument: ${workspacePath}`);
+  handleWorkspacePathInput(workspacePath);
+});
+
 // Listen for menu events
 listen("new-terminal", () => {
   if (state.getWorkspace()) {
