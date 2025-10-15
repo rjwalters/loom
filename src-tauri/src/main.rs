@@ -1004,6 +1004,15 @@ SOFTWARE.
     }
 }
 
+/// Emit a menu event programmatically (for MCP control)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn emit_menu_event(window: tauri::Window, event_name: &str) -> Result<(), String> {
+    window
+        .emit(event_name, ())
+        .map_err(|e| format!("Failed to emit event: {e}"))
+}
+
 fn build_menu() -> Menu {
     // Build File menu
     let new_terminal =
@@ -1271,7 +1280,8 @@ fn main() {
             create_github_label,
             update_github_label,
             create_local_project,
-            create_github_repository
+            create_github_repository,
+            emit_menu_event
         ])
         .run(tauri::generate_context!())
     {
