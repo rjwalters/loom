@@ -10,6 +10,7 @@ import {
   setConfigWorkspace,
   splitTerminals,
 } from "./lib/config";
+import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import { getTerminalManager } from "./lib/terminal-manager";
@@ -67,9 +68,15 @@ initTheme();
 const state = new AppState();
 setAppState(state); // Register singleton so terminal-manager can access it
 
-// Get terminal manager and output poller
+// Get terminal manager, output poller, and health monitor
 const terminalManager = getTerminalManager();
 const outputPoller = getOutputPoller();
+const healthMonitor = getHealthMonitor();
+
+// Register activity callback - notify health monitor when output is received
+outputPoller.onActivity((terminalId) => {
+  healthMonitor.recordActivity(terminalId);
+});
 
 // Register error callback for polling failures
 outputPoller.onError((terminalId, errorMessage) => {
@@ -87,6 +94,17 @@ outputPoller.onError((terminalId, errorMessage) => {
   }
 });
 
+// Start health monitoring
+healthMonitor.start();
+console.log("[main] Health monitoring started");
+
+// Subscribe to health updates to trigger re-renders
+healthMonitor.onHealthUpdate(() => {
+  // Trigger a re-render when health status changes
+  render();
+});
+console.log("[main] Subscribed to health monitor updates");
+
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
 
@@ -99,9 +117,31 @@ function render() {
     "displayedWorkspace:",
     state.getDisplayedWorkspace()
   );
-  renderHeader(state.getDisplayedWorkspace(), hasWorkspace);
+
+  // Get health data from health monitor
+  const systemHealth = healthMonitor.getHealth();
+
+  // Render header with daemon health
+  renderHeader(
+    state.getDisplayedWorkspace(),
+    hasWorkspace,
+    systemHealth.daemon.connected,
+    systemHealth.daemon.lastPing
+  );
+
   renderPrimaryTerminal(state.getPrimary(), hasWorkspace, state.getDisplayedWorkspace());
-  renderMiniTerminals(state.getTerminals(), hasWorkspace);
+
+  // Render mini terminals with health data
+  const terminalHealthMap = new Map(
+    Array.from(systemHealth.terminals.entries()).map(([id, health]) => [
+      id,
+      {
+        lastActivity: health.lastActivity,
+        isStale: health.isStale,
+      },
+    ])
+  );
+  renderMiniTerminals(state.getTerminals(), hasWorkspace, terminalHealthMap);
 
   // Re-attach workspace event listeners if they were just rendered
   if (!hasWorkspace) {
