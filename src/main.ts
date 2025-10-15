@@ -328,7 +328,8 @@ listen("close-workspace", async () => {
   render();
 });
 
-listen("factory-reset-workspace", async () => {
+// Start workspace - with confirmation dialog
+listen("start-workspace", async () => {
   const workspace = state.getWorkspace();
   if (!workspace) return;
 
@@ -339,16 +340,16 @@ listen("factory-reset-workspace", async () => {
       "• Close all current terminals\n" +
       "• Recreate 6 default terminals\n\n" +
       "This action CANNOT be undone!\n\n" +
-      "Continue with factory reset?",
+      "Continue with Start?",
     {
-      title: "⚠️ Factory Reset Warning",
+      title: "⚠️ Start Workspace Warning",
       type: "warning",
     }
   );
 
   if (!confirmed) return;
 
-  console.log("[factory-reset-workspace] Resetting workspace to defaults");
+  console.log("[start-workspace] Resetting workspace to defaults");
 
   // Stop all polling
   const terminals = state.getTerminals();
@@ -358,25 +359,25 @@ listen("factory-reset-workspace", async () => {
   terminalManager.destroyAll();
 
   // Destroy all terminal sessions in daemon (clean up tmux sessions)
-  console.log(`[factory-reset-workspace] Destroying ${terminals.length} terminal sessions`);
+  console.log(`[start-workspace] Destroying ${terminals.length} terminal sessions`);
   for (const terminal of terminals) {
     try {
       await invoke("destroy_terminal", { id: terminal.id });
-      console.log(`[factory-reset-workspace] Destroyed terminal ${terminal.name} (${terminal.id})`);
+      console.log(`[start-workspace] Destroyed terminal ${terminal.name} (${terminal.id})`);
     } catch (error) {
-      console.warn(`[factory-reset-workspace] Failed to destroy terminal ${terminal.id}:`, error);
+      console.warn(`[start-workspace] Failed to destroy terminal ${terminal.id}:`, error);
       // Continue anyway - we'll create fresh terminals
     }
   }
 
   // Kill ALL loom tmux sessions to ensure clean slate
   // This is necessary because daemon may restore old sessions on startup
-  console.log("[factory-reset-workspace] Killing all loom tmux sessions...");
+  console.log("[start-workspace] Killing all loom tmux sessions...");
   try {
     await invoke("kill_all_loom_sessions");
-    console.log("[factory-reset-workspace] All loom sessions killed");
+    console.log("[start-workspace] All loom sessions killed");
   } catch (error) {
-    console.warn("[factory-reset-workspace] Failed to kill loom sessions:", error);
+    console.warn("[start-workspace] Failed to kill loom sessions:", error);
     // Continue anyway - we'll try to create fresh terminals
   }
 
@@ -386,7 +387,7 @@ listen("factory-reset-workspace", async () => {
       workspacePath: workspace,
       defaultsPath: "defaults",
     });
-    console.log("[factory-reset-workspace] Backend reset complete");
+    console.log("[start-workspace] Backend reset complete");
   } catch (error) {
     console.error("Failed to reset workspace:", error);
     alert(`Failed to reset workspace: ${error}`);
@@ -406,14 +407,14 @@ listen("factory-reset-workspace", async () => {
     // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
       // Create new terminal sessions for each agent in the config
-      console.log(`[factory-reset-workspace] Creating ${config.agents.length} terminals...`);
+      console.log(`[start-workspace] Creating ${config.agents.length} terminals...`);
       for (const agent of config.agents) {
         try {
           // Get instance number
           const instanceNumber = state.getNextAgentNumber();
 
           console.log(
-            `[factory-reset-workspace] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspace}`
+            `[start-workspace] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspace}`
           );
 
           // Create terminal in daemon
@@ -427,18 +428,15 @@ listen("factory-reset-workspace", async () => {
 
           // Update agent ID to match the newly created terminal
           agent.id = terminalId;
-          console.log(`[factory-reset-workspace] ✓ Created terminal ${agent.name} (${terminalId})`);
+          console.log(`[start-workspace] ✓ Created terminal ${agent.name} (${terminalId})`);
         } catch (error) {
-          console.error(
-            `[factory-reset-workspace] ✗ Failed to create terminal ${agent.name}:`,
-            error
-          );
+          console.error(`[start-workspace] ✗ Failed to create terminal ${agent.name}:`, error);
           alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
       }
 
       console.log(
-        `[factory-reset-workspace] All terminals created, agents array:`,
+        `[start-workspace] All terminals created, agents array:`,
         config.agents.map((a) => `${a.name}=${a.id}`)
       );
 
@@ -447,18 +445,18 @@ listen("factory-reset-workspace", async () => {
 
       // Now load the agents into state with their new IDs
       console.log(
-        `[factory-reset-workspace] Loading agents into state:`,
+        `[start-workspace] Loading agents into state:`,
         config.agents.map((a) => `${a.name}=${a.id}`)
       );
       state.loadAgents(config.agents);
       console.log(
-        `[factory-reset-workspace] State after loadAgents:`,
+        `[start-workspace] State after loadAgents:`,
         state.getTerminals().map((a) => `${a.name}=${a.id}`)
       );
 
       // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
       // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
-      console.log(`[factory-reset-workspace] Saving config with real terminal IDs...`);
+      console.log(`[start-workspace] Saving config with real terminal IDs...`);
       const terminalsToSave1 = state.getTerminals();
       const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
       await saveConfig({ terminals: terminalConfigs1 });
@@ -466,18 +464,18 @@ listen("factory-reset-workspace", async () => {
         nextAgentNumber: state.getCurrentAgentNumber(),
         terminals: terminalStates1,
       });
-      console.log(`[factory-reset-workspace] Config saved`);
+      console.log(`[start-workspace] Config saved`);
 
       // Launch agents for terminals with role configs
-      console.log(`[factory-reset-workspace] Launching agents...`);
+      console.log(`[start-workspace] Launching agents...`);
       await launchAgentsForTerminals(workspace, config.agents);
       console.log(
-        `[factory-reset-workspace] State after launchAgentsForTerminals:`,
+        `[start-workspace] State after launchAgentsForTerminals:`,
         state.getTerminals().map((a) => `${a.name}=${a.id}`)
       );
 
       // Save again with worktree paths added by agent launch
-      console.log(`[factory-reset-workspace] Saving config with worktree paths...`);
+      console.log(`[start-workspace] Saving config with worktree paths...`);
       const terminalsToSave2 = state.getTerminals();
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
       await saveConfig({ terminals: terminalConfigs2 });
@@ -486,7 +484,164 @@ listen("factory-reset-workspace", async () => {
         terminals: terminalStates2,
       });
 
-      console.log("[factory-reset-workspace] Workspace reset complete");
+      console.log("[start-workspace] Workspace reset complete");
+    } else {
+      // No agents in config - still set workspace as active
+      state.setWorkspace(workspace);
+    }
+  } catch (error) {
+    console.error("Failed to reload config after reset:", error);
+    alert(`Failed to reload config: ${error}`);
+  }
+
+  // Re-render
+  render();
+});
+
+// Force Start workspace - NO confirmation dialog (for MCP automation)
+listen("force-start-workspace", async () => {
+  const workspace = state.getWorkspace();
+  if (!workspace) return;
+
+  console.log("[force-start-workspace] Resetting workspace to defaults (no confirmation)");
+
+  // Stop all polling
+  const terminals = state.getTerminals();
+  terminals.forEach((t) => outputPoller.stopPolling(t.id));
+
+  // Destroy all xterm instances
+  terminalManager.destroyAll();
+
+  // Destroy all terminal sessions in daemon (clean up tmux sessions)
+  console.log(`[force-start-workspace] Destroying ${terminals.length} terminal sessions`);
+  for (const terminal of terminals) {
+    try {
+      await invoke("destroy_terminal", { id: terminal.id });
+      console.log(`[force-start-workspace] Destroyed terminal ${terminal.name} (${terminal.id})`);
+    } catch (error) {
+      console.warn(`[force-start-workspace] Failed to destroy terminal ${terminal.id}:`, error);
+      // Continue anyway - we'll create fresh terminals
+    }
+  }
+
+  // Kill ALL loom tmux sessions to ensure clean slate
+  // This is necessary because daemon may restore old sessions on startup
+  console.log("[force-start-workspace] Killing all loom tmux sessions...");
+  try {
+    await invoke("kill_all_loom_sessions");
+    console.log("[force-start-workspace] All loom sessions killed");
+  } catch (error) {
+    console.warn("[force-start-workspace] Failed to kill loom sessions:", error);
+    // Continue anyway - we'll try to create fresh terminals
+  }
+
+  // Call backend reset
+  try {
+    await invoke("reset_workspace_to_defaults", {
+      workspacePath: workspace,
+      defaultsPath: "defaults",
+    });
+    console.log("[force-start-workspace] Backend reset complete");
+  } catch (error) {
+    console.error("Failed to reset workspace:", error);
+    alert(`Failed to reset workspace: ${error}`);
+    return;
+  }
+
+  // Clear state
+  state.clearAll();
+  currentAttachedTerminalId = null;
+
+  // Reload config and recreate terminals
+  try {
+    setConfigWorkspace(workspace);
+    const config = await loadWorkspaceConfig();
+    state.setNextAgentNumber(config.nextAgentNumber);
+
+    // Load agents from fresh config and create terminal sessions for each
+    if (config.agents && config.agents.length > 0) {
+      // Create new terminal sessions for each agent in the config
+      console.log(`[force-start-workspace] Creating ${config.agents.length} terminals...`);
+      for (const agent of config.agents) {
+        try {
+          // Get instance number
+          const instanceNumber = state.getNextAgentNumber();
+
+          console.log(
+            `[force-start-workspace] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspace}`
+          );
+
+          // Create terminal in daemon
+          const terminalId = await invoke<string>("create_terminal", {
+            configId: agent.id,
+            name: agent.name,
+            workingDir: workspace,
+            role: agent.role || "default",
+            instanceNumber,
+          });
+
+          // Update agent ID to match the newly created terminal
+          agent.id = terminalId;
+          console.log(`[force-start-workspace] ✓ Created terminal ${agent.name} (${terminalId})`);
+        } catch (error) {
+          console.error(
+            `[force-start-workspace] ✗ Failed to create terminal ${agent.name}:`,
+            error
+          );
+          alert(`Failed to create terminal ${agent.name}: ${error}`);
+        }
+      }
+
+      console.log(
+        `[force-start-workspace] All terminals created, agents array:`,
+        config.agents.map((a) => `${a.name}=${a.id}`)
+      );
+
+      // Set workspace as active BEFORE loading agents (needed for proper initialization)
+      state.setWorkspace(workspace);
+
+      // Now load the agents into state with their new IDs
+      console.log(
+        `[force-start-workspace] Loading agents into state:`,
+        config.agents.map((a) => `${a.name}=${a.id}`)
+      );
+      state.loadAgents(config.agents);
+      console.log(
+        `[force-start-workspace] State after loadAgents:`,
+        state.getTerminals().map((a) => `${a.name}=${a.id}`)
+      );
+
+      // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
+      // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
+      console.log(`[force-start-workspace] Saving config with real terminal IDs...`);
+      const terminalsToSave1 = state.getTerminals();
+      const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
+      await saveConfig({ terminals: terminalConfigs1 });
+      await saveState({
+        nextAgentNumber: state.getCurrentAgentNumber(),
+        terminals: terminalStates1,
+      });
+      console.log(`[force-start-workspace] Config saved`);
+
+      // Launch agents for terminals with role configs
+      console.log(`[force-start-workspace] Launching agents...`);
+      await launchAgentsForTerminals(workspace, config.agents);
+      console.log(
+        `[force-start-workspace] State after launchAgentsForTerminals:`,
+        state.getTerminals().map((a) => `${a.name}=${a.id}`)
+      );
+
+      // Save again with worktree paths added by agent launch
+      console.log(`[force-start-workspace] Saving config with worktree paths...`);
+      const terminalsToSave2 = state.getTerminals();
+      const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
+      await saveConfig({ terminals: terminalConfigs2 });
+      await saveState({
+        nextAgentNumber: state.getCurrentAgentNumber(),
+        terminals: terminalStates2,
+      });
+
+      console.log("[force-start-workspace] Workspace reset complete");
     } else {
       // No agents in config - still set workspace as active
       state.setWorkspace(workspace);
