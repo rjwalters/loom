@@ -11,6 +11,7 @@ pub type TerminalId = String;
 pub enum Request {
     Ping,
     CreateTerminal {
+        config_id: String,
         name: String,
         working_dir: Option<String>,
         role: Option<String>,
