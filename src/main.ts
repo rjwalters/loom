@@ -135,9 +135,9 @@ async function initializeTerminalDisplay(terminalId: string) {
     if (!hasSession) {
       console.warn(`[initializeTerminalDisplay] Terminal ${terminalId} has no tmux session`);
 
-      // Mark terminal as having missing session
+      // Mark terminal as having missing session (only if not already marked)
       const terminal = state.getTerminal(terminalId);
-      if (terminal) {
+      if (terminal && !terminal.missingSession) {
         state.updateTerminal(terminal.id, {
           status: TerminalStatus.Error,
           missingSession: true,

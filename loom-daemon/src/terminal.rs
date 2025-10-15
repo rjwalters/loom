@@ -33,6 +33,7 @@ impl TerminalManager {
         log::info!("Creating tmux session: {tmux_session}, working_dir: {working_dir:?}");
 
         let mut cmd = Command::new("tmux");
+        cmd.args(["-L", "loom"]);
         cmd.args([
             "new-session",
             "-d",
@@ -62,6 +63,7 @@ impl TerminalManager {
 
         log::info!("Setting up pipe-pane for session {tmux_session} to {output_file}");
         let result = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["pipe-pane", "-t", &tmux_session, "-o", &pipe_cmd])
             .output()?;
 
@@ -130,11 +132,13 @@ impl TerminalManager {
 
         // Stop pipe-pane (passing no command closes the pipe)
         let _ = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["pipe-pane", "-t", &info.tmux_session])
             .spawn();
 
         // Kill the tmux session
         Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["kill-session", "-t", &info.tmux_session])
             .spawn()?
             .wait()?;
@@ -156,16 +160,19 @@ impl TerminalManager {
         match data {
             "\r" => {
                 Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["send-keys", "-t", &info.tmux_session, "Enter"])
                     .spawn()?;
             }
             "\u{0003}" => {
                 Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["send-keys", "-t", &info.tmux_session, "C-c"])
                     .spawn()?;
             }
             _ => {
                 Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["send-keys", "-t", &info.tmux_session, "-l", data])
                     .spawn()?;
             }
@@ -233,6 +240,7 @@ impl TerminalManager {
 
         // Resize tmux window (which resizes the pane when there's only one pane)
         Command::new("tmux")
+            .args(["-L", "loom"])
             .args([
                 "resize-window",
                 "-t",
@@ -250,6 +258,7 @@ impl TerminalManager {
 
     pub fn restore_from_tmux(&mut self) -> Result<()> {
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()?;
 
@@ -268,6 +277,7 @@ impl TerminalManager {
                 // Clear any existing pipe-pane for this session to avoid duplicates
                 log::debug!("Clearing existing pipe-pane for session {session}");
                 let _ = Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["pipe-pane", "-t", session])
                     .spawn();
 
@@ -277,6 +287,7 @@ impl TerminalManager {
 
                 log::info!("Setting up pipe-pane for session {session} to {output_file}");
                 let result = Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["pipe-pane", "-t", session, "-o", &pipe_cmd])
                     .output()?;
 
@@ -315,6 +326,7 @@ impl TerminalManager {
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["has-session", "-t", &info.tmux_session])
             .output()?;
 
@@ -325,6 +337,7 @@ impl TerminalManager {
     #[allow(clippy::unused_self)]
     pub fn list_available_sessions(&self) -> Vec<String> {
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["list-sessions", "-F", "#{session_name}"])
             .output();
 
@@ -350,6 +363,7 @@ impl TerminalManager {
 
         // Verify the session exists
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["has-session", "-t", &session_name])
             .output()?;
 
@@ -368,6 +382,7 @@ impl TerminalManager {
     pub fn kill_session(&self, session_name: &str) -> Result<()> {
         // Verify the session exists
         let check_output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["has-session", "-t", session_name])
             .output()?;
 
@@ -377,6 +392,7 @@ impl TerminalManager {
 
         // Kill the session
         Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["kill-session", "-t", session_name])
             .spawn()?
             .wait()?;

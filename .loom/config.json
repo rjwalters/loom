@@ -2,8 +2,15 @@
   "terminals": [
     {
       "id": "terminal-1",
-      "name": "Shell",
-      "theme": "default"
+      "name": "Codex",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "codex",
+        "roleFile": "worker.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Continue working on open tasks"
+      },
+      "theme": "crimson"
     },
     {
       "id": "terminal-2",
@@ -48,7 +55,7 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest"
@@ -60,7 +67,7 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest"
