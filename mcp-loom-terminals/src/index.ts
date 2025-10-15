@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
+import { readFile, stat } from "node:fs/promises";
+import { Socket } from "node:net";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { readFile, stat } from "fs/promises";
-import { Socket } from "net";
-import { homedir } from "os";
-import { join } from "path";
 
 const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || "/tmp/loom-daemon.sock";
 const LOOM_DIR = join(homedir(), ".loom");
@@ -93,7 +93,7 @@ async function listTerminals(): Promise<Terminal[]> {
     }
 
     return [];
-  } catch (error) {
+  } catch (_error) {
     // If daemon is not running, fall back to state file
     const state = await readStateFile();
     return state?.terminals || [];

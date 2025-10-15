@@ -61,11 +61,11 @@ async function triggerFactoryReset(): Promise<string> {
 
     const osascript = spawn("osascript", ["-e", script]);
 
-    let stdout = "";
+    let _stdout = "";
     let stderr = "";
 
     osascript.stdout.on("data", (data) => {
-      stdout += data.toString();
+      _stdout += data.toString();
     });
 
     osascript.stderr.on("data", (data) => {

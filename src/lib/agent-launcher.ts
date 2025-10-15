@@ -92,23 +92,46 @@ export async function launchAgentInTerminal(
     data: "\r",
   });
 
-  // Wait for the bypass permissions prompt to appear (3 seconds)
-  // Claude Code needs time to initialize and render the interactive prompt
-  console.log(`[launchAgentInTerminal] Waiting for bypass permissions prompt...`);
-  await new Promise((resolve) => setTimeout(resolve, 3000));
+  // Add initial delay to allow Claude Code to start
+  // This prevents the "2" from concatenating with the previous command
+  console.log(`[launchAgentInTerminal] Initial wait: 1000ms for Claude Code to start...`);
+  await new Promise((resolve) => setTimeout(resolve, 1000));
 
-  // Accept the bypass permissions warning by selecting option 2
-  console.log(`[launchAgentInTerminal] Accepting bypass permissions warning`);
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: "2",
-  });
+  // Retry accepting the bypass permissions warning with exponential backoff
+  // Claude Code initialization time varies, so we try multiple times with increasing delays
+  const maxRetries = 3;
+  const baseDelay = 2000; // Base delay: 2 seconds
 
-  // Press Enter to confirm selection
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: "\r",
-  });
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const delay = baseDelay * attempt; // Exponential backoff: 2s, 4s, 6s
+    console.log(
+      `[launchAgentInTerminal] Attempt ${attempt}/${maxRetries}: Waiting ${delay}ms for bypass permissions prompt...`
+    );
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    // Accept the bypass permissions warning by selecting option 2
+    console.log(`[launchAgentInTerminal] Attempt ${attempt}: Sending "2" to accept warning`);
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: "2",
+    });
+
+    // Small delay before pressing Enter to ensure "2" is processed
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Press Enter to confirm selection
+    console.log(`[launchAgentInTerminal] Attempt ${attempt}: Sending Enter to confirm`);
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: "\r",
+    });
+
+    // If this isn't the last attempt, wait a bit before retrying
+    if (attempt < maxRetries) {
+      console.log(`[launchAgentInTerminal] Waiting 500ms before next attempt...`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
 
   console.log(`[launchAgentInTerminal] COMPLETE - returning agentWorkingDir=${agentWorkingDir}`);
 

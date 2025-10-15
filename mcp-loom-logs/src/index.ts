@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
+import { readdir, readFile, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { readdir, readFile, stat } from "fs/promises";
-import { homedir } from "os";
-import { join } from "path";
 
 const LOOM_DIR = join(homedir(), ".loom");
 const DAEMON_LOG = join(LOOM_DIR, "daemon.log");

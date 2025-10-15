@@ -1015,7 +1015,7 @@ fn emit_menu_event(window: tauri::Window, event_name: &str) -> Result<(), String
 
 /// Append console log message to file for MCP access
 #[tauri::command]
-fn append_to_console_log(content: String) -> Result<(), String> {
+fn append_to_console_log(content: &str) -> Result<(), String> {
     use std::io::Write;
 
     let log_path = dirs::home_dir()

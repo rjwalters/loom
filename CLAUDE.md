@@ -24,6 +24,12 @@
 - ⏳ Issue #6: .loom/ directory configuration (planned)
 - ⏳ Issue #7: Workspace selector improvements (planned)
 
+**Current Work**: Testing and improving factory reset reliability (Issue #84)
+- **Status**: 60% success rate (3/5 worker terminals launching Claude Code successfully)
+- **Fixes Implemented**: Retry mechanism with exponential backoff (2s, 4s, 6s) + increased worktree command delay (100ms → 300ms)
+- **Next**: Restart app and Claude Code to test improvements, aiming for 100% success rate
+- **Files Changed**: `src/lib/agent-launcher.ts`, `src/lib/worktree-manager.ts`
+
 ### Recent Features
 
 **Issue #19: Terminal Configuration System**
@@ -889,6 +895,169 @@ cargo test --test integration_basic   # Run specific test file
 1. **Unit Tests**: Vitest for pure functions (state.ts, ui.ts)
 2. **Integration Tests**: Playwright for E2E workflows
 3. **Type Tests**: TypeScript strict mode as first line of defense
+
+## MCP Testing and Instrumentation
+
+**Location**: `mcp-loom-ui/`, `.mcp.json`
+
+Loom provides MCP (Model Context Protocol) servers that enable AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
+
+### Console Logging to File
+
+**Implementation**: `src/main.ts` (console interceptor) + `src-tauri/src/main.rs` (`append_to_console_log`)
+
+All browser console output is automatically written to `~/.loom/console.log`:
+
+```typescript
+// Console interception (src/main.ts)
+const originalConsoleLog = console.log;
+console.log = (...args: unknown[]) => {
+  originalConsoleLog(...args);  // Still log to DevTools
+  writeToConsoleLog("INFO", ...args);  // Also write to file
+};
+```
+
+**Log Format**:
+```
+[2025-10-15T05:05:06.088Z] [INFO] [launchAgentsForTerminals] Starting agent launch...
+[2025-10-15T05:05:06.814Z] [INFO] [launchAgentInTerminal] Worktree setup complete
+```
+
+**Benefits**:
+- Persistent logs survive app restarts
+- AI agents can read logs via MCP to diagnose issues
+- Debug output visible without watching DevTools in real-time
+- Full visibility into factory reset and agent launch processes
+
+### MCP Loom UI Server
+
+**Package**: `mcp-loom-ui/`
+**Configuration**: `.mcp.json`
+
+MCP server providing tools for Claude Code to interact with Loom's state and logs:
+
+**Available Tools**:
+
+1. **`read_console_log`**
+   - Reads browser console output from `~/.loom/console.log`
+   - Returns recent log entries with timestamps
+   - Use for debugging factory reset, agent launch, worktree setup
+
+2. **`read_state_file`**
+   - Reads current application state from `.loom/state.json`
+   - Shows active terminals, session IDs, working directories
+   - Use for verifying terminal creation and state management
+
+3. **`read_config_file`**
+   - Reads terminal configurations from `.loom/config.json`
+   - Shows terminal roles, intervals, prompts
+   - Use for verifying configuration persistence
+
+4. **`trigger_factory_reset`**
+   - Programmatically triggers factory reset via Tauri IPC
+   - Emits menu event to reset workspace to defaults
+   - Use for automated testing and setup
+
+**MCP Configuration** (`.mcp.json`):
+```json
+{
+  "mcpServers": {
+    "loom-ui": {
+      "command": "node",
+      "args": ["mcp-loom-ui/dist/index.js"],
+      "env": {
+        "LOOM_WORKSPACE": "/Users/rwalters/GitHub/loom"
+      }
+    }
+  }
+}
+```
+
+**Usage Example** (from Claude Code):
+```bash
+# Read recent console logs to see factory reset progress
+mcp__loom-ui__read_console_log
+
+# Check terminal state after factory reset
+mcp__loom-ui__read_state_file
+
+# Trigger factory reset programmatically
+mcp__loom-ui__trigger_factory_reset
+```
+
+### Testing Factory Reset with MCP
+
+**Goal**: Verify factory reset creates 6 terminals with Claude Code agents running autonomously
+
+**Test Procedure**:
+
+1. **Trigger Reset**:
+   ```bash
+   mcp__loom-ui__trigger_factory_reset
+   ```
+
+2. **Monitor Console Logs**:
+   ```bash
+   mcp__loom-ui__read_console_log
+   ```
+   Look for:
+   - `[factory-reset-workspace] Killing all loom tmux sessions`
+   - `[factory-reset-workspace] ✓ Created terminal X`
+   - `[launchAgentInTerminal] Worktree setup complete`
+   - `[launchAgentInTerminal] Attempt N: Sending "2" to accept warning`
+
+3. **Verify State**:
+   ```bash
+   mcp__loom-ui__read_state_file
+   ```
+   Confirm 6 terminals exist with correct session IDs and worktree paths
+
+4. **Check Terminal Outputs**:
+   ```bash
+   cat /tmp/loom-terminal-2.out  # Architect
+   cat /tmp/loom-terminal-3.out  # Curator
+   cat /tmp/loom-terminal-4.out  # Reviewer
+   cat /tmp/loom-terminal-5.out  # Worker 1
+   cat /tmp/loom-terminal-6.out  # Worker 2
+   ```
+   Look for Claude Code prompt interface (not error messages)
+
+5. **Verify Worktrees**:
+   ```bash
+   ls -la .loom/worktrees/
+   git worktree list
+   ```
+   Confirm 5 worktrees created (terminals 2-6)
+
+**Expected Success Criteria**:
+- ✅ 6 terminals created (terminal-1 through terminal-6)
+- ✅ 5 worktrees created at `.loom/worktrees/terminal-{2-6}`
+- ✅ Claude Code running in terminals 2-6 (bypass permissions accepted)
+- ✅ Terminal 1 (Shell) has plain shell prompt
+- ✅ No "command not found" or "duplicate session" errors
+- ✅ Console logs show successful agent launch sequence
+
+### Debugging Common Issues
+
+**Issue**: Commands concatenated in terminal output
+- **Symptom**: `claude --dangerously-skip-permissions2` or multiple commands on one line
+- **Check**: Console logs for timing of `send_terminal_input` calls
+- **Fix**: Increase delay in `worktree-manager.ts` `sendCommand()` function
+
+**Issue**: "duplicate session" errors
+- **Symptom**: `fatal: duplicate session: loom-terminal-X`
+- **Check**: tmux sessions before factory reset: `tmux -L loom list-sessions`
+- **Fix**: `kill_all_loom_sessions` should run before creating terminals
+
+**Issue**: Bypass permissions prompt not accepted
+- **Symptom**: Terminals stuck at "WARNING: Claude Code running in Bypass Permissions mode"
+- **Check**: Terminal output files for prompt appearance timing
+- **Fix**: Adjust retry delays in `agent-launcher.ts`
+
+**Issue**: Worktree creation fails
+- **Symptom**: `fatal: '/path' already exists` or `is a missing but already registered worktree`
+- **Check**: Existing worktrees: `git worktree list`
+- **Fix**: Prune orphaned worktrees: `git worktree prune`
 
 ## Performance Considerations
 

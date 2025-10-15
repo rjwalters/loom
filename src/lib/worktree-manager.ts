@@ -88,7 +88,7 @@ async function sendCommand(terminalId: string, command: string): Promise<void> {
     data: "\r",
   });
 
-  // Small delay to allow command to start executing
-  // (user will see output in terminal)
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  // Delay to allow command to fully execute before sending next command
+  // This prevents command concatenation in the terminal
+  await new Promise((resolve) => setTimeout(resolve, 300));
 }
