@@ -1,0 +1,8 @@
+{
+  "name": "Critic Bot",
+  "description": "Identifies and proposes removal of unnecessary complexity, bloat, and over-engineering",
+  "defaultInterval": 900000,
+  "defaultIntervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with the loom:critic-suggestion label if you find something concrete.",
+  "autonomousRecommended": true,
+  "suggestedWorkerType": "claude"
+}

@@ -1,18 +1,54 @@
 import { type Terminal, TerminalStatus } from "./state";
 import { getTheme, getThemeStyles, isDarkMode } from "./themes";
 
-export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boolean): void {
+/**
+ * Format milliseconds into a human-readable duration
+ */
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) return `${days}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
+
+export function renderHeader(
+  displayedWorkspacePath: string,
+  hasWorkspace: boolean,
+  daemonConnected?: boolean,
+  lastPing?: number | null
+): void {
   const container = document.getElementById("workspace-name");
   if (!container) return;
 
+  let headerContent = "";
   if (hasWorkspace) {
     // Show repo name in header (no "Loom" title)
     const repoName = extractRepoName(displayedWorkspacePath);
-    container.innerHTML = `📂 ${escapeHtml(repoName)}`;
+    headerContent = `📂 ${escapeHtml(repoName)}`;
   } else {
     // Show "Loom" title when no workspace
-    container.innerHTML = "Loom";
+    headerContent = "Loom";
   }
+
+  // Add daemon health indicator if we have that data
+  if (daemonConnected !== undefined) {
+    const statusColor = daemonConnected ? "bg-green-500" : "bg-red-500";
+    const statusText = daemonConnected ? "Connected" : "Disconnected";
+    const timeSincePing = lastPing ? Date.now() - lastPing : null;
+    const pingInfo = timeSincePing !== null ? ` • ${formatDuration(timeSincePing)} ago` : "";
+
+    headerContent += ` <span class="inline-flex items-center gap-1 ml-2 text-xs text-gray-500 dark:text-gray-400" data-tooltip="Daemon ${statusText}${pingInfo}" data-tooltip-position="bottom">
+      <span class="w-2 h-2 rounded-full ${statusColor}"></span>
+      <span class="text-xs">Daemon</span>
+    </span>`;
+  }
+
+  container.innerHTML = headerContent;
 }
 
 function extractRepoName(path: string): string {
@@ -254,11 +290,20 @@ export function renderAvailableSessionsList(
   `;
 }
 
-export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean): void {
+export function renderMiniTerminals(
+  terminals: Terminal[],
+  hasWorkspace: boolean,
+  terminalHealthMap?: Map<string, { lastActivity: number | null; isStale: boolean }>
+): void {
   const container = document.getElementById("mini-terminal-row");
   if (!container) return;
 
-  const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join("");
+  const terminalCards = terminals
+    .map((t, index) => {
+      const health = terminalHealthMap?.get(t.id);
+      return createMiniTerminalHTML(t, index, health);
+    })
+    .join("");
 
   const addButtonClasses = hasWorkspace
     ? "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 cursor-pointer"
@@ -284,7 +329,11 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
   `;
 }
 
-function createMiniTerminalHTML(terminal: Terminal, index: number): string {
+function createMiniTerminalHTML(
+  terminal: Terminal,
+  index: number,
+  health?: { lastActivity: number | null; isStale: boolean }
+): string {
   // Get theme colors
   const theme = getTheme(terminal.theme, terminal.customTheme);
   const styles = getThemeStyles(theme, isDarkMode());
@@ -297,6 +346,24 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
     terminal.status === TerminalStatus.NeedsInput
       ? `<div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-white dark:border-gray-900 animate-pulse"></div>`
       : "";
+
+  // Activity indicator
+  let activityInfo = "";
+  if (health) {
+    if (health.lastActivity) {
+      const timeSince = Date.now() - health.lastActivity;
+      const activityText = formatDuration(timeSince);
+      const activityColor = health.isStale
+        ? "text-orange-500 dark:text-orange-400"
+        : "text-green-600 dark:text-green-400";
+      const activityIcon = health.isStale ? "⏸" : "⚡";
+      activityInfo = `<span class="${activityColor} text-xs flex items-center gap-1" data-tooltip="Last activity: ${activityText} ago" data-tooltip-position="top">
+        ${activityIcon} ${activityText}
+      </span>`;
+    } else {
+      activityInfo = `<span class="text-gray-400 dark:text-gray-500 text-xs" data-tooltip="No activity recorded" data-tooltip-position="top">—</span>`;
+    }
+  }
 
   return `
     <div class="p-1 flex-shrink-0">
@@ -323,9 +390,12 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
             ×
           </button>
         </div>
-        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between">
-          <span>${terminal.status}</span>
-          <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
+          <div class="flex items-center justify-between">
+            <span>${terminal.status}</span>
+            <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+          </div>
+          ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
         </div>
         </div>
       </div>
