@@ -87,7 +87,7 @@ export async function startWorkspaceEngine(
   try {
     setConfigWorkspace(workspacePath);
     const config = await loadWorkspaceConfig();
-    state.setNextAgentNumber(config.nextAgentNumber);
+    state.setNextTerminalNumber(config.nextAgentNumber);
 
     console.log(`[${logPrefix}] Loaded config with ${config.agents?.length || 0} terminals`);
 
@@ -98,7 +98,7 @@ export async function startWorkspaceEngine(
       for (const agent of config.agents) {
         try {
           // Get instance number
-          const instanceNumber = state.getNextAgentNumber();
+          const instanceNumber = state.getNextTerminalNumber();
 
           console.log(
             `[${logPrefix}] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspacePath}`
@@ -154,7 +154,7 @@ export async function startWorkspaceEngine(
       const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
       await saveConfig({ terminals: terminalConfigs1 });
       await saveState({
-        nextAgentNumber: state.getCurrentAgentNumber(),
+        nextAgentNumber: state.getCurrentTerminalNumber(),
         terminals: terminalStates1,
       });
       console.log(`[${logPrefix}] Config saved`);
@@ -173,7 +173,7 @@ export async function startWorkspaceEngine(
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
       await saveConfig({ terminals: terminalConfigs2 });
       await saveState({
-        nextAgentNumber: state.getCurrentAgentNumber(),
+        nextAgentNumber: state.getCurrentTerminalNumber(),
         terminals: terminalStates2,
       });
 

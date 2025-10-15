@@ -197,7 +197,7 @@ async function launchWorker(
     const id = generateNextConfigId(state);
 
     // Get instance number
-    const instanceNumber = state.getNextAgentNumber();
+    const instanceNumber = state.getNextTerminalNumber();
 
     // Create terminal in workspace directory
     const terminalId = await invoke<string>("create_terminal", {
@@ -223,7 +223,7 @@ async function launchWorker(
 
     await saveConfig({ terminals: terminalConfigs });
     await saveState({
-      nextAgentNumber: state.getCurrentAgentNumber(),
+      nextAgentNumber: state.getCurrentTerminalNumber(),
       terminals: terminalStates,
     });
 

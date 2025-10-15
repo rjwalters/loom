@@ -249,23 +249,23 @@ describe("AppState", () => {
     });
   });
 
-  describe("Agent Numbering", () => {
-    it("should increment agent number", () => {
-      expect(state.getNextAgentNumber()).toBe(1);
-      expect(state.getNextAgentNumber()).toBe(2);
-      expect(state.getNextAgentNumber()).toBe(3);
+  describe("Terminal Numbering", () => {
+    it("should increment terminal number", () => {
+      expect(state.getNextTerminalNumber()).toBe(1);
+      expect(state.getNextTerminalNumber()).toBe(2);
+      expect(state.getNextTerminalNumber()).toBe(3);
     });
 
-    it("should set agent number", () => {
-      state.setNextAgentNumber(10);
-      expect(state.getNextAgentNumber()).toBe(10);
-      expect(state.getNextAgentNumber()).toBe(11);
+    it("should set terminal number", () => {
+      state.setNextTerminalNumber(10);
+      expect(state.getNextTerminalNumber()).toBe(10);
+      expect(state.getNextTerminalNumber()).toBe(11);
     });
 
-    it("should get current agent number without incrementing", () => {
-      state.setNextAgentNumber(5);
-      expect(state.getCurrentAgentNumber()).toBe(5);
-      expect(state.getCurrentAgentNumber()).toBe(5);
+    it("should get current terminal number without incrementing", () => {
+      state.setNextTerminalNumber(5);
+      expect(state.getCurrentTerminalNumber()).toBe(5);
+      expect(state.getCurrentTerminalNumber()).toBe(5);
     });
   });
 
