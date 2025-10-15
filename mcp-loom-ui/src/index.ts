@@ -44,62 +44,36 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Trigger a force start via keyboard shortcut
+ * Trigger a force start by writing to IPC trigger file
  *
- * Uses Cmd+Shift+Alt+R keyboard shortcut to trigger force start without
- * confirmation dialog. More reliable than menu accessibility APIs,
- * especially in Tauri development mode.
+ * Creates a trigger file that the Loom app monitors to emit the
+ * force-start-workspace event. This is more reliable than keyboard
+ * shortcuts or AppleScript menu access.
  */
 async function triggerFactoryReset(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    // Use osascript to send keyboard shortcut
-    const script = `
-      tell application "System Events"
-        if not (exists process "Loom") then
-          error "Loom app is not running"
-        end if
+  const { writeFile, unlink } = await import("node:fs/promises");
+  const triggerFile = join(LOOM_DIR, "force-start.trigger");
 
-        tell process "Loom"
-          set frontmost to true
-          delay 0.3
+  try {
+    // Write trigger file
+    await writeFile(triggerFile, Date.now().toString(), "utf-8");
 
-          -- Send Cmd+Shift+Alt+R keyboard shortcut to trigger force start
-          keystroke "r" using {command down, shift down, option down}
-        end tell
-      end tell
-    `;
+    // Wait a bit for the app to process it
+    await new Promise((resolve) => setTimeout(resolve, 500));
 
-    const osascript = spawn("osascript", ["-e", script]);
+    // Clean up trigger file
+    try {
+      await unlink(triggerFile);
+    } catch {
+      // Ignore cleanup errors
+    }
 
-    let _stdout = "";
-    let stderr = "";
-
-    osascript.stdout.on("data", (data) => {
-      _stdout += data.toString();
-    });
-
-    osascript.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    osascript.on("close", (code) => {
-      if (code === 0) {
-        resolve("Force start triggered successfully via keyboard shortcut (Cmd+Shift+Alt+R)");
-      } else {
-        reject(
-          new Error(
-            `Failed to trigger force start (exit code ${code}): ${stderr || "No error message"}`
-          )
-        );
-      }
-    });
-
-    // Timeout after 5 seconds
-    setTimeout(() => {
-      osascript.kill();
-      reject(new Error("Force start trigger timed out after 5 seconds"));
-    }, 5000);
-  });
+    return "Force start triggered successfully via IPC trigger file";
+  } catch (error) {
+    throw new Error(
+      `Failed to trigger force start: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
 }
 
 /**
@@ -140,6 +114,87 @@ async function readConfigFile(): Promise<string> {
   }
 }
 
+/**
+ * Get app heartbeat - check if app is running and logging
+ */
+async function getHeartbeat(): Promise<string> {
+  try {
+    await access(CONSOLE_LOG_PATH);
+    const content = await readFile(CONSOLE_LOG_PATH, "utf-8");
+    const lines = content.split("\n").filter(Boolean);
+
+    if (lines.length === 0) {
+      return JSON.stringify(
+        {
+          status: "unknown",
+          message: "Console log is empty - app may not have started yet",
+          lastLogTime: null,
+          logCount: 0,
+        },
+        null,
+        2
+      );
+    }
+
+    // Get last log entry
+    const lastLine = lines[lines.length - 1];
+    const timestampMatch = lastLine.match(/\[([^\]]+)\]/);
+    const lastLogTime = timestampMatch ? timestampMatch[1] : null;
+
+    // Calculate time since last log
+    let timeSinceLastLog = "unknown";
+    let status = "unknown";
+    if (lastLogTime) {
+      const lastLogDate = new Date(lastLogTime);
+      const now = new Date();
+      const diffMs = now.getTime() - lastLogDate.getTime();
+      const diffSeconds = Math.floor(diffMs / 1000);
+
+      if (diffSeconds < 10) {
+        status = "healthy";
+        timeSinceLastLog = `${diffSeconds}s ago`;
+      } else if (diffSeconds < 60) {
+        status = "active";
+        timeSinceLastLog = `${diffSeconds}s ago`;
+      } else if (diffSeconds < 300) {
+        status = "idle";
+        const diffMinutes = Math.floor(diffSeconds / 60);
+        timeSinceLastLog = `${diffMinutes}m ago`;
+      } else {
+        status = "stale";
+        const diffMinutes = Math.floor(diffSeconds / 60);
+        timeSinceLastLog = `${diffMinutes}m ago`;
+      }
+    }
+
+    return JSON.stringify(
+      {
+        status,
+        message: `Last log entry was ${timeSinceLastLog}`,
+        lastLogTime,
+        logCount: lines.length,
+        recentLogs: lines.slice(-5),
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return JSON.stringify(
+        {
+          status: "not_running",
+          message: "Console log file not found - app is not running or console logging is disabled",
+          lastLogTime: null,
+          logCount: 0,
+        },
+        null,
+        2
+      );
+    }
+    throw error;
+  }
+}
+
 // Create server instance
 const server = new Server(
   {
@@ -175,7 +230,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_factory_reset",
         description:
-          "Trigger a force start of the current workspace using keyboard shortcut (Cmd+Shift+Alt+R). This resets the workspace to defaults with 6 terminals and launches all agents WITHOUT confirmation dialog. Requires the Loom app to be running.",
+          "Trigger a force start of the current workspace by writing an IPC trigger file. This resets the workspace to defaults with 6 terminals and launches all agents WITHOUT confirmation dialog. Requires the Loom app to be running.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -194,6 +249,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "read_config_file",
         description:
           "Read the current Loom config file (.loom/config.json) to see terminal configurations and role settings",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "get_heartbeat",
+        description:
+          "Get app heartbeat status - checks if Loom is running and actively logging. Returns status (healthy/active/idle/stale/not_running), last log time, and recent log entries",
         inputSchema: {
           type: "object",
           properties: {},
@@ -253,6 +317,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: config,
+            },
+          ],
+        };
+      }
+
+      case "get_heartbeat": {
+        const heartbeat = await getHeartbeat();
+        return {
+          content: [
+            {
+              type: "text",
+              text: heartbeat,
             },
           ],
         };

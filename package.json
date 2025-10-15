@@ -18,7 +18,7 @@
     "app:dev": "pnpm daemon:dev & sleep 2 && pnpm tauri:dev",
     "app:preview": "RUST_LOG=info pnpm daemon:preview & sleep 2 && pnpm tauri:preview",
     "app:build": "pnpm daemon:build && pnpm tauri:build",
-    "app:prod": "pnpm daemon:build && pnpm build && RUST_LOG=info ./target/release/loom-daemon & sleep 2 && cargo run --package app --release",
+    "app:prod": "pnpm daemon:build && pnpm tauri:build && RUST_LOG=info ./target/release/loom-daemon & sleep 2 && ./target/release/bundle/macos/Loom.app/Contents/MacOS/Loom",
     "check": "cargo check --workspace",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
