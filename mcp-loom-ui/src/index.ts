@@ -54,7 +54,7 @@ async function triggerFactoryReset(): Promise<string> {
         tell process "Loom"
           set frontmost to true
           delay 0.2
-          click menu item "Factory Reset (Testing)" of menu "Workspace" of menu bar 1
+          click menu item "Factory Reset Workspace..." of menu "File" of menu bar 1
         end tell
       end tell
     `;
