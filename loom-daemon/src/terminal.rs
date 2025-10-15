@@ -50,7 +50,7 @@ impl TerminalManager {
 
         log::info!("About to spawn tmux command...");
         let result = cmd.spawn()?.wait()?;
-        log::info!("Tmux command completed with status: {}", result);
+        log::info!("Tmux command completed with status: {result}");
 
         if !result.success() {
             return Err(anyhow!("Failed to create tmux session"));
