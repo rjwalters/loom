@@ -1045,6 +1045,24 @@ fn append_to_console_log(content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Trigger workspace start programmatically (for MCP/testing)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn trigger_start(window: tauri::Window) -> Result<(), String> {
+    window
+        .emit("start-workspace", ())
+        .map_err(|e| format!("Failed to emit start-workspace event: {e}"))
+}
+
+/// Trigger force start programmatically (for MCP/testing)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn trigger_force_start(window: tauri::Window) -> Result<(), String> {
+    window
+        .emit("force-start-workspace", ())
+        .map_err(|e| format!("Failed to emit force-start-workspace event: {e}"))
+}
+
 /// Kill all loom tmux sessions
 #[tauri::command]
 fn kill_all_loom_sessions() -> Result<(), String> {
@@ -1364,6 +1382,8 @@ fn main() {
             create_github_repository,
             emit_menu_event,
             append_to_console_log,
+            trigger_start,
+            trigger_force_start,
             kill_all_loom_sessions
         ])
         .run(tauri::generate_context!())

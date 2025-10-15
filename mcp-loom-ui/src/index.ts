@@ -44,31 +44,75 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Trigger a force start by writing to IPC trigger file
- *
- * Creates a trigger file that the Loom app monitors to emit the
- * force-start-workspace event. This is more reliable than keyboard
- * shortcuts or AppleScript menu access.
+ * Invoke a Tauri command using AppleScript + JavaScript injection
  */
-async function triggerFactoryReset(): Promise<string> {
-  const { writeFile, unlink } = await import("node:fs/promises");
-  const triggerFile = join(LOOM_DIR, "force-start.trigger");
+async function invokeTauriCommand(
+  command: string,
+  args: Record<string, unknown> = {}
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const argsJson = JSON.stringify(args).replace(/"/g, '\\"');
+    const script = `
+      tell application "Loom"
+        activate
+        tell application "System Events"
+          tell process "Loom"
+            set frontmost to true
+          end tell
+        end tell
+      end tell
 
+      tell application "System Events"
+        keystroke "j" using {command down, option down}
+        delay 0.5
+        keystroke "window.__TAURI__.invoke('${command}', JSON.parse(\\"${argsJson}\\")).then(r => console.log('SUCCESS:', r)).catch(e => console.error('ERROR:', e))"
+        keystroke return
+      end tell
+    `;
+
+    const proc = spawn("osascript", ["-e", script]);
+    let stdout = "";
+    let stderr = "";
+
+    proc.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`AppleScript failed (exit ${code}): ${stderr}`));
+      } else {
+        resolve(`Tauri command '${command}' invoked successfully`);
+      }
+    });
+  });
+}
+
+/**
+ * Trigger workspace start (normal reset with confirmation)
+ */
+async function triggerStart(): Promise<string> {
   try {
-    // Write trigger file
-    await writeFile(triggerFile, Date.now().toString(), "utf-8");
+    await invokeTauriCommand("trigger_start");
+    return "Workspace start triggered successfully";
+  } catch (error) {
+    throw new Error(
+      `Failed to trigger start: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
 
-    // Wait a bit for the app to process it
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // Clean up trigger file
-    try {
-      await unlink(triggerFile);
-    } catch {
-      // Ignore cleanup errors
-    }
-
-    return "Force start triggered successfully via IPC trigger file";
+/**
+ * Trigger force start (bypass confirmation)
+ */
+async function triggerForceStart(): Promise<string> {
+  try {
+    await invokeTauriCommand("trigger_force_start");
+    return "Force start triggered successfully";
   } catch (error) {
     throw new Error(
       `Failed to trigger force start: ${error instanceof Error ? error.message : String(error)}`
@@ -228,9 +272,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
-        name: "trigger_factory_reset",
+        name: "trigger_start",
         description:
-          "Trigger a force start of the current workspace by writing an IPC trigger file. This resets the workspace to defaults with 6 terminals and launches all agents WITHOUT confirmation dialog. Requires the Loom app to be running.",
+          "Trigger workspace start (factory reset) with confirmation dialog. Shows the user a confirmation modal before resetting workspace to defaults with 6 terminals. Requires the Loom app to be running and a workspace to be selected.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "trigger_force_start",
+        description:
+          "Trigger force start of the current workspace. This resets the workspace to defaults with 6 terminals and launches all agents WITHOUT confirmation dialog. Use this for automated testing or when you're certain the user wants to reset. Requires the Loom app to be running.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -286,8 +339,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
-      case "trigger_factory_reset": {
-        const result = await triggerFactoryReset();
+      case "trigger_start": {
+        const result = await triggerStart();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "trigger_force_start": {
+        const result = await triggerForceStart();
         return {
           content: [
             {
