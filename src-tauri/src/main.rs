@@ -1096,8 +1096,10 @@ fn build_menu() -> Menu {
         CustomMenuItem::new("close_terminal", "Close Terminal").accelerator("CmdOrCtrl+Shift+W");
     let close_workspace =
         CustomMenuItem::new("close_workspace", "Close Workspace").accelerator("CmdOrCtrl+W");
-    let factory_reset_workspace =
-        CustomMenuItem::new("factory_reset_workspace", "Factory Reset Workspace...");
+    let start_workspace =
+        CustomMenuItem::new("start_workspace", "Start...").accelerator("CmdOrCtrl+Shift+R");
+    let force_start_workspace = CustomMenuItem::new("force_start_workspace", "Force Start")
+        .accelerator("CmdOrCtrl+Shift+Alt+R");
 
     let file_menu = Submenu::new(
         "File",
@@ -1106,7 +1108,8 @@ fn build_menu() -> Menu {
             .add_item(close_terminal)
             .add_native_item(MenuItem::Separator)
             .add_item(close_workspace)
-            .add_item(factory_reset_workspace)
+            .add_item(start_workspace)
+            .add_item(force_start_workspace)
             .add_native_item(MenuItem::Separator)
             .add_native_item(MenuItem::Quit),
     );
@@ -1189,8 +1192,11 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         "close_workspace" => {
             let _ = event.window().emit("close-workspace", ());
         }
-        "factory_reset_workspace" => {
-            let _ = event.window().emit("factory-reset-workspace", ());
+        "start_workspace" => {
+            let _ = event.window().emit("start-workspace", ());
+        }
+        "force_start_workspace" => {
+            let _ = event.window().emit("force-start-workspace", ());
         }
         "toggle_theme" => {
             let _ = event.window().emit("toggle-theme", ());

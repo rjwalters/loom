@@ -44,17 +44,27 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Trigger a factory reset via Tauri IPC
+ * Trigger a force start via keyboard shortcut
+ *
+ * Uses Cmd+Shift+Alt+R keyboard shortcut to trigger force start without
+ * confirmation dialog. More reliable than menu accessibility APIs,
+ * especially in Tauri development mode.
  */
 async function triggerFactoryReset(): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Use osascript to simulate menu click in Loom app
+    // Use osascript to send keyboard shortcut
     const script = `
       tell application "System Events"
+        if not (exists process "Loom") then
+          error "Loom app is not running"
+        end if
+
         tell process "Loom"
           set frontmost to true
-          delay 0.2
-          click menu item "Factory Reset Workspace..." of menu "File" of menu bar 1
+          delay 0.3
+
+          -- Send Cmd+Shift+Alt+R keyboard shortcut to trigger force start
+          keystroke "r" using {command down, shift down, option down}
         end tell
       end tell
     `;
@@ -74,11 +84,11 @@ async function triggerFactoryReset(): Promise<string> {
 
     osascript.on("close", (code) => {
       if (code === 0) {
-        resolve("Factory reset triggered successfully via menu click");
+        resolve("Force start triggered successfully via keyboard shortcut (Cmd+Shift+Alt+R)");
       } else {
         reject(
           new Error(
-            `Failed to trigger factory reset (exit code ${code}): ${stderr || "No error message"}`
+            `Failed to trigger force start (exit code ${code}): ${stderr || "No error message"}`
           )
         );
       }
@@ -87,7 +97,7 @@ async function triggerFactoryReset(): Promise<string> {
     // Timeout after 5 seconds
     setTimeout(() => {
       osascript.kill();
-      reject(new Error("Factory reset trigger timed out after 5 seconds"));
+      reject(new Error("Force start trigger timed out after 5 seconds"));
     }, 5000);
   });
 }
@@ -165,7 +175,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_factory_reset",
         description:
-          "Trigger a factory reset of the current workspace using macOS accessibility to click the menu item. This resets the workspace to defaults with 6 terminals and launches all agents. Requires the Loom app to be running.",
+          "Trigger a force start of the current workspace using keyboard shortcut (Cmd+Shift+Alt+R). This resets the workspace to defaults with 6 terminals and launches all agents WITHOUT confirmation dialog. Requires the Loom app to be running.",
         inputSchema: {
           type: "object",
           properties: {},
