@@ -6,6 +6,7 @@ This directory contains Claude Code configuration for the Loom project.
 
 - **`settings.json`**: Team-wide permissions and settings (committed to git)
 - **`settings.local.json`**: Personal preferences (gitignored, create if needed)
+- **`../.mcp.json`**: MCP server configuration (at project root, committed to git)
 
 ## Pre-approved Commands
 
@@ -63,6 +64,26 @@ Create `.claude/settings.local.json` for personal preferences:
 ```
 
 Local settings override team settings for that specific configuration key.
+
+## MCP Servers
+
+The project includes two MCP servers configured in `.mcp.json`:
+
+### loom-logs
+Monitor Loom application logs:
+- `tail_daemon_log` - View daemon logs (`~/.loom/daemon.log`)
+- `tail_tauri_log` - View Tauri app logs (`~/.loom/tauri.log`)
+- `list_terminal_logs` - List terminal output files
+- `tail_terminal_log` - View specific terminal output
+
+### loom-terminals
+Interact with Loom terminal sessions:
+- `list_terminals` - List all active terminals
+- `get_terminal_output` - Read terminal output
+- `get_selected_terminal` - Get current terminal info
+- `send_terminal_input` - Execute commands in terminals
+
+**Note**: When you first open the project, Claude Code will prompt you to approve these MCP servers. You can also enable them automatically by setting `"enableAllProjectMcpServers": true` in your `.claude/settings.local.json`.
 
 ## Documentation
 

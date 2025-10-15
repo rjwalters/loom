@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "loom-logs": {
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp-loom-logs/dist/index.js"]
+    },
+    "loom-terminals": {
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp-loom-terminals/dist/index.js"]
+    }
+  }
+}
