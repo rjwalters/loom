@@ -1,20 +1,12 @@
 {
-  "nextAgentNumber": 7,
+  "nextAgentNumber": 8,
   "agents": [
     {
       "configId": "terminal-1",
       "id": "__needs_session__",
-      "name": "Shell",
-      "status": "idle",
-      "isPrimary": true,
-      "theme": "default"
-    },
-    {
-      "configId": "terminal-2",
-      "id": "__needs_session__",
       "name": "Architect",
       "status": "idle",
-      "isPrimary": false,
+      "isPrimary": true,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -25,7 +17,7 @@
       "theme": "lavender"
     },
     {
-      "configId": "terminal-3",
+      "configId": "terminal-2",
       "id": "__needs_session__",
       "name": "Curator",
       "status": "idle",
@@ -40,7 +32,7 @@
       "theme": "ocean"
     },
     {
-      "configId": "terminal-4",
+      "configId": "terminal-3",
       "id": "__needs_session__",
       "name": "Reviewer",
       "status": "idle",
@@ -55,7 +47,7 @@
       "theme": "rose"
     },
     {
-      "configId": "terminal-5",
+      "configId": "terminal-4",
       "id": "__needs_session__",
       "name": "Worker 1",
       "status": "idle",
@@ -67,15 +59,10 @@
         "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
-      "theme": "forest",
-      "agentStatus": "not_started",
-      "worktreePath": null,
-      "agentPid": null,
-      "lastIntervalRun": null,
-      "pendingInputRequests": []
+      "theme": "forest"
     },
     {
-      "configId": "terminal-6",
+      "configId": "terminal-5",
       "id": "__needs_session__",
       "name": "Worker 2",
       "status": "idle",
@@ -88,6 +75,36 @@
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest"
+    },
+    {
+      "configId": "terminal-6",
+      "id": "__needs_session__",
+      "name": "Worker 3",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "codex",
+        "roleFile": "worker.md",
+        "targetInterval": 60000,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "theme": "crimson"
+    },
+    {
+      "configId": "terminal-7",
+      "id": "__needs_session__",
+      "name": "Worker 4",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "codex",
+        "roleFile": "worker.md",
+        "targetInterval": 60000,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "theme": "crimson"
     }
   ]
 }
