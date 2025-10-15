@@ -7,6 +7,13 @@
     "loom-terminals": {
       "command": "node",
       "args": ["${workspaceFolder}/mcp-loom-terminals/dist/index.js"]
+    },
+    "loom-ui": {
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp-loom-ui/dist/index.js"],
+      "env": {
+        "LOOM_WORKSPACE": "${workspaceFolder}"
+      }
     }
   }
 }

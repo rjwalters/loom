@@ -83,6 +83,13 @@ Interact with Loom terminal sessions:
 - `get_selected_terminal` - Get current terminal info
 - `send_terminal_input` - Execute commands in terminals
 
+### loom-ui
+Interact with the Loom application UI and state:
+- `read_console_log` - View browser console output (JavaScript errors, console.log statements)
+- `read_state_file` - Read current application state (.loom/state.json)
+- `read_config_file` - Read terminal configurations (.loom/config.json)
+- `trigger_factory_reset` - Trigger factory reset (placeholder, not yet functional)
+
 **Note**: When you first open the project, Claude Code will prompt you to approve these MCP servers. You can also enable them automatically by setting `"enableAllProjectMcpServers": true` in your `.claude/settings.local.json`.
 
 ## Documentation
