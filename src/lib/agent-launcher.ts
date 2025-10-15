@@ -270,3 +270,77 @@ export async function launchGrokAgent(terminalId: string): Promise<void> {
     data: "\r",
   });
 }
+
+/**
+ * Launch Codex agent in a terminal with system prompt
+ *
+ * This launches Codex with configuration similar to Claude Code:
+ * - Loads role file and writes to CODEX.md (system prompt)
+ * - Uses --full-auto for autonomous execution
+ * - Workspace-write sandbox with on-failure approval
+ * - Permissions configured in .codex/config.toml
+ *
+ * @param terminalId - The terminal ID to launch the agent in
+ * @param roleFile - The role file to use (e.g., "worker.md")
+ * @param workspacePath - The workspace path (used for reading role files)
+ * @param worktreePath - The worktree path for this terminal
+ * @returns Promise that resolves when the agent is launched
+ */
+export async function launchCodexAgent(
+  terminalId: string,
+  roleFile: string,
+  workspacePath: string,
+  worktreePath: string
+): Promise<void> {
+  console.log(
+    `[launchCodexAgent] START - terminalId=${terminalId}, roleFile=${roleFile}, worktreePath=${worktreePath}`
+  );
+
+  // Read role file content from workspace
+  console.log(`[launchCodexAgent] Reading role file ${roleFile}...`);
+  const roleContent = await invoke<string>("read_role_file", {
+    workspacePath,
+    filename: roleFile,
+  });
+  console.log(`[launchCodexAgent] Role file read successfully, length=${roleContent.length}`);
+
+  // Replace template variables in role content
+  const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, worktreePath);
+  console.log(`[launchCodexAgent] Processed prompt with workspace=${worktreePath}`);
+
+  // Write the system prompt to CODEX.md in the worktree
+  // Codex will load this as the system prompt
+  const codexMdPath = `${worktreePath}/CODEX.md`;
+  console.log(`[launchCodexAgent] Writing CODEX.md to ${codexMdPath}...`);
+  await invoke("write_file", {
+    path: codexMdPath,
+    content: processedPrompt,
+  });
+  console.log(`[launchCodexAgent] CODEX.md written successfully`);
+
+  // Build Codex CLI command with autonomous configuration
+  // --full-auto: Combines -a on-failure and --sandbox workspace-write
+  // Additional config from .codex/config.toml (sandbox_permissions, etc.)
+  const command = 'codex --full-auto "$(cat CODEX.md)"';
+  console.log(`[launchCodexAgent] Sending command to terminal: ${command}`);
+
+  // Wait for any previous commands to fully complete
+  console.log(`[launchCodexAgent] Waiting 500ms for previous commands to complete...`);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+  console.log(`[launchCodexAgent] Command sent`);
+
+  // Press Enter to execute
+  console.log(`[launchCodexAgent] Sending Enter to execute`);
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+
+  console.log(`[launchCodexAgent] COMPLETE - Codex agent launched in ${worktreePath}`);
+}
