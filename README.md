@@ -183,6 +183,25 @@ pnpm run tauri:dev
 
 **For detailed development workflow, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
 
+### CLI Usage
+
+Loom supports command-line arguments for headless automation and remote development workflows:
+
+```bash
+# Launch with a specific workspace
+./Loom.app/Contents/MacOS/Loom --workspace /path/to/your/repo
+
+# Short form
+./Loom.app/Contents/MacOS/Loom -w /path/to/your/repo
+```
+
+**Use Cases**:
+- Automated deployment: Launch Loom with a pre-configured workspace on server startup
+- CI/CD integration: Run Loom headlessly in containerized environments
+- Remote development: Start Loom via SSH with a specific repository path
+
+The app will validate the workspace path and automatically load the configuration from `.loom/config.json` if it exists.
+
 ### MCP Servers for Testing and Automation
 
 Loom provides three Model Context Protocol (MCP) servers that enable AI agents like Claude Code to interact with the application programmatically:

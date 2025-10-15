@@ -58,12 +58,12 @@
     "@xterm/xterm": "^5.5.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.2.5",
+    "@biomejs/biome": "^2.2.6",
     "@tailwindcss/postcss": "^4.1.14",
     "@tauri-apps/cli": "^1.6.3",
     "@vitest/ui": "^3.2.4",
     "autoprefixer": "^10.4.21",
-    "happy-dom": "^20.0.0",
+    "happy-dom": "^20.0.2",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.4",
     "postcss": "^8.5.6",
