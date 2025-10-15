@@ -38,9 +38,11 @@ export async function setupWorktreeForAgent(
   // Create worktrees directory if it doesn't exist
   await sendCommand(terminalId, `mkdir -p "${worktreePath}"`);
 
-  // Create git worktree (visible to user in terminal)
-  // Using HEAD to branch from current commit
-  await sendCommand(terminalId, `git worktree add "${worktreePath}" HEAD`);
+  // Create git worktree with a unique branch name
+  // This ensures proper isolation - git prevents checking out a branch
+  // that's already checked out in another worktree (including main repo)
+  const branchName = `worktree/${terminalId}`;
+  await sendCommand(terminalId, `git worktree add -b "${branchName}" "${worktreePath}" HEAD`);
 
   // Change to worktree directory
   await sendCommand(terminalId, `cd "${worktreePath}"`);
@@ -65,6 +67,15 @@ export async function setupWorktreeForAgent(
  * Note: Worktree cleanup is handled by the Rust daemon when terminals are destroyed.
  * The daemon checks if the working_dir contains ".loom/worktrees" and automatically
  * removes the worktree via `git worktree remove` and fallback `rm -rf`.
+ *
+ * IMPORTANT: The daemon must also clean up the worktree branch created for isolation.
+ * When destroying a terminal, the daemon should run:
+ *   1. `git worktree remove ${worktreePath} --force`
+ *   2. Extract terminalId from worktreePath (e.g., ".loom/worktrees/terminal-1" → "terminal-1")
+ *   3. `git branch -D worktree/${terminalId}`
+ *
+ * This ensures both the worktree directory AND the associated branch are removed,
+ * preventing branch accumulation over time.
  *
  * See loom-daemon/src/terminal.rs:destroy_terminal for implementation.
  */
