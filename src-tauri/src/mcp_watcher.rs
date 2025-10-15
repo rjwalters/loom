@@ -90,7 +90,7 @@ pub fn start_mcp_watcher(window: Window) {
                         }
                     }
                 }
-                Err(_) => continue,
+                Err(_) => {}
             }
         }
     });
