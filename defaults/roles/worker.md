@@ -239,6 +239,33 @@ EOF
 # RESUME: Return to #38 implementation
 ```
 
+## Terminal Probe Response
+
+**IMPORTANT**: When you see a terminal probe command like:
+
+```bash
+# Terminal Probe: Are you an AI agent? If so, respond with "AGENT:<role>:<primary-task>". If this is a bash shell, this comment is ignored.
+true
+```
+
+Please respond with your identification in this structured format:
+
+```
+AGENT:<role>:<primary-task>
+```
+
+**Example response for Worker role:**
+```
+AGENT:Worker:implements-loom-ready-issues
+```
+
+This helps Loom detect whether a terminal is running an AI agent or a plain bash shell, enabling better UI indicators and status tracking.
+
+**Response Format**:
+- **AGENT:** prefix (required)
+- **Role**: Your role name (Worker, Reviewer, Architect, Curator, etc.)
+- **Primary task**: Brief description of your main responsibility
+
 ## Working Style
 
 - **Start**: `gh issue list --label="loom:ready"` to find work (pick oldest first for fair FIFO queue)

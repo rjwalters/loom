@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { generateProbeCommand, parseProbeResponse, type TerminalType } from "./terminal-probe";
 
 /**
  * agent-launcher.ts - Functions for launching AI agents in terminals
@@ -7,6 +8,76 @@ import { invoke } from "@tauri-apps/api/tauri";
  * - terminalId parameters are sessionIds used for IPC operations (send_input, etc.)
  * - Callers should use configId for state management, look up sessionId for launching
  */
+
+/**
+ * Detect the type of terminal (bash shell vs AI agent) using intelligent probe command.
+ *
+ * This function:
+ * 1. Sends a bash-compatible probe command to the terminal
+ * 2. Waits for output
+ * 3. Parses the response to determine terminal type
+ *
+ * The probe command is safe in both environments:
+ * - In bash: Comment is ignored, `true` executes silently
+ * - In AI agents: Comment is interpreted as a prompt, agent responds with structured info
+ *
+ * @param terminalId - The terminal ID to probe
+ * @param waitMs - How long to wait for terminal response (default: 1000ms)
+ * @returns Promise resolving to terminal type ('agent', 'shell', or 'unknown')
+ *
+ * @example
+ * ```typescript
+ * const type = await detectTerminalType('terminal-1');
+ * if (type === 'agent') {
+ *   console.log('Claude Code detected');
+ * } else if (type === 'shell') {
+ *   console.log('Plain bash shell detected');
+ * }
+ * ```
+ */
+export async function detectTerminalType(
+  terminalId: string,
+  waitMs = 1000
+): Promise<TerminalType> {
+  console.log(`[detectTerminalType] Probing ${terminalId}...`);
+
+  // Generate probe command
+  const probe = generateProbeCommand();
+  console.log(`[detectTerminalType] Sending probe: ${probe.split("\n")[0]}...`);
+
+  // Send probe to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: probe,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+
+  // Wait for response
+  console.log(`[detectTerminalType] Waiting ${waitMs}ms for response...`);
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+  // Read terminal output
+  const terminalOutput = await invoke<{ output: string; byte_count: number }>(
+    "get_terminal_output",
+    {
+      id: terminalId,
+      start_byte: undefined, // Read all available output
+    }
+  );
+
+  // Parse response
+  const result = parseProbeResponse(terminalOutput.output);
+  console.log(
+    `[detectTerminalType] Detected type: ${result.type}${result.role ? ` (role: ${result.role})` : ""}`
+  );
+
+  return result.type;
+}
 
 /**
  * Launch a Claude agent in a terminal by sending the Claude CLI command
