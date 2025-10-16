@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -172,12 +172,11 @@ impl ActivityDb {
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
                 .with_timezone(&Utc);
 
-            let input_type = InputType::from_str(&input_type_str)
-                .ok_or_else(|| {
-                    rusqlite::Error::ToSqlConversionFailure(
-                        format!("Invalid input_type: {input_type_str}").into(),
-                    )
-                })?;
+            let input_type = InputType::from_str(&input_type_str).ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    format!("Invalid input_type: {input_type_str}").into(),
+                )
+            })?;
 
             let context: InputContext = serde_json::from_str(&context_json)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
