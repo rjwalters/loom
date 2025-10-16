@@ -77,10 +77,19 @@ jobs:
           pnpm run lint &
           pnpm run format &
           pnpm exec tsc --noEmit &
+          pnpm run test:unit &
           wait
 
       - name: Build frontend
         run: pnpm run build
+
+      - name: Upload coverage report
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 7
 
       - name: Upload build artifacts
         if: success()
