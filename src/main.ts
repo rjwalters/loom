@@ -547,6 +547,39 @@ listen("factory-reset-workspace", async () => {
   }
 });
 
+// Force Factory Reset - NO confirmation dialog (for MCP automation)
+listen("force-factory-reset-workspace", async () => {
+  if (!state.hasWorkspace()) return;
+  const workspace = state.getWorkspaceOrThrow();
+
+  console.log("[force-factory-reset-workspace] Resetting workspace (no confirmation)");
+
+  // Set loading state before reset
+  state.setResettingWorkspace(true);
+
+  try {
+    // Use the workspace reset module (no confirmation)
+    const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
+    await resetWorkspaceToDefaults(
+      workspace,
+      {
+        state,
+        outputPoller,
+        terminalManager,
+        setCurrentAttachedTerminalId: (id) => {
+          currentAttachedTerminalId = id;
+        },
+        launchAgentsForTerminals,
+        render,
+      },
+      "force-factory-reset-workspace"
+    );
+  } finally {
+    // Clear loading state when done (even if error)
+    state.setResettingWorkspace(false);
+  }
+});
+
 listen("toggle-theme", () => {
   toggleTheme();
 });
