@@ -128,13 +128,16 @@ let currentAttachedTerminalId: string | null = null;
 function render() {
   const hasWorkspace = state.hasWorkspace();
   const isResetting = state.isWorkspaceResetting();
+  const isInitializing = state.isAppInitializing();
   console.log(
     "[render] hasWorkspace:",
     hasWorkspace,
     "displayedWorkspace:",
     state.getDisplayedWorkspace(),
     "isResetting:",
-    isResetting
+    isResetting,
+    "isInitializing:",
+    isInitializing
   );
 
   // Get health data from health monitor
@@ -147,6 +150,13 @@ function render() {
     systemHealth.daemon.connected,
     systemHealth.daemon.lastPing
   );
+
+  // Show loading state if initializing
+  if (isInitializing) {
+    renderLoadingState("Initializing Loom...");
+    // Don't render terminals or workspace selector while initializing
+    return;
+  }
 
   // Show loading state if factory reset is in progress
   if (isResetting) {
@@ -288,9 +298,14 @@ async function checkDependenciesOnStartup(): Promise<boolean> {
 
 // Initialize app with auto-load workspace
 async function initializeApp() {
+  // Set initializing state to show loading UI
+  state.setInitializing(true);
+  console.log("[initializeApp] Starting initialization...");
+
   // Check dependencies first
   const hasAllDependencies = await checkDependenciesOnStartup();
   if (!hasAllDependencies) {
+    state.setInitializing(false);
     return; // Exit early if dependencies are missing
   }
 
@@ -315,6 +330,7 @@ async function initializeApp() {
         // Load workspace automatically
         console.log("[initializeApp] Loading stored workspace");
         await handleWorkspacePathInput(storedPath);
+        state.setInitializing(false);
         return;
       }
 
@@ -329,6 +345,7 @@ async function initializeApp() {
 
       if (isValid) {
         await handleWorkspacePathInput(localStorageWorkspace);
+        state.setInitializing(false);
         return;
       }
 
@@ -351,6 +368,7 @@ async function initializeApp() {
 
   // No stored workspace or validation failed - show picker
   console.log("[initializeApp] Showing workspace picker");
+  state.setInitializing(false);
   render();
 }
 
