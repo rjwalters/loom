@@ -527,9 +527,25 @@ if working_directory.contains("/.loom/worktrees/") {
 }
 ```
 
-**Manual Worktree Creation for Development**:
+**IMPORTANT: Understanding Worktree Contexts**:
 
-When working on issues manually (not through the app), **ALWAYS use the worktree helper script** instead of running git worktree commands directly:
+There are **two completely different contexts** for worktrees in Loom, and this is critical to understand:
+
+### Context 1: Agents Running Inside Loom (Normal Use)
+
+**Loom automatically creates worktrees for ALL agent terminals.** This happens during workspace start:
+
+- Each terminal gets: `.loom/worktrees/terminal-{id}` with branch `worktree/terminal-{id}`
+- Agents are launched INSIDE their worktree automatically
+- Agents should **NEVER** run `git worktree` commands themselves
+- They just work normally: `git checkout -b feature/my-branch`, make changes, commit, push
+- The worktree is their starting directory - they're already isolated
+
+**For agents**: You're already in a worktree. Just use regular git commands.
+
+### Context 2: Human Developers Working on Loom's Codebase (Dogfooding)
+
+When **human developers** (not agents) want to work on Loom issues manually outside the app, use the worktree helper script:
 
 ```bash
 # ✅ CORRECT - Use the helper script
@@ -574,28 +590,27 @@ pnpm worktree --check
 pnpm worktree --help
 ```
 
-**Common Worktree Scenarios**:
+**When to Use the Helper Script**:
+
+- **Human developers** working on Loom codebase issues manually
+- **NOT for agents** (they already have worktrees)
+- **NOT needed when using Loom itself** (it creates worktrees automatically)
+
+**Human Developer Workflow**:
 
 ```bash
-# Scenario 1: Starting work on a new issue from main
-cd /Users/rwalters/GitHub/loom  # Make sure you're in main workspace
+# 1. Starting work on issue #123 (from main workspace)
+cd /Users/rwalters/GitHub/loom
 pnpm worktree 123
 cd .loom/worktrees/issue-123
-# Now you're in an isolated worktree, safe to work
+# Work on the issue, commit, push, create PR
 
-# Scenario 2: Accidentally try to create worktree while already in one
-cd .loom/worktrees/issue-123
-pnpm worktree 456  # ❌ ERROR: Already in a worktree!
-# Helper shows you where you are and how to return to main
+# 2. Check if you're in a worktree
+pnpm worktree --check
 
-# Scenario 3: Returning to main after finishing work
-cd $(git rev-parse --show-toplevel)/../..  # Return to main workspace
+# 3. Returning to main after finishing
+cd /Users/rwalters/GitHub/loom
 git checkout main
-pnpm worktree --check  # ✅ Confirms you're back in main
-
-# Scenario 4: Existing worktree directory
-pnpm worktree 42  # ⚠️ Directory already exists
-# Helper checks if it's registered with git and guides you
 ```
 
 **Error Handling**:
@@ -609,7 +624,28 @@ The helper script provides clear guidance for common issues:
 
 **Implementation**: See `scripts/worktree.sh` for the full implementation
 
-**Benefits of This Approach**:
+**Dogfooding Confusion (Agents Working on Loom Itself)**:
+
+When agents running inside Loom work on Loom's own codebase, they're ALREADY in worktrees created by Loom. This creates confusion:
+
+- Agent is in `.loom/worktrees/terminal-5/` (created automatically by Loom)
+- Agent tries to run `pnpm worktree 42` to work on an issue
+- Script detects: "You're already in a worktree!" and prevents nested worktrees
+- **This is correct behavior** - the agent should just use normal git commands
+
+**What agents working on Loom should do**:
+```bash
+# You're already in a worktree at .loom/worktrees/terminal-{id}
+# Just create a feature branch from your current location:
+git checkout -b feature/issue-42
+# Work on the issue
+git add -A
+git commit -m "Fix issue #42"
+git push -u origin feature/issue-42
+gh pr create
+```
+
+**Benefits of Automatic Worktree System**:
 
 1. **Isolation**: Each agent has its own working directory and branch
 2. **No Conflicts**: Agents can't interfere with each other's work
