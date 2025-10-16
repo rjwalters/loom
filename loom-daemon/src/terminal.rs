@@ -90,7 +90,14 @@ impl TerminalManager {
         Ok(id)
     }
 
-    pub fn list_terminals(&self) -> Vec<TerminalInfo> {
+    pub fn list_terminals(&mut self) -> Vec<TerminalInfo> {
+        // If registry is empty but tmux sessions exist, restore from tmux
+        if self.terminals.is_empty() {
+            log::debug!("Registry empty, attempting to restore from tmux");
+            if let Err(e) = self.restore_from_tmux() {
+                log::warn!("Failed to restore terminals from tmux: {e}");
+            }
+        }
         self.terminals.values().cloned().collect()
     }
 

@@ -108,7 +108,7 @@ fn handle_request(
         }
 
         Request::ListTerminals => {
-            let tm = terminal_manager
+            let mut tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             Response::TerminalList {

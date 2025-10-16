@@ -58,6 +58,12 @@ pub fn start_mcp_watcher(window: Window) {
                                         );
                                         window.emit("factory-reset-workspace", ())
                                     }
+                                    "trigger_force_factory_reset" => {
+                                        eprintln!(
+                                            "[MCP Watcher] Emitting force-factory-reset-workspace event"
+                                        );
+                                        window.emit("force-factory-reset-workspace", ())
+                                    }
                                     _ => {
                                         eprintln!(
                                             "[MCP Watcher] Unknown command: {}",

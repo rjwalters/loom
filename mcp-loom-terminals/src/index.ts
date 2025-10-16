@@ -8,7 +8,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
-const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || "/tmp/loom-daemon.sock";
+const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(homedir(), ".loom", "loom-daemon.sock");
 const LOOM_DIR = join(homedir(), ".loom");
 const STATE_FILE = join(LOOM_DIR, "state.json");
 
@@ -86,10 +86,10 @@ async function listTerminals(): Promise<Terminal[]> {
   try {
     const response = (await sendDaemonRequest({
       type: "ListTerminals",
-    })) as { type: string; payload?: Terminal[] };
+    })) as { type: string; payload?: { terminals: Terminal[] } };
 
-    if (response.type === "TerminalList" && response.payload) {
-      return response.payload;
+    if (response.type === "TerminalList" && response.payload?.terminals) {
+      return response.payload.terminals;
     }
 
     return [];
