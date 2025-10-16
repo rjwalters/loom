@@ -47,6 +47,7 @@ jobs:
               - 'biome.json'
             rust:
               - 'src-tauri/**/*.rs'
+              - 'loom-daemon/**/*.rs'
               - 'Cargo.{toml,lock}'
             ci:
               - '.github/workflows/**'
@@ -129,7 +130,8 @@ jobs:
             libjavascriptcoregtk-4.0-dev \
             libsoup2.4-dev \
             libayatana-appindicator3-dev \
-            librsvg2-dev
+            librsvg2-dev \
+            tmux
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -142,6 +144,12 @@ jobs:
           shared-key: rust-build
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build daemon
+        run: |
+          cargo build --package loom-daemon --release
+          # Create platform-specific symlink for Tauri build script
+          ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
