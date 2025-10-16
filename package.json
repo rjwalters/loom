@@ -20,6 +20,7 @@
     "app:build": "pnpm daemon:build && pnpm tauri:build",
     "app:prod": "pnpm daemon:build && pnpm tauri:build && RUST_LOG=info ./target/release/loom-daemon & sleep 2 && ./target/release/bundle/macos/Loom.app/Contents/MacOS/Loom",
     "app:quit": "pkill -9 -f 'loom-daemon|Loom|vite|tauri' || true && rm -f ~/.loom/loom-daemon.sock",
+    "logs:clean": "rm -f /tmp/loom-*.log /tmp/app-*.log /tmp/daemon-*.log /tmp/factory-reset-*.log",
     "check": "cargo check --workspace",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
