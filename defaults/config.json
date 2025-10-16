@@ -1,5 +1,5 @@
 {
-  "nextAgentNumber": 9,
+  "nextAgentNumber": 10,
   "agents": [
     {
       "configId": "terminal-1",
@@ -36,6 +36,22 @@
     {
       "configId": "terminal-3",
       "id": "__needs_session__",
+      "name": "Triage",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "triage.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Review all loom:ready issues and update loom:urgent labels to reflect current top 3 priorities"
+      },
+      "worktreePath": "",
+      "theme": "indigo"
+    },
+    {
+      "configId": "terminal-4",
+      "id": "__needs_session__",
       "name": "Reviewer",
       "status": "idle",
       "isPrimary": false,
@@ -50,7 +66,7 @@
       "theme": "rose"
     },
     {
-      "configId": "terminal-4",
+      "configId": "terminal-5",
       "id": "__needs_session__",
       "name": "Worker 1",
       "status": "idle",
@@ -66,7 +82,7 @@
       "theme": "forest"
     },
     {
-      "configId": "terminal-5",
+      "configId": "terminal-6",
       "id": "__needs_session__",
       "name": "Worker 2",
       "status": "idle",
@@ -82,7 +98,7 @@
       "theme": "forest"
     },
     {
-      "configId": "terminal-6",
+      "configId": "terminal-7",
       "id": "__needs_session__",
       "name": "Fluffer",
       "status": "idle",
@@ -98,7 +114,7 @@
       "theme": "amber"
     },
     {
-      "configId": "terminal-7",
+      "configId": "terminal-8",
       "id": "__needs_session__",
       "name": "Critic",
       "status": "idle",
@@ -114,7 +130,7 @@
       "theme": "gray"
     },
     {
-      "configId": "terminal-8",
+      "configId": "terminal-9",
       "id": "__needs_session__",
       "name": "Worker 3",
       "status": "idle",
