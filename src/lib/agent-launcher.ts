@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
+import { generateProbeCommand, type ProbeResponse, parseProbeResponse } from "./terminal-probe";
 
 const logger = Logger.forComponent("agent-launcher");
 
@@ -10,6 +11,61 @@ const logger = Logger.forComponent("agent-launcher");
  * - terminalId parameters are sessionIds used for IPC operations (send_input, etc.)
  * - Callers should use configId for state management, look up sessionId for launching
  */
+
+/**
+ * Detect what type of process is running in a terminal
+ *
+ * Sends an intelligent probe command that works in both bash shells and AI agent sessions.
+ * The probe uses bash comments that agents interpret as prompts, while shells ignore them.
+ *
+ * This is useful for:
+ * - Verifying an agent was launched successfully
+ * - Detecting agent role and current task
+ * - Distinguishing between shells and agents
+ * - Debugging agent launch issues
+ *
+ * @param terminalId - The terminal ID to probe
+ * @param waitMs - How long to wait for response (default: 1000ms)
+ * @returns Promise resolving to the probe response with detected type and metadata
+ */
+export async function detectTerminalType(
+  terminalId: string,
+  waitMs = 1000
+): Promise<ProbeResponse> {
+  logger.info("Sending terminal probe", { terminalId, waitMs });
+
+  // Generate and send the probe command
+  const probe = generateProbeCommand();
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: `${probe}\n`,
+  });
+
+  // Wait for response
+  logger.info("Waiting for probe response", { terminalId, waitMs });
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+  // Read terminal output (try to get recent lines)
+  const output = await invoke<string>("read_terminal_output", {
+    id: terminalId,
+    lines: 10,
+  }).catch((error) => {
+    logger.error("Failed to read terminal output for probe", error, { terminalId });
+    return ""; // Empty output on error
+  });
+
+  // Parse the response
+  const result = parseProbeResponse(output);
+  logger.info("Terminal probe complete", {
+    terminalId,
+    detectedType: result.type,
+    role: result.role,
+    task: result.task,
+    outputLength: output.length,
+  });
+
+  return result;
+}
 
 /**
  * Launch a Claude agent in a terminal by sending the Claude CLI command
