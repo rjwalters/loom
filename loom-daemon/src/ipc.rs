@@ -205,6 +205,18 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
             }
         }
 
+        Request::SetWorktreePath { id, worktree_path } => {
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.set_worktree_path(&id, &worktree_path) {
+                Ok(()) => Response::Success,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);

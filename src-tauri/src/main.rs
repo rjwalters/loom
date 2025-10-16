@@ -247,6 +247,21 @@ async fn kill_session(session_name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn set_worktree_path(id: String, worktree_path: String) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::SetWorktreePath { id, worktree_path })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
 fn validate_git_repo(path: &str) -> Result<bool, String> {
     let workspace_path = Path::new(path);
 
@@ -1551,6 +1566,7 @@ fn main() {
             list_available_sessions,
             attach_to_session,
             kill_session,
+            set_worktree_path,
             get_env_var,
             check_claude_code,
             get_stored_workspace,
