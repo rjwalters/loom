@@ -1,5 +1,6 @@
 mod activity;
 mod ipc;
+mod logging;
 mod terminal;
 mod types;
 
@@ -54,7 +55,23 @@ async fn main() -> Result<()> {
     let tm = Arc::new(Mutex::new(tm));
 
     // Start IPC server
-    let server = IpcServer::new(socket_path, tm, activity_db);
+    let server = IpcServer::new(socket_path.clone(), tm, activity_db);
+
+    // Setup signal handler for graceful shutdown
+    let socket_path_clone = socket_path.clone();
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                log::info!("Received shutdown signal, cleaning up...");
+                let _ = tokio::fs::remove_file(&socket_path_clone).await;
+                log::info!("Socket cleaned up, exiting");
+                std::process::exit(0);
+            }
+            Err(err) => {
+                log::error!("Unable to listen for shutdown signal: {err}");
+            }
+        }
+    });
 
     log::info!("Loom daemon starting...");
     server.run().await?;

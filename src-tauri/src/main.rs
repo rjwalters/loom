@@ -578,6 +578,23 @@ fn check_claude_code() -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn read_text_file(path: &str) -> Result<String, String> {
+    let file_path = Path::new(path);
+
+    // Check if file exists
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {path}"));
+    }
+
+    // Check if it's a file (not a directory)
+    if !file_path.is_file() {
+        return Err(format!("Path is not a file: {path}"));
+    }
+
+    fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+#[tauri::command]
 fn write_file(path: &str, content: &str) -> Result<(), String> {
     let file_path = Path::new(path);
 
@@ -1194,6 +1211,15 @@ fn emit_menu_event(window: tauri::Window, event_name: &str) -> Result<(), String
         .map_err(|e| format!("Failed to emit event: {e}"))
 }
 
+/// Emit any event programmatically (for MCP file watcher)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn emit_event(window: tauri::Window, event: &str) -> Result<(), String> {
+    window
+        .emit(event, ())
+        .map_err(|e| format!("Failed to emit event: {e}"))
+}
+
 /// Append console log message to file for MCP access
 #[tauri::command]
 fn append_to_console_log(content: &str) -> Result<(), String> {
@@ -1578,6 +1604,7 @@ fn main() {
             write_config,
             read_state,
             write_state,
+            read_text_file,
             write_file,
             list_role_files,
             read_role_file,
@@ -1609,6 +1636,7 @@ fn main() {
             create_local_project,
             create_github_repository,
             emit_menu_event,
+            emit_event,
             append_to_console_log,
             trigger_start,
             trigger_force_start,

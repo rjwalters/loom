@@ -1,4 +1,7 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
+
+const logger = Logger.forComponent("worktree-manager");
 
 export interface GitIdentity {
   name: string;
@@ -32,49 +35,67 @@ export async function setupWorktreeForAgent(
   workspacePath: string,
   gitIdentity?: GitIdentity
 ): Promise<string> {
+  logger.info("Starting worktree setup", { terminalId, workspacePath });
+
   // Worktree path: .loom/worktrees/{terminalId}
   const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
 
-  // Create worktrees directory if it doesn't exist
-  await sendCommand(terminalId, `mkdir -p "${worktreePath}"`);
-
-  // Create git worktree with a unique branch name
-  // This ensures proper isolation - git prevents checking out a branch
-  // that's already checked out in another worktree (including main repo)
-  const branchName = `worktree/${terminalId}`;
-  await sendCommand(terminalId, `git worktree add -b "${branchName}" "${worktreePath}" HEAD`);
-
-  // Change to worktree directory
-  await sendCommand(terminalId, `cd "${worktreePath}"`);
-
-  // Configure git identity if provided
-  if (gitIdentity) {
-    await sendCommand(terminalId, `git config user.name "${gitIdentity.name}"`);
-    await sendCommand(terminalId, `git config user.email "${gitIdentity.email}"`);
-    await sendCommand(
-      terminalId,
-      `echo "✓ Git identity configured: ${gitIdentity.name} <${gitIdentity.email}>"`
-    );
-  }
-
-  // Log success message
-  await sendCommand(terminalId, `echo "✓ Worktree ready at ${worktreePath}"`);
-
-  // Notify daemon about worktree path for reference counting
   try {
-    await invoke("set_worktree_path", {
-      id: terminalId,
+    // Create worktrees directory if it doesn't exist
+    await sendCommand(terminalId, `mkdir -p "${worktreePath}"`);
+
+    // Create git worktree with a unique branch name
+    // This ensures proper isolation - git prevents checking out a branch
+    // that's already checked out in another worktree (including main repo)
+    const branchName = `worktree/${terminalId}`;
+    await sendCommand(terminalId, `git worktree add -b "${branchName}" "${worktreePath}" HEAD`);
+
+    // Change to worktree directory
+    await sendCommand(terminalId, `cd "${worktreePath}"`);
+
+    // Configure git identity if provided
+    if (gitIdentity) {
+      logger.info("Configuring git identity", {
+        terminalId,
+        gitName: gitIdentity.name,
+        gitEmail: gitIdentity.email,
+      });
+      await sendCommand(terminalId, `git config user.name "${gitIdentity.name}"`);
+      await sendCommand(terminalId, `git config user.email "${gitIdentity.email}"`);
+      await sendCommand(
+        terminalId,
+        `echo "✓ Git identity configured: ${gitIdentity.name} <${gitIdentity.email}>"`
+      );
+    }
+
+    // Log success message
+    await sendCommand(terminalId, `echo "✓ Worktree ready at ${worktreePath}"`);
+
+    // Notify daemon about worktree path for reference counting
+    try {
+      await invoke("set_worktree_path", {
+        id: terminalId,
+        worktreePath,
+      });
+      logger.info("Notified daemon about worktree", { terminalId, worktreePath });
+    } catch (error) {
+      logger.error("Failed to notify daemon about worktree path", error, {
+        terminalId,
+        worktreePath,
+      });
+      // Non-fatal - continue even if notification fails
+    }
+
+    logger.info("Worktree setup complete", { terminalId, worktreePath });
+    return worktreePath;
+  } catch (error) {
+    logger.error("Failed to setup worktree", error, {
+      terminalId,
+      workspacePath,
       worktreePath,
     });
-    console.log(
-      `[setupWorktreeForAgent] Notified daemon: terminal ${terminalId} using worktree ${worktreePath}`
-    );
-  } catch (error) {
-    console.error(`[setupWorktreeForAgent] Failed to notify daemon about worktree path:`, error);
-    // Non-fatal - continue even if notification fails
+    throw error;
   }
-
-  return worktreePath;
 }
 
 /**

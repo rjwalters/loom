@@ -111,18 +111,82 @@ healthMonitor.onHealthUpdate(() => {
 console.log("[main] Subscribed to health monitor updates");
 
 // Update timer displays every second
+let renderLoopCount = 0;
 window.setInterval(() => {
   // Re-render to update timer displays without full state change
   // This ensures busy/idle timers update in real-time
   const terminals = state.getTerminals();
   if (terminals.length > 0) {
+    renderLoopCount++;
+    console.log(
+      `[render-loop] [Phase 3] Render loop #${renderLoopCount} triggered (${terminals.length} terminals)`
+    );
     render();
   }
 }, 1000);
 console.log("[main] Timer update interval started");
 
+// =================================================================
+// MCP COMMAND FILE WATCHER - For MCP tool automation
+// =================================================================
+// Poll for MCP commands written by the MCP server
+// This enables automation of UI actions like workspace start/reset
+
+let lastMcpCommand: { command: string; timestamp: string } | null = null;
+
+async function checkMcpCommand() {
+  try {
+    const home = await homeDir();
+    const commandPath = `${home}/.loom/mcp-command.json`;
+
+    // Read command file
+    const content = await invoke<string>("read_text_file", { path: commandPath });
+    const command = JSON.parse(content) as { command: string; timestamp: string };
+
+    // Skip if we've already processed this command
+    if (lastMcpCommand && lastMcpCommand.timestamp === command.timestamp) {
+      return;
+    }
+
+    // Process new command
+    console.log(`[MCP] Processing command: ${command.command} (timestamp: ${command.timestamp})`);
+    lastMcpCommand = command;
+
+    // Emit the corresponding Tauri event
+    switch (command.command) {
+      case "trigger_start":
+        await invoke("emit_event", { event: "start-workspace" });
+        break;
+      case "trigger_force_start":
+        await invoke("emit_event", { event: "force-start-workspace" });
+        break;
+      case "trigger_factory_reset":
+        await invoke("emit_event", { event: "factory-reset-workspace" });
+        break;
+      case "trigger_force_factory_reset":
+        await invoke("emit_event", { event: "force-factory-reset-workspace" });
+        break;
+      default:
+        console.warn(`[MCP] Unknown command: ${command.command}`);
+    }
+  } catch (_error) {
+    // File doesn't exist or can't be read - this is normal when no command is pending
+    // Don't log anything to avoid noise
+  }
+}
+
+// Poll for MCP commands every 500ms
+window.setInterval(() => {
+  checkMcpCommand();
+}, 500);
+console.log("[main] MCP command watcher started");
+
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
+
+// Track which terminals have had their health checked (Phase 3: Debouncing)
+// This prevents redundant health checks during the 1-second render loop
+const healthCheckedTerminals = new Set<string>();
 
 // Render function
 function render() {
@@ -204,41 +268,65 @@ async function initializeTerminalDisplay(terminalId: string) {
     return;
   }
 
-  // Check session health before initializing
-  try {
+  // Phase 3: Skip health check if already checked (debouncing)
+  if (healthCheckedTerminals.has(terminalId)) {
     console.log(
-      `[initializeTerminalDisplay] Checking session health for terminal ${terminalId}...`
+      `[initializeTerminalDisplay] [Phase 3] Terminal ${terminalId} already health-checked, skipping redundant check (Set size: ${healthCheckedTerminals.size})`
     );
-    const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
-    console.log(
-      `[initializeTerminalDisplay] check_session_health returned: ${hasSession} for terminal ${terminalId}`
-    );
+    // Continue with xterm initialization without re-checking
+  } else {
+    // Check session health before initializing
+    try {
+      console.log(
+        `[initializeTerminalDisplay] [Phase 3] Performing NEW health check for terminal ${terminalId} (Set size before: ${healthCheckedTerminals.size})`
+      );
+      const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
+      console.log(
+        `[initializeTerminalDisplay] check_session_health returned: ${hasSession} for terminal ${terminalId}`
+      );
 
-    if (!hasSession) {
-      console.warn(`[initializeTerminalDisplay] Terminal ${terminalId} has no tmux session`);
+      if (!hasSession) {
+        console.warn(`[initializeTerminalDisplay] Terminal ${terminalId} has no tmux session`);
 
-      // Mark terminal as having missing session (only if not already marked)
-      const terminal = state.getTerminal(terminalId);
-      console.log(`[initializeTerminalDisplay] Terminal state before update:`, terminal);
-      if (terminal && !terminal.missingSession) {
+        // Mark terminal as having missing session (only if not already marked)
+        const terminal = state.getTerminal(terminalId);
+        console.log(`[initializeTerminalDisplay] Terminal state before update:`, terminal);
+        if (terminal && !terminal.missingSession) {
+          console.log(
+            `[initializeTerminalDisplay] Setting missingSession=true for terminal ${terminalId}`
+          );
+          state.updateTerminal(terminal.id, {
+            status: TerminalStatus.Error,
+            missingSession: true,
+          });
+        }
+
+        // Add to checked set even for failures to prevent repeated checks
+        healthCheckedTerminals.add(terminalId);
         console.log(
-          `[initializeTerminalDisplay] Setting missingSession=true for terminal ${terminalId}`
+          `[initializeTerminalDisplay] [Phase 3] Added ${terminalId} to healthCheckedTerminals (failed check, Set size: ${healthCheckedTerminals.size})`
         );
-        state.updateTerminal(terminal.id, {
-          status: TerminalStatus.Error,
-          missingSession: true,
-        });
+        return; // Don't create xterm instance - error UI will show instead
       }
 
-      return; // Don't create xterm instance - error UI will show instead
-    }
+      console.log(
+        `[initializeTerminalDisplay] Session health check passed for terminal ${terminalId}, proceeding with xterm initialization`
+      );
 
-    console.log(
-      `[initializeTerminalDisplay] Session health check passed for terminal ${terminalId}, proceeding with xterm initialization`
-    );
-  } catch (error) {
-    console.error(`[initializeTerminalDisplay] Failed to check session health:`, error);
-    // Continue anyway - better to try than not
+      // Add to checked set after successful health check (Phase 3: Debouncing)
+      healthCheckedTerminals.add(terminalId);
+      console.log(
+        `[initializeTerminalDisplay] [Phase 3] Added ${terminalId} to healthCheckedTerminals (passed check, Set size: ${healthCheckedTerminals.size})`
+      );
+    } catch (error) {
+      console.error(`[initializeTerminalDisplay] Failed to check session health:`, error);
+      // Add to checked set even on error to prevent retry spam
+      healthCheckedTerminals.add(terminalId);
+      console.log(
+        `[initializeTerminalDisplay] [Phase 3] Added ${terminalId} to healthCheckedTerminals (error during check, Set size: ${healthCheckedTerminals.size})`
+      );
+      // Continue anyway - better to try than not
+    }
   }
 
   // Check if terminal already exists
@@ -462,6 +550,13 @@ listen("close-workspace", async () => {
   setConfigWorkspace("");
   currentAttachedTerminalId = null;
 
+  // Phase 3: Clear health check tracking when workspace closes
+  const previousSize = healthCheckedTerminals.size;
+  healthCheckedTerminals.clear();
+  console.log(
+    `[close-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+  );
+
   // Re-render to show workspace picker
   console.log("[close-workspace] Rendering workspace picker");
   render();
@@ -487,6 +582,13 @@ listen("start-workspace", async () => {
 
   if (!confirmed) return;
 
+  // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
+  const previousSize = healthCheckedTerminals.size;
+  healthCheckedTerminals.clear();
+  console.log(
+    `[start-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+  );
+
   // Use the workspace start module (reads existing config)
   const { startWorkspaceEngine } = await import("./lib/workspace-start");
   await startWorkspaceEngine(
@@ -511,6 +613,13 @@ listen("force-start-workspace", async () => {
   const workspace = state.getWorkspaceOrThrow();
 
   console.log("[force-start-workspace] Starting engine (no confirmation)");
+
+  // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
+  const previousSize = healthCheckedTerminals.size;
+  healthCheckedTerminals.clear();
+  console.log(
+    `[force-start-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+  );
 
   // Use the workspace start module (no confirmation)
   const { startWorkspaceEngine } = await import("./lib/workspace-start");
@@ -553,6 +662,13 @@ listen("factory-reset-workspace", async () => {
 
   if (!confirmed) return;
 
+  // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
+  const previousSize = healthCheckedTerminals.size;
+  healthCheckedTerminals.clear();
+  console.log(
+    `[factory-reset-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+  );
+
   // Set loading state before reset
   state.setResettingWorkspace(true);
 
@@ -585,6 +701,13 @@ listen("force-factory-reset-workspace", async () => {
   const workspace = state.getWorkspaceOrThrow();
 
   console.log("[force-factory-reset-workspace] Resetting workspace (no confirmation)");
+
+  // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
+  const previousSize = healthCheckedTerminals.size;
+  healthCheckedTerminals.clear();
+  console.log(
+    `[force-factory-reset-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+  );
 
   // Set loading state before reset
   state.setResettingWorkspace(true);
@@ -628,26 +751,9 @@ listen("reset-zoom", () => {
   terminalManager.resetAllFontSizes();
 });
 
-listen("show-shortcuts", () => {
-  // TODO: Implement keyboard shortcuts dialog
-  alert(
-    "Keyboard Shortcuts:\n\n" +
-      "File:\n" +
-      "  Cmd+T - New Terminal\n" +
-      "  Cmd+Shift+W - Close Terminal\n" +
-      "  Cmd+W - Close Workspace\n\n" +
-      "Edit:\n" +
-      "  Cmd+C - Copy\n" +
-      "  Cmd+V - Paste\n" +
-      "  Cmd+A - Select All\n\n" +
-      "View:\n" +
-      "  Cmd+Shift+T - Toggle Theme\n" +
-      "  Cmd++ - Zoom In\n" +
-      "  Cmd+- - Zoom Out\n" +
-      "  Cmd+0 - Reset Zoom\n\n" +
-      "Help:\n" +
-      "  Cmd+/ - Show Shortcuts"
-  );
+listen("show-shortcuts", async () => {
+  const { showKeyboardShortcutsModal } = await import("./lib/keyboard-shortcuts-modal");
+  showKeyboardShortcutsModal();
 });
 
 listen("show-daemon-status", async () => {
@@ -997,6 +1103,66 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
   console.log("[launchAgentsForTerminals] Agent launch complete");
 }
 
+/**
+ * Verify terminal sessions health BEFORE rendering
+ * This prevents false positives from stale missingSession flags
+ * by batch-checking all terminals and updating state synchronously
+ */
+async function verifyTerminalSessions(): Promise<void> {
+  const terminals = state.getTerminals();
+  if (terminals.length === 0) {
+    return;
+  }
+
+  console.log(`[verifyTerminalSessions] Checking health for ${terminals.length} terminals...`);
+
+  // Batch check all terminals in parallel
+  const checks = terminals.map(async (terminal) => {
+    // Skip placeholder IDs
+    if (terminal.id === "__unassigned__" || terminal.id === "__needs_session__") {
+      return { terminal, hasSession: false };
+    }
+
+    try {
+      const hasSession = await invoke<boolean>("check_session_health", { id: terminal.id });
+      return { terminal, hasSession };
+    } catch (error) {
+      console.error(`[verifyTerminalSessions] Failed to check ${terminal.id}:`, error);
+      return { terminal, hasSession: false };
+    }
+  });
+
+  const results = await Promise.all(checks);
+
+  // Update state for all terminals based on actual session health
+  let clearedCount = 0;
+  let markedMissingCount = 0;
+
+  for (const { terminal, hasSession } of results) {
+    if (hasSession && terminal.missingSession) {
+      // Clear stale missingSession flag
+      console.log(`[verifyTerminalSessions] Clearing stale missingSession flag for ${terminal.id}`);
+      state.updateTerminal(terminal.id, {
+        status: TerminalStatus.Idle,
+        missingSession: undefined,
+      });
+      clearedCount++;
+    } else if (!hasSession && !terminal.missingSession) {
+      // Mark as missing if not already marked
+      console.log(`[verifyTerminalSessions] Marking ${terminal.id} as missing session`);
+      state.updateTerminal(terminal.id, {
+        status: TerminalStatus.Error,
+        missingSession: true,
+      });
+      markedMissingCount++;
+    }
+  }
+
+  console.log(
+    `[verifyTerminalSessions] Verification complete: ${clearedCount} cleared, ${markedMissingCount} marked missing`
+  );
+}
+
 // Reconnect terminals to daemon after loading config
 async function reconnectTerminals() {
   console.log("[reconnectTerminals] Querying daemon for active terminals...");
@@ -1295,6 +1461,9 @@ async function handleWorkspacePathInput(path: string) {
 
         // Reconnect agents to existing daemon terminals
         await reconnectTerminals();
+
+        // Verify terminal sessions health to clear any stale flags
+        await verifyTerminalSessions();
       }
     }
 
