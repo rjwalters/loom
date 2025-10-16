@@ -37,6 +37,7 @@
     "test:unit:coverage": "vitest run --coverage",
     "check:all": "pnpm lint && pnpm format:rust && pnpm clippy && pnpm check && pnpm build && pnpm test:unit",
     "check:ci": "pnpm lint && pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm build && pnpm test && pnpm test:unit",
+    "worktree": "./scripts/worktree.sh",
     "prepare": "husky"
   },
   "repository": {

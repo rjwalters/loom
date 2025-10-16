@@ -529,15 +529,85 @@ if working_directory.contains("/.loom/worktrees/") {
 
 **Manual Worktree Creation for Development**:
 
-When working on issues manually (not through the app), create worktrees using the same path pattern:
+When working on issues manually (not through the app), **ALWAYS use the worktree helper script** instead of running git worktree commands directly:
 
 ```bash
-# CORRECT - Sandbox-compatible, inside workspace
-git worktree add .loom/worktrees/issue-84 -b feature/issue-84-test-coverage main
+# ✅ CORRECT - Use the helper script
+pnpm worktree 84
 
-# WRONG - Creates directory outside workspace
-git worktree add ../loom-issue-84 -b feature/issue-84-test-coverage main
+# ✅ With custom branch name
+pnpm worktree 84 my-custom-branch
+
+# ✅ Check if you're already in a worktree
+pnpm worktree --check
+
+# ❌ WRONG - Don't run git worktree commands directly
+git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 ```
+
+**Why Use the Helper Script?**
+
+1. **Prevents Nested Worktrees**: Automatically detects if you're already in a worktree and prevents accidental nesting
+2. **Consistent Paths**: Always creates worktrees at `.loom/worktrees/issue-{number}` (sandbox-safe)
+3. **Automatic Branch Naming**: Prefixes branches with `feature/` automatically
+4. **Error Prevention**: Clear error messages instead of cryptic git errors
+5. **Safety Checks**: Validates issue numbers, checks for existing directories, handles existing branches
+
+**Worktree Helper Usage**:
+
+```bash
+# Basic usage - creates worktree for issue #42
+pnpm worktree 42
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/issue-42
+
+# Custom branch name
+pnpm worktree 42 fix-critical-bug
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/fix-critical-bug
+
+# Check current worktree status
+pnpm worktree --check
+# → Shows: Current worktree path and branch (or confirms you're in main)
+
+# Show help
+pnpm worktree --help
+```
+
+**Common Worktree Scenarios**:
+
+```bash
+# Scenario 1: Starting work on a new issue from main
+cd /Users/rwalters/GitHub/loom  # Make sure you're in main workspace
+pnpm worktree 123
+cd .loom/worktrees/issue-123
+# Now you're in an isolated worktree, safe to work
+
+# Scenario 2: Accidentally try to create worktree while already in one
+cd .loom/worktrees/issue-123
+pnpm worktree 456  # ❌ ERROR: Already in a worktree!
+# Helper shows you where you are and how to return to main
+
+# Scenario 3: Returning to main after finishing work
+cd $(git rev-parse --show-toplevel)/../..  # Return to main workspace
+git checkout main
+pnpm worktree --check  # ✅ Confirms you're back in main
+
+# Scenario 4: Existing worktree directory
+pnpm worktree 42  # ⚠️ Directory already exists
+# Helper checks if it's registered with git and guides you
+```
+
+**Error Handling**:
+
+The helper script provides clear guidance for common issues:
+
+- **Already in a worktree**: Shows current worktree info and instructions to return to main
+- **Directory exists**: Checks if it's a valid worktree or needs cleanup
+- **Branch exists**: Prompts whether to use existing branch or create new one
+- **Invalid issue number**: Rejects non-numeric input with usage help
+
+**Implementation**: See `scripts/worktree.sh` for the full implementation
 
 **Benefits of This Approach**:
 
