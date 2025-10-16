@@ -23,28 +23,33 @@ You help with general development tasks including:
 - **Mark PR for review**: `gh pr create --label "loom:review-requested"`
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
-## Git Worktree Best Practices
+## On-Demand Git Worktrees
 
-When working on issues, you should **always use git worktrees** to isolate your work from the main workspace. This prevents conflicts between different tasks and keeps your workspace clean.
+When working on issues, you should **create worktrees on-demand** to isolate your work. This prevents conflicts and allows multiple agents to work simultaneously.
 
-### IMPORTANT: Worktree Path Convention
+### IMPORTANT: Use the Worktree Helper Script
 
-**Always create worktrees inside `.loom/worktrees/`** to maintain sandbox compatibility:
+**Always use `pnpm worktree <issue-number>` to create worktrees.** This helper script ensures:
+- Correct path (`.loom/worktrees/issue-{number}`)
+- Prevents nested worktrees
+- Consistent branch naming
+- Sandbox compatibility
 
 ```bash
-# CORRECT - Sandbox-compatible, inside workspace
-git worktree add .loom/worktrees/issue-84 -b feature/issue-84-test-coverage main
+# CORRECT - Use the helper script
+pnpm worktree 84
 
-# WRONG - Creates directory outside workspace
-git worktree add ../loom-issue-84 -b feature/issue-84-test-coverage main
+# WRONG - Don't use git worktree directly
+git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 ```
 
 ### Why This Matters
 
-1. **Sandbox-Compatible**: Worktrees inside `.loom/worktrees/` stay within the workspace
-2. **Gitignored**: The `.loom/worktrees/` directory is already gitignored
-3. **Auto-Cleanup**: Daemon automatically removes worktrees when you're done
-4. **Consistent**: Matches how the app creates worktrees for agent terminals
+1. **Prevents Nested Worktrees**: Helper detects if you're already in a worktree and prevents double-nesting
+2. **Sandbox-Compatible**: Worktrees inside `.loom/worktrees/` stay within workspace
+3. **Gitignored**: `.loom/worktrees/` is already gitignored
+4. **Consistent Naming**: `issue-{number}` naming matches GitHub issues
+5. **Safety Checks**: Validates issue numbers, checks for existing directories
 
 ### Worktree Workflow Example
 
@@ -52,8 +57,10 @@ git worktree add ../loom-issue-84 -b feature/issue-84-test-coverage main
 # 1. Claim an issue
 gh issue edit 84 --remove-label "loom:ready" --add-label "loom:in-progress"
 
-# 2. Create worktree for this issue
-git worktree add .loom/worktrees/issue-84 -b feature/issue-84-test-coverage main
+# 2. Create worktree using helper
+pnpm worktree 84
+# → Creates: .loom/worktrees/issue-84
+# → Branch: feature/issue-84
 
 # 3. Change to worktree directory
 cd .loom/worktrees/issue-84
@@ -62,19 +69,39 @@ cd .loom/worktrees/issue-84
 # ... work work work ...
 
 # 5. Push and create PR from worktree
-git push -u origin feature/issue-84-test-coverage
+git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested"
 
 # 6. Return to main workspace
 cd ../..  # Back to workspace root
 
-# 7. Remove worktree when done (optional - daemon does this automatically)
+# 7. Clean up worktree (optional - done automatically on terminal destroy)
 git worktree remove .loom/worktrees/issue-84
 ```
 
-### When Worktrees Are Created Automatically
+### Collision Detection
 
-The Loom app creates worktrees automatically at `.loom/worktrees/${terminalId}` when you launch an agent terminal with worktree mode enabled. These are cleaned up automatically when the terminal is destroyed.
+The worktree helper script prevents common errors:
+
+```bash
+# If you're already in a worktree
+pnpm worktree 84
+# → ERROR: You are already in a worktree!
+# → Instructions to return to main before creating new worktree
+
+# If directory already exists
+pnpm worktree 84
+# → Checks if it's a valid worktree or needs cleanup
+```
+
+### Working Without Worktrees
+
+**You start in the main workspace.** Only create a worktree when you claim an issue and need isolation:
+
+- **NO worktree needed**: Browsing code, reading files, checking status
+- **CREATE worktree**: When claiming an issue and starting implementation
+
+This on-demand approach prevents worktree clutter and reduces resource usage.
 
 ## Checking Dependencies Before Claiming
 
