@@ -923,55 +923,49 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
         const { launchGrokAgent } = await import("./lib/agent-launcher");
         await launchGrokAgent(terminal.id);
       } else if (workerType === "codex") {
-        // Codex with worktree support
+        // Codex with worktree support (optional - starts in main workspace if empty)
         console.log(`[launchAgentsForTerminals] Launching Codex for ${terminal.name}...`);
         const { launchCodexAgent } = await import("./lib/agent-launcher");
 
-        // Verify worktreePath exists
-        if (!terminal.worktreePath) {
-          throw new Error(
-            `Terminal ${terminal.name} (${terminal.id}) is missing worktreePath - this should have been created during terminal setup`
-          );
-        }
-
+        // Use worktree path if available, otherwise main workspace
+        const locationDesc = terminal.worktreePath
+          ? `worktree ${terminal.worktreePath}`
+          : "main workspace";
         console.log(
-          `[launchAgentsForTerminals] Launching Codex agent for ${terminal.name} (id=${terminal.id}) in worktree ${terminal.worktreePath}...`
+          `[launchAgentsForTerminals] Launching Codex agent for ${terminal.name} (id=${terminal.id}) in ${locationDesc}...`
         );
 
-        // Launch Codex agent using existing worktree
+        // Launch Codex agent (will use main workspace if worktreePath is empty)
         await launchCodexAgent(
           terminal.id,
           roleConfig.roleFile as string,
           workspacePath,
-          terminal.worktreePath
+          terminal.worktreePath || ""
         );
 
-        console.log(`[launchAgentsForTerminals] Codex agent launched in ${terminal.worktreePath}`);
+        console.log(`[launchAgentsForTerminals] Codex agent launched in ${locationDesc}`);
       } else {
-        // Claude with worktree support
+        // Claude with worktree support (optional - starts in main workspace if empty)
         console.log(`[launchAgentsForTerminals] Importing agent-launcher for ${terminal.name}...`);
         const { launchAgentInTerminal } = await import("./lib/agent-launcher");
 
-        // Verify worktreePath exists (should have been created during terminal creation)
-        if (!terminal.worktreePath) {
-          throw new Error(
-            `Terminal ${terminal.name} (${terminal.id}) is missing worktreePath - this should have been created during terminal setup`
-          );
-        }
-
+        // Use worktree path if available, otherwise main workspace
+        const locationDesc = terminal.worktreePath
+          ? `worktree ${terminal.worktreePath}`
+          : "main workspace";
         console.log(
-          `[launchAgentsForTerminals] Launching agent for ${terminal.name} (id=${terminal.id}) in worktree ${terminal.worktreePath}...`
+          `[launchAgentsForTerminals] Launching agent for ${terminal.name} (id=${terminal.id}) in ${locationDesc}...`
         );
 
-        // Launch agent using existing worktree
+        // Launch agent (will use main workspace if worktreePath is empty)
         await launchAgentInTerminal(
           terminal.id,
           roleConfig.roleFile as string,
           workspacePath,
-          terminal.worktreePath
+          terminal.worktreePath || ""
         );
 
-        console.log(`[launchAgentsForTerminals] Agent launched in ${terminal.worktreePath}`);
+        console.log(`[launchAgentsForTerminals] Agent launched in ${locationDesc}`);
       }
 
       console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
