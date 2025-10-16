@@ -1,0 +1,53 @@
+{
+  "nextAgentNumber": 4,
+  "agents": [
+    {
+      "configId": "terminal-1",
+      "id": "__needs_session__",
+      "name": "Shell",
+      "status": "idle",
+      "isPrimary": true,
+      "role": "default",
+      "roleConfig": {
+        "workerType": "none",
+        "roleFile": "default.md",
+        "targetInterval": 0,
+        "intervalPrompt": ""
+      },
+      "worktreePath": "",
+      "theme": "gray"
+    },
+    {
+      "configId": "terminal-2",
+      "id": "__needs_session__",
+      "name": "Worker",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "worker.md",
+        "targetInterval": 0,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "worktreePath": "",
+      "theme": "forest"
+    },
+    {
+      "configId": "terminal-3",
+      "id": "__needs_session__",
+      "name": "Reviewer",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "reviewer.md",
+        "targetInterval": 0,
+        "intervalPrompt": "Find and review PRs with loom:review-requested label"
+      },
+      "worktreePath": "",
+      "theme": "rose"
+    }
+  ]
+}
