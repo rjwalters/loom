@@ -81,7 +81,7 @@ impl DaemonClient {
     pub fn new() -> Result<Self> {
         let socket_path = dirs::home_dir()
             .ok_or_else(|| anyhow!("No home directory"))?
-            .join(".loom/daemon.sock");
+            .join(".loom/loom-daemon.sock");
 
         Ok(Self { socket_path })
     }

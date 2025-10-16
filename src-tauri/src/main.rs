@@ -172,7 +172,7 @@ struct DaemonStatus {
 #[tauri::command]
 async fn get_daemon_status() -> DaemonStatus {
     let socket_path = dirs::home_dir()
-        .map(|h| h.join(".loom/daemon.sock"))
+        .map(|h| h.join(".loom/loom-daemon.sock"))
         .map_or_else(|| "Unknown".to_string(), |p| p.display().to_string());
 
     match DaemonClient::new() {
