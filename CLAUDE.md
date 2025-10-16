@@ -794,7 +794,23 @@ If this passes, CI should pass too.
 
 **Package Manager Preference**: Always use `pnpm` (not `npm`) as the package manager for this project.
 
-**Development Workflow**: See "Self-Modification Problem" section below for important guidance on which app mode to use.
+**Development Workflow**:
+
+Use the appropriate script based on your scenario:
+
+- **`pnpm app:dev`**: Normal development with hot reload (fastest iteration)
+  - Use when: Making frequent frontend changes
+  - Caveat: Hot reload sometimes misses changes (see "Stale Code Issue" below)
+
+- **`pnpm app:preview`**: Complete rebuild + launch (recommended for testing)
+  - Use when: After pulling new code, switching branches, or hot reload misses changes
+  - Always rebuilds both frontend AND Tauri binary before launching
+  - This is the "safe" option that guarantees fresh code
+
+- **`pnpm app:build`**: Production build
+  - Use when: Creating release builds
+
+**Stale Code Issue**: If you pull new code or switch branches, run `pnpm app:preview` to ensure you're running the latest code. The `tauri dev` command caches the built frontend and hot reload doesn't always catch everything, leading to wasted debugging time.
 
 ### Clippy Configuration Details
 
