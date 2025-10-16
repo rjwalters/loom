@@ -151,6 +151,39 @@ jobs:
           # Create platform-specific symlink for Tauri build script
           ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
 
+      - name: Verify tmux socket consistency (Issue #144 regression check)
+        run: |
+          echo "Checking that all tmux commands use -L loom socket..."
+          # Find all tmux command invocations in main.rs
+          TMUX_COMMANDS=$(grep -n 'Command::new("tmux")' src-tauri/src/main.rs || true)
+
+          if [ -z "$TMUX_COMMANDS" ]; then
+            echo "✅ No tmux commands found (expected if tmux usage removed)"
+            exit 0
+          fi
+
+          # Check each tmux command has -L loom flag within next 3 lines
+          MISSING_SOCKET=0
+          while IFS= read -r line; do
+            LINE_NUM=$(echo "$line" | cut -d':' -f1)
+            CONTEXT=$(sed -n "${LINE_NUM},$((LINE_NUM+3))p" src-tauri/src/main.rs)
+
+            if ! echo "$CONTEXT" | grep -q '"-L".*"loom"'; then
+              echo "❌ Missing -L loom flag near line $LINE_NUM:"
+              echo "$CONTEXT"
+              MISSING_SOCKET=$((MISSING_SOCKET+1))
+            fi
+          done <<< "$TMUX_COMMANDS"
+
+          if [ $MISSING_SOCKET -gt 0 ]; then
+            echo ""
+            echo "❌ Found $MISSING_SOCKET tmux command(s) without -L loom flag"
+            echo "All tmux commands MUST use -L loom to avoid socket mismatch (see Issue #144, PR #172)"
+            exit 1
+          fi
+
+          echo "✅ All tmux commands correctly use -L loom socket"
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
