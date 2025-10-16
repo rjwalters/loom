@@ -64,6 +64,20 @@ pub struct AgentInput {
     pub context: InputContext,
 }
 
+/// Agent output record (terminal output sample)
+#[derive(Debug, Clone)]
+pub struct AgentOutput {
+    #[allow(dead_code)]
+    pub id: Option<i64>,
+    pub input_id: Option<i64>,
+    pub terminal_id: String,
+    pub timestamp: DateTime<Utc>,
+    pub content: Option<String>,
+    pub content_preview: Option<String>,
+    pub exit_code: Option<i32>,
+    pub metadata: Option<String>,
+}
+
 impl ActivityDb {
     /// Create or open activity database at the given path
     pub fn new(db_path: PathBuf) -> Result<Self> {
@@ -90,6 +104,21 @@ impl ActivityDb {
             CREATE INDEX IF NOT EXISTS idx_inputs_terminal_id ON agent_inputs(terminal_id);
             CREATE INDEX IF NOT EXISTS idx_inputs_timestamp ON agent_inputs(timestamp);
             CREATE INDEX IF NOT EXISTS idx_inputs_type ON agent_inputs(input_type);
+
+            CREATE TABLE IF NOT EXISTS agent_outputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                terminal_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                content TEXT,
+                content_preview TEXT,
+                exit_code INTEGER,
+                metadata TEXT
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_outputs_input_id ON agent_outputs(input_id);
+            CREATE INDEX IF NOT EXISTS idx_outputs_terminal_id ON agent_outputs(terminal_id);
+            CREATE INDEX IF NOT EXISTS idx_outputs_timestamp ON agent_outputs(timestamp);
 
             CREATE TABLE IF NOT EXISTS agent_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,6 +172,27 @@ impl ActivityDb {
                 &input.content,
                 &input.agent_role,
                 &context_json,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record terminal output sample
+    pub fn record_output(&self, output: &AgentOutput) -> Result<i64> {
+        self.conn.execute(
+            r"
+            INSERT INTO agent_outputs (input_id, terminal_id, timestamp, content, content_preview, exit_code, metadata)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                output.input_id,
+                &output.terminal_id,
+                output.timestamp.to_rfc3339(),
+                &output.content,
+                &output.content_preview,
+                output.exit_code,
+                &output.metadata,
             ],
         )?;
 
@@ -276,6 +326,48 @@ mod tests {
 
         let count = db.get_input_count()?;
         assert_eq!(count, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_output() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "ls -la".to_string(),
+            agent_role: Some("worker".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Now record an output linked to that input
+        let output_content = "total 48\ndrwxr-xr-x  8 user  staff  256 Oct 16 00:00 .\n";
+        let output = AgentOutput {
+            id: None,
+            input_id: Some(input_id),
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            content: Some(output_content.to_string()),
+            content_preview: Some(output_content[..50.min(output_content.len())].to_string()),
+            exit_code: Some(0),
+            metadata: None,
+        };
+
+        let output_id = db.record_output(&output)?;
+        assert!(output_id > 0);
+
+        // Verify output was recorded by querying directly
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_outputs", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+
         Ok(())
     }
 }
