@@ -342,6 +342,15 @@ export class AppState {
       }
       this.addTerminal(agent);
     });
+
+    // If no terminal was marked as primary, make the first one primary
+    if (!this.primaryId && this.order.length > 0) {
+      const firstId = this.order[0];
+      console.log(
+        `[loadAgents] No primary terminal set, making first terminal primary: ${firstId}`
+      );
+      this.setPrimary(firstId);
+    }
   }
 
   clearAll(): void {

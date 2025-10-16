@@ -223,12 +223,32 @@ export async function loadState(): Promise<LoomState> {
 
 /**
  * Save state to .loom/state.json
+ * Sanitizes runtime-only flags that shouldn't persist across restarts
  */
 export async function saveState(state: LoomState): Promise<void> {
   try {
     const workspacePath = assertWorkspace();
 
-    const contents = JSON.stringify(state, null, 2);
+    // Strip runtime-only flags before persisting
+    // missingSession is a runtime status indicator that should be re-evaluated on startup
+    const sanitized: LoomState = {
+      ...state,
+      terminals: state.terminals.map((terminal) => {
+        // Remove missingSession if present (defensive - splitTerminals should already exclude it)
+        const { missingSession, ...rest } = terminal as TerminalState & {
+          missingSession?: boolean;
+        };
+
+        // Also reset error status if it was only due to missing session
+        if (rest.status === TerminalStatus.Error && missingSession) {
+          return { ...rest, status: TerminalStatus.Idle };
+        }
+
+        return rest;
+      }),
+    };
+
+    const contents = JSON.stringify(sanitized, null, 2);
     await invoke("write_state", {
       workspacePath,
       stateJson: contents,
