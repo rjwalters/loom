@@ -60,6 +60,7 @@ export class AppState {
   private displayedWorkspacePath: string = ""; // Path shown in input (may be invalid)
   private nextTerminalNumber: number = 1; // Counter for terminal numbering (always increments)
   private isResettingWorkspace: boolean = false; // Loading state during factory reset
+  private isInitializing: boolean = false; // Loading state during app startup
 
   addTerminal(terminal: Terminal): void {
     this.terminals.set(terminal.id, terminal);
@@ -303,6 +304,15 @@ export class AppState {
 
   isWorkspaceResetting(): boolean {
     return this.isResettingWorkspace;
+  }
+
+  setInitializing(isInitializing: boolean): void {
+    this.isInitializing = isInitializing;
+    this.notify();
+  }
+
+  isAppInitializing(): boolean {
+    return this.isInitializing;
   }
 
   getNextTerminalNumber(): number {
