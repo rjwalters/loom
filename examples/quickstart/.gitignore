@@ -1,0 +1,22 @@
+# Loom working directories
+.loom/worktrees/
+.loom/state.json
+
+# Logs
+*.log
+
+# Node modules (if using)
+node_modules/
+
+# Build outputs
+dist/
+build/
+target/
+
+# Environment files
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db

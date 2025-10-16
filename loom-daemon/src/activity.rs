@@ -27,6 +27,7 @@ impl InputType {
         }
     }
 
+    #[allow(dead_code)]
     fn from_str(s: &str) -> Option<Self> {
         match s {
             "manual" => Some(Self::Manual),
@@ -53,6 +54,7 @@ pub struct InputContext {
 /// Agent input record
 #[derive(Debug, Clone)]
 pub struct AgentInput {
+    #[allow(dead_code)]
     pub id: Option<i64>,
     pub terminal_id: String,
     pub timestamp: DateTime<Utc>,
@@ -74,7 +76,7 @@ impl ActivityDb {
     /// Initialize database schema
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS agent_inputs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 terminal_id TEXT NOT NULL,
@@ -119,7 +121,7 @@ impl ActivityDb {
                 FOREIGN KEY(input_id) REFERENCES agent_inputs(id),
                 PRIMARY KEY(task_id, input_id)
             );
-            "#,
+            ",
         )?;
 
         Ok(())
@@ -130,10 +132,10 @@ impl ActivityDb {
         let context_json = serde_json::to_string(&input.context)?;
 
         self.conn.execute(
-            r#"
+            r"
             INSERT INTO agent_inputs (terminal_id, timestamp, input_type, content, agent_role, context)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-            "#,
+            ",
             params![
                 &input.terminal_id,
                 input.timestamp.to_rfc3339(),
@@ -148,15 +150,16 @@ impl ActivityDb {
     }
 
     /// Get recent inputs for a terminal
+    #[allow(dead_code)]
     pub fn get_recent_inputs(&self, terminal_id: &str, limit: usize) -> Result<Vec<AgentInput>> {
         let mut stmt = self.conn.prepare(
-            r#"
+            r"
             SELECT id, terminal_id, timestamp, input_type, content, agent_role, context
             FROM agent_inputs
             WHERE terminal_id = ?1
             ORDER BY timestamp DESC
             LIMIT ?2
-            "#,
+            ",
         )?;
 
         let inputs = stmt.query_map(params![terminal_id, limit], |row| {
@@ -166,7 +169,7 @@ impl ActivityDb {
             let input_type_str: String = row.get(3)?;
             let content: String = row.get(4)?;
             let agent_role: Option<String> = row.get(5)?;
-            let context_json: String = row.get(6)?;
+            let ctx_json: String = row.get(6)?;
 
             let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
@@ -178,7 +181,7 @@ impl ActivityDb {
                 )
             })?;
 
-            let context: InputContext = serde_json::from_str(&context_json)
+            let ctx: InputContext = serde_json::from_str(&ctx_json)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
 
             Ok(AgentInput {
@@ -188,7 +191,7 @@ impl ActivityDb {
                 input_type,
                 content,
                 agent_role,
-                context,
+                context: ctx,
             })
         })?;
 
@@ -196,6 +199,7 @@ impl ActivityDb {
     }
 
     /// Get total count of inputs
+    #[allow(dead_code)]
     pub fn get_input_count(&self) -> Result<i64> {
         let count: i64 = self
             .conn
@@ -210,19 +214,20 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_create_database() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let db = ActivityDb::new(temp_file.path().to_path_buf()).unwrap();
+    fn test_create_database() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
         // Verify schema created successfully
-        let count = db.get_input_count().unwrap();
+        let count = db.get_input_count()?;
         assert_eq!(count, 0);
+        Ok(())
     }
 
     #[test]
-    fn test_record_and_retrieve_input() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let db = ActivityDb::new(temp_file.path().to_path_buf()).unwrap();
+    fn test_record_and_retrieve_input() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
         let input = AgentInput {
             id: None,
@@ -238,19 +243,20 @@ mod tests {
             },
         };
 
-        let id = db.record_input(&input).unwrap();
+        let id = db.record_input(&input)?;
         assert!(id > 0);
 
-        let inputs = db.get_recent_inputs("terminal-1", 10).unwrap();
+        let inputs = db.get_recent_inputs("terminal-1", 10)?;
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].content, "ls -la");
         assert_eq!(inputs[0].agent_role, Some("worker".to_string()));
+        Ok(())
     }
 
     #[test]
-    fn test_multiple_inputs() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let db = ActivityDb::new(temp_file.path().to_path_buf()).unwrap();
+    fn test_multiple_inputs() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
         for i in 0..5 {
             let input = AgentInput {
@@ -262,13 +268,14 @@ mod tests {
                 agent_role: Some("worker".to_string()),
                 context: InputContext::default(),
             };
-            db.record_input(&input).unwrap();
+            db.record_input(&input)?;
         }
 
-        let inputs = db.get_recent_inputs("terminal-1", 3).unwrap();
+        let inputs = db.get_recent_inputs("terminal-1", 3)?;
         assert_eq!(inputs.len(), 3);
 
-        let count = db.get_input_count().unwrap();
+        let count = db.get_input_count()?;
         assert_eq!(count, 5);
+        Ok(())
     }
 }
