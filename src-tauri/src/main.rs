@@ -15,6 +15,22 @@ mod mcp_watcher;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
+// Helper structs for JSON parsing (defined at top level to avoid clippy::items_after_statements)
+#[derive(serde::Deserialize)]
+struct GhLabel {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GhIssue {
+    number: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct GhPr {
+    number: u32,
+}
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {name}! Welcome to Loom.")
@@ -774,14 +790,7 @@ fn check_github_remote() -> Result<bool, String> {
 #[tauri::command]
 fn check_label_exists(name: &str) -> Result<bool, String> {
     let output = Command::new("gh")
-        .args([
-            "label",
-            "list",
-            "--json",
-            "name",
-            "--jq",
-            &format!(".[].name | select(. == \"{name}\")"),
-        ])
+        .args(["label", "list", "--json", "name"])
         .output()
         .map_err(|e| format!("Failed to run gh label list: {e}"))?;
 
@@ -790,8 +799,11 @@ fn check_label_exists(name: &str) -> Result<bool, String> {
         return Err(format!("gh label list failed: {stderr}"));
     }
 
-    let result = String::from_utf8_lossy(&output.stdout);
-    Ok(!result.trim().is_empty())
+    // Parse JSON in Rust instead of using jq to prevent injection
+    let labels: Vec<GhLabel> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Failed to parse label JSON: {e}"))?;
+
+    Ok(labels.iter().any(|l| l.name == name))
 }
 
 /// Create a GitHub label
@@ -870,24 +882,23 @@ fn reset_github_labels() -> Result<LabelResetResult, String> {
             "open",
             "--json",
             "number",
-            "--jq",
-            ".[].number",
         ])
         .output()
         .map_err(|e| format!("Failed to list issues: {e}"))?;
 
     if issues_output.status.success() {
-        let issue_numbers = String::from_utf8_lossy(&issues_output.stdout);
-        for issue_num in issue_numbers.lines() {
-            if issue_num.trim().is_empty() {
-                continue;
-            }
+        // Parse JSON in Rust instead of using jq to prevent injection
+        let issues: Vec<GhIssue> = serde_json::from_slice(&issues_output.stdout)
+            .map_err(|e| format!("Failed to parse issue JSON: {e}"))?;
+
+        for issue in issues {
+            let issue_num = issue.number.to_string();
 
             let remove_output = Command::new("gh")
                 .args([
                     "issue",
                     "edit",
-                    issue_num,
+                    &issue_num,
                     "--remove-label",
                     "loom:in-progress",
                 ])
@@ -917,24 +928,23 @@ fn reset_github_labels() -> Result<LabelResetResult, String> {
             "open",
             "--json",
             "number",
-            "--jq",
-            ".[].number",
         ])
         .output()
         .map_err(|e| format!("Failed to list PRs: {e}"))?;
 
     if prs_output.status.success() {
-        let pr_numbers = String::from_utf8_lossy(&prs_output.stdout);
-        for pr_num in pr_numbers.lines() {
-            if pr_num.trim().is_empty() {
-                continue;
-            }
+        // Parse JSON in Rust instead of using jq to prevent injection
+        let prs: Vec<GhPr> = serde_json::from_slice(&prs_output.stdout)
+            .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+
+        for pr in prs {
+            let pr_num = pr.number.to_string();
 
             let edit_output = Command::new("gh")
                 .args([
                     "pr",
                     "edit",
-                    pr_num,
+                    &pr_num,
                     "--remove-label",
                     "loom:reviewing",
                     "--add-label",
