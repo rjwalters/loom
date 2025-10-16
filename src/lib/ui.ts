@@ -58,6 +58,27 @@ function extractRepoName(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/**
+ * Render loading state during factory reset
+ */
+export function renderLoadingState(message: string = "Resetting workspace..."): void {
+  const container = document.getElementById("primary-terminal");
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+      <div class="flex flex-col items-center gap-4">
+        <div class="relative">
+          <div class="w-16 h-16 border-4 border-blue-200 dark:border-blue-900 rounded-full"></div>
+          <div class="absolute top-0 left-0 w-16 h-16 border-4 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+        <p class="text-lg font-medium text-gray-700 dark:text-gray-300">${escapeHtml(message)}</p>
+        <p class="text-sm text-gray-500 dark:text-gray-400">This may take a few moments...</p>
+      </div>
+    </div>
+  `;
+}
+
 export function renderPrimaryTerminal(
   terminal: Terminal | null,
   hasWorkspace: boolean,
