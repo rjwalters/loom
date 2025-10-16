@@ -329,6 +329,55 @@ export function renderMiniTerminals(
   `;
 }
 
+/**
+ * Create timer display HTML for busy/idle time tracking
+ */
+function createTimerDisplayHTML(terminal: Terminal): string {
+  // Initialize timers if not present
+  const busyTime = terminal.busyTime || 0;
+  const idleTime = terminal.idleTime || 0;
+  const lastStateChange = terminal.lastStateChange || Date.now();
+  const now = Date.now();
+
+  // Calculate current delta based on current status
+  let currentBusyTime = busyTime;
+  let currentIdleTime = idleTime;
+
+  if (terminal.lastStateChange) {
+    const delta = now - lastStateChange;
+    if (terminal.status === TerminalStatus.Busy) {
+      currentBusyTime += delta;
+    } else if (terminal.status === TerminalStatus.Idle) {
+      currentIdleTime += delta;
+    }
+  }
+
+  // Format the durations
+  const busyDisplay = formatDuration(currentBusyTime);
+  const idleDisplay = formatDuration(currentIdleTime);
+
+  // Choose colors based on status
+  const busyColor = terminal.status === TerminalStatus.Busy
+    ? "text-blue-600 dark:text-blue-400 font-semibold"
+    : "text-gray-500 dark:text-gray-400";
+  const idleColor = terminal.status === TerminalStatus.Idle
+    ? "text-gray-600 dark:text-gray-300 font-semibold"
+    : "text-gray-500 dark:text-gray-400";
+
+  return `
+    <div class="flex flex-col gap-0.5 mt-1 border-t border-gray-200 dark:border-gray-700 pt-1">
+      <div class="flex items-center justify-between ${busyColor}" data-tooltip="Time spent actively running commands" data-tooltip-position="top">
+        <span>⏱️ Busy:</span>
+        <span class="font-mono text-xs">${busyDisplay}</span>
+      </div>
+      <div class="flex items-center justify-between ${idleColor}" data-tooltip="Time spent waiting at prompt" data-tooltip-position="top">
+        <span>💤 Idle:</span>
+        <span class="font-mono text-xs">${idleDisplay}</span>
+      </div>
+    </div>
+  `;
+}
+
 function createMiniTerminalHTML(
   terminal: Terminal,
   index: number,
@@ -396,6 +445,7 @@ function createMiniTerminalHTML(
             <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
           </div>
           ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
+          ${createTimerDisplayHTML(terminal)}
         </div>
         </div>
       </div>

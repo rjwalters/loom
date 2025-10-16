@@ -45,6 +45,10 @@ export interface Terminal {
   agentStatus?: AgentStatus; // Agent state machine
   lastIntervalRun?: number; // Timestamp (ms)
   pendingInputRequests?: InputRequest[]; // Queue of input requests
+  // Timer tracking fields
+  busyTime?: number; // Total milliseconds spent in busy state
+  idleTime?: number; // Total milliseconds spent in idle state
+  lastStateChange?: number; // Timestamp (ms) of last status change
 }
 
 export class AppState {
@@ -117,6 +121,42 @@ export class AppState {
     }
   }
 
+  updateTerminalStatus(id: string, newStatus: TerminalStatus): void {
+    const terminal = this.terminals.get(id);
+    if (!terminal) {
+      return;
+    }
+
+    const now = Date.now();
+    const oldStatus = terminal.status;
+
+    // Only process timer updates if status actually changed
+    if (oldStatus !== newStatus && terminal.lastStateChange) {
+      const elapsed = now - terminal.lastStateChange;
+
+      // Add elapsed time to the appropriate counter
+      if (oldStatus === TerminalStatus.Busy) {
+        terminal.busyTime = (terminal.busyTime || 0) + elapsed;
+      } else if (oldStatus === TerminalStatus.Idle) {
+        terminal.idleTime = (terminal.idleTime || 0) + elapsed;
+      }
+    }
+
+    // Update status and timestamp
+    terminal.status = newStatus;
+    terminal.lastStateChange = now;
+
+    // Initialize timers if this is the first state change
+    if (terminal.busyTime === undefined) {
+      terminal.busyTime = 0;
+    }
+    if (terminal.idleTime === undefined) {
+      terminal.idleTime = 0;
+    }
+
+    this.notify();
+  }
+
   setTerminalRole(
     id: string,
     role: string | undefined,
@@ -163,6 +203,25 @@ export class AppState {
     return this.primaryId ? this.terminals.get(this.primaryId) || null : null;
   }
 
+  /**
+   * Check if a primary terminal exists
+   */
+  hasPrimary(): boolean {
+    return this.primaryId !== null && this.terminals.has(this.primaryId);
+  }
+
+  /**
+   * Get primary terminal or throw error if none exists
+   * Use this when you're certain a primary must exist (e.g., after validation)
+   */
+  getPrimaryOrThrow(): Terminal {
+    const primary = this.getPrimary();
+    if (!primary) {
+      throw new Error("No primary terminal available");
+    }
+    return primary;
+  }
+
   getTerminals(): Terminal[] {
     // Return terminals in display order
     return this.order
@@ -205,6 +264,24 @@ export class AppState {
   }
 
   getWorkspace(): string | null {
+    return this.workspacePath;
+  }
+
+  /**
+   * Check if a valid workspace is set
+   */
+  hasWorkspace(): boolean {
+    return this.workspacePath !== null && this.workspacePath !== "";
+  }
+
+  /**
+   * Get workspace path or throw error if none exists
+   * Use this when workspace is required for an operation
+   */
+  getWorkspaceOrThrow(): string {
+    if (!this.workspacePath) {
+      throw new Error("No workspace selected");
+    }
     return this.workspacePath;
   }
 
@@ -279,4 +356,12 @@ export function getAppState(): AppState {
 
 export function setAppState(state: AppState): void {
   appStateInstance = state;
+}
+
+/**
+ * Type guard to check if a value is a valid Terminal
+ * Useful for filtering and narrowing types
+ */
+export function isValidTerminal(t: Terminal | null | undefined): t is Terminal {
+  return t !== null && t !== undefined && typeof t.id === "string" && t.id.length > 0;
 }
