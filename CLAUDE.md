@@ -473,6 +473,34 @@ See [defaults/roles/README.md](defaults/roles/README.md) for detailed guidance o
 
 **Files**: `src/lib/worktree-manager.ts`, `src/lib/agent-launcher.ts`, `loom-daemon/src/terminal.rs`
 
+---
+
+**🚨 CRITICAL FOR AI AGENTS 🚨**
+
+**You are ALREADY in a git worktree.** Loom automatically creates isolated worktrees for every agent terminal.
+
+**What you should do:**
+```bash
+# You're already in .loom/worktrees/terminal-{id}
+# Just use normal git commands:
+git checkout -b feature/issue-42
+git add -A
+git commit -m "Description"
+git push -u origin feature/issue-42
+gh pr create
+```
+
+**What you should NEVER do:**
+```bash
+# ❌ NEVER run these commands:
+git worktree add ...
+pnpm worktree ...
+```
+
+**Why:** Attempting to create a worktree while already in one causes "nested worktree" errors. The `pnpm worktree` script is ONLY for human developers working manually outside of Loom.
+
+---
+
 Loom uses git worktrees to provide isolated working directories for each agent terminal. This allows multiple agents to work on different features simultaneously without conflicts.
 
 **Worktree Path Configuration**:
