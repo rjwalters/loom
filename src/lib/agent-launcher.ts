@@ -211,6 +211,34 @@ export async function launchAgentInTerminal(
     data: "\r",
   });
 
+  // Wait for the agent to process the role prompt
+  logger.info("Waiting for agent to process role prompt", { terminalId, delayMs: 2000 });
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Verify agent launched successfully using terminal probe
+  logger.info("Verifying agent launch with terminal probe", { terminalId });
+  const probeResult = await detectTerminalType(terminalId, 1500);
+
+  if (probeResult.type === "agent") {
+    logger.info("Agent launch verified successfully", {
+      terminalId,
+      role: probeResult.role,
+      task: probeResult.task,
+    });
+  } else if (probeResult.type === "shell") {
+    logger.error(
+      "Agent launch verification failed: detected shell instead of agent",
+      new Error("Shell detected after agent launch"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  } else {
+    logger.error(
+      "Agent launch verification inconclusive: unknown terminal type",
+      new Error("Unknown terminal type detected"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  }
+
   logger.info("Agent launch complete", { terminalId, agentWorkingDir });
 }
 
@@ -440,6 +468,34 @@ export async function launchCodexAgent(
     id: terminalId,
     data: "\r",
   });
+
+  // Wait for the agent to initialize and process the role prompt
+  logger.info("Waiting for Codex agent to initialize", { terminalId, delayMs: 2000 });
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Verify agent launched successfully using terminal probe
+  logger.info("Verifying Codex agent launch with terminal probe", { terminalId });
+  const probeResult = await detectTerminalType(terminalId, 1500);
+
+  if (probeResult.type === "agent") {
+    logger.info("Codex agent launch verified successfully", {
+      terminalId,
+      role: probeResult.role,
+      task: probeResult.task,
+    });
+  } else if (probeResult.type === "shell") {
+    logger.error(
+      "Codex agent launch verification failed: detected shell instead of agent",
+      new Error("Shell detected after Codex launch"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  } else {
+    logger.error(
+      "Codex agent launch verification inconclusive: unknown terminal type",
+      new Error("Unknown terminal type detected after Codex launch"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  }
 
   logger.info("Codex agent launch complete", { terminalId, agentWorkingDir });
 }

@@ -103,9 +103,9 @@ export function parseProbeResponse(output: string): ProbeResponse {
   }
 
   // If output contains shell prompt patterns, it's likely a shell
-  // Check for common patterns: "$", "$ ", "$ command\n$", etc.
+  // Check for common patterns: "$", "$ ", "% " (zsh), "# " (root), "$ command\n$", etc.
   if (
-    /^[$#]\s*$/m.test(trimmed) ||
+    /^[$#%]\s*$/m.test(trimmed) ||
     /^bash-\d+\.\d+\$/.test(trimmed) ||
     /\$[^\n]*\n\$/.test(trimmed)
   ) {
