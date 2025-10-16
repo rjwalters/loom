@@ -255,6 +255,12 @@ export class AppState {
   setWorkspace(path: string): void {
     this.workspacePath = path;
     this.displayedWorkspacePath = path;
+    // Persist workspace to localStorage to survive HMR reloads
+    if (path) {
+      localStorage.setItem("loom:workspace", path);
+    } else {
+      localStorage.removeItem("loom:workspace");
+    }
     this.notify();
   }
 
@@ -327,6 +333,21 @@ export class AppState {
     this.displayedWorkspacePath = "";
     // Note: Don't reset nextTerminalNumber - it persists across workspace changes
     this.notify();
+  }
+
+  /**
+   * Restore workspace from localStorage (for HMR survival)
+   * Returns the restored workspace path or null if none was stored
+   */
+  restoreWorkspaceFromLocalStorage(): string | null {
+    const stored = localStorage.getItem("loom:workspace");
+    if (stored) {
+      this.workspacePath = stored;
+      this.displayedWorkspacePath = stored;
+      this.notify();
+      return stored;
+    }
+    return null;
   }
 
   // Helper method to get terminal by ID
