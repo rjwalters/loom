@@ -225,9 +225,10 @@ export class HealthMonitor {
     for (const terminal of terminals) {
       try {
         // Check if tmux session exists
-        const hasSession = await invoke<{ has_session: boolean }>("check_session_health", {
+        const result = await invoke<{ has_session: boolean }>("check_session_health", {
           id: terminal.id,
-        }).then((result) => result.has_session);
+        });
+        const hasSession = result.has_session;
 
         // Get last activity time
         const lastActivity = this.terminalActivity.get(terminal.id) || null;
@@ -251,16 +252,46 @@ export class HealthMonitor {
 
         this.terminalHealth.set(terminal.id, health);
 
-        // Update terminal status if session is missing
+        // Update terminal status based on session health
+        // Only update missingSession flag if health check SUCCEEDED
         if (!hasSession && !terminal.missingSession) {
+          // Session missing - mark as error
           console.warn(`[HealthMonitor] Terminal ${terminal.id} missing tmux session`);
           state.updateTerminal(terminal.id, {
             status: TerminalStatus.Error,
             missingSession: true,
           });
+        } else if (hasSession && terminal.missingSession) {
+          // Session recovered - clear error state
+          console.log(
+            `[HealthMonitor] Terminal ${terminal.id} session recovered, clearing missingSession flag`
+          );
+          state.updateTerminal(terminal.id, {
+            status: TerminalStatus.Idle,
+            missingSession: undefined,
+          });
         }
       } catch (error) {
-        console.error(`[HealthMonitor] Error checking health for ${terminal.id}:`, error);
+        // Health check failed (daemon unreachable, IPC timeout, tmux server down, etc.)
+        // DO NOT set missingSession=true - we simply couldn't check
+        // This prevents false positives when daemon/tmux is temporarily unavailable
+        console.error(
+          `[HealthMonitor] Health check failed for ${terminal.id} (not changing missingSession state):`,
+          error
+        );
+
+        // Still update health record to show check failed
+        const lastActivity = this.terminalActivity.get(terminal.id) || null;
+        const timeSinceActivity = lastActivity ? now - lastActivity : null;
+
+        this.terminalHealth.set(terminal.id, {
+          terminalId: terminal.id,
+          hasSession: false, // Unknown, but mark as false in health record
+          lastActivity,
+          timeSinceActivity,
+          isStale: false, // Can't determine if we couldn't check
+          pollerErrors: 0,
+        });
       }
     }
 
