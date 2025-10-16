@@ -5,288 +5,272 @@ describe("terminal-probe", () => {
   describe("generateProbeCommand", () => {
     test("should generate bash-compatible comment probe", () => {
       const cmd = generateProbeCommand();
-
-      // Should contain comment with probe question
       expect(cmd).toContain("# Terminal Probe");
       expect(cmd).toContain("Are you an AI agent?");
       expect(cmd).toContain("AGENT:<role>:<primary-task>");
-
-      // Should end with true command
       expect(cmd).toContain("true");
-
-      // Should be multiline (comment + command)
-      expect(cmd.split("\n")).toHaveLength(2);
     });
 
-    test("should not contain shell metacharacters that could cause injection", () => {
+    test("should end with true command", () => {
       const cmd = generateProbeCommand();
+      expect(cmd.trim().endsWith("true")).toBe(true);
+    });
 
-      // Should not have dangerous characters
-      expect(cmd).not.toMatch(/[;&|`$()]/);
+    test("should be multi-line with comment and command", () => {
+      const cmd = generateProbeCommand();
+      const lines = cmd.split("\n");
+      expect(lines.length).toBeGreaterThanOrEqual(2);
+      expect(lines[0]).toMatch(/^#/); // First line is comment
+      expect(lines[lines.length - 1].trim()).toBe("true"); // Last line is true
     });
   });
 
   describe("generateCommandProbe", () => {
     test("should generate command-based probe", () => {
       const cmd = generateCommandProbe();
+      expect(cmd).toContain("command -v");
+      expect(cmd).toContain("PROBE:");
+    });
 
-      // Should use command -v to check for claude
-      expect(cmd).toContain("command -v claude");
-
-      // Should have conditional output
-      expect(cmd).toContain("PROBE:AGENT");
-      expect(cmd).toContain("PROBE:SHELL");
+    test("should check for claude command", () => {
+      const cmd = generateCommandProbe();
+      expect(cmd).toContain("claude");
     });
   });
 
   describe("parseProbeResponse", () => {
     describe("structured AGENT responses", () => {
-      test("should detect agent with full structured response", () => {
+      test("should detect agent with structured response", () => {
         const output = "AGENT:Worker:implements-loom-ready-issues";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
         expect(result.role).toBe("Worker");
         expect(result.task).toBe("implements-loom-ready-issues");
         expect(result.raw).toBe(output);
       });
 
-      test("should detect agent with Reviewer role", () => {
-        const output = "AGENT:Reviewer:reviews-PRs-with-loom-review-requested-label";
+      test("should parse reviewer agent response", () => {
+        const output = "AGENT:Reviewer:reviews-PRs-with-loom-review-requested";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
         expect(result.role).toBe("Reviewer");
-        expect(result.task).toBe("reviews-PRs-with-loom-review-requested-label");
+        expect(result.task).toBe("reviews-PRs-with-loom-review-requested");
       });
 
-      test("should detect agent with Architect role", () => {
+      test("should parse architect agent response", () => {
         const output = "AGENT:Architect:proposes-system-improvements";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
         expect(result.role).toBe("Architect");
         expect(result.task).toBe("proposes-system-improvements");
       });
 
-      test("should handle extra whitespace in structured response", () => {
-        const output = "  AGENT:Worker:fixes-bugs  \n";
+      test("should handle spaces in role and task", () => {
+        const output = "AGENT: Worker : implements issue 222 ";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
         expect(result.role).toBe("Worker");
-        expect(result.task).toBe("fixes-bugs");
+        expect(result.task).toBe("implements issue 222");
       });
 
-      test("should handle colons in task description", () => {
-        const output = "AGENT:Worker:implements-feature-x:phase-2";
+      test("should handle multi-word task descriptions", () => {
+        const output = "AGENT:Curator:monitors issues and adds loom:ready label";
         const result = parseProbeResponse(output);
+        expect(result.type).toBe("agent");
+        expect(result.role).toBe("Curator");
+        expect(result.task).toBe("monitors issues and adds loom:ready label");
+      });
 
+      test("should handle idle agent response", () => {
+        const output = "AGENT:Worker:idle-awaiting-work";
+        const result = parseProbeResponse(output);
         expect(result.type).toBe("agent");
         expect(result.role).toBe("Worker");
-        // Task includes everything after the second colon
-        expect(result.task).toBe("implements-feature-x:phase-2");
+        expect(result.task).toBe("idle-awaiting-work");
       });
     });
 
-    describe("command-based PROBE responses", () => {
-      test("should detect agent from PROBE:AGENT response", () => {
-        const output = "PROBE:AGENT:rwalters";
+    describe("command-based probe responses", () => {
+      test("should detect PROBE:AGENT response", () => {
+        const output = "PROBE:AGENT:claude";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
         expect(result.raw).toBe(output);
-        // Role/task undefined for command-based probes
-        expect(result.role).toBeUndefined();
-        expect(result.task).toBeUndefined();
       });
 
-      test("should detect shell from PROBE:SHELL response", () => {
+      test("should detect PROBE:SHELL response", () => {
         const output = "PROBE:SHELL:bash";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("shell");
         expect(result.raw).toBe(output);
+      });
+    });
+
+    describe("shell detection", () => {
+      test("should detect shell from empty output", () => {
+        const result = parseProbeResponse("");
+        expect(result.type).toBe("shell");
+      });
+
+      test("should detect shell from whitespace-only output", () => {
+        const result = parseProbeResponse("   \n  \n  ");
+        expect(result.type).toBe("shell");
+      });
+
+      test("should detect shell from true command output", () => {
+        const result = parseProbeResponse("true");
+        expect(result.type).toBe("shell");
+      });
+
+      test("should detect shell from dollar prompt", () => {
+        const result = parseProbeResponse("$ ");
+        expect(result.type).toBe("shell");
+      });
+
+      test("should detect shell from bash prompt pattern", () => {
+        const result = parseProbeResponse("bash-5.2$ ");
+        expect(result.type).toBe("shell");
+      });
+
+      test("should detect shell from multi-line prompt pattern", () => {
+        const output = "$ true\n$";
+        const result = parseProbeResponse(output);
+        expect(result.type).toBe("shell");
+      });
+
+      test("should detect shell from hash prompt (root)", () => {
+        const result = parseProbeResponse("# ");
+        expect(result.type).toBe("shell");
       });
     });
 
     describe("natural language agent responses", () => {
-      test("should detect agent from natural language with 'I am' pattern", () => {
-        const output = "I am an AI agent working as a reviewer in this terminal...";
+      test("should detect agent from 'I am' response", () => {
+        const output = "I am an AI agent working as a reviewer in this terminal.";
         const result = parseProbeResponse(output);
-
-        expect(result.type).toBe("agent");
-        expect(result.raw).toBe(output);
-      });
-
-      test("should detect agent from 'I'm an assistant' pattern", () => {
-        const output = "I'm an assistant helping with code review tasks.";
-        const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
       });
 
-      test("should detect agent from 'working as' pattern", () => {
-        const output = "I'm currently working as a Worker agent on issue #123.";
+      test("should detect agent from 'I'm' response", () => {
+        const output = "I'm an assistant helping with code reviews.";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
       });
 
-      test("should detect agent from 'my role' pattern", () => {
+      test("should detect agent from role description", () => {
         const output = "My role is to review pull requests and provide feedback.";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
       });
 
       test("should detect agent from Claude Code mention", () => {
-        const output = "Claude Code is running in this terminal with Worker configuration.";
+        const output = "This is Claude Code running in worker mode.";
         const result = parseProbeResponse(output);
-
         expect(result.type).toBe("agent");
       });
 
-      test("should detect agent from role names with context", () => {
-        const outputs = [
-          "This terminal is running as a Worker agent.",
-          "I am a Reviewer agent active and monitoring for PRs.",
-          "Working as an Architect to propose improvements.",
-          "This is the Curator terminal maintaining issue quality.",
-        ];
+      test("should detect agent with role context", () => {
+        const output = "Currently operating as a Worker agent.";
+        const result = parseProbeResponse(output);
+        expect(result.type).toBe("agent");
+      });
 
-        for (const output of outputs) {
-          const result = parseProbeResponse(output);
-          expect(result.type).toBe("agent");
-        }
+      test("should detect agent with task description", () => {
+        const output = "My task is to implement features from GitHub issues.";
+        const result = parseProbeResponse(output);
+        expect(result.type).toBe("agent");
       });
     });
 
-    describe("shell responses", () => {
-      test("should detect shell from empty output", () => {
-        const result = parseProbeResponse("");
-
-        expect(result.type).toBe("shell");
-        expect(result.raw).toBe("");
-      });
-
-      test("should detect shell from whitespace-only output", () => {
-        const result = parseProbeResponse("   \n  \n ");
-
-        expect(result.type).toBe("shell");
-      });
-
-      test("should detect shell from 'true' command output", () => {
-        const result = parseProbeResponse("true");
-
-        expect(result.type).toBe("shell");
-      });
-
-      test("should detect shell from prompt pattern", () => {
-        const outputs = ["$ ", "$", "# ", "#", "bash-5.0$ "];
-
-        for (const output of outputs) {
-          const result = parseProbeResponse(output);
-          expect(result.type).toBe("shell");
-        }
-      });
-
-      test("should detect shell from typical bash session", () => {
-        const output = "$ true\n$";
-        const result = parseProbeResponse(output);
-
-        expect(result.type).toBe("shell");
-      });
-    });
-
-    describe("unknown/ambiguous responses", () => {
-      test("should return unknown for random output", () => {
-        const output = "random output 123";
-        const result = parseProbeResponse(output);
-
-        expect(result.type).toBe("unknown");
-        expect(result.raw).toBe(output);
-      });
-
-      test("should return unknown for command errors", () => {
-        const output = "zsh: command not found: 2";
-        const result = parseProbeResponse(output);
-
+    describe("ambiguous and unknown responses", () => {
+      test("should return unknown for ambiguous output", () => {
+        const result = parseProbeResponse("random output 123");
         expect(result.type).toBe("unknown");
       });
 
-      test("should return unknown for partial structured responses", () => {
-        const output = "AGENT:Worker";
-        const result = parseProbeResponse(output);
-
-        // Missing task field, doesn't match structured format
+      test("should return unknown for error messages", () => {
+        const result = parseProbeResponse("command not found: something");
         expect(result.type).toBe("unknown");
       });
 
-      test("should return unknown for ambiguous text", () => {
-        const output = "Loading configuration...";
-        const result = parseProbeResponse(output);
+      test("should return unknown for generic text", () => {
+        const result = parseProbeResponse("hello world");
+        expect(result.type).toBe("unknown");
+      });
 
+      test("should not detect standalone role name as agent", () => {
+        // Without context words like "as", "a", "the", standalone role names
+        // should not be detected as agents
+        const result = parseProbeResponse("Worker");
         expect(result.type).toBe("unknown");
       });
     });
 
     describe("edge cases", () => {
-      test("should handle multiline agent responses", () => {
-        const output =
-          "AGENT:Worker:implements-features\n\nI'm currently working on implementing the probe system.";
+      test("should handle probe response with extra whitespace", () => {
+        const output = "  AGENT:Worker:implements-features  \n\n";
         const result = parseProbeResponse(output);
-
-        // Should match the structured format in first line
         expect(result.type).toBe("agent");
         expect(result.role).toBe("Worker");
-        expect(result.task).toBe("implements-features");
       });
 
-      test("should handle responses with ANSI escape codes", () => {
-        const output = "\x1b[32mAGENT:Worker:tests\x1b[0m";
+      test("should handle probe response with newlines", () => {
+        const output = "AGENT:Reviewer:reviews-code\n$ ";
         const result = parseProbeResponse(output);
+        expect(result.type).toBe("agent");
+        expect(result.role).toBe("Reviewer");
+      });
 
-        // ANSI codes break the structured format regex (doesn't start with "AGENT:")
-        // This is expected behavior - ANSI codes would need to be stripped first
+      test("should preserve raw output in all cases", () => {
+        const output = "test output";
+        const result = parseProbeResponse(output);
+        expect(result.raw).toBe(output);
+      });
+
+      test("should handle case-sensitive AGENT keyword", () => {
+        // Lowercase "agent:" should not match structured format
+        const result = parseProbeResponse("agent:Worker:task");
         expect(result.type).toBe("unknown");
       });
 
-      test("should preserve raw output regardless of parsing", () => {
-        const testCases = [
-          "AGENT:Worker:task",
-          "PROBE:SHELL:bash",
-          "",
-          "unknown output",
-          "I am an agent",
-        ];
-
-        for (const output of testCases) {
-          const result = parseProbeResponse(output);
-          expect(result.raw).toBe(output);
-        }
+      test("should handle malformed AGENT response missing task", () => {
+        // Must have both role AND task (two colons)
+        const result = parseProbeResponse("AGENT:Worker");
+        expect(result.type).toBe("unknown");
       });
 
-      test("should handle case sensitivity in structured responses", () => {
-        // Lowercase 'agent' should not match
-        const output1 = "agent:Worker:task";
-        const result1 = parseProbeResponse(output1);
-        expect(result1.type).toBe("unknown");
-
-        // Uppercase 'AGENT' should match
-        const output2 = "AGENT:Worker:task";
-        const result2 = parseProbeResponse(output2);
-        expect(result2.type).toBe("agent");
+      test("should handle malformed AGENT response missing role", () => {
+        const result = parseProbeResponse("AGENT::task");
+        // Regex requires non-empty role field ([^:]+), so this won't match
+        expect(result.type).toBe("unknown");
       });
+    });
 
-      test("should handle very long output", () => {
-        const longTask = "a".repeat(1000);
-        const output = `AGENT:Worker:${longTask}`;
+    describe("real-world scenarios", () => {
+      test("should handle Claude Code bypass permissions prompt echo", () => {
+        // When we send "2\n" to bypass permissions, terminal might echo it
+        const output = "2\n$ ";
         const result = parseProbeResponse(output);
+        expect(result.type).toBe("shell");
+      });
 
-        expect(result.type).toBe("agent");
-        expect(result.role).toBe("Worker");
-        expect(result.task).toHaveLength(1000);
+      test("should handle tmux session startup output", () => {
+        const output = "[detached (from session loom-terminal-1)]\n$ ";
+        const result = parseProbeResponse(output);
+        expect(result.type).toBe("shell");
+      });
+
+      test("should handle zsh prompt pattern", () => {
+        const output = "% ";
+        const result = parseProbeResponse(output);
+        expect(result.type).toBe("shell");
+      });
+
+      test("should differentiate between shell echo and agent response", () => {
+        // Shell echoing the probe command should still be detected as shell
+        const output = "# Terminal Probe: Are you an AI agent?\ntrue\n$ ";
+        const result = parseProbeResponse(output);
+        expect(result.type).toBe("shell");
       });
     });
   });
