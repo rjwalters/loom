@@ -684,7 +684,7 @@ If this passes, CI should pass too.
 
 **Package Manager Preference**: Always use `pnpm` (not `npm`) as the package manager for this project.
 
-**Development Workflow**: Use `pnpm run app:dev` to start the daemon and Tauri dev server in one command. See [DEV_WORKFLOW.md](DEV_WORKFLOW.md) for details on hot reload workflow with persistent daemon connections.
+**Development Workflow**: See "Self-Modification Problem" section below for important guidance on which app mode to use.
 
 ### Clippy Configuration Details
 
@@ -711,6 +711,104 @@ rustflags = [
 - Prefer proper error handling with `Result` and `?` operator
 - Use `expect()` with descriptive messages only when panic is acceptable
 - Add `#[allow]` attribute with explanatory comment when necessary
+
+## Self-Modification Problem
+
+**CRITICAL**: Loom cannot develop itself using `app:dev` mode due to hot reload causing restart loops.
+
+### The Problem
+
+When running Loom in development mode (`pnpm app:dev`), Vite watches for file changes and triggers hot module replacement (HMR). If agent terminals within Loom are working on the Loom codebase itself:
+
+1. Agent edits source file (e.g., `src/lib/workspace-reset.ts`)
+2. Vite detects change and triggers HMR
+3. Tauri reloads the app
+4. App restart interrupts the agent mid-work
+5. Agent continues, edits another file
+6. **Infinite restart loop**
+
+This makes it impossible for Loom to work on its own codebase in dev mode.
+
+### Solutions
+
+**Option 1: Use Preview Mode (Recommended)**
+```bash
+pnpm app:preview
+```
+- Builds the app once, then runs without hot reload
+- Agents can edit files without triggering restarts
+- Still faster than full production builds
+- Requires rebuild to see UI changes
+
+**Option 2: Use Production Mode**
+```bash
+pnpm app:build
+# Then run the built app from ./target/release/
+```
+- Fully optimized production build
+- No hot reload at all
+- Slowest rebuild cycle
+
+**Option 3: Work on Different Workspace**
+```bash
+# Clone Loom to a separate directory
+git clone https://github.com/your-username/loom ~/loom-dev
+cd ~/loom-dev
+pnpm app:preview
+
+# Point agent terminals at original workspace
+# Agents work in ~/GitHub/loom, app runs from ~/loom-dev
+```
+- Separates running app from workspace being edited
+- Best for testing factory reset and agent features
+- Requires keeping both repos in sync
+
+**Option 4: Disable Agent Terminals**
+```bash
+# Use app:dev but don't run any agent terminals
+pnpm app:dev
+# Keep terminals as plain shells or run agents on different repos
+```
+- Good for frontend development only
+- Can't test agent orchestration features
+
+### When to Use Each Mode
+
+**Use `app:dev`**:
+- Frontend-only development (CSS, UI components, layouts)
+- No agent terminals running
+- Working on a different repository with agent terminals
+
+**Use `app:preview`**:
+- Testing factory reset, agent launching, worktree management
+- Agent terminals working on Loom codebase
+- Integration testing with agents
+
+**Use `app:build`**:
+- Final testing before release
+- Performance profiling
+- Packaging for distribution
+
+### Vite Ignore Configuration
+
+Vite is already configured to ignore `.loom/**` directories:
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    watch: {
+      ignored: ["**/.loom/**"],  // Ignores .loom/worktrees/, .loom/config.json, etc.
+    },
+  },
+});
+```
+
+However, this only prevents changes to `.loom/` from triggering reloads. Changes to `src/**`, `loom-daemon/**`, or other source files will still trigger HMR.
+
+### Summary
+
+**DO NOT use `app:dev` when agent terminals are working on the Loom codebase.** Always use `app:preview` or `app:build` for self-modification scenarios.
 
 ## Styling Conventions
 
@@ -1130,6 +1228,211 @@ This prevents malicious terminal names from injecting HTML/JS.
 - Tauri IPC will be used for process spawning (sandboxed)
 - API keys stored in system keychain (not .env)
 - GitHub OAuth for authentication
+
+## Structured Logging System (Issue #130)
+
+Loom implements a lightweight structured logging system with JSON-formatted log entries for easy parsing and debugging.
+
+### Frontend Logging
+
+**File**: `src/lib/logger.ts`
+
+```typescript
+import { Logger } from "./logger";
+
+// Create logger for component
+const logger = Logger.forComponent("worktree-manager");
+
+// Log informational message with context
+logger.info("Creating worktree", {
+  terminalId: "terminal-1",
+  worktreePath: "/path/to/worktree",
+});
+
+// Log error with full context
+logger.error("Failed to create worktree", error, {
+  terminalId: "terminal-1",
+  worktreePath: "/path/to/worktree",
+});
+```
+
+**Log Output Format**:
+```json
+{
+  "timestamp": "2025-10-15T05:05:06.088Z",
+  "level": "INFO",
+  "message": "Creating worktree",
+  "context": {
+    "component": "worktree-manager",
+    "terminalId": "terminal-1",
+    "worktreePath": "/path/to/worktree"
+  }
+}
+```
+
+### Backend Logging
+
+**File**: `loom-daemon/src/logging.rs`
+
+```rust
+use crate::{log_info, log_error};
+
+// Log informational message
+log_info!("Terminal created", {
+    component: "terminal",
+    terminal_id: Some(id.clone()),
+    working_dir: path
+});
+
+// Log error
+log_error!("Failed to spawn tmux", &err, {
+    component: "terminal",
+    terminal_id: Some(id.clone())
+});
+```
+
+### Logging Conventions
+
+**When to Use Each Log Level**:
+
+1. **INFO**: Normal operations, milestones, state transitions
+   - Component initialization
+   - Successful operations (terminal created, worktree setup complete)
+   - State changes (workspace loaded, agent launched)
+
+2. **WARN**: Unexpected but recoverable conditions
+   - Non-fatal errors (failed to write cache, optional feature unavailable)
+   - Deprecated code paths
+   - Performance warnings
+
+3. **ERROR**: Error conditions requiring attention
+   - Failed operations with user impact
+   - Exceptions and error objects
+   - Invalid state that prevents functionality
+
+**Context Guidelines**:
+
+Always include these fields when applicable:
+- `component`: The component/module generating the log
+- `terminalId`: Terminal identifier for terminal-related operations
+- `workspacePath`: Workspace path for workspace operations
+- `errorId`: Auto-generated unique error ID for tracking
+
+**Example Patterns**:
+
+```typescript
+// Starting multi-step operation
+logger.info("Starting workspace reset", {
+  workspacePath,
+  terminalCount: terminals.length,
+});
+
+// Operation milestone
+logger.info("Destroyed terminal session", {
+  workspacePath,
+  terminalId: terminal.id,
+  terminalName: terminal.name,
+});
+
+// Error with full context
+logger.error("Failed to create worktree", error, {
+  workspacePath,
+  terminalId,
+  worktreePath,
+});
+
+// Operation complete
+logger.info("Workspace reset complete", { workspacePath });
+```
+
+### Benefits
+
+1. **Structured Data**: JSON format is easily parsed by tools (jq, MCP servers)
+2. **Context Preservation**: All relevant context attached to each log entry
+3. **Error Tracking**: Unique error IDs for correlation across logs
+4. **Component Tracing**: Component field enables filtering by module
+5. **Debugging**: Rich context makes post-mortem debugging easier
+
+### Log File Locations
+
+- **Frontend Console**: `~/.loom/console.log` (JSON structured logs)
+- **Daemon**: `~/.loom/daemon.log` (JSON structured logs)
+- **Tauri**: `~/.loom/tauri.log` (Tauri application logs)
+- **Terminal Output**: `/tmp/loom-terminal-{id}.out` (raw terminal output)
+
+### Querying Logs
+
+**Using jq**:
+```bash
+# Filter by component
+jq 'select(.context.component == "worktree-manager")' ~/.loom/console.log
+
+# Find errors
+jq 'select(.level == "ERROR")' ~/.loom/console.log
+
+# Track specific terminal
+jq 'select(.context.terminalId == "terminal-1")' ~/.loom/console.log
+
+# Find by error ID
+jq 'select(.context.errorId == "ERR-abc123")' ~/.loom/console.log
+```
+
+**Using MCP Tools**:
+```bash
+# Read recent console logs
+mcp__loom-logs__tail_daemon_log --lines=100
+
+# Read terminal-specific logs
+mcp__loom-logs__tail_terminal_log --terminal-id=terminal-1
+```
+
+### Migration Strategy
+
+The logging system is being gradually adopted across the codebase:
+
+**Phase 1 (Complete)**:
+- ✅ Frontend Logger class (`src/lib/logger.ts`)
+- ✅ Backend logging macros (`loom-daemon/src/logging.rs`)
+- ✅ High-risk paths (workspace-reset, worktree-manager)
+
+**Phase 2 (In Progress)**:
+- Agent launcher (`src/lib/agent-launcher.ts`)
+- Daemon terminal operations (`loom-daemon/src/terminal.rs`)
+- Daemon IPC layer (`loom-daemon/src/ipc.rs`)
+
+**Phase 3 (Planned)**:
+- Remaining console.log statements converted gradually
+- Log file rotation (keep last 10 files, 10MB each)
+- Log aggregation dashboard (optional)
+
+### Adding Structured Logging to New Code
+
+1. **Import logger**:
+   ```typescript
+   import { Logger } from "./logger";
+   const logger = Logger.forComponent("my-component");
+   ```
+
+2. **Replace console.log**:
+   ```typescript
+   // Before
+   console.log(`[my-component] Created terminal ${id}`);
+
+   // After
+   logger.info("Created terminal", { terminalId: id });
+   ```
+
+3. **Add context**:
+   Include all relevant IDs, paths, and state in the context object
+
+4. **Use error method for exceptions**:
+   ```typescript
+   try {
+     // operation
+   } catch (error) {
+     logger.error("Operation failed", error, { terminalId, path });
+   }
+   ```
 
 ## Git Workflow
 
