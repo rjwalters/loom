@@ -206,14 +206,24 @@ async function initializeTerminalDisplay(terminalId: string) {
 
   // Check session health before initializing
   try {
+    console.log(
+      `[initializeTerminalDisplay] Checking session health for terminal ${terminalId}...`
+    );
     const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
+    console.log(
+      `[initializeTerminalDisplay] check_session_health returned: ${hasSession} for terminal ${terminalId}`
+    );
 
     if (!hasSession) {
       console.warn(`[initializeTerminalDisplay] Terminal ${terminalId} has no tmux session`);
 
       // Mark terminal as having missing session (only if not already marked)
       const terminal = state.getTerminal(terminalId);
+      console.log(`[initializeTerminalDisplay] Terminal state before update:`, terminal);
       if (terminal && !terminal.missingSession) {
+        console.log(
+          `[initializeTerminalDisplay] Setting missingSession=true for terminal ${terminalId}`
+        );
         state.updateTerminal(terminal.id, {
           status: TerminalStatus.Error,
           missingSession: true,
@@ -222,6 +232,10 @@ async function initializeTerminalDisplay(terminalId: string) {
 
       return; // Don't create xterm instance - error UI will show instead
     }
+
+    console.log(
+      `[initializeTerminalDisplay] Session health check passed for terminal ${terminalId}, proceeding with xterm initialization`
+    );
   } catch (error) {
     console.error(`[initializeTerminalDisplay] Failed to check session health:`, error);
     // Continue anyway - better to try than not
