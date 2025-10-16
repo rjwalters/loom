@@ -1228,7 +1228,7 @@ mcp__loom-ui__trigger_factory_reset
 
 ### Testing Workspace Start with MCP
 
-**Goal**: Verify workspace start creates 7 terminals with Claude Code agents running autonomously
+**Goal**: Verify workspace start creates 7 terminals with Claude Code agents running autonomously in the main workspace
 
 **Test Procedure**:
 
@@ -1244,28 +1244,31 @@ mcp__loom-ui__trigger_factory_reset
    Look for:
    - `[start-workspace] Killing all loom tmux sessions`
    - `[start-workspace] ✓ Created terminal X`
-   - `[launchAgentInTerminal] Worktree setup complete`
+   - `[launchAgentInTerminal] ✓ Agent will start in main workspace`
    - `[launchAgentInTerminal] Sending "2" to accept warning`
 
 3. **Verify State**:
    ```bash
    mcp__loom-ui__read_state_file
    ```
-   Confirm 7 terminals exist with correct session IDs and worktree paths
+   Confirm 7 terminals exist with correct session IDs (no worktree paths yet)
 
-4. **Verify Worktrees**:
+4. **Verify Main Workspace** (agents start here, create worktrees on-demand):
    ```bash
    ls -la .loom/worktrees/
-   git worktree list
+   # Should be empty or show only manually created worktrees
+   # Agents will create .loom/worktrees/issue-{number} when claiming issues
    ```
-   Confirm 7 worktrees created (one for each terminal)
 
 **Expected Success Criteria**:
 - ✅ 7 terminals created (terminal-1 through terminal-7)
-- ✅ 7 worktrees created at `.loom/worktrees/terminal-{1-7}` (automatic for all terminals)
+- ✅ All terminals start in main workspace directory
+- ✅ NO automatic worktrees created during startup
 - ✅ Claude Code running in all 7 terminals (bypass permissions accepted)
 - ✅ No "command not found" or "duplicate session" errors
 - ✅ Console logs show successful agent launch sequence
+
+**Note**: Agents now start in the main workspace and create worktrees on-demand using `pnpm worktree <issue>` when claiming GitHub issues. This prevents resource waste and provides semantic naming (`.loom/worktrees/issue-42` instead of `terminal-1`).
 
 **Factory Reset + Start Workflow**:
 
