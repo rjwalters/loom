@@ -684,6 +684,8 @@ If this passes, CI should pass too.
 
 **Package Manager Preference**: Always use `pnpm` (not `npm`) as the package manager for this project.
 
+**Development Workflow**: Use `pnpm run app:dev` to start the daemon and Tauri dev server in one command. See [DEV_WORKFLOW.md](DEV_WORKFLOW.md) for details on hot reload workflow with persistent daemon connections.
+
 ### Clippy Configuration Details
 
 The `.cargo/config.toml` enforces strict linting:
