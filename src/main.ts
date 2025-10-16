@@ -279,8 +279,15 @@ async function initializeApp() {
     return; // Exit early if dependencies are missing
   }
 
+  // Try to restore workspace from localStorage first (for HMR survival)
+  const localStorageWorkspace = state.restoreWorkspaceFromLocalStorage();
+  if (localStorageWorkspace) {
+    console.log("[initializeApp] Restored workspace from localStorage:", localStorageWorkspace);
+    console.log("[initializeApp] This prevents HMR from clearing the workspace during hot reload");
+  }
+
   try {
-    // Check for stored workspace
+    // Check for stored workspace in Tauri storage
     const storedPath = await invoke<string | null>("get_stored_workspace");
 
     if (storedPath) {
@@ -299,9 +306,32 @@ async function initializeApp() {
       // Path no longer valid - clear it and show picker
       console.log("[initializeApp] Stored workspace invalid, clearing");
       await invoke("clear_stored_workspace");
+      localStorage.removeItem("loom:workspace"); // Also clear localStorage
+    } else if (localStorageWorkspace) {
+      // No Tauri storage but have localStorage (HMR case)
+      console.log("[initializeApp] Using localStorage workspace after HMR");
+      const isValid = await validateWorkspacePath(localStorageWorkspace);
+
+      if (isValid) {
+        await handleWorkspacePathInput(localStorageWorkspace);
+        return;
+      }
+
+      // Invalid - clear it
+      localStorage.removeItem("loom:workspace");
     }
   } catch (error) {
     console.error("[initializeApp] Failed to load stored workspace:", error);
+
+    // If Tauri storage failed but we have localStorage, try that
+    if (localStorageWorkspace) {
+      console.log("[initializeApp] Tauri storage failed, trying localStorage workspace");
+      const isValid = await validateWorkspacePath(localStorageWorkspace);
+      if (isValid) {
+        await handleWorkspacePathInput(localStorageWorkspace);
+        return;
+      }
+    }
   }
 
   // No stored workspace or validation failed - show picker
@@ -364,6 +394,10 @@ listen("close-workspace", async () => {
   } catch (error) {
     console.error("Failed to clear stored workspace:", error);
   }
+
+  // Clear localStorage workspace (for HMR survival)
+  localStorage.removeItem("loom:workspace");
+  console.log("[close-workspace] Cleared localStorage workspace");
 
   // Stop all autonomous intervals
   const { getAutonomousManager } = await import("./lib/autonomous-manager");
