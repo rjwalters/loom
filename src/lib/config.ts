@@ -67,6 +67,19 @@ export function setConfigWorkspace(workspacePath: string): void {
 }
 
 /**
+ * Assert that workspace is configured before file operations
+ * Throws descriptive error if workspace is not set
+ */
+function assertWorkspace(): string {
+  if (!cachedWorkspacePath) {
+    throw new Error(
+      "No workspace configured - call setConfigWorkspace() before loading/saving config"
+    );
+  }
+  return cachedWorkspacePath;
+}
+
+/**
  * Migrate legacy config format to new split format
  * Returns both config and state
  */
@@ -141,12 +154,10 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
  */
 export async function loadConfig(): Promise<LoomConfig> {
   try {
-    if (!cachedWorkspacePath) {
-      throw new Error("No workspace set - cannot load config");
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = await invoke<string>("read_config", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
     });
 
     const parsed = JSON.parse(contents);
@@ -176,13 +187,11 @@ export async function loadConfig(): Promise<LoomConfig> {
  */
 export async function saveConfig(config: LoomConfig): Promise<void> {
   try {
-    if (!cachedWorkspacePath) {
-      return;
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = JSON.stringify(config, null, 2);
     await invoke("write_config", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
       configJson: contents,
     });
   } catch (error) {
@@ -195,12 +204,10 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
  */
 export async function loadState(): Promise<LoomState> {
   try {
-    if (!cachedWorkspacePath) {
-      throw new Error("No workspace set - cannot load state");
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = await invoke<string>("read_state", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
     });
 
     return JSON.parse(contents) as LoomState;
@@ -219,13 +226,11 @@ export async function loadState(): Promise<LoomState> {
  */
 export async function saveState(state: LoomState): Promise<void> {
   try {
-    if (!cachedWorkspacePath) {
-      return;
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = JSON.stringify(state, null, 2);
     await invoke("write_state", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
       stateJson: contents,
     });
   } catch (error) {

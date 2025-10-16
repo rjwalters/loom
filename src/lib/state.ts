@@ -203,6 +203,25 @@ export class AppState {
     return this.primaryId ? this.terminals.get(this.primaryId) || null : null;
   }
 
+  /**
+   * Check if a primary terminal exists
+   */
+  hasPrimary(): boolean {
+    return this.primaryId !== null && this.terminals.has(this.primaryId);
+  }
+
+  /**
+   * Get primary terminal or throw error if none exists
+   * Use this when you're certain a primary must exist (e.g., after validation)
+   */
+  getPrimaryOrThrow(): Terminal {
+    const primary = this.getPrimary();
+    if (!primary) {
+      throw new Error("No primary terminal available");
+    }
+    return primary;
+  }
+
   getTerminals(): Terminal[] {
     // Return terminals in display order
     return this.order
@@ -245,6 +264,24 @@ export class AppState {
   }
 
   getWorkspace(): string | null {
+    return this.workspacePath;
+  }
+
+  /**
+   * Check if a valid workspace is set
+   */
+  hasWorkspace(): boolean {
+    return this.workspacePath !== null && this.workspacePath !== "";
+  }
+
+  /**
+   * Get workspace path or throw error if none exists
+   * Use this when workspace is required for an operation
+   */
+  getWorkspaceOrThrow(): string {
+    if (!this.workspacePath) {
+      throw new Error("No workspace selected");
+    }
     return this.workspacePath;
   }
 
@@ -319,4 +356,12 @@ export function getAppState(): AppState {
 
 export function setAppState(state: AppState): void {
   appStateInstance = state;
+}
+
+/**
+ * Type guard to check if a value is a valid Terminal
+ * Useful for filtering and narrowing types
+ */
+export function isValidTerminal(t: Terminal | null | undefined): t is Terminal {
+  return t !== null && t !== undefined && typeof t.id === "string" && t.id.length > 0;
 }

@@ -121,7 +121,7 @@ let currentAttachedTerminalId: string | null = null;
 
 // Render function
 function render() {
-  const hasWorkspace = state.getWorkspace() !== null && state.getWorkspace() !== "";
+  const hasWorkspace = state.hasWorkspace();
   console.log(
     "[render] hasWorkspace:",
     hasWorkspace,
@@ -321,7 +321,7 @@ listen("cli-workspace", (event) => {
 
 // Listen for menu events
 listen("new-terminal", () => {
-  if (state.getWorkspace()) {
+  if (state.hasWorkspace()) {
     createPlainTerminal();
   }
 });
@@ -388,8 +388,8 @@ listen("close-workspace", async () => {
 
 // Start engine - create sessions for existing config (with confirmation)
 listen("start-workspace", async () => {
-  const workspace = state.getWorkspace();
-  if (!workspace) return;
+  if (!state.hasWorkspace()) return;
+  const workspace = state.getWorkspaceOrThrow();
 
   const confirmed = await ask(
     "This will:\n" +
@@ -426,8 +426,8 @@ listen("start-workspace", async () => {
 
 // Force Start engine - NO confirmation dialog (for MCP automation)
 listen("force-start-workspace", async () => {
-  const workspace = state.getWorkspace();
-  if (!workspace) return;
+  if (!state.hasWorkspace()) return;
+  const workspace = state.getWorkspaceOrThrow();
 
   console.log("[force-start-workspace] Starting engine (no confirmation)");
 
@@ -451,8 +451,8 @@ listen("force-start-workspace", async () => {
 
 // Factory Reset - overwrite config with defaults (with confirmation)
 listen("factory-reset-workspace", async () => {
-  const workspace = state.getWorkspace();
-  if (!workspace) return;
+  if (!state.hasWorkspace()) return;
+  const workspace = state.getWorkspaceOrThrow();
 
   const confirmed = await ask(
     "⚠️ WARNING: Factory Reset ⚠️\n\n" +
@@ -547,8 +547,7 @@ async function showDaemonStatusDialog() {
       ? "✅ Running"
       : `❌ Not Running${status.error ? `\n\nError: ${status.error}` : ""}`;
 
-    const workspace = state.getWorkspace();
-    const hasWorkspace = workspace !== null && workspace !== "";
+    const hasWorkspace = state.hasWorkspace();
 
     // Show different dialog based on whether daemon is running and workspace is loaded
     if (status.running && hasWorkspace) {
@@ -587,8 +586,7 @@ let isDragging: boolean = false;
 
 // Save current state to config and state files
 async function saveCurrentConfig() {
-  const workspace = state.getWorkspace();
-  if (!workspace) {
+  if (!state.hasWorkspace()) {
     return;
   }
 
@@ -708,11 +706,11 @@ function generateNextConfigId(): string {
 
 // Create a plain shell terminal
 async function createPlainTerminal() {
-  const workspacePath = state.getWorkspace();
-  if (!workspacePath) {
+  if (!state.hasWorkspace()) {
     alert("No workspace selected");
     return;
   }
+  const workspacePath = state.getWorkspaceOrThrow();
 
   // Generate terminal name
   const terminalCount = state.getTerminals().length + 1;
@@ -1265,11 +1263,16 @@ async function handleRecoverNewSession(terminalId: string) {
   console.log(`[handleRecoverNewSession] Creating new session for terminal ${terminalId}`);
 
   try {
-    const workspacePath = state.getWorkspace();
+    if (!state.hasWorkspace()) {
+      alert("Cannot recover: no workspace selected");
+      return;
+    }
+
+    const workspacePath = state.getWorkspaceOrThrow();
     const terminal = state.getTerminals().find((t) => t.id === terminalId);
 
-    if (!terminal || !workspacePath) {
-      alert("Cannot recover: terminal or workspace not found");
+    if (!terminal) {
+      alert("Cannot recover: terminal not found");
       return;
     }
 
@@ -1633,7 +1636,7 @@ function setupEventListeners() {
       // Handle add terminal button
       if (target.id === "add-terminal-btn" || target.closest("#add-terminal-btn")) {
         // Don't add if no workspace selected
-        if (!state.getWorkspace()) {
+        if (!state.hasWorkspace()) {
           return;
         }
 
