@@ -216,15 +216,27 @@ export function renderPrimaryTerminal(
 
   // If missing session, render error UI inside the content container after DOM update
   if (hasMissingSession) {
+    console.log(
+      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=true, will render error overlay`
+    );
     setTimeout(() => {
       renderMissingSessionError(terminal.id, terminal.id);
     }, 0);
+  } else {
+    console.log(
+      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=${terminal.missingSession}, will show xterm`
+    );
   }
 }
 
 export function renderMissingSessionError(sessionId: string, configId: string): void {
+  console.log(`[renderMissingSessionError] Rendering error overlay for terminal ${sessionId}`);
   const container = document.getElementById(`xterm-container-${sessionId}`);
-  if (!container) return;
+  if (!container) {
+    console.warn(`[renderMissingSessionError] Container #xterm-container-${sessionId} not found!`);
+    return;
+  }
+  console.log(`[renderMissingSessionError] Found container, replacing with error UI`);
 
   container.innerHTML = `
     <div class="h-full flex items-center justify-center bg-red-50 dark:bg-red-900/20">
