@@ -66,7 +66,7 @@ async function writeMCPCommand(command: string): Promise<string> {
 
   await writeFile(commandFile, JSON.stringify(commandData, null, 2));
 
-  return `MCP command '${command}' written to ${commandFile}. Note: File-based IPC is not yet implemented in Loom app. This command will not execute until file watcher is added.`;
+  return `MCP command '${command}' written to ${commandFile}. The Loom app's MCP watcher will process this command within 500ms.`;
 }
 
 /**

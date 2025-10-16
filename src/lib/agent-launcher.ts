@@ -51,18 +51,9 @@ export async function launchAgentInTerminal(
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
   console.log(`[launchAgentInTerminal] Processed prompt with workspace=${agentWorkingDir}`);
 
-  // Write the system prompt to CLAUDE.md in the worktree/workspace
-  // Claude Code automatically loads CLAUDE.md from the repository root
-  const claudeMdPath = `${agentWorkingDir}/CLAUDE.md`;
-  console.log(`[launchAgentInTerminal] Writing CLAUDE.md to ${claudeMdPath}...`);
-  await invoke("write_file", {
-    path: claudeMdPath,
-    content: processedPrompt,
-  });
-  console.log(`[launchAgentInTerminal] CLAUDE.md written successfully`);
-
-  // Build Claude CLI command - CLAUDE.md will be automatically loaded
-  // Note: --session-id removed because Claude Code requires UUID format, not our terminal IDs
+  // Build Claude CLI command
+  // Note: We send the role as the first message instead of writing CLAUDE.md
+  // This prevents conflicts with the main workspace CLAUDE.md (project instructions)
   // Using --dangerously-skip-permissions to bypass the interactive warning prompt
   const command = "claude --dangerously-skip-permissions";
   console.log(`[launchAgentInTerminal] Sending command to terminal: ${command}`);
@@ -126,6 +117,24 @@ export async function launchAgentInTerminal(
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
+
+  // Wait for Claude Code to be ready to receive input
+  console.log(`[launchAgentInTerminal] Waiting 2000ms for Claude Code to initialize...`);
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Send the role prompt as the first message
+  console.log(`[launchAgentInTerminal] Sending role prompt as first message...`);
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: processedPrompt,
+  });
+
+  // Press Enter to submit the prompt
+  console.log(`[launchAgentInTerminal] Sending Enter to submit role prompt`);
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
 
   console.log(`[launchAgentInTerminal] COMPLETE - agent launched in ${agentWorkingDir}`);
 }
@@ -317,21 +326,16 @@ export async function launchCodexAgent(
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
   console.log(`[launchCodexAgent] Processed prompt with workspace=${agentWorkingDir}`);
 
-  // Write the system prompt to CODEX.md in the working directory
-  // Codex will load this as the system prompt
-  const codexMdPath = `${agentWorkingDir}/CODEX.md`;
-  console.log(`[launchCodexAgent] Writing CODEX.md to ${codexMdPath}...`);
-  await invoke("write_file", {
-    path: codexMdPath,
-    content: processedPrompt,
-  });
-  console.log(`[launchCodexAgent] CODEX.md written successfully`);
-
   // Build Codex CLI command with autonomous configuration
+  // Note: We send the prompt directly in the command instead of via a file
+  // This prevents conflicts with files in the main workspace
   // --full-auto: Combines -a on-failure and --sandbox workspace-write
   // Additional config from .codex/config.toml (sandbox_permissions, etc.)
-  const command = 'codex --full-auto "$(cat CODEX.md)"';
-  console.log(`[launchCodexAgent] Sending command to terminal: ${command}`);
+  // Using single quotes around the heredoc to prevent shell expansion
+  const command = `codex --full-auto "$(cat <<'ROLE_EOF'\n${processedPrompt}\nROLE_EOF\n)"`;
+  console.log(
+    `[launchCodexAgent] Sending command to terminal (prompt length: ${processedPrompt.length})`
+  );
 
   // Wait for any previous commands to fully complete
   console.log(`[launchCodexAgent] Waiting 500ms for previous commands to complete...`);
