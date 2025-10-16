@@ -488,26 +488,25 @@ This design is **sandbox-compatible** because:
 - Each terminal gets its own isolated working directory
 - No shared state or conflicts between agents
 
-**Automatic Worktree Lifecycle** (`src/lib/worktree-manager.ts:28`):
+**On-Demand Worktree Creation** (`scripts/worktree.sh`):
 
-When an agent terminal is created with worktree mode enabled:
+Agents create worktrees when claiming issues using the helper script:
 
-```typescript
-// 1. Create worktree directory
-const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
+```bash
+# Agent claims issue and creates worktree
+pnpm worktree 42
 
-// 2. Execute setup commands via terminal
-mkdir -p "${worktreePath}"
-git worktree add "${worktreePath}" HEAD
-cd "${worktreePath}"
-
-// 3. Optional: Configure git identity
-git config user.name "Agent Name"
-git config user.email "agent@example.com"
-
-// 4. Show success message
-echo "✓ Worktree ready at ${worktreePath}"
+# This runs the helper script which:
+# 1. Validates issue number
+# 2. Checks for nested worktrees (prevents if already in one)
+# 3. Creates worktree at .loom/worktrees/issue-42
+# 4. Creates branch feature/issue-42 from main
+# 5. Provides clear instructions for next steps
 ```
+
+**Manual Worktree Creation** (`src/lib/worktree-manager.ts:28`):
+
+The old `setupWorktreeForAgent()` function still exists but is no longer called automatically during workspace start. It can be used programmatically if needed.
 
 **Daemon Auto-Cleanup** (`loom-daemon/src/terminal.rs:87-102`):
 
@@ -533,15 +532,15 @@ There are **two completely different contexts** for worktrees in Loom, and this 
 
 ### Context 1: Agents Running Inside Loom (Normal Use)
 
-**Loom automatically creates worktrees for ALL agent terminals.** This happens during workspace start:
+**Agents start in the main workspace, not in worktrees.** Worktrees are created on-demand when claiming issues:
 
-- Each terminal gets: `.loom/worktrees/terminal-{id}` with branch `worktree/terminal-{id}`
-- Agents are launched INSIDE their worktree automatically
-- Agents should **NEVER** run `git worktree` commands themselves
-- They just work normally: `git checkout -b feature/my-branch`, make changes, commit, push
-- The worktree is their starting directory - they're already isolated
+- Agents begin in the main workspace directory (not isolated)
+- To work on an issue: `pnpm worktree <issue-number>` creates `.loom/worktrees/issue-{number}`
+- Helper script prevents nested worktrees and ensures proper paths
+- Multiple agents can work simultaneously by each claiming their own issue
+- Worktrees are named semantically by issue number, not terminal ID
 
-**For agents**: You're already in a worktree. Just use regular git commands.
+**For agents**: Use `pnpm worktree <issue>` when claiming an issue. Create feature branches in your worktree.
 
 ### Context 2: Human Developers Working on Loom's Codebase (Dogfooding)
 
@@ -624,35 +623,40 @@ The helper script provides clear guidance for common issues:
 
 **Implementation**: See `scripts/worktree.sh` for the full implementation
 
-**Dogfooding Confusion (Agents Working on Loom Itself)**:
+**Workflow for Agents**:
 
-When agents running inside Loom work on Loom's own codebase, they're ALREADY in worktrees created by Loom. This creates confusion:
+When agents running inside Loom work on issues:
 
-- Agent is in `.loom/worktrees/terminal-5/` (created automatically by Loom)
-- Agent tries to run `pnpm worktree 42` to work on an issue
-- Script detects: "You're already in a worktree!" and prevents nested worktrees
-- **This is correct behavior** - the agent should just use normal git commands
-
-**What agents working on Loom should do**:
 ```bash
-# You're already in a worktree at .loom/worktrees/terminal-{id}
-# Just create a feature branch from your current location:
-git checkout -b feature/issue-42
-# Work on the issue
-git add -A
-git commit -m "Fix issue #42"
+# 1. Claim issue and create worktree
+gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
+pnpm worktree 42
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/issue-42
+
+# 2. Change to worktree
+cd .loom/worktrees/issue-42
+
+# 3. Do the work
+# ... implement, test, commit ...
+
+# 4. Push and create PR
 git push -u origin feature/issue-42
-gh pr create
+gh pr create --label "loom:review-requested"
+
+# 5. Return to main workspace
+cd ../..
 ```
 
-**Benefits of Automatic Worktree System**:
+**Benefits of On-Demand Worktree System**:
 
-1. **Isolation**: Each agent has its own working directory and branch
-2. **No Conflicts**: Agents can't interfere with each other's work
-3. **Clean Workspace**: Main working directory remains unaffected
-4. **Auto-Cleanup**: Daemon removes worktrees when terminals are destroyed
-5. **Gitignored**: Worktrees don't clutter git status
-6. **Sandbox-Safe**: All worktrees inside workspace, no filesystem escapes
+1. **Semantic Naming**: Worktrees named by issue number (`.loom/worktrees/issue-42`), not terminal ID
+2. **On-Demand Creation**: Only create worktrees when needed, reducing resource usage
+3. **No Nested Worktrees**: Helper script prevents accidental nesting and provides clear error messages
+4. **Isolation When Needed**: Each agent can work on separate issues without conflicts
+5. **Clean Workspace**: Agents start in main workspace, create worktrees only for implementation
+6. **Gitignored**: Worktrees don't clutter git status
+7. **Sandbox-Safe**: All worktrees inside workspace, no filesystem escapes
 
 **TypeScript Worktree Setup** (`src/lib/agent-launcher.ts:27-34`):
 

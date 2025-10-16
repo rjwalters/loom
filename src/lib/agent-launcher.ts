@@ -15,13 +15,13 @@ import { invoke } from "@tauri-apps/api/tauri";
  * with the appropriate role prompt and configuration. The agent runs visibly
  * in the terminal where users can see output and interact if needed.
  *
- * NOTE: All terminals now have worktrees automatically created during terminal creation.
- * This function expects worktreePath to be provided from terminal.worktreePath.
+ * NOTE: Worktrees are now created on-demand when claiming issues, not automatically.
+ * Agents start in the main workspace and create worktrees using `pnpm worktree <issue>`.
  *
  * @param terminalId - The terminal ID to launch the agent in
  * @param roleFile - The role file to use (e.g., "worker.md")
  * @param workspacePath - The workspace path (used for reading role files)
- * @param worktreePath - The worktree path for this terminal (required, created during terminal setup)
+ * @param worktreePath - The worktree path (empty string if agent should use main workspace)
  * @returns Promise that resolves when the agent is launched
  */
 export async function launchAgentInTerminal(
@@ -34,9 +34,10 @@ export async function launchAgentInTerminal(
     `[launchAgentInTerminal] START - terminalId=${terminalId}, roleFile=${roleFile}, workspacePath=${workspacePath}, worktreePath=${worktreePath}`
   );
 
-  // Use the provided worktree path as the working directory
-  const agentWorkingDir = worktreePath;
-  console.log(`[launchAgentInTerminal] Using worktree at ${agentWorkingDir}`);
+  // Use worktree path if provided, otherwise use main workspace
+  const agentWorkingDir = worktreePath || workspacePath;
+  const location = worktreePath ? `worktree at ${worktreePath}` : "main workspace";
+  console.log(`[launchAgentInTerminal] Using ${location}`);
 
   // Read role file content from workspace
   console.log(`[launchAgentInTerminal] Reading role file ${roleFile}...`);
@@ -280,10 +281,13 @@ export async function launchGrokAgent(terminalId: string): Promise<void> {
  * - Workspace-write sandbox with on-failure approval
  * - Permissions configured in .codex/config.toml
  *
+ * NOTE: Worktrees are now created on-demand when claiming issues, not automatically.
+ * Agents start in the main workspace and create worktrees using `pnpm worktree <issue>`.
+ *
  * @param terminalId - The terminal ID to launch the agent in
  * @param roleFile - The role file to use (e.g., "worker.md")
  * @param workspacePath - The workspace path (used for reading role files)
- * @param worktreePath - The worktree path for this terminal
+ * @param worktreePath - The worktree path (empty string if agent should use main workspace)
  * @returns Promise that resolves when the agent is launched
  */
 export async function launchCodexAgent(
@@ -296,6 +300,11 @@ export async function launchCodexAgent(
     `[launchCodexAgent] START - terminalId=${terminalId}, roleFile=${roleFile}, worktreePath=${worktreePath}`
   );
 
+  // Use worktree path if provided, otherwise use main workspace
+  const agentWorkingDir = worktreePath || workspacePath;
+  const location = worktreePath ? `worktree at ${worktreePath}` : "main workspace";
+  console.log(`[launchCodexAgent] Using ${location}`);
+
   // Read role file content from workspace
   console.log(`[launchCodexAgent] Reading role file ${roleFile}...`);
   const roleContent = await invoke<string>("read_role_file", {
@@ -305,12 +314,12 @@ export async function launchCodexAgent(
   console.log(`[launchCodexAgent] Role file read successfully, length=${roleContent.length}`);
 
   // Replace template variables in role content
-  const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, worktreePath);
-  console.log(`[launchCodexAgent] Processed prompt with workspace=${worktreePath}`);
+  const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
+  console.log(`[launchCodexAgent] Processed prompt with workspace=${agentWorkingDir}`);
 
-  // Write the system prompt to CODEX.md in the worktree
+  // Write the system prompt to CODEX.md in the working directory
   // Codex will load this as the system prompt
-  const codexMdPath = `${worktreePath}/CODEX.md`;
+  const codexMdPath = `${agentWorkingDir}/CODEX.md`;
   console.log(`[launchCodexAgent] Writing CODEX.md to ${codexMdPath}...`);
   await invoke("write_file", {
     path: codexMdPath,
@@ -342,5 +351,5 @@ export async function launchCodexAgent(
     data: "\r",
   });
 
-  console.log(`[launchCodexAgent] COMPLETE - Codex agent launched in ${worktreePath}`);
+  console.log(`[launchCodexAgent] COMPLETE - Codex agent launched in ${agentWorkingDir}`);
 }
