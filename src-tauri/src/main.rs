@@ -1216,7 +1216,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
     eprintln!("[kill_all_loom_sessions] Killing all loom tmux sessions");
 
     let output = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
         .output()
         .map_err(|e| format!("Failed to list tmux sessions: {e}"))?;
 
@@ -1234,7 +1234,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
             eprintln!("[kill_all_loom_sessions] Killing tmux session: {session}");
 
             let kill_output = Command::new("tmux")
-                .args(["kill-session", "-t", session])
+                .args(["-L", "loom", "kill-session", "-t", session])
                 .output()
                 .map_err(|e| format!("Failed to kill session {session}: {e}"))?;
 
@@ -1503,7 +1503,7 @@ fn main() {
                 if is_production {
                     eprintln!("[Loom] Production mode - cleaning up tmux sessions");
                     let _ = Command::new("tmux")
-                        .args(["list-sessions", "-F", "#{session_name}"])
+                        .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
                         .output()
                         .map(|output| {
                             let sessions = String::from_utf8_lossy(&output.stdout);
@@ -1511,7 +1511,7 @@ fn main() {
                                 if session.starts_with("loom-") {
                                     eprintln!("[Loom] Killing tmux session: {session}");
                                     let _ = Command::new("tmux")
-                                        .args(["kill-session", "-t", session])
+                                        .args(["-L", "loom", "kill-session", "-t", session])
                                         .spawn();
                                 }
                             }
