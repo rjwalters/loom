@@ -4,10 +4,17 @@ This guide covers the development workflow, tooling, and best practices for cont
 
 ## Prerequisites
 
-- **Node.js** 20+ and npm
+- **Node.js** 20+ and pnpm
 - **Rust** 1.60+ (stable)
 - **tmux** (for terminal management)
 - **Git**
+
+## Documentation Overview
+
+This guide covers code quality, tooling, and development practices. For:
+- **Day-to-day development workflow**: See [DEV_WORKFLOW.md](DEV_WORKFLOW.md)
+- **Project vision and architecture**: See [README.md](README.md)
+- **Agent workflows**: See [WORKFLOWS.md](WORKFLOWS.md)
 
 ## Getting Started
 
@@ -19,13 +26,15 @@ This guide covers the development workflow, tooling, and best practices for cont
 
 2. Install dependencies:
    ```bash
-   npm install
+   pnpm install
    ```
 
-3. Run the development server:
+3. Run the development environment:
    ```bash
-   npm run tauri:dev
+   pnpm run app:dev
    ```
+
+   This starts both the daemon and Tauri dev server in one command. For detailed workflow information, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
 
 ## Code Quality Tools
 
@@ -44,46 +53,75 @@ Loom uses a comprehensive set of tools to maintain code quality:
 
 ### Available Commands
 
+#### Application Development Commands
+```bash
+# Start daemon + Tauri dev in one command
+pnpm run app:dev
+
+# Restart daemon when it gets into bad state
+pnpm run app:dev:restart
+
+# Stop the background daemon
+pnpm run app:stop
+```
+
+#### Daemon Management
+```bash
+# Start daemon in background
+pnpm run daemon:start
+
+# Stop daemon
+pnpm run daemon:stop
+
+# Restart daemon
+pnpm run daemon:restart
+
+# Run daemon in foreground (for debugging)
+pnpm run daemon:dev
+```
+
+For detailed workflow information, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
+
 #### Frontend Linting and Formatting
 ```bash
 # Check for linting issues
-npm run lint
+pnpm run lint
 
 # Fix linting issues automatically
-npm run lint:fix
+pnpm run lint:fix
 
 # Check formatting (no changes)
-npm run format
+pnpm run format
 
 # Format code
-npm run format:write
+pnpm run format:write
 ```
 
 #### Backend Linting and Formatting
 ```bash
 # Check Rust formatting
-npm run format:rust
+pnpm run format:rust
 
 # Format Rust code
-npm run format:rust:write
+pnpm run format:rust:write
 
 # Run clippy linter
-npm run clippy
+pnpm run clippy
 
 # Fix clippy issues automatically
-npm run clippy:fix
+pnpm run clippy:fix
 ```
 
 #### Comprehensive Checks
 ```bash
 # Run all checks (lint, format, compile, build)
-npm run check:all
+pnpm run check:all
 
 # Check workspace compilation
-npm run check
+pnpm run check
 
 # Check daemon compilation
-npm run daemon:check
+pnpm run daemon:check
 ```
 
 ### Git Hooks
@@ -95,6 +133,41 @@ When you commit:
 2. **Rust files** are automatically formatted with rustfmt and linted with clippy
 
 If there are errors that can't be auto-fixed, the commit will be blocked.
+
+### Testing
+
+Loom has comprehensive testing at multiple levels:
+
+#### Unit Tests
+```bash
+# Run all workspace tests
+cargo test --workspace
+
+# Run with verbose output
+cargo test --workspace -- --nocapture
+```
+
+#### Integration Tests (Daemon)
+```bash
+# Run daemon integration tests
+pnpm run daemon:test
+
+# Run with verbose output
+pnpm run daemon:test:verbose
+
+# Run specific test
+cargo test --test integration_basic test_ping_pong -- --nocapture
+```
+
+#### Script Integration Tests
+```bash
+# Test daemon management scripts
+pnpm run daemon:test:scripts
+```
+
+**Requirements**: Tests require `tmux` installed (`brew install tmux` on macOS)
+
+See [scripts/README.md](scripts/README.md) for details on daemon management script testing.
 
 ### CI/CD
 
@@ -147,7 +220,7 @@ loom/
 
 3. Run checks locally:
    ```bash
-   npm run check:all
+   pnpm run check:all
    ```
 
 4. Commit your changes (pre-commit hooks will run automatically)
@@ -163,13 +236,13 @@ The daemon manages tmux terminal sessions independently of the GUI.
 
 ```bash
 # Run daemon in development mode (with logging)
-npm run daemon:dev
+pnpm run daemon:dev
 
 # Build daemon for production
-npm run daemon:build
+pnpm run daemon:build
 
 # Check daemon compilation
-npm run daemon:check
+pnpm run daemon:check
 ```
 
 ## VSCode Setup
@@ -187,14 +260,14 @@ Settings in `.vscode/settings.json` enable format-on-save for all languages.
 ### Linting Errors
 
 If you see linting errors:
-1. Try auto-fixing: `npm run lint:fix` (frontend) or `npm run clippy:fix` (Rust)
+1. Try auto-fixing: `pnpm run lint:fix` (frontend) or `pnpm run clippy:fix` (Rust)
 2. Check the error messages for manual fixes needed
 3. If a rule is too strict, discuss with the team before disabling it
 
 ### Build Errors
 
 If builds fail:
-1. Clean and rebuild: `rm -rf node_modules dist target && npm install && npm run build`
+1. Clean and rebuild: `rm -rf node_modules dist target && pnpm install && pnpm run build`
 2. Check that all dependencies are installed
 3. Verify Rust version: `rustc --version` (should be 1.60+)
 4. Verify Node version: `node --version` (should be 20+)
@@ -203,7 +276,7 @@ If builds fail:
 
 If pre-commit hooks fail:
 1. Check the error output for specific issues
-2. Try manual fixes: `npm run lint:fix && npm run format:rust:write`
+2. Try manual fixes: `pnpm run lint:fix && pnpm run format:rust:write`
 3. If hooks are misconfigured, reinstall: `rm -rf .husky && npx husky init`
 
 ## Additional Resources

@@ -174,14 +174,17 @@ cd loom
 # Install dependencies
 pnpm install
 
-# Terminal 1: Start daemon with live monitoring
-pnpm run daemon:dev
-
-# Terminal 2: Start Tauri dev mode
-pnpm run tauri:dev
+# Start development environment (daemon + GUI)
+pnpm run app:dev
 ```
 
-**For detailed development workflow, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
+**For detailed development workflows, troubleshooting, and advanced usage, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
+
+### Additional Development Resources
+- [DEV_WORKFLOW.md](DEV_WORKFLOW.md) - Detailed development workflow with hot reload
+- [DEVELOPMENT.md](DEVELOPMENT.md) - Code quality, testing, and best practices
+- [WORKFLOWS.md](WORKFLOWS.md) - Agent coordination via GitHub labels
+- [scripts/README.md](scripts/README.md) - Daemon management scripts
 
 ### CLI Usage
 
@@ -249,10 +252,10 @@ After launching Loom, you can configure each terminal with a specific role:
 cargo test --workspace
 
 # Run daemon integration tests
-npm run daemon:test
+pnpm run daemon:test
 
 # Run with verbose output (see logs)
-npm run daemon:test:verbose
+pnpm run daemon:test:verbose
 
 # Run specific test
 cargo test --test integration_basic test_ping_pong -- --nocapture
