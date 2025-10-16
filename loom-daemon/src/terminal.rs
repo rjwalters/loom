@@ -326,12 +326,34 @@ impl TerminalManager {
         for session in sessions.lines() {
             if let Some(remainder) = session.strip_prefix("loom-") {
                 // Session format: loom-{config_id}-{role}-{instance}
-                // Extract config_id (everything before the first hyphen after "loom-")
-                // For backwards compatibility, if no hyphens, use entire remainder as ID
-                let id = remainder.split_once('-').map_or_else(
-                    || remainder.to_string(),
-                    |(config_id, _rest)| config_id.to_string(),
-                );
+                // Extract config_id by checking for the "terminal-{number}" pattern
+                //
+                // Example session: loom-terminal-1-claude-code-worker-64
+                // After strip_prefix: terminal-1-claude-code-worker-64
+                // Split by '-': ["terminal", "1", "claude", "code", "worker", "64"]
+                //
+                // Strategy: If format is "terminal-{number}-...", extract "terminal-{number}"
+                // Otherwise use first part for backwards compatibility
+
+                let parts: Vec<&str> = remainder.split('-').collect();
+                if parts.is_empty() {
+                    log::warn!("Skipping malformed session name: {session}");
+                    continue;
+                }
+
+                // Check if this matches the "terminal-{number}" pattern
+                let id = if parts.len() >= 2
+                    && parts[0] == "terminal"
+                    && parts[1].chars().all(|c| c.is_ascii_digit())
+                {
+                    // Format: terminal-{number}-{role}-{instance}
+                    // Extract "terminal-{number}" as the ID
+                    format!("{}-{}", parts[0], parts[1])
+                } else {
+                    // For backwards compatibility with old format (no hyphens in ID),
+                    // use first part as the terminal ID
+                    parts[0].to_string()
+                };
 
                 // Validate terminal ID to prevent command injection
                 if let Err(e) = Self::validate_terminal_id(&id) {
