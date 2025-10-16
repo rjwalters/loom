@@ -1,6 +1,8 @@
+use crate::activity::{ActivityDb, AgentInput, InputContext, InputType};
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
 use anyhow::Result;
+use chrono::Utc;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
@@ -10,13 +12,19 @@ use tokio::net::{UnixListener, UnixStream};
 pub struct IpcServer {
     socket_path: PathBuf,
     terminal_manager: Arc<Mutex<TerminalManager>>,
+    activity_db: Arc<Mutex<ActivityDb>>,
 }
 
 impl IpcServer {
-    pub fn new(socket_path: PathBuf, terminal_manager: Arc<Mutex<TerminalManager>>) -> Self {
+    pub fn new(
+        socket_path: PathBuf,
+        terminal_manager: Arc<Mutex<TerminalManager>>,
+        activity_db: Arc<Mutex<ActivityDb>>,
+    ) -> Self {
         Self {
             socket_path,
             terminal_manager,
+            activity_db,
         }
     }
 
@@ -31,8 +39,9 @@ impl IpcServer {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let tm = self.terminal_manager.clone();
+                    let db = self.activity_db.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm).await {
+                        if let Err(e) = handle_client(stream, tm, db).await {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -48,6 +57,7 @@ impl IpcServer {
 async fn handle_client(
     stream: UnixStream,
     terminal_manager: Arc<Mutex<TerminalManager>>,
+    activity_db: Arc<Mutex<ActivityDb>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -56,7 +66,7 @@ async fn handle_client(
         let request: Request = serde_json::from_str(&line)?;
         log::debug!("Request: {request:?}");
 
-        let response = handle_request(request, &terminal_manager);
+        let response = handle_request(request, &terminal_manager, &activity_db);
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -70,7 +80,11 @@ async fn handle_client(
 // a thread panicked while holding the lock. This is not recoverable and should crash.
 // Allow too_many_lines because this is a central request dispatcher that handles all IPC commands.
 #[allow(clippy::expect_used, clippy::too_many_lines)]
-fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager>>) -> Response {
+fn handle_request(
+    request: Request,
+    terminal_manager: &Arc<Mutex<TerminalManager>>,
+    activity_db: &Arc<Mutex<ActivityDb>>,
+) -> Response {
     match request {
         Request::Ping => Response::Pong,
 
@@ -115,6 +129,24 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::SendInput { id, data } => {
+            // Record input to activity database
+            let input = AgentInput {
+                id: None,
+                terminal_id: id.clone(),
+                timestamp: Utc::now(),
+                input_type: InputType::Manual, // Default to manual, could be enhanced later
+                content: data.clone(),
+                agent_role: None, // Could be populated from terminal metadata
+                context: InputContext::default(),
+            };
+
+            if let Ok(db) = activity_db.lock() {
+                if let Err(e) = db.record_input(&input) {
+                    log::warn!("Failed to record input to activity database: {e}");
+                }
+            }
+
+            // Send input to terminal
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");

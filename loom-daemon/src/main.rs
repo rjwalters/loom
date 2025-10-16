@@ -1,7 +1,9 @@
+mod activity;
 mod ipc;
 mod terminal;
 mod types;
 
+use activity::ActivityDb;
 use anyhow::{anyhow, Result};
 use ipc::IpcServer;
 use std::fs;
@@ -20,15 +22,29 @@ async fn main() -> Result<()> {
 
     // Setup loom directory and socket path
     // For testing, allow override via LOOM_SOCKET_PATH env var
-    let socket_path = if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
-        std::path::PathBuf::from(path)
+    let (loom_dir, socket_path) = if let Ok(path) = std::env::var("LOOM_SOCKET_PATH") {
+        // For testing, use the parent directory of the provided socket path
+        let socket_path = std::path::PathBuf::from(path);
+        let loom_dir = socket_path
+            .parent()
+            .ok_or_else(|| anyhow!("Socket path has no parent directory"))?
+            .to_path_buf();
+        (loom_dir, socket_path)
     } else {
         let loom_dir = dirs::home_dir()
             .ok_or_else(|| anyhow!("No home directory"))?
             .join(".loom");
         fs::create_dir_all(&loom_dir)?;
-        loom_dir.join("daemon.sock")
+        let socket_path = loom_dir.join("daemon.sock");
+        (loom_dir, socket_path)
     };
+
+    // Initialize activity database
+    let db_path = loom_dir.join("activity.db");
+    let activity_db = ActivityDb::new(db_path)?;
+    log::info!("Activity database initialized");
+
+    let activity_db = Arc::new(Mutex::new(activity_db));
 
     // Initialize terminal manager
     let mut tm = TerminalManager::new();
@@ -38,7 +54,7 @@ async fn main() -> Result<()> {
     let tm = Arc::new(Mutex::new(tm));
 
     // Start IPC server
-    let server = IpcServer::new(socket_path, tm);
+    let server = IpcServer::new(socket_path, tm, activity_db);
 
     log::info!("Loom daemon starting...");
     server.run().await?;
