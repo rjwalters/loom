@@ -127,6 +127,14 @@ window.setInterval(() => {
 console.log("[main] Timer update interval started");
 
 // =================================================================
+// EVENT LISTENER DEDUPLICATION
+// =================================================================
+// Track if event listeners have been registered to prevent duplicates
+// This is critical because HMR (Hot Module Replacement) doesn't clean up
+// old listeners, causing duplicate event firings and multiple agent launches
+let eventListenersRegistered = false;
+
+// =================================================================
 // MCP COMMAND FILE WATCHER - For MCP tool automation
 // =================================================================
 // Poll for MCP commands written by the MCP server
@@ -477,288 +485,298 @@ async function initializeApp() {
 // Re-render on state changes
 state.onChange(render);
 
-// Listen for CLI workspace argument from Rust backend
-listen("cli-workspace", (event) => {
-  const workspacePath = event.payload as string;
-  console.log(`[CLI] Loading workspace from CLI argument: ${workspacePath}`);
-  handleWorkspacePathInput(workspacePath);
-});
+// Register all event listeners (with deduplication guard)
+if (!eventListenersRegistered) {
+  console.log("[main] Registering event listeners (first time only)");
+  eventListenersRegistered = true;
 
-// Listen for menu events
-listen("new-terminal", () => {
-  if (state.hasWorkspace()) {
-    createPlainTerminal();
-  }
-});
+  // Listen for CLI workspace argument from Rust backend
+  listen("cli-workspace", (event) => {
+    const workspacePath = event.payload as string;
+    console.log(`[CLI] Loading workspace from CLI argument: ${workspacePath}`);
+    handleWorkspacePathInput(workspacePath);
+  });
 
-listen("close-terminal", async () => {
-  const primary = state.getPrimary();
-  if (primary) {
-    const confirmed = await ask("Are you sure you want to close this terminal?", {
-      title: "Close Terminal",
-      type: "warning",
-    });
+  // Listen for menu events
+  listen("new-terminal", () => {
+    if (state.hasWorkspace()) {
+      createPlainTerminal();
+    }
+  });
 
-    if (confirmed) {
-      // Stop autonomous mode if running
-      const { getAutonomousManager } = await import("./lib/autonomous-manager");
-      const autonomousManager = getAutonomousManager();
-      autonomousManager.stopAutonomous(primary.id);
+  listen("close-terminal", async () => {
+    const primary = state.getPrimary();
+    if (primary) {
+      const confirmed = await ask("Are you sure you want to close this terminal?", {
+        title: "Close Terminal",
+        type: "warning",
+      });
 
-      // Stop polling and destroy terminal
-      outputPoller.stopPolling(primary.id);
-      terminalManager.destroyTerminal(primary.id);
-      if (currentAttachedTerminalId === primary.id) {
-        currentAttachedTerminalId = null;
+      if (confirmed) {
+        // Stop autonomous mode if running
+        const { getAutonomousManager } = await import("./lib/autonomous-manager");
+        const autonomousManager = getAutonomousManager();
+        autonomousManager.stopAutonomous(primary.id);
+
+        // Stop polling and destroy terminal
+        outputPoller.stopPolling(primary.id);
+        terminalManager.destroyTerminal(primary.id);
+        if (currentAttachedTerminalId === primary.id) {
+          currentAttachedTerminalId = null;
+        }
+
+        // Remove from state
+        state.removeTerminal(primary.id);
+        saveCurrentConfig();
       }
-
-      // Remove from state
-      state.removeTerminal(primary.id);
-      saveCurrentConfig();
     }
-  }
-});
+  });
 
-listen("close-workspace", async () => {
-  console.log("[close-workspace] Closing workspace");
+  listen("close-workspace", async () => {
+    console.log("[close-workspace] Closing workspace");
 
-  // Clear stored workspace
-  try {
-    await invoke("clear_stored_workspace");
-    console.log("[close-workspace] Cleared stored workspace");
-  } catch (error) {
-    console.error("Failed to clear stored workspace:", error);
-  }
-
-  // Clear localStorage workspace (for HMR survival)
-  localStorage.removeItem("loom:workspace");
-  console.log("[close-workspace] Cleared localStorage workspace");
-
-  // Stop all autonomous intervals
-  const { getAutonomousManager } = await import("./lib/autonomous-manager");
-  const autonomousManager = getAutonomousManager();
-  autonomousManager.stopAll();
-
-  // Stop all polling
-  outputPoller.stopAll();
-
-  // Destroy all xterm instances
-  terminalManager.destroyAll();
-
-  // Clear runtime state
-  state.clearAll();
-  setConfigWorkspace("");
-  currentAttachedTerminalId = null;
-
-  // Phase 3: Clear health check tracking when workspace closes
-  const previousSize = healthCheckedTerminals.size;
-  healthCheckedTerminals.clear();
-  console.log(
-    `[close-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
-  );
-
-  // Re-render to show workspace picker
-  console.log("[close-workspace] Rendering workspace picker");
-  render();
-});
-
-// Start engine - create sessions for existing config (with confirmation)
-listen("start-workspace", async () => {
-  if (!state.hasWorkspace()) return;
-  const workspace = state.getWorkspaceOrThrow();
-
-  const confirmed = await ask(
-    "This will:\n" +
-      "• Close all current terminal sessions\n" +
-      "• Create new sessions for configured terminals\n" +
-      "• Launch agents as configured\n\n" +
-      "Your configuration will NOT be changed.\n\n" +
-      "Continue?",
-    {
-      title: "Start Loom Engine",
-      type: "info",
+    // Clear stored workspace
+    try {
+      await invoke("clear_stored_workspace");
+      console.log("[close-workspace] Cleared stored workspace");
+    } catch (error) {
+      console.error("Failed to clear stored workspace:", error);
     }
-  );
 
-  if (!confirmed) return;
+    // Clear localStorage workspace (for HMR survival)
+    localStorage.removeItem("loom:workspace");
+    console.log("[close-workspace] Cleared localStorage workspace");
 
-  // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
-  const previousSize = healthCheckedTerminals.size;
-  healthCheckedTerminals.clear();
-  console.log(
-    `[start-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
-  );
+    // Stop all autonomous intervals
+    const { getAutonomousManager } = await import("./lib/autonomous-manager");
+    const autonomousManager = getAutonomousManager();
+    autonomousManager.stopAll();
 
-  // Use the workspace start module (reads existing config)
-  const { startWorkspaceEngine } = await import("./lib/workspace-start");
-  await startWorkspaceEngine(
-    workspace,
-    {
-      state,
-      outputPoller,
-      terminalManager,
-      setCurrentAttachedTerminalId: (id) => {
-        currentAttachedTerminalId = id;
-      },
-      launchAgentsForTerminals,
-      render,
-    },
-    "start-workspace"
-  );
-});
+    // Stop all polling
+    outputPoller.stopAll();
 
-// Force Start engine - NO confirmation dialog (for MCP automation)
-listen("force-start-workspace", async () => {
-  if (!state.hasWorkspace()) return;
-  const workspace = state.getWorkspaceOrThrow();
+    // Destroy all xterm instances
+    terminalManager.destroyAll();
 
-  console.log("[force-start-workspace] Starting engine (no confirmation)");
+    // Clear runtime state
+    state.clearAll();
+    setConfigWorkspace("");
+    currentAttachedTerminalId = null;
 
-  // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
-  const previousSize = healthCheckedTerminals.size;
-  healthCheckedTerminals.clear();
-  console.log(
-    `[force-start-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
-  );
+    // Phase 3: Clear health check tracking when workspace closes
+    const previousSize = healthCheckedTerminals.size;
+    healthCheckedTerminals.clear();
+    console.log(
+      `[close-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+    );
 
-  // Use the workspace start module (no confirmation)
-  const { startWorkspaceEngine } = await import("./lib/workspace-start");
-  await startWorkspaceEngine(
-    workspace,
-    {
-      state,
-      outputPoller,
-      terminalManager,
-      setCurrentAttachedTerminalId: (id) => {
-        currentAttachedTerminalId = id;
-      },
-      launchAgentsForTerminals,
-      render,
-    },
-    "force-start-workspace"
-  );
-});
+    // Re-render to show workspace picker
+    console.log("[close-workspace] Rendering workspace picker");
+    render();
+  });
 
-// Factory Reset - overwrite config with defaults (with confirmation)
-listen("factory-reset-workspace", async () => {
-  if (!state.hasWorkspace()) return;
-  const workspace = state.getWorkspaceOrThrow();
+  // Start engine - create sessions for existing config (with confirmation)
+  listen("start-workspace", async () => {
+    if (!state.hasWorkspace()) return;
+    const workspace = state.getWorkspaceOrThrow();
 
-  const confirmed = await ask(
-    "⚠️ WARNING: Factory Reset ⚠️\n\n" +
+    const confirmed = await ask(
       "This will:\n" +
-      "• DELETE all terminal configurations\n" +
-      "• OVERWRITE .loom/ with default config\n" +
-      "• Reset all roles to defaults\n" +
-      "• Close all current terminals\n" +
-      "• Recreate 6 default terminals\n\n" +
-      "This action CANNOT be undone!\n\n" +
-      "Continue with Factory Reset?",
-    {
-      title: "⚠️ Factory Reset Warning",
-      type: "warning",
+        "• Close all current terminal sessions\n" +
+        "• Create new sessions for configured terminals\n" +
+        "• Launch agents as configured\n\n" +
+        "Your configuration will NOT be changed.\n\n" +
+        "Continue?",
+      {
+        title: "Start Loom Engine",
+        type: "info",
+      }
+    );
+
+    if (!confirmed) return;
+
+    // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
+    const previousSize = healthCheckedTerminals.size;
+    healthCheckedTerminals.clear();
+    console.log(
+      `[start-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+    );
+
+    // Use the workspace start module (reads existing config)
+    const { startWorkspaceEngine } = await import("./lib/workspace-start");
+    await startWorkspaceEngine(
+      workspace,
+      {
+        state,
+        outputPoller,
+        terminalManager,
+        setCurrentAttachedTerminalId: (id) => {
+          currentAttachedTerminalId = id;
+        },
+        launchAgentsForTerminals,
+        render,
+      },
+      "start-workspace"
+    );
+  });
+
+  // Force Start engine - NO confirmation dialog (for MCP automation)
+  listen("force-start-workspace", async () => {
+    if (!state.hasWorkspace()) return;
+    const workspace = state.getWorkspaceOrThrow();
+
+    console.log("[force-start-workspace] Starting engine (no confirmation)");
+
+    // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
+    const previousSize = healthCheckedTerminals.size;
+    healthCheckedTerminals.clear();
+    console.log(
+      `[force-start-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+    );
+
+    // Use the workspace start module (no confirmation)
+    const { startWorkspaceEngine } = await import("./lib/workspace-start");
+    await startWorkspaceEngine(
+      workspace,
+      {
+        state,
+        outputPoller,
+        terminalManager,
+        setCurrentAttachedTerminalId: (id) => {
+          currentAttachedTerminalId = id;
+        },
+        launchAgentsForTerminals,
+        render,
+      },
+      "force-start-workspace"
+    );
+  });
+
+  // Factory Reset - overwrite config with defaults (with confirmation)
+  listen("factory-reset-workspace", async () => {
+    if (!state.hasWorkspace()) return;
+    const workspace = state.getWorkspaceOrThrow();
+
+    const confirmed = await ask(
+      "⚠️ WARNING: Factory Reset ⚠️\n\n" +
+        "This will:\n" +
+        "• DELETE all terminal configurations\n" +
+        "• OVERWRITE .loom/ with default config\n" +
+        "• Reset all roles to defaults\n" +
+        "• Close all current terminals\n" +
+        "• Recreate 6 default terminals\n\n" +
+        "This action CANNOT be undone!\n\n" +
+        "Continue with Factory Reset?",
+      {
+        title: "⚠️ Factory Reset Warning",
+        type: "warning",
+      }
+    );
+
+    if (!confirmed) return;
+
+    // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
+    const previousSize = healthCheckedTerminals.size;
+    healthCheckedTerminals.clear();
+    console.log(
+      `[factory-reset-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
+    );
+
+    // Set loading state before reset
+    state.setResettingWorkspace(true);
+
+    try {
+      // Use the workspace reset module (overwrites config with defaults)
+      const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
+      await resetWorkspaceToDefaults(
+        workspace,
+        {
+          state,
+          outputPoller,
+          terminalManager,
+          setCurrentAttachedTerminalId: (id) => {
+            currentAttachedTerminalId = id;
+          },
+          launchAgentsForTerminals,
+          render,
+        },
+        "factory-reset-workspace"
+      );
+    } finally {
+      // Clear loading state when done (even if error)
+      state.setResettingWorkspace(false);
     }
-  );
+  });
 
-  if (!confirmed) return;
+  // Force Factory Reset - NO confirmation dialog (for MCP automation)
+  listen("force-factory-reset-workspace", async () => {
+    if (!state.hasWorkspace()) return;
+    const workspace = state.getWorkspaceOrThrow();
 
-  // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
-  const previousSize = healthCheckedTerminals.size;
-  healthCheckedTerminals.clear();
-  console.log(
-    `[factory-reset-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
-  );
+    console.log("[force-factory-reset-workspace] Resetting workspace (no confirmation)");
 
-  // Set loading state before reset
-  state.setResettingWorkspace(true);
-
-  try {
-    // Use the workspace reset module (overwrites config with defaults)
-    const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
-    await resetWorkspaceToDefaults(
-      workspace,
-      {
-        state,
-        outputPoller,
-        terminalManager,
-        setCurrentAttachedTerminalId: (id) => {
-          currentAttachedTerminalId = id;
-        },
-        launchAgentsForTerminals,
-        render,
-      },
-      "factory-reset-workspace"
+    // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
+    const previousSize = healthCheckedTerminals.size;
+    healthCheckedTerminals.clear();
+    console.log(
+      `[force-factory-reset-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
     );
-  } finally {
-    // Clear loading state when done (even if error)
-    state.setResettingWorkspace(false);
-  }
-});
 
-// Force Factory Reset - NO confirmation dialog (for MCP automation)
-listen("force-factory-reset-workspace", async () => {
-  if (!state.hasWorkspace()) return;
-  const workspace = state.getWorkspaceOrThrow();
+    // Set loading state before reset
+    state.setResettingWorkspace(true);
 
-  console.log("[force-factory-reset-workspace] Resetting workspace (no confirmation)");
-
-  // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
-  const previousSize = healthCheckedTerminals.size;
-  healthCheckedTerminals.clear();
-  console.log(
-    `[force-factory-reset-workspace] [Phase 3] Cleared healthCheckedTerminals Set (was ${previousSize}, now ${healthCheckedTerminals.size})`
-  );
-
-  // Set loading state before reset
-  state.setResettingWorkspace(true);
-
-  try {
-    // Use the workspace reset module (no confirmation)
-    const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
-    await resetWorkspaceToDefaults(
-      workspace,
-      {
-        state,
-        outputPoller,
-        terminalManager,
-        setCurrentAttachedTerminalId: (id) => {
-          currentAttachedTerminalId = id;
+    try {
+      // Use the workspace reset module (no confirmation)
+      const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
+      await resetWorkspaceToDefaults(
+        workspace,
+        {
+          state,
+          outputPoller,
+          terminalManager,
+          setCurrentAttachedTerminalId: (id) => {
+            currentAttachedTerminalId = id;
+          },
+          launchAgentsForTerminals,
+          render,
         },
-        launchAgentsForTerminals,
-        render,
-      },
-      "force-factory-reset-workspace"
-    );
-  } finally {
-    // Clear loading state when done (even if error)
-    state.setResettingWorkspace(false);
-  }
-});
+        "force-factory-reset-workspace"
+      );
+    } finally {
+      // Clear loading state when done (even if error)
+      state.setResettingWorkspace(false);
+    }
+  });
 
-listen("toggle-theme", () => {
-  toggleTheme();
-});
+  listen("toggle-theme", () => {
+    toggleTheme();
+  });
 
-listen("zoom-in", () => {
-  terminalManager.adjustAllFontSizes(2);
-});
+  listen("zoom-in", () => {
+    terminalManager.adjustAllFontSizes(2);
+  });
 
-listen("zoom-out", () => {
-  terminalManager.adjustAllFontSizes(-2);
-});
+  listen("zoom-out", () => {
+    terminalManager.adjustAllFontSizes(-2);
+  });
 
-listen("reset-zoom", () => {
-  terminalManager.resetAllFontSizes();
-});
+  listen("reset-zoom", () => {
+    terminalManager.resetAllFontSizes();
+  });
 
-listen("show-shortcuts", async () => {
-  const { showKeyboardShortcutsModal } = await import("./lib/keyboard-shortcuts-modal");
-  showKeyboardShortcutsModal();
-});
+  listen("show-shortcuts", async () => {
+    const { showKeyboardShortcutsModal } = await import("./lib/keyboard-shortcuts-modal");
+    showKeyboardShortcutsModal();
+  });
 
-listen("show-daemon-status", async () => {
-  showDaemonStatusDialog();
-});
+  listen("show-daemon-status", async () => {
+    showDaemonStatusDialog();
+  });
+
+  console.log("[main] Event listeners registered successfully");
+} else {
+  console.log("[main] Event listeners already registered, skipping duplicate registration");
+}
 
 // Show daemon status dialog with reconnect option
 async function showDaemonStatusDialog() {
