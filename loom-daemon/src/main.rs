@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("No home directory"))?
             .join(".loom");
         fs::create_dir_all(&loom_dir)?;
-        let socket_path = loom_dir.join("daemon.sock");
+        let socket_path = loom_dir.join("loom-daemon.sock");
         (loom_dir, socket_path)
     };
 
