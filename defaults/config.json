@@ -100,13 +100,13 @@
     {
       "configId": "terminal-7",
       "id": "__needs_session__",
-      "name": "Fluffer",
+      "name": "Fixer",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "fluffer.md",
+        "roleFile": "fixer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Check for PRs with review feedback: gh pr list --label=\"loom:reviewing\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
       },

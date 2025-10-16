@@ -22,7 +22,7 @@ This directory contains example Loom workspace configurations to help you get st
 - Curator - Enhances issues with implementation details
 - Reviewer - Reviews pull requests thoroughly
 - Worker 1, 2, 3 - Parallel feature implementation
-- Fluffer - Addresses review feedback and polishes PRs
+- Fixer - Addresses review feedback and polishes PRs
 - Critic - Identifies opportunities to simplify and remove bloat
 
 **Use when**: You want the complete Loom experience with specialized agents for every part of the development workflow.
