@@ -312,15 +312,43 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Helper function to find git repository root by searching for .git directory
+fn find_git_root() -> Option<std::path::PathBuf> {
+    // Start from current directory
+    let mut current = std::env::current_dir().ok()?;
+
+    loop {
+        let git_dir = current.join(".git");
+        if git_dir.exists() {
+            return Some(current);
+        }
+
+        // Move up to parent directory
+        if !current.pop() {
+            // Reached filesystem root without finding .git
+            return None;
+        }
+    }
+}
+
 // Helper function to resolve defaults directory path
 // Tries development path first, then falls back to bundled resource path
 fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
 
-    // Try the provided path first (development mode)
+    // Try the provided path first (development mode - relative to cwd)
     let dev_path = PathBuf::from(defaults_path);
     if dev_path.exists() {
         return Ok(dev_path);
+    }
+
+    // Try finding defaults relative to git repository root
+    // This handles the case where we're running from a git worktree
+    if let Some(git_root) = find_git_root() {
+        let git_root_defaults = git_root.join(defaults_path);
+        if git_root_defaults.exists() {
+            return Ok(git_root_defaults);
+        }
     }
 
     // Try resolving as bundled resource (production mode)
@@ -339,7 +367,7 @@ fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, Stri
     }
 
     Err(format!(
-        "Defaults directory not found: tried {defaults_path} and bundled resources"
+        "Defaults directory not found: tried {defaults_path}, git root, and bundled resources"
     ))
 }
 
