@@ -45,6 +45,10 @@ export interface Terminal {
   agentStatus?: AgentStatus; // Agent state machine
   lastIntervalRun?: number; // Timestamp (ms)
   pendingInputRequests?: InputRequest[]; // Queue of input requests
+  // Timer tracking fields
+  busyTime?: number; // Total milliseconds spent in busy state
+  idleTime?: number; // Total milliseconds spent in idle state
+  lastStateChange?: number; // Timestamp (ms) of last status change
 }
 
 export class AppState {
@@ -115,6 +119,42 @@ export class AppState {
       Object.assign(terminal, updates);
       this.notify();
     }
+  }
+
+  updateTerminalStatus(id: string, newStatus: TerminalStatus): void {
+    const terminal = this.terminals.get(id);
+    if (!terminal) {
+      return;
+    }
+
+    const now = Date.now();
+    const oldStatus = terminal.status;
+
+    // Only process timer updates if status actually changed
+    if (oldStatus !== newStatus && terminal.lastStateChange) {
+      const elapsed = now - terminal.lastStateChange;
+
+      // Add elapsed time to the appropriate counter
+      if (oldStatus === TerminalStatus.Busy) {
+        terminal.busyTime = (terminal.busyTime || 0) + elapsed;
+      } else if (oldStatus === TerminalStatus.Idle) {
+        terminal.idleTime = (terminal.idleTime || 0) + elapsed;
+      }
+    }
+
+    // Update status and timestamp
+    terminal.status = newStatus;
+    terminal.lastStateChange = now;
+
+    // Initialize timers if this is the first state change
+    if (terminal.busyTime === undefined) {
+      terminal.busyTime = 0;
+    }
+    if (terminal.idleTime === undefined) {
+      terminal.idleTime = 0;
+    }
+
+    this.notify();
   }
 
   setTerminalRole(

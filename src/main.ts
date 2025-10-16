@@ -105,6 +105,17 @@ healthMonitor.onHealthUpdate(() => {
 });
 console.log("[main] Subscribed to health monitor updates");
 
+// Update timer displays every second
+window.setInterval(() => {
+  // Re-render to update timer displays without full state change
+  // This ensures busy/idle timers update in real-time
+  const terminals = state.getTerminals();
+  if (terminals.length > 0) {
+    render();
+  }
+}, 1000);
+console.log("[main] Timer update interval started");
+
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
 

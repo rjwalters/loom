@@ -36,6 +36,10 @@ export interface TerminalState {
     prompt: string;
     timestamp: number;
   }>;
+  // Timer tracking fields
+  busyTime?: number; // Total milliseconds spent in busy state
+  idleTime?: number; // Total milliseconds spent in idle state
+  lastStateChange?: number; // Timestamp (ms) of last status change
 }
 
 export interface LoomState {
@@ -116,6 +120,9 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
       agentStatus: agent.agentStatus,
       lastIntervalRun: agent.lastIntervalRun,
       pendingInputRequests: agent.pendingInputRequests,
+      busyTime: agent.busyTime,
+      idleTime: agent.idleTime,
+      lastStateChange: agent.lastStateChange,
     });
   });
 
@@ -252,6 +259,9 @@ export function mergeConfigAndState(
       agentStatus: st?.agentStatus,
       lastIntervalRun: st?.lastIntervalRun,
       pendingInputRequests: st?.pendingInputRequests,
+      busyTime: st?.busyTime,
+      idleTime: st?.idleTime,
+      lastStateChange: st?.lastStateChange,
     };
   });
 
@@ -286,6 +296,9 @@ export function splitTerminals(terminals: Terminal[]): {
     agentStatus: t.agentStatus,
     lastIntervalRun: t.lastIntervalRun,
     pendingInputRequests: t.pendingInputRequests,
+    busyTime: t.busyTime,
+    idleTime: t.idleTime,
+    lastStateChange: t.lastStateChange,
   }));
 
   return { config, state };
