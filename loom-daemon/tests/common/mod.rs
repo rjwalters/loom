@@ -135,6 +135,7 @@ impl TestClient {
     }
 
     /// Helper: Send Ping request
+    #[allow(dead_code)]
     pub async fn ping(&mut self) -> Result<()> {
         let request = serde_json::json!({"type": "Ping"});
         let response = self.send_request(request).await?;
@@ -175,6 +176,7 @@ impl TestClient {
     }
 
     /// Helper: List terminals
+    #[allow(dead_code)]
     pub async fn list_terminals(&mut self) -> Result<Vec<serde_json::Value>> {
         let request = serde_json::json!({"type": "ListTerminals"});
         let response = self.send_request(request).await?;
@@ -188,6 +190,7 @@ impl TestClient {
     }
 
     /// Helper: Destroy terminal
+    #[allow(dead_code)]
     pub async fn destroy_terminal(&mut self, id: &str) -> Result<()> {
         let request = serde_json::json!({
             "type": "DestroyTerminal",
@@ -204,6 +207,7 @@ impl TestClient {
     }
 
     /// Helper: Send input to terminal
+    #[allow(dead_code)]
     pub async fn send_input(&mut self, id: &str, data: &str) -> Result<()> {
         let request = serde_json::json!({
             "type": "SendInput",
@@ -221,6 +225,7 @@ impl TestClient {
 }
 
 /// Helper: Check if a tmux session exists
+#[allow(dead_code)]
 pub fn tmux_session_exists(session_name: &str) -> bool {
     Command::new("tmux")
         .args(["-L", "loom", "has-session", "-t", session_name])

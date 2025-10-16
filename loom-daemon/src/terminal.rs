@@ -16,6 +16,26 @@ impl TerminalManager {
         }
     }
 
+    /// Validate terminal ID to prevent command injection
+    /// Only allows alphanumeric characters, hyphens, and underscores
+    fn validate_terminal_id(id: &str) -> Result<()> {
+        if id.is_empty() {
+            return Err(anyhow!("Terminal ID cannot be empty"));
+        }
+
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow!(
+                "Invalid terminal ID: '{}'. Only alphanumeric characters, hyphens, and underscores are allowed",
+                id
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn create_terminal(
         &mut self,
         config_id: &str,
@@ -24,6 +44,9 @@ impl TerminalManager {
         role: Option<&String>,
         instance_number: Option<u32>,
     ) -> Result<TerminalId> {
+        // Validate terminal ID to prevent command injection
+        Self::validate_terminal_id(config_id)?;
+
         // Use config_id directly as the terminal ID
         let id = config_id.to_string();
         let role_part = role.map_or("default", String::as_str);
@@ -309,6 +332,12 @@ impl TerminalManager {
                     || remainder.to_string(),
                     |(config_id, _rest)| config_id.to_string(),
                 );
+
+                // Validate terminal ID to prevent command injection
+                if let Err(e) = Self::validate_terminal_id(&id) {
+                    log::warn!("Skipping invalid terminal ID from tmux session {session}: {e}");
+                    continue;
+                }
 
                 // Clear any existing pipe-pane for this session to avoid duplicates
                 log::debug!("Clearing existing pipe-pane for session {session}");
