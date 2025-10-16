@@ -159,13 +159,42 @@ fn handle_request(
         }
 
         Request::GetTerminalOutput { id, start_byte } => {
+            use base64::{engine::general_purpose, Engine as _};
+
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.get_terminal_output(&id, start_byte) {
                 Ok((output_bytes, byte_count)) => {
+                    // Record output sample to activity database if there's new data
+                    if !output_bytes.is_empty() {
+                        let output_str = String::from_utf8_lossy(&output_bytes).to_string();
+                        // Take first 1024 characters (not bytes) to avoid slicing multi-byte UTF-8 chars
+                        let preview = if output_str.chars().count() > 1024 {
+                            output_str.chars().take(1024).collect::<String>()
+                        } else {
+                            output_str.clone()
+                        };
+
+                        let output_record = crate::activity::AgentOutput {
+                            id: None,
+                            input_id: None, // Could link to last input if tracked
+                            terminal_id: id.clone(),
+                            timestamp: Utc::now(),
+                            content: Some(output_str),
+                            content_preview: Some(preview),
+                            exit_code: None,
+                            metadata: None,
+                        };
+
+                        if let Ok(db) = activity_db.lock() {
+                            if let Err(e) = db.record_output(&output_record) {
+                                log::warn!("Failed to record output to activity database: {e}");
+                            }
+                        }
+                    }
+
                     // Encode bytes as base64 for JSON transmission
-                    use base64::{engine::general_purpose, Engine as _};
                     let output = general_purpose::STANDARD.encode(&output_bytes);
                     log::debug!(
                         "GetTerminalOutput: {} raw bytes -> {} base64 chars, total byte_count={}",
