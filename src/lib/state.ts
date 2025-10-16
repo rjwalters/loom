@@ -59,6 +59,7 @@ export class AppState {
   private workspacePath: string | null = null; // Valid workspace path
   private displayedWorkspacePath: string = ""; // Path shown in input (may be invalid)
   private nextTerminalNumber: number = 1; // Counter for terminal numbering (always increments)
+  private isResettingWorkspace: boolean = false; // Loading state during factory reset
 
   addTerminal(terminal: Terminal): void {
     this.terminals.set(terminal.id, terminal);
@@ -293,6 +294,15 @@ export class AppState {
 
   getDisplayedWorkspace(): string {
     return this.displayedWorkspacePath;
+  }
+
+  setResettingWorkspace(isResetting: boolean): void {
+    this.isResettingWorkspace = isResetting;
+    this.notify();
+  }
+
+  isWorkspaceResetting(): boolean {
+    return this.isResettingWorkspace;
   }
 
   getNextTerminalNumber(): number {

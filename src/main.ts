@@ -17,7 +17,12 @@ import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { getTooltipManager } from "./lib/tooltip";
-import { renderHeader, renderMiniTerminals, renderPrimaryTerminal } from "./lib/ui";
+import {
+  renderHeader,
+  renderLoadingState,
+  renderMiniTerminals,
+  renderPrimaryTerminal,
+} from "./lib/ui";
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -122,11 +127,14 @@ let currentAttachedTerminalId: string | null = null;
 // Render function
 function render() {
   const hasWorkspace = state.hasWorkspace();
+  const isResetting = state.isWorkspaceResetting();
   console.log(
     "[render] hasWorkspace:",
     hasWorkspace,
     "displayedWorkspace:",
-    state.getDisplayedWorkspace()
+    state.getDisplayedWorkspace(),
+    "isResetting:",
+    isResetting
   );
 
   // Get health data from health monitor
@@ -139,6 +147,13 @@ function render() {
     systemHealth.daemon.connected,
     systemHealth.daemon.lastPing
   );
+
+  // Show loading state if factory reset is in progress
+  if (isResetting) {
+    renderLoadingState("Resetting workspace...");
+    // Don't render terminals or workspace selector while resetting
+    return;
+  }
 
   renderPrimaryTerminal(state.getPrimary(), hasWorkspace, state.getDisplayedWorkspace());
 
@@ -506,22 +521,30 @@ listen("factory-reset-workspace", async () => {
 
   if (!confirmed) return;
 
-  // Use the workspace reset module (overwrites config with defaults)
-  const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
-  await resetWorkspaceToDefaults(
-    workspace,
-    {
-      state,
-      outputPoller,
-      terminalManager,
-      setCurrentAttachedTerminalId: (id) => {
-        currentAttachedTerminalId = id;
+  // Set loading state before reset
+  state.setResettingWorkspace(true);
+
+  try {
+    // Use the workspace reset module (overwrites config with defaults)
+    const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
+    await resetWorkspaceToDefaults(
+      workspace,
+      {
+        state,
+        outputPoller,
+        terminalManager,
+        setCurrentAttachedTerminalId: (id) => {
+          currentAttachedTerminalId = id;
+        },
+        launchAgentsForTerminals,
+        render,
       },
-      launchAgentsForTerminals,
-      render,
-    },
-    "factory-reset-workspace"
-  );
+      "factory-reset-workspace"
+    );
+  } finally {
+    // Clear loading state when done (even if error)
+    state.setResettingWorkspace(false);
+  }
 });
 
 listen("toggle-theme", () => {
