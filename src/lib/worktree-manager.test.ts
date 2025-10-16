@@ -38,10 +38,10 @@ describe("worktree-manager", () => {
 
       await setupWorktreeForAgent("test-terminal-2", "/path/to/workspace");
 
-      // Check git worktree add was called
+      // Check git worktree add was called with -b flag for branch isolation
       expect(invoke).toHaveBeenCalledWith("send_terminal_input", {
         id: "test-terminal-2",
-        data: 'git worktree add "/path/to/workspace/.loom/worktrees/test-terminal-2" HEAD',
+        data: 'git worktree add -b "worktree/test-terminal-2" "/path/to/workspace/.loom/worktrees/test-terminal-2" HEAD',
       });
 
       // Check Enter was sent after git command
@@ -155,7 +155,7 @@ describe("worktree-manager", () => {
       // Expected order of commands
       const expectedCommands = [
         'mkdir -p "/path/to/workspace/.loom/worktrees/test-terminal-7"',
-        'git worktree add "/path/to/workspace/.loom/worktrees/test-terminal-7" HEAD',
+        'git worktree add -b "worktree/test-terminal-7" "/path/to/workspace/.loom/worktrees/test-terminal-7" HEAD',
         'cd "/path/to/workspace/.loom/worktrees/test-terminal-7"',
         'git config user.name "Test User"',
         'git config user.email "test@example.com"',
@@ -179,7 +179,7 @@ describe("worktree-manager", () => {
 
       expect(invoke).toHaveBeenCalledWith("send_terminal_input", {
         id: "test-terminal-8",
-        data: 'git worktree add "/path/with spaces/workspace/.loom/worktrees/test-terminal-8" HEAD',
+        data: 'git worktree add -b "worktree/test-terminal-8" "/path/with spaces/workspace/.loom/worktrees/test-terminal-8" HEAD',
       });
     });
 
