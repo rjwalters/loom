@@ -45,6 +45,10 @@ pub enum Request {
     KillSession {
         session_name: String,
     },
+    SetWorktreePath {
+        id: TerminalId,
+        worktree_path: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

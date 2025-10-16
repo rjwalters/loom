@@ -94,39 +94,68 @@ impl TerminalManager {
         self.terminals.values().cloned().collect()
     }
 
+    pub fn set_worktree_path(&mut self, id: &TerminalId, worktree_path: &str) -> Result<()> {
+        let info = self
+            .terminals
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        info.worktree_path = Some(worktree_path.to_string());
+        log::info!("Set worktree path for terminal {id}: {worktree_path}");
+        Ok(())
+    }
+
     pub fn destroy_terminal(&mut self, id: &TerminalId) -> Result<()> {
         let info = self
             .terminals
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
-        // If terminal has a worktree working directory, clean it up
-        if let Some(ref working_dir) = info.working_dir {
-            let path = PathBuf::from(working_dir);
-            // Check if this looks like a worktree path (.loom/worktrees/<id>)
+        // Check if terminal has a worktree_path for reference counting
+        if let Some(ref worktree_path) = info.worktree_path {
+            let path = PathBuf::from(worktree_path);
             if path.to_string_lossy().contains(".loom/worktrees") {
-                log::info!("Removing git worktree at {}", path.display());
+                // Count how many OTHER terminals are using this worktree
+                let other_users = self
+                    .terminals
+                    .values()
+                    .filter(|t| t.id != *id && t.worktree_path.as_ref() == Some(worktree_path))
+                    .count();
 
-                // First try to remove the worktree via git
-                let output = Command::new("git")
-                    .args(["worktree", "remove", working_dir])
-                    .output();
+                if other_users == 0 {
+                    // This is the last terminal - safe to remove
+                    log::info!(
+                        "Removing worktree at {} (no other terminals using it)",
+                        path.display()
+                    );
 
-                if let Ok(output) = output {
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        log::warn!("git worktree remove failed: {stderr}");
-                        log::info!("Attempting force removal...");
+                    // First try to remove the worktree via git
+                    let output = Command::new("git")
+                        .args(["worktree", "remove", worktree_path])
+                        .output();
 
-                        // Try force removal
-                        let _ = Command::new("git")
-                            .args(["worktree", "remove", "--force", working_dir])
-                            .output();
+                    if let Ok(output) = output {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            log::warn!("git worktree remove failed: {stderr}");
+                            log::info!("Attempting force removal...");
+
+                            // Try force removal
+                            let _ = Command::new("git")
+                                .args(["worktree", "remove", "--force", worktree_path])
+                                .output();
+                        }
                     }
-                }
 
-                // Also try to remove directory manually as fallback
-                let _ = fs::remove_dir_all(&path);
+                    // Also try to remove directory manually as fallback
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    log::info!(
+                        "Skipping worktree removal at {} ({} other terminal(s) still using it)",
+                        path.display(),
+                        other_users
+                    );
+                }
             }
         }
 

@@ -60,6 +60,20 @@ export async function setupWorktreeForAgent(
   // Log success message
   await sendCommand(terminalId, `echo "✓ Worktree ready at ${worktreePath}"`);
 
+  // Notify daemon about worktree path for reference counting
+  try {
+    await invoke("set_worktree_path", {
+      id: terminalId,
+      worktreePath,
+    });
+    console.log(
+      `[setupWorktreeForAgent] Notified daemon: terminal ${terminalId} using worktree ${worktreePath}`
+    );
+  } catch (error) {
+    console.error(`[setupWorktreeForAgent] Failed to notify daemon about worktree path:`, error);
+    // Non-fatal - continue even if notification fails
+  }
+
   return worktreePath;
 }
 

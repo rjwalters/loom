@@ -357,12 +357,14 @@ function createTimerDisplayHTML(terminal: Terminal): string {
   const idleDisplay = formatDuration(currentIdleTime);
 
   // Choose colors based on status
-  const busyColor = terminal.status === TerminalStatus.Busy
-    ? "text-blue-600 dark:text-blue-400 font-semibold"
-    : "text-gray-500 dark:text-gray-400";
-  const idleColor = terminal.status === TerminalStatus.Idle
-    ? "text-gray-600 dark:text-gray-300 font-semibold"
-    : "text-gray-500 dark:text-gray-400";
+  const busyColor =
+    terminal.status === TerminalStatus.Busy
+      ? "text-blue-600 dark:text-blue-400 font-semibold"
+      : "text-gray-500 dark:text-gray-400";
+  const idleColor =
+    terminal.status === TerminalStatus.Idle
+      ? "text-gray-600 dark:text-gray-300 font-semibold"
+      : "text-gray-500 dark:text-gray-400";
 
   return `
     <div class="flex flex-col gap-0.5 mt-1 border-t border-gray-200 dark:border-gray-700 pt-1">
