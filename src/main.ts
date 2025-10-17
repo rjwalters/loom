@@ -12,12 +12,7 @@ import {
 } from "./lib/config";
 import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
-import {
-  handleAttachToSession,
-  handleKillSession,
-  handleRecoverAttachSession,
-  handleRecoverNewSession,
-} from "./lib/recovery-handlers";
+// Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import { handleRunNowClick, startRename } from "./lib/terminal-actions";
 // NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
@@ -436,65 +431,107 @@ async function initializeApp() {
     return; // Exit early if dependencies are missing
   }
 
-  // Try to restore workspace from localStorage first (for HMR survival)
+  // PRIORITY 1: Check for CLI workspace argument (highest priority)
+  try {
+    const cliWorkspace = await invoke<string | null>("get_cli_workspace");
+    if (cliWorkspace) {
+      console.log("[initializeApp] [CLI] Found CLI workspace argument:", cliWorkspace);
+      console.log(
+        "[initializeApp] [CLI] Using CLI workspace (takes precedence over stored workspace)"
+      );
+
+      // Validate CLI workspace
+      const isValid = await validateWorkspacePath(cliWorkspace);
+      if (isValid) {
+        console.log("[initializeApp] [CLI] CLI workspace is valid, loading...");
+        await handleWorkspacePathInput(cliWorkspace);
+        state.setInitializing(false);
+        return; // CLI workspace loaded successfully - skip stored workspace
+      }
+
+      console.warn(
+        "[initializeApp] [CLI] CLI workspace is invalid, falling back to stored workspace"
+      );
+    } else {
+      console.log("[initializeApp] [CLI] No CLI workspace argument provided");
+    }
+  } catch (error) {
+    console.error("[initializeApp] [CLI] Failed to get CLI workspace:", error);
+    // Continue to stored workspace fallback
+  }
+
+  // PRIORITY 2: Try to restore workspace from localStorage (for HMR survival)
   const localStorageWorkspace = state.restoreWorkspaceFromLocalStorage();
   if (localStorageWorkspace) {
-    console.log("[initializeApp] Restored workspace from localStorage:", localStorageWorkspace);
-    console.log("[initializeApp] This prevents HMR from clearing the workspace during hot reload");
+    console.log(
+      "[initializeApp] [localStorage] Restored workspace from localStorage:",
+      localStorageWorkspace
+    );
+    console.log(
+      "[initializeApp] [localStorage] This prevents HMR from clearing the workspace during hot reload"
+    );
   }
 
   try {
-    // Check for stored workspace in Tauri storage
+    // PRIORITY 3: Check for stored workspace in Tauri storage (lowest priority)
     const storedPath = await invoke<string | null>("get_stored_workspace");
 
     if (storedPath) {
-      console.log("[initializeApp] Found stored workspace:", storedPath);
+      console.log("[initializeApp] [Tauri] Found stored workspace:", storedPath);
 
       // Validate stored workspace is still valid
       const isValid = await validateWorkspacePath(storedPath);
 
       if (isValid) {
         // Load workspace automatically
-        console.log("[initializeApp] Loading stored workspace");
+        console.log("[initializeApp] [Tauri] Loading stored workspace");
         await handleWorkspacePathInput(storedPath);
         state.setInitializing(false);
         return;
       }
 
       // Path no longer valid - clear it and show picker
-      console.log("[initializeApp] Stored workspace invalid, clearing");
+      console.log("[initializeApp] [Tauri] Stored workspace invalid, clearing");
       await invoke("clear_stored_workspace");
       localStorage.removeItem("loom:workspace"); // Also clear localStorage
     } else if (localStorageWorkspace) {
       // No Tauri storage but have localStorage (HMR case)
-      console.log("[initializeApp] Using localStorage workspace after HMR");
+      console.log("[initializeApp] [localStorage] Using localStorage workspace after HMR");
       const isValid = await validateWorkspacePath(localStorageWorkspace);
 
       if (isValid) {
+        console.log("[initializeApp] [localStorage] localStorage workspace is valid, loading...");
         await handleWorkspacePathInput(localStorageWorkspace);
         state.setInitializing(false);
         return;
       }
 
       // Invalid - clear it
+      console.log("[initializeApp] [localStorage] localStorage workspace is invalid, clearing");
       localStorage.removeItem("loom:workspace");
     }
   } catch (error) {
-    console.error("[initializeApp] Failed to load stored workspace:", error);
+    console.error("[initializeApp] [Tauri] Failed to load stored workspace:", error);
 
     // If Tauri storage failed but we have localStorage, try that
     if (localStorageWorkspace) {
-      console.log("[initializeApp] Tauri storage failed, trying localStorage workspace");
+      console.log(
+        "[initializeApp] [localStorage] Tauri storage failed, trying localStorage workspace"
+      );
       const isValid = await validateWorkspacePath(localStorageWorkspace);
       if (isValid) {
+        console.log("[initializeApp] [localStorage] localStorage workspace is valid, loading...");
         await handleWorkspacePathInput(localStorageWorkspace);
+        state.setInitializing(false);
         return;
       }
+
+      console.log("[initializeApp] [localStorage] localStorage workspace is invalid");
     }
   }
 
-  // No stored workspace or validation failed - show picker
-  console.log("[initializeApp] Showing workspace picker");
+  // No workspace found or all validation failed - show picker
+  console.log("[initializeApp] [Fallback] No valid workspace found, showing workspace picker");
   state.setInitializing(false);
   render();
 }
@@ -1493,6 +1530,76 @@ async function handleWorkspacePathInput(path: string) {
         // Reconnect agents to existing daemon terminals
         await reconnectTerminals();
 
+        // Auto-create sessions if ALL terminals are missing (clean slate reset scenario)
+        const terminals = state.getTerminals();
+        const allMissing = terminals.every((t) => t.missingSession === true);
+
+        if (allMissing && terminals.length > 0) {
+          console.log(
+            `[handleWorkspacePathInput] All ${terminals.length} terminals missing, auto-creating sessions (clean slate reset recovery)...`
+          );
+
+          let createdCount = 0;
+          for (const terminal of terminals) {
+            try {
+              const instanceNumber = state.getNextTerminalNumber();
+
+              console.log(
+                `[handleWorkspacePathInput] Auto-creating session for ${terminal.name} (${terminal.id})`
+              );
+
+              // Create terminal session in daemon
+              const sessionId = await invoke<string>("create_terminal", {
+                configId: terminal.id,
+                name: terminal.name,
+                workingDir: expandedPath,
+                role: terminal.role || "default",
+                instanceNumber,
+              });
+
+              // Update terminal with new session ID and clear error state
+              state.updateTerminal(terminal.id, {
+                id: sessionId,
+                status: TerminalStatus.Idle,
+                missingSession: undefined,
+              });
+
+              createdCount++;
+              console.log(
+                `[handleWorkspacePathInput] ✓ Auto-created session for ${terminal.name}: ${sessionId}`
+              );
+            } catch (error) {
+              console.error(
+                `[handleWorkspacePathInput] Failed to auto-create session for ${terminal.name}:`,
+                error
+              );
+              // Keep in error state - user can try manual recovery
+            }
+          }
+
+          if (createdCount > 0) {
+            console.log(
+              `[handleWorkspacePathInput] Auto-created ${createdCount}/${terminals.length} sessions`
+            );
+
+            // Save updated config with new session IDs
+            const terminalsToSave = state.getTerminals();
+            const { config: terminalConfigs, state: terminalStates } =
+              splitTerminals(terminalsToSave);
+            await saveConfig({ terminals: terminalConfigs });
+            await saveState({
+              nextAgentNumber: state.getCurrentTerminalNumber(),
+              terminals: terminalStates,
+            });
+
+            // Launch agents for terminals with role configs
+            console.log(
+              `[handleWorkspacePathInput] Launching agents for auto-created terminals...`
+            );
+            await launchAgentsForTerminals(expandedPath, state.getTerminals());
+          }
+        }
+
         // Verify terminal sessions health to clear any stale flags
         await verifyTerminalSessions();
       }
@@ -1620,54 +1727,24 @@ function setupEventListeners() {
         return;
       }
 
-      // Recovery - Create new session
-      const recoverNewBtn = target.closest("#recover-new-session-btn");
-      if (recoverNewBtn) {
+      // Note: Manual recovery buttons removed - app now auto-recovers missing sessions
+
+      // Health Check - Check Now button
+      const checkNowBtn = target.closest("#check-now-btn");
+      if (checkNowBtn) {
         e.stopPropagation();
-        const id = recoverNewBtn.getAttribute("data-terminal-id");
+        const id = checkNowBtn.getAttribute("data-terminal-id");
         if (id) {
-          handleRecoverNewSession(id, {
-            state,
-            generateNextConfigId,
-            saveCurrentConfig,
-          });
-        }
-        return;
-      }
-
-      // Recovery - Attach to existing session
-      const recoverAttachBtn = target.closest("#recover-attach-session-btn");
-      if (recoverAttachBtn) {
-        e.stopPropagation();
-        const id = recoverAttachBtn.getAttribute("data-terminal-id");
-        if (id) {
-          handleRecoverAttachSession(id, state);
-        }
-        return;
-      }
-
-      // Recovery - Attach to specific session
-      const attachSessionItem = target.closest(".attach-session-item");
-      if (attachSessionItem) {
-        e.stopPropagation();
-        const id = attachSessionItem.getAttribute("data-terminal-id");
-        const sessionName = attachSessionItem.getAttribute("data-session-name");
-        if (id && sessionName) {
-          handleAttachToSession(id, sessionName, {
-            state,
-            saveCurrentConfig,
-          });
-        }
-        return;
-      }
-
-      // Recovery - Kill session
-      const killSessionBtn = target.closest(".kill-session-btn");
-      if (killSessionBtn) {
-        e.stopPropagation();
-        const sessionName = killSessionBtn.getAttribute("data-session-name");
-        if (sessionName) {
-          handleKillSession(sessionName, state);
+          console.log(`[check-now-btn] Triggering immediate health check for terminal ${id}`);
+          // Trigger immediate health check
+          healthMonitor
+            .performHealthCheck()
+            .then(() => {
+              console.log(`[check-now-btn] Health check complete for terminal ${id}`);
+            })
+            .catch((error: unknown) => {
+              console.error(`[check-now-btn] Health check failed:`, error);
+            });
         }
         return;
       }

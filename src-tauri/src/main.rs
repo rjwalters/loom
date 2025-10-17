@@ -16,6 +16,10 @@ mod mcp_watcher;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
+// App state to hold CLI workspace argument
+#[derive(Default)]
+struct CliWorkspace(std::sync::Mutex<Option<String>>);
+
 // Helper structs for JSON parsing (defined at top level to avoid clippy::items_after_statements)
 #[derive(serde::Deserialize)]
 struct GhLabel {
@@ -35,6 +39,12 @@ struct GhPr {
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {name}! Welcome to Loom.")
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn get_cli_workspace(cli_workspace: tauri::State<CliWorkspace>) -> Option<String> {
+    cli_workspace.0.lock().ok()?.clone()
 }
 
 #[tauri::command]
@@ -1592,6 +1602,9 @@ fn main() {
 
     let menu = build_menu();
 
+    // Create CLI workspace state
+    let cli_workspace_state = CliWorkspace::default();
+
     if let Err(e) = tauri::Builder::default()
         .setup(|app| {
             // Check if we're in development or production mode
@@ -1614,9 +1627,16 @@ fn main() {
                         if let serde_json::Value::String(workspace_path) = &workspace_arg.value {
                             safe_eprintln!("[Loom] CLI workspace argument: {workspace_path}");
 
+                            // Store in app state for synchronous access
+                            if let Some(cli_ws) = app.try_state::<CliWorkspace>() {
+                                if let Ok(mut cli_ws_lock) = cli_ws.0.lock() {
+                                    *cli_ws_lock = Some(workspace_path.clone());
+                                }
+                            }
+
                             // Get the main window
                             if let Some(window) = app.get_window("main") {
-                                // Emit event to frontend with workspace path
+                                // Emit event to frontend with workspace path (for backward compatibility)
                                 window.emit("cli-workspace", workspace_path).map_err(|e| {
                                     format!("Failed to emit cli-workspace event: {e}")
                                 })?;
@@ -1651,6 +1671,7 @@ fn main() {
 
             Ok(())
         })
+        .manage(cli_workspace_state)
         .menu(menu)
         .on_menu_event(|event| handle_menu_event(&event))
         .on_window_event(|event| {
@@ -1700,6 +1721,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             greet,
+            get_cli_workspace,
             check_system_dependencies,
             validate_git_repo,
             check_loom_initialized,

@@ -9,7 +9,6 @@ import { ask } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
-import { renderAvailableSessionsList } from "./ui";
 
 /**
  * Dependencies required by recovery handlers
@@ -112,8 +111,8 @@ export async function handleRecoverAttachSession(id: string, state: AppState): P
     const sessions = await invoke<string[]>("list_available_sessions");
     console.log(`[handleRecoverAttachSession] Found ${sessions.length} sessions:`, sessions);
 
-    // Render the available sessions list in the terminal display
-    renderAvailableSessionsList(terminal.id, id, sessions);
+    // Note: Recovery UI removed - app now auto-recovers missing sessions
+    // Manual recovery handlers are deprecated but kept for compatibility
   } catch (error) {
     console.error(`[handleRecoverAttachSession] Failed to list sessions:`, error);
     alert(`Failed to list available sessions: ${error}`);
@@ -172,7 +171,7 @@ export async function handleAttachToSession(
  * @param sessionName - The name of the tmux session to kill
  * @param state - The application state (for finding which terminal is showing the session list)
  */
-export async function handleKillSession(sessionName: string, state: AppState): Promise<void> {
+export async function handleKillSession(sessionName: string, _state: AppState): Promise<void> {
   console.log(`[handleKillSession] Killing session ${sessionName}`);
 
   const confirmed = await ask(
@@ -191,21 +190,8 @@ export async function handleKillSession(sessionName: string, state: AppState): P
     await invoke("kill_session", { sessionName });
     console.log(`[handleKillSession] Session killed successfully`);
 
-    // Refresh the available sessions list
-    // Find which terminal is showing the session list
-    const availableSessionsContainers = document.querySelectorAll("[id^='available-sessions-']");
-    for (const container of availableSessionsContainers) {
-      const terminalId = container.id.replace("available-sessions-", "");
-      if (terminalId) {
-        // Find terminal by id
-        const terminal = state.getTerminal(terminalId);
-        if (terminal) {
-          // Reload sessions for this terminal
-          const sessions = await invoke<string[]>("list_available_sessions");
-          renderAvailableSessionsList(terminalId, terminal.id, sessions);
-        }
-      }
-    }
+    // Note: Recovery UI removed - app now auto-recovers missing sessions
+    // Manual recovery handlers are deprecated but kept for compatibility
   } catch (error) {
     console.error(`[handleKillSession] Failed to kill session:`, error);
     alert(`Failed to kill session: ${error}`);
