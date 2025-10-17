@@ -329,6 +329,51 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Helper function to setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+fn setup_repository_scaffolding(workspace_path: &Path, defaults_path: &Path) -> Result<(), String> {
+    // Copy CLAUDE.md if it doesn't exist
+    let claude_md_dst = workspace_path.join("CLAUDE.md");
+    if !claude_md_dst.exists() {
+        let claude_md_src = defaults_path.join("CLAUDE.md");
+        if claude_md_src.exists() {
+            fs::copy(&claude_md_src, &claude_md_dst)
+                .map_err(|e| format!("Failed to copy CLAUDE.md: {e}"))?;
+        }
+    }
+
+    // Copy AGENTS.md if it doesn't exist
+    let agents_md_dst = workspace_path.join("AGENTS.md");
+    if !agents_md_dst.exists() {
+        let agents_md_src = defaults_path.join("AGENTS.md");
+        if agents_md_src.exists() {
+            fs::copy(&agents_md_src, &agents_md_dst)
+                .map_err(|e| format!("Failed to copy AGENTS.md: {e}"))?;
+        }
+    }
+
+    // Copy .claude/ directory if it doesn't exist
+    let claude_dir_dst = workspace_path.join(".claude");
+    if !claude_dir_dst.exists() {
+        let claude_dir_src = defaults_path.join(".claude");
+        if claude_dir_src.exists() {
+            copy_dir_recursive(&claude_dir_src, &claude_dir_dst)
+                .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
+        }
+    }
+
+    // Copy .codex/ directory if it doesn't exist
+    let codex_dir_dst = workspace_path.join(".codex");
+    if !codex_dir_dst.exists() {
+        let codex_dir_src = defaults_path.join(".codex");
+        if codex_dir_src.exists() {
+            copy_dir_recursive(&codex_dir_src, &codex_dir_dst)
+                .map_err(|e| format!("Failed to copy .codex directory: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
 // Helper function to find git repository root by searching for .git directory
 fn find_git_root() -> Option<std::path::PathBuf> {
     // Start from current directory
@@ -428,8 +473,16 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
     }
 
-    // Add .loom/ and .loom/worktrees/ to .gitignore
+    // Add Loom ephemeral files to .gitignore (not the entire .loom/ directory)
     let gitignore_path = workspace_path.join(".gitignore");
+
+    // Ephemeral files that should be ignored
+    let ephemeral_patterns = [
+        ".loom/state.json",
+        ".loom/worktrees/",
+        ".loom/*.log",
+        ".loom/*.sock",
+    ];
 
     // Check if .gitignore exists
     if gitignore_path.exists() {
@@ -439,22 +492,16 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
         let mut new_contents = contents.clone();
         let mut modified = false;
 
-        // Add .loom/ if not present
-        if !contents.contains(".loom/") {
-            if !new_contents.ends_with('\n') {
+        // Add ephemeral patterns if not present
+        for pattern in &ephemeral_patterns {
+            if !contents.contains(pattern) {
+                if !new_contents.ends_with('\n') {
+                    new_contents.push('\n');
+                }
+                new_contents.push_str(pattern);
                 new_contents.push('\n');
+                modified = true;
             }
-            new_contents.push_str(".loom/\n");
-            modified = true;
-        }
-
-        // Add .loom/worktrees/ if not present
-        if !contents.contains(".loom/worktrees/") {
-            if !new_contents.ends_with('\n') {
-                new_contents.push('\n');
-            }
-            new_contents.push_str(".loom/worktrees/\n");
-            modified = true;
         }
 
         // Write back if we made changes
@@ -463,11 +510,18 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
                 .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
     } else {
-        // Create .gitignore with both entries
-        let loom_entries = ".loom/\n.loom/worktrees/\n";
+        // Create .gitignore with ephemeral patterns
+        let mut loom_entries = String::from("# Loom - AI Development Orchestration\n");
+        for pattern in &ephemeral_patterns {
+            loom_entries.push_str(pattern);
+            loom_entries.push('\n');
+        }
         fs::write(&gitignore_path, loom_entries)
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
+
+    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    setup_repository_scaffolding(workspace_path, &defaults)?;
 
     Ok(())
 }
@@ -743,8 +797,16 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
     }
 
-    // Add .loom/ and .loom/worktrees/ to .gitignore (ensures both entries are present on factory reset)
+    // Add Loom ephemeral files to .gitignore (ensures patterns are present on factory reset)
     let gitignore_path = workspace.join(".gitignore");
+
+    // Ephemeral files that should be ignored
+    let ephemeral_patterns = [
+        ".loom/state.json",
+        ".loom/worktrees/",
+        ".loom/*.log",
+        ".loom/*.sock",
+    ];
 
     // Check if .gitignore exists
     if gitignore_path.exists() {
@@ -754,22 +816,16 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
         let mut new_contents = contents.clone();
         let mut modified = false;
 
-        // Add .loom/ if not present
-        if !contents.contains(".loom/") {
-            if !new_contents.ends_with('\n') {
+        // Add ephemeral patterns if not present
+        for pattern in &ephemeral_patterns {
+            if !contents.contains(pattern) {
+                if !new_contents.ends_with('\n') {
+                    new_contents.push('\n');
+                }
+                new_contents.push_str(pattern);
                 new_contents.push('\n');
+                modified = true;
             }
-            new_contents.push_str(".loom/\n");
-            modified = true;
-        }
-
-        // Add .loom/worktrees/ if not present
-        if !contents.contains(".loom/worktrees/") {
-            if !new_contents.ends_with('\n') {
-                new_contents.push('\n');
-            }
-            new_contents.push_str(".loom/worktrees/\n");
-            modified = true;
         }
 
         // Write back if we made changes
@@ -778,11 +834,18 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
                 .map_err(|e| format!("Failed to write .gitignore: {e}"))?;
         }
     } else {
-        // Create .gitignore with both entries
-        let loom_entries = ".loom/\n.loom/worktrees/\n";
+        // Create .gitignore with ephemeral patterns
+        let mut loom_entries = String::from("# Loom - AI Development Orchestration\n");
+        for pattern in &ephemeral_patterns {
+            loom_entries.push_str(pattern);
+            loom_entries.push('\n');
+        }
         fs::write(&gitignore_path, loom_entries)
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
+
+    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    setup_repository_scaffolding(workspace, &defaults)?;
 
     Ok(())
 }
@@ -1036,8 +1099,12 @@ fn create_local_project(
     // Initialize .loom directory with defaults
     init_loom_directory(&project_path)?;
 
-    // Create initial .gitignore with .loom/ and .loom/worktrees/
-    let gitignore_content = ".loom/\n.loom/worktrees/\n";
+    // Create initial .gitignore with Loom ephemeral file patterns
+    let gitignore_content = "# Loom - AI Development Orchestration\n\
+                             .loom/state.json\n\
+                             .loom/worktrees/\n\
+                             .loom/*.log\n\
+                             .loom/*.sock\n";
     fs::write(project_path.join(".gitignore"), gitignore_content)
         .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
 
@@ -1167,6 +1234,9 @@ fn init_loom_directory(project_path: &Path) -> Result<(), String> {
         fs::copy(&loom_readme_src, &loom_readme_dst)
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
     }
+
+    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    setup_repository_scaffolding(project_path, &defaults_dir)?;
 
     Ok(())
 }
