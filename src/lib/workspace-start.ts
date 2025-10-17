@@ -13,6 +13,7 @@ export interface WorkspaceStartDependencies {
   setCurrentAttachedTerminalId: (id: string | null) => void;
   launchAgentsForTerminals: (workspacePath: string, terminals: Terminal[]) => Promise<void>;
   render: () => void;
+  markTerminalsHealthChecked: (terminalIds: string[]) => void;
 }
 
 /**
@@ -182,6 +183,14 @@ export async function startWorkspaceEngine(
       const healthMonitor = getHealthMonitor();
       await healthMonitor.performHealthCheck();
       console.log(`[${logPrefix}] Health check complete`);
+
+      // Mark all terminals as health-checked to prevent redundant checks in render loop
+      const terminalIds = state.getTerminals().map((t) => t.id);
+      dependencies.markTerminalsHealthChecked(terminalIds);
+      console.log(
+        `[${logPrefix}] Marked ${terminalIds.length} terminals as health-checked:`,
+        terminalIds
+      );
 
       console.log(`[${logPrefix}] Workspace engine started successfully`);
     } else {

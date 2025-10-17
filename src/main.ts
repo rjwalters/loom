@@ -615,6 +615,12 @@ if (!eventListenersRegistered) {
         },
         launchAgentsForTerminals,
         render,
+        markTerminalsHealthChecked: (terminalIds) => {
+          terminalIds.forEach((id) => healthCheckedTerminals.add(id));
+          console.log(
+            `[start-workspace] [Phase 3] Marked ${terminalIds.length} terminals as health-checked, Set size: ${healthCheckedTerminals.size}`
+          );
+        },
       },
       "start-workspace"
     );
@@ -647,6 +653,12 @@ if (!eventListenersRegistered) {
         },
         launchAgentsForTerminals,
         render,
+        markTerminalsHealthChecked: (terminalIds) => {
+          terminalIds.forEach((id) => healthCheckedTerminals.add(id));
+          console.log(
+            `[force-start-workspace] [Phase 3] Marked ${terminalIds.length} terminals as health-checked, Set size: ${healthCheckedTerminals.size}`
+          );
+        },
       },
       "force-start-workspace"
     );
