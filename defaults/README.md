@@ -1,24 +1,53 @@
 # Loom Defaults
 
-This directory contains default configuration files for Loom workspaces.
+This directory contains default configuration files and templates for Loom workspaces.
 
 ## Structure
 
 - `config.json` - Default configuration for new workspaces
 - `roles/` - System prompt templates for different terminal roles
+- `CLAUDE.md` - AI development context template (copied to workspace root)
+- `AGENTS.md` - Repository guidelines template (copied to workspace root)
+- `.claude/` - Claude Code configuration template (copied to workspace root)
+- `.codex/` - Codex configuration template (copied to workspace root)
+- `.loom-README.md` - README template for `.loom/` directory
 
 ## Purpose
 
+### Configuration Defaults
 When a workspace's `.loom/config.json` doesn't exist, Loom uses these defaults.
 These files are committed to git to serve as:
 - Examples of config structure
 - Documentation of available settings
 - Default values for new workspaces
 
+### Repository Scaffolding
+During workspace initialization, Loom automatically copies scaffolding files to the workspace root **if they don't already exist**:
+- `CLAUDE.md` → `<workspace>/CLAUDE.md`
+- `AGENTS.md` → `<workspace>/AGENTS.md`
+- `.claude/` → `<workspace>/.claude/`
+- `.codex/` → `<workspace>/.codex/`
+
+This ensures every Loom-enabled repository has consistent AI context and configuration files that can be committed to version control.
+
+**When scaffolding runs:**
+- Initial workspace setup (`initialize_loom_workspace`)
+- Factory reset (`reset_workspace_to_defaults`)
+- New project creation (`create_local_project`)
+
+### Dogfooding Note
+When using Loom on the Loom repository itself, both versions exist:
+- `defaults/CLAUDE.md` - Source template (committed)
+- `CLAUDE.md` - Working instance (committed, gets updated during development)
+
+This is intentional: defaults/ are distribution templates, the root files are the active documentation.
+
 ## vs `.loom/`
 
-- **`.loom/`** - Gitignored, created in each workspace (including this repo when dogfooding)
-- **`defaults/`** - Committed to git, reference implementation
+- **`.loom/`** - Per-workspace configuration (partially gitignored)
+  - Ephemeral files ignored: `state.json`, `worktrees/`, `*.log`, `*.sock`
+  - Configuration committed: `config.json`, `roles/`, `README.md`
+- **`defaults/`** - Committed templates and reference implementation
 
 ## Config Schema
 
