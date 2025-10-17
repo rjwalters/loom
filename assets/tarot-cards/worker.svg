@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 350" class="tarot-card">
+  <!-- Card Background -->
+  <rect width="200" height="350" fill="#1a1a2e" stroke="#e94560" stroke-width="3" rx="10"/>
+
+  <!-- Card Border -->
+  <rect x="10" y="10" width="180" height="330" fill="none" stroke="#eaeaea" stroke-width="2" rx="5"/>
+
+  <!-- Title Section -->
+  <text x="100" y="40" font-family="serif" font-size="16" fill="#eaeaea" text-anchor="middle" font-weight="bold">
+    THE MAGICIAN
+  </text>
+
+  <!-- Roman Numeral -->
+  <text x="100" y="60" font-family="serif" font-size="12" fill="#e94560" text-anchor="middle">
+    I
+  </text>
+
+  <!-- Symbol (Placeholder - to be replaced with actual artwork) -->
+  <circle cx="100" cy="180" r="60" fill="none" stroke="#e94560" stroke-width="2"/>
+  <text x="100" y="190" font-family="sans-serif" font-size="48" fill="#e94560" text-anchor="middle">
+    🔮
+  </text>
+
+  <!-- Role Name -->
+  <text x="100" y="300" font-family="serif" font-size="14" fill="#eaeaea" text-anchor="middle">
+    WORKER
+  </text>
+
+  <!-- Tagline -->
+  <text x="100" y="320" font-family="serif" font-size="10" fill="#eaeaea" text-anchor="middle" opacity="0.8">
+    Transforms Ideas Into Reality
+  </text>
+</svg>
