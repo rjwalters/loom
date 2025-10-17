@@ -237,6 +237,10 @@ export function renderPrimaryTerminal(
     console.log(
       `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=${terminal.missingSession}, will show xterm`
     );
+    // Clear any existing error overlay from the xterm container
+    setTimeout(() => {
+      clearMissingSessionError(terminal.id);
+    }, 0);
   }
 }
 
@@ -281,6 +285,25 @@ export function renderMissingSessionError(sessionId: string, configId: string): 
       </div>
     </div>
   `;
+}
+
+/**
+ * Clear the missing session error overlay from a terminal's xterm container
+ * This is called when the terminal session is recovered and we need to show the xterm again
+ */
+export function clearMissingSessionError(terminalId: string): void {
+  console.log(`[clearMissingSessionError] Clearing error overlay for terminal ${terminalId}`);
+  const container = document.getElementById(`xterm-container-${terminalId}`);
+  if (!container) {
+    console.warn(`[clearMissingSessionError] Container #xterm-container-${terminalId} not found!`);
+    return;
+  }
+
+  // Clear the error overlay HTML - the terminal manager will handle showing the xterm
+  if (container.innerHTML.includes("Terminal Session Missing")) {
+    console.log(`[clearMissingSessionError] Clearing error overlay HTML from container`);
+    container.innerHTML = "";
+  }
 }
 
 export function renderAvailableSessionsList(
