@@ -31,38 +31,46 @@ describe("HealthMonitor", () => {
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
   let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let mockTerminals: Terminal[];
+  let mockState: any;
+  let mockPoller: any;
 
-  // Mock state and poller
-  const mockTerminals: Terminal[] = [
-    {
-      id: "terminal-1",
-      name: "Test Terminal 1",
-      status: TerminalStatus.Idle,
-      isPrimary: true,
-      sessionId: "session-1",
-    },
-    {
-      id: "terminal-2",
-      name: "Test Terminal 2",
-      status: TerminalStatus.Busy,
-      isPrimary: false,
-      sessionId: "session-2",
-    },
-  ];
-
-  const mockState = {
-    getTerminals: vi.fn(() => mockTerminals),
-    updateTerminal: vi.fn(),
-  };
-
-  const mockPoller = {
-    getErrorState: vi.fn(() => ({ consecutiveErrors: 0 })),
-  };
+  // Factory function to create fresh mock terminals
+  function createMockTerminals(): Terminal[] {
+    return [
+      {
+        id: "terminal-1",
+        name: "Test Terminal 1",
+        status: TerminalStatus.Idle,
+        isPrimary: true,
+        sessionId: "session-1",
+      },
+      {
+        id: "terminal-2",
+        name: "Test Terminal 2",
+        status: TerminalStatus.Busy,
+        isPrimary: false,
+        sessionId: "session-2",
+      },
+    ];
+  }
 
   beforeEach(() => {
     // Reset mocks
     vi.clearAllMocks();
     vi.useFakeTimers();
+
+    // Create fresh mock data for each test
+    mockTerminals = createMockTerminals();
+
+    mockState = {
+      getTerminals: vi.fn(() => mockTerminals),
+      updateTerminal: vi.fn(),
+    };
+
+    mockPoller = {
+      getErrorState: vi.fn(() => ({ consecutiveErrors: 0 })),
+    };
 
     // Setup console spies
     consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -180,16 +188,22 @@ describe("HealthMonitor", () => {
   });
 
   describe("Health Check Operations", () => {
-    it("performs health check for all terminals", async () => {
+    it("performs health check for non-busy terminals", async () => {
       monitor.start();
       await vi.runOnlyPendingTimersAsync();
 
+      // Should check terminal-1 (Idle status)
       expect(invoke).toHaveBeenCalledWith("check_session_health", {
         id: "terminal-1",
       });
-      expect(invoke).toHaveBeenCalledWith("check_session_health", {
-        id: "terminal-2",
-      });
+
+      // Should NOT check terminal-2 (Busy status - skipped)
+      const terminal2Check = vi
+        .mocked(invoke)
+        .mock.calls.find(
+          (call) => call[0] === "check_session_health" && (call[1] as any)?.id === "terminal-2"
+        );
+      expect(terminal2Check).toBeUndefined();
     });
 
     it("skips health check for busy terminals", async () => {
