@@ -1046,6 +1046,9 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
     workersToLaunch.map((t) => `${t.name}=${t.id}`)
   );
 
+  // Track terminals that were successfully launched
+  const launchedTerminalIds: string[] = [];
+
   // Launch each worker
   for (const terminal of workersToLaunch) {
     try {
@@ -1125,22 +1128,32 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
 
       console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
 
-      // Reset terminal to idle status after successful launch
-      state.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
-      console.log(`[launchAgentsForTerminals] Reset ${terminal.name} to idle status`);
+      // Track successfully launched terminals (will reset to idle AFTER all launches complete)
+      launchedTerminalIds.push(terminal.id);
     } catch (error) {
       const errorMessage = `Failed to launch agent for ${terminal.name}: ${error}`;
       console.error(`[launchAgentsForTerminals] ${errorMessage}`);
 
-      // Reset terminal to idle status even on error (agent launch failed but terminal exists)
-      state.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
-      console.log(`[launchAgentsForTerminals] Reset ${terminal.name} to idle status after error`);
+      // Still track this terminal ID - reset to idle after all launches complete
+      // (agent launch failed but terminal exists and should not stay in busy state forever)
+      launchedTerminalIds.push(terminal.id);
 
       // Show error to user so they know what failed
       alert(errorMessage);
 
       // Continue with other terminals even if one fails
     }
+  }
+
+  // Reset ALL launched terminals to idle status AFTER all launches complete
+  // This prevents the periodic HealthMonitor (30s interval) from catching terminals in idle
+  // state before all agent launches finish (which can take 2+ minutes for 6 terminals)
+  console.log(
+    `[launchAgentsForTerminals] All agent launches complete, resetting ${launchedTerminalIds.length} terminals to idle`
+  );
+  for (const terminalId of launchedTerminalIds) {
+    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+    console.log(`[launchAgentsForTerminals] Reset ${terminalId} to idle status`);
   }
 
   console.log("[launchAgentsForTerminals] Agent launch complete");

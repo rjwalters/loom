@@ -11,6 +11,7 @@ use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
 mod daemon_client;
 mod daemon_manager;
 mod dependency_checker;
+mod logging;
 mod mcp_watcher;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
@@ -1292,7 +1293,7 @@ fn trigger_factory_reset(window: tauri::Window) -> Result<(), String> {
 /// Kill all loom tmux sessions
 #[tauri::command]
 fn kill_all_loom_sessions() -> Result<(), String> {
-    eprintln!("[kill_all_loom_sessions] Killing all loom tmux sessions");
+    safe_eprintln!("[kill_all_loom_sessions] Killing all loom tmux sessions");
 
     let output = Command::new("tmux")
         .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
@@ -1301,7 +1302,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
 
     if !output.status.success() {
         // tmux list-sessions fails if no sessions exist - this is OK
-        eprintln!("[kill_all_loom_sessions] No tmux sessions found");
+        safe_eprintln!("[kill_all_loom_sessions] No tmux sessions found");
         return Ok(());
     }
 
@@ -1310,7 +1311,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
 
     for session in sessions.lines() {
         if session.starts_with("loom-") {
-            eprintln!("[kill_all_loom_sessions] Killing tmux session: {session}");
+            safe_eprintln!("[kill_all_loom_sessions] Killing tmux session: {session}");
 
             let kill_output = Command::new("tmux")
                 .args(["-L", "loom", "kill-session", "-t", session])
@@ -1320,7 +1321,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
             if kill_output.status.success() {
                 killed_count += 1;
             } else {
-                eprintln!(
+                safe_eprintln!(
                     "[kill_all_loom_sessions] Failed to kill {session}: {}",
                     String::from_utf8_lossy(&kill_output.stderr)
                 );
@@ -1328,7 +1329,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
         }
     }
 
-    eprintln!("[kill_all_loom_sessions] Killed {killed_count} sessions");
+    safe_eprintln!("[kill_all_loom_sessions] Killed {killed_count} sessions");
     Ok(())
 }
 
@@ -1503,7 +1504,7 @@ fn main() {
             // Check if we're in development or production mode
             let is_production = !cfg!(debug_assertions);
 
-            eprintln!(
+            safe_eprintln!(
                 "[Loom] Starting in {} mode",
                 if is_production {
                     "production"
@@ -1518,7 +1519,7 @@ fn main() {
                     // Check for --workspace argument
                     if let Some(workspace_arg) = matches.args.get("workspace") {
                         if let serde_json::Value::String(workspace_path) = &workspace_arg.value {
-                            eprintln!("[Loom] CLI workspace argument: {workspace_path}");
+                            safe_eprintln!("[Loom] CLI workspace argument: {workspace_path}");
 
                             // Get the main window
                             if let Some(window) = app.get_window("main") {
@@ -1531,7 +1532,7 @@ fn main() {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Loom] Warning: Failed to parse CLI arguments: {e}");
+                    safe_eprintln!("[Loom] Warning: Failed to parse CLI arguments: {e}");
                 }
             }
 
@@ -1553,7 +1554,7 @@ fn main() {
                 .get_window("main")
                 .ok_or_else(|| "Failed to get main window".to_string())?;
             mcp_watcher::start_mcp_watcher(window);
-            eprintln!("[Loom] MCP command watcher started");
+            safe_eprintln!("[Loom] MCP command watcher started");
 
             Ok(())
         })
@@ -1562,7 +1563,7 @@ fn main() {
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
                 // App is quitting - clean up resources
-                eprintln!("[Loom] App closing - cleaning up...");
+                safe_eprintln!("[Loom] App closing - cleaning up...");
 
                 let is_production = !cfg!(debug_assertions);
 
@@ -1580,7 +1581,7 @@ fn main() {
                 // Only kill tmux sessions in production mode
                 // In development, keep sessions alive for frontend hot reload reconnection
                 if is_production {
-                    eprintln!("[Loom] Production mode - cleaning up tmux sessions");
+                    safe_eprintln!("[Loom] Production mode - cleaning up tmux sessions");
                     let _ = Command::new("tmux")
                         .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
                         .output()
@@ -1588,7 +1589,7 @@ fn main() {
                             let sessions = String::from_utf8_lossy(&output.stdout);
                             for session in sessions.lines() {
                                 if session.starts_with("loom-") {
-                                    eprintln!("[Loom] Killing tmux session: {session}");
+                                    safe_eprintln!("[Loom] Killing tmux session: {session}");
                                     let _ = Command::new("tmux")
                                         .args(["-L", "loom", "kill-session", "-t", session])
                                         .spawn();
@@ -1596,12 +1597,12 @@ fn main() {
                             }
                         });
                 } else {
-                    eprintln!(
+                    safe_eprintln!(
                         "[Loom] Development mode - keeping tmux sessions alive for hot reload"
                     );
                 }
 
-                eprintln!("[Loom] Cleanup complete");
+                safe_eprintln!("[Loom] Cleanup complete");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1655,7 +1656,7 @@ fn main() {
         ])
         .run(tauri::generate_context!())
     {
-        eprintln!("Error while running tauri application: {e}");
+        safe_eprintln!("Error while running tauri application: {e}");
         std::process::exit(1);
     }
 }

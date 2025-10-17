@@ -224,6 +224,11 @@ export class HealthMonitor {
     console.log(`[HealthMonitor] Performing health check for ${terminals.length} terminals`);
 
     for (const terminal of terminals) {
+      // Debug: Log exact terminal state before skip check
+      console.log(
+        `[HealthMonitor] Checking ${terminal.id}: name=${terminal.name}, status=${terminal.status}, missingSession=${terminal.missingSession || false}`
+      );
+
       // Skip health checks for terminals that are busy (agent launching in progress)
       // This prevents false positives during agent launch which can take 20+ seconds per terminal
       if (terminal.status === TerminalStatus.Busy) {
