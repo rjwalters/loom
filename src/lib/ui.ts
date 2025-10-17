@@ -353,7 +353,7 @@ export function renderMiniTerminals(
         id="add-terminal-btn"
         data-tooltip="${addButtonTitle}"
         data-tooltip-position="auto"
-        class="flex-shrink-0 w-32 h-32 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
+        class="flex-shrink-0 w-40 h-40 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
         title="${addButtonTitle}"
         ${addButtonDisabled}
       >
@@ -501,7 +501,7 @@ function createMiniTerminalHTML(
       <div class="relative">
         ${needsInputBadge}
         <div
-          class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
           style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
           draggable="true"
