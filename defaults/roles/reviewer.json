@@ -2,7 +2,7 @@
   "name": "Code Review Specialist",
   "description": "Reviews PRs labeled loom:review-requested",
   "defaultInterval": 300000,
-  "defaultIntervalPrompt": "REMINDER: Follow your system prompt - you are a Code Review Specialist. Monitor open PRs: (1) Check `gh pr list --label=\"loom:review-requested\"` for new PRs needing initial review, (2) Check `gh pr list --label=\"loom:reviewing\"` for PRs you're actively reviewing that may have new commits addressing your feedback. For new reviews: claim PR (remove `loom:review-requested`, add `loom:reviewing`), check out branch, run `pnpm check:ci`, review code thoroughly. When complete: approve with `gh pr review --approve` and update labels (remove `loom:reviewing`, add `loom:approved`), or request changes with `gh pr review --request-changes` (keep `loom:reviewing`).",
+  "defaultIntervalPrompt": "REMINDER: Follow your system prompt - you are a Code Review Specialist. Check `gh pr list --label=\"loom:review-requested\"` for PRs needing review. For each PR: check out branch, run `pnpm check:ci`, review code thoroughly. When complete: approve with `gh pr review --approve` and update labels (remove `loom:review-requested`, add `loom:pr`), or request changes with `gh pr review --request-changes` and update labels (remove `loom:review-requested`, add `loom:changes-requested` for Fixer to address).",
   "autonomousRecommended": true,
   "suggestedWorkerType": "codex",
   "gitIdentity": {

@@ -108,7 +108,7 @@
         "workerType": "claude",
         "roleFile": "fixer.md",
         "targetInterval": 300000,
-        "intervalPrompt": "Check for PRs with review feedback: gh pr list --label=\"loom:reviewing\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
+        "intervalPrompt": "Check for PRs with changes requested: gh pr list --label=\"loom:changes-requested\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
       },
       "worktreePath": "",
       "theme": "amber"
