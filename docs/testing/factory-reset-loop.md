@@ -101,15 +101,21 @@ pnpm install
 
 ### Phase 2: Build and Launch
 
-**Goal**: Start Loom with a fresh build in preview mode
+**Goal**: Start Loom with a fresh build attached to the current workspace
 
 **Steps**:
 
-1. **Build the Application**
+1. **Build and Launch the Application**
    ```bash
-   # Run full build (frontend + Tauri binary)
+   # Run full build and launch with workspace attachment
+   # This ensures terminals are created in the correct repository context
+   pnpm test:factory-reset
+
+   # Alternative: Use app:preview (same as test:factory-reset)
    pnpm app:preview
    ```
+
+   **Note**: The `--workspace` argument is automatically added by these scripts, ensuring Loom attaches to the current directory. This is critical for reliable terminal setup.
 
 2. **Monitor Startup Logs** (via MCP)
    ```bash
@@ -124,14 +130,17 @@ pnpm install
    ```
 
 3. **Wait for App Launch**
-   - **Expected**: App window appears
-   - **Expected**: Daemon starts automatically (spawned by Tauri)
+   - **Expected**: App window appears within 10 seconds
+   - **Expected**: Daemon starts automatically with 5-second initialization delay
    - **Expected**: Socket file created at `/tmp/loom-daemon.sock`
+   - **Expected**: Workspace automatically selected (displays current directory path)
 
 **Success Criteria**:
 - ✅ App window visible
+- ✅ Workspace attached to current directory
 - ✅ Daemon process running (check with `ps aux | grep loom-daemon`)
 - ✅ Socket file exists: `/tmp/loom-daemon.sock`
+- ✅ No "workspace not selected" errors in UI
 - ✅ No error messages in logs
 
 ### Phase 3: Workspace Startup & Agent Launch
@@ -290,6 +299,33 @@ pnpm install
 - ✅ No errors or warnings in logs
 
 ## Common Issues & Debugging
+
+### Issue: App launches without workspace attached
+
+**Symptom**: Loom window shows "Select a workspace" despite being in a git repository
+
+**Root Cause**: App launched without `--workspace` argument
+
+**Debug Steps**:
+```bash
+# Check if app was launched with workspace argument
+ps aux | grep Loom | grep workspace || echo "⚠ WARNING: No workspace argument"
+
+# Check console logs for workspace selection
+mcp__loom-ui__read_console_log | grep workspace
+```
+
+**Fix**: Always use the provided pnpm scripts that include workspace argument:
+```bash
+# Use these scripts (they include --workspace argument)
+pnpm test:factory-reset
+pnpm app:preview
+
+# DON'T launch directly without workspace:
+# ❌ ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom
+```
+
+**Impact**: Without workspace attachment, terminals will fail to create or will be created in the wrong directory, causing unreliable agent setup.
 
 ### Issue: "duplicate session" errors
 
