@@ -1,5 +1,5 @@
 import "./style.css";
-import { ask, open } from "@tauri-apps/api/dialog";
+import { ask } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
@@ -13,6 +13,8 @@ import {
 import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+// NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
+// are defined locally in this file, not imported from terminal-lifecycle
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
@@ -23,6 +25,9 @@ import {
   renderMiniTerminals,
   renderPrimaryTerminal,
 } from "./lib/ui";
+
+// NOTE: validateWorkspacePath, browseWorkspace, handleWorkspacePathInput,
+// and attachWorkspaceEventListeners are defined locally in this file
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -1547,6 +1552,30 @@ async function handleWorkspacePathInput(path: string) {
   }
 }
 
+// Handle Run Now button click for interval mode terminals
+async function handleRunNowClick(terminalId: string) {
+  console.log(`[handleRunNowClick] Running interval prompt for terminal ${terminalId}`);
+
+  try {
+    const terminal = state.getTerminal(terminalId);
+    if (!terminal) {
+      console.error(`[handleRunNowClick] Terminal ${terminalId} not found`);
+      return;
+    }
+
+    // Import autonomous manager
+    const { getAutonomousManager } = await import("./lib/autonomous-manager");
+    const autonomousManager = getAutonomousManager();
+
+    // Execute the interval prompt and reset timer
+    await autonomousManager.runNow(terminal);
+    console.log(`[handleRunNowClick] Successfully executed interval prompt for ${terminalId}`);
+  } catch (error) {
+    console.error(`[handleRunNowClick] Failed to execute interval prompt:`, error);
+    alert(`Failed to run interval prompt: ${error}`);
+  }
+}
+
 // Helper function to start renaming a terminal
 function startRename(terminalId: string, nameElement: HTMLElement) {
   const terminal = state.getTerminals().find((t) => t.id === terminalId);
@@ -1872,6 +1901,17 @@ function setupEventListeners() {
         return;
       }
 
+      // Run Now button (interval mode)
+      const runNowBtn = target.closest(".run-now-btn");
+      if (runNowBtn) {
+        e.stopPropagation();
+        const id = runNowBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRunNowClick(id);
+        }
+        return;
+      }
+
       // Close button
       const closeBtn = target.closest("#terminal-close-btn");
       if (closeBtn) {
@@ -1971,6 +2011,17 @@ function setupEventListeners() {
   if (miniRow) {
     miniRow.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
+
+      // Handle Run Now button clicks (interval mode)
+      const runNowBtn = target.closest(".run-now-btn");
+      if (runNowBtn) {
+        e.stopPropagation();
+        const id = runNowBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRunNowClick(id);
+        }
+        return;
+      }
 
       // Handle close button clicks
       if (target.classList.contains("close-terminal-btn")) {
