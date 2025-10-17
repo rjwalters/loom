@@ -6,6 +6,19 @@ This document describes the label-based workflows that coordinate multiple AI ag
 
 Loom uses GitHub labels as a coordination protocol. Each agent type has a specific role and watches for issues/PRs with particular labels. This creates a complete pipeline from idea generation through implementation to code review.
 
+### 🌙 The Archetypal Cycle
+
+In Loom, development follows an ancient pattern of archetypal forces working in harmony:
+
+1. 🏛️ **The Architect** envisions → creates proposals (`loom:proposal`)
+2. 🔍 **The Critic** questions → identifies bloat and simplification opportunities (`loom:critic-suggestion`)
+3. 📚 **The Curator** refines → enhances and marks issues ready (`loom:ready`)
+4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
+5. 🔧 **The Fixer** heals → addresses urgent bugs and breakages (`loom:urgent`)
+6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:approved`)
+
+*Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
+
 **Color-coded workflow:**
 - 🔵 **Blue** = Human action needed
   - Issues: `loom:proposal` (Architect suggestion awaiting approval)
@@ -386,7 +399,39 @@ If Worker discovers a dependency during implementation:
 5. If approved: gh pr review --approve, remove loom:reviewing, add loom:approved (blue)
 ```
 
-### 6. Issues Bot
+### 6. Critic Bot
+**Role**: Code simplification specialist, identifies bloat and suggests removals
+
+**Watches for**: N/A (proactively scans codebase and reviews open issues)
+
+**Creates**:
+- Issues with `loom:critic-suggestion` label (standalone removal proposals)
+- Comments with `<!-- CRITIC-SUGGESTION -->` marker (simplification suggestions on existing issues)
+
+**Interval**: 15 minutes (recommended autonomous)
+
+**Workflow**:
+```
+# Standalone Removal Proposals:
+1. Scan codebase for unused code, dependencies, over-engineering
+2. Verify with evidence (searches, dead code analysis)
+3. Create issue with loom:critic-suggestion label (blue badge)
+4. User reviews and removes label to approve (or closes to reject)
+
+# Simplification Comments:
+1. Review open issues for simplification opportunities
+2. Check if planned work includes unnecessary complexity
+3. Add comment with <!-- CRITIC-SUGGESTION --> marker
+4. Assignee can adopt, adapt, or ignore the suggestion
+```
+
+**Key Principles**:
+- Evidence-based suggestions only (show proof with rg/git commands)
+- Two approaches: standalone issues for independent bloat, comments for scope reduction
+- Respects assignee decisions on comments
+- Quality over quantity (0-1 suggestions per interval)
+
+### 7. Issues Bot
 **Role**: Creates well-structured GitHub issues from user requests
 
 **Watches for**: N/A (manual invocation)
@@ -404,7 +449,7 @@ If Worker discovers a dependency during implementation:
 5. Create issue (no label initially)
 ```
 
-### 7. Default (Plain Shell)
+### 8. Default (Plain Shell)
 **Role**: Standard terminal for manual commands
 
 No automation. Used for manual git operations, system commands, etc.
@@ -481,6 +526,7 @@ No automation. Used for manual git operations, system commands, etc.
 | Label | Color | Created By | Meaning |
 |-------|-------|-----------|---------|
 | `loom:proposal` | 🔵 Blue | Architect | Proposal awaiting user approval |
+| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification proposal awaiting user approval |
 | `loom:ready` | 🟢 Green | Curator | Issue ready for Worker to implement |
 | `loom:in-progress` | 🟡 Amber | Worker | Worker actively implementing |
 | `loom:blocked` | 🔴 Red | Worker | Implementation blocked, needs help |
@@ -531,6 +577,26 @@ gh pr list --label="loom:approved" --state=open
 
 # Merge approved PR
 gh pr merge <number>
+```
+
+### Critic
+```bash
+# Create standalone removal proposal
+gh issue create --title "Remove [thing]: [reason]" --body "..." --label "loom:critic-suggestion"
+
+# Check existing critic suggestions (don't spam)
+gh issue list --label="loom:critic-suggestion" --state=open
+
+# Find open issues to potentially comment on
+gh issue list --state=open --json number,title --jq '.[] | "\(.number): \(.title)"'
+
+# Add simplification comment to existing issue
+gh issue comment <number> --body "$(cat <<'EOF'
+<!-- CRITIC-SUGGESTION -->
+## 🔍 Simplification Opportunity
+[Your suggestion with evidence]
+EOF
+)"
 ```
 
 ### Curator
