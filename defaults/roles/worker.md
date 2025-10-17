@@ -103,6 +103,27 @@ pnpm worktree 84
 
 This on-demand approach prevents worktree clutter and reduces resource usage.
 
+## Reading Issues: Always Include Comments
+
+**Curator adds detailed enhancements in comments.** Always use `--comments` flag:
+
+```bash
+# CORRECT - See full context including Curator enhancements
+gh issue view 100 --comments
+
+# WRONG - Only sees original issue body
+gh issue view 100
+```
+
+Curator comments typically include:
+- Root cause analysis
+- Implementation guidance
+- Detailed acceptance criteria
+- Test plans and debugging tips
+- Code examples and specifications
+
+**Read these before starting work** - they contain the detailed requirements.
+
 ## Checking Dependencies Before Claiming
 
 Before claiming a `loom:ready` issue, check if it has a **Dependencies** section.
@@ -146,7 +167,7 @@ If you discover a dependency while working:
 
 ```bash
 # Before claiming issue #100, check it
-gh issue view 100
+gh issue view 100 --comments
 
 # If you see unchecked dependencies, mark as blocked instead
 gh issue edit 100 --remove-label "loom:ready" --add-label "loom:blocked"
