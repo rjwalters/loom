@@ -3,6 +3,7 @@ import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
+import { appWindow } from "@tauri-apps/api/window";
 import {
   loadWorkspaceConfig,
   saveConfig,
@@ -198,8 +199,6 @@ async function checkMcpCommand() {
         // DebouncedEvent is an array of events with kind and path properties
         // Check if any events occurred (file created, modified, or changed)
         if (events.length > 0) {
-          const eventKinds = events.map((e) => e.kind).join(", ");
-          console.log(`[MCP Watcher] Detected file events: ${eventKinds}, checking command`);
           await checkMcpCommand();
         }
       },
@@ -208,11 +207,32 @@ async function checkMcpCommand() {
 
     console.log("[main] MCP command filesystem watcher started (event-driven, no polling)");
 
-    // Store stop function for cleanup on app close (optional)
+    // Store stop function for cleanup on app close
     (window as Window & { stopMcpWatcher?: () => void }).stopMcpWatcher = stopWatching;
+
+    // Register cleanup handler to stop watcher when app closes
+    appWindow.onCloseRequested(() => {
+      console.log("[main] App closing, stopping MCP filesystem watcher");
+      stopWatching();
+    });
   } catch (error) {
-    console.error("[main] Failed to start MCP filesystem watcher:", error);
-    console.warn("[main] Falling back to polling mode");
+    // Provide specific error context for common failure modes
+    let errorContext = "Unknown error";
+    if (error instanceof Error) {
+      errorContext = error.message;
+
+      // Provide hints for common issues
+      if (errorContext.includes("permission")) {
+        errorContext += " (filesystem permissions issue - check ~/.loom/ access)";
+      } else if (errorContext.includes("not found") || errorContext.includes("ENOENT")) {
+        errorContext += " (file system watcher not available on this platform)";
+      } else if (errorContext.includes("not supported")) {
+        errorContext += " (filesystem watching not supported - may need platform-specific setup)";
+      }
+    }
+
+    console.error("[main] Failed to start MCP filesystem watcher:", errorContext);
+    console.warn("[main] Falling back to polling mode (500ms interval)");
 
     // Fallback to polling if filesystem watcher fails
     window.setInterval(() => {
