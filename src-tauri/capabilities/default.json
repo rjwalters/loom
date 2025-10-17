@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2/capability.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-create",
+    "core:window:allow-center",
+    "core:window:allow-set-title",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-set-min-size",
+    "core:window:allow-set-max-size",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-icon",
+    "core:window:allow-close",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "fs:allow-read-dir",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-create-dir",
+    "fs:allow-exists",
+    "fs:scope-home",
+    "fs:scope-app-config",
+    "fs:scope-app-data",
+    "fs:scope-app-log",
+    "path:default"
+  ]
+}
