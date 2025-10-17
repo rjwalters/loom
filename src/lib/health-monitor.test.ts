@@ -306,19 +306,25 @@ describe("HealthMonitor", () => {
 
   describe("Daemon Health", () => {
     it("should ping daemon and record success", async () => {
-      const expectedTime = new Date("2025-01-01T12:00:00Z").getTime();
-      vi.setSystemTime(expectedTime);
-      mockInvoke.mockResolvedValue(true);
+      const startTime = new Date("2025-01-01T12:00:00Z").getTime();
+      vi.setSystemTime(startTime);
+
+      let pingTime = 0;
+      mockInvoke.mockImplementation(async () => {
+        pingTime = Date.now();
+        return true;
+      });
+
       mockGetAppState.mockReturnValue({
         getTerminals: vi.fn(() => []),
         updateTerminal: vi.fn(),
       });
 
       monitor.start();
-      // Let initial ping complete
-      await vi.waitFor(() => {
-        expect(mockInvoke).toHaveBeenCalledWith("check_daemon_health");
-      });
+
+      // Wait for async operations to complete
+      await Promise.resolve();
+      await Promise.resolve();
 
       monitor.stop();
 
@@ -326,9 +332,9 @@ describe("HealthMonitor", () => {
 
       expect(health.daemon.connected).toBe(true);
       expect(health.daemon.consecutiveFailures).toBe(0);
-      // Allow small timing difference due to async operations
-      expect(health.daemon.lastPing).toBeGreaterThanOrEqual(expectedTime);
-      expect(health.daemon.lastPing).toBeLessThanOrEqual(expectedTime + 100);
+      // Ping should happen at the start time
+      expect(pingTime).toBe(startTime);
+      expect(health.daemon.lastPing).toBe(startTime);
     });
 
     it("should track consecutive daemon ping failures", async () => {
@@ -339,49 +345,63 @@ describe("HealthMonitor", () => {
       });
 
       monitor.start();
-      // Let initial ping fail
-      await vi.waitFor(() => {
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Daemon ping failed"),
-          expect.any(Error)
-        );
-      });
+
+      // Wait for async operations to complete
+      await Promise.resolve();
+      await Promise.resolve();
 
       monitor.stop();
 
       const health = monitor.getHealth();
 
       expect(health.daemon.consecutiveFailures).toBeGreaterThan(0);
+      expect(consoleErrorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Daemon ping failed"),
+        expect.any(Error)
+      );
     });
 
     it("should mark daemon as disconnected after 3 consecutive failures", async () => {
-      let failureCount = 0;
+      const pingTimes: number[] = [];
+      const startTime = Date.now();
+
       mockInvoke.mockImplementation(() => {
-        failureCount++;
+        pingTimes.push(Date.now());
         return Promise.reject(new Error("Connection refused"));
       });
+
       mockGetAppState.mockReturnValue({
         getTerminals: vi.fn(() => []),
         updateTerminal: vi.fn(),
       });
 
-      monitor.setDaemonPingInterval(100); // Short interval for testing
+      const pingInterval = 1000;
+      monitor.setDaemonPingInterval(pingInterval);
       monitor.start();
 
-      // Wait for 3 failures
-      await vi.waitFor(
-        () => {
-          expect(failureCount).toBeGreaterThanOrEqual(3);
-        },
-        { timeout: 1000 }
-      );
+      // Wait for initial ping
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(pingTimes.length).toBe(1);
+
+      // Advance time for second ping
+      await vi.advanceTimersByTimeAsync(pingInterval);
+      expect(pingTimes.length).toBe(2);
+      // Verify second ping happened exactly 1000ms after first
+      expect(pingTimes[1] - pingTimes[0]).toBe(pingInterval);
+
+      // Advance time for third ping
+      await vi.advanceTimersByTimeAsync(pingInterval);
+      expect(pingTimes.length).toBe(3);
+      // Verify third ping happened exactly 1000ms after second
+      expect(pingTimes[2] - pingTimes[1]).toBe(pingInterval);
 
       monitor.stop();
 
       const health = monitor.getHealth();
 
       expect(health.daemon.connected).toBe(false);
-      expect(health.daemon.consecutiveFailures).toBeGreaterThanOrEqual(3);
+      expect(health.daemon.consecutiveFailures).toBe(3);
     });
   });
 
@@ -568,38 +588,124 @@ describe("HealthMonitor", () => {
 
   describe("Periodic Monitoring", () => {
     it("should perform health checks at configured interval", async () => {
+      let healthCheckCount = 0;
+      const checkTimes: number[] = [];
+
       mockGetAppState.mockReturnValue({
         getTerminals: vi.fn(() => []),
         updateTerminal: vi.fn(),
       });
 
-      monitor.setHealthCheckInterval(10000); // 10 seconds
+      // Track health checks via console logs (most reliable)
+      consoleLogSpy.mockImplementation((msg: string) => {
+        if (msg.includes("Performing health check")) {
+          healthCheckCount++;
+          checkTimes.push(Date.now());
+        }
+      });
+
+      const healthCheckInterval = 10000; // 10 seconds
+      monitor.setHealthCheckInterval(healthCheckInterval);
       monitor.start();
 
-      // Clear initial health check logs
-      consoleLogSpy.mockClear();
+      // Wait for initial health check
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(healthCheckCount).toBe(1);
 
-      // Advance time to trigger next health check
-      await vi.advanceTimersByTimeAsync(10000);
+      // Advance time exactly by the interval to trigger next health check
+      await vi.advanceTimersByTimeAsync(healthCheckInterval);
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Performing health check")
-      );
+      expect(healthCheckCount).toBe(2);
+      expect(checkTimes.length).toBe(2);
+      expect(checkTimes[1] - checkTimes[0]).toBe(healthCheckInterval);
+
+      monitor.stop();
     });
 
     it("should ping daemon at configured interval", async () => {
-      mockInvoke.mockResolvedValue(true);
+      const pingTimes: number[] = [];
 
-      monitor.setDaemonPingInterval(5000); // 5 seconds
+      mockInvoke.mockImplementation(() => {
+        pingTimes.push(Date.now());
+        return Promise.resolve(true);
+      });
+
+      mockGetAppState.mockReturnValue({
+        getTerminals: vi.fn(() => []),
+        updateTerminal: vi.fn(),
+      });
+
+      const daemonPingInterval = 5000; // 5 seconds
+      monitor.setDaemonPingInterval(daemonPingInterval);
       monitor.start();
+
+      // Wait for initial ping
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(pingTimes.length).toBe(1);
 
       // Clear initial ping
       mockInvoke.mockClear();
 
-      // Advance time to trigger next ping
-      await vi.advanceTimersByTimeAsync(5000);
+      // Advance time exactly by the interval to trigger next ping
+      await vi.advanceTimersByTimeAsync(daemonPingInterval);
 
       expect(mockInvoke).toHaveBeenCalledWith("check_daemon_health");
+      expect(pingTimes.length).toBe(2);
+      expect(pingTimes[1] - pingTimes[0]).toBe(daemonPingInterval);
+
+      monitor.stop();
+    });
+
+    it("should perform multiple periodic checks at exact intervals", async () => {
+      let healthCheckCount = 0;
+      const checkTimes: number[] = [];
+      const startTime = Date.now();
+
+      mockGetAppState.mockReturnValue({
+        getTerminals: vi.fn(() => []),
+        updateTerminal: vi.fn(),
+      });
+
+      // Track health checks via console logs
+      consoleLogSpy.mockImplementation((msg: string) => {
+        if (msg.includes("Performing health check")) {
+          healthCheckCount++;
+          checkTimes.push(Date.now());
+        }
+      });
+
+      const healthCheckInterval = 1000; // 1 second for faster test
+      monitor.setHealthCheckInterval(healthCheckInterval);
+      monitor.start();
+
+      // Wait for initial check
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(healthCheckCount).toBe(1);
+      expect(checkTimes[0]).toBe(startTime);
+
+      // First interval
+      await vi.advanceTimersByTimeAsync(healthCheckInterval);
+      expect(healthCheckCount).toBe(2);
+      expect(checkTimes[1] - checkTimes[0]).toBe(healthCheckInterval);
+
+      // Second interval
+      await vi.advanceTimersByTimeAsync(healthCheckInterval);
+      expect(healthCheckCount).toBe(3);
+      expect(checkTimes[2] - checkTimes[1]).toBe(healthCheckInterval);
+
+      // Third interval
+      await vi.advanceTimersByTimeAsync(healthCheckInterval);
+      expect(healthCheckCount).toBe(4);
+      expect(checkTimes[3] - checkTimes[2]).toBe(healthCheckInterval);
+
+      monitor.stop();
+
+      // Verify exact count and timing
+      expect(healthCheckCount).toBe(4);
+      expect(checkTimes[3] - checkTimes[0]).toBe(3 * healthCheckInterval);
     });
   });
 });
