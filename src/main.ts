@@ -12,6 +12,12 @@ import {
 } from "./lib/config";
 import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
+import {
+  handleAttachToSession,
+  handleKillSession,
+  handleRecoverAttachSession,
+  handleRecoverNewSession,
+} from "./lib/recovery-handlers";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 // NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
 // are defined locally in this file, not imported from terminal-lifecycle
@@ -1593,154 +1599,7 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
   });
 }
 
-// Recovery handlers for terminals with missing sessions
-async function handleRecoverNewSession(terminalId: string) {
-  console.log(`[handleRecoverNewSession] Creating new session for terminal ${terminalId}`);
-
-  try {
-    if (!state.hasWorkspace()) {
-      alert("Cannot recover: no workspace selected");
-      return;
-    }
-
-    const workspacePath = state.getWorkspaceOrThrow();
-    const terminal = state.getTerminals().find((t) => t.id === terminalId);
-
-    if (!terminal) {
-      alert("Cannot recover: terminal not found");
-      return;
-    }
-
-    // Get instance number
-    const instanceNumber = state.getNextTerminalNumber();
-
-    // Generate a new config ID for the recovered terminal
-    const newConfigId = generateNextConfigId();
-
-    // Create a new terminal in the daemon
-    const newTerminalId = await invoke<string>("create_terminal", {
-      configId: newConfigId,
-      name: terminal.name,
-      workingDir: workspacePath,
-      role: terminal.role || "default",
-      instanceNumber,
-    });
-
-    console.log(`[handleRecoverNewSession] Created new terminal ${newTerminalId}`);
-
-    // Update the terminal in state with the new ID
-    state.removeTerminal(terminalId);
-    state.addTerminal({
-      ...terminal,
-      id: newTerminalId,
-      status: TerminalStatus.Idle,
-      missingSession: undefined,
-    });
-
-    // Set as primary
-    state.setPrimary(newTerminalId);
-
-    // Save config
-    await saveCurrentConfig();
-
-    console.log(`[handleRecoverNewSession] Recovery complete`);
-  } catch (error) {
-    console.error(`[handleRecoverNewSession] Failed to recover:`, error);
-    alert(`Failed to create new session: ${error}`);
-  }
-}
-
-async function handleRecoverAttachSession(id: string) {
-  console.log(`[handleRecoverAttachSession] Loading available sessions for terminal ${id}`);
-
-  try {
-    // Find terminal by id
-    const terminal = state.getTerminal(id);
-    if (!terminal) {
-      console.error(`[handleRecoverAttachSession] Terminal ${id} not found`);
-      return;
-    }
-
-    const sessions = await invoke<string[]>("list_available_sessions");
-    console.log(`[handleRecoverAttachSession] Found ${sessions.length} sessions:`, sessions);
-
-    // Import renderAvailableSessionsList
-    const { renderAvailableSessionsList } = await import("./lib/ui");
-    renderAvailableSessionsList(terminal.id, id, sessions);
-  } catch (error) {
-    console.error(`[handleRecoverAttachSession] Failed to list sessions:`, error);
-    alert(`Failed to list available sessions: ${error}`);
-  }
-}
-
-async function handleAttachToSession(terminalId: string, sessionName: string) {
-  console.log(`[handleAttachToSession] Attaching terminal ${terminalId} to session ${sessionName}`);
-
-  try {
-    await invoke("attach_to_session", {
-      id: terminalId,
-      sessionName,
-    });
-
-    // Update terminal status
-    const terminal = state.getTerminals().find((t) => t.id === terminalId);
-    if (terminal) {
-      state.updateTerminal(terminalId, {
-        status: TerminalStatus.Idle,
-        missingSession: undefined,
-      });
-    }
-
-    // Save config
-    await saveCurrentConfig();
-
-    console.log(`[handleAttachToSession] Attached successfully`);
-  } catch (error) {
-    console.error(`[handleAttachToSession] Failed to attach:`, error);
-    alert(`Failed to attach to session: ${error}`);
-  }
-}
-
-async function handleKillSession(sessionName: string) {
-  console.log(`[handleKillSession] Killing session ${sessionName}`);
-
-  const confirmed = await ask(
-    `Are you sure you want to kill session "${sessionName}"?\n\nThis will permanently terminate the session and cannot be undone.`,
-    {
-      title: "Kill Session",
-      type: "warning",
-    }
-  );
-
-  if (!confirmed) {
-    return;
-  }
-
-  try {
-    await invoke("kill_session", { sessionName });
-    console.log(`[handleKillSession] Session killed successfully`);
-
-    // Refresh the available sessions list
-    // Find which terminal is showing the session list
-    const availableSessionsContainers = document.querySelectorAll("[id^='available-sessions-']");
-    for (const container of availableSessionsContainers) {
-      const terminalId = container.id.replace("available-sessions-", "");
-      if (terminalId) {
-        // Find terminal by id
-        const terminal = state.getTerminal(terminalId);
-        if (terminal) {
-          // Reload sessions for this terminal
-          const sessions = await invoke<string[]>("list_available_sessions");
-          const { renderAvailableSessionsList } = await import("./lib/ui");
-          renderAvailableSessionsList(terminalId, terminal.id, sessions);
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`[handleKillSession] Failed to kill session:`, error);
-    alert(`Failed to kill session: ${error}`);
-  }
-}
+// Recovery handlers are now in src/lib/recovery-handlers.ts
 
 // Set up event listeners (only once, since parent elements are static)
 function setupEventListeners() {
@@ -1834,7 +1693,11 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = recoverNewBtn.getAttribute("data-terminal-id");
         if (id) {
-          handleRecoverNewSession(id);
+          handleRecoverNewSession(id, {
+            state,
+            generateNextConfigId,
+            saveCurrentConfig,
+          });
         }
         return;
       }
@@ -1845,7 +1708,7 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = recoverAttachBtn.getAttribute("data-terminal-id");
         if (id) {
-          handleRecoverAttachSession(id);
+          handleRecoverAttachSession(id, state);
         }
         return;
       }
@@ -1857,7 +1720,10 @@ function setupEventListeners() {
         const id = attachSessionItem.getAttribute("data-terminal-id");
         const sessionName = attachSessionItem.getAttribute("data-session-name");
         if (id && sessionName) {
-          handleAttachToSession(id, sessionName);
+          handleAttachToSession(id, sessionName, {
+            state,
+            saveCurrentConfig,
+          });
         }
         return;
       }
@@ -1868,7 +1734,7 @@ function setupEventListeners() {
         e.stopPropagation();
         const sessionName = killSessionBtn.getAttribute("data-session-name");
         if (sessionName) {
-          handleKillSession(sessionName);
+          handleKillSession(sessionName, state);
         }
         return;
       }
