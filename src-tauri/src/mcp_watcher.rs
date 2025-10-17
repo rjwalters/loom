@@ -73,6 +73,9 @@ pub fn start_mcp_watcher(window: Window) {
                                     }
                                 };
 
+                                // Check success BEFORE consuming result
+                                let success = result.is_ok();
+
                                 if let Err(e) = result {
                                     eprintln!("[MCP Watcher] Failed to execute command: {e}");
                                 } else {
@@ -81,6 +84,24 @@ pub fn start_mcp_watcher(window: Window) {
 
                                 // Update last processed time
                                 last_processed = Some(modified);
+
+                                // Write acknowledgment file BEFORE deleting command file
+                                // This signals to the MCP server that the command was processed
+                                let ack_file = get_ack_file_path();
+                                let ack_data = serde_json::json!({
+                                    "command": mcp_cmd.command,
+                                    "timestamp": mcp_cmd.timestamp,
+                                    "processed_at": chrono::Utc::now().to_rfc3339(),
+                                    "success": success,
+                                });
+                                if let Err(e) = fs::write(
+                                    &ack_file,
+                                    serde_json::to_string_pretty(&ack_data).unwrap_or_default(),
+                                ) {
+                                    eprintln!(
+                                        "[MCP Watcher] Failed to write acknowledgment file: {e}"
+                                    );
+                                }
 
                                 // Delete the command file after processing
                                 if let Err(e) = fs::remove_file(&command_file) {
@@ -103,4 +124,14 @@ fn get_command_file_path() -> PathBuf {
         .expect("Could not get home directory")
         .join(".loom")
         .join("mcp-command.json")
+}
+
+#[allow(clippy::expect_used)]
+fn get_ack_file_path() -> PathBuf {
+    // Home directory must exist for the app to function
+    // This is only called in background thread, panic is acceptable
+    dirs::home_dir()
+        .expect("Could not get home directory")
+        .join(".loom")
+        .join("mcp-ack.json")
 }
