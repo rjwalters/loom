@@ -425,6 +425,13 @@ fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, Stri
             if let Some(contents_dir) = exe_dir.parent() {
                 let resources_dir = contents_dir.join("Resources");
 
+                // Try with _up_ prefix (Tauri bundles ../defaults as _up_/defaults)
+                let up_path = resources_dir.join("_up_").join(defaults_path);
+                tried_paths.push(up_path.display().to_string());
+                if up_path.exists() {
+                    return Ok(up_path);
+                }
+
                 // Try with subdirectory name (standard Tauri bundling)
                 let resources_path = resources_dir.join(defaults_path);
                 tried_paths.push(resources_path.display().to_string());
