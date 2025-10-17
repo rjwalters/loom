@@ -43,19 +43,27 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Write MCP command to control file for Loom to pick up
- * This is a simple file-based IPC mechanism that doesn't require AppleScript
+ * Write MCP command to control file for Loom to pick up with retry and exponential backoff
+ * This is a file-based IPC mechanism with acknowledgment
  */
 async function writeMCPCommand(command: string): Promise<string> {
-  const { writeFile, mkdir } = await import("node:fs/promises");
+  const { writeFile, mkdir, access, readFile, rm } = await import("node:fs/promises");
   const loomDir = join(homedir(), ".loom");
   const commandFile = join(loomDir, "mcp-command.json");
+  const ackFile = join(loomDir, "mcp-ack.json");
 
   // Ensure .loom directory exists
   try {
     await mkdir(loomDir, { recursive: true });
   } catch (_error) {
     // Directory might already exist, that's fine
+  }
+
+  // Clean up old acknowledgment file before writing new command
+  try {
+    await rm(ackFile);
+  } catch (_error) {
+    // Ack file might not exist, that's fine
   }
 
   // Write command with timestamp
@@ -66,7 +74,50 @@ async function writeMCPCommand(command: string): Promise<string> {
 
   await writeFile(commandFile, JSON.stringify(commandData, null, 2));
 
-  return `MCP command '${command}' written to ${commandFile}. The Loom app's MCP watcher will process this command within 500ms.`;
+  // Retry with exponential backoff to wait for acknowledgment
+  const maxRetries = 8; // Max 8 retries
+  const baseDelay = 100; // Start with 100ms
+  const maxDelay = 5000; // Cap at 5 seconds
+  let totalWaitTime = 0;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Calculate exponential backoff delay: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms, 5000ms
+    const delay = Math.min(baseDelay * 2 ** attempt, maxDelay);
+    totalWaitTime += delay;
+
+    // Wait before checking for acknowledgment
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    // Check if acknowledgment file exists
+    try {
+      await access(ackFile);
+
+      // Read acknowledgment data
+      const ackContent = await readFile(ackFile, "utf-8");
+      const ackData = JSON.parse(ackContent);
+
+      // Verify the ack is for our command
+      if (ackData.command === command && ackData.timestamp === commandData.timestamp) {
+        // Clean up acknowledgment file
+        try {
+          await rm(ackFile);
+        } catch (_error) {
+          // Ignore cleanup errors
+        }
+
+        if (ackData.success) {
+          return `MCP command '${command}' processed successfully (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        } else {
+          return `MCP command '${command}' acknowledged but execution failed (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        }
+      }
+    } catch (_error) {
+      // Ack file doesn't exist yet or couldn't be read, continue retrying
+    }
+  }
+
+  // Max retries exceeded - give up but don't error
+  return `MCP command '${command}' written but no acknowledgment received after ${maxRetries} retries (${totalWaitTime}ms total). The command may still be processing.`;
 }
 
 /**
