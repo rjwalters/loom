@@ -43,14 +43,12 @@ describe("HealthMonitor", () => {
         name: "Test Terminal 1",
         status: TerminalStatus.Idle,
         isPrimary: true,
-        sessionId: "session-1",
       },
       {
         id: "terminal-2",
         name: "Test Terminal 2",
         status: TerminalStatus.Busy,
         isPrimary: false,
-        sessionId: "session-2",
       },
     ];
   }

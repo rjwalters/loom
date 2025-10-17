@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ManagedTerminal } from "./terminal-manager";
 import { getTerminalManager, TerminalManager } from "./terminal-manager";
 
 // Mock xterm.js
