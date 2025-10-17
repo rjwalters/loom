@@ -1687,61 +1687,39 @@ Daemon → Spawn terminal with Claude
        → Updates issue status
 ```
 
-## Key Design Decisions
+## Architecture Decision Records (ADRs)
 
-### Why Tauri over Electron?
+Significant architectural decisions are documented in dedicated ADR files for easier reference and understanding.
 
-1. **Performance**: Rust backend, native webview
-2. **Security**: Smaller attack surface
-3. **Size**: ~10MB vs ~100MB for Electron apps
-4. **Modern**: Built for modern web standards
+**📖 See [docs/adr/README.md](docs/adr/README.md) for the complete ADR index**
 
-### Why Map over Array for State?
+### Quick Reference
 
-1. **Performance**: O(1) lookups by ID
-2. **Semantics**: Terminals have unique IDs
-3. **Flexibility**: Easy to add indexed access later
+**Core Architecture**:
+- [ADR-0001: Observer Pattern for State Management](docs/adr/0001-observer-pattern-state-management.md) - Why Observer Pattern over Redux/MobX
+- [ADR-0002: Vanilla TypeScript over React/Vue/Svelte](docs/adr/0002-vanilla-typescript-over-frameworks.md) - Why no frameworks
+- [ADR-0008: tmux + Rust Daemon Architecture](docs/adr/0008-tmux-daemon-architecture.md) - Why tmux and Rust daemon
 
-### Why No React/Vue?
+**Configuration & State**:
+- [ADR-0003: Separate Configuration and State Files](docs/adr/0003-config-state-file-split.md) - Config vs runtime state
+- [ADR-0007: Tauri IPC for Filesystem Operations](docs/adr/0007-tauri-ipc-for-filesystem-operations.md) - Why Rust IPC commands
 
-1. **Simplicity**: This is a learning project
-2. **Performance**: Direct DOM manipulation is fast
-3. **Size**: No framework overhead
-4. **Control**: Full control over rendering
+**Workflows & Coordination**:
+- [ADR-0004: Git Worktree Paths Inside Workspace](docs/adr/0004-worktree-paths-inside-workspace.md) - Sandbox-compatible worktree paths
+- [ADR-0006: Label-Based Workflow Coordination](docs/adr/0006-label-based-workflow-coordination.md) - GitHub labels as state machine
 
-### Why Class for State?
+**UI & Interaction**:
+- [ADR-0005: HTML5 Drag API over Mouse Events](docs/adr/0005-html5-drag-api-over-mouse-events.md) - Native drag behavior
 
-1. **Encapsulation**: Private fields and methods
-2. **TypeScript**: Full type checking
-3. **Familiarity**: OOP pattern many devs know
-4. **Extensibility**: Easy to add methods
+### Quick Answers
 
-### Why HTML5 Drag API (Not Mouse Events)?
+**Why Tauri over Electron?** Performance, security, size (~10MB vs ~100MB), modern web standards
 
-We use HTML5 drag events (`dragstart`, `dragover`, `dragend`) despite initial complexity:
+**Why Map over Array for State?** O(1) lookups by ID, clear semantics, easy to extend
 
-1. **Native behavior**: Browser handles drag cursor and visual feedback
-2. **Accessibility**: Screen readers understand drag operations
-3. **Cross-platform**: Works consistently across operating systems
-4. **No conflicts**: Doesn't interfere with text selection when properly configured
+**Why Class for State?** Encapsulation, TypeScript type checking, familiar OOP patterns
 
-**Key Implementation Details**:
-- Use `dragend` (not `drop`) because Tauri webview doesn't always fire `drop` events
-- Set `user-select: none` on cards to prevent text selection during drag
-- Use border-based selection (not `ring`/`outline`) to prevent clipping during drag
-- Wrapper divs with padding ensure borders don't get cut off
-- Drop indicator shows insertion point using absolute positioning
-
-### Why Separate Workspace State Variables?
-
-We maintain `workspacePath` (valid) and `displayedWorkspacePath` (shown):
-
-1. **Better UX**: Don't clear user input when path is invalid
-2. **Error display**: Show specific validation errors while keeping input
-3. **State clarity**: Distinguish between "what user typed" and "what we'll use"
-4. **Validation workflow**: User sees path → validate → either accept or show error
-
-This pattern prevents frustrating behavior where invalid input disappears.
+**Why Separate displayedWorkspacePath?** Better UX - don't clear invalid input, show specific errors while preserving user typing
 
 ## Common Pitfalls
 
@@ -1811,10 +1789,14 @@ Prefer Tailwind classes over inline styles for theme support:
 
 This document should evolve as the project grows:
 
-1. **When adding patterns**: Document the pattern and rationale
-2. **When making architectural decisions**: Add to "Key Design Decisions"
+1. **When adding patterns**: Document the pattern and rationale in the relevant section
+2. **When making architectural decisions**: Create an ADR in `docs/adr/` (see ADR template)
 3. **When finding pitfalls**: Add to "Common Pitfalls"
-4. **When removing code**: Update relevant sections
+4. **When removing code**: Update relevant sections and mark related ADRs as deprecated
+
+**CLAUDE.md vs ADRs**:
+- **CLAUDE.md**: Onboarding, high-level patterns, how-to guides, common tasks
+- **ADRs**: Specific architectural decisions with context, alternatives, and tradeoffs
 
 Keep this as a living document that helps both humans and AI understand the codebase deeply.
 
