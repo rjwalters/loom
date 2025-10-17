@@ -148,6 +148,7 @@ impl TestClient {
     }
 
     /// Helper: Create terminal
+    #[allow(dead_code)]
     pub async fn create_terminal(
         &mut self,
         name: impl Into<String>,
@@ -155,13 +156,31 @@ impl TestClient {
     ) -> Result<String> {
         // Generate a unique config_id for this test terminal
         let config_id = format!("test-{}", uuid::Uuid::new_v4());
+        self.create_terminal_with_config(config_id, name, working_dir, None, None)
+            .await
+    }
+
+    /// Helper: Create terminal with explicit configuration parameters
+    #[allow(dead_code)]
+    pub async fn create_terminal_with_config(
+        &mut self,
+        config_id: impl Into<String>,
+        name: impl Into<String>,
+        working_dir: Option<String>,
+        role: Option<String>,
+        instance_number: Option<u32>,
+    ) -> Result<String> {
+        let config_id: String = config_id.into();
+        let name: String = name.into();
 
         let request = serde_json::json!({
             "type": "CreateTerminal",
             "payload": {
                 "config_id": config_id,
-                "name": name.into(),
-                "working_dir": working_dir
+                "name": name,
+                "working_dir": working_dir,
+                "role": role,
+                "instance_number": instance_number
             }
         });
 
@@ -221,6 +240,25 @@ impl TestClient {
         }
 
         Ok(())
+    }
+
+    /// Helper: Check session health for a terminal ID
+    #[allow(dead_code)]
+    pub async fn check_session_health(&mut self, id: &str) -> Result<bool> {
+        let request = serde_json::json!({
+            "type": "CheckSessionHealth",
+            "payload": { "id": id }
+        });
+
+        let response = self.send_request(request).await?;
+
+        if let Some(payload) = response.get("payload") {
+            if let Some(has_session) = payload.get("has_session") {
+                return Ok(has_session.as_bool().unwrap_or(false));
+            }
+        }
+
+        anyhow::bail!("Unexpected response: {response:?}");
     }
 }
 

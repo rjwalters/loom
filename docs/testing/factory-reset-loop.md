@@ -470,6 +470,17 @@ echo "4. Trigger reset via: mcp__loom-ui__trigger_factory_reset"
 echo "5. Repeat steps 1-3"
 ```
 
+### Automated Integration Test (pnpm script)
+
+You can execute the end-to-end factory reset regression test directly from any Bash terminal (including Loom MCP terminals) using the existing package script:
+
+```bash
+# Run the loom-daemon factory reset integration test
+pnpm daemon:test -- --test integration_factory_reset -- --test-threads=1
+```
+
+This wraps `cargo test --test integration_factory_reset` so it works with `pnpm mcp__` invocations and local shells alike. The test mirrors the manual loop above: it launches the seven workspace terminals, verifies tmux sessions, destroys them, and repeats to ensure a clean slate.
+
 ## Continuous Improvement
 
 ### After Each Test Run

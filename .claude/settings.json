@@ -38,6 +38,7 @@
       "Bash(pnpm build)",
       "Bash(pnpm tauri:dev:*)",
       "Bash(pnpm daemon:dev:*)",
+      "Bash(pnpm daemon:test:*)",
       "Bash(pnpm check:all:*)",
       "Bash(pnpm check:ci:*)",
       "Bash(pnpm exec tsc:*)",
