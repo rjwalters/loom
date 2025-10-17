@@ -204,6 +204,16 @@ export function renderPrimaryTerminal(
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
           </svg>
         </button>
+        <button
+          id="terminal-close-btn"
+          data-terminal-id="${terminal.id}"
+          data-tooltip="Close terminal"
+          data-tooltip-position="bottom"
+          class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors text-gray-600 dark:text-gray-300 hover:text-red-500 dark:hover:text-red-400 font-bold text-lg"
+          title="Close terminal"
+        >
+          ×
+        </button>
       </div>
     `;
     headerContainer.style.backgroundColor = styles.backgroundColor;

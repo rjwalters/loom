@@ -13,6 +13,8 @@ import {
 import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+// NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
+// are defined locally in this file, not imported from terminal-lifecycle
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
@@ -23,6 +25,9 @@ import {
   renderMiniTerminals,
   renderPrimaryTerminal,
 } from "./lib/ui";
+
+// NOTE: validateWorkspacePath, browseWorkspace, handleWorkspacePathInput,
+// and attachWorkspaceEventListeners are defined locally in this file
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -1903,6 +1908,40 @@ function setupEventListeners() {
         const id = runNowBtn.getAttribute("data-terminal-id");
         if (id) {
           handleRunNowClick(id);
+        }
+        return;
+      }
+
+      // Close button
+      const closeBtn = target.closest("#terminal-close-btn");
+      if (closeBtn) {
+        e.stopPropagation();
+        const id = closeBtn.getAttribute("data-terminal-id");
+        if (id) {
+          ask("Are you sure you want to close this terminal?", {
+            title: "Close Terminal",
+            type: "warning",
+          }).then(async (confirmed) => {
+            if (confirmed) {
+              console.log(`[terminal-close-btn] Closing terminal ${id}`);
+
+              // Stop autonomous mode if running
+              const { getAutonomousManager } = await import("./lib/autonomous-manager");
+              const autonomousManager = getAutonomousManager();
+              autonomousManager.stopAutonomous(id);
+
+              // Stop polling and destroy terminal
+              outputPoller.stopPolling(id);
+              terminalManager.destroyTerminal(id);
+              if (currentAttachedTerminalId === id) {
+                currentAttachedTerminalId = null;
+              }
+
+              // Remove from state
+              state.removeTerminal(id);
+              saveCurrentConfig();
+            }
+          });
         }
         return;
       }
