@@ -352,9 +352,11 @@ fn find_git_root() -> Option<std::path::PathBuf> {
 // Tries development path first, then falls back to bundled resource path
 fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, String> {
     use std::path::PathBuf;
+    let mut tried_paths = Vec::new();
 
     // Try the provided path first (development mode - relative to cwd)
     let dev_path = PathBuf::from(defaults_path);
+    tried_paths.push(dev_path.display().to_string());
     if dev_path.exists() {
         return Ok(dev_path);
     }
@@ -363,28 +365,42 @@ fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, Stri
     // This handles the case where we're running from a git worktree
     if let Some(git_root) = find_git_root() {
         let git_root_defaults = git_root.join(defaults_path);
+        tried_paths.push(git_root_defaults.display().to_string());
         if git_root_defaults.exists() {
             return Ok(git_root_defaults);
         }
     }
 
     // Try resolving as bundled resource (production mode)
-    // In production, resources are in .app/Contents/Resources/
+    // In production, resources are in .app/Contents/Resources/ on macOS
     if let Ok(exe_path) = std::env::current_exe() {
         // Get the app bundle Resources directory
         if let Some(exe_dir) = exe_path.parent() {
             // exe is in Contents/MacOS/, resources are in Contents/Resources/
             if let Some(contents_dir) = exe_dir.parent() {
-                let resources_path = contents_dir.join("Resources").join(defaults_path);
+                let resources_dir = contents_dir.join("Resources");
+
+                // Try with subdirectory name (standard Tauri bundling)
+                let resources_path = resources_dir.join(defaults_path);
+                tried_paths.push(resources_path.display().to_string());
                 if resources_path.exists() {
                     return Ok(resources_path);
+                }
+
+                // Try the Resources directory itself (in case bundling flattens structure)
+                // This handles edge cases where the directory structure might differ
+                tried_paths.push(resources_dir.display().to_string());
+                if resources_dir.join("config.json").exists() {
+                    // If config.json exists directly in Resources/, that's our defaults dir
+                    return Ok(resources_dir);
                 }
             }
         }
     }
 
     Err(format!(
-        "Defaults directory not found: tried {defaults_path}, git root, and bundled resources"
+        "Defaults directory not found. Tried paths:\n  {}",
+        tried_paths.join("\n  ")
     ))
 }
 
