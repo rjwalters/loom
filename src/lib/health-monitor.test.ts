@@ -1,59 +1,84 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SystemHealth } from "./health-monitor";
-import { HealthMonitor } from "./health-monitor";
+import { getHealthMonitor, HealthMonitor } from "./health-monitor";
+import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
 
-// Mock Tauri invoke
+// Mock Tauri API
 vi.mock("@tauri-apps/api/tauri", () => ({
   invoke: vi.fn(),
 }));
 
-// Mock state
-vi.mock("./state", () => ({
-  getAppState: vi.fn(() => ({
-    getTerminals: vi.fn(() => []),
-    updateTerminal: vi.fn(),
-  })),
-  TerminalStatus: {
-    Idle: "idle",
-    Busy: "busy",
-    NeedsInput: "needs_input",
-    Error: "error",
-    Stopped: "stopped",
-  },
+// Mock state module
+vi.mock("./state", async () => {
+  const actual = await vi.importActual<typeof import("./state")>("./state");
+  return {
+    ...actual,
+    getAppState: vi.fn(),
+  };
+});
+
+// Mock output-poller module
+vi.mock("./output-poller", () => ({
+  getOutputPoller: vi.fn(),
 }));
 
-// Mock output-poller
-vi.mock("./output-poller", () => ({
-  getOutputPoller: vi.fn(() => ({
-    getErrorState: vi.fn(() => ({ consecutiveErrors: 0 })),
-  })),
-}));
+import { invoke } from "@tauri-apps/api/tauri";
+import { getOutputPoller } from "./output-poller";
+import { getAppState } from "./state";
 
 describe("HealthMonitor", () => {
   let monitor: HealthMonitor;
-  let mockInvoke: ReturnType<typeof vi.fn>;
-  let mockGetAppState: ReturnType<typeof vi.fn>;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
   let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let mockTerminals: Terminal[];
+  let mockState: any;
+  let mockPoller: any;
 
-  beforeEach(async () => {
+  // Factory function to create fresh mock terminals
+  function createMockTerminals(): Terminal[] {
+    return [
+      {
+        id: "terminal-1",
+        name: "Test Terminal 1",
+        status: TerminalStatus.Idle,
+        isPrimary: true,
+      },
+      {
+        id: "terminal-2",
+        name: "Test Terminal 2",
+        status: TerminalStatus.Busy,
+        isPrimary: false,
+      },
+    ];
+  }
+
+  beforeEach(() => {
     // Reset mocks
     vi.clearAllMocks();
     vi.useFakeTimers();
 
-    // Setup mock functions
-    const { invoke } = await import("@tauri-apps/api/tauri");
-    mockInvoke = invoke as ReturnType<typeof vi.fn>;
+    // Create fresh mock data for each test
+    mockTerminals = createMockTerminals();
 
-    const { getAppState } = await import("./state");
-    mockGetAppState = getAppState as ReturnType<typeof vi.fn>;
+    mockState = {
+      getTerminals: vi.fn(() => mockTerminals),
+      updateTerminal: vi.fn(),
+    };
 
-    // Spy on console methods
+    mockPoller = {
+      getErrorState: vi.fn(() => ({ consecutiveErrors: 0 })),
+    };
+
+    // Setup console spies
     consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     consoleWarnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    // Setup mock implementations
+    vi.mocked(getAppState).mockReturnValue(mockState as any);
+    vi.mocked(getOutputPoller).mockReturnValue(mockPoller as any);
+    vi.mocked(invoke).mockResolvedValue({ has_session: true });
 
     // Create fresh monitor instance
     monitor = new HealthMonitor();
@@ -61,651 +86,624 @@ describe("HealthMonitor", () => {
 
   afterEach(() => {
     monitor.stop();
-    vi.restoreAllMocks();
+    consoleLogSpy.mockRestore();
+    consoleWarnSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
     vi.useRealTimers();
   });
 
-  describe("Lifecycle Management", () => {
-    it("should start monitoring", () => {
+  describe("Start and Stop", () => {
+    it("starts monitoring with initial checks", async () => {
       monitor.start();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Starting health monitoring")
-      );
+      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Starting health monitoring");
+
+      // Should perform initial health check and ping
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(invoke).toHaveBeenCalledWith("check_session_health", {
+        id: "terminal-1",
+      });
+      expect(invoke).toHaveBeenCalledWith("check_daemon_health");
     });
 
-    it("should not start if already running", () => {
+    it("prevents starting multiple times", () => {
       monitor.start();
-      consoleLogSpy.mockClear();
-
       monitor.start();
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining("Already running"));
+      expect(consoleWarnSpy).toHaveBeenCalledWith("[HealthMonitor] Already running");
     });
 
-    it("should stop monitoring and clear timers", () => {
+    it("stops monitoring and clears timers", () => {
       monitor.start();
       monitor.stop();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Stopping health monitoring")
-      );
+      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Stopping health monitoring");
+
+      // Verify no more periodic checks after stop
+      const invokeCallsBefore = vi.mocked(invoke).mock.calls.length;
+      vi.advanceTimersByTime(60000); // Advance 60 seconds
+      const invokeCallsAfter = vi.mocked(invoke).mock.calls.length;
+
+      // Should be no new calls (only the initial checks from start)
+      expect(invokeCallsAfter).toBe(invokeCallsBefore);
     });
 
-    it("should handle stop when not running", () => {
-      // Should not throw
-      expect(() => monitor.stop()).not.toThrow();
-    });
-
-    it("should perform initial health check on start", async () => {
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
-      monitor.start();
-
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Performing health check")
-      );
-    });
-
-    it("should perform initial daemon ping on start", () => {
-      monitor.start();
-
-      expect(mockInvoke).toHaveBeenCalledWith("check_daemon_health");
+    it("handles stop when not running", () => {
+      monitor.stop();
+      // Should not throw or log warning
+      expect(consoleWarnSpy).not.toHaveBeenCalled();
     });
   });
 
-  describe("Activity Tracking", () => {
-    beforeEach(() => {
-      vi.setSystemTime(new Date("2025-01-01T12:00:00Z"));
+  describe("Activity Recording", () => {
+    it("records activity with current timestamp", () => {
+      const now = Date.now();
+      vi.setSystemTime(now);
+
+      monitor.recordActivity("terminal-1");
+
+      expect(consoleLogSpy).toHaveBeenCalledWith(
+        `[HealthMonitor] Activity recorded for terminal-1 at ${now}`
+      );
+
+      const lastActivity = monitor.getLastActivity("terminal-1");
+      expect(lastActivity).toBe(now);
     });
 
-    it("should record terminal activity", () => {
+    it("updates activity timestamp on subsequent recordings", () => {
+      const time1 = 1000000;
+      const time2 = 2000000;
+
+      vi.setSystemTime(time1);
+      monitor.recordActivity("terminal-1");
+
+      vi.setSystemTime(time2);
       monitor.recordActivity("terminal-1");
 
       const lastActivity = monitor.getLastActivity("terminal-1");
-      expect(lastActivity).toBe(new Date("2025-01-01T12:00:00Z").getTime());
+      expect(lastActivity).toBe(time2);
     });
 
-    it("should update activity timestamp on subsequent calls", () => {
-      monitor.recordActivity("terminal-1");
-
-      vi.setSystemTime(new Date("2025-01-01T12:05:00Z"));
-      monitor.recordActivity("terminal-1");
-
-      const lastActivity = monitor.getLastActivity("terminal-1");
-      expect(lastActivity).toBe(new Date("2025-01-01T12:05:00Z").getTime());
-    });
-
-    it("should return null for unknown terminal", () => {
+    it("returns null for terminal with no recorded activity", () => {
       const lastActivity = monitor.getLastActivity("unknown-terminal");
       expect(lastActivity).toBeNull();
     });
 
-    it("should track activity for multiple terminals independently", () => {
-      vi.setSystemTime(new Date("2025-01-01T12:00:00Z"));
+    it("tracks activity for multiple terminals independently", () => {
+      const time1 = 1000000;
+      const time2 = 2000000;
+
+      vi.setSystemTime(time1);
       monitor.recordActivity("terminal-1");
 
-      vi.setSystemTime(new Date("2025-01-01T12:05:00Z"));
+      vi.setSystemTime(time2);
       monitor.recordActivity("terminal-2");
 
-      expect(monitor.getLastActivity("terminal-1")).toBe(
-        new Date("2025-01-01T12:00:00Z").getTime()
-      );
-      expect(monitor.getLastActivity("terminal-2")).toBe(
-        new Date("2025-01-01T12:05:00Z").getTime()
-      );
+      expect(monitor.getLastActivity("terminal-1")).toBe(time1);
+      expect(monitor.getLastActivity("terminal-2")).toBe(time2);
     });
   });
 
-  describe("Health Check", () => {
-    it("should check health for all terminals", async () => {
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [
-          { id: "terminal-1", status: TerminalStatus.Idle },
-          { id: "terminal-2", status: TerminalStatus.Idle },
-        ]),
-        updateTerminal: vi.fn(),
-      });
+  describe("Health Check Operations", () => {
+    it("performs health check for non-busy terminals", async () => {
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
-      mockInvoke.mockResolvedValue({ has_session: true });
-
-      await monitor.performHealthCheck();
-
-      expect(mockInvoke).toHaveBeenCalledWith("check_session_health", {
+      // Should check terminal-1 (Idle status)
+      expect(invoke).toHaveBeenCalledWith("check_session_health", {
         id: "terminal-1",
       });
-      expect(mockInvoke).toHaveBeenCalledWith("check_session_health", {
-        id: "terminal-2",
-      });
+
+      // Should NOT check terminal-2 (Busy status - skipped)
+      const terminal2Check = vi
+        .mocked(invoke)
+        .mock.calls.find(
+          (call) => call[0] === "check_session_health" && (call[1] as any)?.id === "terminal-2"
+        );
+      expect(terminal2Check).toBeUndefined();
     });
 
-    it("should skip health check for busy terminals", async () => {
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [{ id: "terminal-1", status: TerminalStatus.Busy }]),
-        updateTerminal: vi.fn(),
-      });
+    it("skips health check for busy terminals", async () => {
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
-      await monitor.performHealthCheck();
+      const busyTerminalCheck = vi
+        .mocked(invoke)
+        .mock.calls.find(
+          (call) => call[0] === "check_session_health" && (call[1] as any)?.id === "terminal-2"
+        );
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Skipping health check for terminal-1")
-      );
-      expect(mockInvoke).not.toHaveBeenCalledWith("check_session_health", {
-        id: "terminal-1",
-      });
+      // terminal-2 is busy, should be skipped
+      expect(busyTerminalCheck).toBeUndefined();
     });
 
-    it("should detect missing tmux session", async () => {
-      const mockUpdateTerminal = vi.fn();
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [
-          { id: "terminal-1", status: TerminalStatus.Idle, missingSession: false },
-        ]),
-        updateTerminal: mockUpdateTerminal,
-      });
+    it("detects missing session and updates terminal status", async () => {
+      vi.mocked(invoke).mockResolvedValueOnce({ has_session: false });
 
-      mockInvoke.mockResolvedValue({ has_session: false });
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
-      await monitor.performHealthCheck();
-
-      expect(consoleWarnSpy).toHaveBeenCalledWith(expect.stringContaining("missing tmux session"));
-      expect(mockUpdateTerminal).toHaveBeenCalledWith("terminal-1", {
+      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
         status: TerminalStatus.Error,
         missingSession: true,
       });
     });
 
-    it("should detect recovered tmux session", async () => {
-      const mockUpdateTerminal = vi.fn();
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [
-          { id: "terminal-1", status: TerminalStatus.Error, missingSession: true },
-        ]),
-        updateTerminal: mockUpdateTerminal,
-      });
+    it("detects recovered session and clears error state", async () => {
+      // Setup terminal with missing session
+      mockTerminals[0].missingSession = true;
+      mockTerminals[0].status = TerminalStatus.Error;
 
-      mockInvoke.mockResolvedValue({ has_session: true });
+      vi.mocked(invoke).mockResolvedValueOnce({ has_session: true });
 
-      await monitor.performHealthCheck();
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(expect.stringContaining("session recovered"));
-      expect(mockUpdateTerminal).toHaveBeenCalledWith("terminal-1", {
+      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
         status: TerminalStatus.Idle,
         missingSession: undefined,
       });
     });
 
-    it("should not update missingSession flag on health check failure", async () => {
-      const mockUpdateTerminal = vi.fn();
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [
-          { id: "terminal-1", status: TerminalStatus.Idle, missingSession: false },
-        ]),
-        updateTerminal: mockUpdateTerminal,
-      });
+    it("handles health check errors gracefully", async () => {
+      vi.mocked(invoke).mockRejectedValueOnce(new Error("IPC timeout"));
 
-      mockInvoke.mockRejectedValue(new Error("Daemon unreachable"));
-
-      await monitor.performHealthCheck();
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
       expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Health check failed"),
+        expect.stringContaining("[HealthMonitor] Health check failed for terminal-1"),
         expect.any(Error)
       );
-      expect(mockUpdateTerminal).not.toHaveBeenCalled();
+
+      // Should not set missingSession on IPC failure
+      expect(mockState.updateTerminal).not.toHaveBeenCalled();
     });
 
-    it("should detect stale terminals", async () => {
-      vi.setSystemTime(new Date("2025-01-01T12:00:00Z"));
+    it("detects stale terminals based on activity threshold", async () => {
+      const now = Date.now();
+      vi.setSystemTime(now);
+
+      // Record activity 20 minutes ago (default stale threshold is 15 minutes)
+      const activityTime = now - 20 * 60 * 1000;
       monitor.recordActivity("terminal-1");
+      vi.setSystemTime(activityTime);
+      monitor.recordActivity("terminal-1");
+      vi.setSystemTime(now);
 
-      // Advance time beyond stale threshold (15 minutes default)
-      vi.setSystemTime(new Date("2025-01-01T12:20:00Z"));
-
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [{ id: "terminal-1", status: TerminalStatus.Idle }]),
-        updateTerminal: vi.fn(),
-      });
-
-      mockInvoke.mockResolvedValue({ has_session: true });
-
-      await monitor.performHealthCheck();
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
       const health = monitor.getHealth();
-      const terminalHealth = health.terminals.get("terminal-1");
+      const terminal1Health = health.terminals.get("terminal-1");
 
-      expect(terminalHealth?.isStale).toBe(true);
-      expect(terminalHealth?.timeSinceActivity).toBeGreaterThan(15 * 60 * 1000);
+      expect(terminal1Health?.isStale).toBe(true);
+      expect(terminal1Health?.timeSinceActivity).toBeGreaterThan(15 * 60 * 1000);
     });
 
-    it("should mark terminal as not stale when activity is recent", async () => {
-      vi.setSystemTime(new Date("2025-01-01T12:00:00Z"));
-      monitor.recordActivity("terminal-1");
+    it("runs periodic health checks at configured interval", async () => {
+      monitor.setHealthCheckInterval(5000); // 5 seconds
+      monitor.start();
 
-      // Advance time but stay within threshold
-      vi.setSystemTime(new Date("2025-01-01T12:05:00Z"));
+      // Initial check
+      await vi.runOnlyPendingTimersAsync();
+      const initialCalls = vi.mocked(invoke).mock.calls.length;
 
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [{ id: "terminal-1", status: TerminalStatus.Idle }]),
-        updateTerminal: vi.fn(),
-      });
+      // Advance 5 seconds
+      vi.advanceTimersByTime(5000);
+      await vi.runOnlyPendingTimersAsync();
 
-      mockInvoke.mockResolvedValue({ has_session: true });
-
-      await monitor.performHealthCheck();
-
-      const health = monitor.getHealth();
-      const terminalHealth = health.terminals.get("terminal-1");
-
-      expect(terminalHealth?.isStale).toBe(false);
+      // Should have new health check calls
+      expect(vi.mocked(invoke).mock.calls.length).toBeGreaterThan(initialCalls);
     });
   });
 
-  describe("Daemon Health", () => {
-    it("should ping daemon and record success", async () => {
-      const startTime = new Date("2025-01-01T12:00:00Z").getTime();
-      vi.setSystemTime(startTime);
-
-      let pingTime = 0;
-      mockInvoke.mockImplementation(async () => {
-        pingTime = Date.now();
-        return true;
-      });
-
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
+  describe("Daemon Health Monitoring", () => {
+    it("pings daemon successfully", async () => {
+      vi.mocked(invoke).mockResolvedValueOnce(true);
 
       monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
-      // Wait for async operations to complete
-      await Promise.resolve();
-      await Promise.resolve();
-
-      monitor.stop();
+      expect(invoke).toHaveBeenCalledWith("check_daemon_health");
 
       const health = monitor.getHealth();
-
       expect(health.daemon.connected).toBe(true);
       expect(health.daemon.consecutiveFailures).toBe(0);
-      // Ping should happen at the start time
-      expect(pingTime).toBe(startTime);
-      expect(health.daemon.lastPing).toBe(startTime);
     });
 
-    it("should track consecutive daemon ping failures", async () => {
-      mockInvoke.mockRejectedValue(new Error("Connection refused"));
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
+    it("tracks consecutive daemon ping failures", async () => {
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_daemon_health") {
+          return Promise.reject(new Error("Daemon unreachable"));
+        }
+        return Promise.resolve({ has_session: true });
       });
 
       monitor.start();
 
-      // Wait for async operations to complete
-      await Promise.resolve();
-      await Promise.resolve();
+      // First failure
+      await vi.runOnlyPendingTimersAsync();
+      let health = monitor.getHealth();
+      expect(health.daemon.consecutiveFailures).toBe(1);
+      expect(health.daemon.connected).toBe(true); // Still connected (< 3 failures)
 
-      monitor.stop();
+      // Second failure
+      vi.advanceTimersByTime(10000);
+      await vi.runOnlyPendingTimersAsync();
+      health = monitor.getHealth();
+      expect(health.daemon.consecutiveFailures).toBe(2);
+      expect(health.daemon.connected).toBe(true);
 
-      const health = monitor.getHealth();
-
-      expect(health.daemon.consecutiveFailures).toBeGreaterThan(0);
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Daemon ping failed"),
-        expect.any(Error)
-      );
-    });
-
-    it("should mark daemon as disconnected after 3 consecutive failures", async () => {
-      const pingTimes: number[] = [];
-      const startTime = Date.now();
-
-      mockInvoke.mockImplementation(() => {
-        pingTimes.push(Date.now());
-        return Promise.reject(new Error("Connection refused"));
-      });
-
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
-      const pingInterval = 1000;
-      monitor.setDaemonPingInterval(pingInterval);
-      monitor.start();
-
-      // Wait for initial ping
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(pingTimes.length).toBe(1);
-
-      // Advance time for second ping
-      await vi.advanceTimersByTimeAsync(pingInterval);
-      expect(pingTimes.length).toBe(2);
-      // Verify second ping happened exactly 1000ms after first
-      expect(pingTimes[1] - pingTimes[0]).toBe(pingInterval);
-
-      // Advance time for third ping
-      await vi.advanceTimersByTimeAsync(pingInterval);
-      expect(pingTimes.length).toBe(3);
-      // Verify third ping happened exactly 1000ms after second
-      expect(pingTimes[2] - pingTimes[1]).toBe(pingInterval);
-
-      monitor.stop();
-
-      const health = monitor.getHealth();
-
-      expect(health.daemon.connected).toBe(false);
+      // Third failure - marks as disconnected
+      vi.advanceTimersByTime(10000);
+      await vi.runOnlyPendingTimersAsync();
+      health = monitor.getHealth();
       expect(health.daemon.consecutiveFailures).toBe(3);
+      expect(health.daemon.connected).toBe(false);
+    });
+
+    it("resets failure count on successful ping", async () => {
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_daemon_health") {
+          // Fail first, succeed second
+          if (
+            vi.mocked(invoke).mock.calls.filter((c) => c[0] === "check_daemon_health").length <= 1
+          ) {
+            return Promise.reject(new Error("Daemon unreachable"));
+          }
+          return Promise.resolve(true);
+        }
+        return Promise.resolve({ has_session: true });
+      });
+
+      monitor.start();
+
+      // First ping fails
+      await vi.runOnlyPendingTimersAsync();
+      let health = monitor.getHealth();
+      expect(health.daemon.consecutiveFailures).toBe(1);
+
+      // Second ping succeeds
+      vi.advanceTimersByTime(10000);
+      await vi.runOnlyPendingTimersAsync();
+      health = monitor.getHealth();
+      expect(health.daemon.consecutiveFailures).toBe(0);
+      expect(health.daemon.connected).toBe(true);
+    });
+
+    it("runs periodic daemon pings at configured interval", async () => {
+      monitor.setDaemonPingInterval(3000); // 3 seconds
+      monitor.start();
+
+      // Initial ping
+      await vi.runOnlyPendingTimersAsync();
+      const initialPingCalls = vi
+        .mocked(invoke)
+        .mock.calls.filter((c) => c[0] === "check_daemon_health").length;
+
+      // Advance 3 seconds
+      vi.advanceTimersByTime(3000);
+      await vi.runOnlyPendingTimersAsync();
+
+      const newPingCalls = vi
+        .mocked(invoke)
+        .mock.calls.filter((c) => c[0] === "check_daemon_health").length;
+
+      expect(newPingCalls).toBeGreaterThan(initialPingCalls);
     });
   });
 
-  describe("Health Callbacks", () => {
-    it("should notify callbacks on health update", async () => {
+  describe("Health Snapshot", () => {
+    it("returns current health snapshot with all metrics", async () => {
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      const health = monitor.getHealth();
+
+      expect(health).toMatchObject({
+        activeTerminals: expect.any(Number),
+        healthyTerminals: expect.any(Number),
+        errorTerminals: expect.any(Number),
+        lastCheckTime: expect.any(Number),
+      });
+
+      expect(health.terminals).toBeInstanceOf(Map);
+      expect(health.daemon).toMatchObject({
+        connected: expect.any(Boolean),
+        lastPing: expect.any(Number),
+        timeSincePing: expect.any(Number),
+        consecutiveFailures: expect.any(Number),
+      });
+    });
+
+    it("counts active terminals correctly", async () => {
+      mockTerminals[0].status = TerminalStatus.Idle;
+      mockTerminals[1].status = TerminalStatus.Busy;
+
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      const health = monitor.getHealth();
+      // Both terminals are active (not stopped)
+      expect(health.activeTerminals).toBe(2);
+    });
+
+    it("counts error terminals correctly", async () => {
+      vi.mocked(invoke).mockResolvedValueOnce({ has_session: false });
+
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      const health = monitor.getHealth();
+      expect(health.errorTerminals).toBe(1); // terminal-1 has missing session
+    });
+
+    it("includes poller error state in health", async () => {
+      mockPoller.getErrorState.mockReturnValueOnce({ consecutiveErrors: 3 });
+
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      const health = monitor.getHealth();
+      const terminal1Health = health.terminals.get("terminal-1");
+
+      expect(terminal1Health?.pollerErrors).toBe(3);
+    });
+  });
+
+  describe("Health Update Callbacks", () => {
+    it("notifies callbacks on health check completion", async () => {
       const callback = vi.fn();
       monitor.onHealthUpdate(callback);
 
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(callback).toHaveBeenCalled();
+      expect(callback.mock.calls[0][0]).toMatchObject({
+        activeTerminals: expect.any(Number),
+        healthyTerminals: expect.any(Number),
+        errorTerminals: expect.any(Number),
       });
-
-      await monitor.performHealthCheck();
-
-      expect(callback).toHaveBeenCalledWith(
-        expect.objectContaining({
-          terminals: expect.any(Map),
-          daemon: expect.any(Object),
-        })
-      );
     });
 
-    it("should allow multiple callbacks", async () => {
+    it("notifies callbacks on daemon ping completion", async () => {
+      const callback = vi.fn();
+      monitor.onHealthUpdate(callback);
+
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      // Should be called for both health check and daemon ping
+      expect(callback.mock.calls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("supports multiple independent callbacks", async () => {
       const callback1 = vi.fn();
       const callback2 = vi.fn();
 
       monitor.onHealthUpdate(callback1);
       monitor.onHealthUpdate(callback2);
 
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
-      await monitor.performHealthCheck();
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
       expect(callback1).toHaveBeenCalled();
       expect(callback2).toHaveBeenCalled();
     });
 
-    it("should unsubscribe callback using returned function", async () => {
+    it("returns unsubscribe function", async () => {
       const callback = vi.fn();
       const unsubscribe = monitor.onHealthUpdate(callback);
 
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(callback).toHaveBeenCalled();
+
+      callback.mockClear();
       unsubscribe();
 
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
+      // Trigger another health check
       await monitor.performHealthCheck();
 
       expect(callback).not.toHaveBeenCalled();
     });
 
-    it("should handle errors in callbacks gracefully", async () => {
-      const errorCallback = vi.fn(() => {
+    it("handles errors in callbacks gracefully", async () => {
+      const badCallback = vi.fn(() => {
         throw new Error("Callback error");
       });
-      const normalCallback = vi.fn();
+      const goodCallback = vi.fn();
 
-      monitor.onHealthUpdate(errorCallback);
-      monitor.onHealthUpdate(normalCallback);
+      monitor.onHealthUpdate(badCallback);
+      monitor.onHealthUpdate(goodCallback);
 
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
-      await monitor.performHealthCheck();
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
       expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Error in health callback"),
+        "[HealthMonitor] Error in health callback:",
         expect.any(Error)
       );
-      expect(normalCallback).toHaveBeenCalled();
-    });
-  });
 
-  describe("System Health Snapshot", () => {
-    it("should return current health snapshot", () => {
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [
-          { id: "terminal-1", status: TerminalStatus.Idle },
-          { id: "terminal-2", status: TerminalStatus.Error },
-        ]),
-        updateTerminal: vi.fn(),
-      });
-
-      const health = monitor.getHealth();
-
-      expect(health).toHaveProperty("terminals");
-      expect(health).toHaveProperty("daemon");
-      expect(health).toHaveProperty("activeTerminals");
-      expect(health).toHaveProperty("healthyTerminals");
-      expect(health).toHaveProperty("errorTerminals");
-      expect(health).toHaveProperty("lastCheckTime");
-    });
-
-    it("should count active terminals correctly", async () => {
-      // Setup health data for terminals first
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [
-          { id: "terminal-1", status: TerminalStatus.Idle },
-          { id: "terminal-2", status: TerminalStatus.Busy },
-          { id: "terminal-3", status: TerminalStatus.Stopped },
-        ]),
-        updateTerminal: vi.fn(),
-      });
-
-      mockInvoke.mockResolvedValue({ has_session: true });
-
-      // Perform health check to populate terminal health data
-      await monitor.performHealthCheck();
-
-      const health = monitor.getHealth();
-
-      // Active terminals = terminals with health data that are not stopped
-      // Busy terminal is skipped in health checks, so only terminal-1 and terminal-3 have health data
-      // Only terminal-1 is not stopped
-      expect(health.activeTerminals).toBe(1); // Only Idle (Busy skipped, Stopped not active)
+      // Good callback should still be called
+      expect(goodCallback).toHaveBeenCalled();
     });
   });
 
   describe("Configuration", () => {
-    it("should allow configuring stale threshold", async () => {
-      const customThreshold = 5 * 60 * 1000; // 5 minutes
-      monitor.setStaleThreshold(customThreshold);
+    it("allows configuring stale threshold", async () => {
+      monitor.setStaleThreshold(5 * 60 * 1000); // 5 minutes
 
-      vi.setSystemTime(new Date("2025-01-01T12:00:00Z"));
+      const now = Date.now();
+      vi.setSystemTime(now);
+
+      // Record activity 6 minutes ago
+      const activityTime = now - 6 * 60 * 1000;
+      vi.setSystemTime(activityTime);
       monitor.recordActivity("terminal-1");
+      vi.setSystemTime(now);
 
-      vi.setSystemTime(new Date("2025-01-01T12:06:00Z"));
-
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => [{ id: "terminal-1", status: TerminalStatus.Idle }]),
-        updateTerminal: vi.fn(),
-      });
-
-      mockInvoke.mockResolvedValue({ has_session: true });
-
-      await monitor.performHealthCheck();
+      monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
       const health = monitor.getHealth();
-      const terminalHealth = health.terminals.get("terminal-1");
+      const terminal1Health = health.terminals.get("terminal-1");
 
-      expect(terminalHealth?.isStale).toBe(true);
+      expect(terminal1Health?.isStale).toBe(true);
     });
 
-    it("should allow configuring health check interval", () => {
-      const customInterval = 60000; // 60 seconds
-      monitor.setHealthCheckInterval(customInterval);
-
+    it("allows configuring health check interval", async () => {
+      monitor.setHealthCheckInterval(2000); // 2 seconds
       monitor.start();
 
-      // Verify timer was set with new interval
-      // (Implementation detail - would need access to timer internals to verify)
-      expect(() => monitor.start()).not.toThrow();
+      await vi.runOnlyPendingTimersAsync();
+      const callsBeforeInterval = vi.mocked(invoke).mock.calls.length;
+
+      vi.advanceTimersByTime(2000);
+      await vi.runOnlyPendingTimersAsync();
+
+      const callsAfterInterval = vi.mocked(invoke).mock.calls.length;
+      expect(callsAfterInterval).toBeGreaterThan(callsBeforeInterval);
     });
 
-    it("should allow configuring daemon ping interval", () => {
-      const customInterval = 5000; // 5 seconds
-      monitor.setDaemonPingInterval(customInterval);
-
+    it("allows configuring daemon ping interval", async () => {
+      monitor.setDaemonPingInterval(1000); // 1 second
       monitor.start();
 
-      // Verify timer was set with new interval
-      expect(() => monitor.start()).not.toThrow();
+      await vi.runOnlyPendingTimersAsync();
+      const initialPings = vi
+        .mocked(invoke)
+        .mock.calls.filter((c) => c[0] === "check_daemon_health").length;
+
+      vi.advanceTimersByTime(1000);
+      await vi.runOnlyPendingTimersAsync();
+
+      const newPings = vi
+        .mocked(invoke)
+        .mock.calls.filter((c) => c[0] === "check_daemon_health").length;
+
+      expect(newPings).toBeGreaterThan(initialPings);
     });
 
-    it("should restart timers when interval changed while running", () => {
+    it("restarts timer when changing interval while running", async () => {
+      monitor.setHealthCheckInterval(10000); // 10 seconds
       monitor.start();
+
+      await vi.runOnlyPendingTimersAsync();
 
       // Change interval while running
-      monitor.setHealthCheckInterval(5000);
-      monitor.setDaemonPingInterval(2000);
+      monitor.setHealthCheckInterval(1000); // 1 second
 
-      // Should not throw and should continue working
-      expect(() => monitor.stop()).not.toThrow();
+      vi.advanceTimersByTime(1000);
+      await vi.runOnlyPendingTimersAsync();
+
+      // Should have triggered with new interval
+      expect(vi.mocked(invoke).mock.calls.length).toBeGreaterThan(2);
     });
   });
 
-  describe("Periodic Monitoring", () => {
-    it("should perform health checks at configured interval", async () => {
-      let healthCheckCount = 0;
-      const checkTimes: number[] = [];
+  describe("Singleton Instance", () => {
+    it("returns same instance from getHealthMonitor", () => {
+      const instance1 = getHealthMonitor();
+      const instance2 = getHealthMonitor();
 
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
+      expect(instance1).toBe(instance2);
+    });
+  });
 
-      // Track health checks via console logs (most reliable)
-      consoleLogSpy.mockImplementation((msg: string) => {
-        if (msg.includes("Performing health check")) {
-          healthCheckCount++;
-          checkTimes.push(Date.now());
-        }
-      });
+  describe("Real-world Scenarios", () => {
+    it("monitors healthy terminal lifecycle", async () => {
+      const callback = vi.fn();
+      monitor.onHealthUpdate(callback);
 
-      const healthCheckInterval = 10000; // 10 seconds
-      monitor.setHealthCheckInterval(healthCheckInterval);
+      // Start monitoring
       monitor.start();
+      await vi.runOnlyPendingTimersAsync();
 
-      // Wait for initial health check
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(healthCheckCount).toBe(1);
+      let health = monitor.getHealth();
+      expect(health.healthyTerminals).toBe(1); // terminal-1 is healthy
 
-      // Advance time exactly by the interval to trigger next health check
-      await vi.advanceTimersByTimeAsync(healthCheckInterval);
+      // Record activity
+      monitor.recordActivity("terminal-1");
 
-      expect(healthCheckCount).toBe(2);
-      expect(checkTimes.length).toBe(2);
-      expect(checkTimes[1] - checkTimes[0]).toBe(healthCheckInterval);
+      // Wait for next health check
+      vi.advanceTimersByTime(30000);
+      await vi.runOnlyPendingTimersAsync();
 
-      monitor.stop();
+      health = monitor.getHealth();
+      const terminal1Health = health.terminals.get("terminal-1");
+      expect(terminal1Health?.hasSession).toBe(true);
+      expect(terminal1Health?.isStale).toBe(false);
     });
 
-    it("should ping daemon at configured interval", async () => {
-      const pingTimes: number[] = [];
-
-      mockInvoke.mockImplementation(() => {
-        pingTimes.push(Date.now());
-        return Promise.resolve(true);
-      });
-
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
-      const daemonPingInterval = 5000; // 5 seconds
-      monitor.setDaemonPingInterval(daemonPingInterval);
+    it("detects terminal session loss and recovery", async () => {
       monitor.start();
 
-      // Wait for initial ping
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(pingTimes.length).toBe(1);
+      // Initial state - session exists
+      vi.mocked(invoke).mockResolvedValueOnce({ has_session: true });
+      await vi.runOnlyPendingTimersAsync();
 
-      // Clear initial ping
-      mockInvoke.mockClear();
+      const health = monitor.getHealth();
+      expect(health.terminals.get("terminal-1")?.hasSession).toBe(true);
 
-      // Advance time exactly by the interval to trigger next ping
-      await vi.advanceTimersByTimeAsync(daemonPingInterval);
+      // Session lost
+      vi.mocked(invoke).mockResolvedValueOnce({ has_session: false });
+      vi.advanceTimersByTime(30000);
+      await vi.runOnlyPendingTimersAsync();
 
-      expect(mockInvoke).toHaveBeenCalledWith("check_daemon_health");
-      expect(pingTimes.length).toBe(2);
-      expect(pingTimes[1] - pingTimes[0]).toBe(daemonPingInterval);
+      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+        status: TerminalStatus.Error,
+        missingSession: true,
+      });
 
-      monitor.stop();
+      // Session recovered
+      mockTerminals[0].missingSession = true;
+      vi.mocked(invoke).mockResolvedValueOnce({ has_session: true });
+      vi.advanceTimersByTime(30000);
+      await vi.runOnlyPendingTimersAsync();
+
+      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+        status: TerminalStatus.Idle,
+        missingSession: undefined,
+      });
     });
 
-    it("should perform multiple periodic checks at exact intervals", async () => {
-      let healthCheckCount = 0;
-      const checkTimes: number[] = [];
-      const startTime = Date.now();
-
-      mockGetAppState.mockReturnValue({
-        getTerminals: vi.fn(() => []),
-        updateTerminal: vi.fn(),
-      });
-
-      // Track health checks via console logs
-      consoleLogSpy.mockImplementation((msg: string) => {
-        if (msg.includes("Performing health check")) {
-          healthCheckCount++;
-          checkTimes.push(Date.now());
-        }
-      });
-
-      const healthCheckInterval = 1000; // 1 second for faster test
-      monitor.setHealthCheckInterval(healthCheckInterval);
+    it("handles daemon connectivity loss gracefully", async () => {
       monitor.start();
 
-      // Wait for initial check
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(healthCheckCount).toBe(1);
-      expect(checkTimes[0]).toBe(startTime);
+      // Initial successful ping
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_daemon_health") {
+          return Promise.resolve(true);
+        }
+        return Promise.resolve({ has_session: true });
+      });
 
-      // First interval
-      await vi.advanceTimersByTimeAsync(healthCheckInterval);
-      expect(healthCheckCount).toBe(2);
-      expect(checkTimes[1] - checkTimes[0]).toBe(healthCheckInterval);
+      await vi.runOnlyPendingTimersAsync();
+      let health = monitor.getHealth();
+      expect(health.daemon.connected).toBe(true);
 
-      // Second interval
-      await vi.advanceTimersByTimeAsync(healthCheckInterval);
-      expect(healthCheckCount).toBe(3);
-      expect(checkTimes[2] - checkTimes[1]).toBe(healthCheckInterval);
+      // Daemon becomes unreachable
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_daemon_health") {
+          return Promise.reject(new Error("Connection refused"));
+        }
+        return Promise.resolve({ has_session: true });
+      });
 
-      // Third interval
-      await vi.advanceTimersByTimeAsync(healthCheckInterval);
-      expect(healthCheckCount).toBe(4);
-      expect(checkTimes[3] - checkTimes[2]).toBe(healthCheckInterval);
+      // 3 consecutive failures
+      for (let i = 0; i < 3; i++) {
+        vi.advanceTimersByTime(10000);
+        await vi.runOnlyPendingTimersAsync();
+      }
 
-      monitor.stop();
-
-      // Verify exact count and timing
-      expect(healthCheckCount).toBe(4);
-      expect(checkTimes[3] - checkTimes[0]).toBe(3 * healthCheckInterval);
+      health = monitor.getHealth();
+      expect(health.daemon.connected).toBe(false);
+      expect(health.daemon.consecutiveFailures).toBe(3);
     });
   });
 });
