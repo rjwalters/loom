@@ -14,21 +14,21 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 2. 🔍 **The Critic** questions → identifies bloat and simplification opportunities (`loom:critic-suggestion`)
 3. 📚 **The Curator** refines → enhances and marks issues ready (`loom:ready`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
-5. 🔧 **The Fixer** heals → addresses review feedback and keeps PRs merge-ready (no labels managed)
-6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:approved`)
+5. 🔧 **The Fixer** heals → addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
+6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:pr`)
 
 *Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
 
 **Color-coded workflow:**
 - 🔵 **Blue** = Human action needed
   - Issues: `loom:proposal` (Architect suggestion awaiting approval)
-  - PRs: `loom:approved` (Approved PR ready to merge)
+  - PRs: `loom:pr` (Approved PR ready to merge)
 - 🟢 **Green** = Loom bot action needed
   - Issues: `loom:ready` (Issue ready for Worker)
   - PRs: `loom:review-requested` (PR ready for Reviewer)
 - 🟡 **Amber** = Work in progress
   - Issues: `loom:in-progress` (Worker implementing)
-  - PRs: `loom:reviewing` (Reviewer reviewing)
+  - PRs: `loom:changes-requested` (Fixer addressing review feedback)
 - 🔴 **Red** = Blocked or urgent
   - `loom:blocked` (Blocked, needs help)
   - `loom:urgent` (High priority)
@@ -385,25 +385,24 @@ If Worker discovers a dependency during implementation:
 - `loom:review-requested` - PRs ready for review (green badges)
 
 **Creates**:
-- `loom:reviewing` - Claims PR for review (amber)
-- `loom:approved` - Approved PRs ready for human to merge (blue)
+- `loom:changes-requested` - PR needs fixes from Fixer (amber)
+- `loom:pr` - Approved PRs ready for human to merge (blue)
 
 **Interval**: 5 minutes (recommended autonomous)
 
 **Workflow**:
 ```
 1. Find loom:review-requested PRs (green badges)
-2. Claim by removing loom:review-requested, adding loom:reviewing (amber)
-3. Check out branch, run tests, review code
-4. If changes needed: gh pr review --request-changes, keep loom:reviewing
-5. If approved: gh pr review --approve, remove loom:reviewing, add loom:approved (blue)
+2. Check out branch, run tests, review code
+3. If changes needed: gh pr review --request-changes, change label to loom:changes-requested (amber)
+4. If approved: gh pr review --approve, change label to loom:pr (blue)
 ```
 
 ### 6. Fixer Bot
 **Role**: PR health specialist, addresses review feedback and resolves conflicts
 
 **Watches for**:
-- PRs with changes requested: `gh pr list --search "review:changes-requested"`
+- `loom:changes-requested` - PRs with changes requested by Reviewer (amber badges)
 - PRs with merge conflicts: `gh pr list --search "conflicts:>0"`
 
 **Creates**:
@@ -414,7 +413,7 @@ If Worker discovers a dependency during implementation:
 **Workflow**:
 ```
 1. Find PRs needing fixes:
-   - gh pr list --search "review:changes-requested" (review feedback)
+   - gh pr list --label="loom:changes-requested" (review feedback)
    - gh pr list --search "conflicts:>0" (merge conflicts)
 2. Check out PR branch: gh pr checkout <number>
 3. Read reviewer comments and understand feedback
@@ -422,7 +421,7 @@ If Worker discovers a dependency during implementation:
 5. Run pnpm check:ci to ensure all checks pass
 6. Commit and push fixes
 7. Signal ready for re-review:
-   - Remove loom:reviewing
+   - Remove loom:changes-requested (amber badge)
    - Add loom:review-requested (green badge)
 8. Comment on PR to notify reviewer
 ```
@@ -430,7 +429,7 @@ If Worker discovers a dependency during implementation:
 **Relationship with Reviewer**:
 - Reviewer manages initial review workflow and approval
 - Fixer addresses technical issues and signals completion
-- Fixer can transition `loom:reviewing` → `loom:review-requested` after fixes (completing the cycle)
+- Fixer transitions `loom:changes-requested` → `loom:review-requested` after fixes (completing the cycle)
 
 ### 7. Critic Bot
 **Role**: Code simplification specialist, identifies bloat and suggests removals
@@ -534,19 +533,17 @@ No automation. Used for manual git operations, system commands, etc.
 ┌─────────────────────────────────────────────────────────────┐
 │ 5. REVIEWER REVIEWS PR                                      │
 │    Finds loom:review-requested PR #50 (green badge)         │
-│    Updates: removes loom:review-requested, adds loom:reviewing│
-│    (Amber badge - reviewing)                                │
 │    Checks out branch, runs tests                            │
 │    Reviews code, provides feedback                          │
-│    Approves: gh pr review --approve                         │
-│    Removes loom:reviewing, adds loom:approved               │
+│    If approved: gh pr review --approve                      │
+│    Updates: removes loom:review-requested, adds loom:pr     │
 │    (Blue badge - ready for user to merge)                   │
 └─────────────────────┬───────────────────────────────────────┘
                       │
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ 6. USER MERGES PR                                           │
-│    Reviews loom:approved PR (blue badge)                    │
+│    Reviews loom:pr PR (blue badge)                          │
 │    Merges to main                                           │
 │    Issue #42 automatically closes                           │
 └─────────────────────────────────────────────────────────────┘
@@ -569,9 +566,9 @@ No automation. Used for manual git operations, system commands, etc.
 
 | Label | Color | Created By | Meaning |
 |-------|-------|-----------|---------|
-| `loom:review-requested` | 🟢 Green | Worker | PR ready for Reviewer |
-| `loom:reviewing` | 🟡 Amber | Reviewer | Reviewer actively reviewing |
-| `loom:approved` | 🔵 Blue | Reviewer | Approved PR ready for human to merge |
+| `loom:review-requested` | 🟢 Green | Worker/Fixer | PR ready for Reviewer |
+| `loom:changes-requested` | 🟡 Amber | Reviewer | PR needs fixes from Fixer |
+| `loom:pr` | 🔵 Blue | Reviewer | Approved PR ready for human to merge |
 
 **Key insights**:
 - **Blue badges** = Human action needed
@@ -606,7 +603,7 @@ gh issue edit <number> --remove-label "loom:proposal"
 gh issue close <number> --comment "Not needed because..."
 
 # Find PRs ready to merge (blue badges)
-gh pr list --label="loom:approved" --state=open
+gh pr list --label="loom:pr" --state=open
 
 # Merge approved PR
 gh pr merge <number>
@@ -680,26 +677,23 @@ gh issue comment <number> --body "Blocked because..."
 # Find PRs ready to review (green badges)
 gh pr list --label="loom:review-requested" --state=open
 
-# Claim PR for review (green → amber)
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:reviewing"
-
 # Check out and test
 gh pr checkout <number>
 pnpm check:all
 
-# Approve PR
+# Approve PR (green → blue)
 gh pr review <number> --approve --body "LGTM!"
-gh pr edit <number> --remove-label "loom:reviewing" --add-label "loom:approved"
+gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
 
-# Request changes
+# Request changes (green → amber)
 gh pr review <number> --request-changes --body "Issues found..."
-# Keep loom:reviewing - Fixer will address
+gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
 
 ### Fixer
 ```bash
-# Find PRs with changes requested
-gh pr list --state=open --search "review:changes-requested"
+# Find PRs with changes requested (amber badges)
+gh pr list --label="loom:changes-requested" --state=open
 
 # Find PRs with merge conflicts
 gh pr list --state=open --search "is:open conflicts:>0"
@@ -722,7 +716,7 @@ git commit -m "Address review feedback and resolve conflicts"
 git push
 
 # Signal ready for re-review (amber → green)
-gh pr edit <number> --remove-label "loom:reviewing" --add-label "loom:review-requested"
+gh pr edit <number> --remove-label "loom:changes-requested" --add-label "loom:review-requested"
 gh pr comment <number> --body "✅ Feedback addressed and conflicts resolved. Ready for re-review!"
 ```
 
