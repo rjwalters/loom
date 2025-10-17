@@ -1872,6 +1872,40 @@ function setupEventListeners() {
         return;
       }
 
+      // Close button
+      const closeBtn = target.closest("#terminal-close-btn");
+      if (closeBtn) {
+        e.stopPropagation();
+        const id = closeBtn.getAttribute("data-terminal-id");
+        if (id) {
+          ask("Are you sure you want to close this terminal?", {
+            title: "Close Terminal",
+            type: "warning",
+          }).then(async (confirmed) => {
+            if (confirmed) {
+              console.log(`[terminal-close-btn] Closing terminal ${id}`);
+
+              // Stop autonomous mode if running
+              const { getAutonomousManager } = await import("./lib/autonomous-manager");
+              const autonomousManager = getAutonomousManager();
+              autonomousManager.stopAutonomous(id);
+
+              // Stop polling and destroy terminal
+              outputPoller.stopPolling(id);
+              terminalManager.destroyTerminal(id);
+              if (currentAttachedTerminalId === id) {
+                currentAttachedTerminalId = null;
+              }
+
+              // Remove from state
+              state.removeTerminal(id);
+              saveCurrentConfig();
+            }
+          });
+        }
+        return;
+      }
+
       // Recovery - Create new session
       const recoverNewBtn = target.closest("#recover-new-session-btn");
       if (recoverNewBtn) {
