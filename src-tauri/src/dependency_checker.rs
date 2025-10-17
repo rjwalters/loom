@@ -49,24 +49,37 @@ fn check_command(command: &str) -> bool {
 
     // macOS GUI apps don't inherit full shell PATH, so check common installation paths
     // This fixes the issue where tmux is installed via Homebrew but not found by `which`
-    let common_paths = vec![
+    let mut common_paths = vec![
         format!("/opt/homebrew/bin/{command}"), // Apple Silicon Homebrew
         format!("/usr/local/bin/{command}"),    // Intel Homebrew
         format!("/usr/bin/{command}"),          // System binaries
         format!("/bin/{command}"),              // Core utilities
     ];
 
+    if let Some(home) = dirs::home_dir() {
+        let mut push_home_path = |relative: &str| {
+            let mut path = home.clone();
+            path.push(relative);
+            path.push(command);
+            common_paths.push(path.to_string_lossy().to_string());
+        };
+
+        // Common locations for npm/pnpm/yarn global binaries
+        push_home_path(".npm-global/bin");
+        push_home_path(".yarn/bin");
+        push_home_path(".local/bin");
+        push_home_path("Library/pnpm");
+        push_home_path("Library/pnpm/bin");
+        push_home_path("Library/Application Support/fnm/node-versions/current/bin");
+    }
+
     for path in common_paths {
-        if std::path::Path::new(&path).exists() {
-            // Verify it's executable by trying to run --version or --help
-            if Command::new(&path)
-                .arg("--version")
-                .output()
-                .map(|output| output.status.success())
-                .unwrap_or(false)
-            {
-                return true;
-            }
+        let path_ref = std::path::Path::new(&path);
+        if path_ref.exists() && path_ref.is_file() {
+            // On macOS GUI apps the PATH is trimmed, so simply finding an executable file
+            // at a known location is sufficient to consider the dependency available.
+            // Attempting to run `--version` or similar flags is unreliable (e.g. tmux).
+            return true;
         }
     }
 

@@ -505,6 +505,9 @@ state.onChange(render);
 // Register all event listeners (with deduplication guard)
 if (!eventListenersRegistered) {
   console.log("[main] Registering event listeners (first time only)");
+
+  // Render immediately so users see the loading screen before async init
+  render();
   eventListenersRegistered = true;
 
   // Listen for CLI workspace argument from Rust backend
