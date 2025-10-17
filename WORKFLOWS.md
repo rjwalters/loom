@@ -14,17 +14,25 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 2. 🔍 **The Critic** questions → identifies bloat and simplification opportunities (`loom:critic-suggestion`)
 3. 📚 **The Curator** refines → enhances and marks issues ready (`loom:ready`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
-5. 🔧 **The Fixer** heals → addresses review feedback and keeps PRs merge-ready
-6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:approved`)
+5. 🔧 **The Fixer** heals → addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
+6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:pr`)
 
 *Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
 
 ### Color-coded Workflow
 
-- 🔵 **Blue** = Human action needed (`loom:proposal`, `loom:approved`)
-- 🟢 **Green** = Loom bot action needed (`loom:ready`, `loom:review-requested`)
-- 🟡 **Amber** = Work in progress (`loom:in-progress`, `loom:reviewing`)
-- 🔴 **Red** = Blocked or urgent (`loom:blocked`, `loom:urgent`)
+- 🔵 **Blue** = Human action needed
+  - Issues: `loom:proposal` (Architect suggestion awaiting approval)
+  - PRs: `loom:pr` (Approved PR ready to merge)
+- 🟢 **Green** = Loom bot action needed
+  - Issues: `loom:ready` (Issue ready for Worker)
+  - PRs: `loom:review-requested` (PR ready for Reviewer)
+- 🟡 **Amber** = Work in progress
+  - Issues: `loom:in-progress` (Worker implementing)
+  - PRs: `loom:changes-requested` (Fixer addressing review feedback)
+- 🔴 **Red** = Blocked or urgent
+  - `loom:blocked` (Blocked, needs help)
+  - `loom:urgent` (High priority)
 
 See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed label state machine documentation.
 
@@ -37,7 +45,7 @@ CURATOR enhances issue (🟢 loom:ready)
          ↓
 WORKER implements (🟡 loom:in-progress → 🟢 loom:review-requested PR)
          ↓
-REVIEWER reviews (🟡 loom:reviewing → 🔵 loom:approved)
+REVIEWER reviews (🟡 loom:changes-requested OR 🔵 loom:pr)
          ↓
 USER merges PR
 ```
@@ -93,8 +101,8 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 | **Curator** | 5 min | Yes | Approved issues | `loom:ready` (green) |
 | **Triage** | 15 min | Yes | `loom:ready` | `loom:urgent` (red) |
 | **Worker** | Manual | No | `loom:ready` | `loom:in-progress`, `loom:review-requested` |
-| **Reviewer** | 5 min | Yes | `loom:review-requested` | `loom:reviewing`, `loom:approved` |
-| **Fixer** | 5-10 min | Optional | PRs with changes/conflicts | `loom:review-requested` |
+| **Reviewer** | 5 min | Yes | `loom:review-requested` | `loom:changes-requested`, `loom:pr` |
+| **Fixer** | 5-10 min | Optional | `loom:changes-requested` | `loom:review-requested` |
 | **Issues** | Manual | No | N/A | Well-formatted issues |
 | **Default** | Manual | No | N/A | Plain shell |
 
@@ -110,9 +118,9 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 **Worker**: Implements `loom:ready` issues. Claims with `loom:in-progress`, creates PR with `loom:review-requested`. Manages worktrees.
 
-**Reviewer**: Reviews `loom:review-requested` PRs. Claims with `loom:reviewing`, approves with `loom:approved` (ready for user to merge).
+**Reviewer**: Reviews `loom:review-requested` PRs. Requests changes with `loom:changes-requested`, approves with `loom:pr` (ready for user to merge).
 
-**Fixer**: Addresses review feedback and resolves merge conflicts. Transitions `loom:reviewing` → `loom:review-requested` after fixes.
+**Fixer**: Addresses review feedback and resolves merge conflicts. Transitions `loom:changes-requested` → `loom:review-requested` after fixes.
 
 ## Essential Commands
 
@@ -139,15 +147,32 @@ gh pr create --label "loom:review-requested"
 ```bash
 # Find and claim PR
 gh pr list --label="loom:review-requested"
-gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:reviewing"
 
 # Review
 gh pr checkout 50
 pnpm check:all
 
-# Approve or request changes
+# Approve (green → blue)
 gh pr review 50 --approve
-gh pr edit 50 --remove-label "loom:reviewing" --add-label "loom:approved"
+gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:pr"
+
+# Request changes (green → amber)
+gh pr review 50 --request-changes
+gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+```
+
+### Fixer Workflow
+
+```bash
+# Find PRs needing fixes
+gh pr list --label="loom:changes-requested"
+
+# Fix and signal ready for re-review (amber → green)
+gh pr checkout 50
+# ... address feedback ...
+pnpm check:ci
+git push
+gh pr edit 50 --remove-label "loom:changes-requested" --add-label "loom:review-requested"
 ```
 
 ### Curator Workflow
@@ -170,7 +195,7 @@ gh issue edit 42 --remove-label "loom:proposal"  # Approve
 gh issue close 42 --comment "Not needed"          # Reject
 
 # Merge approved PRs
-gh pr list --label="loom:approved"
+gh pr list --label="loom:pr"
 gh pr merge 50
 ```
 
@@ -189,11 +214,11 @@ gh pr merge 50
 
 ### PR Labels
 
-| Label | Color | Meaning |
-|-------|-------|---------|
-| `loom:review-requested` | 🟢 Green | Ready for Reviewer |
-| `loom:reviewing` | 🟡 Amber | Reviewer actively reviewing |
-| `loom:approved` | 🔵 Blue | Approved, ready for human to merge |
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:review-requested` | 🟢 Green | Worker/Fixer | PR ready for Reviewer |
+| `loom:changes-requested` | 🟡 Amber | Reviewer | PR needs fixes from Fixer |
+| `loom:pr` | 🔵 Blue | Reviewer | Approved PR ready for human to merge |
 
 ## Configuration
 
@@ -216,7 +241,7 @@ Users can override these in the Terminal Settings modal.
 ### For Users
 1. Review suggestions promptly (blue labels need approval)
 2. Remove `loom:proposal` to approve, or close to reject
-3. Merge `loom:approved` PRs after final review
+3. Merge `loom:pr` PRs after final review
 
 ### For Agents
 1. **Stay in your lane**: Don't do other roles' work

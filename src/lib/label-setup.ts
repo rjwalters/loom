@@ -26,7 +26,7 @@ export interface LabelDefinition {
  *
  * Labels are separated into Issue labels and PR labels:
  * - Issue labels: loom:proposal, loom:critic-suggestion, loom:ready, loom:in-progress, loom:blocked, loom:urgent
- * - PR labels: loom:review-requested, loom:reviewing, loom:approved
+ * - PR labels: loom:review-requested, loom:changes-requested, loom:pr
  */
 export const LOOM_LABELS: LabelDefinition[] = [
   // Issue Labels
@@ -67,12 +67,12 @@ export const LOOM_LABELS: LabelDefinition[] = [
     color: "10B981", // Green - Loom bot action needed
   },
   {
-    name: "loom:reviewing",
-    description: "Reviewer actively reviewing this PR",
+    name: "loom:changes-requested",
+    description: "PR needs fixes from Fixer",
     color: "F59E0B", // Amber - work in progress
   },
   {
-    name: "loom:approved",
+    name: "loom:pr",
     description: "PR approved by Reviewer, ready for human to merge",
     color: "3B82F6", // Blue - human action needed
   },

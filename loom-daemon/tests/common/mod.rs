@@ -148,8 +148,26 @@ impl TestClient {
     }
 
     /// Helper: Create terminal
+    ///
+    /// For security tests, the first parameter (id) is used as the `config_id`.
+    /// For non-security tests that need unique IDs, use `create_terminal_with_unique_id` instead.
     #[allow(dead_code)]
     pub async fn create_terminal(
+        &mut self,
+        id: impl Into<String>,
+        working_dir: Option<String>,
+    ) -> Result<String> {
+        let id_str: String = id.into();
+        // Use the provided ID as both config_id and name for security testing
+        self.create_terminal_with_config(&id_str, &id_str, working_dir, None, None)
+            .await
+    }
+
+    /// Helper: Create terminal with auto-generated unique ID
+    ///
+    /// Use this for non-security tests that need valid, unique terminal IDs.
+    #[allow(dead_code)]
+    pub async fn create_terminal_with_unique_id(
         &mut self,
         name: impl Into<String>,
         working_dir: Option<String>,
