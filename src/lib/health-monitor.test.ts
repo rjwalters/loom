@@ -641,17 +641,28 @@ describe("HealthMonitor", () => {
     });
 
     it("detects terminal session loss and recovery", async () => {
-      monitor.start();
-
       // Initial state - session exists
-      vi.mocked(invoke).mockResolvedValueOnce({ has_session: true });
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_session_health") {
+          return Promise.resolve({ has_session: true });
+        }
+        return Promise.resolve(true); // daemon health
+      });
+
+      monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
       const health = monitor.getHealth();
       expect(health.terminals.get("terminal-1")?.hasSession).toBe(true);
 
       // Session lost
-      vi.mocked(invoke).mockResolvedValueOnce({ has_session: false });
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_session_health") {
+          return Promise.resolve({ has_session: false });
+        }
+        return Promise.resolve(true); // daemon health
+      });
+
       vi.advanceTimersByTime(30000);
       await vi.advanceTimersByTimeAsync(0);
 
@@ -662,7 +673,13 @@ describe("HealthMonitor", () => {
 
       // Session recovered
       mockTerminals[0].missingSession = true;
-      vi.mocked(invoke).mockResolvedValueOnce({ has_session: true });
+      vi.mocked(invoke).mockImplementation((cmd) => {
+        if (cmd === "check_session_health") {
+          return Promise.resolve({ has_session: true });
+        }
+        return Promise.resolve(true); // daemon health
+      });
+
       vi.advanceTimersByTime(30000);
       await vi.advanceTimersByTimeAsync(0);
 

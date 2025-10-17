@@ -143,12 +143,13 @@ export class HealthMonitor {
     let errorTerminals = 0;
 
     for (const terminal of terminals) {
-      const health = this.terminalHealth.get(terminal.id);
-      if (!health) continue;
-
+      // Count active terminals based on status alone (don't require health record)
       if (terminal.status !== TerminalStatus.Stopped) {
         activeTerminals++;
       }
+
+      const health = this.terminalHealth.get(terminal.id);
+      if (!health) continue;
 
       if (health.hasSession && !health.isStale && health.pollerErrors === 0) {
         healthyTerminals++;
