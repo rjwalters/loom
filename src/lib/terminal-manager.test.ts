@@ -166,19 +166,17 @@ describe("TerminalManager", () => {
     }) as unknown as typeof window.requestAnimationFrame;
     window.cancelAnimationFrame = vi.fn() as unknown as typeof window.cancelAnimationFrame;
 
-    boundingRectSpy = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockReturnValue({
-        width: 800,
-        height: 600,
-        top: 0,
-        left: 0,
-        right: 800,
-        bottom: 600,
-        x: 0,
-        y: 0,
-        toJSON: () => ({}),
-      } as DOMRect);
+    boundingRectSpy = vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      width: 800,
+      height: 600,
+      top: 0,
+      left: 0,
+      right: 800,
+      bottom: 600,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    } as DOMRect);
 
     // Setup console spies
     consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -781,7 +779,7 @@ describe("TerminalManager", () => {
           id: "terminal-1",
           cols: 120,
           rows: 36,
-        }),
+        })
       );
     });
 
@@ -804,7 +802,7 @@ describe("TerminalManager", () => {
           id: expect.any(String),
           cols: 150,
           rows: 45,
-        }),
+        })
       );
     });
   });

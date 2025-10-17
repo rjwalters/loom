@@ -3,6 +3,7 @@ import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
+import { invoke } from "@tauri-apps/api/tauri";
 
 export interface ManagedTerminal {
   terminal: Terminal;
@@ -110,15 +111,9 @@ export class TerminalManager {
 
     // Hook up input handler - send user input directly to daemon
     terminal.onData((data) => {
-      import("@tauri-apps/api/tauri")
-        .then(({ invoke }) => {
-          invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {
-            console.error(`[terminal-input] Failed to send input for ${terminalId}:`, e);
-          });
-        })
-        .catch((e) => {
-          console.error(`[terminal-input] Failed to import tauri API:`, e);
-        });
+      invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {
+        console.error(`[terminal-input] Failed to send input for ${terminalId}:`, e);
+      });
 
       // Clear needs-input state when user types
       import("./state")
@@ -159,8 +154,6 @@ export class TerminalManager {
       attached: false,
     };
     this.terminals.set(terminalId, managedTerminal);
-
-    this.setupResizeHandling(terminalId, managedTerminal);
 
     return managedTerminal;
   }
@@ -528,15 +521,9 @@ export class TerminalManager {
     managed.lastKnownCols = cols;
     managed.lastKnownRows = rows;
 
-    import("@tauri-apps/api/tauri")
-      .then(({ invoke }) =>
-        invoke("resize_terminal", { id: terminalId, cols, rows }).catch((error) => {
-          console.error(`[terminal-manager] Failed to resize tmux session for ${terminalId}:`, error);
-        })
-      )
-      .catch((error) => {
-        console.error(`[terminal-manager] Failed to load tauri API for resize:`, error);
-      });
+    invoke("resize_terminal", { id: terminalId, cols, rows }).catch((error) => {
+      console.error(`[terminal-manager] Failed to resize tmux session for ${terminalId}:`, error);
+    });
   }
 }
 

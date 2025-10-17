@@ -29,9 +29,27 @@
         "noDebugger": "warn",
         "noUnknownAtRules": "off",
         "useIterableCallbackReturn": "off"
+      },
+      "style": {
+        "noNonNullAssertion": "warn"
       }
     }
   },
+  "overrides": [
+    {
+      "includes": ["**/*.test.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          },
+          "style": {
+            "noNonNullAssertion": "off"
+          }
+        }
+      }
+    }
+  ],
   "javascript": {
     "formatter": {
       "quoteStyle": "double",
