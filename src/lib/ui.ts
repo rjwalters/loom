@@ -1,4 +1,5 @@
 import { type Terminal, TerminalStatus } from "./state";
+import { getTarotCardPath } from "./tarot-cards";
 import { getTheme, getThemeStyles, isDarkMode } from "./themes";
 
 /**
@@ -506,42 +507,53 @@ function createMiniTerminalHTML(
     }
   }
 
+  // Get tarot card path for this terminal's role
+  const tarotCardPath = getTarotCardPath(terminal.role);
+
   return `
     <div class="p-1 flex-shrink-0">
       <div class="relative">
         ${needsInputBadge}
         <div
-          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all relative overflow-hidden"
           style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
           draggable="true"
         >
-        <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
-          <div class="flex items-center gap-2 flex-1 min-w-0">
-            <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
-            <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
+          <!-- Regular terminal card content -->
+          <div class="terminal-card-content">
+            <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
+              <div class="flex items-center gap-2 flex-1 min-w-0">
+                <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
+                <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
+              </div>
+              <div class="flex items-center gap-0.5 flex-shrink-0">
+                ${createRunNowButtonHTML(terminal, "mini")}
+                <button
+                  class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
+                  data-terminal-id="${terminal.id}"
+                  data-tooltip="Close terminal"
+                  data-tooltip-position="top"
+                  title="Close terminal"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
+              <div class="flex items-center justify-between">
+                <span>${terminal.status}</span>
+                <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+              </div>
+              ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
+              ${createTimerDisplayHTML(terminal)}
+            </div>
           </div>
-          <div class="flex items-center gap-0.5 flex-shrink-0">
-            ${createRunNowButtonHTML(terminal, "mini")}
-            <button
-              class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
-              data-terminal-id="${terminal.id}"
-              data-tooltip="Close terminal"
-              data-tooltip-position="top"
-              title="Close terminal"
-            >
-              ×
-            </button>
+
+          <!-- Tarot card overlay (hidden by default, shown during drag) -->
+          <div class="tarot-card-overlay absolute inset-0 opacity-0 pointer-events-none flex items-center justify-center bg-gray-900 dark:bg-black rounded-lg">
+            <img src="${tarotCardPath}" alt="Tarot card" class="h-full w-full object-contain p-2" />
           </div>
-        </div>
-        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
-          <div class="flex items-center justify-between">
-            <span>${terminal.status}</span>
-            <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
-          </div>
-          ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
-          ${createTimerDisplayHTML(terminal)}
-        </div>
         </div>
       </div>
     </div>

@@ -38,6 +38,23 @@
   cursor: grabbing;
 }
 
+/* Tarot card reveal effect during drag */
+.terminal-card-content {
+  transition: opacity 200ms ease-in-out;
+}
+
+.terminal-card.dragging .terminal-card-content {
+  opacity: 0;
+}
+
+.tarot-card-overlay {
+  transition: opacity 200ms ease-in-out;
+}
+
+.terminal-card.dragging .tarot-card-overlay {
+  opacity: 1;
+}
+
 /* Modal animations */
 @keyframes fade-in {
   from {
