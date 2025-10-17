@@ -179,7 +179,22 @@ git log --diff-filter=A --name-only --pretty=format: | \
 
 ## Creating Removal Proposals
 
-When you identify bloat, create a GitHub issue with the `loom:critic-suggestion` label.
+When you identify bloat, you have two options:
+
+1. **Create a new issue** with `loom:critic-suggestion` label (for standalone removal proposals)
+2. **Comment on an existing issue** with a `<!-- CRITIC-SUGGESTION -->` marker (for related suggestions)
+
+### When to Create a New Issue vs Comment
+
+**Create New Issue:**
+- The bloat is unrelated to any existing open issue
+- The removal proposal is comprehensive and standalone
+- You want to track the removal as a separate unit of work
+
+**Comment on Existing Issue:**
+- An existing issue discusses related code/functionality
+- Your suggestion simplifies or removes part of what's being discussed
+- The removal would reduce the scope/complexity of the existing issue
 
 ### Issue Template
 
