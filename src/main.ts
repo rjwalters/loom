@@ -527,7 +527,7 @@ if (!eventListenersRegistered) {
   listen("close-terminal", async () => {
     const primary = state.getPrimary();
     if (primary) {
-      const confirmed = await ask("Are you sure you want to close this terminal?", {
+      const confirmed = await ask(`Are you sure you want to close "${primary.name}"?`, {
         title: "Close Terminal",
         type: "warning",
       });
@@ -1590,7 +1590,9 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = closeBtn.getAttribute("data-terminal-id");
         if (id) {
-          ask("Are you sure you want to close this terminal?", {
+          const terminal = state.getTerminal(id);
+          const terminalName = terminal ? terminal.name : "this terminal";
+          ask(`Are you sure you want to close "${terminalName}"?`, {
             title: "Close Terminal",
             type: "warning",
           }).then(async (confirmed) => {
@@ -1708,12 +1710,16 @@ function setupEventListeners() {
         const id = target.getAttribute("data-terminal-id");
 
         if (id) {
-          ask("Are you sure you want to close this terminal?", {
+          // Look up the terminal to get its name
+          const terminal = state.getTerminal(id);
+          const terminalName = terminal ? terminal.name : "this terminal";
+
+          ask(`Are you sure you want to close "${terminalName}"?`, {
             title: "Close Terminal",
             type: "warning",
           }).then(async (confirmed) => {
             if (confirmed) {
-              // Look up the terminal
+              // Look up the terminal again for the rest of the logic
               const terminal = state.getTerminal(id);
               if (!terminal) {
                 console.error(`Terminal with id ${id} not found`);
