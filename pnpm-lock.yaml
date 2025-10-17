@@ -23,6 +23,9 @@ importers:
       '@xterm/xterm':
         specifier: ^5.5.0
         version: 5.5.0
+      tauri-plugin-fs-watch-api:
+        specifier: github:tauri-apps/tauri-plugin-fs-watch#v1
+        version: https://codeload.github.com/tauri-apps/tauri-plugin-fs-watch/tar.gz/9c5d1703c22f069e3dcbc3ec14eced34a1054261
     devDependencies:
       '@biomejs/biome':
         specifier: ^2.2.6
@@ -1386,6 +1389,10 @@ packages:
     resolution: {integrity: sha512-nlGpxf+hv0v7GkWBK2V9spgactGOp0qvfWRxUMjqHyzrt3SgwE48DIv/FhqPHJYLHpgW1opq3nERbz5Anq7n1g==}
     engines: {node: '>=18'}
 
+  tauri-plugin-fs-watch-api@https://codeload.github.com/tauri-apps/tauri-plugin-fs-watch/tar.gz/9c5d1703c22f069e3dcbc3ec14eced34a1054261:
+    resolution: {tarball: https://codeload.github.com/tauri-apps/tauri-plugin-fs-watch/tar.gz/9c5d1703c22f069e3dcbc3ec14eced34a1054261}
+    version: 0.0.0
+
   tinybench@2.9.0:
     resolution: {integrity: sha512-0+DUvqWMValLmha6lr4kD8iAMK1HzV0/aKnCtWb9v9641TnP/MFb7Pc2bxoxQjTXAErryXVgUOfv2YqNllqGeg==}
 
@@ -2699,6 +2706,10 @@ snapshots:
       minipass: 7.1.2
       minizlib: 3.1.0
       yallist: 5.0.0
+
+  tauri-plugin-fs-watch-api@https://codeload.github.com/tauri-apps/tauri-plugin-fs-watch/tar.gz/9c5d1703c22f069e3dcbc3ec14eced34a1054261:
+    dependencies:
+      '@tauri-apps/api': 1.6.0
 
   tinybench@2.9.0: {}
 

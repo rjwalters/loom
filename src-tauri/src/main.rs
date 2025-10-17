@@ -12,7 +12,6 @@ mod daemon_client;
 mod daemon_manager;
 mod dependency_checker;
 mod logging;
-mod mcp_watcher;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
 
@@ -1500,6 +1499,7 @@ fn main() {
     let menu = build_menu();
 
     if let Err(e) = tauri::Builder::default()
+        .plugin(tauri_plugin_fs_watch::init())
         .setup(|app| {
             // Check if we're in development or production mode
             let is_production = !cfg!(debug_assertions);
@@ -1549,12 +1549,8 @@ fn main() {
             // Store daemon manager in app state for cleanup on quit
             app.manage(std::sync::Mutex::new(daemon_manager));
 
-            // Start MCP command file watcher
-            let window = app
-                .get_window("main")
-                .ok_or_else(|| "Failed to get main window".to_string())?;
-            mcp_watcher::start_mcp_watcher(window);
-            safe_eprintln!("[Loom] MCP command watcher started");
+            // MCP command file watcher now implemented in TypeScript using tauri-plugin-fs-watch
+            // See src/main.ts for filesystem event-based implementation
 
             Ok(())
         })

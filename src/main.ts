@@ -183,11 +183,44 @@ async function checkMcpCommand() {
   }
 }
 
-// Poll for MCP commands every 500ms
-window.setInterval(() => {
-  checkMcpCommand();
-}, 500);
-console.log("[main] MCP command watcher started");
+// Watch for MCP command file changes using filesystem events (replaces 500ms polling)
+// Benefits: Zero idle CPU usage, instant detection vs 500ms latency
+(async () => {
+  try {
+    const { watch } = await import("tauri-plugin-fs-watch-api");
+    const home = await homeDir();
+    const commandPath = `${home}/.loom/mcp-command.json`;
+
+    // Start watching for file changes
+    const stopWatching = await watch(
+      commandPath,
+      async (events) => {
+        // DebouncedEvent is an array of events with kind and path properties
+        // Check if any events occurred (file created, modified, or changed)
+        if (events.length > 0) {
+          const eventKinds = events.map((e) => e.kind).join(", ");
+          console.log(`[MCP Watcher] Detected file events: ${eventKinds}, checking command`);
+          await checkMcpCommand();
+        }
+      },
+      { recursive: false }
+    );
+
+    console.log("[main] MCP command filesystem watcher started (event-driven, no polling)");
+
+    // Store stop function for cleanup on app close (optional)
+    (window as Window & { stopMcpWatcher?: () => void }).stopMcpWatcher = stopWatching;
+  } catch (error) {
+    console.error("[main] Failed to start MCP filesystem watcher:", error);
+    console.warn("[main] Falling back to polling mode");
+
+    // Fallback to polling if filesystem watcher fails
+    window.setInterval(() => {
+      checkMcpCommand();
+    }, 500);
+    console.log("[main] MCP command watcher started (polling fallback)");
+  }
+})();
 
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
