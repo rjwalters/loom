@@ -19,6 +19,7 @@ import {
   handleRecoverNewSession,
 } from "./lib/recovery-handlers";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+import { handleRunNowClick, startRename } from "./lib/terminal-actions";
 // NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
 // are defined locally in this file, not imported from terminal-lifecycle
 import { getTerminalManager } from "./lib/terminal-manager";
@@ -1518,87 +1519,7 @@ async function handleWorkspacePathInput(path: string) {
   }
 }
 
-// Handle Run Now button click for interval mode terminals
-async function handleRunNowClick(terminalId: string) {
-  console.log(`[handleRunNowClick] Running interval prompt for terminal ${terminalId}`);
-
-  try {
-    const terminal = state.getTerminal(terminalId);
-    if (!terminal) {
-      console.error(`[handleRunNowClick] Terminal ${terminalId} not found`);
-      return;
-    }
-
-    // Import autonomous manager
-    const { getAutonomousManager } = await import("./lib/autonomous-manager");
-    const autonomousManager = getAutonomousManager();
-
-    // Execute the interval prompt and reset timer
-    await autonomousManager.runNow(terminal);
-    console.log(`[handleRunNowClick] Successfully executed interval prompt for ${terminalId}`);
-  } catch (error) {
-    console.error(`[handleRunNowClick] Failed to execute interval prompt:`, error);
-    alert(`Failed to run interval prompt: ${error}`);
-  }
-}
-
-// Helper function to start renaming a terminal
-function startRename(terminalId: string, nameElement: HTMLElement) {
-  const terminal = state.getTerminals().find((t) => t.id === terminalId);
-  if (!terminal) return;
-
-  const currentName = terminal.name;
-  const input = document.createElement("input");
-  input.type = "text";
-  input.value = currentName;
-
-  // Match the font size of the original element
-  const fontSize = nameElement.classList.contains("text-sm") ? "text-sm" : "text-xs";
-  input.className = `px-1 bg-white dark:bg-gray-900 border border-blue-500 rounded ${fontSize} font-medium w-full`;
-
-  // Replace the name element with input
-  const parent = nameElement.parentElement;
-  if (!parent) return;
-
-  parent.replaceChild(input, nameElement);
-
-  // Defer focus to the next tick to prevent the double-click event from interfering
-  // The double-click bubbles up and can trigger other handlers that might steal focus
-  setTimeout(() => {
-    input.focus();
-    input.select();
-  }, 0);
-
-  const commit = () => {
-    const newName = input.value.trim();
-    if (newName && newName !== currentName) {
-      state.renameTerminal(terminalId, newName);
-      saveCurrentConfig();
-    } else {
-      // Just re-render to restore original state
-      render();
-    }
-  };
-
-  const cancel = () => {
-    render();
-  };
-
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      commit();
-    } else if (e.key === "Escape") {
-      e.preventDefault();
-      cancel();
-    }
-  });
-
-  input.addEventListener("blur", () => {
-    commit();
-  });
-}
-
+// Terminal action handlers are now in src/lib/terminal-actions.ts
 // Recovery handlers are now in src/lib/recovery-handlers.ts
 
 // Set up event listeners (only once, since parent elements are static)
@@ -1648,7 +1569,7 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = runNowBtn.getAttribute("data-terminal-id");
         if (id) {
-          handleRunNowClick(id);
+          handleRunNowClick(id, { state });
         }
         return;
       }
@@ -1748,7 +1669,7 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = target.getAttribute("data-terminal-id");
         if (id) {
-          startRename(id, target);
+          startRename(id, target, { state, saveCurrentConfig, render });
         }
       }
     });
@@ -1766,7 +1687,7 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = runNowBtn.getAttribute("data-terminal-id");
         if (id) {
-          handleRunNowClick(id);
+          handleRunNowClick(id, { state });
         }
         return;
       }
@@ -1867,7 +1788,7 @@ function setupEventListeners() {
         const card = target.closest("[data-terminal-id]");
         const id = card?.getAttribute("data-terminal-id");
         if (id) {
-          startRename(id, target);
+          startRename(id, target, { state, saveCurrentConfig, render });
         }
       }
     });
