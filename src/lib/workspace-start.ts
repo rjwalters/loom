@@ -176,6 +176,11 @@ export async function startWorkspaceEngine(
         terminals: terminalStates2,
       });
 
+      // Brief delay to allow tmux sessions to stabilize after agent launch
+      // Without this delay, health checks may run before tmux sessions are fully query-able
+      console.log(`[${logPrefix}] Waiting for tmux sessions to stabilize (500ms)...`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
       // Trigger immediate health check to verify terminal sessions exist
       // This prevents false "missing session" errors on startup
       console.log(`[${logPrefix}] Running immediate health check...`);
