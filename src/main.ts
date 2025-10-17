@@ -1532,6 +1532,13 @@ function setupEventListeners() {
     toggleTheme();
   });
 
+  // Close workspace button
+  document.getElementById("close-workspace-btn")?.addEventListener("click", async () => {
+    if (state.hasWorkspace()) {
+      await invoke("emit_event", { event: "close-workspace" });
+    }
+  });
+
   // Primary terminal - double-click to rename, click for settings/clear
   const primaryTerminal = document.getElementById("primary-terminal");
   if (primaryTerminal) {
