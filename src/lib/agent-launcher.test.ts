@@ -144,7 +144,7 @@ describe("agent-launcher", () => {
     const worktreePath = "/path/to/workspace/.loom/worktrees/terminal-1";
 
     beforeEach(() => {
-      vi.mocked(invoke).mockImplementation((cmd, args) => {
+      vi.mocked(invoke).mockImplementation((cmd, _args) => {
         if (cmd === "read_role_file") {
           return Promise.resolve(mockRoleContent);
         }
@@ -404,7 +404,7 @@ describe("agent-launcher", () => {
     const worktreePath = "/path/to/workspace/.loom/worktrees/terminal-1";
 
     beforeEach(() => {
-      vi.mocked(invoke).mockImplementation((cmd, args) => {
+      vi.mocked(invoke).mockImplementation((cmd, _args) => {
         if (cmd === "read_role_file") {
           return Promise.resolve(mockRoleContent);
         }
