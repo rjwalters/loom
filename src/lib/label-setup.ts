@@ -16,7 +16,7 @@ export interface LabelDefinition {
 /**
  * Standard Loom workflow labels
  *
- * See scripts/LABEL_WORKFLOW.md for complete documentation.
+ * See WORKFLOWS.md for complete documentation.
  *
  * Color semantics:
  * - Blue: Human action needed
@@ -25,7 +25,7 @@ export interface LabelDefinition {
  * - Red: Blocked/needs help
  *
  * Labels are separated into Issue labels and PR labels:
- * - Issue labels: loom:proposal, loom:ready, loom:in-progress, loom:blocked, loom:urgent
+ * - Issue labels: loom:proposal, loom:critic-suggestion, loom:ready, loom:in-progress, loom:blocked, loom:urgent
  * - PR labels: loom:review-requested, loom:reviewing, loom:approved
  */
 export const LOOM_LABELS: LabelDefinition[] = [
@@ -33,6 +33,11 @@ export const LOOM_LABELS: LabelDefinition[] = [
   {
     name: "loom:proposal",
     description: "Architect suggestion awaiting user approval",
+    color: "3B82F6", // Blue - human action needed
+  },
+  {
+    name: "loom:critic-suggestion",
+    description: "Critic removal/simplification proposal awaiting user approval",
     color: "3B82F6", // Blue - human action needed
   },
   {

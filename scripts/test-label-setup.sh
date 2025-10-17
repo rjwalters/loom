@@ -28,10 +28,20 @@ fi
 echo "✅ Prerequisites check passed"
 echo
 
-# Test labels (from scripts/LABEL_WORKFLOW.md)
-declare -a LABEL_NAMES=("loom:issue" "loom:ready" "loom:in-progress" "loom:pr" "loom:blocked")
-declare -a LABEL_DESCS=("New issue awaiting user triage/approval" "Issue ready for Worker OR PR ready for Reviewer" "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback" "PR approved by Reviewer, ready for human to merge" "Implementation blocked, needs help or clarification")
-declare -a LABEL_COLORS=("3B82F6" "10B981" "F59E0B" "3B82F6" "EF4444")
+# Test labels (from src/lib/label-setup.ts LOOM_LABELS)
+declare -a LABEL_NAMES=("loom:proposal" "loom:critic-suggestion" "loom:ready" "loom:in-progress" "loom:blocked" "loom:urgent" "loom:review-requested" "loom:reviewing" "loom:approved")
+declare -a LABEL_DESCS=(
+  "Architect suggestion awaiting user approval"
+  "Critic removal/simplification proposal awaiting user approval"
+  "Issue ready for Worker to claim and implement"
+  "Worker actively implementing this issue"
+  "Implementation blocked, needs help or clarification"
+  "High priority issue requiring immediate attention"
+  "PR ready for Reviewer to review"
+  "Reviewer actively reviewing this PR"
+  "PR approved by Reviewer, ready for human to merge"
+)
+declare -a LABEL_COLORS=("3B82F6" "3B82F6" "10B981" "F59E0B" "EF4444" "DC2626" "10B981" "F59E0B" "3B82F6")
 
 echo "=== Checking Existing Labels ==="
 for i in "${!LABEL_NAMES[@]}"; do
@@ -68,5 +78,7 @@ echo
 
 echo "✅ Test script completed successfully"
 echo
-echo "To create/update labels, run from Loom UI or use:"
-echo "  gh label create <name> --description <desc> --color <color> --force"
+echo "To create/update labels:"
+echo "  1. From Loom UI: Use the label setup utility (when implemented)"
+echo "  2. Manually: gh label create <name> --description <desc> --color <color> --force"
+echo "  3. See WORKFLOWS.md for complete label workflow documentation"

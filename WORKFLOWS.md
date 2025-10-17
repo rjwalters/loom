@@ -14,7 +14,7 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 2. 🔍 **The Critic** questions → identifies bloat and simplification opportunities (`loom:critic-suggestion`)
 3. 📚 **The Curator** refines → enhances and marks issues ready (`loom:ready`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
-5. 🔧 **The Fixer** heals → addresses urgent bugs and breakages (`loom:urgent`)
+5. 🔧 **The Fixer** heals → addresses review feedback and keeps PRs merge-ready (no labels managed)
 6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:approved`)
 
 *Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
@@ -399,7 +399,40 @@ If Worker discovers a dependency during implementation:
 5. If approved: gh pr review --approve, remove loom:reviewing, add loom:approved (blue)
 ```
 
-### 6. Critic Bot
+### 6. Fixer Bot
+**Role**: PR health specialist, addresses review feedback and resolves conflicts
+
+**Watches for**:
+- PRs with changes requested: `gh pr list --search "review:changes-requested"`
+- PRs with merge conflicts: `gh pr list --search "conflicts:>0"`
+
+**Creates**:
+- `loom:review-requested` - After addressing feedback, signals PR is ready for re-review (green)
+
+**Interval**: 5-10 minutes (recommended autonomous or manual)
+
+**Workflow**:
+```
+1. Find PRs needing fixes:
+   - gh pr list --search "review:changes-requested" (review feedback)
+   - gh pr list --search "conflicts:>0" (merge conflicts)
+2. Check out PR branch: gh pr checkout <number>
+3. Read reviewer comments and understand feedback
+4. Address the requested changes and/or resolve conflicts
+5. Run pnpm check:ci to ensure all checks pass
+6. Commit and push fixes
+7. Signal ready for re-review:
+   - Remove loom:reviewing
+   - Add loom:review-requested (green badge)
+8. Comment on PR to notify reviewer
+```
+
+**Relationship with Reviewer**:
+- Reviewer manages initial review workflow and approval
+- Fixer addresses technical issues and signals completion
+- Fixer can transition `loom:reviewing` → `loom:review-requested` after fixes (completing the cycle)
+
+### 7. Critic Bot
 **Role**: Code simplification specialist, identifies bloat and suggests removals
 
 **Watches for**: N/A (proactively scans codebase and reviews open issues)
@@ -660,7 +693,37 @@ gh pr edit <number> --remove-label "loom:reviewing" --add-label "loom:approved"
 
 # Request changes
 gh pr review <number> --request-changes --body "Issues found..."
-# Keep loom:reviewing - Worker will address
+# Keep loom:reviewing - Fixer will address
+```
+
+### Fixer
+```bash
+# Find PRs with changes requested
+gh pr list --state=open --search "review:changes-requested"
+
+# Find PRs with merge conflicts
+gh pr list --state=open --search "is:open conflicts:>0"
+
+# Check out PR branch
+gh pr checkout <number>
+
+# Read reviewer feedback
+gh pr view <number> --comments
+
+# Address issues, fix conflicts, etc.
+# ... make your changes ...
+
+# Verify everything works
+pnpm check:ci
+
+# Commit and push
+git add .
+git commit -m "Address review feedback and resolve conflicts"
+git push
+
+# Signal ready for re-review (amber → green)
+gh pr edit <number> --remove-label "loom:reviewing" --add-label "loom:review-requested"
+gh pr comment <number> --body "✅ Feedback addressed and conflicts resolved. Ready for re-review!"
 ```
 
 ## Configuration
