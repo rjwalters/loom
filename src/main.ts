@@ -18,17 +18,17 @@ import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/stat
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
-import { getTooltipManager } from "./lib/tooltip";
 import {
   renderHeader,
   renderLoadingState,
   renderMiniTerminals,
   renderPrimaryTerminal,
 } from "./lib/ui";
+import { attachWorkspaceEventListeners, setupTooltips } from "./lib/ui-event-handlers";
 import { clearWorkspaceError, expandTildePath, showWorkspaceError } from "./lib/workspace-utils";
 
-// NOTE: validateWorkspacePath, browseWorkspace, handleWorkspacePathInput,
-// and attachWorkspaceEventListeners are defined locally in this file
+// NOTE: validateWorkspacePath, browseWorkspace, and handleWorkspacePathInput
+// are defined locally in this file
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -259,7 +259,11 @@ function render() {
 
   // Re-attach workspace event listeners if they were just rendered
   if (!hasWorkspace) {
-    attachWorkspaceEventListeners();
+    attachWorkspaceEventListeners(
+      handleWorkspacePathInput,
+      browseWorkspace,
+      () => state.getWorkspace() || ""
+    );
   }
 
   // Set up tooltips for all elements with data-tooltip attributes
@@ -1736,84 +1740,6 @@ async function handleKillSession(sessionName: string) {
     console.error(`[handleKillSession] Failed to kill session:`, error);
     alert(`Failed to kill session: ${error}`);
   }
-}
-
-// Attach workspace event listeners (called dynamically when workspace selector is rendered)
-function attachWorkspaceEventListeners() {
-  console.log("[attachWorkspaceEventListeners] attaching listeners...");
-  // Workspace path input - validate on Enter or blur
-  const workspaceInput = document.getElementById("workspace-path") as HTMLInputElement;
-  console.log("[attachWorkspaceEventListeners] workspaceInput:", workspaceInput);
-  if (workspaceInput) {
-    workspaceInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        console.log("[workspaceInput keydown] Enter pressed, value:", workspaceInput.value);
-        e.preventDefault();
-        handleWorkspacePathInput(workspaceInput.value);
-        workspaceInput.blur();
-      }
-    });
-
-    workspaceInput.addEventListener("blur", () => {
-      console.log(
-        "[workspaceInput blur] value:",
-        workspaceInput.value,
-        "workspace:",
-        state.getWorkspace()
-      );
-      if (workspaceInput.value !== state.getWorkspace()) {
-        handleWorkspacePathInput(workspaceInput.value);
-      }
-    });
-  }
-
-  // Browse workspace button
-  const browseBtn = document.getElementById("browse-workspace");
-  console.log("[attachWorkspaceEventListeners] browseBtn:", browseBtn);
-  browseBtn?.addEventListener("click", () => {
-    console.log("[browseBtn click] clicked");
-    browseWorkspace();
-  });
-
-  // Create new project button
-  const createProjectBtn = document.getElementById("create-new-project-btn");
-  console.log("[attachWorkspaceEventListeners] createProjectBtn:", createProjectBtn);
-  createProjectBtn?.addEventListener("click", async () => {
-    console.log("[createProjectBtn click] clicked");
-    const { showCreateProjectModal } = await import("./lib/create-project-modal");
-    showCreateProjectModal(async (projectPath: string) => {
-      console.log(`[createProjectModal] Project created at: ${projectPath}`);
-      // Load the newly created project as the workspace
-      await handleWorkspacePathInput(projectPath);
-    });
-  });
-}
-
-// Set up tooltips for all elements with data-tooltip attributes
-function setupTooltips() {
-  const tooltipManager = getTooltipManager();
-
-  // Find all elements with data-tooltip attribute
-  const elements = document.querySelectorAll<HTMLElement>("[data-tooltip]");
-
-  elements.forEach((element) => {
-    const text = element.getAttribute("data-tooltip");
-    const position = element.getAttribute("data-tooltip-position") as
-      | "top"
-      | "bottom"
-      | "left"
-      | "right"
-      | "auto"
-      | null;
-
-    if (text) {
-      tooltipManager.attach(element, {
-        text,
-        position: position || "auto",
-        delay: 500,
-      });
-    }
-  });
 }
 
 // Set up event listeners (only once, since parent elements are static)
