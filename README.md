@@ -1,5 +1,7 @@
-# Loom 🧵  
-**Multi-terminal orchestration for AI-powered development.**
+# Loom 🧵
+> *An orchestration of archetypal forces for AI-powered development*
+
+**Multi-terminal workspace where AI agents embody distinct roles—Worker, Curator, Architect, Reviewer, Critic, Fixer—weaving chaos into creation.**
 
 Loom turns **GitHub itself** into the ultimate *vibe coding interface*.  
 Each issue, label, and pull request becomes part of a living workflow orchestrated by AI workers that read, write, and review code — all through your existing GitHub repo.
@@ -273,6 +275,19 @@ cargo test --test integration_basic test_ping_pong -- --nocapture
 
 Loom aims to make **autonomous, self-improving development** natural —
 you define goals, and the system builds, reviews, and learns from itself.
+
+### 🌙 The Archetypal System
+
+Each terminal can embody one of six archetypal forces (see [Agent Archetypes](docs/philosophy/agent-archetypes.md)):
+
+- 🔮 **Worker** (The Magician) - Transforms ideas into reality
+- 📚 **Curator** (The High Priestess) - Refines chaos into clarity
+- 🏛️ **Architect** (The Emperor) - Envisions structure and design
+- ⚖️ **Reviewer** (Justice) - Maintains quality through discernment
+- 🔍 **Critic** (The Hermit) - Questions to find truth
+- 🔧 **Fixer** (The Hanged Man) - Heals what is broken
+
+*Like the Tarot's Major Arcana or Jung's archetypes, each role represents a universal pattern in software development. When working in harmony, they transform chaos into creation.*
 
 ---
 
