@@ -314,7 +314,9 @@ export function splitTerminals(terminals: Terminal[]): {
 
   const state: TerminalState[] = terminals.map((t) => ({
     id: t.id,
-    status: t.status,
+    // Don't persist error status - terminals should start as idle
+    // Health monitor will re-detect missing sessions if they actually don't exist
+    status: t.status === TerminalStatus.Error ? TerminalStatus.Idle : t.status,
     isPrimary: t.isPrimary,
     worktreePath: t.worktreePath,
     agentPid: t.agentPid,

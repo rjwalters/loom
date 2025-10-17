@@ -175,6 +175,14 @@ export async function startWorkspaceEngine(
         terminals: terminalStates2,
       });
 
+      // Trigger immediate health check to verify terminal sessions exist
+      // This prevents false "missing session" errors on startup
+      console.log(`[${logPrefix}] Running immediate health check...`);
+      const { getHealthMonitor } = await import("./health-monitor");
+      const healthMonitor = getHealthMonitor();
+      await healthMonitor.performHealthCheck();
+      console.log(`[${logPrefix}] Health check complete`);
+
       console.log(`[${logPrefix}] Workspace engine started successfully`);
     } else {
       // No agents in config - still set workspace as active

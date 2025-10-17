@@ -214,8 +214,9 @@ export class HealthMonitor {
 
   /**
    * Perform health check on all terminals
+   * Public to allow immediate health checks on workspace start
    */
-  private async performHealthCheck(): Promise<void> {
+  public async performHealthCheck(): Promise<void> {
     const state = getAppState();
     const terminals = state.getTerminals();
     const now = Date.now();
