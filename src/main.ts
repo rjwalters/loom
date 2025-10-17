@@ -1566,8 +1566,13 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
   if (!parent) return;
 
   parent.replaceChild(input, nameElement);
-  input.focus();
-  input.select();
+
+  // Defer focus to the next tick to prevent the double-click event from interfering
+  // The double-click bubbles up and can trigger other handlers that might steal focus
+  setTimeout(() => {
+    input.focus();
+    input.select();
+  }, 0);
 
   const commit = () => {
     const newName = input.value.trim();
