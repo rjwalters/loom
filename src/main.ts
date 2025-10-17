@@ -1547,6 +1547,30 @@ async function handleWorkspacePathInput(path: string) {
   }
 }
 
+// Handle Run Now button click for interval mode terminals
+async function handleRunNowClick(terminalId: string) {
+  console.log(`[handleRunNowClick] Running interval prompt for terminal ${terminalId}`);
+
+  try {
+    const terminal = state.getTerminal(terminalId);
+    if (!terminal) {
+      console.error(`[handleRunNowClick] Terminal ${terminalId} not found`);
+      return;
+    }
+
+    // Import autonomous manager
+    const { getAutonomousManager } = await import("./lib/autonomous-manager");
+    const autonomousManager = getAutonomousManager();
+
+    // Execute the interval prompt and reset timer
+    await autonomousManager.runNow(terminal);
+    console.log(`[handleRunNowClick] Successfully executed interval prompt for ${terminalId}`);
+  } catch (error) {
+    console.error(`[handleRunNowClick] Failed to execute interval prompt:`, error);
+    alert(`Failed to run interval prompt: ${error}`);
+  }
+}
+
 // Helper function to start renaming a terminal
 function startRename(terminalId: string, nameElement: HTMLElement) {
   const terminal = state.getTerminals().find((t) => t.id === terminalId);
@@ -1872,6 +1896,17 @@ function setupEventListeners() {
         return;
       }
 
+      // Run Now button (interval mode)
+      const runNowBtn = target.closest(".run-now-btn");
+      if (runNowBtn) {
+        e.stopPropagation();
+        const id = runNowBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRunNowClick(id);
+        }
+        return;
+      }
+
       // Recovery - Create new session
       const recoverNewBtn = target.closest("#recover-new-session-btn");
       if (recoverNewBtn) {
@@ -1937,6 +1972,17 @@ function setupEventListeners() {
   if (miniRow) {
     miniRow.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
+
+      // Handle Run Now button clicks (interval mode)
+      const runNowBtn = target.closest(".run-now-btn");
+      if (runNowBtn) {
+        e.stopPropagation();
+        const id = runNowBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRunNowClick(id);
+        }
+        return;
+      }
 
       // Handle close button clicks
       if (target.classList.contains("close-terminal-btn")) {
