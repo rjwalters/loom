@@ -241,10 +241,11 @@ export class HealthMonitor {
 
       try {
         // Check if tmux session exists
-        const result = await invoke<{ has_session: boolean }>("check_session_health", {
+        console.log(`[HealthMonitor] 🔍 Checking session health for terminal.id="${terminal.id}"`);
+        const hasSession = await invoke<boolean>("check_session_health", {
           id: terminal.id,
         });
-        const hasSession = result.has_session;
+        console.log(`[HealthMonitor] 📊 Result for ${terminal.id}: hasSession=${hasSession}`);
 
         // Get last activity time
         const lastActivity = this.terminalActivity.get(terminal.id) || null;
