@@ -180,7 +180,7 @@ The Critic serves as the loyal opposition, the skeptical eye that questions befo
 - "The path to mastery winds through failure"
 
 **In the System**:
-The Fixer dwells in the shadow realm of bugs and breakage, transforming failures into functioning systems. They respond to urgent issues, debug production problems, and restore stability when chaos threatens. In Loom, Fixers claim high-priority bugs and restore balance to disrupted systems.
+The Fixer dwells in the space between creation and approval, transforming feedback into refinement. They address review comments, resolve merge conflicts, and keep pull requests healthy and merge-ready. In Loom, Fixers respond when Reviewers request changes, healing what needs healing and completing the feedback cycle so work can flow toward integration.
 
 ---
 
