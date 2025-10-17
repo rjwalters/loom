@@ -505,6 +505,9 @@ state.onChange(render);
 // Register all event listeners (with deduplication guard)
 if (!eventListenersRegistered) {
   console.log("[main] Registering event listeners (first time only)");
+
+  // Render immediately so users see the loading screen before async init
+  render();
   eventListenersRegistered = true;
 
   // Listen for CLI workspace argument from Rust backend
@@ -1527,6 +1530,13 @@ function setupEventListeners() {
   // Theme toggle
   document.getElementById("theme-toggle")?.addEventListener("click", () => {
     toggleTheme();
+  });
+
+  // Close workspace button
+  document.getElementById("close-workspace-btn")?.addEventListener("click", async () => {
+    if (state.hasWorkspace()) {
+      await invoke("emit_event", { event: "close-workspace" });
+    }
   });
 
   // Primary terminal - double-click to rename, click for settings/clear
