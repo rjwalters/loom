@@ -9,7 +9,6 @@
  * - Monitor application state
  */
 
-import { spawn } from "node:child_process";
 import { access, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -44,52 +43,103 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Trigger a factory reset via Tauri IPC
+ * Write MCP command to control file for Loom to pick up with retry and exponential backoff
+ * This is a file-based IPC mechanism with acknowledgment
+ */
+async function writeMCPCommand(command: string): Promise<string> {
+  const { writeFile, mkdir, access, readFile, rm } = await import("node:fs/promises");
+  const loomDir = join(homedir(), ".loom");
+  const commandFile = join(loomDir, "mcp-command.json");
+  const ackFile = join(loomDir, "mcp-ack.json");
+
+  // Ensure .loom directory exists
+  try {
+    await mkdir(loomDir, { recursive: true });
+  } catch (_error) {
+    // Directory might already exist, that's fine
+  }
+
+  // Clean up old acknowledgment file before writing new command
+  try {
+    await rm(ackFile);
+  } catch (_error) {
+    // Ack file might not exist, that's fine
+  }
+
+  // Write command with timestamp
+  const commandData = {
+    command,
+    timestamp: new Date().toISOString(),
+  };
+
+  await writeFile(commandFile, JSON.stringify(commandData, null, 2));
+
+  // Retry with exponential backoff to wait for acknowledgment
+  const maxRetries = 8; // Max 8 retries
+  const baseDelay = 100; // Start with 100ms
+  const maxDelay = 5000; // Cap at 5 seconds
+  let totalWaitTime = 0;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Calculate exponential backoff delay: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms, 5000ms
+    const delay = Math.min(baseDelay * 2 ** attempt, maxDelay);
+    totalWaitTime += delay;
+
+    // Wait before checking for acknowledgment
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    // Check if acknowledgment file exists
+    try {
+      await access(ackFile);
+
+      // Read acknowledgment data
+      const ackContent = await readFile(ackFile, "utf-8");
+      const ackData = JSON.parse(ackContent);
+
+      // Verify the ack is for our command
+      if (ackData.command === command && ackData.timestamp === commandData.timestamp) {
+        // Clean up acknowledgment file
+        try {
+          await rm(ackFile);
+        } catch (_error) {
+          // Ignore cleanup errors
+        }
+
+        if (ackData.success) {
+          return `MCP command '${command}' processed successfully (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        } else {
+          return `MCP command '${command}' acknowledged but execution failed (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        }
+      }
+    } catch (_error) {
+      // Ack file doesn't exist yet or couldn't be read, continue retrying
+    }
+  }
+
+  // Max retries exceeded - give up but don't error
+  return `MCP command '${command}' written but no acknowledgment received after ${maxRetries} retries (${totalWaitTime}ms total). The command may still be processing.`;
+}
+
+/**
+ * Trigger workspace start with existing config (shows confirmation dialog)
+ */
+async function triggerStart(): Promise<string> {
+  return await writeMCPCommand("trigger_start");
+}
+
+/**
+ * Trigger force start with existing config (no confirmation dialog)
+ */
+async function triggerForceStart(): Promise<string> {
+  return await writeMCPCommand("trigger_force_start");
+}
+
+/**
+ * Trigger factory reset - overwrites config with defaults (shows confirmation dialog)
+ * Note: Factory reset does NOT auto-start. User must run "Start" after reset.
  */
 async function triggerFactoryReset(): Promise<string> {
-  return new Promise((resolve, reject) => {
-    // Use osascript to simulate menu click in Loom app
-    const script = `
-      tell application "System Events"
-        tell process "Loom"
-          set frontmost to true
-          delay 0.2
-          click menu item "Factory Reset (Testing)" of menu "Workspace" of menu bar 1
-        end tell
-      end tell
-    `;
-
-    const osascript = spawn("osascript", ["-e", script]);
-
-    let _stdout = "";
-    let stderr = "";
-
-    osascript.stdout.on("data", (data) => {
-      _stdout += data.toString();
-    });
-
-    osascript.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    osascript.on("close", (code) => {
-      if (code === 0) {
-        resolve("Factory reset triggered successfully via menu click");
-      } else {
-        reject(
-          new Error(
-            `Failed to trigger factory reset (exit code ${code}): ${stderr || "No error message"}`
-          )
-        );
-      }
-    });
-
-    // Timeout after 5 seconds
-    setTimeout(() => {
-      osascript.kill();
-      reject(new Error("Factory reset trigger timed out after 5 seconds"));
-    }, 5000);
-  });
+  return await writeMCPCommand("trigger_factory_reset");
 }
 
 /**
@@ -130,6 +180,87 @@ async function readConfigFile(): Promise<string> {
   }
 }
 
+/**
+ * Get app heartbeat - check if app is running and logging
+ */
+async function getHeartbeat(): Promise<string> {
+  try {
+    await access(CONSOLE_LOG_PATH);
+    const content = await readFile(CONSOLE_LOG_PATH, "utf-8");
+    const lines = content.split("\n").filter(Boolean);
+
+    if (lines.length === 0) {
+      return JSON.stringify(
+        {
+          status: "unknown",
+          message: "Console log is empty - app may not have started yet",
+          lastLogTime: null,
+          logCount: 0,
+        },
+        null,
+        2
+      );
+    }
+
+    // Get last log entry
+    const lastLine = lines[lines.length - 1];
+    const timestampMatch = lastLine.match(/\[([^\]]+)\]/);
+    const lastLogTime = timestampMatch ? timestampMatch[1] : null;
+
+    // Calculate time since last log
+    let timeSinceLastLog = "unknown";
+    let status = "unknown";
+    if (lastLogTime) {
+      const lastLogDate = new Date(lastLogTime);
+      const now = new Date();
+      const diffMs = now.getTime() - lastLogDate.getTime();
+      const diffSeconds = Math.floor(diffMs / 1000);
+
+      if (diffSeconds < 10) {
+        status = "healthy";
+        timeSinceLastLog = `${diffSeconds}s ago`;
+      } else if (diffSeconds < 60) {
+        status = "active";
+        timeSinceLastLog = `${diffSeconds}s ago`;
+      } else if (diffSeconds < 300) {
+        status = "idle";
+        const diffMinutes = Math.floor(diffSeconds / 60);
+        timeSinceLastLog = `${diffMinutes}m ago`;
+      } else {
+        status = "stale";
+        const diffMinutes = Math.floor(diffSeconds / 60);
+        timeSinceLastLog = `${diffMinutes}m ago`;
+      }
+    }
+
+    return JSON.stringify(
+      {
+        status,
+        message: `Last log entry was ${timeSinceLastLog}`,
+        lastLogTime,
+        logCount: lines.length,
+        recentLogs: lines.slice(-5),
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return JSON.stringify(
+        {
+          status: "not_running",
+          message: "Console log file not found - app is not running or console logging is disabled",
+          lastLogTime: null,
+          logCount: 0,
+        },
+        null,
+        2
+      );
+    }
+    throw error;
+  }
+}
+
 // Create server instance
 const server = new Server(
   {
@@ -163,9 +294,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "trigger_start",
+        description:
+          "Start the Loom engine using EXISTING workspace config (.loom/config.json). Shows confirmation dialog before creating terminals and launching agents. Does NOT reset or overwrite config. Use this to restart terminals with current configuration (e.g., after app restart or crash). Requires workspace to be selected.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "trigger_force_start",
+        description:
+          "Start the Loom engine using existing config WITHOUT confirmation dialog. Same as trigger_start but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to start. Does NOT reset config. Requires workspace to be selected.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
         name: "trigger_factory_reset",
         description:
-          "Trigger a factory reset of the current workspace using macOS accessibility to click the menu item. This resets the workspace to defaults with 6 terminals and launches all agents. Requires the Loom app to be running.",
+          "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. Use this to reset configuration to clean state for testing.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -189,6 +338,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {},
         },
       },
+      {
+        name: "get_heartbeat",
+        description:
+          "Get app heartbeat status - checks if Loom is running and actively logging. Returns status (healthy/active/idle/stale/not_running), last log time, and recent log entries",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
     ],
   };
 });
@@ -207,6 +365,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: log,
+            },
+          ],
+        };
+      }
+
+      case "trigger_start": {
+        const result = await triggerStart();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "trigger_force_start": {
+        const result = await triggerForceStart();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
             },
           ],
         };
@@ -243,6 +425,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: config,
+            },
+          ],
+        };
+      }
+
+      case "get_heartbeat": {
+        const heartbeat = await getHeartbeat();
+        return {
+          content: [
+            {
+              type: "text",
+              text: heartbeat,
             },
           ],
         };

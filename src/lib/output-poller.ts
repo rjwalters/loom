@@ -13,6 +13,8 @@ interface PollerState {
   intervalId: number | null;
   consecutiveErrors: number;
   lastErrorTime: number | null;
+  lastOutputTime: number | null; // Timestamp of last output received
+  currentPollInterval: number; // Current polling interval (adaptive)
 }
 
 /**
@@ -25,9 +27,12 @@ interface PollerState {
  */
 export class OutputPoller {
   private pollers: Map<string, PollerState> = new Map();
-  private pollInterval: number = 50; // Poll every 50ms for responsive feel
+  private pollInterval: number = 50; // Poll every 50ms for responsive feel (active terminals)
+  private idlePollInterval: number = 10000; // Poll every 10s for idle terminals
+  private activityTimeout: number = 30000; // Consider idle after 30s of no output
   private maxConsecutiveErrors: number = 5; // Stop polling after this many consecutive errors
   private errorCallback?: (terminalId: string, error: string) => void;
+  private activityCallback?: (terminalId: string) => void; // Called when output is received
 
   /**
    * Start polling for a terminal's output
@@ -46,18 +51,14 @@ export class OutputPoller {
       intervalId: null,
       consecutiveErrors: 0,
       lastErrorTime: null,
+      lastOutputTime: null,
+      currentPollInterval: this.pollInterval, // Start with active polling
     };
 
     // Initial fetch to get current state
     this.pollOnce(state).then(() => {
-      // Start interval polling
-      const intervalId = window.setInterval(() => {
-        if (state.polling) {
-          this.pollOnce(state);
-        }
-      }, this.pollInterval);
-
-      state.intervalId = intervalId;
+      // Start interval polling with adaptive frequency
+      this.scheduleNextPoll(state);
     });
 
     this.pollers.set(terminalId, state);
@@ -104,13 +105,7 @@ export class OutputPoller {
 
     // Do immediate poll then start interval
     this.pollOnce(state).then(() => {
-      const intervalId = window.setInterval(() => {
-        if (state.polling) {
-          this.pollOnce(state);
-        }
-      }, this.pollInterval);
-
-      state.intervalId = intervalId;
+      this.scheduleNextPoll(state);
     });
   }
 
@@ -185,6 +180,14 @@ export class OutputPoller {
           console.log(`[poller] Incremental update - writing to terminal ${state.terminalId}`);
           terminalManager.writeToTerminal(state.terminalId, text);
         }
+
+        // Record activity
+        state.lastOutputTime = Date.now();
+
+        // Notify activity callback if registered
+        if (this.activityCallback) {
+          this.activityCallback(state.terminalId);
+        }
       }
       // Silently ignore empty polls - this is normal and expected
 
@@ -194,6 +197,9 @@ export class OutputPoller {
       // Reset error counter on successful poll
       state.consecutiveErrors = 0;
       state.lastErrorTime = null;
+
+      // Adjust polling frequency based on activity
+      this.adjustPollingFrequency(state);
     } catch (error) {
       // Track consecutive errors
       state.consecutiveErrors++;
@@ -272,6 +278,62 @@ export class OutputPoller {
    */
   getPolledTerminals(): string[] {
     return Array.from(this.pollers.keys());
+  }
+
+  /**
+   * Schedule the next poll for a terminal based on its current state
+   */
+  private scheduleNextPoll(state: PollerState): void {
+    if (!state.polling) {
+      return;
+    }
+
+    // Clear any existing timer
+    if (state.intervalId !== null) {
+      window.clearTimeout(state.intervalId);
+    }
+
+    // Schedule next poll with current interval
+    state.intervalId = window.setTimeout(() => {
+      if (state.polling) {
+        this.pollOnce(state).then(() => {
+          this.scheduleNextPoll(state);
+        });
+      }
+    }, state.currentPollInterval);
+  }
+
+  /**
+   * Adjust polling frequency based on terminal activity
+   */
+  private adjustPollingFrequency(state: PollerState): void {
+    const now = Date.now();
+    const timeSinceActivity = state.lastOutputTime ? now - state.lastOutputTime : Infinity;
+
+    // If terminal has been inactive for activityTimeout, slow down polling
+    if (timeSinceActivity > this.activityTimeout) {
+      if (state.currentPollInterval !== this.idlePollInterval) {
+        console.log(
+          `[poller] Terminal ${state.terminalId} idle for ${Math.round(timeSinceActivity / 1000)}s, reducing poll frequency to ${this.idlePollInterval}ms`
+        );
+        state.currentPollInterval = this.idlePollInterval;
+      }
+    } else {
+      // Terminal is active, use fast polling
+      if (state.currentPollInterval !== this.pollInterval) {
+        console.log(
+          `[poller] Terminal ${state.terminalId} active, increasing poll frequency to ${this.pollInterval}ms`
+        );
+        state.currentPollInterval = this.pollInterval;
+      }
+    }
+  }
+
+  /**
+   * Register a callback to be called when output is received (activity detected)
+   */
+  onActivity(callback: (terminalId: string) => void): void {
+    this.activityCallback = callback;
   }
 
   /**

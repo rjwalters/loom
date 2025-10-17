@@ -174,14 +174,63 @@ cd loom
 # Install dependencies
 pnpm install
 
-# Terminal 1: Start daemon with live monitoring
-pnpm run daemon:dev
-
-# Terminal 2: Start Tauri dev mode
-pnpm run tauri:dev
+# Start development environment (daemon + GUI)
+pnpm run app:dev
 ```
 
-**For detailed development workflow, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
+**For detailed development workflows, troubleshooting, and advanced usage, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
+
+### Additional Development Resources
+- [DEV_WORKFLOW.md](DEV_WORKFLOW.md) - Detailed development workflow with hot reload
+- [DEVELOPMENT.md](DEVELOPMENT.md) - Code quality, testing, and best practices
+- [WORKFLOWS.md](WORKFLOWS.md) - Agent coordination via GitHub labels
+- [scripts/README.md](scripts/README.md) - Daemon management scripts
+
+### CLI Usage
+
+Loom supports command-line arguments for headless automation and remote development workflows:
+
+```bash
+# Launch with a specific workspace
+./Loom.app/Contents/MacOS/Loom --workspace /path/to/your/repo
+
+# Short form
+./Loom.app/Contents/MacOS/Loom -w /path/to/your/repo
+```
+
+**Use Cases**:
+- Automated deployment: Launch Loom with a pre-configured workspace on server startup
+- CI/CD integration: Run Loom headlessly in containerized environments
+- Remote development: Start Loom via SSH with a specific repository path
+
+The app will validate the workspace path and automatically load the configuration from `.loom/config.json` if it exists.
+
+### MCP Servers for Testing and Automation
+
+Loom provides three Model Context Protocol (MCP) servers that enable AI agents like Claude Code to interact with the application programmatically:
+
+- **[mcp-loom-ui](docs/mcp/loom-ui.md)** - Interact with UI, console logs, and workspace state
+- **[mcp-loom-logs](docs/mcp/loom-logs.md)** - Access daemon, Tauri, and terminal logs
+- **[mcp-loom-terminals](docs/mcp/loom-terminals.md)** - Control terminals via daemon IPC
+
+**Use Cases**:
+- Testing factory reset and agent launches
+- Monitoring agent activity in real-time
+- Debugging terminal and IPC issues
+- Automating workspace operations
+
+**Quick Start**:
+```bash
+# Build MCP servers
+pnpm build
+
+# Configure in .mcp.json (already included)
+# Use from Claude Code:
+mcp__loom-ui__read_console_log({ lines: 100 })
+mcp__loom-terminals__list_terminals()
+```
+
+**Full documentation**: [docs/mcp/README.md](docs/mcp/README.md)
 
 **For architectural decisions, see [docs/adr/README.md](docs/adr/README.md).**
 
@@ -205,10 +254,10 @@ After launching Loom, you can configure each terminal with a specific role:
 cargo test --workspace
 
 # Run daemon integration tests
-npm run daemon:test
+pnpm run daemon:test
 
 # Run with verbose output (see logs)
-npm run daemon:test:verbose
+pnpm run daemon:test:verbose
 
 # Run specific test
 cargo test --test integration_basic test_ping_pong -- --nocapture

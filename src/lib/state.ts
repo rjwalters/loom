@@ -40,11 +40,15 @@ export interface Terminal {
   theme?: string; // Theme ID (e.g., "ocean", "forest") or "default"
   customTheme?: ColorTheme; // For custom colors
   // Agent-specific fields
-  worktreePath?: string; // Path to git worktree
+  worktreePath?: string; // Path to git worktree (automatically created at .loom/worktrees/{id})
   agentPid?: number; // Claude process ID
   agentStatus?: AgentStatus; // Agent state machine
   lastIntervalRun?: number; // Timestamp (ms)
   pendingInputRequests?: InputRequest[]; // Queue of input requests
+  // Timer tracking fields
+  busyTime?: number; // Total milliseconds spent in busy state
+  idleTime?: number; // Total milliseconds spent in idle state
+  lastStateChange?: number; // Timestamp (ms) of last status change
 }
 
 export class AppState {
@@ -54,7 +58,9 @@ export class AppState {
   private listeners: Set<() => void> = new Set();
   private workspacePath: string | null = null; // Valid workspace path
   private displayedWorkspacePath: string = ""; // Path shown in input (may be invalid)
-  private nextAgentNumber: number = 1; // Counter for agent numbering (always increments)
+  private nextTerminalNumber: number = 1; // Counter for terminal numbering (always increments)
+  private isResettingWorkspace: boolean = false; // Loading state during factory reset
+  private isInitializing: boolean = false; // Loading state during app startup
 
   addTerminal(terminal: Terminal): void {
     this.terminals.set(terminal.id, terminal);
@@ -117,6 +123,42 @@ export class AppState {
     }
   }
 
+  updateTerminalStatus(id: string, newStatus: TerminalStatus): void {
+    const terminal = this.terminals.get(id);
+    if (!terminal) {
+      return;
+    }
+
+    const now = Date.now();
+    const oldStatus = terminal.status;
+
+    // Only process timer updates if status actually changed
+    if (oldStatus !== newStatus && terminal.lastStateChange) {
+      const elapsed = now - terminal.lastStateChange;
+
+      // Add elapsed time to the appropriate counter
+      if (oldStatus === TerminalStatus.Busy) {
+        terminal.busyTime = (terminal.busyTime || 0) + elapsed;
+      } else if (oldStatus === TerminalStatus.Idle) {
+        terminal.idleTime = (terminal.idleTime || 0) + elapsed;
+      }
+    }
+
+    // Update status and timestamp
+    terminal.status = newStatus;
+    terminal.lastStateChange = now;
+
+    // Initialize timers if this is the first state change
+    if (terminal.busyTime === undefined) {
+      terminal.busyTime = 0;
+    }
+    if (terminal.idleTime === undefined) {
+      terminal.idleTime = 0;
+    }
+
+    this.notify();
+  }
+
   setTerminalRole(
     id: string,
     role: string | undefined,
@@ -163,6 +205,25 @@ export class AppState {
     return this.primaryId ? this.terminals.get(this.primaryId) || null : null;
   }
 
+  /**
+   * Check if a primary terminal exists
+   */
+  hasPrimary(): boolean {
+    return this.primaryId !== null && this.terminals.has(this.primaryId);
+  }
+
+  /**
+   * Get primary terminal or throw error if none exists
+   * Use this when you're certain a primary must exist (e.g., after validation)
+   */
+  getPrimaryOrThrow(): Terminal {
+    const primary = this.getPrimary();
+    if (!primary) {
+      throw new Error("No primary terminal available");
+    }
+    return primary;
+  }
+
   getTerminals(): Terminal[] {
     // Return terminals in display order
     return this.order
@@ -196,6 +257,12 @@ export class AppState {
   setWorkspace(path: string): void {
     this.workspacePath = path;
     this.displayedWorkspacePath = path;
+    // Persist workspace to localStorage to survive HMR reloads
+    if (path) {
+      localStorage.setItem("loom:workspace", path);
+    } else {
+      localStorage.removeItem("loom:workspace");
+    }
     this.notify();
   }
 
@@ -208,20 +275,56 @@ export class AppState {
     return this.workspacePath;
   }
 
+  /**
+   * Check if a valid workspace is set
+   */
+  hasWorkspace(): boolean {
+    return this.workspacePath !== null && this.workspacePath !== "";
+  }
+
+  /**
+   * Get workspace path or throw error if none exists
+   * Use this when workspace is required for an operation
+   */
+  getWorkspaceOrThrow(): string {
+    if (!this.workspacePath) {
+      throw new Error("No workspace selected");
+    }
+    return this.workspacePath;
+  }
+
   getDisplayedWorkspace(): string {
     return this.displayedWorkspacePath;
   }
 
-  getNextAgentNumber(): number {
-    return this.nextAgentNumber++;
+  setResettingWorkspace(isResetting: boolean): void {
+    this.isResettingWorkspace = isResetting;
+    this.notify();
   }
 
-  setNextAgentNumber(num: number): void {
-    this.nextAgentNumber = num;
+  isWorkspaceResetting(): boolean {
+    return this.isResettingWorkspace;
   }
 
-  getCurrentAgentNumber(): number {
-    return this.nextAgentNumber;
+  setInitializing(isInitializing: boolean): void {
+    this.isInitializing = isInitializing;
+    this.notify();
+  }
+
+  isAppInitializing(): boolean {
+    return this.isInitializing;
+  }
+
+  getNextTerminalNumber(): number {
+    return this.nextTerminalNumber++;
+  }
+
+  setNextTerminalNumber(num: number): void {
+    this.nextTerminalNumber = num;
+  }
+
+  getCurrentTerminalNumber(): number {
+    return this.nextTerminalNumber;
   }
 
   loadAgents(agents: Terminal[]): void {
@@ -239,6 +342,15 @@ export class AppState {
       }
       this.addTerminal(agent);
     });
+
+    // If no terminal was marked as primary, make the first one primary
+    if (!this.primaryId && this.order.length > 0) {
+      const firstId = this.order[0];
+      console.log(
+        `[loadAgents] No primary terminal set, making first terminal primary: ${firstId}`
+      );
+      this.setPrimary(firstId);
+    }
   }
 
   clearAll(): void {
@@ -248,8 +360,23 @@ export class AppState {
     this.primaryId = null;
     this.workspacePath = null;
     this.displayedWorkspacePath = "";
-    // Note: Don't reset nextAgentNumber - it persists across workspace changes
+    // Note: Don't reset nextTerminalNumber - it persists across workspace changes
     this.notify();
+  }
+
+  /**
+   * Restore workspace from localStorage (for HMR survival)
+   * Returns the restored workspace path or null if none was stored
+   */
+  restoreWorkspaceFromLocalStorage(): string | null {
+    const stored = localStorage.getItem("loom:workspace");
+    if (stored) {
+      this.workspacePath = stored;
+      this.displayedWorkspacePath = stored;
+      this.notify();
+      return stored;
+    }
+    return null;
   }
 
   // Helper method to get terminal by ID
@@ -279,4 +406,12 @@ export function getAppState(): AppState {
 
 export function setAppState(state: AppState): void {
   appStateInstance = state;
+}
+
+/**
+ * Type guard to check if a value is a valid Terminal
+ * Useful for filtering and narrowing types
+ */
+export function isValidTerminal(t: Terminal | null | undefined): t is Terminal {
+  return t !== null && t !== undefined && typeof t.id === "string" && t.id.length > 0;
 }

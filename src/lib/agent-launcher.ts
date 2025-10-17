@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import type { GitIdentity } from "./worktree-manager";
+import { Logger } from "./logger";
+import { generateProbeCommand, type ProbeResponse, parseProbeResponse } from "./terminal-probe";
+
+const logger = Logger.forComponent("agent-launcher");
 
 /**
  * agent-launcher.ts - Functions for launching AI agents in terminals
@@ -10,83 +13,134 @@ import type { GitIdentity } from "./worktree-manager";
  */
 
 /**
+ * Detect what type of process is running in a terminal
+ *
+ * Sends an intelligent probe command that works in both bash shells and AI agent sessions.
+ * The probe uses bash comments that agents interpret as prompts, while shells ignore them.
+ *
+ * This is useful for:
+ * - Verifying an agent was launched successfully
+ * - Detecting agent role and current task
+ * - Distinguishing between shells and agents
+ * - Debugging agent launch issues
+ *
+ * @param terminalId - The terminal ID to probe
+ * @param waitMs - How long to wait for response (default: 1000ms)
+ * @returns Promise resolving to the probe response with detected type and metadata
+ */
+export async function detectTerminalType(
+  terminalId: string,
+  waitMs = 1000
+): Promise<ProbeResponse> {
+  logger.info("Sending terminal probe", { terminalId, waitMs });
+
+  // Generate and send the probe command
+  const probe = generateProbeCommand();
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: `${probe}\n`,
+  });
+
+  // Wait for response
+  logger.info("Waiting for probe response", { terminalId, waitMs });
+  await new Promise((resolve) => setTimeout(resolve, waitMs));
+
+  // Read terminal output (try to get recent lines)
+  const output = await invoke<string>("read_terminal_output", {
+    id: terminalId,
+    lines: 10,
+  }).catch((error) => {
+    logger.error("Failed to read terminal output for probe", error, { terminalId });
+    return ""; // Empty output on error
+  });
+
+  // Parse the response
+  const result = parseProbeResponse(output);
+  logger.info("Terminal probe complete", {
+    terminalId,
+    detectedType: result.type,
+    role: result.role,
+    task: result.task,
+    outputLength: output.length,
+  });
+
+  return result;
+}
+
+/**
  * Launch a Claude agent in a terminal by sending the Claude CLI command
  *
  * This uses the existing terminal input mechanism to send a Claude command
  * with the appropriate role prompt and configuration. The agent runs visibly
  * in the terminal where users can see output and interact if needed.
  *
+ * NOTE: Worktrees are now created on-demand when claiming issues, not automatically.
+ * Agents start in the main workspace and create worktrees using `pnpm worktree <issue>`.
+ *
  * @param terminalId - The terminal ID to launch the agent in
  * @param roleFile - The role file to use (e.g., "worker.md")
- * @param workspacePath - The workspace path for the agent
- * @param worktreePath - Optional worktree path for isolated work (defaults to workspace)
- * @param useWorktree - Whether to create a worktree for isolation (default: false)
- * @param gitIdentity - Optional git identity to configure in the worktree
- * @returns Promise that resolves with the working directory path that was used
+ * @param workspacePath - The workspace path (used for reading role files)
+ * @param worktreePath - The worktree path (empty string if agent should use main workspace)
+ * @returns Promise that resolves when the agent is launched
  */
 export async function launchAgentInTerminal(
   terminalId: string,
   roleFile: string,
   workspacePath: string,
-  worktreePath?: string,
-  useWorktree = false,
-  gitIdentity?: GitIdentity
-): Promise<string> {
-  console.log(
-    `[launchAgentInTerminal] START - terminalId=${terminalId}, roleFile=${roleFile}, workspacePath=${workspacePath}, useWorktree=${useWorktree}`
-  );
+  worktreePath: string
+): Promise<void> {
+  logger.info("Starting agent launch", {
+    terminalId,
+    roleFile,
+    workspacePath,
+    worktreePath: worktreePath || "(main workspace)",
+  });
 
-  // Set up worktree if requested
-  let agentWorkingDir = workspacePath;
-  if (useWorktree && !worktreePath) {
-    console.log(`[launchAgentInTerminal] Setting up worktree for ${terminalId}...`);
-    const { setupWorktreeForAgent } = await import("./worktree-manager");
-    agentWorkingDir = await setupWorktreeForAgent(terminalId, workspacePath, gitIdentity);
-    console.log(
-      `[launchAgentInTerminal] Worktree setup complete, agentWorkingDir=${agentWorkingDir}`
-    );
-  } else if (worktreePath) {
-    agentWorkingDir = worktreePath;
-    console.log(`[launchAgentInTerminal] Using existing worktreePath=${worktreePath}`);
-  }
+  // Use worktree path if provided, otherwise use main workspace
+  const agentWorkingDir = worktreePath || workspacePath;
+  const location = worktreePath ? "worktree" : "main workspace";
+  logger.info(`Agent will start in ${location}`, {
+    terminalId,
+    agentWorkingDir,
+  });
 
   // Read role file content from workspace
-  console.log(`[launchAgentInTerminal] Reading role file ${roleFile}...`);
+  logger.info("Reading role file", { terminalId, roleFile });
   const roleContent = await invoke<string>("read_role_file", {
     workspacePath,
     filename: roleFile,
   });
-  console.log(`[launchAgentInTerminal] Role file read successfully, length=${roleContent.length}`);
+  logger.info("Role file read successfully", {
+    terminalId,
+    roleFile,
+    contentLength: roleContent.length,
+  });
 
   // Replace template variables in role content
   const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
-  console.log(`[launchAgentInTerminal] Processed prompt with workspace=${agentWorkingDir}`);
+  logger.info("Processed role prompt", { terminalId, workspaceReplaced: agentWorkingDir });
 
-  // Write the system prompt to CLAUDE.md in the worktree/workspace
-  // Claude Code automatically loads CLAUDE.md from the repository root
-  const claudeMdPath = `${agentWorkingDir}/CLAUDE.md`;
-  console.log(`[launchAgentInTerminal] Writing CLAUDE.md to ${claudeMdPath}...`);
-  await invoke("write_file", {
-    path: claudeMdPath,
-    content: processedPrompt,
-  });
-  console.log(`[launchAgentInTerminal] CLAUDE.md written successfully`);
-
-  // Build Claude CLI command - CLAUDE.md will be automatically loaded
-  // Note: --session-id removed because Claude Code requires UUID format, not our terminal IDs
+  // Build Claude CLI command
+  // Note: We send the role as the first message instead of writing CLAUDE.md
+  // This prevents conflicts with the main workspace CLAUDE.md (project instructions)
   // Using --dangerously-skip-permissions to bypass the interactive warning prompt
   const command = "claude --dangerously-skip-permissions";
-  console.log(`[launchAgentInTerminal] Sending command to terminal: ${command}`);
+  logger.info("Sending Claude command to terminal", { terminalId, command });
+
+  // Wait for any previous commands to fully complete
+  // This prevents command concatenation with worktree setup commands
+  logger.info("Waiting for previous commands to complete", { terminalId, delayMs: 500 });
+  await new Promise((resolve) => setTimeout(resolve, 500));
 
   // Send command to terminal
   await invoke("send_terminal_input", {
     id: terminalId,
     data: command,
   });
-  console.log(`[launchAgentInTerminal] Command sent`);
+  logger.info("Command sent to terminal", { terminalId });
 
   // Press Enter to execute
-  console.log(`[launchAgentInTerminal] Sending Enter to execute`);
+  logger.info("Sending Enter to execute command", { terminalId });
   await invoke("send_terminal_input", {
     id: terminalId,
     data: "\r",
@@ -94,7 +148,7 @@ export async function launchAgentInTerminal(
 
   // Add initial delay to allow Claude Code to start
   // This prevents the "2" from concatenating with the previous command
-  console.log(`[launchAgentInTerminal] Initial wait: 1000ms for Claude Code to start...`);
+  logger.info("Initial wait for Claude Code to start", { terminalId, delayMs: 1000 });
   await new Promise((resolve) => setTimeout(resolve, 1000));
 
   // Retry accepting the bypass permissions warning with exponential backoff
@@ -104,13 +158,16 @@ export async function launchAgentInTerminal(
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const delay = baseDelay * attempt; // Exponential backoff: 2s, 4s, 6s
-    console.log(
-      `[launchAgentInTerminal] Attempt ${attempt}/${maxRetries}: Waiting ${delay}ms for bypass permissions prompt...`
-    );
+    logger.info("Waiting for bypass permissions prompt", {
+      terminalId,
+      attempt,
+      maxRetries,
+      delayMs: delay,
+    });
     await new Promise((resolve) => setTimeout(resolve, delay));
 
     // Accept the bypass permissions warning by selecting option 2
-    console.log(`[launchAgentInTerminal] Attempt ${attempt}: Sending "2" to accept warning`);
+    logger.info("Sending acceptance input for bypass permissions", { terminalId, attempt });
     await invoke("send_terminal_input", {
       id: terminalId,
       data: "2",
@@ -120,7 +177,7 @@ export async function launchAgentInTerminal(
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     // Press Enter to confirm selection
-    console.log(`[launchAgentInTerminal] Attempt ${attempt}: Sending Enter to confirm`);
+    logger.info("Sending Enter to confirm bypass permissions", { terminalId, attempt });
     await invoke("send_terminal_input", {
       id: terminalId,
       data: "\r",
@@ -128,15 +185,61 @@ export async function launchAgentInTerminal(
 
     // If this isn't the last attempt, wait a bit before retrying
     if (attempt < maxRetries) {
-      console.log(`[launchAgentInTerminal] Waiting 500ms before next attempt...`);
+      logger.info("Waiting before retry", { terminalId, delayMs: 500 });
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
   }
 
-  console.log(`[launchAgentInTerminal] COMPLETE - returning agentWorkingDir=${agentWorkingDir}`);
+  // Wait for Claude Code to be ready to receive input
+  logger.info("Waiting for Claude Code to initialize", { terminalId, delayMs: 2000 });
+  await new Promise((resolve) => setTimeout(resolve, 2000));
 
-  // Return the working directory that was used
-  return agentWorkingDir;
+  // Send the role prompt as the first message
+  logger.info("Sending role prompt as first message", {
+    terminalId,
+    promptLength: processedPrompt.length,
+  });
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: processedPrompt,
+  });
+
+  // Press Enter to submit the prompt
+  logger.info("Sending Enter to submit role prompt", { terminalId });
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+
+  // Wait for the agent to process the role prompt
+  logger.info("Waiting for agent to process role prompt", { terminalId, delayMs: 2000 });
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Verify agent launched successfully using terminal probe
+  logger.info("Verifying agent launch with terminal probe", { terminalId });
+  const probeResult = await detectTerminalType(terminalId, 1500);
+
+  if (probeResult.type === "agent") {
+    logger.info("Agent launch verified successfully", {
+      terminalId,
+      role: probeResult.role,
+      task: probeResult.task,
+    });
+  } else if (probeResult.type === "shell") {
+    logger.error(
+      "Agent launch verification failed: detected shell instead of agent",
+      new Error("Shell detected after agent launch"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  } else {
+    logger.error(
+      "Agent launch verification inconclusive: unknown terminal type",
+      new Error("Unknown terminal type detected"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  }
+
+  logger.info("Agent launch complete", { terminalId, agentWorkingDir });
 }
 
 /**
@@ -279,4 +382,120 @@ export async function launchGrokAgent(terminalId: string): Promise<void> {
     id: terminalId,
     data: "\r",
   });
+}
+
+/**
+ * Launch Codex agent in a terminal with system prompt
+ *
+ * This launches Codex with configuration similar to Claude Code:
+ * - Loads role file and writes to CODEX.md (system prompt)
+ * - Uses --full-auto for autonomous execution
+ * - Workspace-write sandbox with on-failure approval
+ * - Permissions configured in .codex/config.toml
+ *
+ * NOTE: Worktrees are now created on-demand when claiming issues, not automatically.
+ * Agents start in the main workspace and create worktrees using `pnpm worktree <issue>`.
+ *
+ * @param terminalId - The terminal ID to launch the agent in
+ * @param roleFile - The role file to use (e.g., "worker.md")
+ * @param workspacePath - The workspace path (used for reading role files)
+ * @param worktreePath - The worktree path (empty string if agent should use main workspace)
+ * @returns Promise that resolves when the agent is launched
+ */
+export async function launchCodexAgent(
+  terminalId: string,
+  roleFile: string,
+  workspacePath: string,
+  worktreePath: string
+): Promise<void> {
+  logger.info("Starting Codex agent launch", {
+    terminalId,
+    roleFile,
+    workspacePath,
+    worktreePath: worktreePath || "(main workspace)",
+  });
+
+  // Use worktree path if provided, otherwise use main workspace
+  const agentWorkingDir = worktreePath || workspacePath;
+  const location = worktreePath ? "worktree" : "main workspace";
+  logger.info(`Codex agent will start in ${location}`, {
+    terminalId,
+    agentWorkingDir,
+  });
+
+  // Read role file content from workspace
+  logger.info("Reading role file for Codex", { terminalId, roleFile });
+  const roleContent = await invoke<string>("read_role_file", {
+    workspacePath,
+    filename: roleFile,
+  });
+  logger.info("Role file read successfully for Codex", {
+    terminalId,
+    roleFile,
+    contentLength: roleContent.length,
+  });
+
+  // Replace template variables in role content
+  const processedPrompt = roleContent.replace(/\{\{workspace\}\}/g, agentWorkingDir);
+  logger.info("Processed Codex role prompt", { terminalId, workspaceReplaced: agentWorkingDir });
+
+  // Build Codex CLI command with autonomous configuration
+  // Note: We send the prompt directly in the command instead of via a file
+  // This prevents conflicts with files in the main workspace
+  // --full-auto: Combines -a on-failure and --sandbox workspace-write
+  // Additional config from .codex/config.toml (sandbox_permissions, etc.)
+  // Using single quotes around the heredoc to prevent shell expansion
+  const command = `codex --full-auto "$(cat <<'ROLE_EOF'\n${processedPrompt}\nROLE_EOF\n)"`;
+  logger.info("Sending Codex command to terminal", {
+    terminalId,
+    promptLength: processedPrompt.length,
+  });
+
+  // Wait for any previous commands to fully complete
+  logger.info("Waiting for previous commands to complete", { terminalId, delayMs: 500 });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+  logger.info("Codex command sent to terminal", { terminalId });
+
+  // Press Enter to execute
+  logger.info("Sending Enter to execute Codex", { terminalId });
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+
+  // Wait for the agent to initialize and process the role prompt
+  logger.info("Waiting for Codex agent to initialize", { terminalId, delayMs: 2000 });
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Verify agent launched successfully using terminal probe
+  logger.info("Verifying Codex agent launch with terminal probe", { terminalId });
+  const probeResult = await detectTerminalType(terminalId, 1500);
+
+  if (probeResult.type === "agent") {
+    logger.info("Codex agent launch verified successfully", {
+      terminalId,
+      role: probeResult.role,
+      task: probeResult.task,
+    });
+  } else if (probeResult.type === "shell") {
+    logger.error(
+      "Codex agent launch verification failed: detected shell instead of agent",
+      new Error("Shell detected after Codex launch"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  } else {
+    logger.error(
+      "Codex agent launch verification inconclusive: unknown terminal type",
+      new Error("Unknown terminal type detected after Codex launch"),
+      { terminalId, probeOutput: probeResult.raw }
+    );
+  }
+
+  logger.info("Codex agent launch complete", { terminalId, agentWorkingDir });
 }

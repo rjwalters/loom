@@ -1,18 +1,54 @@
 import { type Terminal, TerminalStatus } from "./state";
 import { getTheme, getThemeStyles, isDarkMode } from "./themes";
 
-export function renderHeader(displayedWorkspacePath: string, hasWorkspace: boolean): void {
+/**
+ * Format milliseconds into a human-readable duration
+ */
+function formatDuration(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) return `${days}d ${hours % 24}h`;
+  if (hours > 0) return `${hours}h ${minutes % 60}m`;
+  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  return `${seconds}s`;
+}
+
+export function renderHeader(
+  displayedWorkspacePath: string,
+  hasWorkspace: boolean,
+  daemonConnected?: boolean,
+  lastPing?: number | null
+): void {
   const container = document.getElementById("workspace-name");
   if (!container) return;
 
+  let headerContent = "";
   if (hasWorkspace) {
     // Show repo name in header (no "Loom" title)
     const repoName = extractRepoName(displayedWorkspacePath);
-    container.innerHTML = `📂 ${escapeHtml(repoName)}`;
+    headerContent = `📂 ${escapeHtml(repoName)}`;
   } else {
     // Show "Loom" title when no workspace
-    container.innerHTML = "Loom";
+    headerContent = "Loom";
   }
+
+  // Add daemon health indicator if we have that data
+  if (daemonConnected !== undefined) {
+    const statusColor = daemonConnected ? "bg-green-500" : "bg-red-500";
+    const statusText = daemonConnected ? "Connected" : "Disconnected";
+    const timeSincePing = lastPing ? Date.now() - lastPing : null;
+    const pingInfo = timeSincePing !== null ? ` • ${formatDuration(timeSincePing)} ago` : "";
+
+    headerContent += ` <span class="inline-flex items-center gap-1 ml-2 text-xs text-gray-500 dark:text-gray-400" data-tooltip="Daemon ${statusText}${pingInfo}" data-tooltip-position="bottom">
+      <span class="w-2 h-2 rounded-full ${statusColor}"></span>
+      <span class="text-xs">Daemon</span>
+    </span>`;
+  }
+
+  container.innerHTML = headerContent;
 }
 
 function extractRepoName(path: string): string {
@@ -20,6 +56,27 @@ function extractRepoName(path: string): string {
   // Get the last component of the path
   const parts = path.split("/").filter((p) => p.length > 0);
   return parts[parts.length - 1] || path;
+}
+
+/**
+ * Render loading state during factory reset
+ */
+export function renderLoadingState(message: string = "Resetting workspace..."): void {
+  const container = document.getElementById("primary-terminal");
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+      <div class="flex flex-col items-center gap-4">
+        <div class="relative">
+          <div class="w-16 h-16 border-4 border-blue-200 dark:border-blue-900 rounded-full"></div>
+          <div class="absolute top-0 left-0 w-16 h-16 border-4 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full animate-spin"></div>
+        </div>
+        <p class="text-lg font-medium text-gray-700 dark:text-gray-300">${escapeHtml(message)}</p>
+        <p class="text-sm text-gray-500 dark:text-gray-400">This may take a few moments...</p>
+      </div>
+    </div>
+  `;
 }
 
 export function renderPrimaryTerminal(
@@ -121,6 +178,7 @@ export function renderPrimaryTerminal(
         <span class="text-xs text-gray-500 dark:text-gray-400">• ${roleLabel}</span>
       </div>
       <div class="flex items-center gap-1">
+        ${createRunNowButtonHTML(terminal, "primary")}
         <button
           id="terminal-clear-btn"
           data-terminal-id="${terminal.id}"
@@ -159,15 +217,27 @@ export function renderPrimaryTerminal(
 
   // If missing session, render error UI inside the content container after DOM update
   if (hasMissingSession) {
+    console.log(
+      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=true, will render error overlay`
+    );
     setTimeout(() => {
       renderMissingSessionError(terminal.id, terminal.id);
     }, 0);
+  } else {
+    console.log(
+      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=${terminal.missingSession}, will show xterm`
+    );
   }
 }
 
 export function renderMissingSessionError(sessionId: string, configId: string): void {
+  console.log(`[renderMissingSessionError] Rendering error overlay for terminal ${sessionId}`);
   const container = document.getElementById(`xterm-container-${sessionId}`);
-  if (!container) return;
+  if (!container) {
+    console.warn(`[renderMissingSessionError] Container #xterm-container-${sessionId} not found!`);
+    return;
+  }
+  console.log(`[renderMissingSessionError] Found container, replacing with error UI`);
 
   container.innerHTML = `
     <div class="h-full flex items-center justify-center bg-red-50 dark:bg-red-900/20">
@@ -254,11 +324,20 @@ export function renderAvailableSessionsList(
   `;
 }
 
-export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean): void {
+export function renderMiniTerminals(
+  terminals: Terminal[],
+  hasWorkspace: boolean,
+  terminalHealthMap?: Map<string, { lastActivity: number | null; isStale: boolean }>
+): void {
   const container = document.getElementById("mini-terminal-row");
   if (!container) return;
 
-  const terminalCards = terminals.map((t, index) => createMiniTerminalHTML(t, index)).join("");
+  const terminalCards = terminals
+    .map((t, index) => {
+      const health = terminalHealthMap?.get(t.id);
+      return createMiniTerminalHTML(t, index, health);
+    })
+    .join("");
 
   const addButtonClasses = hasWorkspace
     ? "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 cursor-pointer"
@@ -274,7 +353,7 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
         id="add-terminal-btn"
         data-tooltip="${addButtonTitle}"
         data-tooltip-position="auto"
-        class="flex-shrink-0 w-32 h-32 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
+        class="flex-shrink-0 w-40 h-40 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
         title="${addButtonTitle}"
         ${addButtonDisabled}
       >
@@ -284,7 +363,108 @@ export function renderMiniTerminals(terminals: Terminal[], hasWorkspace: boolean
   `;
 }
 
-function createMiniTerminalHTML(terminal: Terminal, index: number): string {
+/**
+ * Create "Run Now" button HTML for interval mode terminals
+ *
+ * Only shown for terminals with autonomous mode enabled (targetInterval > 0)
+ *
+ * @param terminal - The terminal to create the button for
+ * @param context - Whether this is for "primary" or "mini" view
+ * @returns HTML string for the button, or empty string if not applicable
+ */
+function createRunNowButtonHTML(terminal: Terminal, context: "primary" | "mini"): string {
+  // Check if terminal has interval mode enabled
+  const hasInterval =
+    terminal.roleConfig?.targetInterval !== undefined &&
+    (terminal.roleConfig.targetInterval as number) > 0;
+
+  if (!hasInterval) {
+    return ""; // Don't show button for non-interval terminals
+  }
+
+  // Different styling for primary vs mini view
+  const buttonClasses =
+    context === "primary"
+      ? "p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors run-now-btn"
+      : "p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors run-now-btn";
+
+  const iconClasses =
+    context === "primary"
+      ? "w-4 h-4 text-gray-600 dark:text-gray-300"
+      : "w-3 h-3 text-gray-600 dark:text-gray-300";
+
+  return `
+    <button
+      data-terminal-id="${terminal.id}"
+      data-tooltip="Run interval prompt now"
+      data-tooltip-position="bottom"
+      class="${buttonClasses}"
+      title="Run interval prompt now"
+    >
+      <svg class="${iconClasses}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+      </svg>
+    </button>
+  `;
+}
+
+/**
+ * Create timer display HTML for busy/idle time tracking
+ */
+function createTimerDisplayHTML(terminal: Terminal): string {
+  // Initialize timers if not present
+  const busyTime = terminal.busyTime || 0;
+  const idleTime = terminal.idleTime || 0;
+  const lastStateChange = terminal.lastStateChange || Date.now();
+  const now = Date.now();
+
+  // Calculate current delta based on current status
+  let currentBusyTime = busyTime;
+  let currentIdleTime = idleTime;
+
+  if (terminal.lastStateChange) {
+    const delta = now - lastStateChange;
+    if (terminal.status === TerminalStatus.Busy) {
+      currentBusyTime += delta;
+    } else if (terminal.status === TerminalStatus.Idle) {
+      currentIdleTime += delta;
+    }
+  }
+
+  // Format the durations
+  const busyDisplay = formatDuration(currentBusyTime);
+  const idleDisplay = formatDuration(currentIdleTime);
+
+  // Choose colors based on status
+  const busyColor =
+    terminal.status === TerminalStatus.Busy
+      ? "text-blue-600 dark:text-blue-400 font-semibold"
+      : "text-gray-500 dark:text-gray-400";
+  const idleColor =
+    terminal.status === TerminalStatus.Idle
+      ? "text-gray-600 dark:text-gray-300 font-semibold"
+      : "text-gray-500 dark:text-gray-400";
+
+  return `
+    <div class="flex flex-col gap-0.5 mt-1 border-t border-gray-200 dark:border-gray-700 pt-1">
+      <div class="flex items-center justify-between ${busyColor}" data-tooltip="Time spent actively running commands" data-tooltip-position="top">
+        <span>⏱️ Busy:</span>
+        <span class="font-mono text-xs">${busyDisplay}</span>
+      </div>
+      <div class="flex items-center justify-between ${idleColor}" data-tooltip="Time spent waiting at prompt" data-tooltip-position="top">
+        <span>💤 Idle:</span>
+        <span class="font-mono text-xs">${idleDisplay}</span>
+      </div>
+    </div>
+  `;
+}
+
+function createMiniTerminalHTML(
+  terminal: Terminal,
+  index: number,
+  health?: { lastActivity: number | null; isStale: boolean }
+): string {
   // Get theme colors
   const theme = getTheme(terminal.theme, terminal.customTheme);
   const styles = getThemeStyles(theme, isDarkMode());
@@ -298,12 +478,30 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
       ? `<div class="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-white dark:border-gray-900 animate-pulse"></div>`
       : "";
 
+  // Activity indicator
+  let activityInfo = "";
+  if (health) {
+    if (health.lastActivity) {
+      const timeSince = Date.now() - health.lastActivity;
+      const activityText = formatDuration(timeSince);
+      const activityColor = health.isStale
+        ? "text-orange-500 dark:text-orange-400"
+        : "text-green-600 dark:text-green-400";
+      const activityIcon = health.isStale ? "⏸" : "⚡";
+      activityInfo = `<span class="${activityColor} text-xs flex items-center gap-1" data-tooltip="Last activity: ${activityText} ago" data-tooltip-position="top">
+        ${activityIcon} ${activityText}
+      </span>`;
+    } else {
+      activityInfo = `<span class="text-gray-400 dark:text-gray-500 text-xs" data-tooltip="No activity recorded" data-tooltip-position="top">—</span>`;
+    }
+  }
+
   return `
     <div class="p-1 flex-shrink-0">
       <div class="relative">
         ${needsInputBadge}
         <div
-          class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
           style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
           draggable="true"
@@ -313,19 +511,26 @@ function createMiniTerminalHTML(terminal: Terminal, index: number): string {
             <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
             <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
           </div>
-          <button
-            class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
-            data-terminal-id="${terminal.id}"
-            data-tooltip="Close terminal"
-            data-tooltip-position="top"
-            title="Close terminal"
-          >
-            ×
-          </button>
+          <div class="flex items-center gap-0.5 flex-shrink-0">
+            ${createRunNowButtonHTML(terminal, "mini")}
+            <button
+              class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
+              data-terminal-id="${terminal.id}"
+              data-tooltip="Close terminal"
+              data-tooltip-position="top"
+              title="Close terminal"
+            >
+              ×
+            </button>
+          </div>
         </div>
-        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between">
-          <span>${terminal.status}</span>
-          <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
+          <div class="flex items-center justify-between">
+            <span>${terminal.status}</span>
+            <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+          </div>
+          ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
+          ${createTimerDisplayHTML(terminal)}
         </div>
         </div>
       </div>

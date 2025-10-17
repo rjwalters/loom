@@ -1,6 +1,8 @@
+use crate::activity::{ActivityDb, AgentInput, InputContext, InputType};
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
 use anyhow::Result;
+use chrono::Utc;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
@@ -10,13 +12,19 @@ use tokio::net::{UnixListener, UnixStream};
 pub struct IpcServer {
     socket_path: PathBuf,
     terminal_manager: Arc<Mutex<TerminalManager>>,
+    activity_db: Arc<Mutex<ActivityDb>>,
 }
 
 impl IpcServer {
-    pub fn new(socket_path: PathBuf, terminal_manager: Arc<Mutex<TerminalManager>>) -> Self {
+    pub fn new(
+        socket_path: PathBuf,
+        terminal_manager: Arc<Mutex<TerminalManager>>,
+        activity_db: Arc<Mutex<ActivityDb>>,
+    ) -> Self {
         Self {
             socket_path,
             terminal_manager,
+            activity_db,
         }
     }
 
@@ -31,8 +39,9 @@ impl IpcServer {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let tm = self.terminal_manager.clone();
+                    let db = self.activity_db.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_client(stream, tm).await {
+                        if let Err(e) = handle_client(stream, tm, db).await {
                             log::error!("Client error: {e}");
                         }
                     });
@@ -48,6 +57,7 @@ impl IpcServer {
 async fn handle_client(
     stream: UnixStream,
     terminal_manager: Arc<Mutex<TerminalManager>>,
+    activity_db: Arc<Mutex<ActivityDb>>,
 ) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -56,7 +66,7 @@ async fn handle_client(
         let request: Request = serde_json::from_str(&line)?;
         log::debug!("Request: {request:?}");
 
-        let response = handle_request(request, &terminal_manager);
+        let response = handle_request(request, &terminal_manager, &activity_db);
 
         let response_json = serde_json::to_string(&response)?;
         writer.write_all(response_json.as_bytes()).await?;
@@ -70,7 +80,11 @@ async fn handle_client(
 // a thread panicked while holding the lock. This is not recoverable and should crash.
 // Allow too_many_lines because this is a central request dispatcher that handles all IPC commands.
 #[allow(clippy::expect_used, clippy::too_many_lines)]
-fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager>>) -> Response {
+fn handle_request(
+    request: Request,
+    terminal_manager: &Arc<Mutex<TerminalManager>>,
+    activity_db: &Arc<Mutex<ActivityDb>>,
+) -> Response {
     match request {
         Request::Ping => Response::Pong,
 
@@ -94,7 +108,7 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::ListTerminals => {
-            let tm = terminal_manager
+            let mut tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             Response::TerminalList {
@@ -115,6 +129,24 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::SendInput { id, data } => {
+            // Record input to activity database
+            let input = AgentInput {
+                id: None,
+                terminal_id: id.clone(),
+                timestamp: Utc::now(),
+                input_type: InputType::Manual, // Default to manual, could be enhanced later
+                content: data.clone(),
+                agent_role: None, // Could be populated from terminal metadata
+                context: InputContext::default(),
+            };
+
+            if let Ok(db) = activity_db.lock() {
+                if let Err(e) = db.record_input(&input) {
+                    log::warn!("Failed to record input to activity database: {e}");
+                }
+            }
+
+            // Send input to terminal
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
@@ -127,13 +159,42 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
         }
 
         Request::GetTerminalOutput { id, start_byte } => {
+            use base64::{engine::general_purpose, Engine as _};
+
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.get_terminal_output(&id, start_byte) {
                 Ok((output_bytes, byte_count)) => {
+                    // Record output sample to activity database if there's new data
+                    if !output_bytes.is_empty() {
+                        let output_str = String::from_utf8_lossy(&output_bytes).to_string();
+                        // Take first 1024 characters (not bytes) to avoid slicing multi-byte UTF-8 chars
+                        let preview = if output_str.chars().count() > 1024 {
+                            output_str.chars().take(1024).collect::<String>()
+                        } else {
+                            output_str.clone()
+                        };
+
+                        let output_record = crate::activity::AgentOutput {
+                            id: None,
+                            input_id: None, // Could link to last input if tracked
+                            terminal_id: id.clone(),
+                            timestamp: Utc::now(),
+                            content: Some(output_str),
+                            content_preview: Some(preview),
+                            exit_code: None,
+                            metadata: None,
+                        };
+
+                        if let Ok(db) = activity_db.lock() {
+                            if let Err(e) = db.record_output(&output_record) {
+                                log::warn!("Failed to record output to activity database: {e}");
+                            }
+                        }
+                    }
+
                     // Encode bytes as base64 for JSON transmission
-                    use base64::{engine::general_purpose, Engine as _};
                     let output = general_purpose::STANDARD.encode(&output_bytes);
                     log::debug!(
                         "GetTerminalOutput: {} raw bytes -> {} base64 chars, total byte_count={}",
@@ -198,6 +259,18 @@ fn handle_request(request: Request, terminal_manager: &Arc<Mutex<TerminalManager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
             match tm.kill_session(&session_name) {
+                Ok(()) => Response::Success,
+                Err(e) => Response::Error {
+                    message: e.to_string(),
+                },
+            }
+        }
+
+        Request::SetWorktreePath { id, worktree_path } => {
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+            match tm.set_worktree_path(&id, &worktree_path) {
                 Ok(()) => Response::Success,
                 Err(e) => Response::Error {
                     message: e.to_string(),

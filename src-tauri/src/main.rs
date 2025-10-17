@@ -11,8 +11,26 @@ use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
 mod daemon_client;
 mod daemon_manager;
 mod dependency_checker;
+mod logging;
+mod mcp_watcher;
 
 use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
+
+// Helper structs for JSON parsing (defined at top level to avoid clippy::items_after_statements)
+#[derive(serde::Deserialize)]
+struct GhLabel {
+    name: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GhIssue {
+    number: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct GhPr {
+    number: u32,
+}
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -171,7 +189,7 @@ struct DaemonStatus {
 #[tauri::command]
 async fn get_daemon_status() -> DaemonStatus {
     let socket_path = dirs::home_dir()
-        .map(|h| h.join(".loom/daemon.sock"))
+        .map(|h| h.join(".loom/loom-daemon.sock"))
         .map_or_else(|| "Unknown".to_string(), |p| p.display().to_string());
 
     match DaemonClient::new() {
@@ -246,6 +264,21 @@ async fn kill_session(session_name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn set_worktree_path(id: String, worktree_path: String) -> Result<(), String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::SetWorktreePath { id, worktree_path })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::Success => Ok(()),
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
 fn validate_git_repo(path: &str) -> Result<bool, String> {
     let workspace_path = Path::new(path);
 
@@ -296,6 +329,65 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Helper function to find git repository root by searching for .git directory
+fn find_git_root() -> Option<std::path::PathBuf> {
+    // Start from current directory
+    let mut current = std::env::current_dir().ok()?;
+
+    loop {
+        let git_dir = current.join(".git");
+        if git_dir.exists() {
+            return Some(current);
+        }
+
+        // Move up to parent directory
+        if !current.pop() {
+            // Reached filesystem root without finding .git
+            return None;
+        }
+    }
+}
+
+// Helper function to resolve defaults directory path
+// Tries development path first, then falls back to bundled resource path
+fn resolve_defaults_path(defaults_path: &str) -> Result<std::path::PathBuf, String> {
+    use std::path::PathBuf;
+
+    // Try the provided path first (development mode - relative to cwd)
+    let dev_path = PathBuf::from(defaults_path);
+    if dev_path.exists() {
+        return Ok(dev_path);
+    }
+
+    // Try finding defaults relative to git repository root
+    // This handles the case where we're running from a git worktree
+    if let Some(git_root) = find_git_root() {
+        let git_root_defaults = git_root.join(defaults_path);
+        if git_root_defaults.exists() {
+            return Ok(git_root_defaults);
+        }
+    }
+
+    // Try resolving as bundled resource (production mode)
+    // In production, resources are in .app/Contents/Resources/
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Get the app bundle Resources directory
+        if let Some(exe_dir) = exe_path.parent() {
+            // exe is in Contents/MacOS/, resources are in Contents/Resources/
+            if let Some(contents_dir) = exe_dir.parent() {
+                let resources_path = contents_dir.join("Resources").join(defaults_path);
+                if resources_path.exists() {
+                    return Ok(resources_path);
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "Defaults directory not found: tried {defaults_path}, git root, and bundled resources"
+    ))
+}
+
 #[tauri::command]
 fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), String> {
     let workspace_path = Path::new(path);
@@ -306,13 +398,10 @@ fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), Stri
         return Err("Workspace already initialized (.loom directory exists)".to_string());
     }
 
-    // Copy defaults to .loom (symlink in src-tauri/ points to ../defaults/)
-    let defaults = Path::new(defaults_path);
-    if !defaults.exists() {
-        return Err(format!("Defaults directory not found: {defaults_path}"));
-    }
+    // Copy defaults to .loom
+    let defaults = resolve_defaults_path(defaults_path)?;
 
-    copy_dir_recursive(defaults, &loom_path)
+    copy_dir_recursive(&defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Copy workspace-specific README (overwriting defaults/README.md)
@@ -506,6 +595,23 @@ fn check_claude_code() -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn read_text_file(path: &str) -> Result<String, String> {
+    let file_path = Path::new(path);
+
+    // Check if file exists
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {path}"));
+    }
+
+    // Check if it's a file (not a directory)
+    if !file_path.is_file() {
+        return Err(format!("Path is not a file: {path}"));
+    }
+
+    fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {e}"))
+}
+
+#[tauri::command]
 fn write_file(path: &str, content: &str) -> Result<(), String> {
     let file_path = Path::new(path);
 
@@ -608,12 +714,9 @@ fn reset_workspace_to_defaults(workspace_path: &str, defaults_path: &str) -> Res
     }
 
     // Copy defaults back
-    let defaults = Path::new(defaults_path);
-    if !defaults.exists() {
-        return Err(format!("Defaults directory not found: {defaults_path}"));
-    }
+    let defaults = resolve_defaults_path(defaults_path)?;
 
-    copy_dir_recursive(defaults, &loom_path)
+    copy_dir_recursive(&defaults, &loom_path)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Copy workspace-specific README (overwriting defaults/README.md)
@@ -688,14 +791,7 @@ fn check_github_remote() -> Result<bool, String> {
 #[tauri::command]
 fn check_label_exists(name: &str) -> Result<bool, String> {
     let output = Command::new("gh")
-        .args([
-            "label",
-            "list",
-            "--json",
-            "name",
-            "--jq",
-            &format!(".[].name | select(. == \"{name}\")"),
-        ])
+        .args(["label", "list", "--json", "name"])
         .output()
         .map_err(|e| format!("Failed to run gh label list: {e}"))?;
 
@@ -704,8 +800,11 @@ fn check_label_exists(name: &str) -> Result<bool, String> {
         return Err(format!("gh label list failed: {stderr}"));
     }
 
-    let result = String::from_utf8_lossy(&output.stdout);
-    Ok(!result.trim().is_empty())
+    // Parse JSON in Rust instead of using jq to prevent injection
+    let labels: Vec<GhLabel> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Failed to parse label JSON: {e}"))?;
+
+    Ok(labels.iter().any(|l| l.name == name))
 }
 
 /// Create a GitHub label
@@ -755,6 +854,119 @@ fn update_github_label(name: &str, description: &str, color: &str) -> Result<(),
     }
 
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct LabelResetResult {
+    issues_cleaned: usize,
+    prs_updated: usize,
+    errors: Vec<String>,
+}
+
+/// Reset GitHub label state machine by cleaning up in-progress labels
+#[tauri::command]
+fn reset_github_labels() -> Result<LabelResetResult, String> {
+    let mut result = LabelResetResult {
+        issues_cleaned: 0,
+        prs_updated: 0,
+        errors: Vec::new(),
+    };
+
+    // Step 1: Remove loom:in-progress from all open issues
+    let issues_output = Command::new("gh")
+        .args([
+            "issue",
+            "list",
+            "--label",
+            "loom:in-progress",
+            "--state",
+            "open",
+            "--json",
+            "number",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to list issues: {e}"))?;
+
+    if issues_output.status.success() {
+        // Parse JSON in Rust instead of using jq to prevent injection
+        let issues: Vec<GhIssue> = serde_json::from_slice(&issues_output.stdout)
+            .map_err(|e| format!("Failed to parse issue JSON: {e}"))?;
+
+        for issue in issues {
+            let issue_num = issue.number.to_string();
+
+            let remove_output = Command::new("gh")
+                .args([
+                    "issue",
+                    "edit",
+                    &issue_num,
+                    "--remove-label",
+                    "loom:in-progress",
+                ])
+                .output()
+                .map_err(|e| format!("Failed to remove label: {e}"))?;
+
+            if remove_output.status.success() {
+                result.issues_cleaned += 1;
+            } else {
+                let error = format!(
+                    "Failed to remove loom:in-progress from issue {issue_num}: {}",
+                    String::from_utf8_lossy(&remove_output.stderr)
+                );
+                result.errors.push(error);
+            }
+        }
+    }
+
+    // Step 2: Replace loom:reviewing with loom:review-requested on PRs
+    let prs_output = Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--label",
+            "loom:reviewing",
+            "--state",
+            "open",
+            "--json",
+            "number",
+        ])
+        .output()
+        .map_err(|e| format!("Failed to list PRs: {e}"))?;
+
+    if prs_output.status.success() {
+        // Parse JSON in Rust instead of using jq to prevent injection
+        let prs: Vec<GhPr> = serde_json::from_slice(&prs_output.stdout)
+            .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+
+        for pr in prs {
+            let pr_num = pr.number.to_string();
+
+            let edit_output = Command::new("gh")
+                .args([
+                    "pr",
+                    "edit",
+                    &pr_num,
+                    "--remove-label",
+                    "loom:reviewing",
+                    "--add-label",
+                    "loom:review-requested",
+                ])
+                .output()
+                .map_err(|e| format!("Failed to update PR labels: {e}"))?;
+
+            if edit_output.status.success() {
+                result.prs_updated += 1;
+            } else {
+                let error = format!(
+                    "Failed to update labels on PR {pr_num}: {}",
+                    String::from_utf8_lossy(&edit_output.stderr)
+                );
+                result.errors.push(error);
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Create a new local git repository with Loom configuration
@@ -926,13 +1138,10 @@ fn init_loom_directory(project_path: &Path) -> Result<(), String> {
     fs::create_dir_all(&loom_dir).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
     // Copy default config from defaults directory
-    let defaults_dir = Path::new("defaults");
-    if !defaults_dir.exists() {
-        return Err("Defaults directory not found".to_string());
-    }
+    let defaults_dir = resolve_defaults_path("defaults")?;
 
     // Copy entire defaults directory structure to .loom
-    copy_dir_recursive(defaults_dir, &loom_dir)
+    copy_dir_recursive(&defaults_dir, &loom_dir)
         .map_err(|e| format!("Failed to copy defaults: {e}"))?;
 
     // Copy .loom-README.md to .loom/README.md if it exists
@@ -1013,6 +1222,15 @@ fn emit_menu_event(window: tauri::Window, event_name: &str) -> Result<(), String
         .map_err(|e| format!("Failed to emit event: {e}"))
 }
 
+/// Emit any event programmatically (for MCP file watcher)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn emit_event(window: tauri::Window, event: &str) -> Result<(), String> {
+    window
+        .emit(event, ())
+        .map_err(|e| format!("Failed to emit event: {e}"))
+}
+
 /// Append console log message to file for MCP access
 #[tauri::command]
 fn append_to_console_log(content: &str) -> Result<(), String> {
@@ -1045,19 +1263,46 @@ fn append_to_console_log(content: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Trigger workspace start programmatically (for MCP/testing)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn trigger_start(window: tauri::Window) -> Result<(), String> {
+    window
+        .emit("start-workspace", ())
+        .map_err(|e| format!("Failed to emit start-workspace event: {e}"))
+}
+
+/// Trigger force start programmatically (for MCP/testing)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn trigger_force_start(window: tauri::Window) -> Result<(), String> {
+    window
+        .emit("force-start-workspace", ())
+        .map_err(|e| format!("Failed to emit force-start-workspace event: {e}"))
+}
+
+/// Trigger factory reset programmatically (for MCP/testing)
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn trigger_factory_reset(window: tauri::Window) -> Result<(), String> {
+    window
+        .emit("factory-reset-workspace", ())
+        .map_err(|e| format!("Failed to emit factory-reset-workspace event: {e}"))
+}
+
 /// Kill all loom tmux sessions
 #[tauri::command]
 fn kill_all_loom_sessions() -> Result<(), String> {
-    eprintln!("[kill_all_loom_sessions] Killing all loom tmux sessions");
+    safe_eprintln!("[kill_all_loom_sessions] Killing all loom tmux sessions");
 
     let output = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
         .output()
         .map_err(|e| format!("Failed to list tmux sessions: {e}"))?;
 
     if !output.status.success() {
         // tmux list-sessions fails if no sessions exist - this is OK
-        eprintln!("[kill_all_loom_sessions] No tmux sessions found");
+        safe_eprintln!("[kill_all_loom_sessions] No tmux sessions found");
         return Ok(());
     }
 
@@ -1066,17 +1311,17 @@ fn kill_all_loom_sessions() -> Result<(), String> {
 
     for session in sessions.lines() {
         if session.starts_with("loom-") {
-            eprintln!("[kill_all_loom_sessions] Killing tmux session: {session}");
+            safe_eprintln!("[kill_all_loom_sessions] Killing tmux session: {session}");
 
             let kill_output = Command::new("tmux")
-                .args(["kill-session", "-t", session])
+                .args(["-L", "loom", "kill-session", "-t", session])
                 .output()
                 .map_err(|e| format!("Failed to kill session {session}: {e}"))?;
 
             if kill_output.status.success() {
                 killed_count += 1;
             } else {
-                eprintln!(
+                safe_eprintln!(
                     "[kill_all_loom_sessions] Failed to kill {session}: {}",
                     String::from_utf8_lossy(&kill_output.stderr)
                 );
@@ -1084,7 +1329,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
         }
     }
 
-    eprintln!("[kill_all_loom_sessions] Killed {killed_count} sessions");
+    safe_eprintln!("[kill_all_loom_sessions] Killed {killed_count} sessions");
     Ok(())
 }
 
@@ -1096,8 +1341,12 @@ fn build_menu() -> Menu {
         CustomMenuItem::new("close_terminal", "Close Terminal").accelerator("CmdOrCtrl+Shift+W");
     let close_workspace =
         CustomMenuItem::new("close_workspace", "Close Workspace").accelerator("CmdOrCtrl+W");
+    let start_workspace =
+        CustomMenuItem::new("start_workspace", "Start...").accelerator("CmdOrCtrl+Shift+R");
+    let force_start_workspace = CustomMenuItem::new("force_start_workspace", "Force Start")
+        .accelerator("CmdOrCtrl+Shift+Alt+R");
     let factory_reset_workspace =
-        CustomMenuItem::new("factory_reset_workspace", "Factory Reset Workspace...");
+        CustomMenuItem::new("factory_reset_workspace", "Factory Reset...");
 
     let file_menu = Submenu::new(
         "File",
@@ -1106,6 +1355,8 @@ fn build_menu() -> Menu {
             .add_item(close_terminal)
             .add_native_item(MenuItem::Separator)
             .add_item(close_workspace)
+            .add_item(start_workspace)
+            .add_item(force_start_workspace)
             .add_item(factory_reset_workspace)
             .add_native_item(MenuItem::Separator)
             .add_native_item(MenuItem::Quit),
@@ -1189,6 +1440,12 @@ fn handle_menu_event(event: &tauri::WindowMenuEvent) {
         "close_workspace" => {
             let _ = event.window().emit("close-workspace", ());
         }
+        "start_workspace" => {
+            let _ = event.window().emit("start-workspace", ());
+        }
+        "force_start_workspace" => {
+            let _ = event.window().emit("force-start-workspace", ());
+        }
         "factory_reset_workspace" => {
             let _ = event.window().emit("factory-reset-workspace", ());
         }
@@ -1247,7 +1504,7 @@ fn main() {
             // Check if we're in development or production mode
             let is_production = !cfg!(debug_assertions);
 
-            eprintln!(
+            safe_eprintln!(
                 "[Loom] Starting in {} mode",
                 if is_production {
                     "production"
@@ -1255,6 +1512,29 @@ fn main() {
                     "development"
                 }
             );
+
+            // Handle CLI arguments
+            match app.get_cli_matches() {
+                Ok(matches) => {
+                    // Check for --workspace argument
+                    if let Some(workspace_arg) = matches.args.get("workspace") {
+                        if let serde_json::Value::String(workspace_path) = &workspace_arg.value {
+                            safe_eprintln!("[Loom] CLI workspace argument: {workspace_path}");
+
+                            // Get the main window
+                            if let Some(window) = app.get_window("main") {
+                                // Emit event to frontend with workspace path
+                                window.emit("cli-workspace", workspace_path).map_err(|e| {
+                                    format!("Failed to emit cli-workspace event: {e}")
+                                })?;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    safe_eprintln!("[Loom] Warning: Failed to parse CLI arguments: {e}");
+                }
+            }
 
             // Initialize daemon manager
             let mut daemon_manager = daemon_manager::DaemonManager::new()
@@ -1269,6 +1549,13 @@ fn main() {
             // Store daemon manager in app state for cleanup on quit
             app.manage(std::sync::Mutex::new(daemon_manager));
 
+            // Start MCP command file watcher
+            let window = app
+                .get_window("main")
+                .ok_or_else(|| "Failed to get main window".to_string())?;
+            mcp_watcher::start_mcp_watcher(window);
+            safe_eprintln!("[Loom] MCP command watcher started");
+
             Ok(())
         })
         .menu(menu)
@@ -1276,7 +1563,7 @@ fn main() {
         .on_window_event(|event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
                 // App is quitting - clean up resources
-                eprintln!("[Loom] App closing - cleaning up...");
+                safe_eprintln!("[Loom] App closing - cleaning up...");
 
                 let is_production = !cfg!(debug_assertions);
 
@@ -1294,28 +1581,28 @@ fn main() {
                 // Only kill tmux sessions in production mode
                 // In development, keep sessions alive for frontend hot reload reconnection
                 if is_production {
-                    eprintln!("[Loom] Production mode - cleaning up tmux sessions");
+                    safe_eprintln!("[Loom] Production mode - cleaning up tmux sessions");
                     let _ = Command::new("tmux")
-                        .args(["list-sessions", "-F", "#{session_name}"])
+                        .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
                         .output()
                         .map(|output| {
                             let sessions = String::from_utf8_lossy(&output.stdout);
                             for session in sessions.lines() {
                                 if session.starts_with("loom-") {
-                                    eprintln!("[Loom] Killing tmux session: {session}");
+                                    safe_eprintln!("[Loom] Killing tmux session: {session}");
                                     let _ = Command::new("tmux")
-                                        .args(["kill-session", "-t", session])
+                                        .args(["-L", "loom", "kill-session", "-t", session])
                                         .spawn();
                                 }
                             }
                         });
                 } else {
-                    eprintln!(
+                    safe_eprintln!(
                         "[Loom] Development mode - keeping tmux sessions alive for hot reload"
                     );
                 }
 
-                eprintln!("[Loom] Cleanup complete");
+                safe_eprintln!("[Loom] Cleanup complete");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1328,6 +1615,7 @@ fn main() {
             write_config,
             read_state,
             write_state,
+            read_text_file,
             write_file,
             list_role_files,
             read_role_file,
@@ -1344,6 +1632,7 @@ fn main() {
             list_available_sessions,
             attach_to_session,
             kill_session,
+            set_worktree_path,
             get_env_var,
             check_claude_code,
             get_stored_workspace,
@@ -1354,15 +1643,20 @@ fn main() {
             check_label_exists,
             create_github_label,
             update_github_label,
+            reset_github_labels,
             create_local_project,
             create_github_repository,
             emit_menu_event,
+            emit_event,
             append_to_console_log,
+            trigger_start,
+            trigger_force_start,
+            trigger_factory_reset,
             kill_all_loom_sessions
         ])
         .run(tauri::generate_context!())
     {
-        eprintln!("Error while running tauri application: {e}");
+        safe_eprintln!("Error while running tauri application: {e}");
         std::process::exit(1);
     }
 }

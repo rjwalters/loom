@@ -31,20 +31,39 @@ Issues can have an optional priority label to ensure urgent work gets immediate 
 | 🔴 **Urgent** | `loom:urgent` | Workers check first, before all other issues |
 | 🟢 **Normal** | *(no priority label)* | Workers use FIFO (oldest first) |
 
-### Who Can Add Priority Labels?
+### Who Manages Priority Labels?
 
-- **User**: Ultimate authority, can add any time
-- **Architect**: Can suggest during triage
-- **Curator**: Can add when enhancing issues
+- **Triage Agent**: Continuously monitors `loom:ready` issues and maintains top 3 as `loom:urgent`
+- **User**: Ultimate authority, can override any time
 - **Worker**: Should NOT add (conflict of interest)
+
+**Maximum Urgent: 3 Issues**
+
+The Triage agent enforces a strict limit: **never more than 3 issues marked `loom:urgent`**. This constraint prevents "everything is urgent" syndrome and forces real prioritization decisions.
 
 ### When to Use Urgent Priority
 
-Use `loom:urgent` sparingly for:
-- Security vulnerabilities requiring immediate patches
-- Critical bugs affecting users or blocking all other work
-- Production issues that need hotfixes
-- Time-sensitive work that cannot wait
+The Triage agent marks issues as `loom:urgent` based on:
+
+✅ **Strategic Impact**:
+- Blocks 2+ other high-value issues
+- Foundation for entire roadmap area
+- Unblocks entire team/workflow
+
+✅ **Time Sensitivity**:
+- Security vulnerabilities requiring patches
+- Critical bugs affecting users
+- Production issues needing hotfixes
+- User explicitly requested urgency
+
+✅ **Effort vs Value**:
+- Quick wins (< 1 day) with major impact
+- Low risk, high reward opportunities
+
+❌ **DO NOT mark urgent**:
+- Nice to have but not blocking anything
+- Can wait until next sprint
+- Large effort with uncertain value
 
 **Most issues should be normal priority** (no label). Urgent means "must be done NOW, before anything else."
 
@@ -295,7 +314,35 @@ If Worker discovers a dependency during implementation:
 5. Add loom:ready when enhancement complete
 ```
 
-### 3. Worker Bot
+### 3. Triage Bot
+**Role**: Dynamic priority management for ready issues
+
+**Watches for**:
+- `loom:ready` - Issues ready to be prioritized
+
+**Creates/Manages**:
+- `loom:urgent` - Maintains exactly top 3 priorities
+
+**Interval**: 15 minutes (recommended autonomous)
+
+**Workflow**:
+```
+1. Review all loom:ready issues
+2. Assess strategic priority based on:
+   - Impact on users/product vision
+   - Blocks other high-value work
+   - Time-sensitive (security, bugs, urgent requests)
+   - Effort vs value ratio
+3. Apply loom:urgent to top 3 issues only
+4. Remove loom:urgent from issues no longer critical
+5. When adding 4th urgent:
+   - Demote least critical of current 3 (with explanation)
+   - Promote new top priority (with reasoning)
+```
+
+**Key Constraint**: Never have more than 3 issues marked `loom:urgent`.
+
+### 4. Worker Bot
 **Role**: Implements features and fixes bugs
 
 **Watches for**:
@@ -318,7 +365,7 @@ If Worker discovers a dependency during implementation:
 6. If blocked: add loom:blocked with explanation
 ```
 
-### 4. Reviewer Bot
+### 5. Reviewer Bot
 **Role**: Reviews pull requests
 
 **Watches for**:
@@ -339,7 +386,7 @@ If Worker discovers a dependency during implementation:
 5. If approved: gh pr review --approve, remove loom:reviewing, add loom:approved (blue)
 ```
 
-### 5. Issues Bot
+### 6. Issues Bot
 **Role**: Creates well-structured GitHub issues from user requests
 
 **Watches for**: N/A (manual invocation)
@@ -357,7 +404,7 @@ If Worker discovers a dependency during implementation:
 5. Create issue (no label initially)
 ```
 
-### 6. Default (Plain Shell)
+### 7. Default (Plain Shell)
 **Role**: Standard terminal for manual commands
 
 No automation. Used for manual git operations, system commands, etc.
@@ -494,6 +541,23 @@ gh issue list --state=open --json number,title,labels \
 
 # Mark issue as ready (add green badge)
 gh issue edit <number> --add-label "loom:ready"
+```
+
+### Triage
+```bash
+# Find all ready issues
+gh issue list --label="loom:ready" --state=open --json number,title,labels,body
+
+# Find currently urgent issues
+gh issue list --label="loom:urgent" --state=open
+
+# Mark issue as urgent (with explanation)
+gh issue edit <number> --add-label "loom:urgent"
+gh issue comment <number> --body "🚨 **Marked as urgent** - [Explain reasoning]"
+
+# Remove urgent label (with explanation)
+gh issue edit <number> --remove-label "loom:urgent"
+gh issue comment <number> --body "ℹ️ **Removed urgent label** - [Explain priority shift]"
 ```
 
 ### Worker

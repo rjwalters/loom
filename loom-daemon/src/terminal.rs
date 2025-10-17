@@ -16,6 +16,26 @@ impl TerminalManager {
         }
     }
 
+    /// Validate terminal ID to prevent command injection
+    /// Only allows alphanumeric characters, hyphens, and underscores
+    fn validate_terminal_id(id: &str) -> Result<()> {
+        if id.is_empty() {
+            return Err(anyhow!("Terminal ID cannot be empty"));
+        }
+
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow!(
+                "Invalid terminal ID: '{}'. Only alphanumeric characters, hyphens, and underscores are allowed",
+                id
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn create_terminal(
         &mut self,
         config_id: &str,
@@ -24,6 +44,9 @@ impl TerminalManager {
         role: Option<&String>,
         instance_number: Option<u32>,
     ) -> Result<TerminalId> {
+        // Validate terminal ID to prevent command injection
+        Self::validate_terminal_id(config_id)?;
+
         // Use config_id directly as the terminal ID
         let id = config_id.to_string();
         let role_part = role.map_or("default", String::as_str);
@@ -33,6 +56,7 @@ impl TerminalManager {
         log::info!("Creating tmux session: {tmux_session}, working_dir: {working_dir:?}");
 
         let mut cmd = Command::new("tmux");
+        cmd.args(["-L", "loom"]);
         cmd.args([
             "new-session",
             "-d",
@@ -62,6 +86,7 @@ impl TerminalManager {
 
         log::info!("Setting up pipe-pane for session {tmux_session} to {output_file}");
         let result = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["pipe-pane", "-t", &tmux_session, "-o", &pipe_cmd])
             .output()?;
 
@@ -88,8 +113,26 @@ impl TerminalManager {
         Ok(id)
     }
 
-    pub fn list_terminals(&self) -> Vec<TerminalInfo> {
+    pub fn list_terminals(&mut self) -> Vec<TerminalInfo> {
+        // If registry is empty but tmux sessions exist, restore from tmux
+        if self.terminals.is_empty() {
+            log::debug!("Registry empty, attempting to restore from tmux");
+            if let Err(e) = self.restore_from_tmux() {
+                log::warn!("Failed to restore terminals from tmux: {e}");
+            }
+        }
         self.terminals.values().cloned().collect()
+    }
+
+    pub fn set_worktree_path(&mut self, id: &TerminalId, worktree_path: &str) -> Result<()> {
+        let info = self
+            .terminals
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("Terminal not found"))?;
+
+        info.worktree_path = Some(worktree_path.to_string());
+        log::info!("Set worktree path for terminal {id}: {worktree_path}");
+        Ok(())
     }
 
     pub fn destroy_terminal(&mut self, id: &TerminalId) -> Result<()> {
@@ -98,43 +141,63 @@ impl TerminalManager {
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
-        // If terminal has a worktree working directory, clean it up
-        if let Some(ref working_dir) = info.working_dir {
-            let path = PathBuf::from(working_dir);
-            // Check if this looks like a worktree path (.loom/worktrees/<id>)
+        // Check if terminal has a worktree_path for reference counting
+        if let Some(ref worktree_path) = info.worktree_path {
+            let path = PathBuf::from(worktree_path);
             if path.to_string_lossy().contains(".loom/worktrees") {
-                log::info!("Removing git worktree at {}", path.display());
+                // Count how many OTHER terminals are using this worktree
+                let other_users = self
+                    .terminals
+                    .values()
+                    .filter(|t| t.id != *id && t.worktree_path.as_ref() == Some(worktree_path))
+                    .count();
 
-                // First try to remove the worktree via git
-                let output = Command::new("git")
-                    .args(["worktree", "remove", working_dir])
-                    .output();
+                if other_users == 0 {
+                    // This is the last terminal - safe to remove
+                    log::info!(
+                        "Removing worktree at {} (no other terminals using it)",
+                        path.display()
+                    );
 
-                if let Ok(output) = output {
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        log::warn!("git worktree remove failed: {stderr}");
-                        log::info!("Attempting force removal...");
+                    // First try to remove the worktree via git
+                    let output = Command::new("git")
+                        .args(["worktree", "remove", worktree_path])
+                        .output();
 
-                        // Try force removal
-                        let _ = Command::new("git")
-                            .args(["worktree", "remove", "--force", working_dir])
-                            .output();
+                    if let Ok(output) = output {
+                        if !output.status.success() {
+                            let stderr = String::from_utf8_lossy(&output.stderr);
+                            log::warn!("git worktree remove failed: {stderr}");
+                            log::info!("Attempting force removal...");
+
+                            // Try force removal
+                            let _ = Command::new("git")
+                                .args(["worktree", "remove", "--force", worktree_path])
+                                .output();
+                        }
                     }
-                }
 
-                // Also try to remove directory manually as fallback
-                let _ = fs::remove_dir_all(&path);
+                    // Also try to remove directory manually as fallback
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    log::info!(
+                        "Skipping worktree removal at {} ({} other terminal(s) still using it)",
+                        path.display(),
+                        other_users
+                    );
+                }
             }
         }
 
         // Stop pipe-pane (passing no command closes the pipe)
         let _ = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["pipe-pane", "-t", &info.tmux_session])
             .spawn();
 
         // Kill the tmux session
         Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["kill-session", "-t", &info.tmux_session])
             .spawn()?
             .wait()?;
@@ -156,16 +219,19 @@ impl TerminalManager {
         match data {
             "\r" => {
                 Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["send-keys", "-t", &info.tmux_session, "Enter"])
                     .spawn()?;
             }
             "\u{0003}" => {
                 Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["send-keys", "-t", &info.tmux_session, "C-c"])
                     .spawn()?;
             }
             _ => {
                 Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["send-keys", "-t", &info.tmux_session, "-l", data])
                     .spawn()?;
             }
@@ -233,6 +299,7 @@ impl TerminalManager {
 
         // Resize tmux window (which resizes the pane when there's only one pane)
         Command::new("tmux")
+            .args(["-L", "loom"])
             .args([
                 "resize-window",
                 "-t",
@@ -250,6 +317,7 @@ impl TerminalManager {
 
     pub fn restore_from_tmux(&mut self) -> Result<()> {
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()?;
 
@@ -258,16 +326,45 @@ impl TerminalManager {
         for session in sessions.lines() {
             if let Some(remainder) = session.strip_prefix("loom-") {
                 // Session format: loom-{config_id}-{role}-{instance}
-                // Extract config_id (everything before the first hyphen after "loom-")
-                // For backwards compatibility, if no hyphens, use entire remainder as ID
-                let id = remainder.split_once('-').map_or_else(
-                    || remainder.to_string(),
-                    |(config_id, _rest)| config_id.to_string(),
-                );
+                // Extract config_id by checking for the "terminal-{number}" pattern
+                //
+                // Example session: loom-terminal-1-claude-code-worker-64
+                // After strip_prefix: terminal-1-claude-code-worker-64
+                // Split by '-': ["terminal", "1", "claude", "code", "worker", "64"]
+                //
+                // Strategy: If format is "terminal-{number}-...", extract "terminal-{number}"
+                // Otherwise use first part for backwards compatibility
+
+                let parts: Vec<&str> = remainder.split('-').collect();
+                if parts.is_empty() {
+                    log::warn!("Skipping malformed session name: {session}");
+                    continue;
+                }
+
+                // Check if this matches the "terminal-{number}" pattern
+                let id = if parts.len() >= 2
+                    && parts[0] == "terminal"
+                    && parts[1].chars().all(|c| c.is_ascii_digit())
+                {
+                    // Format: terminal-{number}-{role}-{instance}
+                    // Extract "terminal-{number}" as the ID
+                    format!("{}-{}", parts[0], parts[1])
+                } else {
+                    // For backwards compatibility with old format (no hyphens in ID),
+                    // use first part as the terminal ID
+                    parts[0].to_string()
+                };
+
+                // Validate terminal ID to prevent command injection
+                if let Err(e) = Self::validate_terminal_id(&id) {
+                    log::warn!("Skipping invalid terminal ID from tmux session {session}: {e}");
+                    continue;
+                }
 
                 // Clear any existing pipe-pane for this session to avoid duplicates
                 log::debug!("Clearing existing pipe-pane for session {session}");
                 let _ = Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["pipe-pane", "-t", session])
                     .spawn();
 
@@ -277,6 +374,7 @@ impl TerminalManager {
 
                 log::info!("Setting up pipe-pane for session {session} to {output_file}");
                 let result = Command::new("tmux")
+                    .args(["-L", "loom"])
                     .args(["pipe-pane", "-t", session, "-o", &pipe_cmd])
                     .output()?;
 
@@ -309,22 +407,50 @@ impl TerminalManager {
 
     /// Check if a tmux session exists for the given terminal ID
     pub fn has_tmux_session(&self, id: &TerminalId) -> Result<bool> {
-        let info = self
-            .terminals
-            .get(id)
-            .ok_or_else(|| anyhow!("Terminal not found"))?;
+        // First check if we have this terminal registered
+        if let Some(info) = self.terminals.get(id) {
+            // Terminal is registered - check its specific tmux session
+            let output = Command::new("tmux")
+                .args(["-L", "loom"])
+                .args(["has-session", "-t", &info.tmux_session])
+                .output()?;
+
+            return Ok(output.status.success());
+        }
+
+        // Terminal not registered yet - check if ANY loom session with this ID exists
+        // This handles the race condition where frontend creates state before daemon registers
+        log::debug!("Terminal {id} not found in registry, checking tmux sessions directly");
 
         let output = Command::new("tmux")
-            .args(["has-session", "-t", &info.tmux_session])
+            .args(["-L", "loom"])
+            .args(["list-sessions", "-F", "#{session_name}"])
             .output()?;
 
-        Ok(output.status.success())
+        if !output.status.success() {
+            // tmux server not running or no sessions
+            return Ok(false);
+        }
+
+        let sessions = String::from_utf8_lossy(&output.stdout);
+        let prefix = format!("loom-{id}-");
+
+        // Check if any session matches our terminal ID prefix
+        let has_session = sessions.lines().any(|s| s.starts_with(&prefix));
+
+        log::debug!(
+            "Terminal {id} tmux session check (unregistered): {}",
+            if has_session { "found" } else { "not found" }
+        );
+
+        Ok(has_session)
     }
 
     /// List all available loom tmux sessions
     #[allow(clippy::unused_self)]
     pub fn list_available_sessions(&self) -> Vec<String> {
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["list-sessions", "-F", "#{session_name}"])
             .output();
 
@@ -350,6 +476,7 @@ impl TerminalManager {
 
         // Verify the session exists
         let output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["has-session", "-t", &session_name])
             .output()?;
 
@@ -368,6 +495,7 @@ impl TerminalManager {
     pub fn kill_session(&self, session_name: &str) -> Result<()> {
         // Verify the session exists
         let check_output = Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["has-session", "-t", session_name])
             .output()?;
 
@@ -377,6 +505,7 @@ impl TerminalManager {
 
         // Kill the session
         Command::new("tmux")
+            .args(["-L", "loom"])
             .args(["kill-session", "-t", session_name])
             .spawn()?
             .wait()?;

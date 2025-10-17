@@ -1,20 +1,12 @@
 {
-  "nextAgentNumber": 7,
+  "nextAgentNumber": 10,
   "agents": [
     {
       "configId": "terminal-1",
       "id": "__needs_session__",
-      "name": "Shell",
-      "status": "idle",
-      "isPrimary": true,
-      "theme": "default"
-    },
-    {
-      "configId": "terminal-2",
-      "id": "__needs_session__",
       "name": "Architect",
       "status": "idle",
-      "isPrimary": false,
+      "isPrimary": true,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
@@ -22,22 +14,40 @@
         "targetInterval": 900000,
         "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
       },
+      "worktreePath": "",
       "theme": "lavender"
     },
     {
-      "configId": "terminal-3",
+      "configId": "terminal-2",
       "id": "__needs_session__",
       "name": "Curator",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "curator.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
       },
+      "worktreePath": "",
       "theme": "ocean"
+    },
+    {
+      "configId": "terminal-3",
+      "id": "__needs_session__",
+      "name": "Triage",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "triage.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Review all loom:ready issues and update loom:urgent labels to reflect current top 3 priorities"
+      },
+      "worktreePath": "",
+      "theme": "indigo"
     },
     {
       "configId": "terminal-4",
@@ -47,11 +57,12 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "reviewer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
       },
+      "worktreePath": "",
       "theme": "rose"
     },
     {
@@ -64,15 +75,11 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
-      "theme": "forest",
-      "agentStatus": "not_started",
-      "worktreePath": null,
-      "agentPid": null,
-      "lastIntervalRun": null,
-      "pendingInputRequests": []
+      "worktreePath": "",
+      "theme": "forest"
     },
     {
       "configId": "terminal-6",
@@ -84,10 +91,59 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
+      "worktreePath": "",
       "theme": "forest"
+    },
+    {
+      "configId": "terminal-7",
+      "id": "__needs_session__",
+      "name": "Fixer",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "fixer.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Check for PRs with review feedback: gh pr list --label=\"loom:reviewing\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
+      },
+      "worktreePath": "",
+      "theme": "amber"
+    },
+    {
+      "configId": "terminal-8",
+      "id": "__needs_session__",
+      "name": "Critic",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "critic.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:critic-suggestion label if you find something concrete"
+      },
+      "worktreePath": "",
+      "theme": "gray"
+    },
+    {
+      "configId": "terminal-9",
+      "id": "__needs_session__",
+      "name": "Worker 3",
+      "status": "idle",
+      "isPrimary": false,
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "codex",
+        "roleFile": "worker.md",
+        "targetInterval": 60000,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "worktreePath": "",
+      "theme": "crimson"
     }
   ]
 }

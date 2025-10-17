@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::daemon_client::{DaemonClient, Request, Response};
+use crate::safe_eprintln;
 
 pub struct DaemonManager {
     daemon_process: Option<Child>,
@@ -15,7 +16,7 @@ impl DaemonManager {
     pub fn new() -> Result<Self> {
         let socket_path = dirs::home_dir()
             .ok_or_else(|| anyhow!("No home directory"))?
-            .join(".loom/daemon.sock");
+            .join(".loom/loom-daemon.sock");
 
         Ok(Self {
             daemon_process: None,
@@ -33,14 +34,14 @@ impl DaemonManager {
 
     /// Start daemon in production mode (as child process)
     pub fn start_daemon_production(&mut self, daemon_path: PathBuf) -> Result<()> {
-        eprintln!("[DaemonManager] Starting daemon in production mode...");
+        safe_eprintln!("[DaemonManager] Starting daemon in production mode...");
 
         let child = Command::new(daemon_path)
             .spawn()
             .map_err(|e| anyhow!("Failed to spawn daemon: {e}"))?;
 
         self.daemon_process = Some(child);
-        eprintln!(
+        safe_eprintln!(
             "[DaemonManager] Daemon process spawned with PID: {:?}",
             self.daemon_process.as_ref().map(std::process::Child::id)
         );
@@ -50,7 +51,7 @@ impl DaemonManager {
 
     /// Wait for daemon to be ready (socket exists and responds to ping)
     pub async fn wait_for_ready(&self, timeout_secs: u64) -> Result<()> {
-        eprintln!("[DaemonManager] Waiting for daemon to be ready...");
+        safe_eprintln!("[DaemonManager] Waiting for daemon to be ready...");
 
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
@@ -68,7 +69,7 @@ impl DaemonManager {
 
             // Try to ping daemon
             if self.is_daemon_running().await {
-                eprintln!("[DaemonManager] Daemon is ready!");
+                safe_eprintln!("[DaemonManager] Daemon is ready!");
                 return Ok(());
             }
 
@@ -78,7 +79,7 @@ impl DaemonManager {
 
     /// Connect to existing daemon (development mode)
     pub async fn connect_to_existing(&self) -> Result<()> {
-        eprintln!("[DaemonManager] Connecting to existing daemon...");
+        safe_eprintln!("[DaemonManager] Connecting to existing daemon...");
 
         if !self.socket_path.exists() {
             return Err(anyhow!(
@@ -89,23 +90,51 @@ impl DaemonManager {
             ));
         }
 
+        // Check if socket is stale (exists but no daemon responding)
         if !self.is_daemon_running().await {
+            safe_eprintln!(
+                "[DaemonManager] Detected stale socket at {}, cleaning up...",
+                self.socket_path.display()
+            );
+
+            // Remove stale socket
+            if let Err(e) = std::fs::remove_file(&self.socket_path) {
+                safe_eprintln!("[DaemonManager] Warning: failed to remove stale socket: {e}");
+            } else {
+                safe_eprintln!("[DaemonManager] Stale socket removed");
+            }
+
             return Err(anyhow!(
-                "Daemon socket exists but daemon is not responding. \
-                 Please restart the daemon:\n  \
+                "Daemon socket was stale and has been cleaned up. \
+                 Please start the daemon:\n  \
                  RUST_LOG=info cargo run --manifest-path=loom-daemon/Cargo.toml"
             ));
         }
 
-        eprintln!("[DaemonManager] Successfully connected to existing daemon");
+        safe_eprintln!("[DaemonManager] Successfully connected to existing daemon");
         Ok(())
     }
 
     /// Ensure daemon is running (start if needed in prod, connect in dev)
     pub async fn ensure_daemon_running(&mut self, is_production: bool) -> Result<()> {
+        // Check if socket exists but daemon not responding (stale socket)
+        if self.socket_path.exists() && !self.is_daemon_running().await {
+            safe_eprintln!(
+                "[DaemonManager] Detected stale socket at {}, cleaning up...",
+                self.socket_path.display()
+            );
+
+            // Remove stale socket
+            if let Err(e) = std::fs::remove_file(&self.socket_path) {
+                safe_eprintln!("[DaemonManager] Warning: failed to remove stale socket: {e}");
+            } else {
+                safe_eprintln!("[DaemonManager] Stale socket removed");
+            }
+        }
+
         // If daemon is already running, we're good
         if self.is_daemon_running().await {
-            eprintln!("[DaemonManager] Daemon already running");
+            safe_eprintln!("[DaemonManager] Daemon already running");
             return Ok(());
         }
 
@@ -129,10 +158,10 @@ impl DaemonManager {
     /// Kill daemon (only if we spawned it)
     pub fn kill_daemon(&mut self) {
         if let Some(mut child) = self.daemon_process.take() {
-            eprintln!("[DaemonManager] Killing daemon process...");
+            safe_eprintln!("[DaemonManager] Killing daemon process...");
             let _ = child.kill();
             let _ = child.wait();
-            eprintln!("[DaemonManager] Daemon killed");
+            safe_eprintln!("[DaemonManager] Daemon killed");
         }
     }
 }

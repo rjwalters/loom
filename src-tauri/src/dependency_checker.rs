@@ -37,9 +37,38 @@ fn check_gh_copilot() -> bool {
 }
 
 fn check_command(command: &str) -> bool {
-    Command::new("which")
+    // First try using `which` command
+    if Command::new("which")
         .arg(command)
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+    {
+        return true;
+    }
+
+    // macOS GUI apps don't inherit full shell PATH, so check common installation paths
+    // This fixes the issue where tmux is installed via Homebrew but not found by `which`
+    let common_paths = vec![
+        format!("/opt/homebrew/bin/{command}"), // Apple Silicon Homebrew
+        format!("/usr/local/bin/{command}"),    // Intel Homebrew
+        format!("/usr/bin/{command}"),          // System binaries
+        format!("/bin/{command}"),              // Core utilities
+    ];
+
+    for path in common_paths {
+        if std::path::Path::new(&path).exists() {
+            // Verify it's executable by trying to run --version or --help
+            if Command::new(&path)
+                .arg("--version")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+
+    false
 }

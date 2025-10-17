@@ -1,23 +1,6 @@
 {
   "terminals": [
     {
-      "id": "terminal-1",
-      "name": "Shell",
-      "theme": "default"
-    },
-    {
-      "id": "terminal-2",
-      "name": "Architect",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "architect.md",
-        "targetInterval": 900000,
-        "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
-      },
-      "theme": "lavender"
-    },
-    {
       "id": "terminal-3",
       "name": "Curator",
       "role": "claude-code-worker",
@@ -48,7 +31,7 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest"
@@ -60,10 +43,15 @@
       "roleConfig": {
         "workerType": "claude",
         "roleFile": "worker.md",
-        "targetInterval": 0,
+        "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
       "theme": "forest"
+    },
+    {
+      "id": "terminal-1",
+      "name": "Terminal 5",
+      "theme": "default"
     }
   ]
 }

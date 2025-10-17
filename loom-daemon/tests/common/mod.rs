@@ -135,6 +135,7 @@ impl TestClient {
     }
 
     /// Helper: Send Ping request
+    #[allow(dead_code)]
     pub async fn ping(&mut self) -> Result<()> {
         let request = serde_json::json!({"type": "Ping"});
         let response = self.send_request(request).await?;
@@ -175,6 +176,7 @@ impl TestClient {
     }
 
     /// Helper: List terminals
+    #[allow(dead_code)]
     pub async fn list_terminals(&mut self) -> Result<Vec<serde_json::Value>> {
         let request = serde_json::json!({"type": "ListTerminals"});
         let response = self.send_request(request).await?;
@@ -188,6 +190,7 @@ impl TestClient {
     }
 
     /// Helper: Destroy terminal
+    #[allow(dead_code)]
     pub async fn destroy_terminal(&mut self, id: &str) -> Result<()> {
         let request = serde_json::json!({
             "type": "DestroyTerminal",
@@ -204,6 +207,7 @@ impl TestClient {
     }
 
     /// Helper: Send input to terminal
+    #[allow(dead_code)]
     pub async fn send_input(&mut self, id: &str, data: &str) -> Result<()> {
         let request = serde_json::json!({
             "type": "SendInput",
@@ -221,9 +225,10 @@ impl TestClient {
 }
 
 /// Helper: Check if a tmux session exists
+#[allow(dead_code)]
 pub fn tmux_session_exists(session_name: &str) -> bool {
     Command::new("tmux")
-        .args(["has-session", "-t", session_name])
+        .args(["-L", "loom", "has-session", "-t", session_name])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -232,14 +237,14 @@ pub fn tmux_session_exists(session_name: &str) -> bool {
 /// Helper: Kill a tmux session (for cleanup)
 pub fn kill_tmux_session(session_name: &str) {
     let _ = Command::new("tmux")
-        .args(["kill-session", "-t", session_name])
+        .args(["-L", "loom", "kill-session", "-t", session_name])
         .output();
 }
 
 /// Helper: Get list of all loom-* tmux sessions
 pub fn get_loom_tmux_sessions() -> Vec<String> {
     let output = Command::new("tmux")
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["-L", "loom", "list-sessions", "-F", "#{session_name}"])
         .output();
 
     match output {

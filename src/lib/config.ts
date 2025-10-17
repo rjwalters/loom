@@ -36,11 +36,15 @@ export interface TerminalState {
     prompt: string;
     timestamp: number;
   }>;
+  // Timer tracking fields
+  busyTime?: number; // Total milliseconds spent in busy state
+  idleTime?: number; // Total milliseconds spent in idle state
+  lastStateChange?: number; // Timestamp (ms) of last status change
 }
 
 export interface LoomState {
   daemonPid?: number; // Running daemon process ID
-  nextAgentNumber: number; // Counter for terminal numbering
+  nextAgentNumber: number; // Counter for terminal numbering (legacy name for compatibility)
   terminals: TerminalState[];
 }
 
@@ -60,6 +64,19 @@ let cachedWorkspacePath: string | null = null;
  */
 export function setConfigWorkspace(workspacePath: string): void {
   cachedWorkspacePath = workspacePath;
+}
+
+/**
+ * Assert that workspace is configured before file operations
+ * Throws descriptive error if workspace is not set
+ */
+function assertWorkspace(): string {
+  if (!cachedWorkspacePath) {
+    throw new Error(
+      "No workspace configured - call setConfigWorkspace() before loading/saving config"
+    );
+  }
+  return cachedWorkspacePath;
 }
 
 /**
@@ -116,6 +133,9 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
       agentStatus: agent.agentStatus,
       lastIntervalRun: agent.lastIntervalRun,
       pendingInputRequests: agent.pendingInputRequests,
+      busyTime: agent.busyTime,
+      idleTime: agent.idleTime,
+      lastStateChange: agent.lastStateChange,
     });
   });
 
@@ -134,12 +154,10 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
  */
 export async function loadConfig(): Promise<LoomConfig> {
   try {
-    if (!cachedWorkspacePath) {
-      throw new Error("No workspace set - cannot load config");
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = await invoke<string>("read_config", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
     });
 
     const parsed = JSON.parse(contents);
@@ -169,13 +187,11 @@ export async function loadConfig(): Promise<LoomConfig> {
  */
 export async function saveConfig(config: LoomConfig): Promise<void> {
   try {
-    if (!cachedWorkspacePath) {
-      return;
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = JSON.stringify(config, null, 2);
     await invoke("write_config", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
       configJson: contents,
     });
   } catch (error) {
@@ -188,12 +204,10 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
  */
 export async function loadState(): Promise<LoomState> {
   try {
-    if (!cachedWorkspacePath) {
-      throw new Error("No workspace set - cannot load state");
-    }
+    const workspacePath = assertWorkspace();
 
     const contents = await invoke<string>("read_state", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
     });
 
     return JSON.parse(contents) as LoomState;
@@ -209,16 +223,34 @@ export async function loadState(): Promise<LoomState> {
 
 /**
  * Save state to .loom/state.json
+ * Sanitizes runtime-only flags that shouldn't persist across restarts
  */
 export async function saveState(state: LoomState): Promise<void> {
   try {
-    if (!cachedWorkspacePath) {
-      return;
-    }
+    const workspacePath = assertWorkspace();
 
-    const contents = JSON.stringify(state, null, 2);
+    // Strip runtime-only flags before persisting
+    // missingSession is a runtime status indicator that should be re-evaluated on startup
+    const sanitized: LoomState = {
+      ...state,
+      terminals: state.terminals.map((terminal) => {
+        // Remove missingSession if present (defensive - splitTerminals should already exclude it)
+        const { missingSession, ...rest } = terminal as TerminalState & {
+          missingSession?: boolean;
+        };
+
+        // Also reset error status if it was only due to missing session
+        if (rest.status === TerminalStatus.Error && missingSession) {
+          return { ...rest, status: TerminalStatus.Idle };
+        }
+
+        return rest;
+      }),
+    };
+
+    const contents = JSON.stringify(sanitized, null, 2);
     await invoke("write_state", {
-      workspacePath: cachedWorkspacePath,
+      workspacePath,
       stateJson: contents,
     });
   } catch (error) {
@@ -252,6 +284,9 @@ export function mergeConfigAndState(
       agentStatus: st?.agentStatus,
       lastIntervalRun: st?.lastIntervalRun,
       pendingInputRequests: st?.pendingInputRequests,
+      busyTime: st?.busyTime,
+      idleTime: st?.idleTime,
+      lastStateChange: st?.lastStateChange,
     };
   });
 
@@ -279,13 +314,18 @@ export function splitTerminals(terminals: Terminal[]): {
 
   const state: TerminalState[] = terminals.map((t) => ({
     id: t.id,
-    status: t.status,
+    // Don't persist error status - terminals should start as idle
+    // Health monitor will re-detect missing sessions if they actually don't exist
+    status: t.status === TerminalStatus.Error ? TerminalStatus.Idle : t.status,
     isPrimary: t.isPrimary,
     worktreePath: t.worktreePath,
     agentPid: t.agentPid,
     agentStatus: t.agentStatus,
     lastIntervalRun: t.lastIntervalRun,
     pendingInputRequests: t.pendingInputRequests,
+    busyTime: t.busyTime,
+    idleTime: t.idleTime,
+    lastStateChange: t.lastStateChange,
   }));
 
   return { config, state };

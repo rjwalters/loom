@@ -246,6 +246,12 @@ fn validate_git_repo(path: String) -> Result<bool, String> {
   - Checks path exists and is a directory
   - Verifies `.git` directory exists
   - Returns `Result<bool, String>` with specific error messages
+- `reset_github_labels()`: Resets GitHub label state machine during workspace restart
+  - Removes `loom:in-progress` from all open issues
+  - Replaces `loom:reviewing` with `loom:review-requested` on all open PRs
+  - Returns `LabelResetResult` with counts and errors
+  - Called automatically during both start-workspace and force-start-workspace
+  - Non-critical operation - continues on error
 
 **Workspace Validation Pattern**:
 ```typescript
@@ -482,26 +488,25 @@ This design is **sandbox-compatible** because:
 - Each terminal gets its own isolated working directory
 - No shared state or conflicts between agents
 
-**Automatic Worktree Lifecycle** (`src/lib/worktree-manager.ts:28`):
+**On-Demand Worktree Creation** (`scripts/worktree.sh`):
 
-When an agent terminal is created with worktree mode enabled:
+Agents create worktrees when claiming issues using the helper script:
 
-```typescript
-// 1. Create worktree directory
-const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
+```bash
+# Agent claims issue and creates worktree
+pnpm worktree 42
 
-// 2. Execute setup commands via terminal
-mkdir -p "${worktreePath}"
-git worktree add "${worktreePath}" HEAD
-cd "${worktreePath}"
-
-// 3. Optional: Configure git identity
-git config user.name "Agent Name"
-git config user.email "agent@example.com"
-
-// 4. Show success message
-echo "✓ Worktree ready at ${worktreePath}"
+# This runs the helper script which:
+# 1. Validates issue number
+# 2. Checks for nested worktrees (prevents if already in one)
+# 3. Creates worktree at .loom/worktrees/issue-42
+# 4. Creates branch feature/issue-42 from main
+# 5. Provides clear instructions for next steps
 ```
+
+**Manual Worktree Creation** (`src/lib/worktree-manager.ts:28`):
+
+The old `setupWorktreeForAgent()` function still exists but is no longer called automatically during workspace start. It can be used programmatically if needed.
 
 **Daemon Auto-Cleanup** (`loom-daemon/src/terminal.rs:87-102`):
 
@@ -521,26 +526,137 @@ if working_directory.contains("/.loom/worktrees/") {
 }
 ```
 
-**Manual Worktree Creation for Development**:
+**IMPORTANT: Understanding Worktree Contexts**:
 
-When working on issues manually (not through the app), create worktrees using the same path pattern:
+There are **two completely different contexts** for worktrees in Loom, and this is critical to understand:
+
+### Context 1: Agents Running Inside Loom (Normal Use)
+
+**Agents start in the main workspace, not in worktrees.** Worktrees are created on-demand when claiming issues:
+
+- Agents begin in the main workspace directory (not isolated)
+- To work on an issue: `pnpm worktree <issue-number>` creates `.loom/worktrees/issue-{number}`
+- Helper script prevents nested worktrees and ensures proper paths
+- Multiple agents can work simultaneously by each claiming their own issue
+- Worktrees are named semantically by issue number, not terminal ID
+
+**For agents**: Use `pnpm worktree <issue>` when claiming an issue. Create feature branches in your worktree.
+
+### Context 2: Human Developers Working on Loom's Codebase (Dogfooding)
+
+When **human developers** (not agents) want to work on Loom issues manually outside the app, use the worktree helper script:
 
 ```bash
-# CORRECT - Sandbox-compatible, inside workspace
-git worktree add .loom/worktrees/issue-84 -b feature/issue-84-test-coverage main
+# ✅ CORRECT - Use the helper script
+pnpm worktree 84
 
-# WRONG - Creates directory outside workspace
-git worktree add ../loom-issue-84 -b feature/issue-84-test-coverage main
+# ✅ With custom branch name
+pnpm worktree 84 my-custom-branch
+
+# ✅ Check if you're already in a worktree
+pnpm worktree --check
+
+# ❌ WRONG - Don't run git worktree commands directly
+git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 ```
 
-**Benefits of This Approach**:
+**Why Use the Helper Script?**
 
-1. **Isolation**: Each agent has its own working directory and branch
-2. **No Conflicts**: Agents can't interfere with each other's work
-3. **Clean Workspace**: Main working directory remains unaffected
-4. **Auto-Cleanup**: Daemon removes worktrees when terminals are destroyed
-5. **Gitignored**: Worktrees don't clutter git status
-6. **Sandbox-Safe**: All worktrees inside workspace, no filesystem escapes
+1. **Prevents Nested Worktrees**: Automatically detects if you're already in a worktree and prevents accidental nesting
+2. **Consistent Paths**: Always creates worktrees at `.loom/worktrees/issue-{number}` (sandbox-safe)
+3. **Automatic Branch Naming**: Prefixes branches with `feature/` automatically
+4. **Error Prevention**: Clear error messages instead of cryptic git errors
+5. **Safety Checks**: Validates issue numbers, checks for existing directories, handles existing branches
+
+**Worktree Helper Usage**:
+
+```bash
+# Basic usage - creates worktree for issue #42
+pnpm worktree 42
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/issue-42
+
+# Custom branch name
+pnpm worktree 42 fix-critical-bug
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/fix-critical-bug
+
+# Check current worktree status
+pnpm worktree --check
+# → Shows: Current worktree path and branch (or confirms you're in main)
+
+# Show help
+pnpm worktree --help
+```
+
+**When to Use the Helper Script**:
+
+- **Human developers** working on Loom codebase issues manually
+- **NOT for agents** (they already have worktrees)
+- **NOT needed when using Loom itself** (it creates worktrees automatically)
+
+**Human Developer Workflow**:
+
+```bash
+# 1. Starting work on issue #123 (from main workspace)
+cd /Users/rwalters/GitHub/loom
+pnpm worktree 123
+cd .loom/worktrees/issue-123
+# Work on the issue, commit, push, create PR
+
+# 2. Check if you're in a worktree
+pnpm worktree --check
+
+# 3. Returning to main after finishing
+cd /Users/rwalters/GitHub/loom
+git checkout main
+```
+
+**Error Handling**:
+
+The helper script provides clear guidance for common issues:
+
+- **Already in a worktree**: Shows current worktree info and instructions to return to main
+- **Directory exists**: Checks if it's a valid worktree or needs cleanup
+- **Branch exists**: Prompts whether to use existing branch or create new one
+- **Invalid issue number**: Rejects non-numeric input with usage help
+
+**Implementation**: See `scripts/worktree.sh` for the full implementation
+
+**Workflow for Agents**:
+
+When agents running inside Loom work on issues:
+
+```bash
+# 1. Claim issue and create worktree
+gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
+pnpm worktree 42
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/issue-42
+
+# 2. Change to worktree
+cd .loom/worktrees/issue-42
+
+# 3. Do the work
+# ... implement, test, commit ...
+
+# 4. Push and create PR
+git push -u origin feature/issue-42
+gh pr create --label "loom:review-requested"
+
+# 5. Return to main workspace
+cd ../..
+```
+
+**Benefits of On-Demand Worktree System**:
+
+1. **Semantic Naming**: Worktrees named by issue number (`.loom/worktrees/issue-42`), not terminal ID
+2. **On-Demand Creation**: Only create worktrees when needed, reducing resource usage
+3. **No Nested Worktrees**: Helper script prevents accidental nesting and provides clear error messages
+4. **Isolation When Needed**: Each agent can work on separate issues without conflicts
+5. **Clean Workspace**: Agents start in main workspace, create worktrees only for implementation
+6. **Gitignored**: Worktrees don't clutter git status
+7. **Sandbox-Safe**: All worktrees inside workspace, no filesystem escapes
 
 **TypeScript Worktree Setup** (`src/lib/agent-launcher.ts:27-34`):
 
@@ -678,6 +794,24 @@ If this passes, CI should pass too.
 
 **Package Manager Preference**: Always use `pnpm` (not `npm`) as the package manager for this project.
 
+**Development Workflow**:
+
+Use the appropriate script based on your scenario:
+
+- **`pnpm app:dev`**: Normal development with hot reload (fastest iteration)
+  - Use when: Making frequent frontend changes
+  - Caveat: Hot reload sometimes misses changes (see "Stale Code Issue" below)
+
+- **`pnpm app:preview`**: Complete rebuild + launch (recommended for testing)
+  - Use when: After pulling new code, switching branches, or hot reload misses changes
+  - Always rebuilds both frontend AND Tauri binary before launching
+  - This is the "safe" option that guarantees fresh code
+
+- **`pnpm app:build`**: Production build
+  - Use when: Creating release builds
+
+**Stale Code Issue**: If you pull new code or switch branches, run `pnpm app:preview` to ensure you're running the latest code. The `tauri dev` command caches the built frontend and hot reload doesn't always catch everything, leading to wasted debugging time.
+
 ### Clippy Configuration Details
 
 The `.cargo/config.toml` enforces strict linting:
@@ -703,6 +837,104 @@ rustflags = [
 - Prefer proper error handling with `Result` and `?` operator
 - Use `expect()` with descriptive messages only when panic is acceptable
 - Add `#[allow]` attribute with explanatory comment when necessary
+
+## Self-Modification Problem
+
+**CRITICAL**: Loom cannot develop itself using `app:dev` mode due to hot reload causing restart loops.
+
+### The Problem
+
+When running Loom in development mode (`pnpm app:dev`), Vite watches for file changes and triggers hot module replacement (HMR). If agent terminals within Loom are working on the Loom codebase itself:
+
+1. Agent edits source file (e.g., `src/lib/workspace-reset.ts`)
+2. Vite detects change and triggers HMR
+3. Tauri reloads the app
+4. App restart interrupts the agent mid-work
+5. Agent continues, edits another file
+6. **Infinite restart loop**
+
+This makes it impossible for Loom to work on its own codebase in dev mode.
+
+### Solutions
+
+**Option 1: Use Preview Mode (Recommended)**
+```bash
+pnpm app:preview
+```
+- Builds the app once, then runs without hot reload
+- Agents can edit files without triggering restarts
+- Still faster than full production builds
+- Requires rebuild to see UI changes
+
+**Option 2: Use Production Mode**
+```bash
+pnpm app:build
+# Then run the built app from ./target/release/
+```
+- Fully optimized production build
+- No hot reload at all
+- Slowest rebuild cycle
+
+**Option 3: Work on Different Workspace**
+```bash
+# Clone Loom to a separate directory
+git clone https://github.com/your-username/loom ~/loom-dev
+cd ~/loom-dev
+pnpm app:preview
+
+# Point agent terminals at original workspace
+# Agents work in ~/GitHub/loom, app runs from ~/loom-dev
+```
+- Separates running app from workspace being edited
+- Best for testing factory reset and agent features
+- Requires keeping both repos in sync
+
+**Option 4: Disable Agent Terminals**
+```bash
+# Use app:dev but don't run any agent terminals
+pnpm app:dev
+# Keep terminals as plain shells or run agents on different repos
+```
+- Good for frontend development only
+- Can't test agent orchestration features
+
+### When to Use Each Mode
+
+**Use `app:dev`**:
+- Frontend-only development (CSS, UI components, layouts)
+- No agent terminals running
+- Working on a different repository with agent terminals
+
+**Use `app:preview`**:
+- Testing factory reset, agent launching, worktree management
+- Agent terminals working on Loom codebase
+- Integration testing with agents
+
+**Use `app:build`**:
+- Final testing before release
+- Performance profiling
+- Packaging for distribution
+
+### Vite Ignore Configuration
+
+Vite is already configured to ignore `.loom/**` directories:
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    watch: {
+      ignored: ["**/.loom/**"],  // Ignores .loom/worktrees/, .loom/config.json, etc.
+    },
+  },
+});
+```
+
+However, this only prevents changes to `.loom/` from triggering reloads. Changes to `src/**`, `loom-daemon/**`, or other source files will still trigger HMR.
+
+### Summary
+
+**DO NOT use `app:dev` when agent terminals are working on the Loom codebase.** Always use `app:preview` or `app:build` for self-modification scenarios.
 
 ## Styling Conventions
 
@@ -898,9 +1130,16 @@ cargo test --test integration_basic   # Run specific test file
 
 ## MCP Testing and Instrumentation
 
-**Location**: `mcp-loom-ui/`, `.mcp.json`
+**Location**: `mcp-loom-ui/`, `mcp-loom-logs/`, `mcp-loom-terminals/`, `.mcp.json`
 
-Loom provides MCP (Model Context Protocol) servers that enable AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
+Loom provides three MCP (Model Context Protocol) servers that enable AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
+
+**📖 Full API Documentation**: [docs/mcp/README.md](docs/mcp/README.md)
+
+**Available Servers**:
+- **[mcp-loom-ui](docs/mcp/loom-ui.md)** - UI interaction, console logs, workspace state (7 tools)
+- **[mcp-loom-logs](docs/mcp/loom-logs.md)** - Daemon, Tauri, and terminal logs (4 tools)
+- **[mcp-loom-terminals](docs/mcp/loom-terminals.md)** - Terminal management and IPC (4 tools)
 
 ### Console Logging to File
 
@@ -941,7 +1180,7 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
 1. **`read_console_log`**
    - Reads browser console output from `~/.loom/console.log`
    - Returns recent log entries with timestamps
-   - Use for debugging factory reset, agent launch, worktree setup
+   - Use for debugging workspace start, agent launch, worktree setup
 
 2. **`read_state_file`**
    - Reads current application state from `.loom/state.json`
@@ -953,10 +1192,22 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
    - Shows terminal roles, intervals, prompts
    - Use for verifying configuration persistence
 
-4. **`trigger_factory_reset`**
-   - Programmatically triggers factory reset via Tauri IPC
-   - Emits menu event to reset workspace to defaults
-   - Use for automated testing and setup
+4. **`trigger_start`**
+   - Start engine with EXISTING config (shows confirmation dialog)
+   - Uses current `.loom/config.json` to create terminals and launch agents
+   - Does NOT reset or overwrite configuration
+   - Use for restarting terminals after app restart or crash
+
+5. **`trigger_force_start`**
+   - Start engine with existing config WITHOUT confirmation
+   - Same as trigger_start but bypasses confirmation prompt
+   - Use for MCP automation and testing
+
+6. **`trigger_factory_reset`**
+   - Reset workspace to factory defaults (shows confirmation dialog)
+   - Overwrites `.loom/config.json` with `defaults/config.json`
+   - Does NOT auto-start the engine - must run trigger_start/force_start after
+   - Use for resetting configuration to clean state
 
 **MCP Configuration** (`.mcp.json`):
 ```json
@@ -975,25 +1226,31 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
 
 **Usage Example** (from Claude Code):
 ```bash
-# Read recent console logs to see factory reset progress
+# Read recent console logs to see workspace start progress
 mcp__loom-ui__read_console_log
 
-# Check terminal state after factory reset
+# Check terminal state after start
 mcp__loom-ui__read_state_file
 
-# Trigger factory reset programmatically
+# Check terminal configuration
+mcp__loom-ui__read_config_file
+
+# Start engine with existing config (bypasses confirmation for MCP automation)
+mcp__loom-ui__trigger_force_start
+
+# Reset workspace to defaults (requires separate start command after)
 mcp__loom-ui__trigger_factory_reset
 ```
 
-### Testing Factory Reset with MCP
+### Testing Workspace Start with MCP
 
-**Goal**: Verify factory reset creates 6 terminals with Claude Code agents running autonomously
+**Goal**: Verify workspace start creates 7 terminals with Claude Code agents running autonomously in the main workspace
 
 **Test Procedure**:
 
-1. **Trigger Reset**:
+1. **Start Engine** (use force_start for MCP automation):
    ```bash
-   mcp__loom-ui__trigger_factory_reset
+   mcp__loom-ui__trigger_force_start
    ```
 
 2. **Monitor Console Logs**:
@@ -1001,41 +1258,45 @@ mcp__loom-ui__trigger_factory_reset
    mcp__loom-ui__read_console_log
    ```
    Look for:
-   - `[factory-reset-workspace] Killing all loom tmux sessions`
-   - `[factory-reset-workspace] ✓ Created terminal X`
-   - `[launchAgentInTerminal] Worktree setup complete`
-   - `[launchAgentInTerminal] Attempt N: Sending "2" to accept warning`
+   - `[start-workspace] Killing all loom tmux sessions`
+   - `[start-workspace] ✓ Created terminal X`
+   - `[launchAgentInTerminal] ✓ Agent will start in main workspace`
+   - `[launchAgentInTerminal] Sending "2" to accept warning`
 
 3. **Verify State**:
    ```bash
    mcp__loom-ui__read_state_file
    ```
-   Confirm 6 terminals exist with correct session IDs and worktree paths
+   Confirm 7 terminals exist with correct session IDs (no worktree paths yet)
 
-4. **Check Terminal Outputs**:
-   ```bash
-   cat /tmp/loom-terminal-2.out  # Architect
-   cat /tmp/loom-terminal-3.out  # Curator
-   cat /tmp/loom-terminal-4.out  # Reviewer
-   cat /tmp/loom-terminal-5.out  # Worker 1
-   cat /tmp/loom-terminal-6.out  # Worker 2
-   ```
-   Look for Claude Code prompt interface (not error messages)
-
-5. **Verify Worktrees**:
+4. **Verify Main Workspace** (agents start here, create worktrees on-demand):
    ```bash
    ls -la .loom/worktrees/
-   git worktree list
+   # Should be empty or show only manually created worktrees
+   # Agents will create .loom/worktrees/issue-{number} when claiming issues
    ```
-   Confirm 5 worktrees created (terminals 2-6)
 
 **Expected Success Criteria**:
-- ✅ 6 terminals created (terminal-1 through terminal-6)
-- ✅ 5 worktrees created at `.loom/worktrees/terminal-{2-6}`
-- ✅ Claude Code running in terminals 2-6 (bypass permissions accepted)
-- ✅ Terminal 1 (Shell) has plain shell prompt
+- ✅ 7 terminals created (terminal-1 through terminal-7)
+- ✅ All terminals start in main workspace directory
+- ✅ NO automatic worktrees created during startup
+- ✅ Claude Code running in all 7 terminals (bypass permissions accepted)
 - ✅ No "command not found" or "duplicate session" errors
 - ✅ Console logs show successful agent launch sequence
+
+**Note**: Agents now start in the main workspace and create worktrees on-demand using `pnpm worktree <issue>` when claiming GitHub issues. This prevents resource waste and provides semantic naming (`.loom/worktrees/issue-42` instead of `terminal-1`).
+
+**Factory Reset + Start Workflow**:
+
+To reset configuration AND start the engine:
+
+```bash
+# Step 1: Reset config to defaults (does NOT auto-start)
+mcp__loom-ui__trigger_factory_reset
+
+# Step 2: Start engine with reset config
+mcp__loom-ui__trigger_force_start
+```
 
 ### Debugging Common Issues
 
@@ -1096,6 +1357,211 @@ This prevents malicious terminal names from injecting HTML/JS.
 - Tauri IPC will be used for process spawning (sandboxed)
 - API keys stored in system keychain (not .env)
 - GitHub OAuth for authentication
+
+## Structured Logging System (Issue #130)
+
+Loom implements a lightweight structured logging system with JSON-formatted log entries for easy parsing and debugging.
+
+### Frontend Logging
+
+**File**: `src/lib/logger.ts`
+
+```typescript
+import { Logger } from "./logger";
+
+// Create logger for component
+const logger = Logger.forComponent("worktree-manager");
+
+// Log informational message with context
+logger.info("Creating worktree", {
+  terminalId: "terminal-1",
+  worktreePath: "/path/to/worktree",
+});
+
+// Log error with full context
+logger.error("Failed to create worktree", error, {
+  terminalId: "terminal-1",
+  worktreePath: "/path/to/worktree",
+});
+```
+
+**Log Output Format**:
+```json
+{
+  "timestamp": "2025-10-15T05:05:06.088Z",
+  "level": "INFO",
+  "message": "Creating worktree",
+  "context": {
+    "component": "worktree-manager",
+    "terminalId": "terminal-1",
+    "worktreePath": "/path/to/worktree"
+  }
+}
+```
+
+### Backend Logging
+
+**File**: `loom-daemon/src/logging.rs`
+
+```rust
+use crate::{log_info, log_error};
+
+// Log informational message
+log_info!("Terminal created", {
+    component: "terminal",
+    terminal_id: Some(id.clone()),
+    working_dir: path
+});
+
+// Log error
+log_error!("Failed to spawn tmux", &err, {
+    component: "terminal",
+    terminal_id: Some(id.clone())
+});
+```
+
+### Logging Conventions
+
+**When to Use Each Log Level**:
+
+1. **INFO**: Normal operations, milestones, state transitions
+   - Component initialization
+   - Successful operations (terminal created, worktree setup complete)
+   - State changes (workspace loaded, agent launched)
+
+2. **WARN**: Unexpected but recoverable conditions
+   - Non-fatal errors (failed to write cache, optional feature unavailable)
+   - Deprecated code paths
+   - Performance warnings
+
+3. **ERROR**: Error conditions requiring attention
+   - Failed operations with user impact
+   - Exceptions and error objects
+   - Invalid state that prevents functionality
+
+**Context Guidelines**:
+
+Always include these fields when applicable:
+- `component`: The component/module generating the log
+- `terminalId`: Terminal identifier for terminal-related operations
+- `workspacePath`: Workspace path for workspace operations
+- `errorId`: Auto-generated unique error ID for tracking
+
+**Example Patterns**:
+
+```typescript
+// Starting multi-step operation
+logger.info("Starting workspace reset", {
+  workspacePath,
+  terminalCount: terminals.length,
+});
+
+// Operation milestone
+logger.info("Destroyed terminal session", {
+  workspacePath,
+  terminalId: terminal.id,
+  terminalName: terminal.name,
+});
+
+// Error with full context
+logger.error("Failed to create worktree", error, {
+  workspacePath,
+  terminalId,
+  worktreePath,
+});
+
+// Operation complete
+logger.info("Workspace reset complete", { workspacePath });
+```
+
+### Benefits
+
+1. **Structured Data**: JSON format is easily parsed by tools (jq, MCP servers)
+2. **Context Preservation**: All relevant context attached to each log entry
+3. **Error Tracking**: Unique error IDs for correlation across logs
+4. **Component Tracing**: Component field enables filtering by module
+5. **Debugging**: Rich context makes post-mortem debugging easier
+
+### Log File Locations
+
+- **Frontend Console**: `~/.loom/console.log` (JSON structured logs)
+- **Daemon**: `~/.loom/daemon.log` (JSON structured logs)
+- **Tauri**: `~/.loom/tauri.log` (Tauri application logs)
+- **Terminal Output**: `/tmp/loom-terminal-{id}.out` (raw terminal output)
+
+### Querying Logs
+
+**Using jq**:
+```bash
+# Filter by component
+jq 'select(.context.component == "worktree-manager")' ~/.loom/console.log
+
+# Find errors
+jq 'select(.level == "ERROR")' ~/.loom/console.log
+
+# Track specific terminal
+jq 'select(.context.terminalId == "terminal-1")' ~/.loom/console.log
+
+# Find by error ID
+jq 'select(.context.errorId == "ERR-abc123")' ~/.loom/console.log
+```
+
+**Using MCP Tools**:
+```bash
+# Read recent console logs
+mcp__loom-logs__tail_daemon_log --lines=100
+
+# Read terminal-specific logs
+mcp__loom-logs__tail_terminal_log --terminal-id=terminal-1
+```
+
+### Migration Strategy
+
+The logging system is being gradually adopted across the codebase:
+
+**Phase 1 (Complete)**:
+- ✅ Frontend Logger class (`src/lib/logger.ts`)
+- ✅ Backend logging macros (`loom-daemon/src/logging.rs`)
+- ✅ High-risk paths (workspace-reset, worktree-manager)
+
+**Phase 2 (In Progress)**:
+- Agent launcher (`src/lib/agent-launcher.ts`)
+- Daemon terminal operations (`loom-daemon/src/terminal.rs`)
+- Daemon IPC layer (`loom-daemon/src/ipc.rs`)
+
+**Phase 3 (Planned)**:
+- Remaining console.log statements converted gradually
+- Log file rotation (keep last 10 files, 10MB each)
+- Log aggregation dashboard (optional)
+
+### Adding Structured Logging to New Code
+
+1. **Import logger**:
+   ```typescript
+   import { Logger } from "./logger";
+   const logger = Logger.forComponent("my-component");
+   ```
+
+2. **Replace console.log**:
+   ```typescript
+   // Before
+   console.log(`[my-component] Created terminal ${id}`);
+
+   // After
+   logger.info("Created terminal", { terminalId: id });
+   ```
+
+3. **Add context**:
+   Include all relevant IDs, paths, and state in the context object
+
+4. **Use error method for exceptions**:
+   ```typescript
+   try {
+     // operation
+   } catch (error) {
+     logger.error("Operation failed", error, { terminalId, path });
+   }
+   ```
 
 ## Git Workflow
 
