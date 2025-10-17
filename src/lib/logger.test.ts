@@ -30,7 +30,7 @@ describe("Logger", () => {
       logger.info("Test message");
 
       expect(consoleLogSpy).toHaveBeenCalledTimes(1);
-      const loggedJson = consoleLogSpy.mock.calls[0][0];
+      const loggedJson = consoleLogSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry).toHaveProperty("timestamp");
@@ -45,7 +45,7 @@ describe("Logger", () => {
       logger.warn("Warning message");
 
       expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
-      const loggedJson = consoleWarnSpy.mock.calls[0][0];
+      const loggedJson = consoleWarnSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.level).toBe("WARN");
@@ -58,7 +58,7 @@ describe("Logger", () => {
       logger.error("Error occurred", testError);
 
       expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
-      const loggedJson = consoleErrorSpy.mock.calls[0][0];
+      const loggedJson = consoleErrorSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.level).toBe("ERROR");
@@ -77,7 +77,7 @@ describe("Logger", () => {
         workspacePath: "/path/to/workspace",
       });
 
-      const loggedJson = consoleLogSpy.mock.calls[0][0];
+      const loggedJson = consoleLogSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.component).toBe("test-component");
@@ -89,7 +89,7 @@ describe("Logger", () => {
       const logger = Logger.forComponent("test-component");
       logger.info("Test message");
 
-      const loggedJson = consoleLogSpy.mock.calls[0][0];
+      const loggedJson = consoleLogSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context).toEqual({ component: "test-component" });
@@ -103,7 +103,7 @@ describe("Logger", () => {
         customField3: true,
       });
 
-      const loggedJson = consoleLogSpy.mock.calls[0][0];
+      const loggedJson = consoleLogSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.customField1).toBe("value1");
@@ -121,8 +121,8 @@ describe("Logger", () => {
       logger.error("First error", error1);
       logger.error("Second error", error2);
 
-      const errorId1 = JSON.parse(consoleErrorSpy.mock.calls[0][0]).context.errorId;
-      const errorId2 = JSON.parse(consoleErrorSpy.mock.calls[1][0]).context.errorId;
+      const errorId1 = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string).context.errorId;
+      const errorId2 = JSON.parse(consoleErrorSpy.mock.calls[1][0] as string).context.errorId;
 
       expect(errorId1).toMatch(/^ERR-/);
       expect(errorId2).toMatch(/^ERR-/);
@@ -134,7 +134,7 @@ describe("Logger", () => {
       const error = new Error("Test error");
       logger.error("Error message", error, { terminalId: "terminal-1" });
 
-      const loggedJson = consoleErrorSpy.mock.calls[0][0];
+      const loggedJson = consoleErrorSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.errorId).toBeDefined();
@@ -151,7 +151,7 @@ describe("Logger", () => {
 
       logger.error("Error occurred", error);
 
-      const loggedJson = consoleErrorSpy.mock.calls[0][0];
+      const loggedJson = consoleErrorSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.errorMessage).toBe("Test error");
@@ -162,7 +162,7 @@ describe("Logger", () => {
       const logger = Logger.forComponent("test-component");
       logger.error("Error occurred", "String error");
 
-      const loggedJson = consoleErrorSpy.mock.calls[0][0];
+      const loggedJson = consoleErrorSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.errorMessage).toBe("String error");
@@ -173,7 +173,7 @@ describe("Logger", () => {
       const logger = Logger.forComponent("test-component");
       logger.error("Error occurred", null);
 
-      const loggedJson = consoleErrorSpy.mock.calls[0][0];
+      const loggedJson = consoleErrorSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.errorMessage).toBe("null");
@@ -214,7 +214,7 @@ describe("Logger", () => {
       const logger = Logger.forComponent("test-component");
       logger.info("Test message");
 
-      const output = consoleLogSpy.mock.calls[0][0];
+      const output = consoleLogSpy.mock.calls[0][0] as string;
       expect(() => JSON.parse(output)).not.toThrow();
     });
 
@@ -222,7 +222,7 @@ describe("Logger", () => {
       const logger = Logger.forComponent("test-component");
       logger.info('Message with "quotes" and \n newlines');
 
-      const loggedJson = consoleLogSpy.mock.calls[0][0];
+      const loggedJson = consoleLogSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.message).toBe('Message with "quotes" and \n newlines');
@@ -239,7 +239,7 @@ describe("Logger", () => {
         },
       });
 
-      const loggedJson = consoleLogSpy.mock.calls[0][0];
+      const loggedJson = consoleLogSpy.mock.calls[0][0] as string;
       const logEntry = JSON.parse(loggedJson);
 
       expect(logEntry.context.nested.field1).toBe("value1");
@@ -255,8 +255,8 @@ describe("Logger", () => {
       logger1.info("Message from component 1");
       logger2.info("Message from component 2");
 
-      const log1 = JSON.parse(consoleLogSpy.mock.calls[0][0]);
-      const log2 = JSON.parse(consoleLogSpy.mock.calls[1][0]);
+      const log1 = JSON.parse(consoleLogSpy.mock.calls[0][0] as string);
+      const log2 = JSON.parse(consoleLogSpy.mock.calls[1][0] as string);
 
       expect(log1.context.component).toBe("component-1");
       expect(log2.context.component).toBe("component-2");
