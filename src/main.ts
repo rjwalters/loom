@@ -14,16 +14,22 @@ import {
 import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+// NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
+// are defined locally in this file, not imported from terminal-lifecycle
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
-import { getTooltipManager } from "./lib/tooltip";
 import {
   renderHeader,
   renderLoadingState,
   renderMiniTerminals,
   renderPrimaryTerminal,
 } from "./lib/ui";
+import { attachWorkspaceEventListeners, setupTooltips } from "./lib/ui-event-handlers";
+import { clearWorkspaceError, expandTildePath, showWorkspaceError } from "./lib/workspace-utils";
+
+// NOTE: validateWorkspacePath, browseWorkspace, and handleWorkspacePathInput
+// are defined locally in this file
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -306,7 +312,11 @@ function render() {
 
   // Re-attach workspace event listeners if they were just rendered
   if (!hasWorkspace) {
-    attachWorkspaceEventListeners();
+    attachWorkspaceEventListeners(
+      handleWorkspacePathInput,
+      browseWorkspace,
+      () => state.getWorkspace() || ""
+    );
   }
 
   // Set up tooltips for all elements with data-tooltip attributes
@@ -911,52 +921,7 @@ async function saveCurrentConfig() {
   });
 }
 
-// Expand tilde (~) to home directory
-async function expandTildePath(path: string): Promise<string> {
-  if (path.startsWith("~")) {
-    try {
-      const home = await homeDir();
-      return path.replace(/^~/, home);
-    } catch (error) {
-      console.error("Failed to get home directory:", error);
-      return path;
-    }
-  }
-  return path;
-}
-
-// Workspace error UI helpers
-function showWorkspaceError(message: string) {
-  console.log("[showWorkspaceError]", message);
-  const input = document.getElementById("workspace-path") as HTMLInputElement;
-  const errorDiv = document.getElementById("workspace-error");
-
-  console.log("[showWorkspaceError] input:", input, "errorDiv:", errorDiv);
-
-  if (input) {
-    input.classList.remove("border-gray-300", "dark:border-gray-600");
-    input.classList.add("border-red-500", "dark:border-red-500");
-  }
-
-  if (errorDiv) {
-    errorDiv.textContent = message;
-  }
-}
-
-function clearWorkspaceError() {
-  console.log("[clearWorkspaceError]");
-  const input = document.getElementById("workspace-path") as HTMLInputElement;
-  const errorDiv = document.getElementById("workspace-error");
-
-  if (input) {
-    input.classList.remove("border-red-500", "dark:border-red-500");
-    input.classList.add("border-gray-300", "dark:border-gray-600");
-  }
-
-  if (errorDiv) {
-    errorDiv.textContent = "";
-  }
-}
+// Workspace error UI helpers and path utilities are now in src/lib/workspace-utils.ts
 
 // Validate workspace path
 async function validateWorkspacePath(path: string): Promise<boolean> {
@@ -1600,6 +1565,30 @@ async function handleWorkspacePathInput(path: string) {
   }
 }
 
+// Handle Run Now button click for interval mode terminals
+async function handleRunNowClick(terminalId: string) {
+  console.log(`[handleRunNowClick] Running interval prompt for terminal ${terminalId}`);
+
+  try {
+    const terminal = state.getTerminal(terminalId);
+    if (!terminal) {
+      console.error(`[handleRunNowClick] Terminal ${terminalId} not found`);
+      return;
+    }
+
+    // Import autonomous manager
+    const { getAutonomousManager } = await import("./lib/autonomous-manager");
+    const autonomousManager = getAutonomousManager();
+
+    // Execute the interval prompt and reset timer
+    await autonomousManager.runNow(terminal);
+    console.log(`[handleRunNowClick] Successfully executed interval prompt for ${terminalId}`);
+  } catch (error) {
+    console.error(`[handleRunNowClick] Failed to execute interval prompt:`, error);
+    alert(`Failed to run interval prompt: ${error}`);
+  }
+}
+
 // Helper function to start renaming a terminal
 function startRename(terminalId: string, nameElement: HTMLElement) {
   const terminal = state.getTerminals().find((t) => t.id === terminalId);
@@ -1619,8 +1608,13 @@ function startRename(terminalId: string, nameElement: HTMLElement) {
   if (!parent) return;
 
   parent.replaceChild(input, nameElement);
-  input.focus();
-  input.select();
+
+  // Defer focus to the next tick to prevent the double-click event from interfering
+  // The double-click bubbles up and can trigger other handlers that might steal focus
+  setTimeout(() => {
+    input.focus();
+    input.select();
+  }, 0);
 
   const commit = () => {
     const newName = input.value.trim();
@@ -1801,84 +1795,6 @@ async function handleKillSession(sessionName: string) {
   }
 }
 
-// Attach workspace event listeners (called dynamically when workspace selector is rendered)
-function attachWorkspaceEventListeners() {
-  console.log("[attachWorkspaceEventListeners] attaching listeners...");
-  // Workspace path input - validate on Enter or blur
-  const workspaceInput = document.getElementById("workspace-path") as HTMLInputElement;
-  console.log("[attachWorkspaceEventListeners] workspaceInput:", workspaceInput);
-  if (workspaceInput) {
-    workspaceInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        console.log("[workspaceInput keydown] Enter pressed, value:", workspaceInput.value);
-        e.preventDefault();
-        handleWorkspacePathInput(workspaceInput.value);
-        workspaceInput.blur();
-      }
-    });
-
-    workspaceInput.addEventListener("blur", () => {
-      console.log(
-        "[workspaceInput blur] value:",
-        workspaceInput.value,
-        "workspace:",
-        state.getWorkspace()
-      );
-      if (workspaceInput.value !== state.getWorkspace()) {
-        handleWorkspacePathInput(workspaceInput.value);
-      }
-    });
-  }
-
-  // Browse workspace button
-  const browseBtn = document.getElementById("browse-workspace");
-  console.log("[attachWorkspaceEventListeners] browseBtn:", browseBtn);
-  browseBtn?.addEventListener("click", () => {
-    console.log("[browseBtn click] clicked");
-    browseWorkspace();
-  });
-
-  // Create new project button
-  const createProjectBtn = document.getElementById("create-new-project-btn");
-  console.log("[attachWorkspaceEventListeners] createProjectBtn:", createProjectBtn);
-  createProjectBtn?.addEventListener("click", async () => {
-    console.log("[createProjectBtn click] clicked");
-    const { showCreateProjectModal } = await import("./lib/create-project-modal");
-    showCreateProjectModal(async (projectPath: string) => {
-      console.log(`[createProjectModal] Project created at: ${projectPath}`);
-      // Load the newly created project as the workspace
-      await handleWorkspacePathInput(projectPath);
-    });
-  });
-}
-
-// Set up tooltips for all elements with data-tooltip attributes
-function setupTooltips() {
-  const tooltipManager = getTooltipManager();
-
-  // Find all elements with data-tooltip attribute
-  const elements = document.querySelectorAll<HTMLElement>("[data-tooltip]");
-
-  elements.forEach((element) => {
-    const text = element.getAttribute("data-tooltip");
-    const position = element.getAttribute("data-tooltip-position") as
-      | "top"
-      | "bottom"
-      | "left"
-      | "right"
-      | "auto"
-      | null;
-
-    if (text) {
-      tooltipManager.attach(element, {
-        text,
-        position: position || "auto",
-        delay: 500,
-      });
-    }
-  });
-}
-
 // Set up event listeners (only once, since parent elements are static)
 function setupEventListeners() {
   // Theme toggle
@@ -1916,6 +1832,51 @@ function setupEventListeners() {
         if (id) {
           console.log(`[terminal-clear-btn] Clearing terminal ${id}`);
           terminalManager.clearTerminal(id);
+        }
+        return;
+      }
+
+      // Run Now button (interval mode)
+      const runNowBtn = target.closest(".run-now-btn");
+      if (runNowBtn) {
+        e.stopPropagation();
+        const id = runNowBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRunNowClick(id);
+        }
+        return;
+      }
+
+      // Close button
+      const closeBtn = target.closest("#terminal-close-btn");
+      if (closeBtn) {
+        e.stopPropagation();
+        const id = closeBtn.getAttribute("data-terminal-id");
+        if (id) {
+          ask("Are you sure you want to close this terminal?", {
+            title: "Close Terminal",
+            type: "warning",
+          }).then(async (confirmed) => {
+            if (confirmed) {
+              console.log(`[terminal-close-btn] Closing terminal ${id}`);
+
+              // Stop autonomous mode if running
+              const { getAutonomousManager } = await import("./lib/autonomous-manager");
+              const autonomousManager = getAutonomousManager();
+              autonomousManager.stopAutonomous(id);
+
+              // Stop polling and destroy terminal
+              outputPoller.stopPolling(id);
+              terminalManager.destroyTerminal(id);
+              if (currentAttachedTerminalId === id) {
+                currentAttachedTerminalId = null;
+              }
+
+              // Remove from state
+              state.removeTerminal(id);
+              saveCurrentConfig();
+            }
+          });
         }
         return;
       }
@@ -1985,6 +1946,17 @@ function setupEventListeners() {
   if (miniRow) {
     miniRow.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
+
+      // Handle Run Now button clicks (interval mode)
+      const runNowBtn = target.closest(".run-now-btn");
+      if (runNowBtn) {
+        e.stopPropagation();
+        const id = runNowBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRunNowClick(id);
+        }
+        return;
+      }
 
       // Handle close button clicks
       if (target.classList.contains("close-terminal-btn")) {

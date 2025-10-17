@@ -178,6 +178,7 @@ export function renderPrimaryTerminal(
         <span class="text-xs text-gray-500 dark:text-gray-400">• ${roleLabel}</span>
       </div>
       <div class="flex items-center gap-1">
+        ${createRunNowButtonHTML(terminal, "primary")}
         <button
           id="terminal-clear-btn"
           data-terminal-id="${terminal.id}"
@@ -202,6 +203,16 @@ export function renderPrimaryTerminal(
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
           </svg>
+        </button>
+        <button
+          id="terminal-close-btn"
+          data-terminal-id="${terminal.id}"
+          data-tooltip="Close terminal"
+          data-tooltip-position="bottom"
+          class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors text-gray-600 dark:text-gray-300 hover:text-red-500 dark:hover:text-red-400 font-bold text-lg"
+          title="Close terminal"
+        >
+          ×
         </button>
       </div>
     `;
@@ -352,13 +363,59 @@ export function renderMiniTerminals(
         id="add-terminal-btn"
         data-tooltip="${addButtonTitle}"
         data-tooltip-position="auto"
-        class="flex-shrink-0 w-32 h-32 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
+        class="flex-shrink-0 w-40 h-40 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
         title="${addButtonTitle}"
         ${addButtonDisabled}
       >
         <span class="text-3xl text-gray-400">+</span>
       </button>
     </div>
+  `;
+}
+
+/**
+ * Create "Run Now" button HTML for interval mode terminals
+ *
+ * Only shown for terminals with autonomous mode enabled (targetInterval > 0)
+ *
+ * @param terminal - The terminal to create the button for
+ * @param context - Whether this is for "primary" or "mini" view
+ * @returns HTML string for the button, or empty string if not applicable
+ */
+function createRunNowButtonHTML(terminal: Terminal, context: "primary" | "mini"): string {
+  // Check if terminal has interval mode enabled
+  const hasInterval =
+    terminal.roleConfig?.targetInterval !== undefined &&
+    (terminal.roleConfig.targetInterval as number) > 0;
+
+  if (!hasInterval) {
+    return ""; // Don't show button for non-interval terminals
+  }
+
+  // Different styling for primary vs mini view
+  const buttonClasses =
+    context === "primary"
+      ? "p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors run-now-btn"
+      : "p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors run-now-btn";
+
+  const iconClasses =
+    context === "primary"
+      ? "w-4 h-4 text-gray-600 dark:text-gray-300"
+      : "w-3 h-3 text-gray-600 dark:text-gray-300";
+
+  return `
+    <button
+      data-terminal-id="${terminal.id}"
+      data-tooltip="Run interval prompt now"
+      data-tooltip-position="bottom"
+      class="${buttonClasses}"
+      title="Run interval prompt now"
+    >
+      <svg class="${iconClasses}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+      </svg>
+    </button>
   `;
 }
 
@@ -454,7 +511,7 @@ function createMiniTerminalHTML(
       <div class="relative">
         ${needsInputBadge}
         <div
-          class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
           style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
           draggable="true"
@@ -464,15 +521,18 @@ function createMiniTerminalHTML(
             <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
             <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
           </div>
-          <button
-            class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
-            data-terminal-id="${terminal.id}"
-            data-tooltip="Close terminal"
-            data-tooltip-position="top"
-            title="Close terminal"
-          >
-            ×
-          </button>
+          <div class="flex items-center gap-0.5 flex-shrink-0">
+            ${createRunNowButtonHTML(terminal, "mini")}
+            <button
+              class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
+              data-terminal-id="${terminal.id}"
+              data-tooltip="Close terminal"
+              data-tooltip-position="top"
+              title="Close terminal"
+            >
+              ×
+            </button>
+          </div>
         </div>
         <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
           <div class="flex items-center justify-between">

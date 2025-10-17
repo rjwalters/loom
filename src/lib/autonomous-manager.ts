@@ -156,6 +156,45 @@ class AutonomousManager {
   getAllStatus(): AutonomousInterval[] {
     return Array.from(this.intervals.values());
   }
+
+  /**
+   * Manually trigger the interval prompt for a terminal immediately
+   *
+   * This executes the terminal's interval prompt and resets the interval timer,
+   * allowing users to trigger autonomous work on-demand without waiting for
+   * the next scheduled interval.
+   *
+   * @param terminal - The terminal to execute the prompt for
+   * @returns Promise that resolves when the prompt is sent
+   */
+  async runNow(terminal: Terminal): Promise<void> {
+    // Ensure terminal has autonomous configuration
+    const targetInterval = terminal.roleConfig?.targetInterval as number | undefined;
+    if (!targetInterval || targetInterval <= 0 || !terminal.roleConfig) {
+      console.warn(`Terminal ${terminal.id} does not have valid autonomous configuration`);
+      return;
+    }
+
+    const intervalPrompt = (terminal.roleConfig.intervalPrompt as string) || "Continue working";
+
+    console.log(
+      `Manually executing interval prompt for ${terminal.id} (prompt: "${intervalPrompt}")`
+    );
+
+    try {
+      // Send the prompt to the agent
+      await sendPromptToAgent(terminal.id, intervalPrompt);
+      console.log(`Manually sent prompt to ${terminal.id}`);
+
+      // Reset the interval timer by restarting autonomous mode
+      // This ensures the next automatic execution happens targetInterval ms from now
+      this.restartAutonomous(terminal);
+      console.log(`Reset interval timer for ${terminal.id}`);
+    } catch (error) {
+      console.error(`Failed to manually execute prompt for ${terminal.id}:`, error);
+      throw error;
+    }
+  }
 }
 
 // Singleton instance

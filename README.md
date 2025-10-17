@@ -232,6 +232,8 @@ mcp__loom-terminals__list_terminals()
 
 **Full documentation**: [docs/mcp/README.md](docs/mcp/README.md)
 
+**For architectural decisions, see [docs/adr/README.md](docs/adr/README.md).**
+
 ### Configuring Terminal Roles
 
 After launching Loom, you can configure each terminal with a specific role:
