@@ -3,6 +3,8 @@ import { getTerminalManager, TerminalManager } from "./terminal-manager";
 
 // Mock xterm.js
 const mockTerminalInstance = {
+  cols: 80,
+  rows: 24,
   open: vi.fn(),
   write: vi.fn(),
   clear: vi.fn(),
@@ -24,14 +26,49 @@ const mockTerminalInstance = {
   },
 };
 
+class MockResizeObserver {
+  public observe = vi.fn();
+  public disconnect = vi.fn();
+  private callback: ResizeObserverCallback;
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+    mockResizeObservers.push(this);
+  }
+
+  trigger(width = 800, height = 600): void {
+    const entry = {
+      contentRect: {
+        width,
+        height,
+        top: 0,
+        left: 0,
+        right: width,
+        bottom: height,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      },
+    } as ResizeObserverEntry;
+
+    this.callback([entry], this as unknown as ResizeObserver);
+  }
+}
+
+let mockResizeObservers: MockResizeObserver[] = [];
+let nextFitDimensions = { cols: 80, rows: 24 };
+
 vi.mock("@xterm/xterm", () => ({
   Terminal: vi.fn(() => mockTerminalInstance),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({
   FitAddon: vi.fn(() => ({
-    fit: vi.fn(),
-    proposeDimensions: vi.fn(() => ({ cols: 80, rows: 24 })),
+    fit: vi.fn(() => {
+      mockTerminalInstance.cols = nextFitDimensions.cols;
+      mockTerminalInstance.rows = nextFitDimensions.rows;
+    }),
+    proposeDimensions: vi.fn(() => ({ ...nextFitDimensions })),
   })),
 }));
 
@@ -77,6 +114,9 @@ describe("TerminalManager", () => {
   let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
   let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
   let persistentContainer: HTMLElement;
+  let originalRequestAnimationFrame: typeof window.requestAnimationFrame;
+  let originalCancelAnimationFrame: typeof window.cancelAnimationFrame;
+  let boundingRectSpy: ReturnType<typeof vi.spyOn>;
 
   // Mock state
   const mockTerminal = {
@@ -110,6 +150,35 @@ describe("TerminalManager", () => {
   beforeEach(() => {
     // Reset mocks
     vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockResizeObservers = [];
+    nextFitDimensions = { cols: 80, rows: 24 };
+
+    (window as any).ResizeObserver = vi
+      .fn((callback: ResizeObserverCallback) => new MockResizeObserver(callback))
+      .mockImplementation((callback: ResizeObserverCallback) => new MockResizeObserver(callback));
+
+    originalRequestAnimationFrame = window.requestAnimationFrame;
+    originalCancelAnimationFrame = window.cancelAnimationFrame;
+    window.requestAnimationFrame = vi.fn((cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    }) as unknown as typeof window.requestAnimationFrame;
+    window.cancelAnimationFrame = vi.fn() as unknown as typeof window.cancelAnimationFrame;
+
+    boundingRectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        width: 800,
+        height: 600,
+        top: 0,
+        left: 0,
+        right: 800,
+        bottom: 600,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
 
     // Setup console spies
     consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -142,6 +211,8 @@ describe("TerminalManager", () => {
     mockTerminalInstance.onBell.mockClear();
     mockTerminalInstance.loadAddon.mockClear();
     mockTerminalInstance.options.fontSize = 14;
+    mockTerminalInstance.cols = 80;
+    mockTerminalInstance.rows = 24;
 
     // Create fresh manager instance
     manager = new TerminalManager();
@@ -153,6 +224,12 @@ describe("TerminalManager", () => {
     consoleWarnSpy.mockRestore();
     consoleErrorSpy.mockRestore();
     document.body.innerHTML = "";
+    boundingRectSpy.mockRestore();
+    window.requestAnimationFrame = originalRequestAnimationFrame;
+    window.cancelAnimationFrame = originalCancelAnimationFrame;
+    delete (window as any).ResizeObserver;
+    mockResizeObservers = [];
+    vi.useRealTimers();
   });
 
   describe("Terminal Creation", () => {
@@ -686,25 +763,49 @@ describe("TerminalManager", () => {
     });
   });
 
-  describe("Terminal Fit (No-op)", () => {
-    it("fitTerminal is a no-op", async () => {
+  describe("Terminal Fit", () => {
+    it("fitTerminal resizes xterm and tmux", async () => {
+      vi.mocked(invoke).mockClear();
       manager.createTerminal("terminal-1", "container-1");
+      const container = document.getElementById("xterm-container-terminal-1")!;
+      container.style.display = "block";
+
+      nextFitDimensions = { cols: 120, rows: 36 };
+      mockTerminalInstance.cols = 120;
+      mockTerminalInstance.rows = 36;
 
       await manager.fitTerminal("terminal-1");
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Skipping resize for terminal-1 (using fixed size)")
+      await vi.waitFor(() =>
+        expect(vi.mocked(invoke)).toHaveBeenCalledWith("resize_terminal", {
+          id: "terminal-1",
+          cols: 120,
+          rows: 36,
+        }),
       );
     });
 
-    it("fitAllTerminals is a no-op", () => {
+    it("fitAllTerminals resizes every managed terminal", async () => {
       manager.createTerminal("terminal-1", "container-1");
       manager.createTerminal("terminal-2", "container-2");
 
+      document.getElementById("xterm-container-terminal-1")!.style.display = "block";
+      document.getElementById("xterm-container-terminal-2")!.style.display = "block";
+      vi.mocked(invoke).mockClear();
+
+      nextFitDimensions = { cols: 150, rows: 45 };
+      mockTerminalInstance.cols = 150;
+      mockTerminalInstance.rows = 45;
+
       manager.fitAllTerminals();
 
-      // Should not throw, just no-op
-      expect(consoleErrorSpy).not.toHaveBeenCalled();
+      await vi.waitFor(() =>
+        expect(vi.mocked(invoke)).toHaveBeenCalledWith("resize_terminal", {
+          id: expect.any(String),
+          cols: 150,
+          rows: 45,
+        }),
+      );
     });
   });
 
@@ -718,19 +819,22 @@ describe("TerminalManager", () => {
   });
 
   describe("Real-world Scenarios", () => {
-    it("creates, shows, writes, hides, and destroys terminal", () => {
+    it("creates, shows, writes, hides, and destroys terminal", async () => {
       const managed = manager.createTerminal("terminal-1", "container-1");
       expect(managed).not.toBeNull();
 
       manager.showTerminal("terminal-1");
       const container = document.getElementById("xterm-container-terminal-1")!;
       expect(container.style.display).toBe("block");
+      await vi.advanceTimersByTimeAsync(0);
 
       manager.writeToTerminal("terminal-1", "$ ls\n");
       expect(mockTerminalInstance.write).toHaveBeenCalledWith("$ ls\n");
 
       manager.hideTerminal("terminal-1");
       expect(container.style.display).toBe("none");
+      expect(mockResizeObservers.length).toBeGreaterThan(0);
+      expect(mockResizeObservers[0].disconnect).toHaveBeenCalled();
 
       manager.destroyTerminal("terminal-1");
       expect(mockTerminalInstance.dispose).toHaveBeenCalled();
