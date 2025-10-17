@@ -28,8 +28,7 @@ impl TerminalManager {
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
         {
             return Err(anyhow!(
-                "Invalid terminal ID: '{}'. Only alphanumeric characters, hyphens, and underscores are allowed",
-                id
+                "Invalid terminal ID: '{id}'. Only alphanumeric characters, hyphens, and underscores are allowed"
             ));
         }
 
