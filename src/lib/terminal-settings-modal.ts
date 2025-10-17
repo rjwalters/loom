@@ -390,21 +390,6 @@ export async function showTerminalSettingsModal(
 
   // Worker type dropdown is now handled in applySettings
 
-  // Wire up reset prompt button
-  const resetPromptBtn = modal.querySelector("#reset-prompt-btn");
-  const systemPromptTextarea = modal.querySelector("#system-prompt") as HTMLTextAreaElement;
-
-  resetPromptBtn?.addEventListener("click", async () => {
-    // Get workspace path to format default prompt
-    const workspacePath = state.getWorkspace();
-    if (!workspacePath) {
-      return;
-    }
-
-    const { DEFAULT_WORKER_PROMPT, formatPrompt } = await import("./prompts");
-    systemPromptTextarea.value = formatPrompt(DEFAULT_WORKER_PROMPT, workspacePath);
-  });
-
   // Wire up buttons
   const cancelBtn = modal.querySelector("#cancel-settings-btn");
   const applyBtn = modal.querySelector("#apply-settings-btn");

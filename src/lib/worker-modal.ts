@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { saveConfig, saveState, splitTerminals } from "./config";
-import { DEFAULT_WORKER_PROMPT, formatPrompt } from "./prompts";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
 
@@ -119,7 +118,18 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
 
     const workerCount = state.getTerminals().length + 1;
     nameInput.value = `Worker ${workerCount}`;
-    promptTextarea.value = formatPrompt(DEFAULT_WORKER_PROMPT, workspacePath);
+
+    // Load worker.md role file content
+    try {
+      const roleContent = await invoke<string>("read_role_file", {
+        workspacePath,
+        filename: "worker.md",
+      });
+      promptTextarea.value = roleContent;
+    } catch (error) {
+      console.error("Failed to load worker.md role file:", error);
+      promptTextarea.value = "Error loading worker role file";
+    }
 
     // Show modal
     modal.classList.remove("hidden");
