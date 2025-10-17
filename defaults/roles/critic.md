@@ -604,7 +604,7 @@ $ gh issue list --state=open --json number,title,body --jq '.[] | "\(.number): \
 ...
 
 # Review issue #42 about auth refactoring
-$ gh issue view 42
+$ gh issue view 42 --comments
 
 # Notice: Issue mentions supporting OAuth, SAML, and LDAP
 # Check: Are all these actually used?
@@ -658,7 +658,7 @@ gh issue list --state=open --json number,title,labels \
   --jq '.[] | select(([.labels[].name] | inside(["loom:critic-suggestion"])) | not) | "\(.number): \(.title)"'
 
 # View issue details before commenting
-gh issue view <number>
+gh issue view <number> --comments
 
 # Search for issues related to specific topic
 gh issue list --search "authentication" --state=open

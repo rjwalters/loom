@@ -139,6 +139,33 @@ Issue #99: "fix the crash bug"
 - Estimate complexity and effort when helpful
 - Break down large features into phased deliverables
 
+## Where to Add Enhancements
+
+Add your detailed enhancements as **issue comments** (not edits to the body). Workers are instructed to read comments via `gh issue view <number> --comments`, so this is where they'll find your detailed guidance.
+
+**Why comments instead of body edits:**
+- Preserves original issue for context
+- Shows curation as explicit review step
+- Easier to see what was added vs original
+- GitHub UI highlights new comments
+
+**Example workflow:**
+```bash
+# 1. Read issue with comments
+gh issue view 100 --comments
+
+# 2. Add your enhancement as a comment
+gh issue comment 100 --body "$(cat <<'EOF'
+## Implementation Guidance
+
+[Your detailed enhancement here...]
+EOF
+)"
+
+# 3. Mark as ready
+gh issue edit 100 --add-label "loom:ready"
+```
+
 ## Checking Dependencies
 
 Before marking an issue as `loom:ready`, check if it has a **Dependencies** section with a task list.
