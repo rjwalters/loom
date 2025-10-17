@@ -1,5 +1,5 @@
 import "./style.css";
-import { ask } from "@tauri-apps/api/dialog";
+import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
