@@ -183,6 +183,8 @@ pnpm run tauri:dev
 
 **For detailed development workflow, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
 
+**For architectural decisions, see [docs/adr/README.md](docs/adr/README.md).**
+
 ### Configuring Terminal Roles
 
 After launching Loom, you can configure each terminal with a specific role:
