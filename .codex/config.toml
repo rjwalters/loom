@@ -6,7 +6,7 @@
 sandbox = "workspace-write"
 
 # Approval policy: never - run commands without asking for approval
-# Since we trust the commands in our workflow (git, gh, pnpm, cargo, etc.)
+# Matches Claude Code's pre-approved command workflow.
 ask_for_approval = "never"
 
 # Enable web search for agents that need it
@@ -17,7 +17,7 @@ search = true
 inherit = "all"
 
 # Sandbox permissions - grant specific access beyond workspace-write
-# These mirror the permissions we've granted in .claude/settings.json
+# Mirrors the allowances documented in CLAUDE.md and .claude/settings.json.
 sandbox_permissions = [
     "disk-full-read-access",  # Allow reading anywhere (like cat, ls in Claude settings)
 ]

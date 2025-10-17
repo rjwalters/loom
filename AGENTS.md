@@ -1,22 +1,22 @@
-# Repository Guidelines
+# Loom Agent Quickstart
 
-## Project Structure & Module Organization
-The Vite-powered frontend lives in `src/` with feature modules under `src/lib/` and colocated Vitest specs (`*.test.ts`). Tauri glue code and native bindings reside in `src-tauri/`, while the Rust daemon runs from `loom-daemon/`. Runtime defaults and role templates sit in `defaults/` and `.loom/roles/`; automation helpers live in `scripts/`, and production bundles emit to `dist/`.
+Use this as the lightweight entrypoint for human contributors and AI agents. For deeper context, see `CLAUDE.md`.
 
-## Build, Test, and Development Commands
-- `pnpm app:dev` boots the daemon then Tauri for an end-to-end local session.
-- `pnpm daemon:dev` + `pnpm tauri:dev` mirrors the two-terminal workflow in `DEV_WORKFLOW.md`.
-- `pnpm build`, `pnpm daemon:build`, and `pnpm tauri:build` produce frontend assets, the daemon binary, and the packaged desktop app.
-- Quality gates: `pnpm lint`, `pnpm format:rust`, `pnpm clippy`, and `pnpm check:ci`.
+## Must-Know Commands
+- Run the full loop with `pnpm app:dev` (daemon + Tauri).
+- Standalone: `pnpm daemon:dev`, `pnpm tauri:dev`.
+- Quality gates: `pnpm lint`, `pnpm check:ci`, `pnpm clippy`, `pnpm format:rust`.
+- Tests: `pnpm test`, `pnpm test:unit`, `pnpm test:unit:coverage`.
 
-## Coding Style & Naming Conventions
-TypeScript follows Biome defaults (two-space indent, trailing commas, explicit semicolons); prefer `camelCase` for functions and `PascalCase` for exported classes. Keep modules single-purpose and expose public helpers from `src/lib/` index files only when shared. Rust code must pass `cargo fmt` and `cargo clippy -- -D warnings`; keep IPC command enums and structs serde-annotated for stability.
+## Style & Review Guardrails
+- TypeScript: Biome defaults (two spaces, trailing commas, semicolons).
+- Rust: enforce `cargo fmt` and `cargo clippy -- -D warnings`; serde-tag IPC structs/enums.
+- Keep features scoped, expose shared helpers from `src/lib/index.ts` only when needed.
+- Commits: imperative Title Case with issue reference, e.g., `Fix Tmux Socket Mismatch (#144)`.
 
-## Testing Guidelines
-Rust suites run through `pnpm test` (aliased to `cargo test --workspace --locked --all-features`). Frontend units reside beside their sources and execute with `pnpm test:unit`; use `pnpm test:unit:coverage` when verifying regressions or new UI states. Mirror test filenames after the subject and include minimal fixtures so daemon logs stay readable.
+## Operational Notes
+- Role prompts live under `.loom/roles/`; keep Markdown and JSON metadata in sync.
+- Document new defaults/env vars under `defaults/` before review.
+- Resetting local state: `Help → Daemon Status → Yes` after touching `.loom` data.
 
-## Commit & Pull Request Guidelines
-Commits use imperative, title-cased subjects with the related issue in parentheses (e.g., `Fix tmux socket mismatch (#144)`). Group work logically and include generated artifacts or schema updates in the same change. Pull requests should outline intent, list the commands you ran, and link issues or Loom workflow references. Attach screenshots or terminal excerpts for UX-facing updates and call out any skipped checks.
-
-## Daemon & Configuration Notes
-Agent role prompts live under `.loom/roles/`; keep Markdown and any sibling JSON metadata in sync. Workspace overrides persist in `~/.loom/`, so mention reset steps (`Help → Daemon Status → Yes`) when altering stateful behavior. Document new environment variables or defaults under `defaults/` before requesting review.
+For architecture background, workflows, and agent-specific guidance, jump to `CLAUDE.md`.
