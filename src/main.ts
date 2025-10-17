@@ -1056,6 +1056,11 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
 
       console.log(`[launchAgentsForTerminals] Launching ${terminal.name} (${terminal.id})`);
 
+      // Set terminal to busy status BEFORE launching agent
+      // This prevents HealthMonitor from incorrectly marking it as missing during the launch process
+      state.updateTerminal(terminal.id, { status: TerminalStatus.Busy });
+      console.log(`[launchAgentsForTerminals] Set ${terminal.name} to busy status`);
+
       // Get worker type from config (default to claude)
       const workerType = (roleConfig.workerType as string) || "claude";
 
@@ -1119,9 +1124,17 @@ async function launchAgentsForTerminals(workspacePath: string, terminals: Termin
       }
 
       console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
+
+      // Reset terminal to idle status after successful launch
+      state.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
+      console.log(`[launchAgentsForTerminals] Reset ${terminal.name} to idle status`);
     } catch (error) {
       const errorMessage = `Failed to launch agent for ${terminal.name}: ${error}`;
       console.error(`[launchAgentsForTerminals] ${errorMessage}`);
+
+      // Reset terminal to idle status even on error (agent launch failed but terminal exists)
+      state.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
+      console.log(`[launchAgentsForTerminals] Reset ${terminal.name} to idle status after error`);
 
       // Show error to user so they know what failed
       alert(errorMessage);

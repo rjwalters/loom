@@ -224,6 +224,15 @@ export class HealthMonitor {
     console.log(`[HealthMonitor] Performing health check for ${terminals.length} terminals`);
 
     for (const terminal of terminals) {
+      // Skip health checks for terminals that are busy (agent launching in progress)
+      // This prevents false positives during agent launch which can take 20+ seconds per terminal
+      if (terminal.status === TerminalStatus.Busy) {
+        console.log(
+          `[HealthMonitor] Skipping health check for ${terminal.id} (status: busy - agent launch in progress)`
+        );
+        continue;
+      }
+
       try {
         // Check if tmux session exists
         const result = await invoke<{ has_session: boolean }>("check_session_health", {
