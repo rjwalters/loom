@@ -23,6 +23,7 @@ import {
   renderMiniTerminals,
   renderPrimaryTerminal,
 } from "./lib/ui";
+import { clearWorkspaceError, expandTildePath, showWorkspaceError } from "./lib/workspace-utils";
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -858,52 +859,7 @@ async function saveCurrentConfig() {
   });
 }
 
-// Expand tilde (~) to home directory
-async function expandTildePath(path: string): Promise<string> {
-  if (path.startsWith("~")) {
-    try {
-      const home = await homeDir();
-      return path.replace(/^~/, home);
-    } catch (error) {
-      console.error("Failed to get home directory:", error);
-      return path;
-    }
-  }
-  return path;
-}
-
-// Workspace error UI helpers
-function showWorkspaceError(message: string) {
-  console.log("[showWorkspaceError]", message);
-  const input = document.getElementById("workspace-path") as HTMLInputElement;
-  const errorDiv = document.getElementById("workspace-error");
-
-  console.log("[showWorkspaceError] input:", input, "errorDiv:", errorDiv);
-
-  if (input) {
-    input.classList.remove("border-gray-300", "dark:border-gray-600");
-    input.classList.add("border-red-500", "dark:border-red-500");
-  }
-
-  if (errorDiv) {
-    errorDiv.textContent = message;
-  }
-}
-
-function clearWorkspaceError() {
-  console.log("[clearWorkspaceError]");
-  const input = document.getElementById("workspace-path") as HTMLInputElement;
-  const errorDiv = document.getElementById("workspace-error");
-
-  if (input) {
-    input.classList.remove("border-red-500", "dark:border-red-500");
-    input.classList.add("border-gray-300", "dark:border-gray-600");
-  }
-
-  if (errorDiv) {
-    errorDiv.textContent = "";
-  }
-}
+// Workspace error UI helpers and path utilities are now in src/lib/workspace-utils.ts
 
 // Validate workspace path
 async function validateWorkspacePath(path: string): Promise<boolean> {
