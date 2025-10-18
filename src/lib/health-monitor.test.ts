@@ -78,7 +78,7 @@ describe("HealthMonitor", () => {
     // Setup mock implementations
     vi.mocked(getAppState).mockReturnValue(mockState as any);
     vi.mocked(getOutputPoller).mockReturnValue(mockPoller as any);
-    vi.mocked(invoke).mockResolvedValue({ has_session: true });
+    vi.mocked(invoke).mockResolvedValue(true);
 
     // Create fresh monitor instance
     monitor = new HealthMonitor();
@@ -219,7 +219,7 @@ describe("HealthMonitor", () => {
     });
 
     it("detects missing session and updates terminal status", async () => {
-      vi.mocked(invoke).mockResolvedValueOnce({ has_session: false });
+      vi.mocked(invoke).mockResolvedValueOnce(false);
 
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
@@ -235,7 +235,7 @@ describe("HealthMonitor", () => {
       mockTerminals[0].missingSession = true;
       mockTerminals[0].status = TerminalStatus.Error;
 
-      vi.mocked(invoke).mockResolvedValueOnce({ has_session: true });
+      vi.mocked(invoke).mockResolvedValueOnce(true);
 
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
@@ -318,7 +318,7 @@ describe("HealthMonitor", () => {
         if (cmd === "check_daemon_health") {
           return Promise.reject(new Error("Daemon unreachable"));
         }
-        return Promise.resolve({ has_session: true });
+        return Promise.resolve(true);
       });
 
       monitor.start();
@@ -355,7 +355,7 @@ describe("HealthMonitor", () => {
           }
           return Promise.resolve(true);
         }
-        return Promise.resolve({ has_session: true });
+        return Promise.resolve(true);
       });
 
       monitor.start();
@@ -431,7 +431,7 @@ describe("HealthMonitor", () => {
     });
 
     it("counts error terminals correctly", async () => {
-      vi.mocked(invoke).mockResolvedValueOnce({ has_session: false });
+      vi.mocked(invoke).mockResolvedValueOnce(false);
 
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
@@ -644,7 +644,7 @@ describe("HealthMonitor", () => {
       // Initial state - session exists
       vi.mocked(invoke).mockImplementation((cmd) => {
         if (cmd === "check_session_health") {
-          return Promise.resolve({ has_session: true });
+          return Promise.resolve(true);
         }
         return Promise.resolve(true); // daemon health
       });
@@ -658,7 +658,7 @@ describe("HealthMonitor", () => {
       // Session lost
       vi.mocked(invoke).mockImplementation((cmd) => {
         if (cmd === "check_session_health") {
-          return Promise.resolve({ has_session: false });
+          return Promise.resolve(false);
         }
         return Promise.resolve(true); // daemon health
       });
@@ -675,7 +675,7 @@ describe("HealthMonitor", () => {
       mockTerminals[0].missingSession = true;
       vi.mocked(invoke).mockImplementation((cmd) => {
         if (cmd === "check_session_health") {
-          return Promise.resolve({ has_session: true });
+          return Promise.resolve(true);
         }
         return Promise.resolve(true); // daemon health
       });
@@ -697,7 +697,7 @@ describe("HealthMonitor", () => {
         if (cmd === "check_daemon_health") {
           return Promise.resolve(true);
         }
-        return Promise.resolve({ has_session: true });
+        return Promise.resolve(true);
       });
 
       await vi.advanceTimersByTimeAsync(0);
@@ -709,7 +709,7 @@ describe("HealthMonitor", () => {
         if (cmd === "check_daemon_health") {
           return Promise.reject(new Error("Connection refused"));
         }
-        return Promise.resolve({ has_session: true });
+        return Promise.resolve(true);
       });
 
       // 3 consecutive failures

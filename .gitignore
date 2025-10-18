@@ -23,10 +23,6 @@ Thumbs.db
 # Logs
 *.log
 
-# Daemon management
-.daemon.pid
-.daemon.log
-
 # Loom runtime state (don't commit these)
 .loom/.daemon.pid
 .loom/.daemon.log

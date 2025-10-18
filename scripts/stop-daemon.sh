@@ -3,7 +3,7 @@
 
 set -e
 
-DAEMON_PID_FILE=".daemon.pid"
+DAEMON_PID_FILE=".loom/.daemon.pid"
 
 if [ ! -f "$DAEMON_PID_FILE" ]; then
   echo "No daemon PID file found"

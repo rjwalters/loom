@@ -84,16 +84,24 @@ Goal: **scale Loom beyond your laptop** — one repo, many AI workers, distribut
 
 Loom uses GitHub labels to coordinate work between different agent roles:
 
-| Label | Created By | Reviewed By | Meaning |
-|-------|-----------|-------------|---------|
-| (no label) | Anyone | Architect triages | Unreviewed issue |
-| `loom:architect-suggestion` | Architect | User accepts | Triaged, awaiting approval |
-| `loom:accepted` | User | Curator enhances | Approved, awaiting enhancement |
-| `loom:ready` | Curator | Worker implements | Enhanced, ready for work |
-| `loom:in-progress` | Worker | Worker completes | Being implemented |
-| `loom:blocked` | Worker | User/Worker resolves | Blocked, needs help |
-| `loom:review-requested` | Worker | Reviewer reviews | PR ready for review |
-| `loom:reviewing` | Reviewer | Reviewer completes | PR under review |
+### Issue Labels
+
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:proposal` | 🔵 Blue | Architect | Suggestion awaiting approval |
+| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
+| `loom:ready` | 🟢 Green | Curator | Enhanced, ready for Worker |
+| `loom:in-progress` | 🟡 Amber | Worker | Being implemented |
+| `loom:blocked` | 🔴 Red | Worker | Blocked, needs help |
+| `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
+
+### PR Labels
+
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:review-requested` | 🟢 Green | Worker/Fixer | PR ready for Reviewer |
+| `loom:changes-requested` | 🟡 Amber | Reviewer | PR needs fixes from Fixer |
+| `loom:pr` | 🔵 Blue | Reviewer | Approved, ready to merge |
 
 For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
@@ -101,20 +109,20 @@ For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 ## 🧵 Example Workflow
 
-1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an unlabeled issue:
+1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an issue with `loom:proposal` label:
    > "Add search functionality to terminal history"
 
-   Then triages it by adding `loom:architect-suggestion` label.
+2. **You** review the proposal. Remove `loom:proposal` to approve it (or close the issue to reject).
 
-2. **You** review the suggestion and add `loom:accepted` label to approve it.
-
-3. **Curator Bot** (autonomous, runs every 5 minutes) finds the `loom:accepted` issue, adds implementation details, test plans, and code references. Removes `loom:accepted` and adds `loom:ready`.
+3. **Curator Bot** (autonomous, runs every 5 minutes) finds the approved issue, adds implementation details, test plans, and code references. Marks it as `loom:ready`.
 
 4. **Worker Bot** (manual or on-demand) finds `loom:ready` issues, claims it by adding `loom:in-progress`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
 
-5. **Reviewer Bot** (autonomous, runs every 5 minutes) finds the PR, reviews the code, runs tests, and approves or requests changes. Removes `loom:reviewing` when complete.
+5. **Reviewer Bot** (autonomous, runs every 5 minutes) finds the PR, reviews the code, runs tests, and either:
+   - Approves: adds `loom:pr` (ready for you to merge)
+   - Requests changes: adds `loom:changes-requested` (for Fixer bot to address)
 
-6. **You** merge the approved PR. GitHub automatically closes the linked issue.
+6. **You** merge the approved PR with `loom:pr` label. GitHub automatically closes the linked issue.
 
 GitHub shows the whole lifecycle — Loom orchestrates it through labels and autonomous terminals.
 
