@@ -32,12 +32,80 @@ This document describes the comprehensive testing procedure for validating Loom'
 # Ensure you're in the Loom workspace
 cd /Users/rwalters/GitHub/loom
 
-# Verify MCP servers are configured
-cat .mcp.json
-
 # Check that all dependencies are installed
 pnpm install
 ```
+
+### MCP Server Connection
+
+**IMPORTANT**: The testing procedures in this document rely on MCP (Model Context Protocol) servers for observability and control. You must verify MCP servers are connected before starting tests.
+
+**Verifying MCP Connection**:
+
+1. **Check MCP Configuration** exists in workspace:
+   ```bash
+   cat .mcp.json
+   ```
+
+   Expected output should show three MCP servers configured:
+   - `loom-ui`: UI interaction and state inspection
+   - `loom-logs`: Log file monitoring
+   - `loom-terminals`: Terminal IPC control
+
+2. **Test MCP Server Availability** (from Claude Code or MCP client):
+   ```bash
+   # Test if MCP commands are available
+   mcp__loom-ui__get_heartbeat
+   ```
+
+   If this returns a heartbeat response, MCP servers are connected.
+
+**If MCP Connection Fails**:
+
+1. **Ensure MCP servers are built**:
+   ```bash
+   # Build all MCP servers
+   cd mcp-loom-ui && pnpm install && pnpm build && cd ..
+   cd mcp-loom-logs && pnpm install && pnpm build && cd ..
+   cd mcp-loom-terminals && pnpm install && pnpm build && cd ..
+   ```
+
+2. **Restart Claude Code** to reload MCP configuration:
+   - Exit Claude Code completely
+   - Restart Claude Code in the Loom workspace
+
+3. **Check MCP server logs** for errors:
+   ```bash
+   # MCP servers log to stderr, visible in Claude Code console
+   # Look for connection errors or missing dependencies
+   ```
+
+**Alternative Testing Methods** (if MCP unavailable):
+
+If MCP servers are not available, you can still test manually using:
+
+1. **Console Logs** - Monitor `~/.loom/console.log` directly:
+   ```bash
+   tail -f ~/.loom/console.log
+   ```
+
+2. **Daemon Logs** - Monitor daemon activity:
+   ```bash
+   tail -f ~/.loom/daemon.log
+   ```
+
+3. **tmux Sessions** - Check terminal sessions directly:
+   ```bash
+   tmux -L loom list-sessions
+   tmux -L loom attach -t loom-terminal-1
+   ```
+
+4. **Terminal Output Files** - Check individual terminal logs:
+   ```bash
+   tail -f /tmp/loom-terminal-1.out
+   ```
+
+**Note**: Manual methods are more tedious and error-prone. MCP servers are strongly recommended for comprehensive factory reset testing.
 
 ## Testing Loop Phases
 
@@ -101,17 +169,38 @@ pnpm install
 
 ### Phase 2: Build and Launch
 
-**Goal**: Start Loom with a fresh build in preview mode
+**Goal**: Start Loom with a fresh build in preview mode attached to workspace
 
 **Steps**:
 
-1. **Build the Application**
+1. **Build and Launch with Workspace Argument** (Recommended)
    ```bash
-   # Run full build (frontend + Tauri binary)
-   pnpm app:preview
+   # Run full build and launch with workspace argument
+   pnpm test:factory-reset
    ```
 
-2. **Monitor Startup Logs** (via MCP)
+   This script:
+   - Builds the frontend (TypeScript + Vite)
+   - Builds the Tauri debug bundle
+   - Starts daemon with 5-second initialization wait
+   - Launches app attached to current directory as workspace
+
+2. **Alternative: Manual Launch with Workspace**
+   ```bash
+   # Build only (without launching)
+   pnpm build && pnpm tauri build --debug --bundles app
+
+   # Start daemon
+   RUST_LOG=info pnpm daemon:preview &
+
+   # Wait for daemon to be ready (5 seconds recommended)
+   sleep 5
+
+   # Launch with workspace argument
+   ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom --workspace $(pwd)
+   ```
+
+3. **Monitor Startup Logs** (via MCP)
    ```bash
    # Watch daemon logs for startup sequence
    mcp__loom-logs__tail_daemon_log --lines=50
@@ -393,6 +482,27 @@ rm -f /tmp/loom-daemon.sock
 # Restart app
 ```
 
+### Issue: App launch fails with "Connection refused"
+
+**Symptom**: App launches before daemon socket is ready, connection fails
+
+**Root Cause**: Insufficient wait time for daemon initialization
+
+**Fix**: The `pnpm app:preview` and `pnpm test:factory-reset` scripts now use a 5-second wait (increased from 2 seconds) to ensure daemon socket is ready before app launches.
+
+If you still experience connection issues:
+```bash
+# Manually verify daemon is running
+ps aux | grep loom-daemon
+
+# Check if socket exists
+ls -la /tmp/loom-daemon.sock
+
+# If socket doesn't exist, wait a bit longer before launching
+sleep 3
+./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom --workspace $(pwd)
+```
+
 ## Success Metrics
 
 ### Target: 100% Success Rate
@@ -499,6 +609,12 @@ This wraps `cargo test --test integration_factory_reset` so it works with `pnpm 
 
 ---
 
-**Last Updated**: 2025-10-16
+**Last Updated**: 2025-10-17 (Issue #294)
 **Status**: Active Testing
 **Next Milestone**: 10 consecutive successful runs
+
+**Recent Improvements**:
+- Added `pnpm test:factory-reset` script for workspace-attached testing
+- Increased daemon startup wait time from 2s to 5s for better reliability
+- Added comprehensive MCP server connection documentation
+- Documented alternative testing methods when MCP unavailable
