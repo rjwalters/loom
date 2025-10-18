@@ -11,6 +11,9 @@ src-tauri/target/
 .env
 .env.local
 
+# MCP configuration (generated locally by setup-mcp.sh)
+.mcp.json
+
 # OS
 .DS_Store
 Thumbs.db
