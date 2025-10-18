@@ -28,8 +28,7 @@ impl TerminalManager {
             .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
         {
             return Err(anyhow!(
-                "Invalid terminal ID: '{}'. Only alphanumeric characters, hyphens, and underscores are allowed",
-                id
+                "Invalid terminal ID: '{id}'. Only alphanumeric characters, hyphens, and underscores are allowed"
             ));
         }
 
@@ -286,7 +285,7 @@ impl TerminalManager {
 
         let mut buffer = vec![0u8; bytes_to_read];
         file.read_exact(&mut buffer)?;
-        log::debug!("Read {} bytes successfully", buffer.len());
+        log::debug!("Read {len} bytes successfully", len = buffer.len());
 
         Ok((buffer, file_size))
     }

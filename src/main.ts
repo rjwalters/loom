@@ -1,7 +1,6 @@
 import "./style.css";
 import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
-import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { saveConfig, saveState, setConfigWorkspace, splitTerminals } from "./lib/config";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
@@ -147,57 +146,9 @@ let eventListenersRegistered = false;
 // =================================================================
 // MCP COMMAND FILE WATCHER - For MCP tool automation
 // =================================================================
-// Poll for MCP commands written by the MCP server
-// This enables automation of UI actions like workspace start/reset
-
-let lastMcpCommand: { command: string; timestamp: string } | null = null;
-
-async function checkMcpCommand() {
-  try {
-    const home = await homeDir();
-    const commandPath = `${home}/.loom/mcp-command.json`;
-
-    // Read command file
-    const content = await invoke<string>("read_text_file", { path: commandPath });
-    const command = JSON.parse(content) as { command: string; timestamp: string };
-
-    // Skip if we've already processed this command
-    if (lastMcpCommand && lastMcpCommand.timestamp === command.timestamp) {
-      return;
-    }
-
-    // Process new command
-    console.log(`[MCP] Processing command: ${command.command} (timestamp: ${command.timestamp})`);
-    lastMcpCommand = command;
-
-    // Emit the corresponding Tauri event
-    switch (command.command) {
-      case "trigger_start":
-        await invoke("emit_event", { event: "start-workspace" });
-        break;
-      case "trigger_force_start":
-        await invoke("emit_event", { event: "force-start-workspace" });
-        break;
-      case "trigger_factory_reset":
-        await invoke("emit_event", { event: "factory-reset-workspace" });
-        break;
-      case "trigger_force_factory_reset":
-        await invoke("emit_event", { event: "force-factory-reset-workspace" });
-        break;
-      default:
-        console.warn(`[MCP] Unknown command: ${command.command}`);
-    }
-  } catch (_error) {
-    // File doesn't exist or can't be read - this is normal when no command is pending
-    // Don't log anything to avoid noise
-  }
-}
-
-// Poll for MCP commands every 500ms
-window.setInterval(() => {
-  checkMcpCommand();
-}, 500);
-console.log("[main] MCP command watcher started");
+// File watching is now handled by the Rust backend (mcp_watcher.rs) using the notify crate
+// This provides event-driven file watching with 0 CPU usage when idle (vs 120 fs reads/min with polling)
+console.log("[main] MCP command watcher started in backend (using notify crate)");
 
 // Track which terminal is currently attached
 let currentAttachedTerminalId: string | null = null;
