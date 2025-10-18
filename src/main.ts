@@ -2,6 +2,7 @@ import "./style.css";
 import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
+import { getAppLevelState } from "./lib/app-state";
 import { saveConfig, saveState, setConfigWorkspace, splitTerminals } from "./lib/config";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
 import { getHealthMonitor } from "./lib/health-monitor";
@@ -155,9 +156,6 @@ let eventListenersRegistered = false;
 // File watching is now handled by the Rust backend (mcp_watcher.rs) using the notify crate
 // This provides event-driven file watching with 0 CPU usage when idle (vs 120 fs reads/min with polling)
 logger.info("MCP command watcher started in backend (using notify crate)");
-
-// Track which terminal is currently attached
-let currentAttachedTerminalId: string | null = null;
 
 // Track which terminals have had their health checked (Phase 3: Debouncing)
 // This prevents redundant health checks during the 1-second render loop
@@ -318,6 +316,8 @@ async function initializeTerminalDisplay(terminalId: string) {
     logger.info("Terminal already exists, using show/hide", { terminalId });
 
     // Hide previous terminal (if different)
+    const appLevelState = getAppLevelState();
+    const currentAttachedTerminalId = appLevelState.getCurrentAttachedTerminalId();
     if (currentAttachedTerminalId && currentAttachedTerminalId !== terminalId) {
       logger.info("Hiding previous terminal", {
         terminalId: currentAttachedTerminalId,
@@ -334,7 +334,7 @@ async function initializeTerminalDisplay(terminalId: string) {
     logger.info("Resuming polling for terminal", { terminalId });
     outputPoller.resumePolling(terminalId);
 
-    currentAttachedTerminalId = terminalId;
+    appLevelState.setCurrentAttachedTerminalId(terminalId);
     return;
   }
 
@@ -344,6 +344,8 @@ async function initializeTerminalDisplay(terminalId: string) {
   // Wait for DOM to be ready
   setTimeout(() => {
     // Hide all other terminals first
+    const appLevelState = getAppLevelState();
+    const currentAttachedTerminalId = appLevelState.getCurrentAttachedTerminalId();
     if (currentAttachedTerminalId) {
       terminalManager.hideTerminal(currentAttachedTerminalId);
       outputPoller.pausePolling(currentAttachedTerminalId);
@@ -357,7 +359,7 @@ async function initializeTerminalDisplay(terminalId: string) {
 
       // Start polling for output
       outputPoller.startPolling(terminalId);
-      currentAttachedTerminalId = terminalId;
+      appLevelState.setCurrentAttachedTerminalId(terminalId);
 
       logger.info("Created and showing terminal", { terminalId });
     }
@@ -546,8 +548,9 @@ if (!eventListenersRegistered) {
         // Stop polling and destroy terminal
         outputPoller.stopPolling(primary.id);
         terminalManager.destroyTerminal(primary.id);
-        if (currentAttachedTerminalId === primary.id) {
-          currentAttachedTerminalId = null;
+        const appLevelState = getAppLevelState();
+        if (appLevelState.getCurrentAttachedTerminalId() === primary.id) {
+          appLevelState.setCurrentAttachedTerminalId(null);
         }
 
         // Remove from state
@@ -586,7 +589,7 @@ if (!eventListenersRegistered) {
     // Clear runtime state
     state.clearAll();
     setConfigWorkspace("");
-    currentAttachedTerminalId = null;
+    getAppLevelState().setCurrentAttachedTerminalId(null);
 
     // Phase 3: Clear health check tracking when workspace closes
     const previousSize = healthCheckedTerminals.size;
@@ -638,7 +641,7 @@ if (!eventListenersRegistered) {
         outputPoller,
         terminalManager,
         setCurrentAttachedTerminalId: (id) => {
-          currentAttachedTerminalId = id;
+          getAppLevelState().setCurrentAttachedTerminalId(id);
         },
         launchAgentsForTerminals,
         render,
@@ -678,7 +681,7 @@ if (!eventListenersRegistered) {
         outputPoller,
         terminalManager,
         setCurrentAttachedTerminalId: (id) => {
-          currentAttachedTerminalId = id;
+          getAppLevelState().setCurrentAttachedTerminalId(id);
         },
         launchAgentsForTerminals,
         render,
@@ -738,7 +741,7 @@ if (!eventListenersRegistered) {
           outputPoller,
           terminalManager,
           setCurrentAttachedTerminalId: (id) => {
-            currentAttachedTerminalId = id;
+            getAppLevelState().setCurrentAttachedTerminalId(id);
           },
           launchAgentsForTerminals,
           render,
@@ -779,7 +782,7 @@ if (!eventListenersRegistered) {
           outputPoller,
           terminalManager,
           setCurrentAttachedTerminalId: (id) => {
-            currentAttachedTerminalId = id;
+            getAppLevelState().setCurrentAttachedTerminalId(id);
           },
           launchAgentsForTerminals,
           render,
@@ -1117,8 +1120,9 @@ function setupEventListeners() {
               // Stop polling and destroy terminal
               outputPoller.stopPolling(id);
               terminalManager.destroyTerminal(id);
-              if (currentAttachedTerminalId === id) {
-                currentAttachedTerminalId = null;
+              const appLevelState = getAppLevelState();
+              if (appLevelState.getCurrentAttachedTerminalId() === id) {
+                appLevelState.setCurrentAttachedTerminalId(null);
               }
 
               // Remove from state
@@ -1218,8 +1222,9 @@ function setupEventListeners() {
               terminalManager.destroyTerminal(terminal.id);
 
               // If this was the current attached terminal, clear it
-              if (currentAttachedTerminalId === terminal.id) {
-                currentAttachedTerminalId = null;
+              const appLevelState = getAppLevelState();
+              if (appLevelState.getCurrentAttachedTerminalId() === terminal.id) {
+                appLevelState.setCurrentAttachedTerminalId(null);
               }
 
               // Remove from state
