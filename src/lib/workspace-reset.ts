@@ -9,6 +9,7 @@ import {
 import type { OutputPoller } from "./output-poller";
 import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
+import { cleanupWorkspace } from "./workspace-cleanup";
 
 /**
  * Dependencies needed by the workspace reset logic
@@ -55,35 +56,14 @@ export async function resetWorkspaceToDefaults(
 
   console.log(`[${logPrefix}] Resetting workspace to defaults`);
 
-  // Stop all polling
-  const terminals = state.getTerminals();
-  terminals.forEach((t) => outputPoller.stopPolling(t.id));
-
-  // Destroy all xterm instances
-  terminalManager.destroyAll();
-
-  // Destroy all terminal sessions in daemon (clean up tmux sessions)
-  console.log(`[${logPrefix}] Destroying ${terminals.length} terminal sessions`);
-  for (const terminal of terminals) {
-    try {
-      await invoke("destroy_terminal", { id: terminal.id });
-      console.log(`[${logPrefix}] Destroyed terminal ${terminal.name} (${terminal.id})`);
-    } catch (error) {
-      console.warn(`[${logPrefix}] Failed to destroy terminal ${terminal.id}:`, error);
-      // Continue anyway - we'll create fresh terminals
-    }
-  }
-
-  // Kill ALL loom tmux sessions to ensure clean slate
-  // This is necessary because daemon may restore old sessions on startup
-  console.log(`[${logPrefix}] Killing all loom tmux sessions...`);
-  try {
-    await invoke("kill_all_loom_sessions");
-    console.log(`[${logPrefix}] All loom sessions killed`);
-  } catch (error) {
-    console.warn(`[${logPrefix}] Failed to kill loom sessions:`, error);
-    // Continue anyway - we'll try to create fresh terminals
-  }
+  // Cleanup existing terminals and sessions
+  await cleanupWorkspace({
+    component: logPrefix,
+    state,
+    outputPoller,
+    terminalManager,
+    setCurrentAttachedTerminalId,
+  });
 
   // Call backend reset
   try {
@@ -119,10 +99,6 @@ export async function resetWorkspaceToDefaults(
     console.warn(`[${logPrefix}] Failed to reset GitHub labels:`, error);
     // Continue anyway - label reset is non-critical
   }
-
-  // Clear state
-  state.clearAll();
-  setCurrentAttachedTerminalId(null);
 
   // Reload config and recreate terminals
   try {
