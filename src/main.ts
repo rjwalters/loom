@@ -541,7 +541,7 @@ if (!eventListenersRegistered) {
         // Stop autonomous mode if running
         const { getAutonomousManager } = await import("./lib/autonomous-manager");
         const autonomousManager = getAutonomousManager();
-        autonomousManager.stopAutonomous(primary.id);
+        await autonomousManager.stopAutonomous(primary.id);
 
         // Stop polling and destroy terminal
         outputPoller.stopPolling(primary.id);
@@ -572,10 +572,10 @@ if (!eventListenersRegistered) {
     localStorage.removeItem("loom:workspace");
     logger.info("Cleared localStorage workspace");
 
-    // Stop all autonomous intervals
+    // Stop all autonomous intervals and wait for active executions
     const { getAutonomousManager } = await import("./lib/autonomous-manager");
     const autonomousManager = getAutonomousManager();
-    autonomousManager.stopAll();
+    await autonomousManager.stopAll();
 
     // Stop all polling
     outputPoller.stopAll();
@@ -1112,7 +1112,7 @@ function setupEventListeners() {
               // Stop autonomous mode if running
               const { getAutonomousManager } = await import("./lib/autonomous-manager");
               const autonomousManager = getAutonomousManager();
-              autonomousManager.stopAutonomous(id);
+              await autonomousManager.stopAutonomous(id);
 
               // Stop polling and destroy terminal
               outputPoller.stopPolling(id);
@@ -1211,7 +1211,7 @@ function setupEventListeners() {
               // Stop autonomous mode if running
               const { getAutonomousManager } = await import("./lib/autonomous-manager");
               const autonomousManager = getAutonomousManager();
-              autonomousManager.stopAutonomous(id);
+              await autonomousManager.stopAutonomous(id);
 
               // Stop polling and clean up xterm.js instance
               outputPoller.stopPolling(terminal.id);

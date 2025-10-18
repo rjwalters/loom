@@ -359,7 +359,7 @@ describe("autonomous-manager", () => {
       expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledWith("test-14", "New prompt");
     });
 
-    it("should handle restart when not already running", () => {
+    it("should handle restart when not already running", async () => {
       const terminal = {
         id: "test-15",
         name: "Test Terminal",
@@ -372,7 +372,7 @@ describe("autonomous-manager", () => {
         },
       };
 
-      expect(() => manager.restartAutonomous(terminal)).not.toThrow();
+      await expect(manager.restartAutonomous(terminal)).resolves.not.toThrow();
       expect(manager.isAutonomous("test-15")).toBe(true);
     });
   });
@@ -552,6 +552,210 @@ describe("autonomous-manager", () => {
     it("should return empty array when no autonomous terminals", () => {
       const statuses = manager.getAllStatus();
       expect(statuses).toEqual([]);
+    });
+  });
+
+  describe("Overrun Protection", () => {
+    it("should prevent overlapping executions", async () => {
+      // Create a promise that we can manually resolve
+      let resolveExecution: (() => void) | null = null;
+      const executionPromise = new Promise<void>((resolve) => {
+        resolveExecution = resolve;
+      });
+
+      // Mock sendPromptToAgent to return a long-running promise
+      vi.mocked(agentLauncher.sendPromptToAgent).mockReturnValue(executionPromise);
+
+      const terminal = {
+        id: "test-overrun-1",
+        name: "Test Terminal",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "worker",
+        roleConfig: {
+          targetInterval: 100, // 100ms interval
+          intervalPrompt: "Work",
+        },
+      };
+
+      manager.startAutonomous(terminal);
+
+      // First execution should start immediately with first interval tick
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Second interval tick should be skipped (first execution still in progress)
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Third interval tick should also be skipped
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Complete the first execution
+      resolveExecution!();
+      await executionPromise;
+
+      // Next interval tick should start a new execution
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(2);
+    });
+
+    it("should allow next execution after previous completes", async () => {
+      let executionCount = 0;
+      vi.mocked(agentLauncher.sendPromptToAgent).mockImplementation(async () => {
+        executionCount++;
+        // Fast execution (completes before next interval)
+        await Promise.resolve();
+      });
+
+      const terminal = {
+        id: "test-overrun-2",
+        name: "Test Terminal",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "worker",
+        roleConfig: {
+          targetInterval: 100,
+          intervalPrompt: "Work",
+        },
+      };
+
+      manager.startAutonomous(terminal);
+
+      // First execution
+      await vi.advanceTimersByTimeAsync(100);
+      expect(executionCount).toBe(1);
+
+      // Second execution (first completed, so this should run)
+      await vi.advanceTimersByTimeAsync(100);
+      expect(executionCount).toBe(2);
+
+      // Third execution
+      await vi.advanceTimersByTimeAsync(100);
+      expect(executionCount).toBe(3);
+    });
+
+    it("should clean up activePrompts on error", async () => {
+      // Mock sendPromptToAgent to throw error
+      vi.mocked(agentLauncher.sendPromptToAgent).mockRejectedValueOnce(new Error("Test error"));
+
+      const terminal = {
+        id: "test-overrun-3",
+        name: "Test Terminal",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "worker",
+        roleConfig: {
+          targetInterval: 100,
+          intervalPrompt: "Work",
+        },
+      };
+
+      manager.startAutonomous(terminal);
+
+      // First execution (will error)
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Reset mock to succeed
+      vi.mocked(agentLauncher.sendPromptToAgent).mockResolvedValue();
+
+      // Next execution should run (activePrompts was cleaned up despite error)
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(2);
+    });
+
+    it("should wait for active execution when stopping", async () => {
+      let resolveExecution: (() => void) | null = null;
+      const executionPromise = new Promise<void>((resolve) => {
+        resolveExecution = resolve;
+      });
+
+      vi.mocked(agentLauncher.sendPromptToAgent).mockReturnValue(executionPromise);
+
+      const terminal = {
+        id: "test-overrun-4",
+        name: "Test Terminal",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "worker",
+        roleConfig: {
+          targetInterval: 100,
+          intervalPrompt: "Work",
+        },
+      };
+
+      manager.startAutonomous(terminal);
+
+      // Start first execution
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Try to stop (should wait for execution to complete)
+      const stopPromise = manager.stopAutonomous(terminal.id);
+
+      // Advance real time slightly to allow promise microtasks to run
+      await vi.advanceTimersByTimeAsync(50);
+      await Promise.resolve(); // Flush microtasks
+
+      // Note: With fake timers, the while loop's setTimeout won't advance
+      // So we need to complete the execution for stopAutonomous to finish
+      resolveExecution!();
+      await executionPromise;
+
+      // Advance timers for the while loop's setTimeout checks
+      await vi.advanceTimersByTimeAsync(200);
+
+      // Now stopAutonomous should complete
+      await stopPromise;
+    });
+
+    it("should prevent manual runNow from overlapping with interval", async () => {
+      let resolveExecution: (() => void) | null = null;
+      const executionPromise = new Promise<void>((resolve) => {
+        resolveExecution = resolve;
+      });
+
+      vi.mocked(agentLauncher.sendPromptToAgent).mockReturnValue(executionPromise);
+
+      const terminal = {
+        id: "test-overrun-5",
+        name: "Test Terminal",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "worker",
+        roleConfig: {
+          targetInterval: 100,
+          intervalPrompt: "Work",
+        },
+      };
+
+      manager.startAutonomous(terminal);
+
+      // Start first execution from interval
+      await vi.advanceTimersByTimeAsync(100);
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Try to run manually while interval execution is in progress
+      // This should be skipped due to overrun protection
+      // Note: runNow calls restartAutonomous which is async, so we don't await it
+      const runNowPromise = manager.runNow(terminal);
+
+      // Should still be just 1 call (manual was skipped, restartAutonomous is waiting)
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(1);
+
+      // Complete the execution so restartAutonomous can finish
+      resolveExecution!();
+      await executionPromise;
+      await vi.advanceTimersByTimeAsync(200); // Let stopAutonomous while loop run
+      await runNowPromise; // Wait for runNow to complete
+
+      // Count should be 2:
+      // 1. Original interval execution (which we resolved above)
+      // 2. New interval after restart (runNow restarts the interval)
+      // The manual execution itself was skipped due to overlap protection
+      expect(agentLauncher.sendPromptToAgent).toHaveBeenCalledTimes(2);
     });
   });
 

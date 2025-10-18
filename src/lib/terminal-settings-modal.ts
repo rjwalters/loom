@@ -576,11 +576,11 @@ async function applySettings(
       // Start or restart autonomous mode
       const updatedTerminal = state.getTerminal(terminal.id);
       if (updatedTerminal) {
-        autonomousManager.restartAutonomous(updatedTerminal);
+        await autonomousManager.restartAutonomous(updatedTerminal);
       }
     } else {
       // Stop autonomous mode if disabled
-      autonomousManager.stopAutonomous(terminal.id);
+      await autonomousManager.stopAutonomous(terminal.id);
     }
 
     // Close modal and re-render
