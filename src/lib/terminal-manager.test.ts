@@ -475,7 +475,7 @@ describe("TerminalManager", () => {
       manager.showTerminal("non-existent");
 
       expect(consoleWarnSpy).toHaveBeenCalled();
-      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0]);
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
       expect(warnCall.level).toBe("WARN");
       expect(warnCall.message).toBe("Terminal not found");
       expect(warnCall.context.terminalId).toBe("non-existent");
@@ -485,7 +485,7 @@ describe("TerminalManager", () => {
       manager.hideTerminal("non-existent");
 
       expect(consoleWarnSpy).toHaveBeenCalled();
-      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0]);
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
       expect(warnCall.level).toBe("WARN");
       expect(warnCall.message).toBe("Terminal not found");
       expect(warnCall.context.terminalId).toBe("non-existent");
@@ -521,7 +521,7 @@ describe("TerminalManager", () => {
       manager.writeToTerminal("non-existent", "test");
 
       expect(consoleWarnSpy).toHaveBeenCalled();
-      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0]);
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
       expect(warnCall.level).toBe("WARN");
       expect(warnCall.message).toBe("Terminal not found");
       expect(warnCall.context.terminalId).toBe("non-existent");
@@ -542,7 +542,7 @@ describe("TerminalManager", () => {
       manager.clearAndWriteTerminal("non-existent", "test");
 
       expect(consoleWarnSpy).toHaveBeenCalled();
-      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0]);
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
       expect(warnCall.level).toBe("WARN");
       expect(warnCall.message).toBe("Terminal not found");
       expect(warnCall.context.terminalId).toBe("non-existent");
@@ -561,7 +561,7 @@ describe("TerminalManager", () => {
       manager.clearTerminal("non-existent");
 
       expect(consoleWarnSpy).toHaveBeenCalled();
-      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0]);
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
       expect(warnCall.level).toBe("WARN");
       expect(warnCall.message).toBe("Terminal not found");
       expect(warnCall.context.terminalId).toBe("non-existent");
