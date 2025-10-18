@@ -597,7 +597,7 @@ function createMiniTerminalHTML(
           </div>
 
           <!-- Tarot card overlay (hidden by default, shown during drag) -->
-          <div class="tarot-card-overlay absolute inset-0 opacity-0 pointer-events-none flex items-center justify-center bg-gray-900 dark:bg-black rounded-lg">
+          <div class="tarot-card-overlay absolute inset-0 pointer-events-none flex items-center justify-center bg-gray-900 dark:bg-black rounded-lg">
             <img src="${tarotCardPath}" alt="Tarot card" class="h-full w-full object-contain p-2" />
           </div>
         </div>
