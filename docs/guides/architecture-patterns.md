@@ -280,14 +280,19 @@ Each role consists of two files:
 
 **Label-based Workflow Coordination**:
 
-Roles coordinate work through GitHub labels (see [WORKFLOWS.md](../../WORKFLOWS.md) for complete details):
+Roles coordinate work through GitHub labels with two human approval gates (see [WORKFLOWS.md](../../WORKFLOWS.md) for complete details):
 
 1. **Architect** creates issues with `loom:architect-suggestion` label
-2. User reviews and removes label to approve
-3. **Curator** finds unlabeled issues, enhances them, marks as `loom:ready`
-4. **Worker** claims `loom:ready` issues, implements, creates PR with `loom:review-requested`
-5. **Reviewer** finds `loom:review-requested` PRs, reviews, approves/requests changes
-6. User merges approved PRs
+2. **Human approval (Gate 1)**: User reviews and removes label to approve proposal
+3. **Curator** finds unlabeled issues, enhances them, marks as `loom:curated`
+4. **Human approval (Gate 2)**: User reviews and changes `loom:curated` to `loom:issue` to authorize work
+5. **Worker** claims `loom:issue` issues, implements, creates PR with `loom:review-requested`
+6. **Reviewer** finds `loom:review-requested` PRs, reviews, approves/requests changes
+7. **Human merges** approved PRs
+
+The two approval gates ensure human judgment guides the autonomous workflow:
+- **Gate 1**: Strategic alignment - "Should we pursue this direction?"
+- **Gate 2**: Resource allocation - "Is this worth implementing now?"
 
 **Terminal Settings Modal UI**:
 
@@ -512,7 +517,7 @@ When agents running inside Loom work on issues:
 
 ```bash
 # 1. Claim issue and create worktree
-gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
+gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
 pnpm worktree 42
 # → Creates: .loom/worktrees/issue-42
 # → Branch: feature/issue-42
