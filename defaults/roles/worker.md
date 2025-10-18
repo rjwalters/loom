@@ -103,26 +103,68 @@ pnpm worktree 84
 
 This on-demand approach prevents worktree clutter and reduces resource usage.
 
-## Reading Issues: Always Include Comments
+## Reading Issues: ALWAYS Read Comments First
 
-**Curator adds detailed enhancements in comments.** Always use `--comments` flag:
+**CRITICAL:** Curator adds implementation guidance in comments (and sometimes amends descriptions). You MUST read both the issue body AND all comments before starting work.
+
+### Required Command
+
+**ALWAYS use `--comments` flag when viewing issues:**
 
 ```bash
-# CORRECT - See full context including Curator enhancements
+# ✅ CORRECT - See full context including Curator enhancements
 gh issue view 100 --comments
 
-# WRONG - Only sees original issue body
+# ❌ WRONG - Only sees original issue body, misses critical guidance
 gh issue view 100
 ```
 
-Curator comments typically include:
-- Root cause analysis
-- Implementation guidance
-- Detailed acceptance criteria
-- Test plans and debugging tips
-- Code examples and specifications
+### What You'll Find in Comments
 
-**Read these before starting work** - they contain the detailed requirements.
+Curator comments typically include:
+- **Implementation guidance** - Technical approach and options
+- **Root cause analysis** - Why this issue exists
+- **Detailed acceptance criteria** - Specific success metrics
+- **Test plans and debugging tips** - How to verify your solution
+- **Code examples and specifications** - Concrete patterns to follow
+- **Architecture decisions** - Design considerations and tradeoffs
+
+### What You'll Find in Amended Descriptions
+
+Sometimes Curators amend the issue description itself (preserving the original). Look for:
+- **"## Original Issue"** section - The user's initial request
+- **"## Curator Enhancement"** section - Comprehensive spec with acceptance criteria
+- **Problem Statement** - Clear explanation of what needs fixing and why
+- **Implementation Guidance** - Recommended approaches
+- **Test Plan** - Checklist of what to verify
+
+### Red Flags: Issue Needs More Info
+
+Before claiming, check for these warning signs:
+
+⚠️ **Vague description with no comments** → Ask Curator for clarification
+⚠️ **Comments contradict description** → Ask for clarification before proceeding
+⚠️ **No acceptance criteria anywhere** → Request Curator enhancement
+⚠️ **Multiple possible interpretations** → Get alignment before starting
+
+**If you see red flags:** Comment on the issue requesting clarification, then move to a different issue while waiting.
+
+### Good Patterns to Look For
+
+✅ **Description has acceptance criteria** → Start with that as your checklist
+✅ **Curator comment with "Implementation Guidance"** → Read carefully, follow recommendations
+✅ **Recent comment from maintainer** → May override earlier guidance, use latest
+✅ **Amended description with clear sections** → This is your complete spec
+
+### Why This Matters
+
+**Workers who skip comments miss critical information:**
+- Implement wrong approach (comment had better option)
+- Miss important constraints or gotchas
+- Build incomplete solution (comment had full requirements)
+- Waste time redoing work (comment had shortcut)
+
+**Reading comments is not optional** - it's where Curators put the detailed spec that makes issues truly ready for implementation.
 
 ## Checking Dependencies Before Claiming
 

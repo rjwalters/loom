@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/tauri";
 import type { OutputPoller } from "./output-poller";
 import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
+import { cleanupWorkspace } from "./workspace-cleanup";
 
 /**
  * Dependencies needed by the workspace start logic
@@ -48,38 +49,14 @@ export async function startWorkspaceEngine(
 
   console.log(`[${logPrefix}] Starting Loom engine for workspace`);
 
-  // Stop all polling
-  const existingTerminals = state.getTerminals();
-  existingTerminals.forEach((t) => outputPoller.stopPolling(t.id));
-
-  // Destroy all xterm instances
-  terminalManager.destroyAll();
-
-  // Destroy all terminal sessions in daemon (clean up old tmux sessions)
-  console.log(`[${logPrefix}] Destroying ${existingTerminals.length} existing terminal sessions`);
-  for (const terminal of existingTerminals) {
-    try {
-      await invoke("destroy_terminal", { id: terminal.id });
-      console.log(`[${logPrefix}] Destroyed terminal ${terminal.name} (${terminal.id})`);
-    } catch (error) {
-      console.warn(`[${logPrefix}] Failed to destroy terminal ${terminal.id}:`, error);
-      // Continue anyway - we'll create fresh terminals
-    }
-  }
-
-  // Kill ALL loom tmux sessions to ensure clean slate
-  console.log(`[${logPrefix}] Killing all loom tmux sessions...`);
-  try {
-    await invoke("kill_all_loom_sessions");
-    console.log(`[${logPrefix}] All loom sessions killed`);
-  } catch (error) {
-    console.warn(`[${logPrefix}] Failed to kill loom sessions:`, error);
-    // Continue anyway
-  }
-
-  // Clear state (but don't clear config files)
-  state.clearAll();
-  setCurrentAttachedTerminalId(null);
+  // Cleanup existing terminals and sessions
+  await cleanupWorkspace({
+    component: logPrefix,
+    state,
+    outputPoller,
+    terminalManager,
+    setCurrentAttachedTerminalId,
+  });
 
   // Load existing config (do NOT reset to defaults)
   const { loadWorkspaceConfig, setConfigWorkspace, saveConfig, saveState, splitTerminals } =
