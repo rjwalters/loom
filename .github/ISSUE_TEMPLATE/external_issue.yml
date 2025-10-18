@@ -1,0 +1,63 @@
+name: "💬 External feedback"
+description: "Submit a bug report, question, or suggestion"
+title: "[Feedback]: "
+labels: ["triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for your interest in Loom! 🙏
+
+        Since Loom is developed using Loom itself, external code contributions are limited. However, we welcome bug reports, feature suggestions, and questions through this issue template.
+
+        Your issue will be reviewed by the maintainers. For more information, see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: "Type of issue"
+      description: "What type of feedback are you providing?"
+      options:
+        - Bug report
+        - Feature request
+        - Question
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: "Describe your issue"
+      description: "Please include as much detail as possible. For bug reports, include steps to reproduce, expected behavior, and actual behavior."
+      placeholder: |
+        Example for bug report:
+        1. Launch Loom
+        2. Select workspace
+        3. Click "Start"
+        4. Observe error in console
+
+        Expected: Engine starts successfully
+        Actual: Error message appears
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Environment (optional)"
+      description: "For bug reports, please share your environment details"
+      placeholder: |
+        - OS: macOS 14.5
+        - Loom version: 0.1.0
+        - Node version: 20.x
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: "Additional context (optional)"
+      description: "Any other information that might be helpful (screenshots, logs, etc.)"
+    validations:
+      required: false
