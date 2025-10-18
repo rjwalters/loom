@@ -59,6 +59,16 @@
           }
         }
       }
+    },
+    {
+      "includes": ["mcp-*/src/**/*.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
     }
   ],
   "javascript": {

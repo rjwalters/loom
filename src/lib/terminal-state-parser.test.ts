@@ -2,7 +2,7 @@
  * terminal-state-parser.test.ts - Tests for passive terminal state detection
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import { parseTerminalState } from "./terminal-state-parser";
 
 describe("parseTerminalState", () => {

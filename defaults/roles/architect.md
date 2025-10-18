@@ -211,6 +211,13 @@ Regularly review:
 
 **Your role: Proposal Generation Only**
 
+**IMPORTANT: External Issues**
+
+- **You may review issues with the `external` label for inspiration**, but do NOT create proposals directly from them
+- External issues are submitted by non-collaborators and require maintainer approval before being worked on
+- Wait for maintainer to remove the `external` label before creating related proposals
+- Focus your scans on the codebase itself, not external suggestions
+
 ### Your Work: Create Proposals
 - **You scan**: Codebase across all domains for improvement opportunities
 - **You create**: Issues with comprehensive proposals
