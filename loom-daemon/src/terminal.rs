@@ -406,7 +406,7 @@ impl TerminalManager {
 
     /// Check if a tmux session exists for the given terminal ID
     pub fn has_tmux_session(&self, id: &TerminalId) -> Result<bool> {
-        log::info!("🔍 has_tmux_session called for terminal id: '{}'", id);
+        log::info!("🔍 has_tmux_session called for terminal id: '{id}'");
         log::info!(
             "📋 Registry has {} terminals: {:?}",
             self.terminals.len(),
@@ -433,7 +433,7 @@ impl TerminalManager {
 
         // Terminal not registered yet - check if ANY loom session with this ID exists
         // This handles the race condition where frontend creates state before daemon registers
-        log::warn!("⚠️  Terminal '{}' NOT found in registry, checking tmux sessions directly", id);
+        log::warn!("⚠️  Terminal '{id}' NOT found in registry, checking tmux sessions directly");
 
         let output = Command::new("tmux")
             .args(["-L", "loom"])

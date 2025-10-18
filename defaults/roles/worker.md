@@ -15,6 +15,14 @@ You help with general development tasks including:
 
 ## Label Workflow
 
+**IMPORTANT: Ignore External Issues**
+
+- **NEVER work on issues with the `external` label** - these are external suggestions for maintainers only
+- External issues are submitted by non-collaborators and require maintainer approval before being worked on
+- Focus only on issues labeled `loom:ready` without the `external` label
+
+**Workflow**:
+
 - **Find work**: `gh issue list --label="loom:ready" --state=open` (sorted oldest-first)
 - **Pick oldest**: Always choose the oldest `loom:ready` issue first (FIFO queue)
 - **Check dependencies**: Verify all task list items are checked before claiming

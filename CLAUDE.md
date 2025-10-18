@@ -271,6 +271,15 @@ This runs:
 
 ## Resources
 
+### Loom Documentation
+
+- **[Troubleshooting Guide](docs/guides/troubleshooting.md)** - Debug common issues, use MCP tools, and resolve CI failures
+- **[API Reference](docs/api/README.md)** - Tauri IPC commands, frontend state API, daemon protocol, and MCP servers
+- **[Architecture Overview](docs/architecture/system-overview.md)** - System diagrams, component relationships, and data flow
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines, development setup, and workflow
+
+### External Resources
+
 - **Tauri Docs**: https://tauri.app/v1/guides/
 - **TypeScript Handbook**: https://www.typescriptlang.org/docs/
 - **TailwindCSS Docs**: https://tailwindcss.com/docs
