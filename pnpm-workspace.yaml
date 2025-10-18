@@ -1,6 +1,9 @@
 packages:
-  - "."
-  - "mcp-*"
+  - .
+  - mcp-*
+
+ignoredBuiltDependencies:
+  - '@tailwindcss/oxide'
 
 onlyBuiltDependencies:
   - esbuild
