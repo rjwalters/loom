@@ -1,5 +1,8 @@
 import { sendPromptToAgent } from "./agent-launcher";
+import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
+
+const logger = Logger.forComponent("autonomous-manager");
 
 /**
  * Manages autonomous agent intervals for terminals with autonomous mode enabled
@@ -30,7 +33,9 @@ class AutonomousManager {
     // Ensure terminal has autonomous configuration
     const targetInterval = terminal.roleConfig?.targetInterval as number | undefined;
     if (!targetInterval || targetInterval <= 0 || !terminal.roleConfig) {
-      console.warn(`Terminal ${terminal.id} does not have valid autonomous configuration`);
+      logger.warn("Terminal does not have valid autonomous configuration", {
+        terminalId: terminal.id,
+      });
       return;
     }
 
@@ -39,16 +44,18 @@ class AutonomousManager {
 
     const intervalPrompt = (terminal.roleConfig.intervalPrompt as string) || "Continue working";
 
-    console.log(
-      `Starting autonomous mode for ${terminal.id} (interval: ${targetInterval}ms, prompt: "${intervalPrompt}")`
-    );
+    logger.info("Starting autonomous mode", {
+      terminalId: terminal.id,
+      interval: targetInterval,
+      intervalPrompt,
+    });
 
     // Set up interval to send prompts
     const intervalId = window.setInterval(async () => {
       try {
         // Use sessionId for IPC call to send prompt
         await sendPromptToAgent(terminal.id, intervalPrompt);
-        console.log(`Sent autonomous prompt to ${terminal.id} (sessionId: ${terminal.id})`);
+        logger.info("Sent autonomous prompt", { terminalId: terminal.id });
 
         // Update last run timestamp in the interval record (use configId for lookup)
         const interval = this.intervals.get(terminal.id);
@@ -56,7 +63,9 @@ class AutonomousManager {
           interval.lastRun = Date.now();
         }
       } catch (error) {
-        console.error(`Failed to send autonomous prompt to ${terminal.id}:`, error);
+        logger.error("Failed to send autonomous prompt", error, {
+          terminalId: terminal.id,
+        });
       }
     }, targetInterval);
 
@@ -77,7 +86,7 @@ class AutonomousManager {
   stopAutonomous(terminalId: string): void {
     const interval = this.intervals.get(terminalId);
     if (interval) {
-      console.log(`Stopping autonomous mode for ${terminalId}`);
+      logger.info("Stopping autonomous mode", { terminalId });
       window.clearInterval(interval.intervalId);
       this.intervals.delete(terminalId);
     }
@@ -132,7 +141,7 @@ class AutonomousManager {
    * This should be called on app shutdown
    */
   stopAll(): void {
-    console.log(`Stopping ${this.intervals.size} autonomous intervals`);
+    logger.info("Stopping all autonomous intervals", { count: this.intervals.size });
     for (const [terminalId] of this.intervals) {
       this.stopAutonomous(terminalId);
     }
@@ -171,27 +180,32 @@ class AutonomousManager {
     // Ensure terminal has autonomous configuration
     const targetInterval = terminal.roleConfig?.targetInterval as number | undefined;
     if (!targetInterval || targetInterval <= 0 || !terminal.roleConfig) {
-      console.warn(`Terminal ${terminal.id} does not have valid autonomous configuration`);
+      logger.warn("Terminal does not have valid autonomous configuration", {
+        terminalId: terminal.id,
+      });
       return;
     }
 
     const intervalPrompt = (terminal.roleConfig.intervalPrompt as string) || "Continue working";
 
-    console.log(
-      `Manually executing interval prompt for ${terminal.id} (prompt: "${intervalPrompt}")`
-    );
+    logger.info("Manually executing interval prompt", {
+      terminalId: terminal.id,
+      intervalPrompt,
+    });
 
     try {
       // Send the prompt to the agent
       await sendPromptToAgent(terminal.id, intervalPrompt);
-      console.log(`Manually sent prompt to ${terminal.id}`);
+      logger.info("Manually sent prompt", { terminalId: terminal.id });
 
       // Reset the interval timer by restarting autonomous mode
       // This ensures the next automatic execution happens targetInterval ms from now
       this.restartAutonomous(terminal);
-      console.log(`Reset interval timer for ${terminal.id}`);
+      logger.info("Reset interval timer", { terminalId: terminal.id });
     } catch (error) {
-      console.error(`Failed to manually execute prompt for ${terminal.id}:`, error);
+      logger.error("Failed to manually execute prompt", error, {
+        terminalId: terminal.id,
+      });
       throw error;
     }
   }

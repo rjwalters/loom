@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
 import type { AgentStatus, ColorTheme, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+
+const logger = Logger.forComponent("config");
 
 /**
  * Persistent configuration stored in .loom/config.json (committed to git)
@@ -87,7 +90,9 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
   config: LoomConfig;
   state: LoomState;
 } {
-  console.log("[migrateLegacyConfig] Migrating from legacy format...");
+  logger.info("Migrating from legacy config format", {
+    agentCount: legacy.agents.length,
+  });
 
   const terminals: TerminalConfig[] = [];
   const terminalStates: TerminalState[] = [];
@@ -99,7 +104,10 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
     // Case 1: Has configId (dual-ID system) - use it
     if ("configId" in agent && agent.configId) {
       id = agent.configId;
-      console.log(`[migrateLegacyConfig] Using configId="${id}" for ${agent.name}`);
+      logger.info("Using existing configId", {
+        id,
+        terminalName: agent.name,
+      });
     }
     // Case 2: Has UUID or placeholder - generate stable ID
     else if (
@@ -107,7 +115,10 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
       (agent.id.includes("-") || agent.id === "__needs_session__" || agent.id === "__unassigned__")
     ) {
       id = `terminal-${index + 1}`;
-      console.log(`[migrateLegacyConfig] Generated stable ID "${id}" for ${agent.name}`);
+      logger.info("Generated stable ID", {
+        id,
+        terminalName: agent.name,
+      });
     }
     // Case 3: Already has stable ID
     else {
@@ -153,9 +164,9 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
  * Automatically migrates legacy format if needed
  */
 export async function loadConfig(): Promise<LoomConfig> {
-  try {
-    const workspacePath = assertWorkspace();
+  const workspacePath = assertWorkspace();
 
+  try {
     const contents = await invoke<string>("read_config", {
       workspacePath,
     });
@@ -164,7 +175,7 @@ export async function loadConfig(): Promise<LoomConfig> {
 
     // Check if legacy format (has "agents" array with mixed data)
     if (parsed.agents && !parsed.terminals) {
-      console.log("[loadConfig] Detected legacy format, migrating...");
+      logger.info("Detected legacy format, migrating");
       const { config, state } = migrateLegacyConfig(parsed as LegacyConfig);
 
       // Save migrated versions
@@ -176,7 +187,7 @@ export async function loadConfig(): Promise<LoomConfig> {
 
     return parsed as LoomConfig;
   } catch (error) {
-    console.error("Failed to load config:", error);
+    logger.error("Failed to load config", error as Error, { workspacePath });
     // Return empty config on error
     return { terminals: [] };
   }
@@ -195,7 +206,7 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
       configJson: contents,
     });
   } catch (error) {
-    console.error("Failed to save config:", error);
+    logger.error("Failed to save config", error as Error, { workspacePath: assertWorkspace() });
   }
 }
 
@@ -212,7 +223,7 @@ export async function loadState(): Promise<LoomState> {
 
     return JSON.parse(contents) as LoomState;
   } catch (error) {
-    console.error("Failed to load state:", error);
+    logger.error("Failed to load state", error as Error, { workspacePath: assertWorkspace() });
     // Return empty state on error
     return {
       nextAgentNumber: 1,
@@ -254,7 +265,7 @@ export async function saveState(state: LoomState): Promise<void> {
       stateJson: contents,
     });
   } catch (error) {
-    console.error("Failed to save state:", error);
+    logger.error("Failed to save state", error as Error, { workspacePath: assertWorkspace() });
   }
 }
 

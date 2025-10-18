@@ -1,3 +1,7 @@
+import { Logger } from "./logger";
+
+const logger = Logger.forComponent("state");
+
 export enum TerminalStatus {
   Idle = "idle",
   Busy = "busy",
@@ -337,7 +341,9 @@ export class AppState {
     agents.forEach((agent) => {
       // Check if agent has id
       if (!agent.id) {
-        console.warn(`[loadAgents] Skipping terminal "${agent.name}" without id`);
+        logger.warn("Skipping terminal without id", {
+          terminalName: agent.name,
+        });
         return;
       }
       this.addTerminal(agent);
@@ -346,9 +352,9 @@ export class AppState {
     // If no terminal was marked as primary, make the first one primary
     if (!this.primaryId && this.order.length > 0) {
       const firstId = this.order[0];
-      console.log(
-        `[loadAgents] No primary terminal set, making first terminal primary: ${firstId}`
-      );
+      logger.info("No primary terminal set, making first terminal primary", {
+        terminalId: firstId,
+      });
       this.setPrimary(firstId);
     }
   }

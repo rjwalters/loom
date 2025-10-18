@@ -5,7 +5,10 @@
  * and inline renaming. These are called from event handlers in main.ts.
  */
 
+import { Logger } from "./logger";
 import type { AppState } from "./state";
+
+const logger = Logger.forComponent("terminal-actions");
 
 /**
  * Dependencies required by terminal action handlers
@@ -30,12 +33,14 @@ export async function handleRunNowClick(
   deps: Pick<TerminalActionDependencies, "state">
 ): Promise<void> {
   const { state } = deps;
-  console.log(`[handleRunNowClick] Running interval prompt for terminal ${terminalId}`);
+  logger.info("Running interval prompt manually", { terminalId });
 
   try {
     const terminal = state.getTerminal(terminalId);
     if (!terminal) {
-      console.error(`[handleRunNowClick] Terminal ${terminalId} not found`);
+      logger.error("Terminal not found", new Error("Terminal not found"), {
+        terminalId,
+      });
       return;
     }
 
@@ -45,9 +50,11 @@ export async function handleRunNowClick(
 
     // Execute the interval prompt and reset timer
     await autonomousManager.runNow(terminal);
-    console.log(`[handleRunNowClick] Successfully executed interval prompt for ${terminalId}`);
+    logger.info("Successfully executed interval prompt", { terminalId });
   } catch (error) {
-    console.error(`[handleRunNowClick] Failed to execute interval prompt:`, error);
+    logger.error("Failed to execute interval prompt", error as Error, {
+      terminalId,
+    });
     alert(`Failed to run interval prompt: ${error}`);
   }
 }

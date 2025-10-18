@@ -6,10 +6,13 @@ import {
   setConfigWorkspace,
   splitTerminals,
 } from "./config";
+import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
 import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
 import { cleanupWorkspace } from "./workspace-cleanup";
+
+const logger = Logger.forComponent("workspace-reset");
 
 /**
  * Dependencies needed by the workspace reset logic
@@ -54,7 +57,10 @@ export async function resetWorkspaceToDefaults(
     render,
   } = dependencies;
 
-  console.log(`[${logPrefix}] Resetting workspace to defaults`);
+  logger.info("Resetting workspace to defaults", {
+    workspacePath,
+    source: logPrefix
+  });
 
   // Cleanup existing terminals and sessions
   await cleanupWorkspace({
@@ -71,15 +77,24 @@ export async function resetWorkspaceToDefaults(
       workspacePath,
       defaultsPath: "defaults",
     });
-    console.log(`[${logPrefix}] Backend reset complete`);
+    logger.info("Backend reset complete", {
+      workspacePath,
+      source: logPrefix
+    });
   } catch (error) {
-    console.error("Failed to reset workspace:", error);
+    logger.error("Failed to reset workspace", error as Error, {
+      workspacePath,
+      source: logPrefix
+    });
     alert(`Failed to reset workspace: ${error}`);
     return;
   }
 
   // Reset GitHub labels to clean state
-  console.log(`[${logPrefix}] Resetting GitHub labels...`);
+  logger.info("Resetting GitHub labels", {
+    workspacePath,
+    source: logPrefix
+  });
   try {
     interface LabelResetResult {
       issues_cleaned: number;
@@ -88,15 +103,26 @@ export async function resetWorkspaceToDefaults(
     }
 
     const labelResult = await invoke<LabelResetResult>("reset_github_labels");
-    console.log(
-      `[${logPrefix}] Label reset complete: ${labelResult.issues_cleaned} issues cleaned, ${labelResult.prs_updated} PRs updated`
-    );
+    logger.info("Label reset complete", {
+      workspacePath,
+      issuesCleaned: labelResult.issues_cleaned,
+      prsUpdated: labelResult.prs_updated,
+      source: logPrefix
+    });
 
     if (labelResult.errors.length > 0) {
-      console.warn(`[${logPrefix}] Label reset errors:`, labelResult.errors);
+      logger.warn("Label reset errors", {
+        workspacePath,
+        errors: labelResult.errors,
+        source: logPrefix
+      });
     }
   } catch (error) {
-    console.warn(`[${logPrefix}] Failed to reset GitHub labels:`, error);
+    logger.warn("Failed to reset GitHub labels", {
+      workspacePath,
+      error: String(error),
+      source: logPrefix
+    });
     // Continue anyway - label reset is non-critical
   }
 
@@ -109,15 +135,23 @@ export async function resetWorkspaceToDefaults(
     // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
       // Create new terminal sessions for each agent in the config
-      console.log(`[${logPrefix}] Creating ${config.agents.length} terminals...`);
+      logger.info("Creating terminals", {
+        workspacePath,
+        terminalCount: config.agents.length,
+        source: logPrefix
+      });
       for (const agent of config.agents) {
         try {
           // Get instance number
           const instanceNumber = state.getNextTerminalNumber();
 
-          console.log(
-            `[${logPrefix}] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspacePath}`
-          );
+          logger.info("Creating terminal", {
+            workspacePath,
+            terminalName: agent.name,
+            instanceNumber,
+            role: agent.role || "default",
+            source: logPrefix
+          });
 
           // Create terminal in daemon
           const terminalId = await invoke<string>("create_terminal", {
@@ -130,40 +164,59 @@ export async function resetWorkspaceToDefaults(
 
           // Update agent ID to match the newly created terminal
           agent.id = terminalId;
-          console.log(`[${logPrefix}] ✓ Created terminal ${agent.name} (${terminalId})`);
+          logger.info("Created terminal", {
+            workspacePath,
+            terminalName: agent.name,
+            terminalId,
+            source: logPrefix
+          });
 
           // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
           // Agents start in the main workspace directory
           agent.worktreePath = "";
-          console.log(`[${logPrefix}] ✓ Agent will start in main workspace`);
+          logger.info("Agent will start in main workspace", {
+            workspacePath,
+            terminalName: agent.name,
+            source: logPrefix
+          });
         } catch (error) {
-          console.error(`[${logPrefix}] ✗ Failed to create terminal ${agent.name}:`, error);
+          logger.error("Failed to create terminal", error as Error, {
+            workspacePath,
+            terminalName: agent.name,
+            source: logPrefix
+          });
           alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
       }
 
-      console.log(
-        `[${logPrefix}] All terminals created, agents array:`,
-        config.agents.map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("All terminals created", {
+        workspacePath,
+        agents: config.agents.map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
 
       // Set workspace as active BEFORE loading agents (needed for proper initialization)
       state.setWorkspace(workspacePath);
 
       // Now load the agents into state with their new IDs
-      console.log(
-        `[${logPrefix}] Loading agents into state:`,
-        config.agents.map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("Loading agents into state", {
+        workspacePath,
+        agents: config.agents.map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
       state.loadAgents(config.agents);
-      console.log(
-        `[${logPrefix}] State after loadAgents:`,
-        state.getTerminals().map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("State after loadAgents", {
+        workspacePath,
+        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
 
       // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
       // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
-      console.log(`[${logPrefix}] Saving config with real terminal IDs...`);
+      logger.info("Saving config with real terminal IDs", {
+        workspacePath,
+        source: logPrefix
+      });
       const terminalsToSave1 = state.getTerminals();
       const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
       await saveConfig({ terminals: terminalConfigs1 });
@@ -171,18 +224,28 @@ export async function resetWorkspaceToDefaults(
         nextAgentNumber: state.getCurrentTerminalNumber(),
         terminals: terminalStates1,
       });
-      console.log(`[${logPrefix}] Config saved`);
+      logger.info("Config saved", {
+        workspacePath,
+        source: logPrefix
+      });
 
       // Launch agents for terminals with role configs
-      console.log(`[${logPrefix}] Launching agents...`);
+      logger.info("Launching agents", {
+        workspacePath,
+        source: logPrefix
+      });
       await launchAgentsForTerminals(workspacePath, config.agents);
-      console.log(
-        `[${logPrefix}] State after launchAgentsForTerminals:`,
-        state.getTerminals().map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("State after launchAgentsForTerminals", {
+        workspacePath,
+        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
 
       // Save final state after agent launch
-      console.log(`[${logPrefix}] Saving final config...`);
+      logger.info("Saving final config", {
+        workspacePath,
+        source: logPrefix
+      });
       const terminalsToSave2 = state.getTerminals();
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
       await saveConfig({ terminals: terminalConfigs2 });
@@ -191,13 +254,19 @@ export async function resetWorkspaceToDefaults(
         terminals: terminalStates2,
       });
 
-      console.log(`[${logPrefix}] Workspace reset complete`);
+      logger.info("Workspace reset complete", {
+        workspacePath,
+        source: logPrefix
+      });
     } else {
       // No agents in config - still set workspace as active
       state.setWorkspace(workspacePath);
     }
   } catch (error) {
-    console.error("Failed to reload config after reset:", error);
+    logger.error("Failed to reload config after reset", error as Error, {
+      workspacePath,
+      source: logPrefix
+    });
     alert(`Failed to reload config: ${error}`);
   }
 

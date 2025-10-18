@@ -1,6 +1,9 @@
+import { Logger } from "./logger";
 import { type Terminal, TerminalStatus } from "./state";
 import { getTarotCardPath } from "./tarot-cards";
 import { getTheme, getThemeStyles, isDarkMode } from "./themes";
+
+const logger = Logger.forComponent("ui");
 
 /**
  * Format milliseconds into a human-readable duration
@@ -281,9 +284,9 @@ export function renderPrimaryTerminal(
 
   // If missing session, render error UI inside the content container after DOM update
   if (hasMissingSession) {
-    console.log(
-      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=true, will render error overlay`
-    );
+    logger.info("Terminal has missing session, rendering error overlay", {
+      terminalId: terminal.id,
+    });
     setTimeout(async () => {
       // Get health check timing from health monitor
       const { getHealthMonitor } = await import("./health-monitor");
@@ -293,9 +296,10 @@ export function renderPrimaryTerminal(
       renderMissingSessionError(terminal.id, terminal.id, healthTiming);
     }, 0);
   } else {
-    console.log(
-      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=${terminal.missingSession}, will show xterm`
-    );
+    logger.info("Terminal session valid, showing xterm", {
+      terminalId: terminal.id,
+      missingSession: terminal.missingSession,
+    });
   }
 }
 
@@ -310,13 +314,19 @@ export function renderMissingSessionError(
   configId: string,
   healthTiming?: HealthCheckTiming
 ): void {
-  console.log(`[renderMissingSessionError] Rendering error overlay for terminal ${sessionId}`);
+  logger.info("Rendering missing session error overlay", {
+    sessionId,
+    configId,
+  });
   const container = document.getElementById(`xterm-container-${sessionId}`);
   if (!container) {
-    console.warn(`[renderMissingSessionError] Container #xterm-container-${sessionId} not found!`);
+    logger.warn("Container not found for session", {
+      sessionId,
+      containerId: `xterm-container-${sessionId}`,
+    });
     return;
   }
-  console.log(`[renderMissingSessionError] Found container, replacing with error UI`);
+  logger.info("Found container, replacing with error UI", { sessionId });
 
   // Calculate health check timing info
   let healthCheckInfo = "";
