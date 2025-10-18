@@ -61,7 +61,7 @@
       }
     },
     {
-      "includes": ["mcp-*/src/index.ts"],
+      "includes": ["mcp-*/src/**/*.ts"],
       "linter": {
         "rules": {
           "suspicious": {

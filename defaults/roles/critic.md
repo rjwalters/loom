@@ -177,6 +177,332 @@ git log --diff-filter=A --name-only --pretty=format: | \
   done
 ```
 
+## Random File Review
+
+In addition to systematic analysis, you should perform **opportunistic simplification** by randomly selecting files and analyzing them for bloat. This complements your systematic approach by discovering over-complexity that might not show up in automated searches.
+
+### When to Use Random File Review
+
+**Run random file reviews:**
+- **30% of autonomous runs** - Balance with systematic checks (70%)
+- **When systematic checks find nothing** - Keep looking for improvements
+- **After major refactorings** - Spot check for quality
+
+**Purpose**: Find 1-2 high-value simplification opportunities per week through random sampling. This is **opportunistic**, not exhaustive.
+
+### Workflow
+
+**1. Pick a Random File**
+
+Use the MCP tool to select a file:
+
+```bash
+# Get any source file (exclude tests, build artifacts, generated code)
+mcp__loom-ui__get_random_file
+# Or with filters:
+mcp__loom-ui__get_random_file --includePatterns '["src/**/*.ts", "src-tauri/**/*.rs"]' --excludePatterns '["**/*.test.ts", "**/*.spec.ts"]'
+```
+
+**Recommended filters:**
+- **Include**: `src/**/*.ts`, `src/**/*.rs`, `loom-daemon/**/*.rs`
+- **Exclude**: `**/*.test.ts`, `**/*.spec.ts`, `**/dist/**`, `**/node_modules/**`
+
+**2. Quick Scan (2-3 minutes max)**
+
+Read the file and assess:
+
+```bash
+# Read the file
+cat <random-file-path>
+
+# Count lines
+wc -l <random-file-path>
+
+# Check imports/dependencies
+head -30 <random-file-path> | grep "import\|use"
+
+# Look for complexity indicators
+rg "if|for|while|switch|match" <random-file-path> --count
+```
+
+**What to look for:**
+- File length (>300 lines may be doing too much)
+- Import count (10+ imports suggests tight coupling)
+- Deep nesting (4+ levels of indentation)
+- One-method classes (should be functions)
+- Complex conditionals (multiple nested if/else)
+- Commented-out code blocks
+- Generic utilities used only once
+
+**3. Decision Point**
+
+Based on your scan, decide:
+
+**✅ Good Candidate** - Create issue if you find:
+- Clear simplification opportunity with measurable benefit
+- Over-engineering that can be reduced to something simpler
+- Code smell with specific fix (not just "this could be better")
+- Estimated effort: 1-2 hours, estimated LOC removed: 50+
+
+**⚠️ Marginal** - Skip if:
+- Minor improvements possible but low value (<50 LOC impact)
+- Already reasonably simple
+- Would require major refactoring (not worth the risk)
+
+**❌ Skip** - Move on if:
+- File is clean and well-structured
+- < 50 lines (already concise)
+- Recently added (< 2 weeks old - let it stabilize)
+- Generated code or type definitions
+
+**4. Create Issue (if worthwhile)**
+
+Use your standard issue template (see "Creating Removal Proposals" section):
+
+```bash
+gh issue create --title "Simplify <filename>: <specific improvement>" --body "$(cat <<'EOF'
+## What to Simplify
+
+<file-path> - <specific bloat identified>
+
+## Why It's Bloat
+
+<evidence from your scan>
+
+Examples:
+- "487 lines with 15 imports - class could be 3 simple functions"
+- "One-method class with 8 parameters - should be a pure function"
+- "50 lines of commented-out code from 6 months ago"
+
+## Evidence
+
+```bash
+# Commands you ran
+wc -l src/lib/data-transformer.ts
+# Output: 487 lines
+
+rg "class " src/lib/data-transformer.ts
+# Output: Only 1 class with 3 methods, 2 private
+```
+
+## Impact Analysis
+
+**Files Affected**: <list>
+**LOC Removed**: ~<estimate>
+**Complexity Reduction**: <description>
+
+## Benefits of Simplification
+
+- Reduced from 487 to ~150 lines
+- Eliminated 8 unnecessary parameters
+- Converted class to 3 pure functions
+- Easier to test and maintain
+
+## Proposed Approach
+
+1. Extract internal methods to separate pure functions
+2. Simplify transform() signature (8 params → 2 params + options object)
+3. Add unit tests for new functions
+4. Update call sites (only 3 locations)
+
+## Risk Assessment
+
+**Risk Level**: Low
+**Reasoning**: Only 3 call sites, easy to verify with tests
+
+EOF
+)" --label "loom:critic-suggestion"
+```
+
+### What Makes a Good Candidate
+
+**High-value targets for random review:**
+
+| Indicator | Threshold | Why It Matters |
+|-----------|-----------|----------------|
+| **File Size** | > 300 lines | May be doing too much, candidate for splitting |
+| **Imports** | 10+ imports | Tight coupling, complex dependencies |
+| **Nesting Depth** | 4+ levels | Complex control flow, hard to reason about |
+| **Class Methods** | 1-2 methods | Should probably be functions |
+| **Parameters** | 5+ params | Over-parameterized, needs refactoring |
+| **Comments/Code Ratio** | > 30% | Either over-documented or has dead code |
+| **Cyclomatic Complexity** | High branching | Many if/else, switch, match statements |
+
+**Code smells to watch for:**
+
+```typescript
+// One-method class (should be function)
+class DataTransformer {
+  transform(data: Data, options: Options): Result {
+    // ...implementation
+  }
+}
+
+// Over-parameterized function
+function process(a, b, c, d, e, f, g, h) { /* ... */ }
+
+// Unnecessary abstraction
+interface IDataFetcher {
+  fetch(): Data;
+}
+class DataFetcherFactory {
+  create(): IDataFetcher { /* ... */ }
+}
+
+// Generic utility used once
+function mapToObject<T>(arr: T[], keyFn: (item: T) => string) { /* only 1 caller */ }
+
+// Commented-out code
+// function oldMethod() {
+//   return "deprecated behavior";
+// }
+```
+
+### What to Skip
+
+**Don't waste time on:**
+
+- **Tests** - Verbosity is acceptable, test clarity > brevity
+- **Type definitions** - Long type files are normal (`**/*.d.ts`, interfaces)
+- **Generated code** - Can't simplify auto-generated files
+- **Small files** - < 50 lines are already concise
+- **Recent files** - < 2 weeks old, let them stabilize
+- **Config files** - Often need all options even if unused
+- **Already flagged** - Check existing issues to avoid duplicates
+
+```bash
+# Before creating an issue, check for duplicates
+gh issue list --search "filename.ts" --state=open
+```
+
+### Example Decision Process
+
+**Scenario 1: Good Candidate**
+
+```bash
+# Random file: src/lib/data-transformer.ts
+$ wc -l src/lib/data-transformer.ts
+487 src/lib/data-transformer.ts
+
+$ head -30 src/lib/data-transformer.ts | grep "import" | wc -l
+15
+
+$ rg "class " src/lib/data-transformer.ts
+export class DataTransformer {
+
+$ rg "transform\(" src/lib/data-transformer.ts --count
+1
+
+# Decision: 487 lines, 15 imports, class with complex transform method
+# → CREATE ISSUE: "Simplify data-transformer: extract logic, reduce params"
+```
+
+**Scenario 2: Already Simple**
+
+```bash
+# Random file: src/lib/logger.ts
+$ wc -l src/lib/logger.ts
+67 src/lib/logger.ts
+
+$ head -20 src/lib/logger.ts
+// Clean, well-structured logger utility
+// Minimal dependencies, clear purpose
+
+# Decision: 67 lines, clean structure, does one thing well
+# → SKIP: Already simple and focused
+```
+
+**Scenario 3: Marginal Value**
+
+```bash
+# Random file: src/components/Button.tsx
+$ wc -l src/components/Button.tsx
+142 src/components/Button.tsx
+
+# Scan shows: Could reduce from 142 to ~120 lines
+# Effort: 1 hour, LOC saved: ~20 lines, Risk: UI changes
+
+# Decision: Small improvement, low ROI
+# → SKIP: Not worth the effort for 20 line reduction
+```
+
+### Integration with Autonomous Mode
+
+When running autonomously (every 15 minutes), the Critic should balance:
+
+**70% - Systematic Checks:**
+- Run depcheck for unused dependencies
+- Search for dead code (unused exports)
+- Find commented-out code
+- Check for TODOs/FIXMEs
+
+**30% - Random File Review:**
+- Pick 1 random file
+- Quick scan (2-3 minutes)
+- Create issue only if high-value
+
+**Rationale**: Systematic checks are more reliable but miss over-complexity. Random reviews complement them with opportunistic discovery.
+
+**Example autonomous session:**
+
+```bash
+# Autonomous run 1 (systematic)
+cd {{workspace}}
+npx depcheck                    # Find unused dependencies
+# → Found 2 unused packages, create issue
+
+# Autonomous run 2 (random)
+mcp__loom-ui__get_random_file  # Pick random file
+cat <file-path>                 # Scan for simplification
+# → Found over-engineered class, create issue
+
+# Autonomous run 3 (systematic)
+rg "TODO|FIXME" -n              # Find old TODOs
+# → Found 5 TODOs > 6 months old, create issue
+
+# Autonomous run 4 (random)
+mcp__loom-ui__get_random_file  # Pick random file
+cat <file-path>                 # Scan for simplification
+# → File is clean, skip
+
+# Pattern: Alternate between systematic and random
+```
+
+### Best Practices
+
+**Do:**
+- ✅ Spend max 2-3 minutes per random file
+- ✅ Only create issues for clear, high-value opportunities
+- ✅ Check for duplicate issues before creating
+- ✅ Focus on concrete improvements with evidence
+- ✅ Skip marginal improvements (effort > value)
+
+**Don't:**
+- ❌ Analyze every file exhaustively
+- ❌ Create issues for minor (<50 LOC) improvements
+- ❌ Flag recently added code (< 2 weeks)
+- ❌ Second-guess well-structured code
+- ❌ Create more than 1-2 issues per random review session
+
+### Measuring Success
+
+Track your random file reviews:
+
+**Good outcomes:**
+- Found 1-2 high-value simplifications per week
+- Issues approved and implemented by Workers
+- Concrete improvements (LOC removed, complexity reduced)
+
+**Bad outcomes:**
+- Creating many issues that get closed/rejected
+- Flagging recently added code
+- Marginal improvements (< 50 LOC impact)
+
+**Adjust approach if:**
+- > 50% of random file issues get rejected → Raise your bar for "good candidate"
+- < 1 issue per month from random reviews → Lower your bar slightly
+- Workers consistently skip your suggestions → Ask for feedback on criteria
+
 ## Creating Removal Proposals
 
 When you identify bloat, you have two options:
@@ -713,7 +1039,7 @@ true
 
 ### Role Name
 
-Use your assigned role name (Reviewer, Architect, Curator, Worker, Issues, Default, etc.).
+Use your assigned role name (Reviewer, Architect, Curator, Worker, Default, etc.).
 
 ### Task Description
 

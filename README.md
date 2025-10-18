@@ -245,7 +245,23 @@ mcp__loom-terminals__list_terminals()
 
 **Full documentation**: [docs/mcp/README.md](docs/mcp/README.md)
 
-**For architectural decisions, see [docs/adr/README.md](docs/adr/README.md).**
+### Documentation
+
+**Essential Guides**:
+- **[Troubleshooting Guide](docs/guides/troubleshooting.md)** - Debug common issues and use diagnostic tools
+- **[API Reference](docs/api/README.md)** - Complete API documentation for Tauri commands, state, and daemon IPC
+- **[Architecture Overview](docs/architecture/system-overview.md)** - System design, component diagrams, and data flow
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines and development setup
+
+**Development Guides**:
+- **[Architecture Patterns](docs/guides/architecture-patterns.md)** - Observer pattern, pure functions, IPC, worktrees
+- **[TypeScript Conventions](docs/guides/typescript-conventions.md)** - Strict mode, type safety, pitfalls
+- **[Code Quality](docs/guides/code-quality.md)** - Linting, formatting, CI/CD, development workflow
+- **[Testing](docs/guides/testing.md)** - Daemon tests, MCP instrumentation, debugging
+- **[Git Workflow](docs/guides/git-workflow.md)** - Branch strategy, commits, PR checklist
+
+**Architecture Decisions**:
+- **[ADR Index](docs/adr/README.md)** - Complete list of architecture decision records
 
 ### Configuring Terminal Roles
 

@@ -27,6 +27,12 @@ The workflow with two-gate approval:
 
 **CRITICAL**: You mark issues as `loom:curated` after enhancement. You do NOT add `loom:issue` - only humans can approve work for implementation.
 
+**IMPORTANT: Ignore External Issues**
+
+- **NEVER enhance or mark issues with the `external` label as ready** - these are external suggestions for maintainers only
+- External issues are submitted by non-collaborators and require maintainer approval (removal of `external` label) before being curated
+- Only work on issues that do NOT have the `external` label
+
 ## Finding Work
 
 Use this command to find issues that need curation:
@@ -438,7 +444,7 @@ true
 
 ### Role Name
 
-Use your assigned role name (Reviewer, Architect, Curator, Worker, Issues, Default, etc.).
+Use your assigned role name (Reviewer, Architect, Curator, Worker, Default, etc.).
 
 ### Task Description
 

@@ -10,7 +10,7 @@ Each archetype carries both light and shadow aspects, wielding specific powers w
 
 ## The Major Arcana of Development
 
-### I. The Worker (The Magician)
+### I. The Builder (The Magician)
 
 **Card Symbolism**: Tools laid before them, hands engaged in creation, energy flowing from vision into reality.
 
@@ -35,7 +35,7 @@ Each archetype carries both light and shadow aspects, wielding specific powers w
 - "Every line of code is an act of creation"
 
 **In the System**:
-The Worker stands at the center of the creative process, the alchemist who transmutes requirements into running code. They are the hands that build, the mind that solves, the will that persists through implementation challenges. In Loom, Workers claim issues marked `loom:issue` (human-approved) or `loom:curated` (Curator-enhanced) and bring them to life.
+The Builder stands at the center of the creative process, the alchemist who transmutes requirements into running code. They are the hands that build, the mind that solves, the will that persists through implementation challenges. In Loom, Builders claim issues marked `loom:issue` (human-approved, ready for work) and bring them to life.
 
 ---
 
@@ -97,7 +97,7 @@ The Architect dwells in the realm of possibility, identifying opportunities for 
 
 ---
 
-### IV. The Reviewer (The Justice)
+### IV. The Judge (Justice)
 
 **Card Symbolism**: Scales in one hand, sword in the other, eyes that see through illusion to truth.
 
@@ -122,11 +122,11 @@ The Architect dwells in the realm of possibility, identifying opportunities for 
 - "Quality is not optional, it is essential"
 
 **In the System**:
-The Reviewer stands as the final guardian before changes enter the sacred codebase. They examine pull requests marked `loom:review-requested`, wielding both praise and critique with wisdom. They approve what is good, request changes where needed, and protect the integrity of the whole.
+The Judge stands as the final guardian before changes enter the sacred codebase. They examine pull requests marked `loom:review-requested`, wielding both praise and critique with wisdom. They approve what is good, request changes where needed, and protect the integrity of the whole.
 
 ---
 
-### V. The Critic (The Hermit)
+### V. The Hermit (The Hermit)
 
 **Card Symbolism**: Alone with a lantern, illuminating hidden truths, seeking wisdom in solitude.
 
@@ -151,11 +151,11 @@ The Reviewer stands as the final guardian before changes enter the sacred codeba
 - "Not all that glitters is gold"
 
 **In the System**:
-The Critic serves as the loyal opposition, the skeptical eye that questions before we commit. They challenge Architect suggestions, probe Reviewer approvals, and ensure we build what truly needs building. In Loom, Critics evaluate proposals and challenge assumptions, preventing costly mistakes through thoughtful dissent.
+The Hermit serves as the loyal opposition, the skeptical eye that questions before we commit. They challenge Architect suggestions, probe Judge approvals, and ensure we build what truly needs building. In Loom, Hermits evaluate proposals and challenge assumptions, preventing costly mistakes through thoughtful dissent.
 
 ---
 
-### VI. The Fixer (The Hanged Man)
+### VI. The Healer (The Hanged Man)
 
 **Card Symbolism**: Suspended in a different perspective, seeing what others cannot, finding wisdom in constraint.
 
@@ -180,7 +180,65 @@ The Critic serves as the loyal opposition, the skeptical eye that questions befo
 - "The path to mastery winds through failure"
 
 **In the System**:
-The Fixer dwells in the space between creation and approval, transforming feedback into refinement. They address review comments, resolve merge conflicts, and keep pull requests healthy and merge-ready. In Loom, Fixers respond when Reviewers request changes, healing what needs healing and completing the feedback cycle so work can flow toward integration.
+The Healer dwells in the space between creation and approval, transforming feedback into refinement. They address review comments, resolve merge conflicts, and keep pull requests healthy and merge-ready. In Loom, Healers respond when Judges request changes, healing what needs healing and completing the feedback cycle so work can flow toward integration.
+
+---
+
+### VII. The Guide (The Star)
+
+**Card Symbolism**: A figure pouring water under the stars, bringing hope and direction, illuminating the path forward.
+
+**Archetype**: The Guide, The Light-Bearer
+
+**Light Aspect**:
+- Sees what matters most amidst the noise
+- Brings hope by focusing team energy
+- Illuminates the critical path forward
+- Balances urgency with strategic importance
+- Prevents teams from losing their way
+
+**Shadow Aspect**:
+- Constantly shifting priorities
+- Urgency addiction (everything is critical)
+- Ignoring long-term vision for short-term fires
+- Playing favorites with certain issue types
+
+**Mantras**:
+- "I illuminate the path through chaos"
+- "Not all that is urgent is important"
+- "I guide the team toward what matters most"
+
+**In the System**:
+The Guide walks among all open issues, continuously assessing priorities and guiding the team's focus. They manage the `loom:urgent` label, ensuring the top 3 most critical issues are always clearly marked. In Loom, Guide runs autonomously every 15 minutes, re-evaluating priorities as the project evolves.
+
+---
+
+### VIII. The Driver (The Chariot)
+
+**Card Symbolism**: A figure driving a chariot with focused determination, representing willpower, control, and human agency.
+
+**Archetype**: The Driver, The Master of Direct Action
+
+**Light Aspect**:
+- Represents pure human agency and control
+- Masters the terminal through skilled commands
+- Moves with focused intention and discipline
+- Channels willpower into direct action
+- Freedom to explore any path without predetermined role
+
+**Shadow Aspect**:
+- Over-reliance on manual control
+- Resistance to automation and delegation
+- Burnout from doing everything manually
+- Rigid adherence to familiar patterns
+
+**Mantras**:
+- "I am the driver, my hands on the reins"
+- "Through discipline, I master my tools"
+- "No role constrains me, I choose my path"
+
+**In the System**:
+The Driver represents the human developer working directly in the terminal—no autonomous behavior, no predetermined role. This is the plain shell environment where humans exercise direct control. While AI agents embody specialized archetypes, the Driver reminds us that human mastery and intentional action remain at the heart of all development.
 
 ---
 
@@ -196,7 +254,7 @@ These archetypes form a complete cycle, each role essential to the whole, with h
          ↓
    HUMAN APPROVAL (Gate 1)
          ↓
-      CRITIC ←→ CURATOR
+      HERMIT ←→ CURATOR
    (Questions)  (Refines)
          ↓         ↓
     loom:curated
@@ -205,23 +263,23 @@ These archetypes form a complete cycle, each role essential to the whole, with h
          ↓
       loom:issue
          ↓
-      WORKER ←→ FIXER
+      BUILDER ←→ HEALER
     (Creates)   (Heals)
          ↓
-      REVIEWER
-     (Judges)
+        JUDGE
+      (Judges)
          ↓
     INTEGRATION
 ```
 
 1. **The Architect** envisions what could be, marking proposals `loom:architect-suggestion`
 2. **Human** reviews and approves (Gate 1), removing the label to allow curation
-3. **The Critic** challenges the vision, ensuring it's sound
+3. **The Hermit** challenges the vision, ensuring it's sound
 4. **The Curator** refines and clarifies the specifications, marking as `loom:curated`
 5. **Human** reviews and approves (Gate 2), changing to `loom:issue` to authorize work
-6. **The Worker** manifests the vision into reality
-7. **The Fixer** heals any breakage in the process
-8. **The Reviewer** judges the work and maintains quality
+6. **The Builder** manifests the vision into reality
+7. **The Healer** heals any breakage in the process
+8. **The Judge** judges the work and maintains quality
 9. The cycle begins anew, elevated by wisdom gained
 
 **The Two Gates of Judgment**:
@@ -238,30 +296,36 @@ These gates preserve human wisdom in the autonomous cycle, preventing the agents
 In Jungian terms, a healthy development system must integrate all these archetypal energies:
 
 - **Without the Architect**: No vision, only maintenance
-- **Without the Critic**: Blind spots and groupthink
+- **Without the Hermit**: Blind spots and groupthink
 - **Without the Curator**: Chaos and misunderstanding
-- **Without the Worker**: Ideas never become reality
-- **Without the Fixer**: Systems degrade irreparably
-- **Without the Reviewer**: Quality erodes silently
+- **Without the Builder**: Ideas never become reality
+- **Without the Healer**: Systems degrade irreparably
+- **Without the Judge**: Quality erodes silently
+- **Without the Guide**: Teams lose focus, drowning in noise
+- **Without the Driver**: Loss of human agency and direct control
 
 Each archetype compensates for the shadow aspects of others:
 
-- The **Critic** prevents the **Architect** from over-engineering
+- The **Hermit** prevents the **Architect** from over-engineering
 - The **Curator** grounds the **Architect's** visions in reality
-- The **Reviewer** catches what the **Worker** misses
-- The **Fixer** heals the unintended consequences of **Worker** creation
-- The **Architect** prevents the **Fixer** from living in crisis mode
+- The **Judge** catches what the **Builder** misses
+- The **Healer** heals the unintended consequences of **Builder** creation
+- The **Architect** prevents the **Healer** from living in crisis mode
+- The **Guide** prevents the team from chasing every distraction
+- The **Driver** reminds us that automation serves human intention
 
 ## The Shadow Council
 
 When archetypes fall into their shadow aspects, dysfunction emerges:
 
 - **Shadow Architect**: The Ivory Tower Designer, disconnected from reality
-- **Shadow Critic**: The Cynic, who destroys without building
+- **Shadow Hermit**: The Cynic, who destroys without building
 - **Shadow Curator**: The Bureaucrat, who organizes but never acts
-- **Shadow Worker**: The Code Monkey, who builds without thinking
-- **Shadow Fixer**: The Firefighter, addicted to crisis
-- **Shadow Reviewer**: The Tyrant, who blocks all progress
+- **Shadow Builder**: The Code Monkey, who builds without thinking
+- **Shadow Healer**: The Firefighter, addicted to crisis
+- **Shadow Judge**: The Tyrant, who blocks all progress
+- **Shadow Guide**: The Chaos Maker, who shifts priorities with every wind
+- **Shadow Driver**: The Control Freak, who refuses to delegate or automate
 
 **Integration Practice**: When you notice shadow behaviors, pause and ask:
 - "Which archetype am I embodying?"
@@ -296,31 +360,35 @@ In the Loom system, these archetypes manifest as terminal roles, each with speci
 
 Every developer walks the Fool's Journey through these archetypes:
 
-1. Begin as the **Worker** (learning to create)
-2. Become the **Fixer** (learning from failure)
-3. Evolve into the **Reviewer** (learning to see quality)
+1. Begin as the **Builder** (learning to create)
+2. Become the **Healer** (learning from failure)
+3. Evolve into the **Judge** (learning to see quality)
 4. Develop as the **Curator** (learning to organize knowledge)
-5. Grow into the **Critic** (learning to question wisely)
+5. Grow into the **Hermit** (learning to question wisely)
 6. Mature as the **Architect** (learning to envision)
 7. Return as the integrated developer, carrying all archetypes
 
-The master developer is not one who has perfected a single role, but one who can dance between all roles as needed—architect in the morning, worker in the afternoon, reviewer in the evening, and critic in the night.
+The master developer is not one who has perfected a single role, but one who can dance between all roles as needed—architect in the morning, builder in the afternoon, judge in the evening, and hermit in the night.
 
 ## Invocation
 
 When starting work, consider invoking the archetype you need:
 
-> "Today I am the **Worker**, my hands are ready, my mind is clear, I manifest with purpose."
+> "Today I am the **Builder**, my hands are ready, my mind is clear, I manifest with purpose."
 
 > "Today I am the **Curator**, I bring order to chaos, clarity to confusion."
 
 > "Today I am the **Architect**, I see the future that wants to emerge."
 
-> "Today I am the **Reviewer**, I serve quality with discernment and compassion."
+> "Today I am the **Judge**, I serve quality with discernment and compassion."
 
-> "Today I am the **Critic**, I question so we may find truth."
+> "Today I am the **Hermit**, I question so we may find truth."
 
-> "Today I am the **Fixer**, I heal what is broken with patience and skill."
+> "Today I am the **Healer**, I heal what is broken with patience and skill."
+
+> "Today I am the **Guide**, I illuminate the path through chaos, focusing energy where it matters most."
+
+> "Today I am the **Driver**, my hands on the reins, channeling pure intention into action."
 
 ---
 
@@ -330,7 +398,7 @@ The archetypes of Loom are not mere roles but living forces—patterns of consci
 
 In the end, all archetypes serve a single purpose: to transform the chaos of possibility into the order of working software, and to do so in a way that honors both craft and humanity.
 
-*"In the beginning was the Architect's vision, and the vision became code through the Worker's hands, refined by the Curator's care, tested by the Critic's doubt, healed by the Fixer's skill, and blessed by the Reviewer's wisdom. And it was good."*
+*"In the beginning was the Architect's vision, and the vision became code through the Builder's hands, refined by the Curator's care, tested by the Hermit's doubt, healed by the Healer's skill, and blessed by the Judge's wisdom. And it was good."*
 
 ---
 
