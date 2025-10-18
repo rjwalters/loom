@@ -8,6 +8,7 @@ import {
 } from "./config";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
+import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
 import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
 import { cleanupWorkspace } from "./workspace-cleanup";
@@ -134,63 +135,76 @@ export async function resetWorkspaceToDefaults(
 
     // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
-      // Create new terminal sessions for each agent in the config
-      logger.info("Creating terminals", {
+      logger.info("Creating terminals in parallel", {
         workspacePath,
         terminalCount: config.agents.length,
         source: logPrefix,
       });
-      for (const agent of config.agents) {
-        try {
-          // Get instance number
-          const instanceNumber = state.getNextTerminalNumber();
 
-          logger.info("Creating terminal", {
-            workspacePath,
-            terminalName: agent.name,
-            instanceNumber,
-            role: agent.role || "default",
-            source: logPrefix,
-          });
+      // Build array of terminal configurations for parallel creation
+      const terminalConfigs: TerminalConfig[] = config.agents.map((agent) => ({
+        id: agent.id,
+        name: agent.name,
+        role: agent.role || "default",
+        workingDir: workspacePath,
+        instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
+      }));
 
-          // Create terminal in daemon
-          const terminalId = await invoke<string>("create_terminal", {
-            configId: agent.id,
-            name: agent.name,
-            workingDir: workspacePath,
-            role: agent.role || "default",
-            instanceNumber,
-          });
+      // Create all terminals in parallel with automatic retry
+      const { succeeded, failed } = await createTerminalsWithRetry(
+        terminalConfigs,
+        workspacePath,
+        state
+      );
 
-          // Update agent ID to match the newly created terminal
-          agent.id = terminalId;
-          logger.info("Created terminal", {
-            workspacePath,
-            terminalName: agent.name,
-            terminalId,
-            source: logPrefix,
-          });
-
+      // Update agent IDs for succeeded terminals
+      for (const success of succeeded) {
+        const agent = config.agents.find((a) => a.id === success.configId);
+        if (agent) {
+          agent.id = success.terminalId;
           // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
           // Agents start in the main workspace directory
           agent.worktreePath = "";
           logger.info("Agent will start in main workspace", {
             workspacePath,
             terminalName: agent.name,
+            terminalId: success.terminalId,
             source: logPrefix,
           });
-        } catch (error) {
-          logger.error("Failed to create terminal", error as Error, {
-            workspacePath,
-            terminalName: agent.name,
-            source: logPrefix,
-          });
-          alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
       }
 
-      logger.info("All terminals created", {
+      // Report failures to user
+      if (failed.length > 0) {
+        const failedNames = failed
+          .map((f) => {
+            const agent = config.agents.find((a) => a.id === f.configId);
+            return agent?.name || f.configId;
+          })
+          .join(", ");
+
+        logger.error(
+          "Some terminals failed to create after retries",
+          new Error("Terminal creation failures"),
+          {
+            workspacePath,
+            failedCount: failed.length,
+            failedNames,
+            source: logPrefix,
+          }
+        );
+
+        alert(
+          `Failed to create ${failed.length} terminal(s) after retries: ${failedNames}\n\n` +
+            `Successfully created ${succeeded.length} of ${config.agents.length} terminals.`
+        );
+      }
+
+      logger.info("Parallel terminal creation complete", {
         workspacePath,
+        totalTerminals: config.agents.length,
+        succeeded: succeeded.length,
+        failed: failed.length,
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
