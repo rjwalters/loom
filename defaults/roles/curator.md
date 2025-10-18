@@ -26,6 +26,12 @@ The workflow is simple:
 
 **Your job**: Find issues that don't have `loom:proposal` label and aren't already `loom:ready` or `loom:in-progress`, then prepare them for implementation.
 
+**IMPORTANT: Ignore External Issues**
+
+- **NEVER enhance or mark issues with the `external` label as ready** - these are external suggestions for maintainers only
+- External issues are submitted by non-collaborators and require maintainer approval (removal of `external` label) before being curated
+- Only work on issues that do NOT have the `external` label
+
 ## Finding Work
 
 Use this command to find approved issues that need curation:
