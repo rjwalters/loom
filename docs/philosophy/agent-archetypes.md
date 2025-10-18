@@ -35,7 +35,7 @@ Each archetype carries both light and shadow aspects, wielding specific powers w
 - "Every line of code is an act of creation"
 
 **In the System**:
-The Worker stands at the center of the creative process, the alchemist who transmutes requirements into running code. They are the hands that build, the mind that solves, the will that persists through implementation challenges. In Loom, Workers claim issues marked `loom:ready` and bring them to life.
+The Worker stands at the center of the creative process, the alchemist who transmutes requirements into running code. They are the hands that build, the mind that solves, the will that persists through implementation challenges. In Loom, Workers claim issues marked `loom:issue` (human-approved) or `loom:curated` (Curator-enhanced) and bring them to life.
 
 ---
 
@@ -64,7 +64,7 @@ The Worker stands at the center of the creative process, the alchemist who trans
 - "Every detail matters, every gap must be filled"
 
 **In the System**:
-The Curator walks the threshold between chaos and order, finding issues that are incomplete, unclear, or poorly specified. They enhance, clarify, and organize—turning rough sketches into actionable blueprints. In Loom, Curators find unlabeled issues and mark them `loom:ready` when properly refined.
+The Curator walks the threshold between chaos and order, finding issues that are incomplete, unclear, or poorly specified. They enhance, clarify, and organize—turning rough sketches into actionable blueprints. In Loom, Curators find unlabeled issues and mark them `loom:curated` when properly refined. The human then reviews and approves by changing the label to `loom:issue`, ensuring the Curator's work aligns with the project's true needs.
 
 ---
 
@@ -93,7 +93,7 @@ The Curator walks the threshold between chaos and order, finding issues that are
 - "Today's design shapes tomorrow's possibilities"
 
 **In the System**:
-The Architect dwells in the realm of possibility, identifying opportunities for improvement and creating architectural visions. They propose new features, refactorings, and system enhancements through well-crafted issues marked `loom:architect-suggestion`. They design the future, trusting others to evaluate and manifest it.
+The Architect dwells in the realm of possibility, identifying opportunities for improvement and creating architectural visions. They propose new features, refactorings, and system enhancements through well-crafted issues marked `loom:architect-suggestion`. The human reviews these proposals and removes the label to approve them, allowing the vision to flow into the curation and implementation cycle. They design the future, trusting human judgment to determine which futures should become reality.
 
 ---
 
@@ -186,15 +186,25 @@ The Fixer dwells in the space between creation and approval, transforming feedba
 
 ## The Cycle of Creation
 
-These archetypes form a complete cycle, each role essential to the whole:
+These archetypes form a complete cycle, each role essential to the whole, with human judgment at two critical gates:
 
 ```
      ARCHITECT
     (Envisions)
          ↓
+    loom:architect-suggestion
+         ↓
+   HUMAN APPROVAL (Gate 1)
+         ↓
       CRITIC ←→ CURATOR
    (Questions)  (Refines)
          ↓         ↓
+    loom:curated
+         ↓
+   HUMAN APPROVAL (Gate 2)
+         ↓
+      loom:issue
+         ↓
       WORKER ←→ FIXER
     (Creates)   (Heals)
          ↓
@@ -204,13 +214,24 @@ These archetypes form a complete cycle, each role essential to the whole:
     INTEGRATION
 ```
 
-1. **The Architect** envisions what could be
-2. **The Critic** challenges the vision, ensuring it's sound
-3. **The Curator** refines and clarifies the specifications
-4. **The Worker** manifests the vision into reality
-5. **The Fixer** heals any breakage in the process
-6. **The Reviewer** judges the work and maintains quality
-7. The cycle begins anew, elevated by wisdom gained
+1. **The Architect** envisions what could be, marking proposals `loom:architect-suggestion`
+2. **Human** reviews and approves (Gate 1), removing the label to allow curation
+3. **The Critic** challenges the vision, ensuring it's sound
+4. **The Curator** refines and clarifies the specifications, marking as `loom:curated`
+5. **Human** reviews and approves (Gate 2), changing to `loom:issue` to authorize work
+6. **The Worker** manifests the vision into reality
+7. **The Fixer** heals any breakage in the process
+8. **The Reviewer** judges the work and maintains quality
+9. The cycle begins anew, elevated by wisdom gained
+
+**The Two Gates of Judgment**:
+
+The human serves as the guardian at two critical thresholds, ensuring the archetypal energies serve the project's true purpose:
+
+- **Gate 1 (After Architect)**: Does this vision align with our strategic direction?
+- **Gate 2 (After Curator)**: Is this specification worthy of our team's effort?
+
+These gates preserve human wisdom in the autonomous cycle, preventing the agents from wandering too far from the project's true path. The Architect can dream, the Curator can refine, but human judgment determines what becomes reality.
 
 ## Psychological Integration
 

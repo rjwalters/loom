@@ -10,9 +10,9 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 
 In Loom, development follows an ancient pattern of archetypal forces working in harmony:
 
-1. 🏛️ **The Architect** envisions → creates proposals (`loom:proposal`)
+1. 🏛️ **The Architect** envisions → creates proposals (`loom:architect-suggestion`)
 2. 🔍 **The Critic** questions → identifies bloat and simplification opportunities (`loom:critic-suggestion`)
-3. 📚 **The Curator** refines → enhances and marks issues ready (`loom:ready`)
+3. 📚 **The Curator** refines → enhances and adds `loom:curated` (human then approves with `loom:issue`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
 5. 🔧 **The Fixer** heals → addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
 6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:pr`)
@@ -22,10 +22,10 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 ### Color-coded Workflow
 
 - 🔵 **Blue** = Human action needed
-  - Issues: `loom:proposal` (Architect suggestion awaiting approval)
+  - Issues: `loom:architect-suggestion` (Architect suggestion awaiting approval)
   - PRs: `loom:pr` (Approved PR ready to merge)
 - 🟢 **Green** = Loom bot action needed
-  - Issues: `loom:ready` (Issue ready for Worker)
+  - Issues: `loom:curated` (Curator enhanced), `loom:issue` (human approved)
   - PRs: `loom:review-requested` (PR ready for Reviewer)
 - 🟡 **Amber** = Work in progress
   - Issues: `loom:in-progress` (Worker implementing)
@@ -39,10 +39,10 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed label st
 ## Complete Feature Flow
 
 ```
-ARCHITECT creates proposal (🔵 loom:proposal)
-         ↓ (user removes loom:proposal to approve)
-CURATOR enhances issue (🟢 loom:ready)
-         ↓
+ARCHITECT creates proposal (🔵 loom:architect-suggestion)
+         ↓ (human removes loom:architect-suggestion to approve)
+CURATOR enhances issue (🟢 loom:curated)
+         ↓ (human adds loom:issue to approve for work)
 WORKER implements (🟡 loom:in-progress → 🟢 loom:review-requested PR)
          ↓
 REVIEWER reviews (🟡 loom:changes-requested OR 🔵 loom:pr)
@@ -96,11 +96,11 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 | Agent | Interval | Autonomous | Watches For | Creates |
 |-------|----------|-----------|-------------|---------|
-| **Architect** | 15 min | Yes | N/A (scans codebase) | `loom:proposal` (blue) |
+| **Architect** | 15 min | Yes | N/A (scans codebase) | `loom:architect-suggestion` (blue) |
 | **Critic** | 15 min | Yes | N/A (scans code/issues) | `loom:critic-suggestion` (blue) |
-| **Curator** | 5 min | Yes | Approved issues | `loom:ready` (green) |
-| **Triage** | 15 min | Yes | `loom:ready` | `loom:urgent` (red) |
-| **Worker** | Manual | No | `loom:ready` | `loom:in-progress`, `loom:review-requested` |
+| **Curator** | 5 min | Yes | Approved issues (no suggestion labels) | `loom:curated` (green) |
+| **Triage** | 15 min | Yes | `loom:issue` | `loom:urgent` (red) |
+| **Worker** | Manual | No | `loom:issue` | `loom:in-progress`, `loom:review-requested` |
 | **Reviewer** | 5 min | Yes | `loom:review-requested` | `loom:changes-requested`, `loom:pr` |
 | **Fixer** | 5-10 min | Optional | `loom:changes-requested` | `loom:review-requested` |
 | **Issues** | Manual | No | N/A | Well-formatted issues |
@@ -108,15 +108,15 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 ### Quick Role Descriptions
 
-**Architect**: Scans codebase for improvements across all domains (architecture, code quality, docs, tests, CI, performance). Creates comprehensive proposals with `loom:proposal` label.
+**Architect**: Scans codebase for improvements across all domains (architecture, code quality, docs, tests, CI, performance). Creates comprehensive proposals with `loom:architect-suggestion` label.
 
 **Critic**: Identifies bloat, unused code, over-engineering. Creates removal proposals or adds simplification comments to existing issues.
 
-**Curator**: Enhances approved issues with implementation details, test plans, multiple options. Marks as `loom:ready` when complete.
+**Curator**: Enhances approved issues with implementation details, test plans, multiple options. Adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
 
-**Triage**: Dynamically prioritizes `loom:ready` issues, maintains top 3 as `loom:urgent` based on strategic impact and time sensitivity.
+**Triage**: Dynamically prioritizes `loom:issue` issues, maintains top 3 as `loom:urgent` based on strategic impact and time sensitivity.
 
-**Worker**: Implements `loom:ready` issues. Claims with `loom:in-progress`, creates PR with `loom:review-requested`. Manages worktrees.
+**Worker**: Implements `loom:issue` issues. Claims with `loom:in-progress`, creates PR with `loom:review-requested`. Manages worktrees.
 
 **Reviewer**: Reviews `loom:review-requested` PRs. Requests changes with `loom:changes-requested`, approves with `loom:pr` (ready for user to merge).
 
@@ -127,9 +127,9 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 ### Worker Workflow
 
 ```bash
-# Find and claim ready issue
-gh issue list --label="loom:ready"
-gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
+# Find and claim approved issue
+gh issue list --label="loom:issue"
+gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
 
 # Create worktree and implement
 pnpm worktree 42
@@ -178,21 +178,25 @@ gh pr edit 50 --remove-label "loom:changes-requested" --add-label "loom:review-r
 ### Curator Workflow
 
 ```bash
-# Find approved issues (no loom:proposal, not ready/in-progress)
+# Find approved issues (no suggestion labels, not loom:issue/in-progress)
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:proposal", "loom:ready", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:architect-suggestion", "loom:critic-suggestion", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 
-# Enhance and mark ready
-gh issue edit 42 --add-label "loom:ready"
+# Enhance and mark as curated
+gh issue edit 42 --add-label "loom:curated"
 ```
 
 ### User (Manual) Workflow
 
 ```bash
 # Review proposals
-gh issue list --label="loom:proposal"
-gh issue edit 42 --remove-label "loom:proposal"  # Approve
-gh issue close 42 --comment "Not needed"          # Reject
+gh issue list --label="loom:architect-suggestion"
+gh issue edit 42 --remove-label "loom:architect-suggestion"  # Approve
+gh issue close 42 --comment "Not needed"                      # Reject
+
+# Approve curated issues for work
+gh issue list --label="loom:curated"
+gh issue edit 42 --add-label "loom:issue"  # Approve for work
 
 # Merge approved PRs
 gh pr list --label="loom:pr"
@@ -203,14 +207,15 @@ gh pr merge 50
 
 ### Issue Labels
 
-| Label | Color | Meaning |
-|-------|-------|---------|
-| `loom:proposal` | 🔵 Blue | Architect suggestion awaiting approval |
-| `loom:critic-suggestion` | 🔵 Blue | Removal/simplification awaiting approval |
-| `loom:ready` | 🟢 Green | Ready for Worker to implement |
-| `loom:in-progress` | 🟡 Amber | Worker actively implementing |
-| `loom:blocked` | 🔴 Red | Implementation blocked, needs help |
-| `loom:urgent` | 🔴 Dark Red | High priority (max 3) |
+| Label | Color | Set By | Meaning |
+|-------|-------|--------|---------|
+| `loom:architect-suggestion` | 🔵 Blue | Architect | Architect suggestion awaiting human approval |
+| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification awaiting human approval |
+| `loom:curated` | 🟢 Green | Curator | Curator enhanced, awaiting human approval for work |
+| `loom:issue` | 🟢 Green | Human | Human approved, ready for Worker to implement |
+| `loom:in-progress` | 🟡 Amber | Worker | Worker actively implementing |
+| `loom:blocked` | 🔴 Red | Any agent | Implementation blocked, needs help |
+| `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
 
 ### PR Labels
 
@@ -240,8 +245,9 @@ Users can override these in the Terminal Settings modal.
 
 ### For Users
 1. Review suggestions promptly (blue labels need approval)
-2. Remove `loom:proposal` to approve, or close to reject
-3. Merge `loom:pr` PRs after final review
+2. Remove `loom:architect-suggestion` to approve, or close to reject
+3. Add `loom:issue` to curated issues to approve for work
+4. Merge `loom:pr` PRs after final review
 
 ### For Agents
 1. **Stay in your lane**: Don't do other roles' work
@@ -260,7 +266,7 @@ Users can override these in the Terminal Settings modal.
 
 **Issue stuck without labels**
 → Curator should pick up within 5min (if autonomous)
-→ Manually add `loom:ready` if urgent
+→ Manually add `loom:issue` if urgent
 
 **PR not reviewed**
 → Reviewer may be disabled
@@ -284,4 +290,4 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for comprehensive doc
 
 **For detailed agent workflows and command references, see [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md).**
 
-Last updated: Issue #312 - Split large documentation files for token efficiency
+Last updated: Issue #332 - Revised label state machine with human approval gate

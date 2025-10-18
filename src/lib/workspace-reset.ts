@@ -59,7 +59,7 @@ export async function resetWorkspaceToDefaults(
 
   logger.info("Resetting workspace to defaults", {
     workspacePath,
-    source: logPrefix
+    source: logPrefix,
   });
 
   // Cleanup existing terminals and sessions
@@ -79,12 +79,12 @@ export async function resetWorkspaceToDefaults(
     });
     logger.info("Backend reset complete", {
       workspacePath,
-      source: logPrefix
+      source: logPrefix,
     });
   } catch (error) {
     logger.error("Failed to reset workspace", error as Error, {
       workspacePath,
-      source: logPrefix
+      source: logPrefix,
     });
     alert(`Failed to reset workspace: ${error}`);
     return;
@@ -93,7 +93,7 @@ export async function resetWorkspaceToDefaults(
   // Reset GitHub labels to clean state
   logger.info("Resetting GitHub labels", {
     workspacePath,
-    source: logPrefix
+    source: logPrefix,
   });
   try {
     interface LabelResetResult {
@@ -107,21 +107,21 @@ export async function resetWorkspaceToDefaults(
       workspacePath,
       issuesCleaned: labelResult.issues_cleaned,
       prsUpdated: labelResult.prs_updated,
-      source: logPrefix
+      source: logPrefix,
     });
 
     if (labelResult.errors.length > 0) {
       logger.warn("Label reset errors", {
         workspacePath,
         errors: labelResult.errors,
-        source: logPrefix
+        source: logPrefix,
       });
     }
   } catch (error) {
     logger.warn("Failed to reset GitHub labels", {
       workspacePath,
       error: String(error),
-      source: logPrefix
+      source: logPrefix,
     });
     // Continue anyway - label reset is non-critical
   }
@@ -138,7 +138,7 @@ export async function resetWorkspaceToDefaults(
       logger.info("Creating terminals", {
         workspacePath,
         terminalCount: config.agents.length,
-        source: logPrefix
+        source: logPrefix,
       });
       for (const agent of config.agents) {
         try {
@@ -150,7 +150,7 @@ export async function resetWorkspaceToDefaults(
             terminalName: agent.name,
             instanceNumber,
             role: agent.role || "default",
-            source: logPrefix
+            source: logPrefix,
           });
 
           // Create terminal in daemon
@@ -168,7 +168,7 @@ export async function resetWorkspaceToDefaults(
             workspacePath,
             terminalName: agent.name,
             terminalId,
-            source: logPrefix
+            source: logPrefix,
           });
 
           // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
@@ -177,13 +177,13 @@ export async function resetWorkspaceToDefaults(
           logger.info("Agent will start in main workspace", {
             workspacePath,
             terminalName: agent.name,
-            source: logPrefix
+            source: logPrefix,
           });
         } catch (error) {
           logger.error("Failed to create terminal", error as Error, {
             workspacePath,
             terminalName: agent.name,
-            source: logPrefix
+            source: logPrefix,
           });
           alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
@@ -192,7 +192,7 @@ export async function resetWorkspaceToDefaults(
       logger.info("All terminals created", {
         workspacePath,
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Set workspace as active BEFORE loading agents (needed for proper initialization)
@@ -202,20 +202,20 @@ export async function resetWorkspaceToDefaults(
       logger.info("Loading agents into state", {
         workspacePath,
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
       state.loadAgents(config.agents);
       logger.info("State after loadAgents", {
         workspacePath,
         terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
 
       // IMPORTANT: Save config now with real terminal IDs, BEFORE launching agents
       // This ensures that if we get interrupted (e.g., hot reload), the config has real IDs
       logger.info("Saving config with real terminal IDs", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       const terminalsToSave1 = state.getTerminals();
       const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
@@ -226,25 +226,25 @@ export async function resetWorkspaceToDefaults(
       });
       logger.info("Config saved", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Launch agents for terminals with role configs
       logger.info("Launching agents", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       await launchAgentsForTerminals(workspacePath, config.agents);
       logger.info("State after launchAgentsForTerminals", {
         workspacePath,
         terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Save final state after agent launch
       logger.info("Saving final config", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       const terminalsToSave2 = state.getTerminals();
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
@@ -256,7 +256,7 @@ export async function resetWorkspaceToDefaults(
 
       logger.info("Workspace reset complete", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
     } else {
       // No agents in config - still set workspace as active
@@ -265,7 +265,7 @@ export async function resetWorkspaceToDefaults(
   } catch (error) {
     logger.error("Failed to reload config after reset", error as Error, {
       workspacePath,
-      source: logPrefix
+      source: logPrefix,
     });
     alert(`Failed to reload config: ${error}`);
   }

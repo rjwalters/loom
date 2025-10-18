@@ -22,17 +22,19 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 **Label State Machine**:
 1. `loom:architect-suggestion` → Issue created by Architect (requires user approval)
 2. (No label) → Unlabeled issues ready for Curator enhancement
-3. `loom:ready` → Issue ready for Worker to claim
-4. `loom:in-progress` → Worker actively implementing
-5. `loom:review-requested` → PR ready for Reviewer
-6. `loom:approved` → Reviewer approved, ready to merge
-7. `loom:blocked` → Work blocked on dependency
+3. `loom:curated` → Curator-enhanced, awaiting human approval
+4. `loom:issue` → Human-approved, ready for Worker to claim
+5. `loom:in-progress` → Worker actively implementing
+6. `loom:review-requested` → PR ready for Reviewer
+7. `loom:approved` → Reviewer approved, ready to merge
+8. `loom:blocked` → Work blocked on dependency
 
 **Workflow**:
 - **Architect**: Creates issues with `loom:architect-suggestion`
-- **User**: Reviews suggestions, removes label to approve
-- **Curator**: Finds unlabeled issues, enhances, marks `loom:ready`
-- **Worker**: Claims `loom:ready`, implements, creates PR with `loom:review-requested`
+- **User**: Reviews suggestions, removes label to approve for curation
+- **Curator**: Finds unlabeled issues, enhances, marks `loom:curated`
+- **User**: Reviews curated issues, adds `loom:issue` to explicitly approve work
+- **Worker**: Claims `loom:issue`, implements, creates PR with `loom:review-requested`
 - **Reviewer**: Finds `loom:review-requested`, reviews, marks `loom:approved`
 - **User**: Merges approved PRs
 
@@ -46,7 +48,8 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 - **Auditable**: Label history shows state transitions
 - **Familiar**: GitHub labels are well-understood by developers
 - **Flexible**: Easy to add new states with new labels
-- **Searchable**: `gh issue list --label="loom:ready"` finds work instantly
+- **Searchable**: `gh issue list --label="loom:issue"` finds work instantly
+- **Human approval gate**: Explicit `loom:issue` label prevents automatic work without oversight
 
 ### Negative
 
@@ -116,10 +119,10 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 **Finding Work** (Worker role):
 ```bash
 # List issues oldest-first (FIFO queue)
-gh issue list --label="loom:ready" --state=open --limit=10
+gh issue list --label="loom:issue" --state=open --limit=10
 
 # Claim oldest issue
-gh issue edit <number> --remove-label "loom:ready" --add-label "loom:in-progress"
+gh issue edit <number> --remove-label "loom:issue" --add-label "loom:in-progress"
 ```
 
 **Creating PRs** (Worker role):
@@ -143,7 +146,7 @@ gh issue list --label="loom:in-progress" --state=open --json number | \
 
 Label updates are **not atomic**. If two Workers try to claim the same issue simultaneously:
 
-1. Both check: Issue has `loom:ready`
+1. Both check: Issue has `loom:issue`
 2. Both execute: `gh issue edit <N> --add-label "loom:in-progress"`
 3. **Result**: Both think they claimed it
 

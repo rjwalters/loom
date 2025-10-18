@@ -52,7 +52,7 @@ export async function startWorkspaceEngine(
 
   logger.info("Starting Loom engine for workspace", {
     workspacePath,
-    source: logPrefix
+    source: logPrefix,
   });
 
   // Cleanup existing terminals and sessions
@@ -76,7 +76,7 @@ export async function startWorkspaceEngine(
     logger.info("Loaded config", {
       workspacePath,
       terminalCount: config.agents?.length || 0,
-      source: logPrefix
+      source: logPrefix,
     });
 
     // Create terminal sessions for each agent in the config
@@ -84,7 +84,7 @@ export async function startWorkspaceEngine(
       logger.info("Creating terminal sessions", {
         workspacePath,
         terminalCount: config.agents.length,
-        source: logPrefix
+        source: logPrefix,
       });
 
       for (const agent of config.agents) {
@@ -97,7 +97,7 @@ export async function startWorkspaceEngine(
             terminalName: agent.name,
             instanceNumber,
             role: agent.role || "default",
-            source: logPrefix
+            source: logPrefix,
           });
 
           // Create terminal in daemon
@@ -115,7 +115,7 @@ export async function startWorkspaceEngine(
             workspacePath,
             terminalName: agent.name,
             terminalId,
-            source: logPrefix
+            source: logPrefix,
           });
 
           // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
@@ -124,13 +124,13 @@ export async function startWorkspaceEngine(
           logger.info("Agent will start in main workspace", {
             workspacePath,
             terminalName: agent.name,
-            source: logPrefix
+            source: logPrefix,
           });
         } catch (error) {
           logger.error("Failed to create terminal", error as Error, {
             workspacePath,
             terminalName: agent.name,
-            source: logPrefix
+            source: logPrefix,
           });
           alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
@@ -139,7 +139,7 @@ export async function startWorkspaceEngine(
       logger.info("All terminals created", {
         workspacePath,
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Set workspace as active BEFORE loading agents
@@ -149,19 +149,19 @@ export async function startWorkspaceEngine(
       logger.info("Loading agents into state", {
         workspacePath,
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
       state.loadAgents(config.agents);
       logger.info("State after loadAgents", {
         workspacePath,
         terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Save config with real terminal IDs BEFORE launching agents
       logger.info("Saving config with real terminal IDs", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       const terminalsToSave1 = state.getTerminals();
       const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
@@ -172,25 +172,25 @@ export async function startWorkspaceEngine(
       });
       logger.info("Config saved", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Launch agents for terminals with role configs
       logger.info("Launching agents", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       await launchAgentsForTerminals(workspacePath, config.agents);
       logger.info("State after launchAgentsForTerminals", {
         workspacePath,
         terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Save final state after agent launch
       logger.info("Saving final config", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       const terminalsToSave2 = state.getTerminals();
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
@@ -204,7 +204,7 @@ export async function startWorkspaceEngine(
       // Without this delay, health checks may run before tmux sessions are fully query-able
       logger.info("Waiting for tmux sessions to stabilize (500ms)", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       await new Promise((resolve) => setTimeout(resolve, 500));
 
@@ -212,14 +212,14 @@ export async function startWorkspaceEngine(
       // This prevents false "missing session" errors on startup
       logger.info("Running immediate health check", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
       const { getHealthMonitor } = await import("./health-monitor");
       const healthMonitor = getHealthMonitor();
       await healthMonitor.performHealthCheck();
       logger.info("Health check complete", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
 
       // Mark all terminals as health-checked to prevent redundant checks in render loop
@@ -229,25 +229,25 @@ export async function startWorkspaceEngine(
         workspacePath,
         terminalCount: terminalIds.length,
         terminalIds,
-        source: logPrefix
+        source: logPrefix,
       });
 
       logger.info("Workspace engine started successfully", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
     } else {
       // No agents in config - still set workspace as active
       state.setWorkspace(workspacePath);
       logger.info("No terminals configured, workspace active with empty state", {
         workspacePath,
-        source: logPrefix
+        source: logPrefix,
       });
     }
   } catch (error) {
     logger.error("Failed to start engine", error as Error, {
       workspacePath,
-      source: logPrefix
+      source: logPrefix,
     });
     alert(`Failed to start Loom engine: ${error}`);
   }

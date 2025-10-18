@@ -59,6 +59,26 @@
           }
         }
       }
+    },
+    {
+      "includes": ["mcp-*/src/index.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/lib/terminal-state-parser.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noControlCharactersInRegex": "off"
+          }
+        }
+      }
     }
   ],
   "javascript": {

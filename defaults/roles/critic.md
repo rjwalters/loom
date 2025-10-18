@@ -463,11 +463,11 @@ Your role fits into the larger workflow with two approaches:
 # Create issue with critic suggestion
 gh issue create --label "loom:critic-suggestion" --title "..." --body "..."
 
-# User approves by removing the label (you don't do this)
-# gh issue edit <number> --remove-label "loom:critic-suggestion"
+# User approves by adding loom:issue label (you don't do this)
+# gh issue edit <number> --add-label "loom:issue"
 
-# Curator may then enhance and mark as ready
-# gh issue edit <number> --add-label "loom:ready"
+# Curator may then enhance and mark as curated
+# gh issue edit <number> --add-label "loom:curated"
 
 # Worker claims and implements
 # gh issue edit <number> --add-label "loom:in-progress"
