@@ -93,12 +93,12 @@ jobs:
           retention-days: 7
 
       - name: Upload coverage to Codecov
-        if: success()
+        if: always()
         uses: codecov/codecov-action@v5
         with:
           files: ./coverage/coverage-final.json
           flags: frontend
-          fail_ci_if_error: true
+          fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload build artifacts
