@@ -4,8 +4,8 @@
 
 set -e
 
-DAEMON_PID_FILE=".daemon.pid"
-DAEMON_LOG_FILE=".daemon.log"
+DAEMON_PID_FILE=".loom/.daemon.pid"
+DAEMON_LOG_FILE=".loom/.daemon.log"
 DAEMON_SOCKET="$HOME/.loom/daemon.sock"
 
 # Colors

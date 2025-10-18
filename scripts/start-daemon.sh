@@ -3,8 +3,8 @@
 
 set -e
 
-DAEMON_PID_FILE=".daemon.pid"
-DAEMON_LOG_FILE=".daemon.log"
+DAEMON_PID_FILE=".loom/.daemon.pid"
+DAEMON_LOG_FILE=".loom/.daemon.log"
 
 # Check if daemon is already running
 if [ -f "$DAEMON_PID_FILE" ]; then
@@ -17,6 +17,9 @@ if [ -f "$DAEMON_PID_FILE" ]; then
     rm -f "$DAEMON_PID_FILE"
   fi
 fi
+
+# Ensure .loom directory exists
+mkdir -p .loom
 
 # Start daemon in background
 echo "Starting daemon..."
