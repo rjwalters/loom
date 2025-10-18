@@ -1960,7 +1960,7 @@ function setupEventListeners() {
         const wrapper = card.parentElement;
         const indicator = document.createElement("div");
         indicator.className =
-          "w-1 h-32 my-1 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
+          "drop-indicator w-1 h-40 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
         wrapper?.parentElement?.insertBefore(
           indicator,
           insertBefore ? wrapper : wrapper.nextSibling
@@ -1984,7 +1984,7 @@ function setupEventListeners() {
             const wrapper = lastCard.parentElement;
             const indicator = document.createElement("div");
             indicator.className =
-              "w-1 h-32 my-1 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
+              "drop-indicator w-1 h-40 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
             wrapper?.parentElement?.insertBefore(indicator, wrapper?.nextSibling || null);
           }
         }
