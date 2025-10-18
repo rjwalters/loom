@@ -262,7 +262,7 @@ true
 
 ### Role Name
 
-Use your assigned role name (Reviewer, Architect, Curator, Worker, Issues, Default, etc.).
+Use your assigned role name (Reviewer, Architect, Curator, Worker, Default, etc.).
 
 ### Task Description
 

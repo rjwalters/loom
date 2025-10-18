@@ -74,6 +74,7 @@ export function parseTerminalState(output: string): TerminalState {
   const trimmed = output.trim();
   // Remove ANSI escape codes for cleaner pattern matching
   // ANSI codes look like: \x1b[...m or \u001b[...m
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape codes are intentional for terminal output parsing
   const cleaned = trimmed.replace(/\x1b\[[0-9;]*m/g, "").replace(/\u001b\[[0-9;]*m/g, "");
 
   logger.info("Parsing terminal state", {

@@ -403,7 +403,6 @@ Use one of these standard role names:
 - `Reviewer` - For code review specialists
 - `Architect` - For system architecture and design
 - `Curator` - For issue maintenance
-- `Issues` - For issue creation specialists
 - `Default` - For plain shells or unspecified roles
 
 ### Task Description
