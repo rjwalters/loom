@@ -1,6 +1,9 @@
 import { open } from "@tauri-apps/api/dialog";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
+
+const logger = Logger.forComponent("create-project-modal");
 
 export async function showCreateProjectModal(
   onProjectCreated: (projectPath: string) => void
@@ -198,7 +201,7 @@ export async function showCreateProjectModal(
         locationInput.value = selected;
       }
     } catch (error) {
-      console.error("Error browsing for location:", error);
+      logger.error("Error browsing for location", error as Error);
     }
   });
 
@@ -263,7 +266,7 @@ export async function showCreateProjectModal(
         license,
       });
 
-      console.log(`[createProjectModal] Project created at: ${projectPath}`);
+      logger.info("Project created", { projectPath });
 
       // If GitHub checkbox is selected, create GitHub repository
       if (createGithub) {
@@ -274,9 +277,12 @@ export async function showCreateProjectModal(
             description,
             isPrivate: githubVisibility === "private",
           });
-          console.log(`[createProjectModal] GitHub repository created`);
+          logger.info("GitHub repository created", { projectPath, name });
         } catch (githubError) {
-          console.error("[createProjectModal] Failed to create GitHub repository:", githubError);
+          logger.error("Failed to create GitHub repository", githubError as Error, {
+            projectPath,
+            name,
+          });
           if (errorDiv) {
             errorDiv.textContent = `Local project created, but GitHub creation failed: ${
               typeof githubError === "string" ? githubError : "Unknown error"
@@ -298,7 +304,10 @@ export async function showCreateProjectModal(
       // Notify parent
       onProjectCreated(projectPath);
     } catch (error) {
-      console.error("[createProjectModal] Failed to create project:", error);
+      logger.error("Failed to create project", error as Error, {
+        name,
+        location,
+      });
       if (errorDiv) {
         errorDiv.textContent =
           typeof error === "string" ? error : "Failed to create project. Please try again.";

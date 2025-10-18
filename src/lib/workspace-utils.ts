@@ -6,6 +6,9 @@
  */
 
 import { homeDir } from "@tauri-apps/api/path";
+import { Logger } from "./logger";
+
+const logger = Logger.forComponent("workspace-utils");
 
 /**
  * Expand tilde (~) to home directory in file paths
@@ -23,7 +26,7 @@ export async function expandTildePath(path: string): Promise<string> {
       const home = await homeDir();
       return path.replace(/^~/, home);
     } catch (error) {
-      console.error("Failed to get home directory:", error);
+      logger.error("Failed to get home directory", error as Error, { path });
       return path;
     }
   }
@@ -39,11 +42,14 @@ export async function expandTildePath(path: string): Promise<string> {
  * @param message - The error message to display
  */
 export function showWorkspaceError(message: string): void {
-  console.log("[showWorkspaceError]", message);
+  logger.info("Showing workspace error", { message });
   const input = document.getElementById("workspace-path") as HTMLInputElement;
   const errorDiv = document.getElementById("workspace-error");
 
-  console.log("[showWorkspaceError] input:", input, "errorDiv:", errorDiv);
+  logger.info("Found workspace error UI elements", {
+    hasInput: !!input,
+    hasErrorDiv: !!errorDiv,
+  });
 
   if (input) {
     input.classList.remove("border-gray-300", "dark:border-gray-600");
@@ -62,7 +68,7 @@ export function showWorkspaceError(message: string): void {
  * and clears the error message display.
  */
 export function clearWorkspaceError(): void {
-  console.log("[clearWorkspaceError]");
+  logger.info("Clearing workspace error");
   const input = document.getElementById("workspace-path") as HTMLInputElement;
   const errorDiv = document.getElementById("workspace-error");
 

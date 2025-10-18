@@ -5,7 +5,10 @@
  * These are called dynamically when UI is rendered.
  */
 
+import { Logger } from "./logger";
 import { getTooltipManager } from "./tooltip";
+
+const logger = Logger.forComponent("ui-event-handlers");
 
 /**
  * Set up tooltips for all elements with data-tooltip attributes
@@ -51,14 +54,18 @@ export function attachWorkspaceEventListeners(
   browseWorkspace: () => void,
   getCurrentWorkspace: () => string
 ): void {
-  console.log("[attachWorkspaceEventListeners] attaching listeners...");
+  logger.info("Attaching workspace event listeners");
   // Workspace path input - validate on Enter or blur
   const workspaceInput = document.getElementById("workspace-path") as HTMLInputElement;
-  console.log("[attachWorkspaceEventListeners] workspaceInput:", workspaceInput);
+  logger.info("Found workspace input element", {
+    hasElement: !!workspaceInput,
+  });
   if (workspaceInput) {
     workspaceInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
-        console.log("[workspaceInput keydown] Enter pressed, value:", workspaceInput.value);
+        logger.info("Enter key pressed in workspace input", {
+          value: workspaceInput.value,
+        });
         e.preventDefault();
         handleWorkspacePathInput(workspaceInput.value);
         workspaceInput.blur();
@@ -66,12 +73,10 @@ export function attachWorkspaceEventListeners(
     });
 
     workspaceInput.addEventListener("blur", () => {
-      console.log(
-        "[workspaceInput blur] value:",
-        workspaceInput.value,
-        "workspace:",
-        getCurrentWorkspace()
-      );
+      logger.info("Workspace input blur event", {
+        inputValue: workspaceInput.value,
+        currentWorkspace: getCurrentWorkspace(),
+      });
       if (workspaceInput.value !== getCurrentWorkspace()) {
         handleWorkspacePathInput(workspaceInput.value);
       }
@@ -80,20 +85,24 @@ export function attachWorkspaceEventListeners(
 
   // Browse workspace button
   const browseBtn = document.getElementById("browse-workspace");
-  console.log("[attachWorkspaceEventListeners] browseBtn:", browseBtn);
+  logger.info("Found browse button element", {
+    hasElement: !!browseBtn,
+  });
   browseBtn?.addEventListener("click", () => {
-    console.log("[browseBtn click] clicked");
+    logger.info("Browse workspace button clicked");
     browseWorkspace();
   });
 
   // Create new project button
   const createProjectBtn = document.getElementById("create-new-project-btn");
-  console.log("[attachWorkspaceEventListeners] createProjectBtn:", createProjectBtn);
+  logger.info("Found create project button element", {
+    hasElement: !!createProjectBtn,
+  });
   createProjectBtn?.addEventListener("click", async () => {
-    console.log("[createProjectBtn click] clicked");
+    logger.info("Create project button clicked");
     const { showCreateProjectModal } = await import("./create-project-modal");
     showCreateProjectModal(async (projectPath: string) => {
-      console.log(`[createProjectModal] Project created at: ${projectPath}`);
+      logger.info("Project created via modal", { projectPath });
       // Load the newly created project as the workspace
       await handleWorkspacePathInput(projectPath);
     });

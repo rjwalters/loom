@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
 import { getAppState, TerminalStatus } from "./state";
+
+const logger = Logger.forComponent("health-monitor");
 
 /**
  * Health check result for a terminal
@@ -71,11 +74,11 @@ export class HealthMonitor {
    */
   start(): void {
     if (this.running) {
-      console.warn("[HealthMonitor] Already running");
+      logger.warn("Already running");
       return;
     }
 
-    console.log("[HealthMonitor] Starting health monitoring");
+    logger.info("Starting health monitoring");
     this.running = true;
 
     // Initial checks
@@ -101,7 +104,7 @@ export class HealthMonitor {
       return;
     }
 
-    console.log("[HealthMonitor] Stopping health monitoring");
+    logger.info("Stopping health monitoring");
     this.running = false;
 
     if (this.healthCheckTimer !== null) {
@@ -121,7 +124,7 @@ export class HealthMonitor {
   recordActivity(terminalId: string): void {
     const now = Date.now();
     this.terminalActivity.set(terminalId, now);
-    console.log(`[HealthMonitor] Activity recorded for ${terminalId} at ${now}`);
+    logger.info("Activity recorded", { terminalId, timestamp: now });
   }
 
   /**
@@ -249,30 +252,37 @@ export class HealthMonitor {
     const terminals = state.getTerminals();
     const now = Date.now();
 
-    console.log(`[HealthMonitor] Performing health check for ${terminals.length} terminals`);
+    logger.info("Performing health check", { terminalCount: terminals.length });
 
     for (const terminal of terminals) {
       // Debug: Log exact terminal state before skip check
-      console.log(
-        `[HealthMonitor] Checking ${terminal.id}: name=${terminal.name}, status=${terminal.status}, missingSession=${terminal.missingSession || false}`
-      );
+      logger.info("Checking terminal", {
+        terminalId: terminal.id,
+        name: terminal.name,
+        status: terminal.status,
+        missingSession: terminal.missingSession || false,
+      });
 
       // Skip health checks for terminals that are busy (agent launching in progress)
       // This prevents false positives during agent launch which can take 20+ seconds per terminal
       if (terminal.status === TerminalStatus.Busy) {
-        console.log(
-          `[HealthMonitor] Skipping health check for ${terminal.id} (status: busy - agent launch in progress)`
-        );
+        logger.info("Skipping health check - agent launch in progress", {
+          terminalId: terminal.id,
+          status: terminal.status,
+        });
         continue;
       }
 
       try {
         // Check if tmux session exists
-        console.log(`[HealthMonitor] 🔍 Checking session health for terminal.id="${terminal.id}"`);
+        logger.info("Checking session health", { terminalId: terminal.id });
         const hasSession = await invoke<boolean>("check_session_health", {
           id: terminal.id,
         });
-        console.log(`[HealthMonitor] 📊 Result for ${terminal.id}: hasSession=${hasSession}`);
+        logger.info("Session health check result", {
+          terminalId: terminal.id,
+          hasSession,
+        });
 
         // Get last activity time
         const lastActivity = this.terminalActivity.get(terminal.id) || null;
@@ -300,16 +310,14 @@ export class HealthMonitor {
         // Only update missingSession flag if health check SUCCEEDED
         if (!hasSession && !terminal.missingSession) {
           // Session missing - mark as error
-          console.warn(`[HealthMonitor] Terminal ${terminal.id} missing tmux session`);
+          logger.warn("Terminal missing tmux session", { terminalId: terminal.id });
           state.updateTerminal(terminal.id, {
             status: TerminalStatus.Error,
             missingSession: true,
           });
         } else if (hasSession && terminal.missingSession) {
           // Session recovered - clear error state
-          console.log(
-            `[HealthMonitor] Terminal ${terminal.id} session recovered, clearing missingSession flag`
-          );
+          logger.info("Terminal session recovered", { terminalId: terminal.id });
           state.updateTerminal(terminal.id, {
             status: TerminalStatus.Idle,
             missingSession: undefined,
@@ -319,10 +327,9 @@ export class HealthMonitor {
         // Health check failed (daemon unreachable, IPC timeout, tmux server down, etc.)
         // DO NOT set missingSession=true - we simply couldn't check
         // This prevents false positives when daemon/tmux is temporarily unavailable
-        console.error(
-          `[HealthMonitor] Health check failed for ${terminal.id} (not changing missingSession state):`,
-          error
-        );
+        logger.error("Health check failed - not changing missingSession state", error, {
+          terminalId: terminal.id,
+        });
 
         // Still update health record to show check failed
         const lastActivity = this.terminalActivity.get(terminal.id) || null;
@@ -359,7 +366,7 @@ export class HealthMonitor {
         consecutiveFailures: 0,
       };
 
-      console.log(`[HealthMonitor] Daemon ping successful at ${now}`);
+      logger.info("Daemon ping successful", { timestamp: now });
     } catch (error) {
       this.daemonHealth.consecutiveFailures++;
       this.daemonHealth.connected = this.daemonHealth.consecutiveFailures < 3; // Mark disconnected after 3 failures
@@ -369,10 +376,10 @@ export class HealthMonitor {
         : null;
       this.daemonHealth.timeSincePing = timeSincePing;
 
-      console.error(
-        `[HealthMonitor] Daemon ping failed (${this.daemonHealth.consecutiveFailures} consecutive):`,
-        error
-      );
+      logger.error("Daemon ping failed", error, {
+        consecutiveFailures: this.daemonHealth.consecutiveFailures,
+        connected: this.daemonHealth.connected,
+      });
     }
 
     // Notify listeners
@@ -388,7 +395,7 @@ export class HealthMonitor {
       try {
         callback(health);
       } catch (error) {
-        console.error("[HealthMonitor] Error in health callback:", error);
+        logger.error("Error in health callback", error);
       }
     });
   }

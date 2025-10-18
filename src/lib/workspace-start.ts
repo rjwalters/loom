@@ -1,8 +1,11 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
 import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
 import { cleanupWorkspace } from "./workspace-cleanup";
+
+const logger = Logger.forComponent("workspace-start");
 
 /**
  * Dependencies needed by the workspace start logic
@@ -47,7 +50,10 @@ export async function startWorkspaceEngine(
     render,
   } = dependencies;
 
-  console.log(`[${logPrefix}] Starting Loom engine for workspace`);
+  logger.info("Starting Loom engine for workspace", {
+    workspacePath,
+    source: logPrefix
+  });
 
   // Cleanup existing terminals and sessions
   await cleanupWorkspace({
@@ -67,20 +73,32 @@ export async function startWorkspaceEngine(
     const config = await loadWorkspaceConfig();
     state.setNextTerminalNumber(config.nextAgentNumber);
 
-    console.log(`[${logPrefix}] Loaded config with ${config.agents?.length || 0} terminals`);
+    logger.info("Loaded config", {
+      workspacePath,
+      terminalCount: config.agents?.length || 0,
+      source: logPrefix
+    });
 
     // Create terminal sessions for each agent in the config
     if (config.agents && config.agents.length > 0) {
-      console.log(`[${logPrefix}] Creating ${config.agents.length} terminal sessions...`);
+      logger.info("Creating terminal sessions", {
+        workspacePath,
+        terminalCount: config.agents.length,
+        source: logPrefix
+      });
 
       for (const agent of config.agents) {
         try {
           // Get instance number
           const instanceNumber = state.getNextTerminalNumber();
 
-          console.log(
-            `[${logPrefix}] Creating terminal "${agent.name}" with instance ${instanceNumber}, role=${agent.role || "default"}, workingDir=${workspacePath}`
-          );
+          logger.info("Creating terminal", {
+            workspacePath,
+            terminalName: agent.name,
+            instanceNumber,
+            role: agent.role || "default",
+            source: logPrefix
+          });
 
           // Create terminal in daemon
           const terminalId = await invoke<string>("create_terminal", {
@@ -93,39 +111,58 @@ export async function startWorkspaceEngine(
 
           // Update agent ID to match the newly created terminal
           agent.id = terminalId;
-          console.log(`[${logPrefix}] ✓ Created terminal ${agent.name} (${terminalId})`);
+          logger.info("Created terminal", {
+            workspacePath,
+            terminalName: agent.name,
+            terminalId,
+            source: logPrefix
+          });
 
           // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
           // Agents start in the main workspace directory
           agent.worktreePath = "";
-          console.log(`[${logPrefix}] ✓ Agent will start in main workspace`);
+          logger.info("Agent will start in main workspace", {
+            workspacePath,
+            terminalName: agent.name,
+            source: logPrefix
+          });
         } catch (error) {
-          console.error(`[${logPrefix}] ✗ Failed to create terminal ${agent.name}:`, error);
+          logger.error("Failed to create terminal", error as Error, {
+            workspacePath,
+            terminalName: agent.name,
+            source: logPrefix
+          });
           alert(`Failed to create terminal ${agent.name}: ${error}`);
         }
       }
 
-      console.log(
-        `[${logPrefix}] All terminals created, agents array:`,
-        config.agents.map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("All terminals created", {
+        workspacePath,
+        agents: config.agents.map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
 
       // Set workspace as active BEFORE loading agents
       state.setWorkspace(workspacePath);
 
       // Load agents into state with their new session IDs
-      console.log(
-        `[${logPrefix}] Loading agents into state:`,
-        config.agents.map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("Loading agents into state", {
+        workspacePath,
+        agents: config.agents.map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
       state.loadAgents(config.agents);
-      console.log(
-        `[${logPrefix}] State after loadAgents:`,
-        state.getTerminals().map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("State after loadAgents", {
+        workspacePath,
+        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
 
       // Save config with real terminal IDs BEFORE launching agents
-      console.log(`[${logPrefix}] Saving config with real terminal IDs...`);
+      logger.info("Saving config with real terminal IDs", {
+        workspacePath,
+        source: logPrefix
+      });
       const terminalsToSave1 = state.getTerminals();
       const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
       await saveConfig({ terminals: terminalConfigs1 });
@@ -133,18 +170,28 @@ export async function startWorkspaceEngine(
         nextAgentNumber: state.getCurrentTerminalNumber(),
         terminals: terminalStates1,
       });
-      console.log(`[${logPrefix}] Config saved`);
+      logger.info("Config saved", {
+        workspacePath,
+        source: logPrefix
+      });
 
       // Launch agents for terminals with role configs
-      console.log(`[${logPrefix}] Launching agents...`);
+      logger.info("Launching agents", {
+        workspacePath,
+        source: logPrefix
+      });
       await launchAgentsForTerminals(workspacePath, config.agents);
-      console.log(
-        `[${logPrefix}] State after launchAgentsForTerminals:`,
-        state.getTerminals().map((a) => `${a.name}=${a.id}`)
-      );
+      logger.info("State after launchAgentsForTerminals", {
+        workspacePath,
+        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        source: logPrefix
+      });
 
       // Save final state after agent launch
-      console.log(`[${logPrefix}] Saving final config...`);
+      logger.info("Saving final config", {
+        workspacePath,
+        source: logPrefix
+      });
       const terminalsToSave2 = state.getTerminals();
       const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
       await saveConfig({ terminals: terminalConfigs2 });
@@ -155,33 +202,53 @@ export async function startWorkspaceEngine(
 
       // Brief delay to allow tmux sessions to stabilize after agent launch
       // Without this delay, health checks may run before tmux sessions are fully query-able
-      console.log(`[${logPrefix}] Waiting for tmux sessions to stabilize (500ms)...`);
+      logger.info("Waiting for tmux sessions to stabilize (500ms)", {
+        workspacePath,
+        source: logPrefix
+      });
       await new Promise((resolve) => setTimeout(resolve, 500));
 
       // Trigger immediate health check to verify terminal sessions exist
       // This prevents false "missing session" errors on startup
-      console.log(`[${logPrefix}] Running immediate health check...`);
+      logger.info("Running immediate health check", {
+        workspacePath,
+        source: logPrefix
+      });
       const { getHealthMonitor } = await import("./health-monitor");
       const healthMonitor = getHealthMonitor();
       await healthMonitor.performHealthCheck();
-      console.log(`[${logPrefix}] Health check complete`);
+      logger.info("Health check complete", {
+        workspacePath,
+        source: logPrefix
+      });
 
       // Mark all terminals as health-checked to prevent redundant checks in render loop
       const terminalIds = state.getTerminals().map((t) => t.id);
       dependencies.markTerminalsHealthChecked(terminalIds);
-      console.log(
-        `[${logPrefix}] Marked ${terminalIds.length} terminals as health-checked:`,
-        terminalIds
-      );
+      logger.info("Marked terminals as health-checked", {
+        workspacePath,
+        terminalCount: terminalIds.length,
+        terminalIds,
+        source: logPrefix
+      });
 
-      console.log(`[${logPrefix}] Workspace engine started successfully`);
+      logger.info("Workspace engine started successfully", {
+        workspacePath,
+        source: logPrefix
+      });
     } else {
       // No agents in config - still set workspace as active
       state.setWorkspace(workspacePath);
-      console.log(`[${logPrefix}] No terminals configured, workspace active with empty state`);
+      logger.info("No terminals configured, workspace active with empty state", {
+        workspacePath,
+        source: logPrefix
+      });
     }
   } catch (error) {
-    console.error(`[${logPrefix}] Failed to start engine:`, error);
+    logger.error("Failed to start engine", error as Error, {
+      workspacePath,
+      source: logPrefix
+    });
     alert(`Failed to start Loom engine: ${error}`);
   }
 

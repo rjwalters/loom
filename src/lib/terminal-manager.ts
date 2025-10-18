@@ -4,6 +4,9 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
+
+const logger = Logger.forComponent("terminal-manager");
 
 export interface ManagedTerminal {
   terminal: Terminal;
@@ -35,14 +38,17 @@ export class TerminalManager {
     // Check if terminal already exists
     const existing = this.terminals.get(terminalId);
     if (existing) {
-      console.warn(`Terminal ${terminalId} already exists`);
+      logger.warn("Terminal already exists", { terminalId });
       return existing;
     }
 
     // Find or create the persistent container
     const persistentArea = document.getElementById("persistent-xterm-containers");
     if (!persistentArea) {
-      console.error("persistent-xterm-containers not found - UI not initialized");
+      logger.error(
+        "persistent-xterm-containers not found - UI not initialized",
+        new Error("UI not initialized")
+      );
       return null;
     }
 
@@ -103,7 +109,9 @@ export class TerminalManager {
       const webglAddon = new WebglAddon();
       terminal.loadAddon(webglAddon);
     } catch (e) {
-      console.warn("WebGL addon failed to load, using canvas renderer", e);
+      logger.warn("WebGL addon failed to load, using canvas renderer", {
+        error: String(e),
+      });
     }
 
     // Open terminal in container
@@ -112,7 +120,7 @@ export class TerminalManager {
     // Hook up input handler - send user input directly to daemon
     terminal.onData((data) => {
       invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {
-        console.error(`[terminal-input] Failed to send input for ${terminalId}:`, e);
+        logger.error("Failed to send input", e, { terminalId });
       });
 
       // Clear needs-input state when user types
@@ -126,7 +134,7 @@ export class TerminalManager {
           }
         })
         .catch((e) => {
-          console.error(`[terminal-input] Failed to clear needs-input state:`, e);
+          logger.error("Failed to clear needs-input state", e, { terminalId });
         });
     });
 
@@ -142,7 +150,7 @@ export class TerminalManager {
           }
         })
         .catch((e) => {
-          console.error(`[terminal-bell] Failed to set needs-input state:`, e);
+          logger.error("Failed to set needs-input state", e, { terminalId });
         });
     });
 
@@ -171,14 +179,14 @@ export class TerminalManager {
   showTerminal(terminalId: string): void {
     const managed = this.terminals.get(terminalId);
     if (!managed) {
-      console.warn(`Terminal ${terminalId} not found`);
+      logger.warn("Terminal not found", { terminalId });
       return;
     }
 
     managed.container.style.display = "block";
     this.setupResizeHandling(terminalId, managed);
     this.scheduleResize(terminalId);
-    console.log(`[terminal-manager] Showing terminal ${terminalId}`);
+    logger.info("Showing terminal", { terminalId });
   }
 
   /**
@@ -187,13 +195,13 @@ export class TerminalManager {
   hideTerminal(terminalId: string): void {
     const managed = this.terminals.get(terminalId);
     if (!managed) {
-      console.warn(`Terminal ${terminalId} not found`);
+      logger.warn("Terminal not found", { terminalId });
       return;
     }
 
     this.teardownResizeHandling(managed);
     managed.container.style.display = "none";
-    console.log(`[terminal-manager] Hiding terminal ${terminalId}`);
+    logger.info("Hiding terminal", { terminalId });
   }
 
   /**
@@ -211,7 +219,7 @@ export class TerminalManager {
   writeToTerminal(terminalId: string, data: string): void {
     const managed = this.terminals.get(terminalId);
     if (!managed) {
-      console.warn(`Terminal ${terminalId} not found`);
+      logger.warn("Terminal not found", { terminalId });
       return;
     }
 
@@ -224,7 +232,7 @@ export class TerminalManager {
   clearAndWriteTerminal(terminalId: string, data: string): void {
     const managed = this.terminals.get(terminalId);
     if (!managed) {
-      console.warn(`Terminal ${terminalId} not found`);
+      logger.warn("Terminal not found", { terminalId });
       return;
     }
 
@@ -244,7 +252,7 @@ export class TerminalManager {
   clearTerminal(terminalId: string): void {
     const managed = this.terminals.get(terminalId);
     if (!managed) {
-      console.warn(`Terminal ${terminalId} not found`);
+      logger.warn("Terminal not found", { terminalId });
       return;
     }
 
@@ -522,7 +530,7 @@ export class TerminalManager {
     managed.lastKnownRows = rows;
 
     invoke("resize_terminal", { id: terminalId, cols, rows }).catch((error) => {
-      console.error(`[terminal-manager] Failed to resize tmux session for ${terminalId}:`, error);
+      logger.error("Failed to resize tmux session", error, { terminalId, cols, rows });
     });
   }
 }

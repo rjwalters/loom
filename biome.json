@@ -25,6 +25,7 @@
         "noUnusedVariables": "warn"
       },
       "suspicious": {
+        "noConsole": "error",
         "noExplicitAny": "warn",
         "noDebugger": "warn",
         "noUnknownAtRules": "off",
@@ -45,6 +46,16 @@
           },
           "style": {
             "noNonNullAssertion": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/lib/logger.ts", "src/main.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
           }
         }
       }

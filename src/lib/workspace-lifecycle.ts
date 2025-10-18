@@ -7,9 +7,12 @@ import {
   setConfigWorkspace,
   splitTerminals,
 } from "./config";
+import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { expandTildePath } from "./workspace-utils";
+
+const logger = Logger.forComponent("workspace-lifecycle");
 
 /**
  * Workspace lifecycle management
@@ -63,28 +66,28 @@ export async function handleWorkspacePathInput(
     verifyTerminalSessions,
   } = deps;
 
-  console.log("[handleWorkspacePathInput] input path:", path);
+  logger.info("Handling workspace path input", { path });
 
   // Expand tilde if present
   const expandedPath = await expandTildePath(path);
-  console.log("[handleWorkspacePathInput] expanded path:", expandedPath);
+  logger.info("Expanded path", { expandedPath });
 
   // Always update displayed workspace so bad paths are visible with error message
   state.setDisplayedWorkspace(expandedPath);
-  console.log("[handleWorkspacePathInput] set displayedWorkspace, triggering render...");
+  logger.info("Set displayedWorkspace, triggering render");
 
   const isValid = await validateWorkspacePath(expandedPath);
-  console.log("[handleWorkspacePathInput] isValid:", isValid);
+  logger.info("Workspace path validation complete", { isValid });
 
   if (!isValid) {
-    console.log("[handleWorkspacePathInput] invalid path, stopping");
+    logger.info("Invalid path, stopping");
     return;
   }
 
   // Check if Loom is initialized in this workspace
   try {
     const isInitialized = await invoke<boolean>("check_loom_initialized", { path: expandedPath });
-    console.log("[handleWorkspacePathInput] isInitialized:", isInitialized);
+    logger.info("Loom initialization status", { isInitialized, workspacePath: expandedPath });
 
     if (!isInitialized) {
       // Ask user to confirm initialization with detailed information
@@ -109,7 +112,7 @@ export async function handleWorkspacePathInput(
       );
 
       if (!confirmed) {
-        console.log("[handleWorkspacePathInput] user cancelled initialization");
+        logger.info("User cancelled initialization");
         return;
       }
 
@@ -119,9 +122,9 @@ export async function handleWorkspacePathInput(
           workspacePath: expandedPath,
           defaultsPath: "defaults",
         });
-        console.log("[handleWorkspacePathInput] Workspace initialized");
+        logger.info("Workspace initialized", { workspacePath: expandedPath });
       } catch (error) {
-        console.error("Failed to initialize workspace:", error);
+        logger.error("Failed to initialize workspace", error as Error, { workspacePath: expandedPath });
         alert(`Failed to initialize workspace: ${error}`);
         return;
       }
@@ -132,7 +135,10 @@ export async function handleWorkspacePathInput(
       state.setNextTerminalNumber(config.nextAgentNumber);
 
       if (config.agents && config.agents.length > 0) {
-        console.log("[handleWorkspacePathInput] Creating terminals for fresh workspace");
+        logger.info("Creating terminals for fresh workspace", {
+          workspacePath: expandedPath,
+          terminalCount: config.agents.length
+        });
 
         // Create terminal sessions for each agent in the config
         for (const agent of config.agents) {
@@ -151,14 +157,16 @@ export async function handleWorkspacePathInput(
 
             // Update agent ID to match the newly created terminal
             agent.id = terminalId;
-            console.log(
-              `[handleWorkspacePathInput] Created terminal ${agent.name} (${terminalId})`
-            );
+            logger.info("Created terminal", {
+              terminalName: agent.name,
+              terminalId,
+              workspacePath: expandedPath
+            });
           } catch (error) {
-            console.error(
-              `[handleWorkspacePathInput] Failed to create terminal ${agent.name}:`,
-              error
-            );
+            logger.error("Failed to create terminal", error as Error, {
+              terminalName: agent.name,
+              workspacePath: expandedPath
+            });
             alert(`Failed to create terminal ${agent.name}: ${error}`);
           }
         }
@@ -177,7 +185,7 @@ export async function handleWorkspacePathInput(
           nextAgentNumber: state.getCurrentTerminalNumber(),
           terminals: terminalStates,
         });
-        console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
+        logger.info("Saved config with real terminal IDs", { workspacePath: expandedPath });
       }
     } else {
       // Workspace already initialized - load existing config
@@ -187,10 +195,10 @@ export async function handleWorkspacePathInput(
 
       // Load agents from config
       if (config.agents && config.agents.length > 0) {
-        console.log(
-          `[handleWorkspacePathInput] Config agents before session creation:`,
-          config.agents.map((a) => `${a.name}=${a.id}`)
-        );
+        logger.info("Config agents before session creation", {
+          workspacePath: expandedPath,
+          agents: config.agents.map((a) => `${a.name}=${a.id}`)
+        });
 
         // IMPORTANT: Create sessions for migrated terminals with placeholder IDs
         // After migration, terminals have configId but id="__needs_session__"
@@ -201,9 +209,11 @@ export async function handleWorkspacePathInput(
               // Get instance number
               const instanceNumber = state.getNextTerminalNumber();
 
-              console.log(
-                `[handleWorkspacePathInput] Creating session for migrated terminal "${agent.name}" (${agent.id})`
-              );
+              logger.info("Creating session for migrated terminal", {
+                workspacePath: expandedPath,
+                terminalName: agent.name,
+                currentId: agent.id
+              });
 
               // Create terminal session in daemon
               const sessionId = await invoke<string>("create_terminal", {
@@ -218,14 +228,16 @@ export async function handleWorkspacePathInput(
               agent.id = sessionId;
               createdSessionCount++;
 
-              console.log(
-                `[handleWorkspacePathInput] ✓ Created session for ${agent.name}: ${sessionId}`
-              );
+              logger.info("Created session for migrated terminal", {
+                workspacePath: expandedPath,
+                terminalName: agent.name,
+                sessionId
+              });
             } catch (error) {
-              console.error(
-                `[handleWorkspacePathInput] Failed to create session for ${agent.name}:`,
-                error
-              );
+              logger.error("Failed to create session for migrated terminal", error as Error, {
+                workspacePath: expandedPath,
+                terminalName: agent.name
+              });
               // Keep placeholder ID - terminal will show as missing session
               // User can use recovery options
             }
@@ -233,21 +245,22 @@ export async function handleWorkspacePathInput(
         }
 
         if (createdSessionCount > 0) {
-          console.log(
-            `[handleWorkspacePathInput] Created ${createdSessionCount} sessions for migrated terminals`
-          );
+          logger.info("Created sessions for migrated terminals", {
+            workspacePath: expandedPath,
+            createdCount: createdSessionCount
+          });
         }
 
         // Now load agents into state with their session IDs
-        console.log(
-          `[handleWorkspacePathInput] Config agents before loadAgents:`,
-          config.agents.map((a) => `${a.name}=${a.id}`)
-        );
+        logger.info("Config agents before loadAgents", {
+          workspacePath: expandedPath,
+          agents: config.agents.map((a) => `${a.name}=${a.id}`)
+        });
         state.loadAgents(config.agents);
-        console.log(
-          `[handleWorkspacePathInput] State after loadAgents:`,
-          state.getTerminals().map((a) => `${a.name}=${a.id}`)
-        );
+        logger.info("State after loadAgents", {
+          workspacePath: expandedPath,
+          terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`)
+        });
 
         // If we created sessions, save the updated config with real IDs
         if (createdSessionCount > 0) {
@@ -259,9 +272,10 @@ export async function handleWorkspacePathInput(
             nextAgentNumber: state.getCurrentTerminalNumber(),
             terminals: terminalStates,
           });
-          console.log(
-            `[handleWorkspacePathInput] Saved config with ${createdSessionCount} new session IDs`
-          );
+          logger.info("Saved config with new session IDs", {
+            workspacePath: expandedPath,
+            newSessionCount: createdSessionCount
+          });
         }
 
         // Reconnect agents to existing daemon terminals
@@ -272,18 +286,21 @@ export async function handleWorkspacePathInput(
         const allMissing = terminals.every((t) => t.missingSession === true);
 
         if (allMissing && terminals.length > 0) {
-          console.log(
-            `[handleWorkspacePathInput] All ${terminals.length} terminals missing, auto-creating sessions (clean slate reset recovery)...`
-          );
+          logger.info("All terminals missing, auto-creating sessions (clean slate reset recovery)", {
+            workspacePath: expandedPath,
+            terminalCount: terminals.length
+          });
 
           let createdCount = 0;
           for (const terminal of terminals) {
             try {
               const instanceNumber = state.getNextTerminalNumber();
 
-              console.log(
-                `[handleWorkspacePathInput] Auto-creating session for ${terminal.name} (${terminal.id})`
-              );
+              logger.info("Auto-creating session for terminal", {
+                workspacePath: expandedPath,
+                terminalName: terminal.name,
+                terminalId: terminal.id
+              });
 
               // Create terminal session in daemon
               const sessionId = await invoke<string>("create_terminal", {
@@ -302,22 +319,26 @@ export async function handleWorkspacePathInput(
               });
 
               createdCount++;
-              console.log(
-                `[handleWorkspacePathInput] ✓ Auto-created session for ${terminal.name}: ${sessionId}`
-              );
+              logger.info("Auto-created session for terminal", {
+                workspacePath: expandedPath,
+                terminalName: terminal.name,
+                sessionId
+              });
             } catch (error) {
-              console.error(
-                `[handleWorkspacePathInput] Failed to auto-create session for ${terminal.name}:`,
-                error
-              );
+              logger.error("Failed to auto-create session for terminal", error as Error, {
+                workspacePath: expandedPath,
+                terminalName: terminal.name
+              });
               // Keep in error state - user can try manual recovery
             }
           }
 
           if (createdCount > 0) {
-            console.log(
-              `[handleWorkspacePathInput] Auto-created ${createdCount}/${terminals.length} sessions`
-            );
+            logger.info("Auto-created sessions", {
+              workspacePath: expandedPath,
+              createdCount,
+              totalCount: terminals.length
+            });
 
             // Save updated config with new session IDs
             const terminalsToSave = state.getTerminals();
@@ -330,9 +351,9 @@ export async function handleWorkspacePathInput(
             });
 
             // Launch agents for terminals with role configs
-            console.log(
-              `[handleWorkspacePathInput] Launching agents for auto-created terminals...`
-            );
+            logger.info("Launching agents for auto-created terminals", {
+              workspacePath: expandedPath
+            });
             await launchAgentsForTerminals(expandedPath, state.getTerminals());
           }
         }
@@ -346,22 +367,22 @@ export async function handleWorkspacePathInput(
     const { getAutonomousManager } = await import("./autonomous-manager");
     const autonomousManager = getAutonomousManager();
     autonomousManager.startAllAutonomous(state);
-    console.log("[handleWorkspacePathInput] Started autonomous agents");
+    logger.info("Started autonomous agents", { workspacePath: expandedPath });
 
     // Now set workspace as active
     state.setWorkspace(expandedPath);
-    console.log("[handleWorkspacePathInput] workspace fully loaded");
+    logger.info("Workspace fully loaded", { workspacePath: expandedPath });
 
     // Store workspace path for next app launch
     try {
       await invoke("set_stored_workspace", { path: expandedPath });
-      console.log("[handleWorkspacePathInput] workspace path stored");
+      logger.info("Workspace path stored", { workspacePath: expandedPath });
     } catch (error) {
-      console.error("Failed to store workspace path:", error);
+      logger.error("Failed to store workspace path", error as Error, { workspacePath: expandedPath });
       // Non-fatal - workspace is still loaded
     }
   } catch (error) {
-    console.error("Error handling workspace:", error);
+    logger.error("Error handling workspace", error as Error, { workspacePath: expandedPath });
     alert(`Error: ${error}`);
   }
 }

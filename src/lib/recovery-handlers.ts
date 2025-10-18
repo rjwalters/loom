@@ -7,8 +7,11 @@
 
 import { ask } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
+
+const logger = Logger.forComponent("recovery-handlers");
 
 /**
  * Dependencies required by recovery handlers
@@ -33,7 +36,7 @@ export async function handleRecoverNewSession(
   deps: RecoveryDependencies
 ): Promise<void> {
   const { state, generateNextConfigId, saveCurrentConfig } = deps;
-  console.log(`[handleRecoverNewSession] Creating new session for terminal ${terminalId}`);
+  logger.info("Creating new session for terminal", { terminalId });
 
   try {
     if (!state.hasWorkspace()) {
@@ -64,7 +67,7 @@ export async function handleRecoverNewSession(
       instanceNumber,
     });
 
-    console.log(`[handleRecoverNewSession] Created new terminal ${newTerminalId}`);
+    logger.info("Created new terminal", { oldTerminalId: terminalId, newTerminalId });
 
     // Update the terminal in state with the new ID
     state.removeTerminal(terminalId);
@@ -81,9 +84,9 @@ export async function handleRecoverNewSession(
     // Save config
     await saveCurrentConfig();
 
-    console.log(`[handleRecoverNewSession] Recovery complete`);
+    logger.info("Recovery complete", { terminalId: newTerminalId });
   } catch (error) {
-    console.error(`[handleRecoverNewSession] Failed to recover:`, error);
+    logger.error("Failed to recover terminal", error, { terminalId });
     alert(`Failed to create new session: ${error}`);
   }
 }
@@ -98,23 +101,23 @@ export async function handleRecoverNewSession(
  * @param state - The application state
  */
 export async function handleRecoverAttachSession(id: string, state: AppState): Promise<void> {
-  console.log(`[handleRecoverAttachSession] Loading available sessions for terminal ${id}`);
+  logger.info("Loading available sessions for terminal", { terminalId: id });
 
   try {
     // Find terminal by id
     const terminal = state.getTerminal(id);
     if (!terminal) {
-      console.error(`[handleRecoverAttachSession] Terminal ${id} not found`);
+      logger.error("Terminal not found", new Error("Terminal not found"), { terminalId: id });
       return;
     }
 
     const sessions = await invoke<string[]>("list_available_sessions");
-    console.log(`[handleRecoverAttachSession] Found ${sessions.length} sessions:`, sessions);
+    logger.info("Found sessions", { terminalId: id, sessionCount: sessions.length });
 
     // Note: Recovery UI removed - app now auto-recovers missing sessions
     // Manual recovery handlers are deprecated but kept for compatibility
   } catch (error) {
-    console.error(`[handleRecoverAttachSession] Failed to list sessions:`, error);
+    logger.error("Failed to list sessions", error, { terminalId: id });
     alert(`Failed to list available sessions: ${error}`);
   }
 }
@@ -135,7 +138,7 @@ export async function handleAttachToSession(
   deps: Pick<RecoveryDependencies, "state" | "saveCurrentConfig">
 ): Promise<void> {
   const { state, saveCurrentConfig } = deps;
-  console.log(`[handleAttachToSession] Attaching terminal ${terminalId} to session ${sessionName}`);
+  logger.info("Attaching terminal to session", { terminalId, sessionName });
 
   try {
     await invoke("attach_to_session", {
@@ -155,9 +158,9 @@ export async function handleAttachToSession(
     // Save config
     await saveCurrentConfig();
 
-    console.log(`[handleAttachToSession] Attached successfully`);
+    logger.info("Attached successfully", { terminalId, sessionName });
   } catch (error) {
-    console.error(`[handleAttachToSession] Failed to attach:`, error);
+    logger.error("Failed to attach to session", error, { terminalId, sessionName });
     alert(`Failed to attach to session: ${error}`);
   }
 }
@@ -172,7 +175,7 @@ export async function handleAttachToSession(
  * @param state - The application state (for finding which terminal is showing the session list)
  */
 export async function handleKillSession(sessionName: string, _state: AppState): Promise<void> {
-  console.log(`[handleKillSession] Killing session ${sessionName}`);
+  logger.info("Killing session", { sessionName });
 
   const confirmed = await ask(
     `Are you sure you want to kill session "${sessionName}"?\n\nThis will permanently terminate the session and cannot be undone.`,
@@ -188,12 +191,12 @@ export async function handleKillSession(sessionName: string, _state: AppState): 
 
   try {
     await invoke("kill_session", { sessionName });
-    console.log(`[handleKillSession] Session killed successfully`);
+    logger.info("Session killed successfully", { sessionName });
 
     // Note: Recovery UI removed - app now auto-recovers missing sessions
     // Manual recovery handlers are deprecated but kept for compatibility
   } catch (error) {
-    console.error(`[handleKillSession] Failed to kill session:`, error);
+    logger.error("Failed to kill session", error, { sessionName });
     alert(`Failed to kill session: ${error}`);
   }
 }

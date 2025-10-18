@@ -1,7 +1,10 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { saveConfig, saveState, splitTerminals } from "./config";
+import { Logger } from "./logger";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
+
+const logger = Logger.forComponent("worker-modal");
 
 export function createWorkerModal(_workspacePath: string): HTMLElement {
   const modal = document.createElement("div");
@@ -93,7 +96,7 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
       .catch(() => false);
 
     if (!hasApiKey) {
-      console.warn("ANTHROPIC_API_KEY not set in .env file");
+      logger.warn("ANTHROPIC_API_KEY not set", { workspacePath });
       alert(
         "Warning: ANTHROPIC_API_KEY not set in .env file.\n\nWorkers won't function without it. Add the key to your .env file and restart Loom."
       );
@@ -102,7 +105,7 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
     // Check for Claude Code (warn if missing)
     const hasClaudeCode = await invoke<boolean>("check_claude_code");
     if (!hasClaudeCode) {
-      console.warn("Claude Code not found in PATH");
+      logger.warn("Claude Code not found in PATH", { workspacePath });
       alert(
         "Warning: Claude Code not found in PATH.\n\nWorkers won't function without it. Install with:\nnpm install -g @anthropic-ai/claude-code"
       );
@@ -127,7 +130,9 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
       });
       promptTextarea.value = roleContent;
     } catch (error) {
-      console.error("Failed to load worker.md role file:", error);
+      logger.error("Failed to load worker.md role file", error as Error, {
+        workspacePath,
+      });
       promptTextarea.value = "Error loading worker role file";
     }
 

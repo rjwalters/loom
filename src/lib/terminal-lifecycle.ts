@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+
+const logger = Logger.forComponent("terminal-lifecycle");
 
 /**
  * Terminal lifecycle management
@@ -37,22 +40,21 @@ export async function launchAgentsForTerminals(
 ): Promise<void> {
   const { state } = deps;
 
-  console.log("[launchAgentsForTerminals] Launching agents for configured terminals");
-  console.log("[launchAgentsForTerminals] workspacePath:", workspacePath);
-  console.log(
-    "[launchAgentsForTerminals] terminals:",
-    terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`)
-  );
+  logger.info("Launching agents for configured terminals", {
+    workspacePath,
+    terminals: terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`)
+  });
 
   // Filter terminals that have Claude Code worker role
   const workersToLaunch = terminals.filter(
     (t) => t.role === "claude-code-worker" && t.roleConfig && t.roleConfig.roleFile
   );
 
-  console.log(
-    `[launchAgentsForTerminals] Found ${workersToLaunch.length} terminals with role configs`,
-    workersToLaunch.map((t) => `${t.name}=${t.id}`)
-  );
+  logger.info("Found terminals with role configs", {
+    workspacePath,
+    workerCount: workersToLaunch.length,
+    workers: workersToLaunch.map((t) => `${t.name}=${t.id}`)
+  });
 
   // Track terminals that were successfully launched
   const launchedTerminalIds: string[] = [];
@@ -65,12 +67,20 @@ export async function launchAgentsForTerminals(
         continue;
       }
 
-      console.log(`[launchAgentsForTerminals] Launching ${terminal.name} (${terminal.id})`);
+      logger.info("Launching agent", {
+        workspacePath,
+        terminalName: terminal.name,
+        terminalId: terminal.id
+      });
 
       // Set terminal to busy status BEFORE launching agent
       // This prevents HealthMonitor from incorrectly marking it as missing during the launch process
       state.updateTerminal(terminal.id, { status: TerminalStatus.Busy });
-      console.log(`[launchAgentsForTerminals] Set ${terminal.name} to busy status`);
+      logger.info("Set terminal to busy status", {
+        workspacePath,
+        terminalName: terminal.name,
+        terminalId: terminal.id
+      });
 
       // Get worker type from config (default to claude)
       const workerType = (roleConfig.workerType as string) || "claude";
@@ -90,16 +100,18 @@ export async function launchAgentsForTerminals(
         await launchGrokAgent(terminal.id);
       } else if (workerType === "codex") {
         // Codex with worktree support (optional - starts in main workspace if empty)
-        console.log(`[launchAgentsForTerminals] Launching Codex for ${terminal.name}...`);
         const { launchCodexAgent } = await import("./agent-launcher");
 
         // Use worktree path if available, otherwise main workspace
         const locationDesc = terminal.worktreePath
           ? `worktree ${terminal.worktreePath}`
           : "main workspace";
-        console.log(
-          `[launchAgentsForTerminals] Launching Codex agent for ${terminal.name} (id=${terminal.id}) in ${locationDesc}...`
-        );
+        logger.info("Launching Codex agent", {
+          workspacePath,
+          terminalName: terminal.name,
+          terminalId: terminal.id,
+          location: locationDesc
+        });
 
         // Launch Codex agent (will use main workspace if worktreePath is empty)
         await launchCodexAgent(
@@ -109,19 +121,25 @@ export async function launchAgentsForTerminals(
           terminal.worktreePath || ""
         );
 
-        console.log(`[launchAgentsForTerminals] Codex agent launched in ${locationDesc}`);
+        logger.info("Codex agent launched", {
+          workspacePath,
+          terminalName: terminal.name,
+          location: locationDesc
+        });
       } else {
         // Claude with worktree support (optional - starts in main workspace if empty)
-        console.log(`[launchAgentsForTerminals] Importing agent-launcher for ${terminal.name}...`);
         const { launchAgentInTerminal } = await import("./agent-launcher");
 
         // Use worktree path if available, otherwise main workspace
         const locationDesc = terminal.worktreePath
           ? `worktree ${terminal.worktreePath}`
           : "main workspace";
-        console.log(
-          `[launchAgentsForTerminals] Launching agent for ${terminal.name} (id=${terminal.id}) in ${locationDesc}...`
-        );
+        logger.info("Launching Claude agent", {
+          workspacePath,
+          terminalName: terminal.name,
+          terminalId: terminal.id,
+          location: locationDesc
+        });
 
         // Launch agent (will use main workspace if worktreePath is empty)
         await launchAgentInTerminal(
@@ -131,16 +149,28 @@ export async function launchAgentsForTerminals(
           terminal.worktreePath || ""
         );
 
-        console.log(`[launchAgentsForTerminals] Agent launched in ${locationDesc}`);
+        logger.info("Claude agent launched", {
+          workspacePath,
+          terminalName: terminal.name,
+          location: locationDesc
+        });
       }
 
-      console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
+      logger.info("Successfully launched agent", {
+        workspacePath,
+        terminalName: terminal.name,
+        terminalId: terminal.id
+      });
 
       // Track successfully launched terminals (will reset to idle AFTER all launches complete)
       launchedTerminalIds.push(terminal.id);
     } catch (error) {
       const errorMessage = `Failed to launch agent for ${terminal.name}: ${error}`;
-      console.error(`[launchAgentsForTerminals] ${errorMessage}`);
+      logger.error("Failed to launch agent", error as Error, {
+        workspacePath,
+        terminalName: terminal.name,
+        terminalId: terminal.id
+      });
 
       // Still track this terminal ID - reset to idle after all launches complete
       // (agent launch failed but terminal exists and should not stay in busy state forever)
@@ -156,15 +186,19 @@ export async function launchAgentsForTerminals(
   // Reset ALL launched terminals to idle status AFTER all launches complete
   // This prevents the periodic HealthMonitor (30s interval) from catching terminals in idle
   // state before all agent launches finish (which can take 2+ minutes for 6 terminals)
-  console.log(
-    `[launchAgentsForTerminals] All agent launches complete, resetting ${launchedTerminalIds.length} terminals to idle`
-  );
+  logger.info("All agent launches complete, resetting terminals to idle", {
+    workspacePath,
+    terminalCount: launchedTerminalIds.length
+  });
   for (const terminalId of launchedTerminalIds) {
     state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
-    console.log(`[launchAgentsForTerminals] Reset ${terminalId} to idle status`);
+    logger.info("Reset terminal to idle status", {
+      workspacePath,
+      terminalId
+    });
   }
 
-  console.log("[launchAgentsForTerminals] Agent launch complete");
+  logger.info("Agent launch complete", { workspacePath });
 }
 
 /**
@@ -182,7 +216,9 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
     return;
   }
 
-  console.log(`[verifyTerminalSessions] Checking health for ${terminals.length} terminals...`);
+  logger.info("Checking terminal session health", {
+    terminalCount: terminals.length
+  });
 
   // Batch check all terminals in parallel
   const checks = terminals.map(async (terminal) => {
@@ -195,7 +231,9 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
       const hasSession = await invoke<boolean>("check_session_health", { id: terminal.id });
       return { terminal, hasSession };
     } catch (error) {
-      console.error(`[verifyTerminalSessions] Failed to check ${terminal.id}:`, error);
+      logger.error("Failed to check terminal session health", error as Error, {
+        terminalId: terminal.id
+      });
       return { terminal, hasSession: false };
     }
   });
@@ -209,7 +247,9 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
   for (const { terminal, hasSession } of results) {
     if (hasSession && terminal.missingSession) {
       // Clear stale missingSession flag
-      console.log(`[verifyTerminalSessions] Clearing stale missingSession flag for ${terminal.id}`);
+      logger.info("Clearing stale missingSession flag", {
+        terminalId: terminal.id
+      });
       state.updateTerminal(terminal.id, {
         status: TerminalStatus.Idle,
         missingSession: undefined,
@@ -217,7 +257,9 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
       clearedCount++;
     } else if (!hasSession && !terminal.missingSession) {
       // Mark as missing if not already marked
-      console.log(`[verifyTerminalSessions] Marking ${terminal.id} as missing session`);
+      logger.info("Marking terminal as missing session", {
+        terminalId: terminal.id
+      });
       state.updateTerminal(terminal.id, {
         status: TerminalStatus.Error,
         missingSession: true,
@@ -226,9 +268,10 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
     }
   }
 
-  console.log(
-    `[verifyTerminalSessions] Verification complete: ${clearedCount} cleared, ${markedMissingCount} marked missing`
-  );
+  logger.info("Terminal session verification complete", {
+    clearedCount,
+    markedMissingCount
+  });
 }
 
 /**
@@ -242,7 +285,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
 export async function reconnectTerminals(deps: TerminalLifecycleDependencies): Promise<void> {
   const { state, initializeTerminalDisplay, saveCurrentConfig } = deps;
 
-  console.log("[reconnectTerminals] Querying daemon for active terminals...");
+  logger.info("Querying daemon for active terminals");
 
   try {
     // Get list of active terminals from daemon
@@ -255,14 +298,18 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
     }
 
     const daemonTerminals = await invoke<DaemonTerminalInfo[]>("list_terminals");
-    console.log(`[reconnectTerminals] Found ${daemonTerminals.length} active daemon terminals`);
+    logger.info("Found active daemon terminals", {
+      daemonTerminalCount: daemonTerminals.length
+    });
 
     // Create a set of active terminal IDs for quick lookup
     const activeTerminalIds = new Set(daemonTerminals.map((t) => t.id));
 
     // Get all agents from state
     const agents = state.getTerminals();
-    console.log(`[reconnectTerminals] Config has ${agents.length} agents`);
+    logger.info("Config agents loaded", {
+      agentCount: agents.length
+    });
 
     let reconnectedCount = 0;
     let missingCount = 0;
@@ -271,9 +318,9 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
     for (const agent of agents) {
       // Check if agent has placeholder ID (shouldn't happen after proper initialization)
       if (agent.id === "__unassigned__") {
-        console.log(
-          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, skipping (already in error state)`
-        );
+        logger.info("Agent has placeholder ID, skipping (already in error state)", {
+          terminalName: agent.name
+        });
 
         // Don't call state.updateTerminal() here - it triggers infinite render loop
         // The terminal already shows as missing because check_session_health will fail for "__unassigned__"
@@ -282,7 +329,10 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
       }
 
       if (activeTerminalIds.has(agent.id)) {
-        console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
+        logger.info("Reconnecting agent", {
+          terminalName: agent.name,
+          terminalId: agent.id
+        });
 
         // Clear any error state from previous connection issues (use configId for state)
         if (agent.missingSession) {
@@ -300,9 +350,10 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
 
         reconnectedCount++;
       } else {
-        console.log(
-          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, marking as missing`
-        );
+        logger.info("Agent not found in daemon, marking as missing", {
+          terminalName: agent.name,
+          terminalId: agent.id
+        });
 
         // Mark terminal as having missing session so user can see it needs recovery (use configId for state)
         state.updateTerminal(agent.id, {
@@ -314,16 +365,17 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
       }
     }
 
-    console.log(
-      `[reconnectTerminals] Reconnection complete: ${reconnectedCount} reconnected, ${missingCount} missing`
-    );
+    logger.info("Reconnection complete", {
+      reconnectedCount,
+      missingCount
+    });
 
     // If we reconnected at least some terminals, save the updated state
     if (reconnectedCount > 0 && saveCurrentConfig) {
       await saveCurrentConfig();
     }
   } catch (error) {
-    console.error("[reconnectTerminals] Failed to reconnect terminals:", error);
+    logger.error("Failed to reconnect terminals", error as Error);
     // Non-fatal - workspace is still loaded
     alert(
       `Warning: Could not reconnect to daemon terminals.\n\n` +
