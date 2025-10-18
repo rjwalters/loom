@@ -114,14 +114,16 @@ export class AppState {
 ### Terminal Roles
 
 Each terminal can be assigned a specialized role from `defaults/roles/`:
-- **Worker** (manual): Implements features, creates PRs
-- **Reviewer** (autonomous, 5min): Reviews PRs
-- **Curator** (autonomous, 5min): Enhances issues
-- **Architect** (autonomous, 15min): Creates proposals
-- **Critic** (autonomous, 15min): Identifies bloat
-- **Triage** (autonomous, 15min): Prioritizes issues
+- **Builder** (manual, worker.md): Implements features, creates PRs
+- **Judge** (autonomous 5min, reviewer.md): Reviews PRs
+- **Curator** (autonomous 5min, curator.md): Enhances issues
+- **Architect** (autonomous 15min, architect.md): Creates proposals
+- **Hermit** (autonomous 15min, critic.md): Identifies bloat
+- **Healer** (manual, fixer.md): Fixes bugs and maintains PRs
+- **Guide** (autonomous 15min, triage.md): Prioritizes issues
+- **Driver** (manual, default.md): Plain shell, direct action
 
-See [WORKFLOWS.md](WORKFLOWS.md) for complete workflow details.
+See [WORKFLOWS.md](WORKFLOWS.md) and [Agent Archetypes](docs/philosophy/agent-archetypes.md) for complete details.
 
 ## Development Workflow
 
@@ -138,7 +140,7 @@ cd /Users/rwalters/GitHub/loom
 ### Working on an Issue
 
 ```bash
-# 1. Claim issue (as Worker agent)
+# 1. Claim issue (as Builder)
 gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
 
 # 2. Create worktree
@@ -285,7 +287,7 @@ This runs:
 
 ## Project Philosophy
 
-Loom embraces archetypal roles (Architect, Worker, Reviewer, Critic, Curator) that work in harmony through label-based coordination. Each role has a specific purpose and interval. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the philosophical framework.
+Loom embraces archetypal roles (Builder, Judge, Curator, Architect, Hermit, Healer, Guide, Driver) that work in harmony through label-based coordination. Each role embodies a universal pattern from Tarot's Major Arcana, with specific purposes and rhythms. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the complete philosophical framework.
 
 ## Maintaining Documentation
 
