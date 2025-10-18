@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { parseTerminalState, type TerminalState } from "./terminal-state-parser";
+import { parseTerminalState } from "./terminal-state-parser";
 
 describe("parseTerminalState", () => {
   describe("Claude Code bypass permissions prompt", () => {

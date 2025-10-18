@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
-import { detectTerminalState, getLastLines, type TerminalState } from "./terminal-state-parser";
+import { detectTerminalState, type TerminalState } from "./terminal-state-parser";
 
 const logger = Logger.forComponent("agent-launcher");
 

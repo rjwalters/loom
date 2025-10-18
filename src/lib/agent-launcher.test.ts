@@ -169,42 +169,24 @@ describe("agent-launcher", () => {
       });
     });
 
-    it("sends bypass permissions acceptance with retry", async () => {
-      const promise = launchAgentInTerminal("terminal-1", "worker.md", workspacePath, worktreePath);
-
-      await vi.runAllTimersAsync();
-      await promise;
-
-      // Should send "2" to accept bypass permissions (3 retries)
-      const bypassCalls = vi
-        .mocked(invoke)
-        .mock.calls.filter((call) => call[1] && (call[1] as any).data === "2");
-      expect(bypassCalls.length).toBe(3); // 3 retry attempts
-    });
-
-    it("verifies agent launch with terminal probe", async () => {
-      const promise = launchAgentInTerminal("terminal-1", "worker.md", workspacePath, worktreePath);
-
-      await vi.runAllTimersAsync();
-      await promise;
-
-      // Should call read_terminal_output for probe
-      const probeCalls = vi
-        .mocked(invoke)
-        .mock.calls.filter((call) => call[0] === "read_terminal_output");
-      expect(probeCalls.length).toBeGreaterThan(0);
-    });
-
-    it("logs successful agent verification", async () => {
-      // Mock returns agent type
-      vi.mocked(invoke).mockImplementation((cmd) => {
-        if (cmd === "read_role_file") {
-          return Promise.resolve(mockRoleContent);
+    it("sends bypass permissions acceptance when prompt detected", async () => {
+      // Mock passive detection to return bypass prompt on first check, then waiting-input
+      let pollCount = 0;
+      vi.mocked(detectTerminalState).mockImplementation(async () => {
+        pollCount++;
+        if (pollCount === 1) {
+          return {
+            type: "claude-code",
+            status: "bypass-prompt",
+            raw: "WARNING: Claude Code running in Bypass Permissions mode",
+          };
         }
-        if (cmd === "read_terminal_output") {
-          return Promise.resolve("AGENT_TYPE: worker");
-        }
-        return Promise.resolve(undefined);
+        return {
+          type: "claude-code",
+          status: "waiting-input",
+          lastPrompt: "⏺ Ready",
+          raw: "⏺ Ready",
+        };
       });
 
       const promise = launchAgentInTerminal("terminal-1", "worker.md", workspacePath, worktreePath);
@@ -212,20 +194,51 @@ describe("agent-launcher", () => {
       await vi.runAllTimersAsync();
       await promise;
 
-      // Should verify successfully (check parseProbeResponse was called)
-      expect(parseProbeResponse).toHaveBeenCalled();
+      // Should send "2" once when bypass prompt is detected
+      const bypassCalls = vi
+        .mocked(invoke)
+        .mock.calls.filter((call) => call[1] && (call[1] as any).data === "2");
+      expect(bypassCalls.length).toBe(1);
+    });
+
+    it("verifies agent launch with passive detection", async () => {
+      const promise = launchAgentInTerminal("terminal-1", "worker.md", workspacePath, worktreePath);
+
+      await vi.runAllTimersAsync();
+      await promise;
+
+      // Should call detectTerminalState for verification
+      expect(detectTerminalState).toHaveBeenCalled();
+
+      // Verify it's checking for agent state at the end
+      const lastCall = vi.mocked(detectTerminalState).mock.calls.slice(-1)[0];
+      expect(lastCall).toBeDefined();
+    });
+
+    it("logs successful agent verification", async () => {
+      // Mock passive detection to return claude-code waiting-input
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "claude-code",
+        status: "waiting-input",
+        lastPrompt: "⏺ Ready",
+        raw: "⏺ Ready",
+      });
+
+      const promise = launchAgentInTerminal("terminal-1", "worker.md", workspacePath, worktreePath);
+
+      await vi.runAllTimersAsync();
+      await promise;
+
+      // Should verify successfully (check detectTerminalState was called)
+      expect(detectTerminalState).toHaveBeenCalled();
     });
 
     it("logs error when shell detected instead of agent", async () => {
-      // Mock returns shell type
-      vi.mocked(invoke).mockImplementation((cmd) => {
-        if (cmd === "read_role_file") {
-          return Promise.resolve(mockRoleContent);
-        }
-        if (cmd === "read_terminal_output") {
-          return Promise.resolve("$ ls");
-        }
-        return Promise.resolve(undefined);
+      // Mock passive detection to return shell type
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "shell",
+        status: "idle",
+        raw: "$ ",
       });
 
       const promise = launchAgentInTerminal("terminal-1", "worker.md", workspacePath, worktreePath);
@@ -234,7 +247,7 @@ describe("agent-launcher", () => {
       await promise;
 
       // Should complete (error is logged, not thrown)
-      expect(parseProbeResponse).toHaveBeenCalledWith("$ ls");
+      expect(detectTerminalState).toHaveBeenCalled();
     });
 
     it("waits appropriate delays between commands", async () => {
@@ -434,28 +447,26 @@ describe("agent-launcher", () => {
       expect(codexCalls.length).toBeGreaterThan(0);
     });
 
-    it("verifies Codex agent launch with terminal probe", async () => {
+    it("verifies Codex agent launch with passive detection", async () => {
       const promise = launchCodexAgent("terminal-1", "worker.md", workspacePath, worktreePath);
 
       await vi.runAllTimersAsync();
       await promise;
 
-      // Should call read_terminal_output for probe
-      const probeCalls = vi
-        .mocked(invoke)
-        .mock.calls.filter((call) => call[0] === "read_terminal_output");
-      expect(probeCalls.length).toBeGreaterThan(0);
+      // Should call detectTerminalState for verification
+      expect(detectTerminalState).toHaveBeenCalled();
+
+      // Verify it's checking for agent state at the end
+      const lastCall = vi.mocked(detectTerminalState).mock.calls.slice(-1)[0];
+      expect(lastCall).toBeDefined();
     });
 
     it("logs successful Codex agent verification", async () => {
-      vi.mocked(invoke).mockImplementation((cmd) => {
-        if (cmd === "read_role_file") {
-          return Promise.resolve(mockRoleContent);
-        }
-        if (cmd === "read_terminal_output") {
-          return Promise.resolve("AGENT_TYPE: worker");
-        }
-        return Promise.resolve(undefined);
+      // Mock passive detection to return codex type
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "codex",
+        status: "waiting-input",
+        raw: "[Codex] Ready",
       });
 
       const promise = launchCodexAgent("terminal-1", "worker.md", workspacePath, worktreePath);
@@ -463,18 +474,15 @@ describe("agent-launcher", () => {
       await vi.runAllTimersAsync();
       await promise;
 
-      expect(parseProbeResponse).toHaveBeenCalled();
+      expect(detectTerminalState).toHaveBeenCalled();
     });
 
     it("logs error when shell detected instead of Codex agent", async () => {
-      vi.mocked(invoke).mockImplementation((cmd) => {
-        if (cmd === "read_role_file") {
-          return Promise.resolve(mockRoleContent);
-        }
-        if (cmd === "read_terminal_output") {
-          return Promise.resolve("$ ls");
-        }
-        return Promise.resolve(undefined);
+      // Mock passive detection to return shell type
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "shell",
+        status: "idle",
+        raw: "$ ",
       });
 
       const promise = launchCodexAgent("terminal-1", "worker.md", workspacePath, worktreePath);
@@ -483,7 +491,7 @@ describe("agent-launcher", () => {
       await promise;
 
       // Should complete (error is logged, not thrown)
-      expect(parseProbeResponse).toHaveBeenCalledWith("$ ls");
+      expect(detectTerminalState).toHaveBeenCalled();
     });
   });
 
@@ -561,8 +569,13 @@ describe("agent-launcher", () => {
       });
     });
 
-    it("handles rapid probe checks", async () => {
-      vi.mocked(invoke).mockResolvedValue("AGENT_TYPE: worker");
+    it("handles rapid state detection checks", async () => {
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "claude-code",
+        status: "waiting-input",
+        lastPrompt: "⏺ Ready",
+        raw: "⏺ Ready",
+      });
 
       const probes = [
         detectTerminalType("terminal-1"),
@@ -570,11 +583,10 @@ describe("agent-launcher", () => {
         detectTerminalType("terminal-3"),
       ];
 
-      await vi.runAllTimersAsync();
       const results = await Promise.all(probes);
 
       expect(results).toHaveLength(3);
-      expect(results.every((r) => r.type === "agent")).toBe(true);
+      expect(results.every((r) => r.type === "claude-code")).toBe(true);
     });
   });
 });
