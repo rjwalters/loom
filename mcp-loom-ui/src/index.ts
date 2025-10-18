@@ -15,6 +15,8 @@ import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import fg from "fast-glob";
+import ignore from "ignore";
 
 const LOOM_DIR = join(homedir(), ".loom");
 const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
@@ -261,6 +263,72 @@ async function getHeartbeat(): Promise<string> {
   }
 }
 
+/**
+ * Get a random file from the workspace
+ * Respects .gitignore and allows custom include/exclude patterns
+ */
+async function getRandomFile(options?: {
+  includePatterns?: string[];
+  excludePatterns?: string[];
+}): Promise<string> {
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+
+    // Default exclude patterns
+    const defaultExcludes = [
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/target/**",
+      "**/.loom/worktrees/**",
+      "**/*.log",
+      "**/package-lock.json",
+      "**/pnpm-lock.yaml",
+      "**/yarn.lock",
+    ];
+
+    const excludePatterns = [...defaultExcludes, ...(options?.excludePatterns || [])];
+    const includePatterns = options?.includePatterns || ["**/*"];
+
+    // Read .gitignore if it exists
+    const gitignorePath = join(workspacePath, ".gitignore");
+    let ig = ignore();
+    try {
+      const gitignoreContent = await readFile(gitignorePath, "utf-8");
+      ig = ignore().add(gitignoreContent);
+    } catch {
+      // .gitignore doesn't exist or can't be read, that's fine
+    }
+
+    // Find all files
+    const files = await fg(includePatterns, {
+      cwd: workspacePath,
+      ignore: excludePatterns,
+      onlyFiles: true,
+      dot: false,
+      absolute: false,
+    });
+
+    // Filter by .gitignore
+    const filteredFiles = files.filter((file) => !ig.ignores(file));
+
+    if (filteredFiles.length === 0) {
+      return "No files found matching the criteria";
+    }
+
+    // Pick a random file
+    const randomIndex = Math.floor(Math.random() * filteredFiles.length);
+    const randomFile = filteredFiles[randomIndex];
+
+    // Return absolute path
+    return join(workspacePath, randomFile);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to get random file: ${errorMessage}`);
+  }
+}
+
 // Create server instance
 const server = new Server(
   {
@@ -345,6 +413,28 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      {
+        name: "get_random_file",
+        description:
+          "Get a random file path from the workspace. Respects .gitignore and excludes common build artifacts. Useful for the Critic agent to pick files to review.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            includePatterns: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Optional glob patterns to include (e.g., ['src/**/*.ts']). Defaults to all files.",
+            },
+            excludePatterns: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Optional glob patterns to exclude in addition to defaults (node_modules, .git, dist, etc.)",
+            },
+          },
         },
       },
     ],
@@ -437,6 +527,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: heartbeat,
+            },
+          ],
+        };
+      }
+
+      case "get_random_file": {
+        const includePatterns = args?.includePatterns as string[] | undefined;
+        const excludePatterns = args?.excludePatterns as string[] | undefined;
+        const randomFile = await getRandomFile({ includePatterns, excludePatterns });
+        return {
+          content: [
+            {
+              type: "text",
+              text: randomFile,
             },
           ],
         };

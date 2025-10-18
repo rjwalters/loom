@@ -42,7 +42,7 @@ export async function launchAgentsForTerminals(
 
   logger.info("Launching agents for configured terminals", {
     workspacePath,
-    terminals: terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`)
+    terminals: terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`),
   });
 
   // Filter terminals that have Claude Code worker role
@@ -53,7 +53,7 @@ export async function launchAgentsForTerminals(
   logger.info("Found terminals with role configs", {
     workspacePath,
     workerCount: workersToLaunch.length,
-    workers: workersToLaunch.map((t) => `${t.name}=${t.id}`)
+    workers: workersToLaunch.map((t) => `${t.name}=${t.id}`),
   });
 
   // Track terminals that were successfully launched
@@ -70,7 +70,7 @@ export async function launchAgentsForTerminals(
       logger.info("Launching agent", {
         workspacePath,
         terminalName: terminal.name,
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
 
       // Set terminal to busy status BEFORE launching agent
@@ -79,7 +79,7 @@ export async function launchAgentsForTerminals(
       logger.info("Set terminal to busy status", {
         workspacePath,
         terminalName: terminal.name,
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
 
       // Get worker type from config (default to claude)
@@ -110,7 +110,7 @@ export async function launchAgentsForTerminals(
           workspacePath,
           terminalName: terminal.name,
           terminalId: terminal.id,
-          location: locationDesc
+          location: locationDesc,
         });
 
         // Launch Codex agent (will use main workspace if worktreePath is empty)
@@ -124,7 +124,7 @@ export async function launchAgentsForTerminals(
         logger.info("Codex agent launched", {
           workspacePath,
           terminalName: terminal.name,
-          location: locationDesc
+          location: locationDesc,
         });
       } else {
         // Claude with worktree support (optional - starts in main workspace if empty)
@@ -138,7 +138,7 @@ export async function launchAgentsForTerminals(
           workspacePath,
           terminalName: terminal.name,
           terminalId: terminal.id,
-          location: locationDesc
+          location: locationDesc,
         });
 
         // Launch agent (will use main workspace if worktreePath is empty)
@@ -152,14 +152,14 @@ export async function launchAgentsForTerminals(
         logger.info("Claude agent launched", {
           workspacePath,
           terminalName: terminal.name,
-          location: locationDesc
+          location: locationDesc,
         });
       }
 
       logger.info("Successfully launched agent", {
         workspacePath,
         terminalName: terminal.name,
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
 
       // Track successfully launched terminals (will reset to idle AFTER all launches complete)
@@ -169,7 +169,7 @@ export async function launchAgentsForTerminals(
       logger.error("Failed to launch agent", error as Error, {
         workspacePath,
         terminalName: terminal.name,
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
 
       // Still track this terminal ID - reset to idle after all launches complete
@@ -188,13 +188,13 @@ export async function launchAgentsForTerminals(
   // state before all agent launches finish (which can take 2+ minutes for 6 terminals)
   logger.info("All agent launches complete, resetting terminals to idle", {
     workspacePath,
-    terminalCount: launchedTerminalIds.length
+    terminalCount: launchedTerminalIds.length,
   });
   for (const terminalId of launchedTerminalIds) {
     state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
     logger.info("Reset terminal to idle status", {
       workspacePath,
-      terminalId
+      terminalId,
     });
   }
 
@@ -217,7 +217,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
   }
 
   logger.info("Checking terminal session health", {
-    terminalCount: terminals.length
+    terminalCount: terminals.length,
   });
 
   // Batch check all terminals in parallel
@@ -232,7 +232,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
       return { terminal, hasSession };
     } catch (error) {
       logger.error("Failed to check terminal session health", error as Error, {
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
       return { terminal, hasSession: false };
     }
@@ -248,7 +248,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
     if (hasSession && terminal.missingSession) {
       // Clear stale missingSession flag
       logger.info("Clearing stale missingSession flag", {
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
       state.updateTerminal(terminal.id, {
         status: TerminalStatus.Idle,
@@ -258,7 +258,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
     } else if (!hasSession && !terminal.missingSession) {
       // Mark as missing if not already marked
       logger.info("Marking terminal as missing session", {
-        terminalId: terminal.id
+        terminalId: terminal.id,
       });
       state.updateTerminal(terminal.id, {
         status: TerminalStatus.Error,
@@ -270,7 +270,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
 
   logger.info("Terminal session verification complete", {
     clearedCount,
-    markedMissingCount
+    markedMissingCount,
   });
 }
 
@@ -299,7 +299,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
 
     const daemonTerminals = await invoke<DaemonTerminalInfo[]>("list_terminals");
     logger.info("Found active daemon terminals", {
-      daemonTerminalCount: daemonTerminals.length
+      daemonTerminalCount: daemonTerminals.length,
     });
 
     // Create a set of active terminal IDs for quick lookup
@@ -308,7 +308,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
     // Get all agents from state
     const agents = state.getTerminals();
     logger.info("Config agents loaded", {
-      agentCount: agents.length
+      agentCount: agents.length,
     });
 
     let reconnectedCount = 0;
@@ -319,7 +319,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
       // Check if agent has placeholder ID (shouldn't happen after proper initialization)
       if (agent.id === "__unassigned__") {
         logger.info("Agent has placeholder ID, skipping (already in error state)", {
-          terminalName: agent.name
+          terminalName: agent.name,
         });
 
         // Don't call state.updateTerminal() here - it triggers infinite render loop
@@ -331,7 +331,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
       if (activeTerminalIds.has(agent.id)) {
         logger.info("Reconnecting agent", {
           terminalName: agent.name,
-          terminalId: agent.id
+          terminalId: agent.id,
         });
 
         // Clear any error state from previous connection issues (use configId for state)
@@ -352,7 +352,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
       } else {
         logger.info("Agent not found in daemon, marking as missing", {
           terminalName: agent.name,
-          terminalId: agent.id
+          terminalId: agent.id,
         });
 
         // Mark terminal as having missing session so user can see it needs recovery (use configId for state)
@@ -367,7 +367,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
 
     logger.info("Reconnection complete", {
       reconnectedCount,
-      missingCount
+      missingCount,
     });
 
     // If we reconnected at least some terminals, save the updated state

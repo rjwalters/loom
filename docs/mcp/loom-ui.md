@@ -16,6 +16,7 @@ This MCP server enables AI agents (like Claude Code) to:
 - Monitor application state and configuration
 - Trigger workspace operations (start, reset)
 - Check application health status
+- Get random file paths from the workspace for code review
 
 All file operations use `~/.loom/` directory for logs and state files.
 
@@ -217,6 +218,90 @@ mcp__loom-ui__get_heartbeat()
 - Verifying Loom is running before triggering operations
 - Monitoring app health during testing
 - Detecting frozen or crashed app instances
+
+---
+
+### `get_random_file`
+
+Get a random file path from the workspace. Respects `.gitignore` and excludes common build artifacts.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `includePatterns` | string[] | No | `["**/*"]` | Glob patterns to include (e.g., `["src/**/*.ts"]`) |
+| `excludePatterns` | string[] | No | `[]` | Additional glob patterns to exclude beyond defaults |
+
+**Default Exclusions:**
+
+The following patterns are always excluded:
+- `**/node_modules/**`
+- `**/.git/**`
+- `**/dist/**`
+- `**/build/**`
+- `**/target/**`
+- `**/.loom/worktrees/**`
+- `**/*.log`
+- `**/package-lock.json`
+- `**/pnpm-lock.yaml`
+- `**/yarn.lock`
+
+**Returns:**
+
+Absolute path to a randomly selected file from the workspace.
+
+**Output Format:**
+```
+/Users/username/GitHub/loom/src/lib/state.ts
+```
+
+**Error Conditions:**
+
+- **No Files Found**: Returns message "No files found matching the criteria"
+- **Read Error**: Returns error message with details
+
+**Example:**
+```typescript
+// Get any random file (default behavior)
+mcp__loom-ui__get_random_file()
+
+// Get random TypeScript file from src/
+mcp__loom-ui__get_random_file({
+  includePatterns: ["src/**/*.ts"]
+})
+
+// Get random file, excluding test files
+mcp__loom-ui__get_random_file({
+  excludePatterns: ["**/*.test.ts", "**/*.spec.ts"]
+})
+
+// Get random Rust file
+mcp__loom-ui__get_random_file({
+  includePatterns: ["**/*.rs"]
+})
+```
+
+**Use Cases:**
+- **Critic agent**: Randomly select files to review for code quality issues
+- **Refactoring**: Find random files to improve or modernize
+- **Code exploration**: Discover unfamiliar parts of the codebase
+- **Random testing**: Pick files for spot checks or manual review
+
+**How It Works:**
+
+1. Scans the workspace directory using glob patterns
+2. Filters out files matching default exclusions
+3. Respects `.gitignore` rules if present
+4. Applies custom include/exclude patterns
+5. Randomly selects one file from the filtered list
+6. Returns the absolute path
+
+**Notes:**
+
+- Respects workspace `.gitignore` automatically
+- All paths relative to `LOOM_WORKSPACE` environment variable
+- Only returns files, not directories
+- Does not follow symbolic links
 
 ---
 
