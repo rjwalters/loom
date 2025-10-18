@@ -80,9 +80,57 @@ pnpm install
    # Look for connection errors or missing dependencies
    ```
 
-**Alternative Testing Methods** (if MCP unavailable):
+**File-Based MCP Command Triggering** (Recommended Alternative):
 
-If MCP servers are not available, you can still test manually using:
+Loom implements a file-based command system that works reliably regardless of MCP stdio connection status. This is the **recommended testing method** when MCP servers aren't connected to your Claude Code session.
+
+**How it works:**
+1. Write command to `~/.loom/mcp-command.json`
+2. Loom's file watcher (using `notify` crate) detects the change
+3. Loom executes the command and emits appropriate events
+4. Loom writes acknowledgment to `~/.loom/mcp-ack.json`
+
+**Usage:**
+
+```bash
+# Trigger force start (bypasses confirmation dialog)
+echo '{"command": "trigger_force_start", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > ~/.loom/mcp-command.json
+
+# Wait for acknowledgment
+sleep 2
+cat ~/.loom/mcp-ack.json
+
+# Trigger factory reset
+echo '{"command": "trigger_factory_reset", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > ~/.loom/mcp-command.json
+```
+
+**Available commands:**
+- `trigger_start` - Start workspace (shows confirmation)
+- `trigger_force_start` - Start workspace (no confirmation)
+- `trigger_factory_reset` - Reset workspace (shows confirmation)
+- `trigger_force_factory_reset` - Reset workspace (no confirmation)
+
+**Troubleshooting MCP stdio connection:**
+
+If `mcp__loom-ui__*` commands show "No such tool available", check:
+
+1. **Verify Claude Code loaded MCP config**: MCP servers are only loaded when Claude Code starts
+   ```bash
+   # Check if MCP servers are attached to current session
+   ps -p $PPID -o pid,ppid,comm
+   ps -ef | grep "mcp-loom" | grep "$(ps -p $PPID -o ppid=)"
+   ```
+
+2. **Multiple Claude Code sessions**: If you see orphaned MCP server processes, they may be connected to old sessions:
+   ```bash
+   # Count running MCP server processes
+   ps aux | grep "mcp-loom" | grep -v grep | wc -l
+   # Should be 3 (one set), not 6, 9, 15, 21, etc.
+   ```
+
+3. **Solution**: Restart Claude Code to reload MCP configuration, OR use file-based commands (which always work)
+
+**Manual Monitoring Methods** (if file-based commands unavailable):
 
 1. **Console Logs** - Monitor `~/.loom/console.log` directly:
    ```bash
@@ -105,7 +153,7 @@ If MCP servers are not available, you can still test manually using:
    tail -f /tmp/loom-terminal-1.out
    ```
 
-**Note**: Manual methods are more tedious and error-prone. MCP servers are strongly recommended for comprehensive factory reset testing.
+**Note**: File-based command triggering is the most reliable method. MCP stdio connection is a convenience wrapper that may not always be available depending on session state.
 
 ## Testing Loop Phases
 
@@ -237,15 +285,34 @@ If MCP servers are not available, you can still test manually using:
 
 **Steps**:
 
-1. **Trigger Workspace Start** (via MCP)
+1. **Trigger Workspace Start**
+
+   **Method A: File-Based Command** (Recommended - always works):
    ```bash
-   # Use force_start to bypass confirmation dialog (for automation)
+   # Trigger workspace start via file-based command
+   echo '{"command": "trigger_force_start", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > ~/.loom/mcp-command.json
+
+   # Wait for acknowledgment
+   sleep 2
+   cat ~/.loom/mcp-ack.json
+   ```
+
+   **Method B: MCP Tool** (if MCP servers connected):
+   ```bash
+   # Use force_start to bypass confirmation dialog
    mcp__loom-ui__trigger_force_start
    ```
 
 2. **Monitor Console Logs** (real-time)
+
+   **Method A: Direct File Read** (Recommended):
    ```bash
    # Watch for terminal creation sequence
+   tail -50 ~/.loom/console.log | grep -E "start-workspace|Created terminal|Claude Code"
+   ```
+
+   **Method B: MCP Tool** (if available):
+   ```bash
    mcp__loom-ui__read_console_log
    ```
 
@@ -255,15 +322,22 @@ If MCP servers are not available, you can still test manually using:
    [start-workspace] ✓ Created terminal-1
    [start-workspace] ✓ Created terminal-2
    ...
-   [start-workspace] ✓ Created terminal-7
+   [start-workspace] ✓ Created terminal-9
    [launchAgentInTerminal] ✓ Agent will start in main workspace
    [launchAgentInTerminal] Sending "2" to accept warning
    [launchAgentInTerminal] ✓ Claude Code launched successfully
    ```
 
-3. **Verify Terminal State** (via MCP)
+3. **Verify Terminal State**
+
+   **Method A: Direct File Read** (Recommended):
    ```bash
    # Check application state
+   cat .loom/state.json | head -50
+   ```
+
+   **Method B: MCP Tool** (if available):
+   ```bash
    mcp__loom-ui__read_state_file
    ```
 
@@ -278,14 +352,24 @@ If MCP servers are not available, you can still test manually using:
          "sessionId": "loom-terminal-1",
          "workingDirectory": "/Users/rwalters/GitHub/loom"
        },
-       // ... 6 more terminals
+       // ... 8 more terminals (terminal-2 through terminal-9)
      ]
    }
    ```
 
-4. **Verify tmux Sessions** (via MCP)
+4. **Verify tmux Sessions**
+
+   **Method A: Direct tmux Check** (Recommended):
    ```bash
    # List all terminal sessions
+   tmux -L loom list-sessions
+
+   # Count sessions (should be 9)
+   tmux -L loom list-sessions 2>/dev/null | wc -l
+   ```
+
+   **Method B: MCP Tool** (if available):
+   ```bash
    mcp__loom-terminals__list_terminals
    ```
 
@@ -319,11 +403,11 @@ If MCP servers are not available, you can still test manually using:
    - Claude Code interactive prompt
 
 **Success Criteria**:
-- ✅ 7 terminals created (terminal-1 through terminal-7)
+- ✅ 9 terminals created (terminal-1 through terminal-9)
 - ✅ All terminals in `idle` or `busy` status (not `error`)
 - ✅ All terminals have valid `sessionId` (no `null` or missing)
 - ✅ All terminals start in main workspace directory
-- ✅ Claude Code running in all 7 terminals
+- ✅ Claude Code running in all 9 terminals
 - ✅ No "command not found" errors
 - ✅ No "duplicate session" errors
 - ✅ No stale error overlays visible in UI
@@ -334,13 +418,24 @@ If MCP servers are not available, you can still test manually using:
 
 **Steps**:
 
-1. **Trigger Factory Reset** (via MCP)
+1. **Trigger Factory Reset**
+
+   **Method A: File-Based Command** (Recommended):
    ```bash
    # Reset workspace to defaults (does NOT auto-start)
-   mcp__loom-ui__trigger_factory_reset
+   echo '{"command": "trigger_factory_reset", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > ~/.loom/mcp-command.json
 
-   # Wait for reset to complete (watch console logs)
-   mcp__loom-ui__read_console_log
+   # Wait for acknowledgment
+   sleep 2
+   cat ~/.loom/mcp-ack.json
+
+   # Watch console logs for reset progress
+   tail -50 ~/.loom/console.log | grep -E "workspace-reset|Destroying|Configuration"
+   ```
+
+   **Method B: MCP Tool** (if available):
+   ```bash
+   mcp__loom-ui__trigger_factory_reset
    ```
 
    **Expected log sequence**:
@@ -350,27 +445,47 @@ If MCP servers are not available, you can still test manually using:
    [workspace-reset] ✓ Killed all sessions
    [workspace-reset] Destroying terminal session for terminal-1
    ...
-   [workspace-reset] Destroying terminal session for terminal-7
+   [workspace-reset] Destroying terminal session for terminal-9
    [workspace-reset] ✓ All terminals destroyed
    [workspace-reset] Resetting configuration to defaults
    [workspace-reset] ✓ Configuration reset complete
    ```
 
 2. **Verify Clean State After Reset**
+
+   **Method A: Direct Verification** (Recommended):
    ```bash
    # Check that all terminals are destroyed
-   mcp__loom-ui__read_state_file
+   cat .loom/state.json
 
    # Verify no tmux sessions remain
-   mcp__loom-terminals__list_terminals
+   tmux -L loom list-sessions 2>/dev/null || echo "✓ No sessions"
 
-   # Check for any errors in logs
+   # Check daemon logs for errors
+   tail -50 ~/.loom/daemon.log | grep -i error
+   ```
+
+   **Method B: MCP Tools** (if available):
+   ```bash
+   mcp__loom-ui__read_state_file
+   mcp__loom-terminals__list_terminals
    mcp__loom-logs__tail_daemon_log --lines=50
    ```
 
-3. **Restart Workspace** (via MCP)
+3. **Restart Workspace**
+
+   **Method A: File-Based Command** (Recommended):
    ```bash
    # Start engine with reset configuration
+   echo '{"command": "trigger_force_start", "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' > ~/.loom/mcp-command.json
+
+   # Wait for acknowledgment
+   sleep 2
+   cat ~/.loom/mcp-ack.json
+   ```
+
+   **Method B: MCP Tool** (if available):
+   ```bash
    mcp__loom-ui__trigger_force_start
    ```
 
@@ -564,7 +679,7 @@ sleep 3
    - **Measure**: Reset trigger to last agent launch
 
 3. **Agent Success Rate**: Percentage of terminals with successful agent launch
-   - **Target**: 100% (7/7 terminals)
+   - **Target**: 100% (9/9 terminals)
    - **Measure**: Count of "Claude Code launched successfully" logs
 
 4. **Error Rate**: Number of errors per test run
