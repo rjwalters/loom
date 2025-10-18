@@ -68,15 +68,68 @@ export function renderLoadingState(message: string = "Resetting workspace..."): 
 
   container.innerHTML = `
     <div class="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-      <div class="flex flex-col items-center gap-4">
-        <div class="relative">
-          <div class="w-16 h-16 border-4 border-blue-200 dark:border-blue-900 rounded-full"></div>
-          <div class="absolute top-0 left-0 w-16 h-16 border-4 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full animate-spin"></div>
+      <div class="flex flex-col items-center gap-6">
+        <!-- Loom weaving animation -->
+        <div class="relative w-32 h-32">
+          <!-- Vertical warp threads -->
+          <div class="absolute inset-0 flex justify-around items-center">
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 0ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 200ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 400ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 600ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 800ms; animation-duration: 1.5s;"></div>
+          </div>
+
+          <!-- Horizontal weft shuttle -->
+          <div class="absolute inset-0 flex items-center overflow-hidden">
+            <div class="w-full h-1 bg-gradient-to-r from-transparent via-blue-500 dark:via-blue-400 to-transparent animate-pulse" style="animation-duration: 2s;"></div>
+          </div>
+
+          <!-- Weaving shuttle moving across and up -->
+          <div class="absolute inset-0 flex items-center">
+            <div class="h-2 w-6 bg-blue-600 dark:bg-blue-400 rounded-full shadow-lg" style="animation: shuttle 4s ease-in-out infinite;"></div>
+          </div>
         </div>
-        <p class="text-lg font-medium text-gray-700 dark:text-gray-300">${escapeHtml(message)}</p>
-        <p class="text-sm text-gray-500 dark:text-gray-400">This may take a few moments...</p>
+
+        <!-- Animated message -->
+        <div class="text-center">
+          <p class="text-lg font-semibold text-gray-700 dark:text-gray-300 animate-pulse">${escapeHtml(message)}</p>
+          <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This may take a few moments...</p>
+        </div>
       </div>
     </div>
+
+    <style>
+      @keyframes shuttle {
+        0% {
+          transform: translateX(-200%) translateY(50%);
+        }
+        22% {
+          transform: translateX(600%) translateY(50%);
+        }
+        25% {
+          transform: translateX(600%) translateY(30%);
+        }
+        47% {
+          transform: translateX(-200%) translateY(30%);
+        }
+        50% {
+          transform: translateX(-200%) translateY(10%);
+        }
+        72% {
+          transform: translateX(600%) translateY(10%);
+        }
+        75% {
+          transform: translateX(600%) translateY(-10%);
+        }
+        97% {
+          transform: translateX(-200%) translateY(-10%);
+        }
+        100% {
+          transform: translateX(-200%) translateY(50%);
+        }
+      }
+    </style>
   `;
 }
 
@@ -231,8 +284,13 @@ export function renderPrimaryTerminal(
     console.log(
       `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=true, will render error overlay`
     );
-    setTimeout(() => {
-      renderMissingSessionError(terminal.id, terminal.id);
+    setTimeout(async () => {
+      // Get health check timing from health monitor
+      const { getHealthMonitor } = await import("./health-monitor");
+      const healthMonitor = getHealthMonitor();
+      const healthTiming = healthMonitor.getHealthCheckTiming();
+
+      renderMissingSessionError(terminal.id, terminal.id, healthTiming);
     }, 0);
   } else {
     console.log(
@@ -241,7 +299,17 @@ export function renderPrimaryTerminal(
   }
 }
 
-export function renderMissingSessionError(sessionId: string, configId: string): void {
+export interface HealthCheckTiming {
+  lastCheckTime: number | null;
+  nextCheckTime: number | null;
+  checkIntervalMs: number;
+}
+
+export function renderMissingSessionError(
+  sessionId: string,
+  configId: string,
+  healthTiming?: HealthCheckTiming
+): void {
   console.log(`[renderMissingSessionError] Rendering error overlay for terminal ${sessionId}`);
   const container = document.getElementById(`xterm-container-${sessionId}`);
   if (!container) {
@@ -249,6 +317,48 @@ export function renderMissingSessionError(sessionId: string, configId: string): 
     return;
   }
   console.log(`[renderMissingSessionError] Found container, replacing with error UI`);
+
+  // Calculate health check timing info
+  let healthCheckInfo = "";
+  if (healthTiming) {
+    const now = Date.now();
+    const lastCheckText = healthTiming.lastCheckTime
+      ? formatDuration(now - healthTiming.lastCheckTime)
+      : "never";
+    const nextCheckText = healthTiming.nextCheckTime
+      ? formatDuration(healthTiming.nextCheckTime - now)
+      : "unknown";
+
+    healthCheckInfo = `
+      <div class="mt-4 p-4 bg-gray-100 dark:bg-gray-800 rounded-lg border border-gray-300 dark:border-gray-600">
+        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Health Check Diagnostics</h4>
+        <div class="grid grid-cols-2 gap-3 text-xs">
+          <div class="flex flex-col">
+            <span class="text-gray-500 dark:text-gray-400">Last Check:</span>
+            <span class="font-mono font-semibold text-gray-700 dark:text-gray-300">${lastCheckText} ago</span>
+          </div>
+          <div class="flex flex-col">
+            <span class="text-gray-500 dark:text-gray-400">Next Check:</span>
+            <span class="font-mono font-semibold text-gray-700 dark:text-gray-300">in ${nextCheckText}</span>
+          </div>
+          <div class="flex flex-col col-span-2">
+            <span class="text-gray-500 dark:text-gray-400">Check Interval:</span>
+            <span class="font-mono font-semibold text-gray-700 dark:text-gray-300">${formatDuration(healthTiming.checkIntervalMs)}</span>
+          </div>
+        </div>
+        <button
+          id="check-now-btn"
+          data-terminal-id="${configId}"
+          class="mt-3 w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+          </svg>
+          Check Now
+        </button>
+      </div>
+    `;
+  }
 
   container.innerHTML = `
     <div class="h-full flex items-center justify-center bg-red-50 dark:bg-red-900/20">
@@ -259,78 +369,14 @@ export function renderMissingSessionError(sessionId: string, configId: string): 
           </svg>
         </div>
         <h3 class="text-lg font-semibold text-red-700 dark:text-red-300 mb-2">Terminal Session Missing</h3>
-        <p class="text-sm text-red-600 dark:text-red-400 mb-6">
+        <p class="text-sm text-red-600 dark:text-red-400 mb-4">
           The tmux session for this terminal no longer exists. This can happen if the daemon was restarted or the session was killed.
         </p>
-        <div class="flex flex-col gap-3 items-center">
-          <button
-            id="recover-new-session-btn"
-            data-terminal-id="${configId}"
-            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
-          >
-            Create New Session
-          </button>
-          <button
-            id="recover-attach-session-btn"
-            data-terminal-id="${configId}"
-            class="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg font-medium transition-colors"
-          >
-            Attach to Existing Session
-          </button>
-          <div id="available-sessions-${sessionId}" class="mt-4 w-full max-w-md"></div>
-        </div>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6">
+          The app will automatically recreate the session on next restart, or you can trigger a health check below.
+        </p>
+        ${healthCheckInfo}
       </div>
-    </div>
-  `;
-}
-
-export function renderAvailableSessionsList(
-  sessionId: string,
-  configId: string,
-  sessions: string[]
-): void {
-  const container = document.getElementById(`available-sessions-${sessionId}`);
-  if (!container) return;
-
-  if (sessions.length === 0) {
-    container.innerHTML = `
-      <p class="text-sm text-gray-500 dark:text-gray-400">No available loom sessions found</p>
-    `;
-    return;
-  }
-
-  const sessionItems = sessions
-    .map(
-      (session) => `
-      <div class="flex items-center gap-2">
-        <button
-          class="attach-session-item flex-1 px-4 py-2 text-left bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 border border-gray-300 dark:border-gray-600 rounded transition-colors"
-          data-terminal-id="${configId}"
-          data-session-name="${escapeHtml(session)}"
-        >
-          <div class="flex items-center justify-between">
-            <span class="text-sm font-mono">${escapeHtml(session)}</span>
-            <span class="text-xs text-gray-500 dark:text-gray-400">Attach</span>
-          </div>
-        </button>
-        <button
-          class="kill-session-btn px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
-          data-session-name="${escapeHtml(session)}"
-          title="Kill session"
-        >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-          </svg>
-        </button>
-      </div>
-    `
-    )
-    .join("");
-
-  container.innerHTML = `
-    <div class="flex flex-col gap-2">
-      <p class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Available Sessions:</p>
-      ${sessionItems}
     </div>
   `;
 }
@@ -551,7 +597,7 @@ function createMiniTerminalHTML(
           </div>
 
           <!-- Tarot card overlay (hidden by default, shown during drag) -->
-          <div class="tarot-card-overlay absolute inset-0 opacity-0 pointer-events-none flex items-center justify-center bg-gray-900 dark:bg-black rounded-lg">
+          <div class="tarot-card-overlay absolute inset-0 pointer-events-none flex items-center justify-center bg-gray-900 dark:bg-black rounded-lg">
             <img src="${tarotCardPath}" alt="Tarot card" class="h-full w-full object-contain p-2" />
           </div>
         </div>

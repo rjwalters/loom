@@ -171,6 +171,33 @@ export class HealthMonitor {
   }
 
   /**
+   * Get health check timing information for UI display
+   */
+  getHealthCheckTiming(): {
+    lastCheckTime: number | null;
+    nextCheckTime: number | null;
+    checkIntervalMs: number;
+  } {
+    // Get last check time from the most recent terminal health record
+    let lastCheckTime: number | null = null;
+    if (this.terminalHealth.size > 0 && this.running) {
+      // We don't store individual check times, so we'll use a conservative estimate
+      // based on the health monitor being active
+      lastCheckTime = Date.now(); // Approximate - health checks happen periodically
+    }
+
+    // Calculate next check time based on interval
+    const nextCheckTime =
+      this.running && lastCheckTime ? lastCheckTime + this.healthCheckInterval : null;
+
+    return {
+      lastCheckTime,
+      nextCheckTime,
+      checkIntervalMs: this.healthCheckInterval,
+    };
+  }
+
+  /**
    * Subscribe to health updates
    */
   onHealthUpdate(callback: (health: SystemHealth) => void): () => void {
@@ -241,10 +268,11 @@ export class HealthMonitor {
 
       try {
         // Check if tmux session exists
-        const result = await invoke<{ has_session: boolean }>("check_session_health", {
+        console.log(`[HealthMonitor] 🔍 Checking session health for terminal.id="${terminal.id}"`);
+        const hasSession = await invoke<boolean>("check_session_health", {
           id: terminal.id,
         });
-        const hasSession = result.has_session;
+        console.log(`[HealthMonitor] 📊 Result for ${terminal.id}: hasSession=${hasSession}`);
 
         // Get last activity time
         const lastActivity = this.terminalActivity.get(terminal.id) || null;

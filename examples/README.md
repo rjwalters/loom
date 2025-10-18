@@ -71,12 +71,15 @@ When you use these templates, you should **commit the `.loom/` directory** to ve
 ❌ **Don't commit these** (automatically gitignored):
 ```
 .loom/
-├── .daemon.pid         # Runtime process ID
-├── .daemon.log         # Daemon logs
+├── .daemon.pid         # Dev script PID file
+├── .daemon.log         # Dev script logs
 ├── daemon.sock         # IPC socket
 ├── state.json          # Current terminal state
-└── worktrees/          # Git worktrees (one per terminal)
+├── activity.db         # Activity tracking database
+└── worktrees/          # Git worktrees (one per issue)
 ```
+
+Note: Production daemon logs are written to `~/.loom/daemon.log` (home directory).
 
 Each template includes a `.gitignore` file with the correct patterns.
 

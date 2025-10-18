@@ -141,9 +141,20 @@ Issue #99: "fix the crash bug"
 
 ## Where to Add Enhancements
 
-Add your detailed enhancements as **issue comments** (not edits to the body). Workers are instructed to read comments via `gh issue view <number> --comments`, so this is where they'll find your detailed guidance.
+**Use a hybrid approach** based on issue quality:
 
-**Why comments instead of body edits:**
+### When to Use Comments (Preserve Original)
+
+Use comments when the issue is already clear and you're adding supplementary information:
+
+✅ **Good for:**
+- Issue has clear description with acceptance criteria
+- Adding implementation options/tradeoffs
+- Providing supplementary research or links
+- Breaking down large feature into phases
+- Sharing technical insights or considerations
+
+**Why comments work here:**
 - Preserves original issue for context
 - Shows curation as explicit review step
 - Easier to see what was added vs original
@@ -158,13 +169,74 @@ gh issue view 100 --comments
 gh issue comment 100 --body "$(cat <<'EOF'
 ## Implementation Guidance
 
-[Your detailed enhancement here...]
+[Your detailed implementation options here...]
 EOF
 )"
 
 # 3. Mark as ready
 gh issue edit 100 --add-label "loom:ready"
 ```
+
+### When to Amend Description (Improve Original)
+
+Amend the description when the original issue is vague or incomplete:
+
+✅ **Good for:**
+- Original issue is vague/incomplete (e.g., "fix the bug")
+- Missing critical information (reproduction steps, acceptance criteria)
+- Title doesn't match description
+- Issue created by Architect with placeholder text
+- Creating comprehensive spec from brief request
+
+**How to amend safely:**
+
+```bash
+# 1. Read current issue body
+CURRENT=$(gh issue view 310 --json body --jq .body)
+
+# 2. Create enhanced version preserving original
+ENHANCED="## Original Issue
+
+$CURRENT
+
+---
+
+## Curator Enhancement
+
+### Problem Statement
+[Clear explanation of the problem and why it matters]
+
+### Acceptance Criteria
+- [ ] Specific, testable criterion 1
+- [ ] Specific, testable criterion 2
+
+### Implementation Guidance
+[Technical approach, options, or recommendations]
+
+### Test Plan
+- [ ] Test case 1
+- [ ] Test case 2
+"
+
+# 3. Update issue body
+gh issue edit 310 --body "$ENHANCED"
+
+# 4. Add comment noting the amendment
+gh issue comment 310 --body "📝 **Curator**: Enhanced issue description with implementation details. Original issue preserved above."
+```
+
+**Important:**
+- Always preserve the original issue text
+- Add clear section headers to show what you added
+- Leave a comment noting you amended the description
+- This creates a single source of truth for Workers
+
+### Decision Tree
+
+Ask yourself: "Is the original issue already clear and actionable?"
+
+- **YES** → Add enhancement as **comment** (supplementary info)
+- **NO** → **Amend description** (create comprehensive spec, preserving original)
 
 ## Checking Dependencies
 

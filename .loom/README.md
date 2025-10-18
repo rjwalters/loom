@@ -45,11 +45,15 @@ Custom roles override system defaults when they have the same filename.
 These are automatically gitignored:
 ```
 .loom/
-├── .daemon.pid          # Process ID
-├── .daemon.log          # Daemon logs
+├── .daemon.pid          # Dev script PID file
+├── .daemon.log          # Dev script logs
 ├── daemon.sock          # IPC socket
-└── worktrees/           # Git worktrees (one per terminal)
+├── state.json           # Runtime terminal state
+├── activity.db          # Activity tracking database
+└── worktrees/           # Git worktrees (one per issue)
 ```
+
+Note: Production daemon logs are written to `~/.loom/daemon.log` (home directory).
 
 ## Creating Custom Roles
 
@@ -157,7 +161,7 @@ This allows teams to share agent roles and configurations while keeping runtime 
 ### Configuration not persisting
 - Check `.loom/config.json` exists
 - Check file permissions (should be writable)
-- Check logs in `.loom/.daemon.log`
+- Check logs: `.loom/.daemon.log`
 
 ### Worktrees taking up space
 - Worktrees are automatically cleaned up when terminals are destroyed

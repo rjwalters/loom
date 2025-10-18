@@ -3,23 +3,18 @@ import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
-import {
-  loadWorkspaceConfig,
-  saveConfig,
-  saveState,
-  setConfigWorkspace,
-  splitTerminals,
-} from "./lib/config";
+import { saveConfig, saveState, setConfigWorkspace, splitTerminals } from "./lib/config";
+import { setupDragAndDrop } from "./lib/drag-drop-manager";
 import { getHealthMonitor } from "./lib/health-monitor";
 import { getOutputPoller } from "./lib/output-poller";
-import {
-  handleAttachToSession,
-  handleKillSession,
-  handleRecoverAttachSession,
-  handleRecoverNewSession,
-} from "./lib/recovery-handlers";
+// Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import { handleRunNowClick, startRename } from "./lib/terminal-actions";
+import {
+  launchAgentsForTerminals as launchAgentsForTerminalsCore,
+  reconnectTerminals as reconnectTerminalsCore,
+  verifyTerminalSessions as verifyTerminalSessionsCore,
+} from "./lib/terminal-lifecycle";
 // NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
 // are defined locally in this file, not imported from terminal-lifecycle
 import { getTerminalManager } from "./lib/terminal-manager";
@@ -32,10 +27,12 @@ import {
   renderPrimaryTerminal,
 } from "./lib/ui";
 import { attachWorkspaceEventListeners, setupTooltips } from "./lib/ui-event-handlers";
-import { clearWorkspaceError, expandTildePath, showWorkspaceError } from "./lib/workspace-utils";
+import { handleWorkspacePathInput as handleWorkspacePathInputCore } from "./lib/workspace-lifecycle";
+import { clearWorkspaceError, showWorkspaceError } from "./lib/workspace-utils";
 
-// NOTE: validateWorkspacePath, browseWorkspace, and handleWorkspacePathInput
-// are defined locally in this file
+// NOTE: validateWorkspacePath and browseWorkspace are defined locally in this file
+// handleWorkspacePathInput is now in src/lib/workspace-lifecycle.ts
+// launchAgentsForTerminals, reconnectTerminals, verifyTerminalSessions are now in src/lib/terminal-lifecycle.ts
 
 // =================================================================
 // CONSOLE LOGGING TO FILE - For MCP access to browser console
@@ -436,65 +433,107 @@ async function initializeApp() {
     return; // Exit early if dependencies are missing
   }
 
-  // Try to restore workspace from localStorage first (for HMR survival)
+  // PRIORITY 1: Check for CLI workspace argument (highest priority)
+  try {
+    const cliWorkspace = await invoke<string | null>("get_cli_workspace");
+    if (cliWorkspace) {
+      console.log("[initializeApp] [CLI] Found CLI workspace argument:", cliWorkspace);
+      console.log(
+        "[initializeApp] [CLI] Using CLI workspace (takes precedence over stored workspace)"
+      );
+
+      // Validate CLI workspace
+      const isValid = await validateWorkspacePath(cliWorkspace);
+      if (isValid) {
+        console.log("[initializeApp] [CLI] CLI workspace is valid, loading...");
+        await handleWorkspacePathInput(cliWorkspace);
+        state.setInitializing(false);
+        return; // CLI workspace loaded successfully - skip stored workspace
+      }
+
+      console.warn(
+        "[initializeApp] [CLI] CLI workspace is invalid, falling back to stored workspace"
+      );
+    } else {
+      console.log("[initializeApp] [CLI] No CLI workspace argument provided");
+    }
+  } catch (error) {
+    console.error("[initializeApp] [CLI] Failed to get CLI workspace:", error);
+    // Continue to stored workspace fallback
+  }
+
+  // PRIORITY 2: Try to restore workspace from localStorage (for HMR survival)
   const localStorageWorkspace = state.restoreWorkspaceFromLocalStorage();
   if (localStorageWorkspace) {
-    console.log("[initializeApp] Restored workspace from localStorage:", localStorageWorkspace);
-    console.log("[initializeApp] This prevents HMR from clearing the workspace during hot reload");
+    console.log(
+      "[initializeApp] [localStorage] Restored workspace from localStorage:",
+      localStorageWorkspace
+    );
+    console.log(
+      "[initializeApp] [localStorage] This prevents HMR from clearing the workspace during hot reload"
+    );
   }
 
   try {
-    // Check for stored workspace in Tauri storage
+    // PRIORITY 3: Check for stored workspace in Tauri storage (lowest priority)
     const storedPath = await invoke<string | null>("get_stored_workspace");
 
     if (storedPath) {
-      console.log("[initializeApp] Found stored workspace:", storedPath);
+      console.log("[initializeApp] [Tauri] Found stored workspace:", storedPath);
 
       // Validate stored workspace is still valid
       const isValid = await validateWorkspacePath(storedPath);
 
       if (isValid) {
         // Load workspace automatically
-        console.log("[initializeApp] Loading stored workspace");
+        console.log("[initializeApp] [Tauri] Loading stored workspace");
         await handleWorkspacePathInput(storedPath);
         state.setInitializing(false);
         return;
       }
 
       // Path no longer valid - clear it and show picker
-      console.log("[initializeApp] Stored workspace invalid, clearing");
+      console.log("[initializeApp] [Tauri] Stored workspace invalid, clearing");
       await invoke("clear_stored_workspace");
       localStorage.removeItem("loom:workspace"); // Also clear localStorage
     } else if (localStorageWorkspace) {
       // No Tauri storage but have localStorage (HMR case)
-      console.log("[initializeApp] Using localStorage workspace after HMR");
+      console.log("[initializeApp] [localStorage] Using localStorage workspace after HMR");
       const isValid = await validateWorkspacePath(localStorageWorkspace);
 
       if (isValid) {
+        console.log("[initializeApp] [localStorage] localStorage workspace is valid, loading...");
         await handleWorkspacePathInput(localStorageWorkspace);
         state.setInitializing(false);
         return;
       }
 
       // Invalid - clear it
+      console.log("[initializeApp] [localStorage] localStorage workspace is invalid, clearing");
       localStorage.removeItem("loom:workspace");
     }
   } catch (error) {
-    console.error("[initializeApp] Failed to load stored workspace:", error);
+    console.error("[initializeApp] [Tauri] Failed to load stored workspace:", error);
 
     // If Tauri storage failed but we have localStorage, try that
     if (localStorageWorkspace) {
-      console.log("[initializeApp] Tauri storage failed, trying localStorage workspace");
+      console.log(
+        "[initializeApp] [localStorage] Tauri storage failed, trying localStorage workspace"
+      );
       const isValid = await validateWorkspacePath(localStorageWorkspace);
       if (isValid) {
+        console.log("[initializeApp] [localStorage] localStorage workspace is valid, loading...");
         await handleWorkspacePathInput(localStorageWorkspace);
+        state.setInitializing(false);
         return;
       }
+
+      console.log("[initializeApp] [localStorage] localStorage workspace is invalid");
     }
   }
 
-  // No stored workspace or validation failed - show picker
-  console.log("[initializeApp] Showing workspace picker");
+  // No workspace found or all validation failed - show picker
+  console.log("[initializeApp] [Fallback] No valid workspace found, showing workspace picker");
   state.setInitializing(false);
   render();
 }
@@ -856,11 +895,7 @@ async function showDaemonStatusDialog() {
 // Initialize app
 initializeApp();
 
-// Drag and drop state (uses configId for stable identification)
-let draggedConfigId: string | null = null;
-let dropTargetConfigId: string | null = null;
-let dropInsertBefore: boolean = false;
-let isDragging: boolean = false;
+// Drag and drop state moved to src/lib/drag-drop-manager.ts
 
 // Save current state to config and state files
 async function saveCurrentConfig() {
@@ -994,532 +1029,34 @@ async function createPlainTerminal() {
   }
 }
 
-/**
- * Launch agents for terminals that have role configurations
- *
- * This function is called after workspace initialization or factory reset
- * to automatically start Claude agents for terminals with roleConfig.
- *
- * @param workspacePath - The workspace directory path
- * @param terminals - Array of terminal configurations
- */
+// Launch agents for terminals (wrapper for terminal-lifecycle module)
 async function launchAgentsForTerminals(workspacePath: string, terminals: Terminal[]) {
-  console.log("[launchAgentsForTerminals] Launching agents for configured terminals");
-  console.log("[launchAgentsForTerminals] workspacePath:", workspacePath);
-  console.log(
-    "[launchAgentsForTerminals] terminals:",
-    terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`)
-  );
-
-  // Filter terminals that have Claude Code worker role
-  const workersToLaunch = terminals.filter(
-    (t) => t.role === "claude-code-worker" && t.roleConfig && t.roleConfig.roleFile
-  );
-
-  console.log(
-    `[launchAgentsForTerminals] Found ${workersToLaunch.length} terminals with role configs`,
-    workersToLaunch.map((t) => `${t.name}=${t.id}`)
-  );
-
-  // Track terminals that were successfully launched
-  const launchedTerminalIds: string[] = [];
-
-  // Launch each worker
-  for (const terminal of workersToLaunch) {
-    try {
-      const roleConfig = terminal.roleConfig;
-      if (!roleConfig || !roleConfig.roleFile) {
-        continue;
-      }
-
-      console.log(`[launchAgentsForTerminals] Launching ${terminal.name} (${terminal.id})`);
-
-      // Set terminal to busy status BEFORE launching agent
-      // This prevents HealthMonitor from incorrectly marking it as missing during the launch process
-      state.updateTerminal(terminal.id, { status: TerminalStatus.Busy });
-      console.log(`[launchAgentsForTerminals] Set ${terminal.name} to busy status`);
-
-      // Get worker type from config (default to claude)
-      const workerType = (roleConfig.workerType as string) || "claude";
-
-      // Launch based on worker type
-      if (workerType === "github-copilot") {
-        const { launchGitHubCopilotAgent } = await import("./lib/agent-launcher");
-        await launchGitHubCopilotAgent(terminal.id);
-      } else if (workerType === "gemini") {
-        const { launchGeminiCLIAgent } = await import("./lib/agent-launcher");
-        await launchGeminiCLIAgent(terminal.id);
-      } else if (workerType === "deepseek") {
-        const { launchDeepSeekAgent } = await import("./lib/agent-launcher");
-        await launchDeepSeekAgent(terminal.id);
-      } else if (workerType === "grok") {
-        const { launchGrokAgent } = await import("./lib/agent-launcher");
-        await launchGrokAgent(terminal.id);
-      } else if (workerType === "codex") {
-        // Codex with worktree support (optional - starts in main workspace if empty)
-        console.log(`[launchAgentsForTerminals] Launching Codex for ${terminal.name}...`);
-        const { launchCodexAgent } = await import("./lib/agent-launcher");
-
-        // Use worktree path if available, otherwise main workspace
-        const locationDesc = terminal.worktreePath
-          ? `worktree ${terminal.worktreePath}`
-          : "main workspace";
-        console.log(
-          `[launchAgentsForTerminals] Launching Codex agent for ${terminal.name} (id=${terminal.id}) in ${locationDesc}...`
-        );
-
-        // Launch Codex agent (will use main workspace if worktreePath is empty)
-        await launchCodexAgent(
-          terminal.id,
-          roleConfig.roleFile as string,
-          workspacePath,
-          terminal.worktreePath || ""
-        );
-
-        console.log(`[launchAgentsForTerminals] Codex agent launched in ${locationDesc}`);
-      } else {
-        // Claude with worktree support (optional - starts in main workspace if empty)
-        console.log(`[launchAgentsForTerminals] Importing agent-launcher for ${terminal.name}...`);
-        const { launchAgentInTerminal } = await import("./lib/agent-launcher");
-
-        // Use worktree path if available, otherwise main workspace
-        const locationDesc = terminal.worktreePath
-          ? `worktree ${terminal.worktreePath}`
-          : "main workspace";
-        console.log(
-          `[launchAgentsForTerminals] Launching agent for ${terminal.name} (id=${terminal.id}) in ${locationDesc}...`
-        );
-
-        // Launch agent (will use main workspace if worktreePath is empty)
-        await launchAgentInTerminal(
-          terminal.id,
-          roleConfig.roleFile as string,
-          workspacePath,
-          terminal.worktreePath || ""
-        );
-
-        console.log(`[launchAgentsForTerminals] Agent launched in ${locationDesc}`);
-      }
-
-      console.log(`[launchAgentsForTerminals] Successfully launched ${terminal.name}`);
-
-      // Track successfully launched terminals (will reset to idle AFTER all launches complete)
-      launchedTerminalIds.push(terminal.id);
-    } catch (error) {
-      const errorMessage = `Failed to launch agent for ${terminal.name}: ${error}`;
-      console.error(`[launchAgentsForTerminals] ${errorMessage}`);
-
-      // Still track this terminal ID - reset to idle after all launches complete
-      // (agent launch failed but terminal exists and should not stay in busy state forever)
-      launchedTerminalIds.push(terminal.id);
-
-      // Show error to user so they know what failed
-      alert(errorMessage);
-
-      // Continue with other terminals even if one fails
-    }
-  }
-
-  // Reset ALL launched terminals to idle status AFTER all launches complete
-  // This prevents the periodic HealthMonitor (30s interval) from catching terminals in idle
-  // state before all agent launches finish (which can take 2+ minutes for 6 terminals)
-  console.log(
-    `[launchAgentsForTerminals] All agent launches complete, resetting ${launchedTerminalIds.length} terminals to idle`
-  );
-  for (const terminalId of launchedTerminalIds) {
-    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
-    console.log(`[launchAgentsForTerminals] Reset ${terminalId} to idle status`);
-  }
-
-  console.log("[launchAgentsForTerminals] Agent launch complete");
+  await launchAgentsForTerminalsCore(workspacePath, terminals, { state });
 }
 
-/**
- * Verify terminal sessions health BEFORE rendering
- * This prevents false positives from stale missingSession flags
- * by batch-checking all terminals and updating state synchronously
- */
+// Verify terminal sessions health (wrapper for terminal-lifecycle module)
 async function verifyTerminalSessions(): Promise<void> {
-  const terminals = state.getTerminals();
-  if (terminals.length === 0) {
-    return;
-  }
-
-  console.log(`[verifyTerminalSessions] Checking health for ${terminals.length} terminals...`);
-
-  // Batch check all terminals in parallel
-  const checks = terminals.map(async (terminal) => {
-    // Skip placeholder IDs
-    if (terminal.id === "__unassigned__" || terminal.id === "__needs_session__") {
-      return { terminal, hasSession: false };
-    }
-
-    try {
-      const hasSession = await invoke<boolean>("check_session_health", { id: terminal.id });
-      return { terminal, hasSession };
-    } catch (error) {
-      console.error(`[verifyTerminalSessions] Failed to check ${terminal.id}:`, error);
-      return { terminal, hasSession: false };
-    }
-  });
-
-  const results = await Promise.all(checks);
-
-  // Update state for all terminals based on actual session health
-  let clearedCount = 0;
-  let markedMissingCount = 0;
-
-  for (const { terminal, hasSession } of results) {
-    if (hasSession && terminal.missingSession) {
-      // Clear stale missingSession flag
-      console.log(`[verifyTerminalSessions] Clearing stale missingSession flag for ${terminal.id}`);
-      state.updateTerminal(terminal.id, {
-        status: TerminalStatus.Idle,
-        missingSession: undefined,
-      });
-      clearedCount++;
-    } else if (!hasSession && !terminal.missingSession) {
-      // Mark as missing if not already marked
-      console.log(`[verifyTerminalSessions] Marking ${terminal.id} as missing session`);
-      state.updateTerminal(terminal.id, {
-        status: TerminalStatus.Error,
-        missingSession: true,
-      });
-      markedMissingCount++;
-    }
-  }
-
-  console.log(
-    `[verifyTerminalSessions] Verification complete: ${clearedCount} cleared, ${markedMissingCount} marked missing`
-  );
+  await verifyTerminalSessionsCore({ state });
 }
 
-// Reconnect terminals to daemon after loading config
+// Reconnect terminals to daemon (wrapper for terminal-lifecycle module)
 async function reconnectTerminals() {
-  console.log("[reconnectTerminals] Querying daemon for active terminals...");
-
-  try {
-    // Get list of active terminals from daemon
-    interface DaemonTerminalInfo {
-      id: string;
-      name: string;
-      tmux_session: string;
-      working_dir: string | null;
-      created_at: number;
-    }
-
-    const daemonTerminals = await invoke<DaemonTerminalInfo[]>("list_terminals");
-    console.log(`[reconnectTerminals] Found ${daemonTerminals.length} active daemon terminals`);
-
-    // Create a set of active terminal IDs for quick lookup
-    const activeTerminalIds = new Set(daemonTerminals.map((t) => t.id));
-
-    // Get all agents from state
-    const agents = state.getTerminals();
-    console.log(`[reconnectTerminals] Config has ${agents.length} agents`);
-
-    let reconnectedCount = 0;
-    let missingCount = 0;
-
-    // For each agent in config, check if daemon has it
-    for (const agent of agents) {
-      // Check if agent has placeholder ID (shouldn't happen after proper initialization)
-      if (agent.id === "__unassigned__") {
-        console.log(
-          `[reconnectTerminals] Agent ${agent.name} has placeholder ID, skipping (already in error state)`
-        );
-
-        // Don't call state.updateTerminal() here - it triggers infinite render loop
-        // The terminal already shows as missing because check_session_health will fail for "__unassigned__"
-        missingCount++;
-        continue;
-      }
-
-      if (activeTerminalIds.has(agent.id)) {
-        console.log(`[reconnectTerminals] Reconnecting agent ${agent.name} (${agent.id})`);
-
-        // Clear any error state from previous connection issues (use configId for state)
-        if (agent.missingSession) {
-          state.updateTerminal(agent.id, {
-            status: TerminalStatus.Idle,
-            missingSession: undefined,
-          });
-        }
-
-        // Initialize xterm for this terminal (will fetch full history)
-        // Only initialize if this is the primary terminal to avoid creating too many instances
-        if (agent.isPrimary) {
-          initializeTerminalDisplay(agent.id);
-        }
-
-        reconnectedCount++;
-      } else {
-        console.log(
-          `[reconnectTerminals] Agent ${agent.name} (${agent.id}) not found in daemon, marking as missing`
-        );
-
-        // Mark terminal as having missing session so user can see it needs recovery (use configId for state)
-        state.updateTerminal(agent.id, {
-          status: TerminalStatus.Error,
-          missingSession: true,
-        });
-
-        missingCount++;
-      }
-    }
-
-    console.log(
-      `[reconnectTerminals] Reconnection complete: ${reconnectedCount} reconnected, ${missingCount} missing`
-    );
-
-    // If we reconnected at least some terminals, save the updated state
-    if (reconnectedCount > 0) {
-      await saveCurrentConfig();
-    }
-  } catch (error) {
-    console.error("[reconnectTerminals] Failed to reconnect terminals:", error);
-    // Non-fatal - workspace is still loaded
-    alert(
-      `Warning: Could not reconnect to daemon terminals.\n\n` +
-        `Error: ${error}\n\n` +
-        `Terminals may need to be recreated. Check Help → Daemon Status for more info.`
-    );
-  }
+  await reconnectTerminalsCore({
+    state,
+    initializeTerminalDisplay,
+    saveCurrentConfig,
+  });
 }
 
-// Handle manual workspace path entry
+// Handle manual workspace path entry (wrapper for workspace-lifecycle module)
 async function handleWorkspacePathInput(path: string) {
-  console.log("[handleWorkspacePathInput] input path:", path);
-
-  // Expand tilde if present
-  const expandedPath = await expandTildePath(path);
-  console.log("[handleWorkspacePathInput] expanded path:", expandedPath);
-
-  // Always update displayed workspace so bad paths are visible with error message
-  state.setDisplayedWorkspace(expandedPath);
-  console.log("[handleWorkspacePathInput] set displayedWorkspace, triggering render...");
-
-  const isValid = await validateWorkspacePath(expandedPath);
-  console.log("[handleWorkspacePathInput] isValid:", isValid);
-
-  if (!isValid) {
-    console.log("[handleWorkspacePathInput] invalid path, stopping");
-    return;
-  }
-
-  // Check if Loom is initialized in this workspace
-  try {
-    const isInitialized = await invoke<boolean>("check_loom_initialized", { path: expandedPath });
-    console.log("[handleWorkspacePathInput] isInitialized:", isInitialized);
-
-    if (!isInitialized) {
-      // Ask user to confirm initialization with detailed information
-      const confirmed = await ask(
-        `This will create:\n\n` +
-          `📁 .loom/ directory with:\n` +
-          `  • config.json - Terminal configuration\n` +
-          `  • roles/ - Agent role definitions\n\n` +
-          `🤖 6 Default Terminals:\n` +
-          `  • Shell - Plain shell (primary)\n` +
-          `  • Architect - Claude Code worker\n` +
-          `  • Curator - Claude Code worker\n` +
-          `  • Reviewer - Claude Code worker\n` +
-          `  • Worker 1 - Claude Code worker\n` +
-          `  • Worker 2 - Claude Code worker\n\n` +
-          `📝 .loom/ will be added to .gitignore\n\n` +
-          `Continue?`,
-        {
-          title: "Initialize Loom in this workspace?",
-          type: "info",
-        }
-      );
-
-      if (!confirmed) {
-        console.log("[handleWorkspacePathInput] user cancelled initialization");
-        return;
-      }
-
-      // Initialize workspace using reset_workspace_to_defaults
-      try {
-        await invoke("reset_workspace_to_defaults", {
-          workspacePath: expandedPath,
-          defaultsPath: "defaults",
-        });
-        console.log("[handleWorkspacePathInput] Workspace initialized");
-      } catch (error) {
-        console.error("Failed to initialize workspace:", error);
-        alert(`Failed to initialize workspace: ${error}`);
-        return;
-      }
-
-      // After initialization, create terminals for the default config
-      setConfigWorkspace(expandedPath);
-      const config = await loadWorkspaceConfig();
-      state.setNextTerminalNumber(config.nextAgentNumber);
-
-      if (config.agents && config.agents.length > 0) {
-        console.log("[handleWorkspacePathInput] Creating terminals for fresh workspace");
-
-        // Create terminal sessions for each agent in the config
-        for (const agent of config.agents) {
-          try {
-            // Get instance number
-            const instanceNumber = state.getNextTerminalNumber();
-
-            // Create terminal in daemon
-            const terminalId = await invoke<string>("create_terminal", {
-              configId: agent.id,
-              name: agent.name,
-              workingDir: expandedPath,
-              role: agent.role || "default",
-              instanceNumber,
-            });
-
-            // Update agent ID to match the newly created terminal
-            agent.id = terminalId;
-            console.log(
-              `[handleWorkspacePathInput] Created terminal ${agent.name} (${terminalId})`
-            );
-          } catch (error) {
-            console.error(
-              `[handleWorkspacePathInput] Failed to create terminal ${agent.name}:`,
-              error
-            );
-            alert(`Failed to create terminal ${agent.name}: ${error}`);
-          }
-        }
-
-        // Load agents into state with their new IDs
-        state.loadAgents(config.agents);
-
-        // Launch agents for terminals with role configs
-        await launchAgentsForTerminals(expandedPath, config.agents);
-
-        // Save the updated config with real terminal IDs (including worktree paths)
-        const terminalsToSave = state.getTerminals();
-        const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminalsToSave);
-        await saveConfig({ terminals: terminalConfigs });
-        await saveState({
-          nextAgentNumber: state.getCurrentTerminalNumber(),
-          terminals: terminalStates,
-        });
-        console.log("[handleWorkspacePathInput] Saved config with real terminal IDs");
-      }
-    } else {
-      // Workspace already initialized - load existing config
-      setConfigWorkspace(expandedPath);
-      const config = await loadWorkspaceConfig();
-      state.setNextTerminalNumber(config.nextAgentNumber);
-
-      // Load agents from config
-      if (config.agents && config.agents.length > 0) {
-        console.log(
-          `[handleWorkspacePathInput] Config agents before session creation:`,
-          config.agents.map((a) => `${a.name}=${a.id}`)
-        );
-
-        // IMPORTANT: Create sessions for migrated terminals with placeholder IDs
-        // After migration, terminals have configId but id="__needs_session__"
-        let createdSessionCount = 0;
-        for (const agent of config.agents) {
-          if (agent.id === "__needs_session__") {
-            try {
-              // Get instance number
-              const instanceNumber = state.getNextTerminalNumber();
-
-              console.log(
-                `[handleWorkspacePathInput] Creating session for migrated terminal "${agent.name}" (${agent.id})`
-              );
-
-              // Create terminal session in daemon
-              const sessionId = await invoke<string>("create_terminal", {
-                configId: agent.id,
-                name: agent.name,
-                workingDir: expandedPath,
-                role: agent.role || "default",
-                instanceNumber,
-              });
-
-              // Update agent with real session ID (keep configId stable)
-              agent.id = sessionId;
-              createdSessionCount++;
-
-              console.log(
-                `[handleWorkspacePathInput] ✓ Created session for ${agent.name}: ${sessionId}`
-              );
-            } catch (error) {
-              console.error(
-                `[handleWorkspacePathInput] Failed to create session for ${agent.name}:`,
-                error
-              );
-              // Keep placeholder ID - terminal will show as missing session
-              // User can use recovery options
-            }
-          }
-        }
-
-        if (createdSessionCount > 0) {
-          console.log(
-            `[handleWorkspacePathInput] Created ${createdSessionCount} sessions for migrated terminals`
-          );
-        }
-
-        // Now load agents into state with their session IDs
-        console.log(
-          `[handleWorkspacePathInput] Config agents before loadAgents:`,
-          config.agents.map((a) => `${a.name}=${a.id}`)
-        );
-        state.loadAgents(config.agents);
-        console.log(
-          `[handleWorkspacePathInput] State after loadAgents:`,
-          state.getTerminals().map((a) => `${a.name}=${a.id}`)
-        );
-
-        // If we created sessions, save the updated config with real IDs
-        if (createdSessionCount > 0) {
-          const terminalsToSave = state.getTerminals();
-          const { config: terminalConfigs, state: terminalStates } =
-            splitTerminals(terminalsToSave);
-          await saveConfig({ terminals: terminalConfigs });
-          await saveState({
-            nextAgentNumber: state.getCurrentTerminalNumber(),
-            terminals: terminalStates,
-          });
-          console.log(
-            `[handleWorkspacePathInput] Saved config with ${createdSessionCount} new session IDs`
-          );
-        }
-
-        // Reconnect agents to existing daemon terminals
-        await reconnectTerminals();
-
-        // Verify terminal sessions health to clear any stale flags
-        await verifyTerminalSessions();
-      }
-    }
-
-    // Start autonomous mode for eligible terminals
-    const { getAutonomousManager } = await import("./lib/autonomous-manager");
-    const autonomousManager = getAutonomousManager();
-    autonomousManager.startAllAutonomous(state);
-    console.log("[handleWorkspacePathInput] Started autonomous agents");
-
-    // Now set workspace as active
-    state.setWorkspace(expandedPath);
-    console.log("[handleWorkspacePathInput] workspace fully loaded");
-
-    // Store workspace path for next app launch
-    try {
-      await invoke("set_stored_workspace", { path: expandedPath });
-      console.log("[handleWorkspacePathInput] workspace path stored");
-    } catch (error) {
-      console.error("Failed to store workspace path:", error);
-      // Non-fatal - workspace is still loaded
-    }
-  } catch (error) {
-    console.error("Error handling workspace:", error);
-    alert(`Error: ${error}`);
-  }
+  await handleWorkspacePathInputCore(path, {
+    state,
+    validateWorkspacePath,
+    launchAgentsForTerminals,
+    reconnectTerminals,
+    verifyTerminalSessions,
+  });
 }
 
 // Terminal action handlers are now in src/lib/terminal-actions.ts
@@ -1620,54 +1157,24 @@ function setupEventListeners() {
         return;
       }
 
-      // Recovery - Create new session
-      const recoverNewBtn = target.closest("#recover-new-session-btn");
-      if (recoverNewBtn) {
+      // Note: Manual recovery buttons removed - app now auto-recovers missing sessions
+
+      // Health Check - Check Now button
+      const checkNowBtn = target.closest("#check-now-btn");
+      if (checkNowBtn) {
         e.stopPropagation();
-        const id = recoverNewBtn.getAttribute("data-terminal-id");
+        const id = checkNowBtn.getAttribute("data-terminal-id");
         if (id) {
-          handleRecoverNewSession(id, {
-            state,
-            generateNextConfigId,
-            saveCurrentConfig,
-          });
-        }
-        return;
-      }
-
-      // Recovery - Attach to existing session
-      const recoverAttachBtn = target.closest("#recover-attach-session-btn");
-      if (recoverAttachBtn) {
-        e.stopPropagation();
-        const id = recoverAttachBtn.getAttribute("data-terminal-id");
-        if (id) {
-          handleRecoverAttachSession(id, state);
-        }
-        return;
-      }
-
-      // Recovery - Attach to specific session
-      const attachSessionItem = target.closest(".attach-session-item");
-      if (attachSessionItem) {
-        e.stopPropagation();
-        const id = attachSessionItem.getAttribute("data-terminal-id");
-        const sessionName = attachSessionItem.getAttribute("data-session-name");
-        if (id && sessionName) {
-          handleAttachToSession(id, sessionName, {
-            state,
-            saveCurrentConfig,
-          });
-        }
-        return;
-      }
-
-      // Recovery - Kill session
-      const killSessionBtn = target.closest(".kill-session-btn");
-      if (killSessionBtn) {
-        e.stopPropagation();
-        const sessionName = killSessionBtn.getAttribute("data-session-name");
-        if (sessionName) {
-          handleKillSession(sessionName, state);
+          console.log(`[check-now-btn] Triggering immediate health check for terminal ${id}`);
+          // Trigger immediate health check
+          healthMonitor
+            .performHealthCheck()
+            .then(() => {
+              console.log(`[check-now-btn] Health check complete for terminal ${id}`);
+            })
+            .catch((error: unknown) => {
+              console.error(`[check-now-btn] Health check failed:`, error);
+            });
         }
         return;
       }
@@ -1809,110 +1316,8 @@ function setupEventListeners() {
       }
     });
 
-    // HTML5 drag events for visual feedback
-    miniRow.addEventListener("dragstart", (e) => {
-      const target = e.target as HTMLElement;
-      const card = target.closest(".terminal-card") as HTMLElement;
-
-      if (card) {
-        isDragging = true;
-        draggedConfigId = card.getAttribute("data-terminal-id"); // Will be configId after Phase 3
-        card.classList.add("dragging");
-
-        if (e.dataTransfer) {
-          e.dataTransfer.effectAllowed = "move";
-          e.dataTransfer.setData("text/html", card.innerHTML);
-        }
-      }
-    });
-
-    miniRow.addEventListener("dragend", (e) => {
-      // Perform reorder if valid (uses configId for state operation)
-      if (draggedConfigId && dropTargetConfigId && dropTargetConfigId !== draggedConfigId) {
-        state.reorderTerminal(draggedConfigId, dropTargetConfigId, dropInsertBefore);
-        saveCurrentConfig();
-      }
-
-      // Select the terminal that was dragged (uses configId for state operation)
-      if (draggedConfigId) {
-        state.setPrimary(draggedConfigId);
-      }
-
-      // Cleanup
-      const target = e.target as HTMLElement;
-      const card = target.closest(".terminal-card");
-      if (card) {
-        card.classList.remove("dragging");
-      }
-
-      document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
-      draggedConfigId = null;
-      dropTargetConfigId = null;
-      dropInsertBefore = false;
-      isDragging = false;
-    });
-
-    // dragover for tracking position and showing indicator
-    miniRow.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      if (e.dataTransfer) {
-        e.dataTransfer.dropEffect = "move";
-      }
-
-      if (!isDragging || !draggedConfigId) return;
-
-      const target = e.target as HTMLElement;
-      const card = target.closest(".terminal-card") as HTMLElement;
-
-      if (card && card.getAttribute("data-terminal-id") !== draggedConfigId) {
-        const targetId = card.getAttribute("data-terminal-id"); // Will be configId after Phase 3
-
-        // Remove old indicators
-        document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
-
-        // Calculate if we should insert before or after
-        const rect = card.getBoundingClientRect();
-        const midpoint = rect.left + rect.width / 2;
-        const insertBefore = e.clientX < midpoint;
-
-        // Store drop target info (configId)
-        dropTargetConfigId = targetId;
-        dropInsertBefore = insertBefore;
-
-        // Create and position insertion indicator - insert at wrapper level
-        const wrapper = card.parentElement;
-        const indicator = document.createElement("div");
-        indicator.className =
-          "w-1 h-32 my-1 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
-        wrapper?.parentElement?.insertBefore(
-          indicator,
-          insertBefore ? wrapper : wrapper.nextSibling
-        );
-      } else if (!card) {
-        // In empty space - find all cards and determine position
-        const allCards = Array.from(miniRow.querySelectorAll(".terminal-card")) as HTMLElement[];
-        const lastCard = allCards[allCards.length - 1];
-
-        if (lastCard && !lastCard.classList.contains("dragging")) {
-          const lastId = lastCard.getAttribute("data-terminal-id"); // Will be configId after Phase 3
-          if (lastId && lastId !== draggedConfigId) {
-            // Remove old indicators
-            document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
-
-            // Drop after the last card
-            dropTargetConfigId = lastId;
-            dropInsertBefore = false;
-
-            // Create and position insertion indicator after last card - insert at wrapper level
-            const wrapper = lastCard.parentElement;
-            const indicator = document.createElement("div");
-            indicator.className =
-              "w-1 h-32 my-1 bg-blue-500 rounded flex-shrink-0 pointer-events-none animate-pulse";
-            wrapper?.parentElement?.insertBefore(indicator, wrapper?.nextSibling || null);
-          }
-        }
-      }
-    });
+    // Set up drag-and-drop handlers (extracted to drag-drop-manager.ts)
+    setupDragAndDrop(miniRow, state, saveCurrentConfig);
   }
 }
 

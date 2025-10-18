@@ -169,21 +169,26 @@ If MCP servers are not available, you can still test manually using:
 
 ### Phase 2: Build and Launch
 
-**Goal**: Start Loom with a fresh build in preview mode attached to workspace
+**Goal**: Start Loom with a fresh build attached to the current workspace
 
 **Steps**:
 
 1. **Build and Launch with Workspace Argument** (Recommended)
    ```bash
-   # Run full build and launch with workspace argument
+   # Run full build and launch with workspace attachment
    pnpm test:factory-reset
+
+   # Alternative: Use app:preview (same as test:factory-reset)
+   pnpm app:preview
    ```
 
-   This script:
-   - Builds the frontend (TypeScript + Vite)
-   - Builds the Tauri debug bundle
-   - Starts daemon with 5-second initialization wait
-   - Launches app attached to current directory as workspace
+   Both scripts:
+   - Build the frontend (TypeScript + Vite)
+   - Build the Tauri debug bundle
+   - Start daemon with 5-second initialization wait
+   - Launch app attached to current directory as workspace
+
+   **Note**: The `--workspace` argument is automatically added by these scripts, ensuring Loom attaches to the current directory. This is critical for reliable terminal setup.
 
 2. **Alternative: Manual Launch with Workspace**
    ```bash
@@ -197,7 +202,7 @@ If MCP servers are not available, you can still test manually using:
    sleep 5
 
    # Launch with workspace argument
-   ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom --workspace $(pwd)
+   ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom --workspace "$(pwd)"
    ```
 
 3. **Monitor Startup Logs** (via MCP)
@@ -213,14 +218,17 @@ If MCP servers are not available, you can still test manually using:
    ```
 
 3. **Wait for App Launch**
-   - **Expected**: App window appears
-   - **Expected**: Daemon starts automatically (spawned by Tauri)
+   - **Expected**: App window appears within 10 seconds
+   - **Expected**: Daemon starts automatically with 5-second initialization delay
    - **Expected**: Socket file created at `/tmp/loom-daemon.sock`
+   - **Expected**: Workspace automatically selected (displays current directory path)
 
 **Success Criteria**:
 - ✅ App window visible
+- ✅ Workspace attached to current directory
 - ✅ Daemon process running (check with `ps aux | grep loom-daemon`)
 - ✅ Socket file exists: `/tmp/loom-daemon.sock`
+- ✅ No "workspace not selected" errors in UI
 - ✅ No error messages in logs
 
 ### Phase 3: Workspace Startup & Agent Launch
@@ -379,6 +387,33 @@ If MCP servers are not available, you can still test manually using:
 - ✅ No errors or warnings in logs
 
 ## Common Issues & Debugging
+
+### Issue: App launches without workspace attached
+
+**Symptom**: Loom window shows "Select a workspace" despite being in a git repository
+
+**Root Cause**: App launched without `--workspace` argument
+
+**Debug Steps**:
+```bash
+# Check if app was launched with workspace argument
+ps aux | grep Loom | grep workspace || echo "⚠ WARNING: No workspace argument"
+
+# Check console logs for workspace selection
+mcp__loom-ui__read_console_log | grep workspace
+```
+
+**Fix**: Always use the provided pnpm scripts that include workspace argument:
+```bash
+# Use these scripts (they include --workspace argument)
+pnpm test:factory-reset
+pnpm app:preview
+
+# DON'T launch directly without workspace:
+# ❌ ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom
+```
+
+**Impact**: Without workspace attachment, terminals will fail to create or will be created in the wrong directory, causing unreliable agent setup.
 
 ### Issue: "duplicate session" errors
 
