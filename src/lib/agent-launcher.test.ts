@@ -16,27 +16,26 @@ vi.mock("@tauri-apps/api/tauri", () => ({
   invoke: vi.fn(),
 }));
 
-// Mock terminal-probe module
-vi.mock("./terminal-probe", () => ({
-  generateProbeCommand: vi.fn(() => "# probe command"),
-  parseProbeResponse: vi.fn((output: string) => {
-    if (output.includes("AGENT_TYPE")) {
-      return {
-        type: "agent" as const,
-        role: "worker",
-        task: "implementing feature",
-        raw: output,
-      };
-    }
-    if (output.includes("$ ")) {
-      return { type: "shell" as const, role: null, task: null, raw: output };
-    }
-    return { type: "unknown" as const, role: null, task: null, raw: output };
-  }),
+// Mock terminal-state-parser module
+vi.mock("./terminal-state-parser", () => ({
+  detectTerminalState: vi.fn(async () => ({
+    type: "claude-code" as const,
+    status: "waiting-input" as const,
+    lastPrompt: "⏺ Ready",
+    raw: "⏺ Ready",
+  })),
+  getLastLines: vi.fn(async () => "⏺ Ready"),
+  readTerminalOutput: vi.fn(async () => "⏺ Ready"),
+  parseTerminalState: vi.fn(() => ({
+    type: "claude-code" as const,
+    status: "waiting-input" as const,
+    lastPrompt: "⏺ Ready",
+    raw: "⏺ Ready",
+  })),
 }));
 
 import { invoke } from "@tauri-apps/api/tauri";
-import { generateProbeCommand, parseProbeResponse } from "./terminal-probe";
+import { detectTerminalState } from "./terminal-state-parser";
 
 describe("agent-launcher", () => {
   beforeEach(() => {
@@ -52,89 +51,51 @@ describe("agent-launcher", () => {
   });
 
   describe("detectTerminalType", () => {
-    it("sends probe command and waits for response", async () => {
-      vi.mocked(invoke).mockResolvedValue("AGENT_TYPE: worker\nTASK: implementing feature");
-
-      const promise = detectTerminalType("terminal-1");
-
-      // Fast-forward timers
-      await vi.runAllTimersAsync();
-
-      const result = await promise;
-
-      expect(invoke).toHaveBeenCalledWith("send_terminal_input", {
-        id: "terminal-1",
-        data: "# probe command\n",
+    it("uses passive detection to read terminal state", async () => {
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "claude-code",
+        status: "waiting-input",
+        lastPrompt: "⏺ Ready",
+        raw: "⏺ Ready",
       });
 
-      expect(invoke).toHaveBeenCalledWith("read_terminal_output", {
-        id: "terminal-1",
-        lines: 10,
+      const result = await detectTerminalType("terminal-1");
+
+      expect(detectTerminalState).toHaveBeenCalledWith("terminal-1", 20);
+      expect(result.type).toBe("claude-code");
+      expect(result.status).toBe("waiting-input");
+    });
+
+    it("uses custom line count", async () => {
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "shell",
+        status: "idle",
+        raw: "$ ",
       });
 
-      expect(result.type).toBe("agent");
-      expect(result.role).toBe("worker");
-    });
+      const result = await detectTerminalType("terminal-1", 50);
 
-    it("uses custom wait time", async () => {
-      vi.mocked(invoke).mockResolvedValue("");
-
-      // Start the promise - this creates the timer
-      const promise = detectTerminalType("terminal-1", 2000);
-
-      // Wait for the promise microtask to complete, creating timers
-      await Promise.resolve();
-
-      // Now check timer count
-      const timerCount = vi.getTimerCount();
-      expect(timerCount).toBeGreaterThanOrEqual(1);
-
-      await vi.runAllTimersAsync();
-      await promise;
-    });
-
-    it("handles read output errors gracefully", async () => {
-      vi.mocked(invoke)
-        .mockResolvedValueOnce(undefined) // send_terminal_input
-        .mockRejectedValueOnce(new Error("Failed to read"));
-
-      const promise = detectTerminalType("terminal-1");
-      await vi.runAllTimersAsync();
-      const result = await promise;
-
-      // Should return unknown type on error
-      expect(result.type).toBe("unknown");
-    });
-
-    it("detects shell type", async () => {
-      vi.mocked(invoke).mockResolvedValue("$ ls\nfile1.txt file2.txt");
-
-      const promise = detectTerminalType("terminal-1");
-      await vi.runAllTimersAsync();
-      const result = await promise;
-
+      expect(detectTerminalState).toHaveBeenCalledWith("terminal-1", 50);
       expect(result.type).toBe("shell");
     });
 
-    it("generates probe command correctly", async () => {
-      vi.mocked(invoke).mockResolvedValue("");
+    it("handles detection errors gracefully", async () => {
+      vi.mocked(detectTerminalState).mockRejectedValue(new Error("Detection failed"));
 
-      const promise = detectTerminalType("terminal-1");
-      await vi.runAllTimersAsync();
-      await promise;
-
-      expect(generateProbeCommand).toHaveBeenCalled();
+      await expect(detectTerminalType("terminal-1")).rejects.toThrow("Detection failed");
     });
 
-    it("parses probe response correctly", async () => {
-      const mockOutput = "AGENT_TYPE: worker";
-      vi.mocked(invoke).mockResolvedValue(mockOutput);
+    it("detects shell type", async () => {
+      vi.mocked(detectTerminalState).mockResolvedValue({
+        type: "shell",
+        status: "idle",
+        raw: "$ ",
+      });
 
-      const promise = detectTerminalType("terminal-1");
-      await vi.runAllTimersAsync();
-      await promise;
+      const result = await detectTerminalType("terminal-1");
 
-      expect(parseProbeResponse).toHaveBeenCalledWith(mockOutput);
+      expect(result.type).toBe("shell");
+      expect(result.status).toBe("idle");
     });
   });
 

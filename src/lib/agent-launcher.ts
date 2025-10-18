@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
-import { generateProbeCommand, type ProbeResponse, parseProbeResponse } from "./terminal-probe";
+import { detectTerminalState, getLastLines, type TerminalState } from "./terminal-state-parser";
 
 const logger = Logger.forComponent("agent-launcher");
 
@@ -13,58 +13,40 @@ const logger = Logger.forComponent("agent-launcher");
  */
 
 /**
- * Detect what type of process is running in a terminal
+ * Detect what type of process is running in a terminal (passive detection)
  *
- * Sends an intelligent probe command that works in both bash shells and AI agent sessions.
- * The probe uses bash comments that agents interpret as prompts, while shells ignore them.
+ * Uses passive detection by reading and parsing terminal output instead of
+ * sending probe commands. This approach is:
+ * - Non-intrusive: No commands sent to terminal
+ * - Real-time: Can detect state immediately
+ * - More informative: Can detect multiple states (working, paused, waiting, etc.)
  *
  * This is useful for:
  * - Verifying an agent was launched successfully
- * - Detecting agent role and current task
+ * - Detecting bypass permissions prompt
  * - Distinguishing between shells and agents
  * - Debugging agent launch issues
  *
- * @param terminalId - The terminal ID to probe
- * @param waitMs - How long to wait for response (default: 1000ms)
- * @returns Promise resolving to the probe response with detected type and metadata
+ * @param terminalId - The terminal ID to check
+ * @param lineCount - Number of lines to analyze (default: 20)
+ * @returns Promise resolving to the terminal state with detected type and status
  */
 export async function detectTerminalType(
   terminalId: string,
-  waitMs = 1000
-): Promise<ProbeResponse> {
-  logger.info("Sending terminal probe", { terminalId, waitMs });
+  lineCount = 20
+): Promise<TerminalState> {
+  logger.info("Detecting terminal type with passive parsing", { terminalId, lineCount });
 
-  // Generate and send the probe command
-  const probe = generateProbeCommand();
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: `${probe}\n`,
-  });
+  const state = await detectTerminalState(terminalId, lineCount);
 
-  // Wait for response
-  logger.info("Waiting for probe response", { terminalId, waitMs });
-  await new Promise((resolve) => setTimeout(resolve, waitMs));
-
-  // Read terminal output (try to get recent lines)
-  const output = await invoke<string>("read_terminal_output", {
-    id: terminalId,
-    lines: 10,
-  }).catch((error) => {
-    logger.error("Failed to read terminal output for probe", error, { terminalId });
-    return ""; // Empty output on error
-  });
-
-  // Parse the response
-  const result = parseProbeResponse(output);
-  logger.info("Terminal probe complete", {
+  logger.info("Terminal type detection complete", {
     terminalId,
-    detectedType: result.type,
-    role: result.role,
-    task: result.task,
-    outputLength: output.length,
+    type: state.type,
+    status: state.status,
+    hasPrompt: !!state.lastPrompt,
   });
 
-  return result;
+  return state;
 }
 
 /**
@@ -146,48 +128,63 @@ export async function launchAgentInTerminal(
     data: "\r",
   });
 
-  // Add initial delay to allow Claude Code to start
-  // This prevents the "2" from concatenating with the previous command
-  logger.info("Initial wait for Claude Code to start", { terminalId, delayMs: 1000 });
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Poll for bypass permissions prompt using passive detection
+  // Instead of blindly sending "2", detect the prompt first, then respond
+  const maxAttempts = 10; // Max polling attempts
+  const pollInterval = 1000; // Check every 1 second
+  let bypassAccepted = false;
 
-  // Retry accepting the bypass permissions warning with exponential backoff
-  // Claude Code initialization time varies, so we try multiple times with increasing delays
-  const maxRetries = 3;
-  const baseDelay = 2000; // Base delay: 2 seconds
+  logger.info("Polling for bypass permissions prompt", { terminalId, maxAttempts, pollInterval });
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const delay = baseDelay * attempt; // Exponential backoff: 2s, 4s, 6s
-    logger.info("Waiting for bypass permissions prompt", {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, pollInterval));
+
+    // Check terminal state using passive detection
+    const state = await detectTerminalType(terminalId, 10);
+
+    logger.info("Bypass polling attempt", {
       terminalId,
       attempt,
-      maxRetries,
-      delayMs: delay,
-    });
-    await new Promise((resolve) => setTimeout(resolve, delay));
-
-    // Accept the bypass permissions warning by selecting option 2
-    logger.info("Sending acceptance input for bypass permissions", { terminalId, attempt });
-    await invoke("send_terminal_input", {
-      id: terminalId,
-      data: "2",
+      detectedType: state.type,
+      detectedStatus: state.status,
     });
 
-    // Small delay before pressing Enter to ensure "2" is processed
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (state.status === "bypass-prompt") {
+      // Bypass prompt detected - send "2" to accept
+      logger.info("Bypass prompt detected, accepting", { terminalId, attempt });
 
-    // Press Enter to confirm selection
-    logger.info("Sending Enter to confirm bypass permissions", { terminalId, attempt });
-    await invoke("send_terminal_input", {
-      id: terminalId,
-      data: "\r",
-    });
+      await invoke("send_terminal_input", {
+        id: terminalId,
+        data: "2",
+      });
 
-    // If this isn't the last attempt, wait a bit before retrying
-    if (attempt < maxRetries) {
-      logger.info("Waiting before retry", { terminalId, delayMs: 500 });
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      // Small delay before Enter
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      await invoke("send_terminal_input", {
+        id: terminalId,
+        data: "\r",
+      });
+
+      bypassAccepted = true;
+      logger.info("Bypass permissions accepted", { terminalId });
+      break;
+    } else if (state.status === "waiting-input") {
+      // Agent already ready, no bypass prompt needed
+      logger.info("Agent already ready, skipping bypass", { terminalId, attempt });
+      bypassAccepted = true;
+      break;
     }
+
+    // Continue polling
+  }
+
+  if (!bypassAccepted) {
+    logger.error(
+      "Bypass permissions prompt not detected within timeout",
+      new Error("Timeout waiting for bypass prompt"),
+      { terminalId, maxAttempts }
+    );
   }
 
   // Wait for Claude Code to be ready to receive input
@@ -215,27 +212,27 @@ export async function launchAgentInTerminal(
   logger.info("Waiting for agent to process role prompt", { terminalId, delayMs: 2000 });
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
-  // Verify agent launched successfully using terminal probe
-  logger.info("Verifying agent launch with terminal probe", { terminalId });
-  const probeResult = await detectTerminalType(terminalId, 1500);
+  // Verify agent launched successfully using passive detection
+  logger.info("Verifying agent launch with passive detection", { terminalId });
+  const state = await detectTerminalType(terminalId, 20);
 
-  if (probeResult.type === "agent") {
+  if (state.type === "claude-code" && state.status === "waiting-input") {
     logger.info("Agent launch verified successfully", {
       terminalId,
-      role: probeResult.role,
-      task: probeResult.task,
+      type: state.type,
+      status: state.status,
     });
-  } else if (probeResult.type === "shell") {
+  } else if (state.type === "shell") {
     logger.error(
       "Agent launch verification failed: detected shell instead of agent",
       new Error("Shell detected after agent launch"),
-      { terminalId, probeOutput: probeResult.raw }
+      { terminalId, detectedState: state }
     );
   } else {
     logger.error(
-      "Agent launch verification inconclusive: unknown terminal type",
-      new Error("Unknown terminal type detected"),
-      { terminalId, probeOutput: probeResult.raw }
+      "Agent launch verification inconclusive: unexpected state",
+      new Error("Unexpected terminal state detected"),
+      { terminalId, type: state.type, status: state.status }
     );
   }
 
@@ -473,27 +470,27 @@ export async function launchCodexAgent(
   logger.info("Waiting for Codex agent to initialize", { terminalId, delayMs: 2000 });
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
-  // Verify agent launched successfully using terminal probe
-  logger.info("Verifying Codex agent launch with terminal probe", { terminalId });
-  const probeResult = await detectTerminalType(terminalId, 1500);
+  // Verify agent launched successfully using passive detection
+  logger.info("Verifying Codex agent launch with passive detection", { terminalId });
+  const state = await detectTerminalType(terminalId, 20);
 
-  if (probeResult.type === "agent") {
+  if (state.type === "codex") {
     logger.info("Codex agent launch verified successfully", {
       terminalId,
-      role: probeResult.role,
-      task: probeResult.task,
+      type: state.type,
+      status: state.status,
     });
-  } else if (probeResult.type === "shell") {
+  } else if (state.type === "shell") {
     logger.error(
       "Codex agent launch verification failed: detected shell instead of agent",
       new Error("Shell detected after Codex launch"),
-      { terminalId, probeOutput: probeResult.raw }
+      { terminalId, detectedState: state }
     );
   } else {
     logger.error(
-      "Codex agent launch verification inconclusive: unknown terminal type",
-      new Error("Unknown terminal type detected after Codex launch"),
-      { terminalId, probeOutput: probeResult.raw }
+      "Codex agent launch verification inconclusive: unexpected state",
+      new Error("Unexpected terminal state detected after Codex launch"),
+      { terminalId, type: state.type, status: state.status }
     );
   }
 
