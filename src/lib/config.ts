@@ -6,72 +6,116 @@ import { TerminalStatus } from "./state";
 const logger = Logger.forComponent("config");
 
 /**
- * Persistent configuration stored in .loom/config.json (committed to git)
- * Contains team-shareable terminal definitions (roles, themes, intervals)
+ * Persistent configuration stored in .loom/config.json (committed to git).
+ * Contains team-shareable terminal definitions (roles, themes, intervals).
+ * This file should be committed to git so all team members share the same terminal setup.
  */
 export interface TerminalConfig {
-  id: string; // Stable terminal ID (e.g., "terminal-1")
-  name: string; // User-assigned terminal name
-  role?: string; // Role type (worker, reviewer, architect, etc.)
-  roleConfig?: Record<string, unknown>; // Role-specific configuration
-  theme?: string; // Theme ID or "default"
-  customTheme?: ColorTheme; // Custom color theme
+  /** Stable terminal ID (e.g., "terminal-1") - persists across restarts */
+  id: string;
+  /** User-assigned terminal name */
+  name: string;
+  /** Optional role type (worker, reviewer, architect, etc.) */
+  role?: string;
+  /** Role-specific configuration (e.g., system prompt, worker type) */
+  roleConfig?: Record<string, unknown>;
+  /** Theme ID (e.g., "ocean", "forest") or "default" */
+  theme?: string;
+  /** Custom color theme configuration */
+  customTheme?: ColorTheme;
 }
 
+/**
+ * Root configuration structure for Loom workspace.
+ * Stored in .loom/config.json and committed to version control.
+ */
 export interface LoomConfig {
+  /** Array of terminal configurations */
   terminals: TerminalConfig[];
 }
 
 /**
- * Ephemeral runtime state stored in .loom/state.json (gitignored)
- * Contains machine-specific terminal sessions and daemon state
+ * Ephemeral runtime state stored in .loom/state.json (gitignored).
+ * Contains machine-specific terminal sessions and daemon state that should NOT be committed.
+ * This file is regenerated on each machine based on actual running processes.
  */
 export interface TerminalState {
-  id: string; // Stable terminal ID (matches config)
-  status: TerminalStatus; // Current runtime status
-  isPrimary: boolean; // Which terminal is currently focused
-  worktreePath?: string; // Active git worktree path
-  agentPid?: number; // Running agent process ID
-  agentStatus?: AgentStatus; // Agent lifecycle state
-  lastIntervalRun?: number; // Last autonomous interval execution (ms)
+  /** Stable terminal ID (matches corresponding TerminalConfig) */
+  id: string;
+  /** Current runtime status of the terminal */
+  status: TerminalStatus;
+  /** Whether this terminal is currently focused in the UI */
+  isPrimary: boolean;
+  /** Active git worktree path (if terminal is working in a worktree) */
+  worktreePath?: string;
+  /** Running agent process ID (if an AI agent is active) */
+  agentPid?: number;
+  /** Agent lifecycle state */
+  agentStatus?: AgentStatus;
+  /** Unix timestamp (ms) of last autonomous interval execution */
+  lastIntervalRun?: number;
+  /** Queue of pending input requests from the agent */
   pendingInputRequests?: Array<{
+    /** Unique request identifier */
     id: string;
+    /** The question or prompt */
     prompt: string;
+    /** Unix timestamp (ms) when requested */
     timestamp: number;
   }>;
-  // Timer tracking fields
-  busyTime?: number; // Total milliseconds spent in busy state
-  idleTime?: number; // Total milliseconds spent in idle state
-  lastStateChange?: number; // Timestamp (ms) of last status change
+  /** Total milliseconds spent in busy state (for analytics) */
+  busyTime?: number;
+  /** Total milliseconds spent in idle state (for analytics) */
+  idleTime?: number;
+  /** Unix timestamp (ms) of last status change */
+  lastStateChange?: number;
 }
 
+/**
+ * Root state structure for Loom workspace.
+ * Stored in .loom/state.json and gitignored (machine-specific).
+ */
 export interface LoomState {
-  daemonPid?: number; // Running daemon process ID
-  nextAgentNumber: number; // Counter for terminal numbering (legacy name for compatibility)
+  /** Running daemon process ID */
+  daemonPid?: number;
+  /** Counter for terminal numbering (name preserved for compatibility) */
+  nextAgentNumber: number;
+  /** Array of terminal runtime states */
   terminals: TerminalState[];
 }
 
 /**
- * Legacy config format (pre-split)
- * Contained both config and state in one file
+ * Legacy config format (pre-split into config/state).
+ * Contained both config and state in one file.
+ * Automatically migrated to new format on first load.
+ *
+ * @deprecated This format is no longer used but supported for migration
  */
 interface LegacyConfig {
+  /** Terminal number counter */
   nextAgentNumber: number;
+  /** Array of terminals with mixed config and state data */
   agents: Array<Terminal & { configId?: string }>;
 }
 
 let cachedWorkspacePath: string | null = null;
 
 /**
- * Set the current workspace path for config/state operations
+ * Sets the current workspace path for config/state operations.
+ * Must be called before any loadConfig/saveConfig/loadState/saveState operations.
+ *
+ * @param workspacePath - Absolute path to the workspace directory
  */
 export function setConfigWorkspace(workspacePath: string): void {
   cachedWorkspacePath = workspacePath;
 }
 
 /**
- * Assert that workspace is configured before file operations
- * Throws descriptive error if workspace is not set
+ * Asserts that workspace is configured before file operations.
+ * Internal helper to ensure setConfigWorkspace() was called before file I/O.
+ *
+ * @returns The configured workspace path
+ * @throws {Error} If workspace is not set (setConfigWorkspace() not called)
  */
 function assertWorkspace(): string {
   if (!cachedWorkspacePath) {
@@ -83,8 +127,14 @@ function assertWorkspace(): string {
 }
 
 /**
- * Migrate legacy config format to new split format
- * Returns both config and state
+ * Migrates legacy config format to new split format.
+ * Handles three cases of legacy IDs:
+ * 1. Dual-ID system (configId field) - uses existing configId
+ * 2. UUID or placeholder IDs - generates stable "terminal-N" ID
+ * 3. Already stable IDs - uses as-is
+ *
+ * @param legacy - The legacy config object containing mixed config/state data
+ * @returns Object with separated config and state structures
  */
 function migrateLegacyConfig(legacy: LegacyConfig): {
   config: LoomConfig;
@@ -160,8 +210,12 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
 }
 
 /**
- * Load config from .loom/config.json
- * Automatically migrates legacy format if needed
+ * Loads configuration from .loom/config.json.
+ * Automatically migrates legacy format if detected (has "agents" field instead of "terminals").
+ * Returns empty config on error.
+ *
+ * @returns The loaded configuration, or empty config if file doesn't exist or is invalid
+ * @throws Never throws - returns empty config on error and logs the error
  */
 export async function loadConfig(): Promise<LoomConfig> {
   const workspacePath = assertWorkspace();
@@ -194,7 +248,12 @@ export async function loadConfig(): Promise<LoomConfig> {
 }
 
 /**
- * Save config to .loom/config.json
+ * Saves configuration to .loom/config.json.
+ * Creates the .loom directory if it doesn't exist.
+ * Formats JSON with 2-space indentation for readability.
+ *
+ * @param config - The configuration to save
+ * @throws Never throws - logs error and continues on failure
  */
 export async function saveConfig(config: LoomConfig): Promise<void> {
   try {
@@ -211,7 +270,11 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
 }
 
 /**
- * Load state from .loom/state.json
+ * Loads runtime state from .loom/state.json.
+ * Returns default state (nextAgentNumber: 1, empty terminals array) on error.
+ *
+ * @returns The loaded state, or default state if file doesn't exist or is invalid
+ * @throws Never throws - returns default state on error and logs the error
  */
 export async function loadState(): Promise<LoomState> {
   try {
@@ -233,8 +296,13 @@ export async function loadState(): Promise<LoomState> {
 }
 
 /**
- * Save state to .loom/state.json
- * Sanitizes runtime-only flags that shouldn't persist across restarts
+ * Saves runtime state to .loom/state.json.
+ * Sanitizes runtime-only flags that shouldn't persist across restarts:
+ * - Removes missingSession flag (re-evaluated on startup)
+ * - Resets error status to idle if it was only due to missing session
+ *
+ * @param state - The state to save
+ * @throws Never throws - logs error and continues on failure
  */
 export async function saveState(state: LoomState): Promise<void> {
   try {
@@ -270,7 +338,13 @@ export async function saveState(state: LoomState): Promise<void> {
 }
 
 /**
- * Merge config and state into full Terminal objects
+ * Merges configuration and state into full Terminal objects.
+ * Combines persistent config (roles, themes) with ephemeral state (status, PIDs).
+ * Uses default values for any missing state fields.
+ *
+ * @param config - The persistent configuration
+ * @param state - The ephemeral runtime state
+ * @returns Object containing merged terminals array and nextAgentNumber counter
  */
 export function mergeConfigAndState(
   config: LoomConfig,
@@ -308,7 +382,12 @@ export function mergeConfigAndState(
 }
 
 /**
- * Split Terminal objects into config and state
+ * Splits Terminal objects into separate config and state arrays.
+ * Separates persistent configuration (roles, themes) from ephemeral state (status, PIDs).
+ * Resets error status to idle before persisting (health monitor will re-detect issues).
+ *
+ * @param terminals - Array of full Terminal objects to split
+ * @returns Object containing separate config and state arrays
  */
 export function splitTerminals(terminals: Terminal[]): {
   config: TerminalConfig[];
@@ -343,9 +422,18 @@ export function splitTerminals(terminals: Terminal[]): {
 }
 
 /**
- * Load both config and state, merge them, and return in legacy format
- * This provides backward compatibility for existing code that expects
- * { nextAgentNumber, agents } structure
+ * Loads both config and state, merges them, and returns in legacy format.
+ * This provides backward compatibility for existing code that expects the
+ * { nextAgentNumber, agents } structure instead of separate config/state.
+ *
+ * @returns Object containing nextAgentNumber counter and merged terminals array (as "agents")
+ *
+ * @example
+ * ```ts
+ * const { nextAgentNumber, agents } = await loadWorkspaceConfig();
+ * state.setNextAgentNumber(nextAgentNumber);
+ * state.loadAgents(agents);
+ * ```
  */
 export async function loadWorkspaceConfig(): Promise<{
   nextAgentNumber: number;
