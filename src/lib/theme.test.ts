@@ -2,17 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getCurrentTheme, initTheme, toggleTheme } from "./theme";
 
 describe("theme", () => {
-  let localStorageGetItemSpy: any;
-  let localStorageSetItemSpy: any;
   let matchMediaMock: any;
 
   beforeEach(() => {
     // Reset document state
     document.documentElement.classList.remove("dark");
 
-    // Spy on localStorage
-    localStorageGetItemSpy = vi.spyOn(Storage.prototype, "getItem");
-    localStorageSetItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    // Clear localStorage
+    localStorage.clear();
 
     // Mock matchMedia
     matchMediaMock = vi.fn();
@@ -21,14 +18,13 @@ describe("theme", () => {
 
   afterEach(() => {
     // Clean up
-    localStorageGetItemSpy.mockRestore();
-    localStorageSetItemSpy.mockRestore();
+    localStorage.clear();
     document.documentElement.classList.remove("dark");
   });
 
   describe("initTheme", () => {
     it("uses stored dark theme from localStorage", () => {
-      localStorageGetItemSpy.mockReturnValue("dark");
+      localStorage.setItem("theme", "dark");
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();
@@ -37,7 +33,7 @@ describe("theme", () => {
     });
 
     it("uses stored light theme from localStorage", () => {
-      localStorageGetItemSpy.mockReturnValue("light");
+      localStorage.setItem("theme", "light");
       matchMediaMock.mockReturnValue({ matches: true }); // Even if system prefers dark
 
       initTheme();
@@ -46,7 +42,7 @@ describe("theme", () => {
     });
 
     it("uses system preference when no stored theme (prefers dark)", () => {
-      localStorageGetItemSpy.mockReturnValue(null);
+      // localStorage is already clear from beforeEach
       matchMediaMock.mockReturnValue({ matches: true });
 
       initTheme();
@@ -55,7 +51,7 @@ describe("theme", () => {
     });
 
     it("uses system preference when no stored theme (prefers light)", () => {
-      localStorageGetItemSpy.mockReturnValue(null);
+      // localStorage is already clear from beforeEach
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();
@@ -64,7 +60,7 @@ describe("theme", () => {
     });
 
     it("defaults to light theme when localStorage is empty string", () => {
-      localStorageGetItemSpy.mockReturnValue("");
+      localStorage.setItem("theme", "");
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();
@@ -80,7 +76,7 @@ describe("theme", () => {
       toggleTheme();
 
       expect(document.documentElement.classList.contains("dark")).toBe(true);
-      expect(localStorageSetItemSpy).toHaveBeenCalledWith("theme", "dark");
+      expect(localStorage.getItem("theme")).toBe("dark");
     });
 
     it("toggles from dark to light", () => {
@@ -89,14 +85,15 @@ describe("theme", () => {
       toggleTheme();
 
       expect(document.documentElement.classList.contains("dark")).toBe(false);
-      expect(localStorageSetItemSpy).toHaveBeenCalledWith("theme", "light");
+      expect(localStorage.getItem("theme")).toBe("light");
     });
 
     it("persists theme to localStorage", () => {
       toggleTheme();
 
-      expect(localStorageSetItemSpy).toHaveBeenCalledOnce();
-      expect(localStorageSetItemSpy).toHaveBeenCalledWith("theme", expect.any(String));
+      const theme = localStorage.getItem("theme");
+      expect(theme).toBeTruthy();
+      expect(["dark", "light"]).toContain(theme);
     });
 
     it("toggles multiple times correctly", () => {
@@ -129,7 +126,7 @@ describe("theme", () => {
 
   describe("integration", () => {
     it("initTheme and getCurrentTheme work together", () => {
-      localStorageGetItemSpy.mockReturnValue("dark");
+      localStorage.setItem("theme", "dark");
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();
@@ -152,7 +149,7 @@ describe("theme", () => {
     });
 
     it("full workflow: init -> toggle -> getCurrentTheme", () => {
-      localStorageGetItemSpy.mockReturnValue("light");
+      localStorage.setItem("theme", "light");
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();

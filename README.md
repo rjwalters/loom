@@ -1,4 +1,7 @@
 # Loom 🧵
+
+[![codecov](https://codecov.io/gh/rjwalters/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/rjwalters/loom)
+
 > *An orchestration of archetypal forces for AI-powered development*
 
 **Multi-terminal workspace where AI agents embody distinct roles—Worker, Curator, Architect, Reviewer, Critic, Fixer—weaving chaos into creation.**

@@ -474,13 +474,21 @@ describe("TerminalManager", () => {
     it("warns when showing non-existent terminal", () => {
       manager.showTerminal("non-existent");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      expect(consoleWarnSpy).toHaveBeenCalled();
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
+      expect(warnCall.level).toBe("WARN");
+      expect(warnCall.message).toBe("Terminal not found");
+      expect(warnCall.context.terminalId).toBe("non-existent");
     });
 
     it("warns when hiding non-existent terminal", () => {
       manager.hideTerminal("non-existent");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      expect(consoleWarnSpy).toHaveBeenCalled();
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
+      expect(warnCall.level).toBe("WARN");
+      expect(warnCall.message).toBe("Terminal not found");
+      expect(warnCall.context.terminalId).toBe("non-existent");
     });
 
     it("hides all terminals", () => {
@@ -512,7 +520,11 @@ describe("TerminalManager", () => {
     it("warns when writing to non-existent terminal", () => {
       manager.writeToTerminal("non-existent", "test");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      expect(consoleWarnSpy).toHaveBeenCalled();
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
+      expect(warnCall.level).toBe("WARN");
+      expect(warnCall.message).toBe("Terminal not found");
+      expect(warnCall.context.terminalId).toBe("non-existent");
       expect(mockTerminalInstance.write).not.toHaveBeenCalled();
     });
 
@@ -529,7 +541,11 @@ describe("TerminalManager", () => {
     it("warns when clearing and writing to non-existent terminal", () => {
       manager.clearAndWriteTerminal("non-existent", "test");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      expect(consoleWarnSpy).toHaveBeenCalled();
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
+      expect(warnCall.level).toBe("WARN");
+      expect(warnCall.message).toBe("Terminal not found");
+      expect(warnCall.context.terminalId).toBe("non-existent");
       expect(mockTerminalInstance.clear).not.toHaveBeenCalled();
     });
 
@@ -544,7 +560,11 @@ describe("TerminalManager", () => {
     it("warns when clearing non-existent terminal", () => {
       manager.clearTerminal("non-existent");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      expect(consoleWarnSpy).toHaveBeenCalled();
+      const warnCall = JSON.parse(consoleWarnSpy.mock.calls[0][0] as string);
+      expect(warnCall.level).toBe("WARN");
+      expect(warnCall.message).toBe("Terminal not found");
+      expect(warnCall.context.terminalId).toBe("non-existent");
     });
   });
 
