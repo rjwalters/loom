@@ -1,12 +1,16 @@
 #!/usr/bin/env node
 
+import { exec } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+
+const execAsync = promisify(exec);
 
 const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(homedir(), ".loom", "loom-daemon.sock");
 const LOOM_DIR = join(homedir(), ".loom");
@@ -148,6 +152,125 @@ async function sendTerminalInput(terminalId: string, input: string): Promise<str
   }
 }
 
+/**
+ * Check tmux server health and count active loom sessions
+ */
+async function checkTmuxServerHealth(): Promise<{
+  serverRunning: boolean;
+  sessionCount: number;
+  sessions: string[];
+  errorMessage?: string;
+}> {
+  try {
+    const { stdout } = await execAsync("tmux -L loom list-sessions -F '#{session_name}'");
+    const sessions = stdout
+      .trim()
+      .split("\n")
+      .filter((s) => s.startsWith("loom-"));
+
+    return {
+      serverRunning: true,
+      sessionCount: sessions.length,
+      sessions,
+    };
+  } catch (error: unknown) {
+    const err = error as { code?: number; stderr?: string };
+    return {
+      serverRunning: false,
+      sessionCount: 0,
+      sessions: [],
+      errorMessage: err.stderr || String(error),
+    };
+  }
+}
+
+/**
+ * Get tmux server information (PID, socket path, version)
+ */
+async function getTmuxServerInfo(): Promise<{
+  serverProcess?: string;
+  socketPath: string;
+  socketExists: boolean;
+  tmuxVersion?: string;
+}> {
+  const uid = process.getuid?.() || 0;
+  const socketPath = `/private/tmp/tmux-${uid}/loom`;
+
+  try {
+    // Check if socket exists
+    const socketExists = await stat(socketPath)
+      .then(() => true)
+      .catch(() => false);
+
+    // Find tmux server process
+    let serverProcess: string | undefined;
+    try {
+      const { stdout } = await execAsync("ps aux | grep 'tmux.*-L loom' | grep -v grep");
+      serverProcess = stdout.trim();
+    } catch {
+      serverProcess = undefined;
+    }
+
+    // Get tmux version
+    let tmuxVersion: string | undefined;
+    try {
+      const { stdout } = await execAsync("tmux -V");
+      tmuxVersion = stdout.trim();
+    } catch {
+      tmuxVersion = undefined;
+    }
+
+    return {
+      serverProcess,
+      socketPath,
+      socketExists,
+      tmuxVersion,
+    };
+  } catch (error) {
+    return {
+      socketPath,
+      socketExists: false,
+      errorMessage: String(error),
+    };
+  }
+}
+
+/**
+ * Toggle tmux verbose logging by sending SIGUSR2 to tmux server
+ */
+async function toggleTmuxVerboseLogging(): Promise<{
+  success: boolean;
+  message: string;
+  pid?: string;
+}> {
+  try {
+    // Find tmux server PID
+    const { stdout } = await execAsync("pgrep -f 'tmux.*-L loom'");
+    const pid = stdout.trim();
+
+    if (!pid) {
+      return {
+        success: false,
+        message: "tmux server not found (no process matching 'tmux.*-L loom')",
+      };
+    }
+
+    // Send SIGUSR2 to toggle logging
+    await execAsync(`kill -SIGUSR2 ${pid}`);
+
+    return {
+      success: true,
+      message: `Sent SIGUSR2 to tmux server (PID ${pid}) - check for tmux-server-${pid}.log`,
+      pid,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Error toggling tmux verbose logging: ${error}`,
+    };
+  }
+}
+
 const server = new Server(
   {
     name: "loom-terminals",
@@ -224,6 +347,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["terminal_id", "input"],
+        },
+      },
+      {
+        name: "check_tmux_server_health",
+        description:
+          "Check if tmux server is running and count active loom sessions. Use this to verify tmux server status and detect crashes.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "get_tmux_server_info",
+        description:
+          "Get tmux server information including PID, socket path, and version. Use this to diagnose tmux server issues and verify socket paths.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "toggle_tmux_verbose_logging",
+        description:
+          "Toggle tmux verbose logging by sending SIGUSR2 to the tmux server. Creates tmux-server-{PID}.log file. Use this for deep debugging of tmux issues.",
+        inputSchema: {
+          type: "object",
+          properties: {},
         },
       },
     ],
@@ -371,6 +521,82 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: result,
+            },
+          ],
+        };
+      }
+
+      case "check_tmux_server_health": {
+        const health = await checkTmuxServerHealth();
+
+        if (!health.serverRunning) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== tmux Server Health ===\n\n🚨 Server Status: NOT RUNNING\n\nError: ${health.errorMessage || "Server not responding"}\n\nThis usually means:\n- tmux server crashed\n- No tmux sessions have been created yet\n- Socket path issue\n\nTo start the server, create a new terminal or run:\n  tmux -L loom new-session -d`,
+              },
+            ],
+          };
+        }
+
+        const sessionList = health.sessions.map((s) => `  - ${s}`).join("\n");
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== tmux Server Health ===\n\n✅ Server Status: RUNNING\nSession Count: ${health.sessionCount}\n\nActive loom sessions:\n${sessionList || "  (none)"}`,
+            },
+          ],
+        };
+      }
+
+      case "get_tmux_server_info": {
+        const info = await getTmuxServerInfo();
+
+        let statusText = `=== tmux Server Information ===\n\n`;
+        statusText += `Socket Path: ${info.socketPath}\n`;
+        statusText += `Socket Exists: ${info.socketExists ? "✅ Yes" : "❌ No"}\n\n`;
+
+        if (info.tmuxVersion) {
+          statusText += `tmux Version: ${info.tmuxVersion}\n\n`;
+        }
+
+        if (info.serverProcess) {
+          statusText += `Server Process:\n${info.serverProcess}\n`;
+        } else {
+          statusText += `Server Process: ❌ Not found (no matching process)\n`;
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: statusText,
+            },
+          ],
+        };
+      }
+
+      case "toggle_tmux_verbose_logging": {
+        const result = await toggleTmuxVerboseLogging();
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Toggle tmux Verbose Logging ===\n\n❌ Failed\n\n${result.message}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Toggle tmux Verbose Logging ===\n\n✅ Success\n\n${result.message}\n\nNote: Verbose logging writes to tmux-server-${result.pid}.log in the current directory where the tmux server was started.`,
             },
           ],
         };
