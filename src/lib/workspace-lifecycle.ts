@@ -1,12 +1,6 @@
 import { ask } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
-import {
-  loadWorkspaceConfig,
-  saveConfig,
-  saveState,
-  setConfigWorkspace,
-  splitTerminals,
-} from "./config";
+import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
@@ -193,13 +187,7 @@ export async function handleWorkspacePathInput(
         await launchAgentsForTerminals(expandedPath, config.agents);
 
         // Save the updated config with real terminal IDs (including worktree paths)
-        const terminalsToSave = state.getTerminals();
-        const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminalsToSave);
-        await saveConfig({ terminals: terminalConfigs });
-        await saveState({
-          nextAgentNumber: state.getCurrentTerminalNumber(),
-          terminals: terminalStates,
-        });
+        await saveCurrentConfiguration(state);
         logger.info("Saved config with real terminal IDs", { workspacePath: expandedPath });
       }
     } else {
@@ -279,14 +267,7 @@ export async function handleWorkspacePathInput(
 
         // If we created sessions, save the updated config with real IDs
         if (createdSessionCount > 0) {
-          const terminalsToSave = state.getTerminals();
-          const { config: terminalConfigs, state: terminalStates } =
-            splitTerminals(terminalsToSave);
-          await saveConfig({ terminals: terminalConfigs });
-          await saveState({
-            nextAgentNumber: state.getCurrentTerminalNumber(),
-            terminals: terminalStates,
-          });
+          await saveCurrentConfiguration(state);
           logger.info("Saved config with new session IDs", {
             workspacePath: expandedPath,
             newSessionCount: createdSessionCount,
@@ -359,14 +340,7 @@ export async function handleWorkspacePathInput(
             });
 
             // Save updated config with new session IDs
-            const terminalsToSave = state.getTerminals();
-            const { config: terminalConfigs, state: terminalStates } =
-              splitTerminals(terminalsToSave);
-            await saveConfig({ terminals: terminalConfigs });
-            await saveState({
-              nextAgentNumber: state.getCurrentTerminalNumber(),
-              terminals: terminalStates,
-            });
+            await saveCurrentConfiguration(state);
 
             // Launch agents for terminals with role configs
             logger.info("Launching agents for auto-created terminals", {

@@ -1,4 +1,4 @@
-import { saveConfig, saveState, splitTerminals } from "./config";
+import { saveCurrentConfiguration } from "./config";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
@@ -478,14 +478,7 @@ async function applySettings(
     state.setTerminalTheme(terminal.id, selectedTheme);
 
     // Save config and state files
-    const terminals = state.getTerminals();
-    const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
-
-    await saveConfig({ terminals: terminalConfigs });
-    await saveState({
-      nextAgentNumber: state.getCurrentTerminalNumber(),
-      terminals: terminalStates,
-    });
+    await saveCurrentConfiguration(state);
 
     // Launch agent if role was set/changed
     if (roleChanged && hasNewRole) {

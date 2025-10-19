@@ -337,6 +337,97 @@ EOF
 # RESUME: Return to #38 implementation
 ```
 
+## Creating Pull Requests: CRITICAL GitHub Auto-Close Requirements
+
+**IMPORTANT**: When creating PRs, you MUST use GitHub's magic keywords to ensure issues auto-close when PRs merge.
+
+### The Problem
+
+If you write "Issue #123" or "Fixes issue #123", GitHub will NOT auto-close the issue. This leads to:
+- ❌ Orphaned open issues that appear incomplete
+- ❌ Manual cleanup work for maintainers
+- ❌ Confusion about what's actually done
+
+### The Solution: Use Magic Keywords
+
+**ALWAYS use one of these exact formats in your PR description:**
+
+```markdown
+Closes #123
+Fixes #123
+Resolves #123
+```
+
+### Examples
+
+**❌ WRONG - Issue stays open after merge:**
+```markdown
+## Summary
+This PR implements the feature requested in issue #123.
+
+## Changes
+- Added new functionality
+- Updated tests
+```
+
+**✅ CORRECT - Issue auto-closes on merge:**
+```markdown
+## Summary
+Implement new feature to improve user experience.
+
+## Changes
+- Added new functionality
+- Updated tests
+
+Closes #123
+```
+
+### Why This Matters
+
+GitHub's auto-close feature only works with specific keywords at the start of a line:
+- `Closes #X`
+- `Fixes #X`
+- `Resolves #X`
+- `Closing #X`
+- `Fixed #X`
+- `Resolved #X`
+
+**Any other phrasing will NOT trigger auto-close.**
+
+### PR Creation Checklist
+
+When creating a PR, verify:
+
+1. ✅ PR description uses "Closes #X" syntax (not "Issue #X" or "Addresses #X")
+2. ✅ Issue number is correct
+3. ✅ PR has `loom:review-requested` label
+4. ✅ All CI checks pass (`pnpm check:ci` locally)
+5. ✅ Changes match issue requirements
+6. ✅ Tests added/updated as needed
+
+### Creating the PR
+
+```bash
+# CORRECT way to create PR
+gh pr create --label "loom:review-requested" --body "$(cat <<'EOF'
+## Summary
+Brief description of what this PR does and why.
+
+## Changes
+- Change 1
+- Change 2
+- Change 3
+
+## Test Plan
+How you verified the changes work.
+
+Closes #123
+EOF
+)"
+```
+
+**Remember**: Put "Closes #123" on its own line in the PR description. This ensures GitHub recognizes it and auto-closes the issue when the PR merges.
+
 ## Working Style
 
 - **Start**: `gh issue list --label="loom:issue"` to find work (pick oldest first for fair FIFO queue)
@@ -344,7 +435,7 @@ EOF
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see Scope Management)
 - Use the TodoWrite tool to plan and track multi-step tasks
 - Run lint, format, and type checks before considering complete
-- **Create PR**: Reference issue with "Closes #123", add `loom:review-requested` label
+- **Create PR**: **Use "Closes #123" syntax** (see section above), add `loom:review-requested` label
 - When blocked: Add comment explaining blocker, mark `loom:blocked`
 - Stay focused on assigned issue - create separate issues for other work
 

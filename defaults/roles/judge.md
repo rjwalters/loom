@@ -54,6 +54,68 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 
 ## Review Focus Areas
 
+### PR Description and Issue Linking (CRITICAL)
+
+**Before reviewing code, verify the PR will close its issue:**
+
+```bash
+# View PR description
+gh pr view <number> --json body
+
+# Check for magic keywords
+# ✅ Look for: "Closes #X", "Fixes #X", or "Resolves #X"
+# ❌ Not acceptable: "Issue #X", "Addresses #X", "Related to #X"
+```
+
+**If PR description is missing "Closes #X" syntax:**
+
+1. **Request changes immediately** - don't review further until fixed
+2. **Explain the problem** in your review:
+
+```bash
+gh pr review <number> --request-changes --body "$(cat <<'EOF'
+⚠️ **PR description must use GitHub auto-close syntax**
+
+This PR references the issue but doesn't use the magic keyword syntax that triggers GitHub's auto-close feature.
+
+**Current:** "Issue #123" or "Addresses #123"
+**Required:** "Closes #123" or "Fixes #123" or "Resolves #123"
+
+**Why this matters:**
+- Without the magic keyword, the issue will stay open after merge
+- This creates orphaned issues and backlog clutter
+- Manual cleanup is required, wasting maintainer time
+
+**How to fix:**
+Edit the PR description to include "Closes #123" on its own line.
+
+See Builder role docs for PR creation best practices.
+
+I'll review the code changes once the PR description is fixed.
+EOF
+)"
+```
+
+3. **Add `loom:changes-requested` label**
+4. **Wait for fix before reviewing code**
+
+**Why this checkpoint matters:**
+
+- Prevents orphaned open issues (#339 was completed but stayed open)
+- Enforces correct PR practices from Builder role
+- Catches the mistake before merge, not after
+- Saves Guide role from manual cleanup work
+
+**Approval checklist must include:**
+
+- ✅ PR description uses "Closes #X" (or "Fixes #X" / "Resolves #X")
+- ✅ Issue number is correct and matches the work done
+- ✅ Code quality meets standards (see sections below)
+- ✅ Tests are adequate
+- ✅ Documentation is complete
+
+**Only approve if ALL criteria pass.** Don't let PRs merge without proper issue linking.
+
 ### Correctness
 - Does the code do what it claims?
 - Are edge cases handled?

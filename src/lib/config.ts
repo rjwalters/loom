@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
-import type { AgentStatus, ColorTheme, Terminal } from "./state";
+import type { AgentStatus, AppState, ColorTheme, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 
 const logger = Logger.forComponent("config");
@@ -419,6 +419,38 @@ export function splitTerminals(terminals: Terminal[]): {
   }));
 
   return { config, state };
+}
+
+/**
+ * Saves the current configuration and state from AppState.
+ * Convenience function that encapsulates the common pattern of:
+ * 1. Getting terminals from state
+ * 2. Splitting into config and state
+ * 3. Saving both files
+ *
+ * @param state - The AppState instance to save from
+ *
+ * @example
+ * ```ts
+ * // Instead of:
+ * const terminals = state.getTerminals();
+ * const { config, state: terminalStates } = splitTerminals(terminals);
+ * await saveConfig({ terminals: config });
+ * await saveState({ nextAgentNumber: state.getCurrentTerminalNumber(), terminals: terminalStates });
+ *
+ * // Use:
+ * await saveCurrentConfiguration(state);
+ * ```
+ */
+export async function saveCurrentConfiguration(state: AppState): Promise<void> {
+  const terminals = state.getTerminals();
+  const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
+
+  await saveConfig({ terminals: terminalConfigs });
+  await saveState({
+    nextAgentNumber: state.getCurrentTerminalNumber(),
+    terminals: terminalStates,
+  });
 }
 
 /**

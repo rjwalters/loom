@@ -41,6 +41,7 @@
       "Bash(pnpm daemon:test:*)",
       "Bash(pnpm check:all:*)",
       "Bash(pnpm check:ci:*)",
+      "Bash(pnpm worktree:*)",
       "Bash(pnpm exec tsc:*)",
       "Bash(pnpm lint:*)",
       "Bash(pnpm format:*)",
