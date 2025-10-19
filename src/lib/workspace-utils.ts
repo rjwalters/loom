@@ -5,8 +5,11 @@
  * These functions have no state dependencies and can be safely used anywhere.
  */
 
+import { open } from "@tauri-apps/api/dialog";
 import { homeDir } from "@tauri-apps/api/path";
+import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
+import type { Terminal } from "./state";
 
 const logger = Logger.forComponent("workspace-utils");
 
@@ -80,4 +83,83 @@ export function clearWorkspaceError(): void {
   if (errorDiv) {
     errorDiv.textContent = "";
   }
+}
+
+/**
+ * Validate workspace path
+ *
+ * Checks if the provided path is a valid git repository using Tauri IPC.
+ * Updates the workspace error UI based on validation result.
+ *
+ * @param path - The workspace path to validate
+ * @returns True if valid git repository, false otherwise
+ */
+export async function validateWorkspacePath(path: string): Promise<boolean> {
+  logger.info("Validating workspace path", { path });
+  if (!path || path.trim() === "") {
+    logger.info("Empty path, clearing error");
+    clearWorkspaceError();
+    return false;
+  }
+
+  try {
+    await invoke<boolean>("validate_git_repo", { path });
+    logger.info("Workspace validation passed", { path });
+    clearWorkspaceError();
+    return true;
+  } catch (error) {
+    const errorMessage =
+      typeof error === "string"
+        ? error
+        : (error as { message?: string })?.message || "Invalid workspace path";
+    logger.warn("Workspace validation failed", { path, errorMessage });
+    showWorkspaceError(errorMessage);
+    return false;
+  }
+}
+
+/**
+ * Browse for workspace folder
+ *
+ * Opens a native folder picker dialog and handles the selected path.
+ *
+ * @param handleWorkspacePathInput - Callback to handle the selected path
+ */
+export async function browseWorkspace(
+  handleWorkspacePathInput: (path: string) => Promise<void>
+): Promise<void> {
+  try {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Select workspace folder",
+    });
+
+    if (selected && typeof selected === "string") {
+      await handleWorkspacePathInput(selected);
+    }
+  } catch (error) {
+    logger.error("Error selecting workspace", error);
+    alert("Failed to select workspace. Please try again.");
+  }
+}
+
+/**
+ * Generate next available config ID
+ *
+ * Finds the next available terminal-N ID by checking existing terminal IDs.
+ *
+ * @param terminals - Current list of terminals
+ * @returns Next available terminal ID (e.g., "terminal-1", "terminal-2")
+ */
+export function generateNextConfigId(terminals: Terminal[]): string {
+  const existingIds = new Set(terminals.map((t) => t.id));
+
+  // Find the next available terminal-N ID
+  let i = 1;
+  while (existingIds.has(`terminal-${i}`)) {
+    i++;
+  }
+
+  return `terminal-${i}`;
 }

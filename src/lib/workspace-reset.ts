@@ -1,9 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
-import {
-  loadWorkspaceConfig,
-  saveCurrentConfiguration,
-  setConfigWorkspace,
-} from "./config";
+import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";

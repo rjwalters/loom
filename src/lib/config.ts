@@ -1,8 +1,7 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
-import type { AgentStatus, ColorTheme, Terminal } from "./state";
+import type { AgentStatus, AppState, ColorTheme, Terminal } from "./state";
 import { TerminalStatus } from "./state";
-import type { AppState } from "./state";
 
 const logger = Logger.forComponent("config");
 

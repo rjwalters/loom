@@ -1,10 +1,6 @@
 import { ask } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
-import {
-  loadWorkspaceConfig,
-  saveCurrentConfiguration,
-  setConfigWorkspace,
-} from "./config";
+import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";

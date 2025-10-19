@@ -65,8 +65,9 @@ export async function startWorkspaceEngine(
   });
 
   // Load existing config (do NOT reset to defaults)
-  const { loadWorkspaceConfig, setConfigWorkspace, saveCurrentConfiguration } =
-    await import("./config");
+  const { loadWorkspaceConfig, setConfigWorkspace, saveCurrentConfiguration } = await import(
+    "./config"
+  );
 
   try {
     setConfigWorkspace(workspacePath);
