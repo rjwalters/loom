@@ -145,6 +145,14 @@ async function triggerFactoryReset(): Promise<string> {
 }
 
 /**
+ * Trigger force factory reset - overwrites config with defaults (NO confirmation dialog)
+ * Note: Factory reset does NOT auto-start. User must run "Start" after reset.
+ */
+async function triggerForceFactoryReset(): Promise<string> {
+  return await writeMCPCommand("trigger_force_factory_reset");
+}
+
+/**
  * Read the Loom state file
  */
 async function readStateFile(): Promise<string> {
@@ -382,7 +390,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_factory_reset",
         description:
-          "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. Use this to reset configuration to clean state for testing.",
+          "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog that requires user interaction. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. For MCP automation, use trigger_force_factory_reset instead to bypass the confirmation dialog.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "trigger_force_factory_reset",
+        description:
+          "Reset workspace to factory defaults WITHOUT confirmation dialog. Same as trigger_factory_reset but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to reset. Does NOT auto-start - must run trigger_force_start after reset to create terminals.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -486,6 +503,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "trigger_factory_reset": {
         const result = await triggerFactoryReset();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "trigger_force_factory_reset": {
+        const result = await triggerForceFactoryReset();
         return {
           content: [
             {
