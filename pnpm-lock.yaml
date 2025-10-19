@@ -85,6 +85,9 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.20.0
         version: 1.20.0
+      strip-ansi:
+        specifier: ^7.1.2
+        version: 7.1.2
     devDependencies:
       '@types/node':
         specifier: ^22.18.10
