@@ -1,11 +1,23 @@
 {
   "terminals": [
     {
-      "id": "terminal-3",
-      "name": "Curator",
+      "id": "terminal-1",
+      "name": "Architect",
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
+        "roleFile": "architect.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
+      },
+      "theme": "lavender"
+    },
+    {
+      "id": "terminal-2",
+      "name": "Curator",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "codex",
         "roleFile": "curator.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
@@ -13,11 +25,23 @@
       "theme": "ocean"
     },
     {
+      "id": "terminal-3",
+      "name": "Triage",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "triage.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Review all loom:ready issues and update loom:urgent labels to reflect current top 3 priorities"
+      },
+      "theme": "indigo"
+    },
+    {
       "id": "terminal-4",
       "name": "Reviewer",
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "claude",
+        "workerType": "codex",
         "roleFile": "reviewer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
@@ -49,9 +73,40 @@
       "theme": "forest"
     },
     {
-      "id": "terminal-1",
-      "name": "Terminal 5",
-      "theme": "default"
+      "id": "terminal-7",
+      "name": "Fixer",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "fixer.md",
+        "targetInterval": 300000,
+        "intervalPrompt": "Check for PRs with changes requested: gh pr list --label=\"loom:changes-requested\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
+      },
+      "theme": "amber"
+    },
+    {
+      "id": "terminal-8",
+      "name": "Critic",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "critic.md",
+        "targetInterval": 900000,
+        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:critic-suggestion label if you find something concrete"
+      },
+      "theme": "gray"
+    },
+    {
+      "id": "terminal-9",
+      "name": "Worker 3",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "codex",
+        "roleFile": "worker.md",
+        "targetInterval": 60000,
+        "intervalPrompt": "Find and implement loom:ready issues"
+      },
+      "theme": "crimson"
     }
   ]
 }
