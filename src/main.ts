@@ -10,7 +10,7 @@ import { Logger } from "./lib/logger";
 import { getOutputPoller } from "./lib/output-poller";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
-import { handleRunNowClick, startRename } from "./lib/terminal-actions";
+import { handleRestartTerminal, handleRunNowClick, startRename } from "./lib/terminal-actions";
 import {
   launchAgentsForTerminals as launchAgentsForTerminalsCore,
   reconnectTerminals as reconnectTerminalsCore,
@@ -1086,6 +1086,17 @@ function setupEventListeners() {
         return;
       }
 
+      // Restart Terminal button
+      const restartBtn = target.closest(".restart-terminal-btn");
+      if (restartBtn) {
+        e.stopPropagation();
+        const id = restartBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRestartTerminal(id, { state, saveCurrentConfig });
+        }
+        return;
+      }
+
       // Run Now button (interval mode)
       const runNowBtn = target.closest(".run-now-btn");
       if (runNowBtn) {
@@ -1176,6 +1187,17 @@ function setupEventListeners() {
   if (miniRow) {
     miniRow.addEventListener("click", (e) => {
       const target = e.target as HTMLElement;
+
+      // Handle Restart Terminal button clicks
+      const restartBtn = target.closest(".restart-terminal-btn");
+      if (restartBtn) {
+        e.stopPropagation();
+        const id = restartBtn.getAttribute("data-terminal-id");
+        if (id) {
+          handleRestartTerminal(id, { state, saveCurrentConfig });
+        }
+        return;
+      }
 
       // Handle Run Now button clicks (interval mode)
       const runNowBtn = target.closest(".run-now-btn");

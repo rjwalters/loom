@@ -1,12 +1,14 @@
 /**
  * Terminal Action Handlers
  *
- * Functions for handling terminal-specific UI actions like running interval prompts
- * and inline renaming. These are called from event handlers in main.ts.
+ * Functions for handling terminal-specific UI actions like running interval prompts,
+ * restarting terminals, and inline renaming. These are called from event handlers in main.ts.
  */
 
+import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
 import type { AppState } from "./state";
+import { TerminalStatus } from "./state";
 
 const logger = Logger.forComponent("terminal-actions");
 
@@ -56,6 +58,110 @@ export async function handleRunNowClick(
       terminalId,
     });
     alert(`Failed to run interval prompt: ${error}`);
+  }
+}
+
+/**
+ * Handle Restart Terminal button click
+ *
+ * Destroys the current terminal and creates a new one with the same configuration.
+ * If the terminal had an agent running, it will be relaunched.
+ *
+ * @param terminalId - The ID of the terminal to restart
+ * @param deps - Dependencies (state, saveCurrentConfig)
+ */
+export async function handleRestartTerminal(
+  terminalId: string,
+  deps: Pick<TerminalActionDependencies, "state" | "saveCurrentConfig">
+): Promise<void> {
+  const { state, saveCurrentConfig } = deps;
+  logger.info("Restarting terminal", { terminalId });
+
+  try {
+    const terminal = state.getTerminal(terminalId);
+    if (!terminal) {
+      logger.error("Terminal not found", new Error("Terminal not found"), {
+        terminalId,
+      });
+      return;
+    }
+
+    // Store terminal configuration before destroying
+    const config = {
+      name: terminal.name,
+      role: terminal.role,
+      roleConfig: terminal.roleConfig,
+      worktreePath: terminal.worktreePath,
+    };
+
+    logger.info("Stored terminal configuration for restart", {
+      terminalId,
+      config,
+    });
+
+    // Set terminal to busy status during restart
+    state.updateTerminal(terminalId, { status: TerminalStatus.Busy });
+
+    // Destroy the terminal via Tauri IPC
+    await invoke("destroy_terminal", { id: terminalId });
+
+    logger.info("Destroyed terminal", { terminalId });
+
+    // Small delay to ensure tmux session is fully cleaned up
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Create a new terminal with the same configuration
+    const workspacePath = state.getWorkspace();
+    if (!workspacePath) {
+      throw new Error("No workspace path available");
+    }
+
+    // Determine working directory - use worktree path if available, otherwise workspace
+    const workingDir = config.worktreePath || workspacePath;
+
+    await invoke("create_terminal", {
+      configId: terminalId,
+      name: config.name,
+      workingDir,
+      role: config.role || "",
+      instanceNumber: 0,
+    });
+
+    logger.info("Created new terminal", { terminalId });
+
+    // If terminal had a worktree path, set it again
+    if (config.worktreePath) {
+      await invoke("set_worktree_path", {
+        id: terminalId,
+        worktreePath: config.worktreePath,
+      });
+    }
+
+    // Update terminal status to idle
+    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+
+    // Save the configuration
+    await saveCurrentConfig();
+
+    // If terminal had a role config with an agent, relaunch it
+    if (config.role === "claude-code-worker" && config.roleConfig?.roleFile) {
+      logger.info("Relaunching agent for restarted terminal", { terminalId });
+
+      const { launchAgentsForTerminals } = await import("./terminal-lifecycle");
+      await launchAgentsForTerminals(workspacePath, [terminal], {
+        state,
+        saveCurrentConfig,
+      });
+    }
+
+    logger.info("Successfully restarted terminal", { terminalId });
+  } catch (error) {
+    logger.error("Failed to restart terminal", error as Error, {
+      terminalId,
+    });
+    // Reset status to idle on error
+    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+    alert(`Failed to restart terminal: ${error}`);
   }
 }
 
