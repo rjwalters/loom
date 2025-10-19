@@ -1,5 +1,6 @@
 mod activity;
 mod health_monitor;
+mod init;
 mod ipc;
 mod logging;
 mod terminal;
@@ -7,6 +8,7 @@ mod types;
 
 use activity::ActivityDb;
 use anyhow::{anyhow, Result};
+use clap::{Parser, Subcommand};
 use ipc::IpcServer;
 use std::fs;
 use std::io::Write;
@@ -14,8 +16,46 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use terminal::TerminalManager;
 
+/// Loom daemon - terminal multiplexing and workspace orchestration
+#[derive(Parser)]
+#[command(name = "loom-daemon")]
+#[command(about = "Loom daemon for AI-powered development orchestration", long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Initialize a Loom workspace in a target repository
+    Init {
+        /// Target workspace directory (must be a git repository)
+        #[arg(value_name = "PATH", default_value = ".")]
+        workspace: String,
+
+        /// Path to defaults directory
+        #[arg(long, default_value = "defaults")]
+        defaults: String,
+
+        /// Overwrite existing .loom directory if it exists
+        #[arg(long)]
+        force: bool,
+
+        /// Print what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Handle CLI commands (init mode)
+    if let Some(command) = cli.command {
+        return handle_cli_command(command);
+    }
+
     // Setup logging to ~/.loom/daemon.log
     setup_logging()?;
 
@@ -132,4 +172,73 @@ fn setup_logging() -> Result<()> {
     log::info!("Daemon logging initialized to {}", log_path.display());
 
     Ok(())
+}
+
+/// Handle CLI commands (init mode)
+fn handle_cli_command(command: Commands) -> Result<()> {
+    match command {
+        Commands::Init {
+            workspace,
+            defaults,
+            force,
+            dry_run,
+        } => {
+            // Convert workspace path to absolute path
+            let workspace_path = std::path::Path::new(&workspace);
+            let absolute_workspace = if workspace_path.is_absolute() {
+                workspace_path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(workspace_path)
+            };
+
+            let workspace_str = absolute_workspace
+                .to_str()
+                .ok_or_else(|| anyhow!("Invalid workspace path"))?;
+
+            if dry_run {
+                println!("Dry run mode - no changes will be made\n");
+                println!("Would initialize Loom workspace:");
+                println!("  Workspace: {workspace_str}");
+                println!("  Defaults:  {defaults}");
+                println!("  Force:     {force}");
+                println!("\nActions that would be performed:");
+                println!("  1. Validate {workspace_str} is a git repository");
+                println!("  2. Copy .loom/ configuration from {defaults}");
+                println!("  3. Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/, .github/)");
+                println!("  4. Update .gitignore with Loom ephemeral patterns");
+                return Ok(());
+            }
+
+            println!("Initializing Loom workspace...");
+            println!("  Workspace: {workspace_str}");
+            println!("  Defaults:  {defaults}");
+
+            match init::initialize_workspace(workspace_str, &defaults, force) {
+                Ok(()) => {
+                    println!("\n✅ Loom workspace initialized successfully!");
+                    println!("\nFiles installed:");
+                    println!("  📁 .loom/          - Configuration directory");
+                    println!("  📄 .loom/config.json - Terminal configuration");
+                    println!("  📁 .loom/roles/    - Agent role definitions");
+                    println!("  📄 CLAUDE.md       - AI context documentation");
+                    println!("  📄 AGENTS.md       - Agent workflow guide");
+                    println!("  📁 .claude/        - Claude Code configuration");
+                    println!("  📁 .codex/         - Codex configuration");
+                    println!("  📁 .github/        - GitHub workflow templates");
+                    println!("  📄 .gitignore      - Updated with Loom patterns");
+                    println!("\nNext steps:");
+                    println!("  1. Review .loom/config.json for terminal configuration");
+                    println!("  2. Customize agent roles in .loom/roles/ (optional)");
+                    println!("  3. Start the Loom app or use manual orchestration:");
+                    println!("     - Launch Loom.app and select this workspace");
+                    println!("     - Or run agents manually: claude --role builder");
+                    Ok(())
+                }
+                Err(e) => {
+                    eprintln!("\n❌ Failed to initialize workspace: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
