@@ -158,7 +158,7 @@ Label updates are **not atomic**. If two Workers try to claim the same issue sim
 
 ## References
 
-- Implementation: `defaults/roles/worker.md`, `defaults/roles/curator.md`, `defaults/roles/reviewer.md`
+- Implementation: `defaults/roles/builder.md`, `defaults/roles/curator.md`, `defaults/roles/judge.md`
 - Related: ADR-0008 (tmux + Daemon Architecture)
 - Related: WORKFLOWS.md (detailed workflow documentation)
 - GitHub Labels API: https://docs.github.com/en/rest/issues/labels

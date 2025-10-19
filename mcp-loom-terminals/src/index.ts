@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
-import { readFile, stat } from "node:fs/promises";
 import { exec } from "node:child_process";
+import { readFile, stat } from "node:fs/promises";
 import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -155,7 +155,12 @@ async function sendTerminalInput(terminalId: string, input: string): Promise<str
 /**
  * Check tmux server health and count active loom sessions
  */
-async function checkTmuxServerHealth(): Promise<{ serverRunning: boolean; sessionCount: number; sessions: string[]; errorMessage?: string }> {
+async function checkTmuxServerHealth(): Promise<{
+  serverRunning: boolean;
+  sessionCount: number;
+  sessions: string[];
+  errorMessage?: string;
+}> {
   try {
     const { stdout } = await execAsync("tmux -L loom list-sessions -F '#{session_name}'");
     const sessions = stdout
@@ -182,7 +187,12 @@ async function checkTmuxServerHealth(): Promise<{ serverRunning: boolean; sessio
 /**
  * Get tmux server information (PID, socket path, version)
  */
-async function getTmuxServerInfo(): Promise<{ serverProcess?: string; socketPath: string; socketExists: boolean; tmuxVersion?: string }> {
+async function getTmuxServerInfo(): Promise<{
+  serverProcess?: string;
+  socketPath: string;
+  socketExists: boolean;
+  tmuxVersion?: string;
+}> {
   const uid = process.getuid?.() || 0;
   const socketPath = `/private/tmp/tmux-${uid}/loom`;
 
@@ -228,7 +238,11 @@ async function getTmuxServerInfo(): Promise<{ serverProcess?: string; socketPath
 /**
  * Toggle tmux verbose logging by sending SIGUSR2 to tmux server
  */
-async function toggleTmuxVerboseLogging(): Promise<{ success: boolean; message: string; pid?: string }> {
+async function toggleTmuxVerboseLogging(): Promise<{
+  success: boolean;
+  message: string;
+  pid?: string;
+}> {
   try {
     // Find tmux server PID
     const { stdout } = await execAsync("pgrep -f 'tmux.*-L loom'");

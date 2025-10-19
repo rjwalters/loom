@@ -168,13 +168,13 @@ Loom stores workspace-specific configuration in `.loom/config.json` within each 
     },
     {
       "id": "2",
-      "name": "Worker 1",
+      "name": "Builder 1",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 300000,
         "intervalPrompt": "Continue working on open tasks"
       }
@@ -212,7 +212,7 @@ state.addTerminal({ name: `Agent ${num}`, ... });
 // 6. User configures terminal role via settings modal
 state.updateTerminalRole(id, 'claude-code-worker', {
   workerType: 'claude',
-  roleFile: 'worker.md',
+  roleFile: 'builder.md',
   targetInterval: 300000,
   intervalPrompt: 'Continue working on open tasks'
 });
@@ -247,7 +247,7 @@ Each role consists of two files:
 **Role Metadata Schema**:
 ```json
 {
-  "name": "Worker Bot",
+  "name": "Builder Bot",
   "description": "General development worker for features, bugs, and refactoring",
   "defaultInterval": 0,
   "defaultIntervalPrompt": "Continue working on open tasks",
@@ -265,18 +265,18 @@ Each role consists of two files:
 
 | Role | File | Autonomous | Interval | Description |
 |------|------|-----------|----------|-------------|
-| **Default** | `default.md` | No | N/A | Plain shell environment, no specialized role |
-| **Worker** | `worker.md` | No | 0 (manual) | General development worker for features, bugs, and refactoring |
+| **Driver** | `driver.md` | No | N/A | Plain shell environment, no specialized role |
+| **Builder** | `builder.md` | No | 0 (manual) | General development worker for features, bugs, and refactoring |
 | **Issues** | `issues.md` | No | 0 (manual) | Specialist for creating well-structured GitHub issues |
-| **Reviewer** | `reviewer.md` | Yes | 5 min | Code review specialist for thorough PR reviews |
+| **Judge** | `judge.md` | Yes | 5 min | Code review specialist for thorough PR reviews |
 | **Architect** | `architect.md` | Yes | 15 min | System architecture and technical decision making |
 | **Curator** | `curator.md` | Yes | 5 min | Issue maintenance and quality improvement |
 
 **Autonomous Mode**:
 - When `targetInterval > 0`, the terminal will automatically execute the `intervalPrompt` at regular intervals
-- Example: Reviewer bot runs every 5 minutes with prompt "Find and review open PRs with loom:review-requested label"
+- Example: Judge bot runs every 5 minutes with prompt "Find and review open PRs with loom:review-requested label"
 - Allows terminals to work autonomously without user intervention
-- Recommended for Curator, Reviewer, and Architect roles
+- Recommended for Curator, Judge, and Architect roles
 
 **Label-based Workflow Coordination**:
 
@@ -286,8 +286,8 @@ Roles coordinate work through GitHub labels with two human approval gates (see [
 2. **Human approval (Gate 1)**: User reviews and removes label to approve proposal
 3. **Curator** finds unlabeled issues, enhances them, marks as `loom:curated`
 4. **Human approval (Gate 2)**: User reviews and changes `loom:curated` to `loom:issue` to authorize work
-5. **Worker** claims `loom:issue` issues, implements, creates PR with `loom:review-requested`
-6. **Reviewer** finds `loom:review-requested` PRs, reviews, approves/requests changes
+5. **Builder** claims `loom:issue` issues, implements, creates PR with `loom:review-requested`
+6. **Judge** finds `loom:review-requested` PRs, reviews, approves/requests changes
 7. **Human merges** approved PRs
 
 The two approval gates ensure human judgment guides the autonomous workflow:
