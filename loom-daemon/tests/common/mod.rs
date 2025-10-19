@@ -338,10 +338,7 @@ pub fn capture_terminal_output(session_name: &str) -> Result<String> {
         .context("Failed to execute tmux capture-pane")?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "tmux capture-pane failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::bail!("tmux capture-pane failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     String::from_utf8(output.stdout).context("Invalid UTF-8 in captured output")

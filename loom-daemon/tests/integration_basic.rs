@@ -5,8 +5,7 @@
 mod common;
 
 use common::{
-    capture_terminal_output, cleanup_all_loom_sessions, tmux_session_exists, TestClient,
-    TestDaemon,
+    capture_terminal_output, cleanup_all_loom_sessions, tmux_session_exists, TestClient, TestDaemon,
 };
 use serial_test::serial;
 
@@ -125,8 +124,7 @@ async fn test_create_terminal_with_working_dir() {
     tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
     // Capture terminal output
-    let output = capture_terminal_output(&session_name)
-        .expect("Failed to capture terminal output");
+    let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
 
     // Verify working directory appears in output
     // The output should contain the actual directory path from pwd command
@@ -294,15 +292,10 @@ async fn test_send_input() {
 
     // Capture terminal output
     let session_name = format!("loom-{terminal_id}-default-0");
-    let output = capture_terminal_output(&session_name)
-        .expect("Failed to capture terminal output");
+    let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
 
     // Verify echoed output appears in terminal
-    assert!(
-        output.contains("hello"),
-        "Expected 'hello' in output, got: {}",
-        output
-    );
+    assert!(output.contains("hello"), "Expected 'hello' in output, got: {}", output);
 
     // Cleanup
     cleanup_all_loom_sessions();
