@@ -4,7 +4,9 @@
 
 mod common;
 
-use common::{cleanup_all_loom_sessions, tmux_session_exists, TestClient, TestDaemon};
+use common::{
+    capture_terminal_output, cleanup_all_loom_sessions, tmux_session_exists, TestClient, TestDaemon,
+};
 use serial_test::serial;
 
 /// Cleanup helper to run before/after tests
@@ -109,8 +111,29 @@ async fn test_create_terminal_with_working_dir() {
     let session_name = format!("loom-{terminal_id}-default-0");
     assert!(tmux_session_exists(&session_name));
 
-    // TODO: Verify working directory (would need output capture)
-    // For now, just verify terminal was created successfully
+    // Wait for terminal shell to initialize
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    // Send pwd command to verify working directory
+    client
+        .send_input(&terminal_id, "pwd\r")
+        .await
+        .expect("Failed to send pwd command");
+
+    // Wait for command to execute and output to appear
+    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+    // Capture terminal output
+    let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
+
+    // Verify working directory appears in output
+    // The output should contain the actual directory path from pwd command
+    assert!(
+        output.contains(&working_dir),
+        "Expected working directory '{}' in output, got: '{}'",
+        working_dir,
+        output
+    );
 
     // Cleanup
     cleanup_all_loom_sessions();
@@ -260,18 +283,19 @@ async fn test_send_input() {
 
     // Send some input (echo command)
     client
-        .send_input(&terminal_id, "echo hello")
+        .send_input(&terminal_id, "echo hello\r")
         .await
         .expect("Failed to send input");
 
-    // Send Enter key
-    client
-        .send_input(&terminal_id, "\r")
-        .await
-        .expect("Failed to send Enter");
+    // Wait for command to execute
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    // TODO: Verify output when output capture is implemented
-    // For now, just verify input was accepted without error
+    // Capture terminal output
+    let session_name = format!("loom-{terminal_id}-default-0");
+    let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
+
+    // Verify echoed output appears in terminal
+    assert!(output.contains("hello"), "Expected 'hello' in output, got: {}", output);
 
     // Cleanup
     cleanup_all_loom_sessions();

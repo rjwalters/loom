@@ -319,3 +319,27 @@ pub fn cleanup_all_loom_sessions() {
         kill_tmux_session(&session);
     }
 }
+
+/// Helper: Capture terminal output using tmux capture-pane
+///
+/// Uses tmux's built-in capture mechanism to read the terminal's pane content.
+/// Returns the captured output as a String.
+///
+/// # Arguments
+/// * `session_name` - The tmux session name to capture from
+///
+/// # Returns
+/// * `Result<String>` - The captured output or an error message
+#[allow(dead_code)]
+pub fn capture_terminal_output(session_name: &str) -> Result<String> {
+    let output = Command::new("tmux")
+        .args(["-L", "loom", "capture-pane", "-t", session_name, "-p"])
+        .output()
+        .context("Failed to execute tmux capture-pane")?;
+
+    if !output.status.success() {
+        anyhow::bail!("tmux capture-pane failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    String::from_utf8(output.stdout).context("Invalid UTF-8 in captured output")
+}
