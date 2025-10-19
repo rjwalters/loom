@@ -330,9 +330,9 @@ impl TerminalManager {
                     "🚨 TMUX SERVER DEAD - Socket should be at /private/tmp/tmux-$UID/loom"
                 );
             } else if stderr.contains("no such session") || stderr.contains("no sessions") {
-                log::debug!("No tmux sessions found: {}", stderr);
+                log::debug!("No tmux sessions found: {stderr}");
             } else {
-                log::error!("tmux list-sessions failed: {}", stderr);
+                log::error!("tmux list-sessions failed: {stderr}");
             }
 
             // Return early with empty list if server is dead
@@ -341,7 +341,7 @@ impl TerminalManager {
 
         let sessions = String::from_utf8_lossy(&output.stdout);
         let session_count = sessions.lines().count();
-        log::info!("📊 tmux server status: {} total sessions", session_count);
+        log::info!("📊 tmux server status: {session_count} total sessions");
 
         for session in sessions.lines() {
             if let Some(remainder) = session.strip_prefix("loom-") {
@@ -470,9 +470,9 @@ impl TerminalManager {
                     "🚨 TMUX SERVER DEAD during has_tmux_session check - Socket should be at /private/tmp/tmux-$UID/loom"
                 );
             } else if stderr.contains("no sessions") {
-                log::debug!("No tmux sessions exist: {}", stderr);
+                log::debug!("No tmux sessions exist: {stderr}");
             } else {
-                log::error!("tmux list-sessions failed: {}", stderr);
+                log::error!("tmux list-sessions failed: {stderr}");
             }
 
             return Ok(false);
@@ -517,7 +517,7 @@ impl TerminalManager {
             } else if stderr.contains("no sessions") {
                 log::debug!("No tmux sessions exist");
             } else {
-                log::error!("tmux list-sessions failed: {}", stderr);
+                log::error!("tmux list-sessions failed: {stderr}");
             }
 
             return Vec::new();
@@ -558,7 +558,7 @@ impl TerminalManager {
                 return Err(anyhow!("tmux server is not running"));
             }
 
-            log::error!("tmux has-session failed for '{}': {}", session_name, stderr);
+            log::error!("tmux has-session failed for '{session_name}': {stderr}");
             return Err(anyhow!("Tmux session '{session_name}' does not exist"));
         }
 
@@ -588,7 +588,7 @@ impl TerminalManager {
                 return Err(anyhow!("tmux server is not running"));
             }
 
-            log::error!("tmux has-session failed for '{}': {}", session_name, stderr);
+            log::error!("tmux has-session failed for '{session_name}': {stderr}");
             return Err(anyhow!("Tmux session '{session_name}' does not exist"));
         }
 

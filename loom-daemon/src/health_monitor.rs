@@ -28,7 +28,7 @@ use std::time::Duration;
 /// let _monitor = health_monitor::start_tmux_health_monitor(30);
 /// ```
 pub fn start_tmux_health_monitor(interval_secs: u64) -> JoinHandle<()> {
-    log::info!("🏥 Starting tmux health monitor (checking every {} seconds)", interval_secs);
+    log::info!("🏥 Starting tmux health monitor (checking every {interval_secs} seconds)");
 
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(interval_secs));
@@ -63,13 +63,13 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> JoinHandle<()> {
                         "🚨 TMUX SERVER DEAD (health monitor) - Socket should be at /private/tmp/tmux-$UID/loom"
                     );
                 } else if stderr.contains("no sessions") {
-                    log::debug!("No tmux sessions exist: {}", stderr);
+                    log::debug!("No tmux sessions exist: {stderr}");
                 } else {
-                    log::error!("🚨 tmux server not responding: {}", stderr);
+                    log::error!("🚨 tmux server not responding: {stderr}");
                 }
             }
             Err(e) => {
-                log::error!("Failed to check tmux health: {}", e);
+                log::error!("Failed to check tmux health: {e}");
             }
         }
     })
