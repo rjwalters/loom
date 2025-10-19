@@ -453,8 +453,8 @@ loom/
 ├── defaults/                     # Default templates
 │   ├── config.json               # Factory config
 │   └── roles/                    # System role templates
-│       ├── worker.md
-│       ├── reviewer.md
+│       ├── builder.md
+│       ├── judge.md
 │       ├── architect.md
 │       └── curator.md
 │

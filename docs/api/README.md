@@ -67,7 +67,7 @@ function list_role_files(workspacePath: string): Promise<string[]>
 - `workspacePath` (string) - Path to workspace
 
 **Returns:**
-- `Promise<string[]>` - Array of role filenames (e.g., `["worker.md", "reviewer.md"]`)
+- `Promise<string[]>` - Array of role filenames (e.g., `["builder.md", "judge.md"]`)
 
 **Resolution order:**
 1. Workspace-specific: `.loom/roles/`
@@ -80,7 +80,7 @@ const roleFiles = await invoke<string[]>('list_role_files', {
 });
 
 console.log('Available roles:', roleFiles);
-// Output: ["default.md", "worker.md", "reviewer.md", ...]
+// Output: ["driver.md", "builder.md", "judge.md", ...]
 ```
 
 #### `read_role_file`
@@ -97,7 +97,7 @@ function read_role_file(
 
 **Parameters:**
 - `workspacePath` (string) - Path to workspace
-- `filename` (string) - Role filename (e.g., `"worker.md"`)
+- `filename` (string) - Role filename (e.g., `"builder.md"`)
 
 **Returns:**
 - `Promise<string>` - File content with `{{workspace}}` variable replaced
@@ -106,7 +106,7 @@ function read_role_file(
 ```typescript
 const content = await invoke<string>('read_role_file', {
   workspacePath: '/Users/username/projects/my-repo',
-  filename: 'worker.md'
+  filename: 'builder.md'
 });
 
 console.log('Role definition:', content);
@@ -126,7 +126,7 @@ function read_role_metadata(
 
 **Parameters:**
 - `workspacePath` (string) - Path to workspace
-- `filename` (string) - Role filename base (e.g., `"worker.md"`)
+- `filename` (string) - Role filename base (e.g., `"builder.md"`)
 
 **Returns:**
 - `Promise<string | null>` - JSON metadata string, or `null` if no metadata file exists
@@ -135,7 +135,7 @@ function read_role_metadata(
 ```typescript
 const metadata = await invoke<string | null>('read_role_metadata', {
   workspacePath: '/Users/username/projects/my-repo',
-  filename: 'worker.md'
+  filename: 'builder.md'
 });
 
 if (metadata) {
@@ -298,10 +298,10 @@ appState.addTerminal({
   name: 'Worker 1',
   status: TerminalStatus.Idle,
   isPrimary: false,
-  role: 'worker',
+  role: 'builder',
   roleConfig: {
     workerType: 'claude',
-    roleFile: 'worker.md',
+    roleFile: 'builder.md',
     targetInterval: 0,
     intervalPrompt: ''
   }
@@ -360,9 +360,9 @@ if (primary) {
 Updates a terminal's role configuration.
 
 ```typescript
-appState.updateTerminalRole('terminal-1', 'worker', {
+appState.updateTerminalRole('terminal-1', 'builder', {
   workerType: 'claude',
-  roleFile: 'worker.md',
+  roleFile: 'builder.md',
   targetInterval: 300000, // 5 minutes
   intervalPrompt: 'Continue working on open tasks'
 });
@@ -653,10 +653,10 @@ Workspace configuration persisted across app restarts.
       "name": "Worker 1",
       "status": "idle",
       "isPrimary": true,
-      "role": "worker",
+      "role": "builder",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 0,
         "intervalPrompt": ""
       }

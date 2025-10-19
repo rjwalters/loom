@@ -36,13 +36,13 @@
     {
       "configId": "terminal-3",
       "id": "__needs_session__",
-      "name": "Triage",
+      "name": "Guide",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "triage.md",
+        "roleFile": "guide.md",
         "targetInterval": 900000,
         "intervalPrompt": "Review all loom:ready issues and update loom:urgent labels to reflect current top 3 priorities"
       },
@@ -52,13 +52,13 @@
     {
       "configId": "terminal-4",
       "id": "__needs_session__",
-      "name": "Reviewer",
+      "name": "Judge",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "codex",
-        "roleFile": "reviewer.md",
+        "roleFile": "judge.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find and review PRs with loom:review-requested label"
       },
@@ -68,13 +68,13 @@
     {
       "configId": "terminal-5",
       "id": "__needs_session__",
-      "name": "Worker 1",
+      "name": "Builder 1",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
@@ -84,13 +84,13 @@
     {
       "configId": "terminal-6",
       "id": "__needs_session__",
-      "name": "Worker 2",
+      "name": "Builder 2",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },
@@ -100,13 +100,13 @@
     {
       "configId": "terminal-7",
       "id": "__needs_session__",
-      "name": "Fixer",
+      "name": "Healer",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "fixer.md",
+        "roleFile": "healer.md",
         "targetInterval": 300000,
         "intervalPrompt": "Check for PRs with changes requested: gh pr list --label=\"loom:changes-requested\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
       },
@@ -116,13 +116,13 @@
     {
       "configId": "terminal-8",
       "id": "__needs_session__",
-      "name": "Critic",
+      "name": "Hermit",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "critic.md",
+        "roleFile": "hermit.md",
         "targetInterval": 900000,
         "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:critic-suggestion label if you find something concrete"
       },
@@ -132,13 +132,13 @@
     {
       "configId": "terminal-9",
       "id": "__needs_session__",
-      "name": "Worker 3",
+      "name": "Builder 3",
       "status": "idle",
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
         "workerType": "claude",
-        "roleFile": "worker.md",
+        "roleFile": "builder.md",
         "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
       },

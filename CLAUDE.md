@@ -114,14 +114,14 @@ export class AppState {
 ### Terminal Roles
 
 Each terminal can be assigned a specialized role from `defaults/roles/`:
-- **Builder** (manual, worker.md): Implements features, creates PRs
-- **Judge** (autonomous 5min, reviewer.md): Reviews PRs
+- **Builder** (manual, builder.md): Implements features, creates PRs
+- **Judge** (autonomous 5min, judge.md): Reviews PRs
 - **Curator** (autonomous 5min, curator.md): Enhances issues
 - **Architect** (autonomous 15min, architect.md): Creates proposals
-- **Hermit** (autonomous 15min, critic.md): Identifies bloat
-- **Healer** (manual, fixer.md): Fixes bugs and maintains PRs
-- **Guide** (autonomous 15min, triage.md): Prioritizes issues
-- **Driver** (manual, default.md): Plain shell, direct action
+- **Hermit** (autonomous 15min, hermit.md): Identifies bloat
+- **Healer** (manual, healer.md): Fixes bugs and maintains PRs
+- **Guide** (autonomous 15min, guide.md): Prioritizes issues
+- **Driver** (manual, driver.md): Plain shell, direct action
 
 See [WORKFLOWS.md](WORKFLOWS.md) and [Agent Archetypes](docs/philosophy/agent-archetypes.md) for complete details.
 
