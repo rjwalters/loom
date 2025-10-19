@@ -187,26 +187,38 @@ export async function launchAgentInTerminal(
     );
   }
 
-  // Wait for Claude Code to be ready to receive input
-  logger.info("Waiting for Claude Code to initialize", { terminalId, delayMs: 2000 });
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  // Wait for Claude Code to be ready to receive input and send role prompt
+  // Wrapped in try-catch to capture any silent failures
+  try {
+    logger.info("Waiting for Claude Code to initialize", { terminalId, delayMs: 2000 });
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    logger.info("Wait complete, proceeding to send role prompt", { terminalId });
 
-  // Send the role prompt as the first message
-  logger.info("Sending role prompt as first message", {
-    terminalId,
-    promptLength: processedPrompt.length,
-  });
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: processedPrompt,
-  });
+    // Send the role prompt as the first message
+    logger.info("Sending role prompt as first message", {
+      terminalId,
+      promptLength: processedPrompt.length,
+    });
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: processedPrompt,
+    });
+    logger.info("Role prompt sent successfully", { terminalId });
 
-  // Press Enter to submit the prompt
-  logger.info("Sending Enter to submit role prompt", { terminalId });
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: "\r",
-  });
+    // Press Enter to submit the prompt
+    logger.info("Sending Enter to submit role prompt", { terminalId });
+    await invoke("send_terminal_input", {
+      id: terminalId,
+      data: "\r",
+    });
+    logger.info("Enter sent successfully", { terminalId });
+  } catch (error) {
+    logger.error("Failed to send role prompt or Enter", error as Error, {
+      terminalId,
+      promptLength: processedPrompt.length,
+    });
+    throw error; // Re-throw to let caller handle
+  }
 
   // Wait for the agent to process the role prompt
   logger.info("Waiting for agent to process role prompt", { terminalId, delayMs: 2000 });
