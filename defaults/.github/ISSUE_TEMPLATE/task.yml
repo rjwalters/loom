@@ -1,6 +1,5 @@
 name: "Development Task"
 description: "Create a development task for Loom"
-title: ""
 labels: ["loom:triage"]
 body:
   - type: markdown
