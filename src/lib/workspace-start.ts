@@ -65,7 +65,7 @@ export async function startWorkspaceEngine(
   });
 
   // Load existing config (do NOT reset to defaults)
-  const { loadWorkspaceConfig, setConfigWorkspace, saveConfig, saveState, splitTerminals } =
+  const { loadWorkspaceConfig, setConfigWorkspace, saveCurrentConfiguration } =
     await import("./config");
 
   try {
@@ -176,13 +176,7 @@ export async function startWorkspaceEngine(
         workspacePath,
         source: logPrefix,
       });
-      const terminalsToSave1 = state.getTerminals();
-      const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
-      await saveConfig({ terminals: terminalConfigs1 });
-      await saveState({
-        nextAgentNumber: state.getCurrentTerminalNumber(),
-        terminals: terminalStates1,
-      });
+      await saveCurrentConfiguration(state);
       logger.info("Config saved", {
         workspacePath,
         source: logPrefix,
@@ -205,13 +199,7 @@ export async function startWorkspaceEngine(
         workspacePath,
         source: logPrefix,
       });
-      const terminalsToSave2 = state.getTerminals();
-      const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
-      await saveConfig({ terminals: terminalConfigs2 });
-      await saveState({
-        nextAgentNumber: state.getCurrentTerminalNumber(),
-        terminals: terminalStates2,
-      });
+      await saveCurrentConfiguration(state);
 
       // Brief delay to allow tmux sessions to stabilize after agent launch
       // Without this delay, health checks may run before tmux sessions are fully query-able

@@ -3,14 +3,14 @@ import { ask, open } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
 import { getAppLevelState } from "./lib/app-state";
-import { saveConfig, saveState, setConfigWorkspace, splitTerminals } from "./lib/config";
+import { saveCurrentConfiguration, setConfigWorkspace } from "./lib/config";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
 import { getHealthMonitor } from "./lib/health-monitor";
 import { Logger } from "./lib/logger";
 import { getOutputPoller } from "./lib/output-poller";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
-import { handleRestartTerminal, handleRunNowClick, startRename } from "./lib/terminal-actions";
+import { closeTerminalWithConfirmation, handleRestartTerminal, handleRunNowClick, startRename } from "./lib/terminal-actions";
 import {
   launchAgentsForTerminals as launchAgentsForTerminalsCore,
   reconnectTerminals as reconnectTerminalsCore,
@@ -534,29 +534,13 @@ if (!eventListenersRegistered) {
   listen("close-terminal", async () => {
     const primary = state.getPrimary();
     if (primary) {
-      const confirmed = await ask(`Are you sure you want to close "${primary.name}"?`, {
-        title: "Close Terminal",
-        type: "warning",
+      await closeTerminalWithConfirmation(primary.id, {
+        state,
+        outputPoller,
+        terminalManager,
+        appLevelState: getAppLevelState(),
+        saveCurrentConfig,
       });
-
-      if (confirmed) {
-        // Stop autonomous mode if running
-        const { getAutonomousManager } = await import("./lib/autonomous-manager");
-        const autonomousManager = getAutonomousManager();
-        await autonomousManager.stopAutonomous(primary.id);
-
-        // Stop polling and destroy terminal
-        outputPoller.stopPolling(primary.id);
-        terminalManager.destroyTerminal(primary.id);
-        const appLevelState = getAppLevelState();
-        if (appLevelState.getCurrentAttachedTerminalId() === primary.id) {
-          appLevelState.setCurrentAttachedTerminalId(null);
-        }
-
-        // Remove from state
-        state.removeTerminal(primary.id);
-        saveCurrentConfig();
-      }
     }
   });
 
@@ -894,14 +878,7 @@ async function saveCurrentConfig() {
     return;
   }
 
-  const terminals = state.getTerminals();
-  const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
-
-  await saveConfig({ terminals: terminalConfigs });
-  await saveState({
-    nextAgentNumber: state.getCurrentTerminalNumber(),
-    terminals: terminalStates,
-  });
+  await saveCurrentConfiguration(state);
 }
 
 // Workspace error UI helpers and path utilities are now in src/lib/workspace-utils.ts
@@ -1072,7 +1049,7 @@ function setupEventListeners() {
   const primaryTerminal = document.getElementById("primary-terminal");
   if (primaryTerminal) {
     // Button clicks (settings, clear)
-    primaryTerminal.addEventListener("click", (e) => {
+    primaryTerminal.addEventListener("click", async (e) => {
       const target = e.target as HTMLElement;
 
       // Settings button
@@ -1130,32 +1107,12 @@ function setupEventListeners() {
         e.stopPropagation();
         const id = closeBtn.getAttribute("data-terminal-id");
         if (id) {
-          const terminal = state.getTerminal(id);
-          const terminalName = terminal ? terminal.name : "this terminal";
-          ask(`Are you sure you want to close "${terminalName}"?`, {
-            title: "Close Terminal",
-            type: "warning",
-          }).then(async (confirmed) => {
-            if (confirmed) {
-              logger.info("Closing terminal", { terminalId: id });
-
-              // Stop autonomous mode if running
-              const { getAutonomousManager } = await import("./lib/autonomous-manager");
-              const autonomousManager = getAutonomousManager();
-              await autonomousManager.stopAutonomous(id);
-
-              // Stop polling and destroy terminal
-              outputPoller.stopPolling(id);
-              terminalManager.destroyTerminal(id);
-              const appLevelState = getAppLevelState();
-              if (appLevelState.getCurrentAttachedTerminalId() === id) {
-                appLevelState.setCurrentAttachedTerminalId(null);
-              }
-
-              // Remove from state
-              state.removeTerminal(id);
-              saveCurrentConfig();
-            }
+          await closeTerminalWithConfirmation(id, {
+            state,
+            outputPoller,
+            terminalManager,
+            appLevelState: getAppLevelState(),
+            saveCurrentConfig,
           });
         }
         return;
@@ -1201,7 +1158,7 @@ function setupEventListeners() {
   // Mini terminal row - event delegation for dynamic children
   const miniRow = document.getElementById("mini-terminal-row");
   if (miniRow) {
-    miniRow.addEventListener("click", (e) => {
+    miniRow.addEventListener("click", async (e) => {
       const target = e.target as HTMLElement;
 
       // Handle Restart Terminal button clicks
@@ -1232,43 +1189,12 @@ function setupEventListeners() {
         const id = target.getAttribute("data-terminal-id");
 
         if (id) {
-          // Look up the terminal to get its name
-          const terminal = state.getTerminal(id);
-          const terminalName = terminal ? terminal.name : "this terminal";
-
-          ask(`Are you sure you want to close "${terminalName}"?`, {
-            title: "Close Terminal",
-            type: "warning",
-          }).then(async (confirmed) => {
-            if (confirmed) {
-              // Look up the terminal again for the rest of the logic
-              const terminal = state.getTerminal(id);
-              if (!terminal) {
-                logger.error("Terminal not found", new Error("Terminal not found"), {
-                  terminalId: id,
-                });
-                return;
-              }
-
-              // Stop autonomous mode if running
-              const { getAutonomousManager } = await import("./lib/autonomous-manager");
-              const autonomousManager = getAutonomousManager();
-              await autonomousManager.stopAutonomous(id);
-
-              // Stop polling and clean up xterm.js instance
-              outputPoller.stopPolling(terminal.id);
-              terminalManager.destroyTerminal(terminal.id);
-
-              // If this was the current attached terminal, clear it
-              const appLevelState = getAppLevelState();
-              if (appLevelState.getCurrentAttachedTerminalId() === terminal.id) {
-                appLevelState.setCurrentAttachedTerminalId(null);
-              }
-
-              // Remove from state
-              state.removeTerminal(id);
-              saveCurrentConfig();
-            }
+          await closeTerminalWithConfirmation(id, {
+            state,
+            outputPoller,
+            terminalManager,
+            appLevelState: getAppLevelState(),
+            saveCurrentConfig,
           });
         }
         return;

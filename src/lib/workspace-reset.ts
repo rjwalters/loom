@@ -1,10 +1,8 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import {
   loadWorkspaceConfig,
-  saveConfig,
-  saveState,
+  saveCurrentConfiguration,
   setConfigWorkspace,
-  splitTerminals,
 } from "./config";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
@@ -231,13 +229,7 @@ export async function resetWorkspaceToDefaults(
         workspacePath,
         source: logPrefix,
       });
-      const terminalsToSave1 = state.getTerminals();
-      const { config: terminalConfigs1, state: terminalStates1 } = splitTerminals(terminalsToSave1);
-      await saveConfig({ terminals: terminalConfigs1 });
-      await saveState({
-        nextAgentNumber: state.getCurrentTerminalNumber(),
-        terminals: terminalStates1,
-      });
+      await saveCurrentConfiguration(state);
       logger.info("Config saved", {
         workspacePath,
         source: logPrefix,
@@ -260,13 +252,7 @@ export async function resetWorkspaceToDefaults(
         workspacePath,
         source: logPrefix,
       });
-      const terminalsToSave2 = state.getTerminals();
-      const { config: terminalConfigs2, state: terminalStates2 } = splitTerminals(terminalsToSave2);
-      await saveConfig({ terminals: terminalConfigs2 });
-      await saveState({
-        nextAgentNumber: state.getCurrentTerminalNumber(),
-        terminals: terminalStates2,
-      });
+      await saveCurrentConfiguration(state);
 
       logger.info("Workspace reset complete", {
         workspacePath,
