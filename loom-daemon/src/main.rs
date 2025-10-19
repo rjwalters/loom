@@ -1,4 +1,5 @@
 mod activity;
+mod health_monitor;
 mod ipc;
 mod logging;
 mod terminal;
@@ -53,6 +54,14 @@ async fn main() -> Result<()> {
     log::info!("Restored {} terminals", tm.list_terminals().len());
 
     let tm = Arc::new(Mutex::new(tm));
+
+    // Start optional health monitoring if enabled via environment variable
+    if let Some(interval) = health_monitor::check_env_enabled() {
+        health_monitor::start_tmux_health_monitor(interval);
+        log::info!("✅ tmux health monitoring enabled (interval: {}s)", interval);
+    } else {
+        log::debug!("tmux health monitoring disabled (set LOOM_TMUX_HEALTH_MONITOR to enable)");
+    }
 
     // Start IPC server
     let server = IpcServer::new(socket_path.clone(), tm, activity_db);
