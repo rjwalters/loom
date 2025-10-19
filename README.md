@@ -204,6 +204,44 @@ pnpm run app:dev
 
 ### CLI Usage
 
+#### Workspace Initialization (Headless Mode)
+
+Initialize a Loom workspace without launching the GUI app - perfect for CI/CD, headless servers, or manual orchestration:
+
+```bash
+# Initialize current directory
+loom-daemon init
+
+# Initialize specific repository
+loom-daemon init /path/to/your/repo
+
+# Preview changes without applying them
+loom-daemon init --dry-run
+
+# Overwrite existing .loom directory
+loom-daemon init --force
+
+# Custom defaults directory
+loom-daemon init --defaults ./custom-defaults
+```
+
+**What Gets Installed**:
+- `.loom/` - Configuration directory with terminal roles and settings
+- `CLAUDE.md` - AI context documentation for Claude Code
+- `AGENTS.md` - Agent workflow and coordination guide
+- `.claude/` - Claude Code slash commands and configuration
+- `.codex/` - Codex configuration (if available)
+- `.github/` - GitHub workflow templates and label definitions
+- `.gitignore` - Updated with Loom ephemeral patterns
+
+**Use Cases**:
+- **Manual Orchestration**: Set up Loom in a repo and run agents manually (`claude --role builder`)
+- **CI/CD Pipelines**: Initialize Loom as part of your build/deploy process
+- **Headless Servers**: Install Loom configuration without GUI dependencies
+- **Bulk Setup**: Script initialization across multiple repositories
+
+#### Launching the GUI
+
 Loom supports command-line arguments for headless automation and remote development workflows:
 
 ```bash
@@ -216,7 +254,6 @@ Loom supports command-line arguments for headless automation and remote developm
 
 **Use Cases**:
 - Automated deployment: Launch Loom with a pre-configured workspace on server startup
-- CI/CD integration: Run Loom headlessly in containerized environments
 - Remote development: Start Loom via SSH with a specific repository path
 
 The app will validate the workspace path and automatically load the configuration from `.loom/config.json` if it exists.
