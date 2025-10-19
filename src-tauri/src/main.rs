@@ -384,6 +384,34 @@ fn setup_repository_scaffolding(workspace_path: &Path, defaults_path: &Path) -> 
     Ok(())
 }
 
+/// Ensure repository scaffolding is set up for an existing workspace
+///
+/// This function should be called when attaching to an existing repository to ensure
+/// that necessary files (.claude/, CLAUDE.md, .codex/, AGENTS.md) exist.
+///
+/// Unlike init_loom_directory, this ONLY sets up the scaffolding, not the .loom/ directory.
+#[tauri::command]
+fn ensure_workspace_scaffolding(workspace_path: &str) -> Result<(), String> {
+    let workspace = Path::new(workspace_path);
+
+    // Validate that workspace exists and is a directory
+    if !workspace.exists() {
+        return Err(format!("Workspace path does not exist: {workspace_path}"));
+    }
+
+    if !workspace.is_dir() {
+        return Err(format!("Workspace path is not a directory: {workspace_path}"));
+    }
+
+    // Get defaults path
+    let defaults = resolve_defaults_path("defaults")?;
+
+    // Setup scaffolding (only copies files that don't exist)
+    setup_repository_scaffolding(workspace, &defaults)?;
+
+    Ok(())
+}
+
 // Helper function to find git repository root by searching for .git directory
 fn find_git_root() -> Option<std::path::PathBuf> {
     // Start from current directory
@@ -1761,6 +1789,7 @@ fn main() {
             reset_github_labels,
             create_local_project,
             create_github_repository,
+            ensure_workspace_scaffolding,
             emit_menu_event,
             emit_event,
             append_to_console_log,
