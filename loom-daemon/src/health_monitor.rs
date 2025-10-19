@@ -40,7 +40,10 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> JoinHandle<()> {
         match output {
             Ok(out) if out.status.success() => {
                 let stdout_str = String::from_utf8_lossy(&out.stdout);
-                let sessions: Vec<_> = stdout_str.lines().filter(|s| s.starts_with("loom-")).collect();
+                let sessions: Vec<_> = stdout_str
+                    .lines()
+                    .filter(|s| s.starts_with("loom-"))
+                    .collect();
 
                 log::info!("📊 tmux health check: {} loom sessions active", sessions.len());
 
