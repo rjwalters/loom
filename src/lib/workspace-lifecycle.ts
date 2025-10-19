@@ -84,6 +84,19 @@ export async function handleWorkspacePathInput(
     return;
   }
 
+  // Ensure repository scaffolding (CLAUDE.md, .claude/, .codex/, AGENTS.md) is set up
+  // This ensures agents have proper configuration files even when attaching to existing repos
+  try {
+    await invoke("ensure_workspace_scaffolding", { workspacePath: expandedPath });
+    logger.info("Repository scaffolding ensured", { workspacePath: expandedPath });
+  } catch (error) {
+    logger.warn("Failed to ensure repository scaffolding", {
+      workspacePath: expandedPath,
+      error: String(error),
+    });
+    // Non-fatal - workspace can still be used, but some features may not work optimally
+  }
+
   // Check if Loom is initialized in this workspace
   try {
     const isInitialized = await invoke<boolean>("check_loom_initialized", { path: expandedPath });
