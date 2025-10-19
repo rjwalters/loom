@@ -795,6 +795,21 @@ if (!eventListenersRegistered) {
     }
   });
 
+  // Restart Terminal - triggered by MCP command
+  listen("restart-terminal", async (event) => {
+    const terminalId = event.payload as string;
+    if (!terminalId) {
+      logger.error(
+        "Restart terminal event received without terminal ID",
+        new Error("Missing terminal ID")
+      );
+      return;
+    }
+
+    logger.info("Restarting terminal via MCP command", { terminalId });
+    await handleRestartTerminal(terminalId, { state, saveCurrentConfig });
+  });
+
   listen("toggle-theme", () => {
     toggleTheme();
   });

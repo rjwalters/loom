@@ -142,6 +142,14 @@ fn process_command_file(window: &Window, command_file: &PathBuf) {
             safe_eprintln!("[MCP Watcher] Emitting force-factory-reset-workspace event");
             window.emit("force-factory-reset-workspace", ())
         }
+        cmd if cmd.starts_with("restart_terminal:") => {
+            // Parse terminal ID from command string
+            let terminal_id = cmd.strip_prefix("restart_terminal:").unwrap_or("");
+            safe_eprintln!(
+                "[MCP Watcher] Emitting restart-terminal event for terminal: {terminal_id}"
+            );
+            window.emit("restart-terminal", terminal_id)
+        }
         _ => {
             safe_eprintln!("[MCP Watcher] Unknown command: {}", mcp_cmd.command);
             Ok(())
