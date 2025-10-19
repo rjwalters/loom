@@ -5,10 +5,14 @@
  * restarting terminals, and inline renaming. These are called from event handlers in main.ts.
  */
 
+import { ask } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
+import type { AppLevelState } from "./app-state";
 import { Logger } from "./logger";
+import type { OutputPoller } from "./output-poller";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
+import type { TerminalManager } from "./terminal-manager";
 
 const logger = Logger.forComponent("terminal-actions");
 
@@ -19,6 +23,17 @@ export interface TerminalActionDependencies {
   state: AppState;
   saveCurrentConfig: () => Promise<void>;
   render: () => void;
+}
+
+/**
+ * Dependencies required for closing terminals
+ */
+export interface CloseTerminalDependencies {
+  state: AppState;
+  outputPoller: OutputPoller;
+  terminalManager: TerminalManager;
+  appLevelState: AppLevelState;
+  saveCurrentConfig: () => Promise<void>;
 }
 
 /**
@@ -233,4 +248,68 @@ export function startRename(
   input.addEventListener("blur", () => {
     commit();
   });
+}
+
+/**
+ * Close a terminal with confirmation dialog
+ *
+ * Shows a confirmation dialog before closing the terminal. If confirmed:
+ * - Stops autonomous mode if running
+ * - Stops output polling
+ * - Destroys the terminal session
+ * - Clears attached terminal ID if needed
+ * - Removes terminal from state
+ * - Saves configuration
+ *
+ * @param terminalId - The ID of the terminal to close
+ * @param deps - Dependencies (state, outputPoller, terminalManager, appLevelState, saveCurrentConfig)
+ * @returns Promise that resolves when the terminal is closed or user cancels
+ */
+export async function closeTerminalWithConfirmation(
+  terminalId: string,
+  deps: CloseTerminalDependencies
+): Promise<void> {
+  const { state, outputPoller, terminalManager, appLevelState, saveCurrentConfig } = deps;
+
+  const terminal = state.getTerminal(terminalId);
+  if (!terminal) {
+    logger.error("Terminal not found", new Error("Terminal not found"), {
+      terminalId,
+    });
+    return;
+  }
+
+  // Ask for confirmation
+  const confirmed = await ask(`Are you sure you want to close "${terminal.name}"?`, {
+    title: "Close Terminal",
+    type: "warning",
+  });
+
+  if (!confirmed) {
+    return;
+  }
+
+  logger.info("Closing terminal", { terminalId });
+
+  // Stop autonomous mode if running
+  const { getAutonomousManager } = await import("./autonomous-manager");
+  const autonomousManager = getAutonomousManager();
+  await autonomousManager.stopAutonomous(terminalId);
+
+  // Stop polling and destroy terminal
+  outputPoller.stopPolling(terminalId);
+  terminalManager.destroyTerminal(terminalId);
+
+  // Clear attached terminal ID if it matches
+  if (appLevelState.getCurrentAttachedTerminalId() === terminalId) {
+    appLevelState.setCurrentAttachedTerminalId(null);
+  }
+
+  // Remove from state
+  state.removeTerminal(terminalId);
+
+  // Save configuration
+  await saveCurrentConfig();
+
+  logger.info("Terminal closed successfully", { terminalId });
 }
