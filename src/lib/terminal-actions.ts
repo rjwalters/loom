@@ -313,3 +313,69 @@ export async function closeTerminalWithConfirmation(
 
   logger.info("Terminal closed successfully", { terminalId });
 }
+
+/**
+ * Create a plain shell terminal
+ *
+ * Creates a new terminal in the workspace directory with the default role.
+ * Automatically generates a worktree for the terminal and switches to it.
+ *
+ * @param deps - Dependencies for terminal creation
+ */
+export async function createPlainTerminal(deps: {
+  state: AppState;
+  workspacePath: string;
+  generateNextConfigId: (terminals: import("./state").Terminal[]) => string;
+  saveCurrentConfig: () => Promise<void>;
+}): Promise<void> {
+  const { state, workspacePath, generateNextConfigId, saveCurrentConfig } = deps;
+
+  // Generate terminal name
+  const terminalCount = state.getTerminals().length + 1;
+  const name = `Terminal ${terminalCount}`;
+
+  try {
+    // Generate stable ID first
+    const id = generateNextConfigId(state.getTerminals());
+
+    // Get instance number for this terminal
+    const instanceNumber = state.getNextTerminalNumber();
+
+    // Create terminal in workspace directory
+    const terminalId = await invoke<string>("create_terminal", {
+      configId: id,
+      name,
+      workingDir: workspacePath,
+      role: "default",
+      instanceNumber,
+    });
+
+    logger.info("Created terminal", { name, id, tmuxId: terminalId });
+
+    // Create worktree for this terminal
+    logger.info("Creating worktree for terminal", { name, id });
+    const { setupWorktreeForAgent } = await import("./worktree-manager");
+    const worktreePath = await setupWorktreeForAgent(id, workspacePath);
+    logger.info("Created worktree", { name, id, worktreePath });
+
+    // Add to state with default role (plain shell / driver)
+    state.addTerminal({
+      id,
+      name,
+      worktreePath,
+      status: TerminalStatus.Idle,
+      isPrimary: false,
+      role: "default",
+      theme: "default",
+    });
+
+    // Save updated state to config
+    await saveCurrentConfig();
+
+    // Switch to new terminal
+    state.setPrimary(id);
+  } catch (error) {
+    logger.error("Failed to create terminal", error, { workspacePath });
+    alert(`Failed to create terminal: ${error}`);
+  }
+}

@@ -2,6 +2,7 @@ import "./style.css";
 import { ask } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
+import { initializeApp } from "./lib/app-initializer";
 import { getAppLevelState } from "./lib/app-state";
 import { saveCurrentConfiguration, setConfigWorkspace } from "./lib/config";
 import { initConsoleLogger } from "./lib/console-logger";
@@ -13,6 +14,7 @@ import { getOutputPoller } from "./lib/output-poller";
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import {
   closeTerminalWithConfirmation,
+  createPlainTerminal,
   handleRestartTerminal,
   handleRunNowClick,
   startRename,
@@ -335,144 +337,7 @@ async function initializeTerminalDisplay(terminalId: string) {
 }
 
 // Check dependencies on startup
-async function checkDependenciesOnStartup(): Promise<boolean> {
-  const { checkAndReportDependencies } = await import("./lib/dependency-checker");
-  const hasAllDependencies = await checkAndReportDependencies();
-
-  if (!hasAllDependencies) {
-    // User chose not to retry, close the app gracefully
-    logger.error("Missing dependencies, exiting", new Error("Missing dependencies"));
-    const { exit } = await import("@tauri-apps/api/process");
-    await exit(1);
-    return false;
-  }
-
-  return true;
-}
-
-// Initialize app with auto-load workspace
-async function initializeApp() {
-  // Set initializing state to show loading UI
-  state.setInitializing(true);
-  logger.info("Starting initialization");
-
-  // Check dependencies first
-  const hasAllDependencies = await checkDependenciesOnStartup();
-  if (!hasAllDependencies) {
-    state.setInitializing(false);
-    return; // Exit early if dependencies are missing
-  }
-
-  // PRIORITY 1: Check for CLI workspace argument (highest priority)
-  try {
-    const cliWorkspace = await invoke<string | null>("get_cli_workspace");
-    if (cliWorkspace) {
-      logger.info("Found CLI workspace argument", {
-        cliWorkspace,
-        priority: "highest",
-      });
-      logger.info("Using CLI workspace (takes precedence over stored workspace)");
-
-      // Validate CLI workspace
-      const isValid = await validateWorkspacePath(cliWorkspace);
-      if (isValid) {
-        logger.info("CLI workspace is valid, loading", { cliWorkspace });
-        await handleWorkspacePathInput(cliWorkspace);
-        state.setInitializing(false);
-        return; // CLI workspace loaded successfully - skip stored workspace
-      }
-
-      logger.warn("CLI workspace is invalid, falling back to stored workspace", {
-        cliWorkspace,
-      });
-    } else {
-      logger.info("No CLI workspace argument provided");
-    }
-  } catch (error) {
-    logger.error("Failed to get CLI workspace", error);
-    // Continue to stored workspace fallback
-  }
-
-  // PRIORITY 2: Try to restore workspace from localStorage (for HMR survival)
-  const localStorageWorkspace = state.restoreWorkspaceFromLocalStorage();
-  if (localStorageWorkspace) {
-    logger.info("Restored workspace from localStorage (HMR survival)", {
-      localStorageWorkspace,
-    });
-    logger.info("This prevents HMR from clearing the workspace during hot reload");
-  }
-
-  try {
-    // PRIORITY 3: Check for stored workspace in Tauri storage (lowest priority)
-    const storedPath = await invoke<string | null>("get_stored_workspace");
-
-    if (storedPath) {
-      logger.info("Found stored workspace", { storedPath, priority: "lowest" });
-
-      // Validate stored workspace is still valid
-      const isValid = await validateWorkspacePath(storedPath);
-
-      if (isValid) {
-        // Load workspace automatically
-        logger.info("Loading stored workspace", { storedPath });
-        await handleWorkspacePathInput(storedPath);
-        state.setInitializing(false);
-        return;
-      }
-
-      // Path no longer valid - clear it and show picker
-      logger.info("Stored workspace invalid, clearing", { storedPath });
-      await invoke("clear_stored_workspace");
-      localStorage.removeItem("loom:workspace"); // Also clear localStorage
-    } else if (localStorageWorkspace) {
-      // No Tauri storage but have localStorage (HMR case)
-      logger.info("Using localStorage workspace after HMR", {
-        localStorageWorkspace,
-      });
-      const isValid = await validateWorkspacePath(localStorageWorkspace);
-
-      if (isValid) {
-        logger.info("localStorage workspace is valid, loading", {
-          localStorageWorkspace,
-        });
-        await handleWorkspacePathInput(localStorageWorkspace);
-        state.setInitializing(false);
-        return;
-      }
-
-      // Invalid - clear it
-      logger.info("localStorage workspace is invalid, clearing", {
-        localStorageWorkspace,
-      });
-      localStorage.removeItem("loom:workspace");
-    }
-  } catch (error) {
-    logger.error("Failed to load stored workspace", error);
-
-    // If Tauri storage failed but we have localStorage, try that
-    if (localStorageWorkspace) {
-      logger.info("Tauri storage failed, trying localStorage workspace", {
-        localStorageWorkspace,
-      });
-      const isValid = await validateWorkspacePath(localStorageWorkspace);
-      if (isValid) {
-        logger.info("localStorage workspace is valid, loading", {
-          localStorageWorkspace,
-        });
-        await handleWorkspacePathInput(localStorageWorkspace);
-        state.setInitializing(false);
-        return;
-      }
-
-      logger.info("localStorage workspace is invalid", { localStorageWorkspace });
-    }
-  }
-
-  // No workspace found or all validation failed - show picker
-  logger.info("No valid workspace found, showing workspace picker");
-  state.setInitializing(false);
-  render();
-}
+// App initialization moved to src/lib/app-initializer.ts
 
 // Re-render on state changes
 state.onChange(render);
@@ -495,7 +360,12 @@ if (!eventListenersRegistered) {
   // Listen for menu events
   listen("new-terminal", () => {
     if (state.hasWorkspace()) {
-      createPlainTerminal();
+      createPlainTerminal({
+        state,
+        workspacePath: state.getWorkspaceOrThrow(),
+        generateNextConfigId,
+        saveCurrentConfig,
+      });
     }
   });
 
@@ -844,7 +714,12 @@ async function showDaemonStatusDialog() {
 }
 
 // Initialize app
-initializeApp();
+initializeApp({
+  state,
+  validateWorkspacePath,
+  handleWorkspacePathInput,
+  render,
+});
 
 // Drag and drop state moved to src/lib/drag-drop-manager.ts
 
@@ -858,64 +733,7 @@ async function saveCurrentConfig() {
 }
 
 // Workspace utilities (validation, browsing, ID generation) are now in src/lib/workspace-utils.ts
-
-// Create a plain shell terminal
-async function createPlainTerminal() {
-  if (!state.hasWorkspace()) {
-    alert("No workspace selected");
-    return;
-  }
-  const workspacePath = state.getWorkspaceOrThrow();
-
-  // Generate terminal name
-  const terminalCount = state.getTerminals().length + 1;
-  const name = `Terminal ${terminalCount}`;
-
-  try {
-    // Generate stable ID first
-    const id = generateNextConfigId(state.getTerminals());
-
-    // Get instance number for this terminal
-    const instanceNumber = state.getNextTerminalNumber();
-
-    // Create terminal in workspace directory
-    const terminalId = await invoke<string>("create_terminal", {
-      configId: id,
-      name,
-      workingDir: workspacePath,
-      role: "default",
-      instanceNumber,
-    });
-
-    logger.info("Created terminal", { name, id, tmuxId: terminalId });
-
-    // Create worktree for this terminal
-    logger.info("Creating worktree for terminal", { name, id });
-    const { setupWorktreeForAgent } = await import("./lib/worktree-manager");
-    const worktreePath = await setupWorktreeForAgent(id, workspacePath);
-    logger.info("Created worktree", { name, id, worktreePath });
-
-    // Add to state with default role (plain shell / driver)
-    state.addTerminal({
-      id,
-      name,
-      worktreePath,
-      status: TerminalStatus.Idle,
-      isPrimary: false,
-      role: "default",
-      theme: "default",
-    });
-
-    // Save updated state to config
-    await saveCurrentConfig();
-
-    // Switch to new terminal
-    state.setPrimary(id);
-  } catch (error) {
-    logger.error("Failed to create terminal", error, { workspacePath });
-    alert(`Failed to create terminal: ${error}`);
-  }
-}
+// Terminal creation (createPlainTerminal) moved to src/lib/terminal-actions.ts
 
 // Handle manual workspace path entry (wrapper for workspace-lifecycle module)
 async function handleWorkspacePathInput(path: string) {
@@ -1113,7 +931,12 @@ function setupEventListeners() {
         }
 
         // Create plain terminal
-        createPlainTerminal();
+        createPlainTerminal({
+          state,
+          workspacePath: state.getWorkspaceOrThrow(),
+          generateNextConfigId,
+          saveCurrentConfig,
+        });
         return;
       }
 
