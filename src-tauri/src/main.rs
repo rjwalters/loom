@@ -389,7 +389,7 @@ fn setup_repository_scaffolding(workspace_path: &Path, defaults_path: &Path) -> 
 /// This function should be called when attaching to an existing repository to ensure
 /// that necessary files (.claude/, CLAUDE.md, .codex/, AGENTS.md) exist.
 ///
-/// Unlike init_loom_directory, this ONLY sets up the scaffolding, not the .loom/ directory.
+/// Unlike `init_loom_directory`, this ONLY sets up the scaffolding, not the .loom/ directory.
 #[tauri::command]
 fn ensure_workspace_scaffolding(workspace_path: &str) -> Result<(), String> {
     let workspace = Path::new(workspace_path);
