@@ -9,12 +9,12 @@ import { getHealthMonitor } from "./lib/health-monitor";
 import { Logger } from "./lib/logger";
 import { getOutputPoller } from "./lib/output-poller";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
-import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+import { AppState, setAppState, TerminalStatus } from "./lib/state";
 import { handleRestartTerminal, handleRunNowClick, startRename } from "./lib/terminal-actions";
 import {
-  launchAgentsForTerminals as launchAgentsForTerminalsCore,
-  reconnectTerminals as reconnectTerminalsCore,
-  verifyTerminalSessions as verifyTerminalSessionsCore,
+  launchAgentsForTerminals,
+  reconnectTerminals,
+  verifyTerminalSessions,
 } from "./lib/terminal-lifecycle";
 // NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
 // are defined locally in this file, not imported from terminal-lifecycle
@@ -28,7 +28,7 @@ import {
   renderPrimaryTerminal,
 } from "./lib/ui";
 import { attachWorkspaceEventListeners, setupTooltips } from "./lib/ui-event-handlers";
-import { handleWorkspacePathInput as handleWorkspacePathInputCore } from "./lib/workspace-lifecycle";
+import { handleWorkspacePathInput } from "./lib/workspace-lifecycle";
 import { clearWorkspaceError, showWorkspaceError } from "./lib/workspace-utils";
 
 // NOTE: validateWorkspacePath and browseWorkspace are defined locally in this file
@@ -215,7 +215,15 @@ function render() {
   // Re-attach workspace event listeners if they were just rendered
   if (!hasWorkspace) {
     attachWorkspaceEventListeners(
-      handleWorkspacePathInput,
+      (path) =>
+        handleWorkspacePathInput(path, {
+          state,
+          validateWorkspacePath,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+          reconnectTerminals: () =>
+            reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+          verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+        }),
       browseWorkspace,
       () => state.getWorkspace() || ""
     );
@@ -409,7 +417,14 @@ async function initializeApp() {
       const isValid = await validateWorkspacePath(cliWorkspace);
       if (isValid) {
         logger.info("CLI workspace is valid, loading", { cliWorkspace });
-        await handleWorkspacePathInput(cliWorkspace);
+        await handleWorkspacePathInput(cliWorkspace, {
+          state,
+          validateWorkspacePath,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+          reconnectTerminals: () =>
+            reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+          verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+        });
         state.setInitializing(false);
         return; // CLI workspace loaded successfully - skip stored workspace
       }
@@ -447,7 +462,14 @@ async function initializeApp() {
       if (isValid) {
         // Load workspace automatically
         logger.info("Loading stored workspace", { storedPath });
-        await handleWorkspacePathInput(storedPath);
+        await handleWorkspacePathInput(storedPath, {
+          state,
+          validateWorkspacePath,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+          reconnectTerminals: () =>
+            reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+          verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+        });
         state.setInitializing(false);
         return;
       }
@@ -467,7 +489,14 @@ async function initializeApp() {
         logger.info("localStorage workspace is valid, loading", {
           localStorageWorkspace,
         });
-        await handleWorkspacePathInput(localStorageWorkspace);
+        await handleWorkspacePathInput(localStorageWorkspace, {
+          state,
+          validateWorkspacePath,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+          reconnectTerminals: () =>
+            reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+          verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+        });
         state.setInitializing(false);
         return;
       }
@@ -491,7 +520,14 @@ async function initializeApp() {
         logger.info("localStorage workspace is valid, loading", {
           localStorageWorkspace,
         });
-        await handleWorkspacePathInput(localStorageWorkspace);
+        await handleWorkspacePathInput(localStorageWorkspace, {
+          state,
+          validateWorkspacePath,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+          reconnectTerminals: () =>
+            reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+          verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+        });
         state.setInitializing(false);
         return;
       }
@@ -521,7 +557,14 @@ if (!eventListenersRegistered) {
   listen("cli-workspace", (event) => {
     const workspacePath = event.payload as string;
     logger.info("Loading workspace from CLI argument", { workspacePath });
-    handleWorkspacePathInput(workspacePath);
+    handleWorkspacePathInput(workspacePath, {
+      state,
+      validateWorkspacePath,
+      launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+      reconnectTerminals: () =>
+        reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+      verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+    });
   });
 
   // Listen for menu events
@@ -643,7 +686,7 @@ if (!eventListenersRegistered) {
         setCurrentAttachedTerminalId: (id) => {
           getAppLevelState().setCurrentAttachedTerminalId(id);
         },
-        launchAgentsForTerminals,
+        launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
         render,
         markTerminalsHealthChecked: (terminalIds) => {
           terminalIds.forEach((id) => healthCheckedTerminals.add(id));
@@ -683,7 +726,7 @@ if (!eventListenersRegistered) {
         setCurrentAttachedTerminalId: (id) => {
           getAppLevelState().setCurrentAttachedTerminalId(id);
         },
-        launchAgentsForTerminals,
+        launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
         render,
         markTerminalsHealthChecked: (terminalIds) => {
           terminalIds.forEach((id) => healthCheckedTerminals.add(id));
@@ -743,7 +786,7 @@ if (!eventListenersRegistered) {
           setCurrentAttachedTerminalId: (id) => {
             getAppLevelState().setCurrentAttachedTerminalId(id);
           },
-          launchAgentsForTerminals,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
           render,
         },
         "factory-reset-workspace"
@@ -784,7 +827,7 @@ if (!eventListenersRegistered) {
           setCurrentAttachedTerminalId: (id) => {
             getAppLevelState().setCurrentAttachedTerminalId(id);
           },
-          launchAgentsForTerminals,
+          launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
           render,
         },
         "force-factory-reset-workspace"
@@ -871,7 +914,11 @@ async function showDaemonStatusDialog() {
 
       if (shouldReconnect) {
         logger.info("User requested terminal reconnection");
-        await reconnectTerminals();
+        await reconnectTerminals({
+          state,
+          initializeTerminalDisplay,
+          saveCurrentConfig,
+        });
         alert("Terminal reconnection complete! Check the console for details.");
       }
     } else {
@@ -941,7 +988,14 @@ async function browseWorkspace() {
     });
 
     if (selected && typeof selected === "string") {
-      await handleWorkspacePathInput(selected);
+      await handleWorkspacePathInput(selected, {
+        state,
+        validateWorkspacePath,
+        launchAgentsForTerminals: (wp, t) => launchAgentsForTerminals(wp, t, { state }),
+        reconnectTerminals: () =>
+          reconnectTerminals({ state, initializeTerminalDisplay, saveCurrentConfig }),
+        verifyTerminalSessions: () => verifyTerminalSessions({ state }),
+      });
     }
   } catch (error) {
     logger.error("Error selecting workspace", error);
@@ -1019,36 +1073,6 @@ async function createPlainTerminal() {
     logger.error("Failed to create terminal", error, { workspacePath });
     alert(`Failed to create terminal: ${error}`);
   }
-}
-
-// Launch agents for terminals (wrapper for terminal-lifecycle module)
-async function launchAgentsForTerminals(workspacePath: string, terminals: Terminal[]) {
-  await launchAgentsForTerminalsCore(workspacePath, terminals, { state });
-}
-
-// Verify terminal sessions health (wrapper for terminal-lifecycle module)
-async function verifyTerminalSessions(): Promise<void> {
-  await verifyTerminalSessionsCore({ state });
-}
-
-// Reconnect terminals to daemon (wrapper for terminal-lifecycle module)
-async function reconnectTerminals() {
-  await reconnectTerminalsCore({
-    state,
-    initializeTerminalDisplay,
-    saveCurrentConfig,
-  });
-}
-
-// Handle manual workspace path entry (wrapper for workspace-lifecycle module)
-async function handleWorkspacePathInput(path: string) {
-  await handleWorkspacePathInputCore(path, {
-    state,
-    validateWorkspacePath,
-    launchAgentsForTerminals,
-    reconnectTerminals,
-    verifyTerminalSessions,
-  });
 }
 
 // Terminal action handlers are now in src/lib/terminal-actions.ts

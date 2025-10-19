@@ -130,9 +130,7 @@ async fn test_create_terminal_with_working_dir() {
     // The output should contain the actual directory path from pwd command
     assert!(
         output.contains(&working_dir),
-        "Expected working directory '{}' in output, got: '{}'",
-        working_dir,
-        output
+        "Expected working directory '{working_dir}' in output, got: '{output}'"
     );
 
     // Cleanup
@@ -295,7 +293,7 @@ async fn test_send_input() {
     let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
 
     // Verify echoed output appears in terminal
-    assert!(output.contains("hello"), "Expected 'hello' in output, got: {}", output);
+    assert!(output.contains("hello"), "Expected 'hello' in output, got: {output}");
 
     // Cleanup
     cleanup_all_loom_sessions();
