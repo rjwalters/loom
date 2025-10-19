@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     // Start optional health monitoring if enabled via environment variable
     if let Some(interval) = health_monitor::check_env_enabled() {
         health_monitor::start_tmux_health_monitor(interval);
-        log::info!("✅ tmux health monitoring enabled (interval: {}s)", interval);
+        log::info!("✅ tmux health monitoring enabled (interval: {interval}s)");
     } else {
         log::debug!("tmux health monitoring disabled (set LOOM_TMUX_HEALTH_MONITOR to enable)");
     }

@@ -300,10 +300,10 @@ GROUP BY template_id;
 Agents can reference templates in their role definitions:
 
 ```markdown
-<!-- .loom/roles/worker.md -->
-# Worker Bot
+<!-- .loom/roles/builder.md -->
+# Builder Bot
 
-You are a development worker for the {{workspace}} repository.
+You are a development builder for the {{workspace}} repository.
 
 ## Available Templates
 You have access to these prompt templates via the syntax `@template:template-id`:

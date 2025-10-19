@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import stripAnsi from "strip-ansi";
 
 const execAsync = promisify(exec);
 
@@ -120,7 +121,9 @@ async function getTerminalOutput(terminalId: string, lines = 100): Promise<strin
       return "(empty terminal output)";
     }
 
-    return relevantLines.join("\n");
+    // Strip ANSI escape sequences from output before returning
+    const cleanOutput = relevantLines.map((line) => stripAnsi(line)).join("\n");
+    return cleanOutput;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return `Terminal output file not found for ${terminalId}.\n\nThis usually means:\n- The terminal hasn't been created yet, or\n- The terminal was closed`;

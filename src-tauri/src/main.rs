@@ -31,11 +31,6 @@ struct GhIssue {
     number: u32,
 }
 
-#[derive(serde::Deserialize)]
-struct GhPr {
-    number: u32,
-}
-
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {name}! Welcome to Loom.")
@@ -380,6 +375,34 @@ fn setup_repository_scaffolding(workspace_path: &Path, defaults_path: &Path) -> 
                 .map_err(|e| format!("Failed to copy .codex directory: {e}"))?;
         }
     }
+
+    Ok(())
+}
+
+/// Ensure repository scaffolding is set up for an existing workspace
+///
+/// This function should be called when attaching to an existing repository to ensure
+/// that necessary files (.claude/, CLAUDE.md, .codex/, AGENTS.md) exist.
+///
+/// Unlike `init_loom_directory`, this ONLY sets up the scaffolding, not the .loom/ directory.
+#[tauri::command]
+fn ensure_workspace_scaffolding(workspace_path: &str) -> Result<(), String> {
+    let workspace = Path::new(workspace_path);
+
+    // Validate that workspace exists and is a directory
+    if !workspace.exists() {
+        return Err(format!("Workspace path does not exist: {workspace_path}"));
+    }
+
+    if !workspace.is_dir() {
+        return Err(format!("Workspace path is not a directory: {workspace_path}"));
+    }
+
+    // Get defaults path
+    let defaults = resolve_defaults_path("defaults")?;
+
+    // Setup scaffolding (only copies files that don't exist)
+    setup_repository_scaffolding(workspace, &defaults)?;
 
     Ok(())
 }
@@ -955,7 +978,6 @@ fn update_github_label(name: &str, description: &str, color: &str) -> Result<(),
 #[derive(serde::Serialize)]
 struct LabelResetResult {
     issues_cleaned: usize,
-    prs_updated: usize,
     errors: Vec<String>,
 }
 
@@ -964,7 +986,6 @@ struct LabelResetResult {
 fn reset_github_labels() -> Result<LabelResetResult, String> {
     let mut result = LabelResetResult {
         issues_cleaned: 0,
-        prs_updated: 0,
         errors: Vec::new(),
     };
 
@@ -1008,54 +1029,6 @@ fn reset_github_labels() -> Result<LabelResetResult, String> {
                 let error = format!(
                     "Failed to remove loom:in-progress from issue {issue_num}: {}",
                     String::from_utf8_lossy(&remove_output.stderr)
-                );
-                result.errors.push(error);
-            }
-        }
-    }
-
-    // Step 2: Replace loom:reviewing with loom:review-requested on PRs
-    let prs_output = Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--label",
-            "loom:reviewing",
-            "--state",
-            "open",
-            "--json",
-            "number",
-        ])
-        .output()
-        .map_err(|e| format!("Failed to list PRs: {e}"))?;
-
-    if prs_output.status.success() {
-        // Parse JSON in Rust instead of using jq to prevent injection
-        let prs: Vec<GhPr> = serde_json::from_slice(&prs_output.stdout)
-            .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
-
-        for pr in prs {
-            let pr_num = pr.number.to_string();
-
-            let edit_output = Command::new("gh")
-                .args([
-                    "pr",
-                    "edit",
-                    &pr_num,
-                    "--remove-label",
-                    "loom:reviewing",
-                    "--add-label",
-                    "loom:review-requested",
-                ])
-                .output()
-                .map_err(|e| format!("Failed to update PR labels: {e}"))?;
-
-            if edit_output.status.success() {
-                result.prs_updated += 1;
-            } else {
-                let error = format!(
-                    "Failed to update labels on PR {pr_num}: {}",
-                    String::from_utf8_lossy(&edit_output.stderr)
                 );
                 result.errors.push(error);
             }
@@ -1761,6 +1734,7 @@ fn main() {
             reset_github_labels,
             create_local_project,
             create_github_repository,
+            ensure_workspace_scaffolding,
             emit_menu_event,
             emit_event,
             append_to_console_log,
