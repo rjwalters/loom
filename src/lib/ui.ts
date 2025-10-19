@@ -235,6 +235,7 @@ export function renderPrimaryTerminal(
         <span class="text-xs text-gray-500 dark:text-gray-400">• ${roleLabel}</span>
       </div>
       <div class="flex items-center gap-1">
+        ${createRestartButtonHTML(terminal, "primary")}
         ${createRunNowButtonHTML(terminal, "primary")}
         <button
           id="terminal-clear-btn"
@@ -431,6 +432,42 @@ export function renderMiniTerminals(
 }
 
 /**
+ * Create "Restart Terminal" button HTML
+ *
+ * Shown for all terminals to allow quick restart of the tmux session
+ *
+ * @param terminal - The terminal to create the button for
+ * @param context - Whether this is for "primary" or "mini" view
+ * @returns HTML string for the button
+ */
+function createRestartButtonHTML(terminal: Terminal, context: "primary" | "mini"): string {
+  // Different styling for primary vs mini view
+  const buttonClasses =
+    context === "primary"
+      ? "p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors restart-terminal-btn"
+      : "p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors restart-terminal-btn";
+
+  const iconClasses =
+    context === "primary"
+      ? "w-4 h-4 text-gray-600 dark:text-gray-300"
+      : "w-3 h-3 text-gray-600 dark:text-gray-300";
+
+  return `
+    <button
+      data-terminal-id="${terminal.id}"
+      data-tooltip="Restart terminal"
+      data-tooltip-position="bottom"
+      class="${buttonClasses}"
+      title="Restart terminal"
+    >
+      <svg class="${iconClasses}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+      </svg>
+    </button>
+  `;
+}
+
+/**
  * Create "Run Now" button HTML for interval mode terminals
  *
  * Only shown for terminals with autonomous mode enabled (targetInterval > 0)
@@ -584,6 +621,7 @@ function createMiniTerminalHTML(
                 <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
               </div>
               <div class="flex items-center gap-0.5 flex-shrink-0">
+                ${createRestartButtonHTML(terminal, "mini")}
                 ${createRunNowButtonHTML(terminal, "mini")}
                 <button
                   class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
