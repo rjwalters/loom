@@ -262,6 +262,124 @@ Users can override these in the Terminal Settings modal.
 3. **Intervals**: Curator/Reviewer 5min, Architect/Triage 15min
 4. **Monitor blocked**: Auto-resolve or escalate
 
+## Common Mistakes
+
+### Missing GitHub Auto-Close Keywords (Critical)
+
+**Problem**: PR uses "Issue #123" or "Addresses #123" instead of magic keywords, leaving issues open after merge.
+
+**Impact**:
+- ❌ Completed issues stay open (appears incomplete)
+- ❌ Stale backlog clutter
+- ❌ Manual cleanup work for maintainers
+- ❌ Confusion about project status
+
+**Root Cause**: GitHub **only** auto-closes issues when PRs use specific keywords:
+- ✅ `Closes #X`
+- ✅ `Fixes #X`
+- ✅ `Resolves #X`
+- ✅ `Closing #X`
+- ✅ `Fixed #X`
+- ✅ `Resolved #X`
+
+**Wrong vs Right:**
+
+```markdown
+# ❌ WRONG - Issue stays open after merge
+## Summary
+This PR implements the feature requested in issue #123.
+
+## Changes
+...
+
+# ✅ CORRECT - Issue auto-closes on merge
+## Summary
+Implement new feature to improve user experience.
+
+## Changes
+...
+
+Closes #123
+```
+
+**Prevention (Multi-Layered):**
+
+1. **Builder** (Prevention):
+   - Always use `gh pr create` with "Closes #X" in body
+   - See Builder role docs for PR creation checklist
+   - Put keyword on its own line at end of description
+
+2. **Judge** (Checkpoint):
+   - Verify PR description has magic keyword BEFORE reviewing code
+   - Request changes immediately if missing
+   - Don't approve PRs without proper issue linking
+
+3. **Guide** (Verification):
+   - Check recently merged PRs (every 15-30 min)
+   - Find orphaned issues that should have closed
+   - Manually close with explanatory comment
+
+**Example Fix (Guide role):**
+
+```bash
+# Found: PR #344 merged but issue #339 still open
+gh issue close 339 --comment "✅ **Closing completed issue**
+
+This issue was completed in PR #344 (merged 2025-10-18) but stayed open because the PR didn't use the magic keyword syntax.
+
+**What happened:**
+- PR #344 used 'Issue #339' instead of 'Closes #339'
+- GitHub only auto-closes with specific keywords
+- Manual closure now to clean up backlog
+
+**To prevent this:** See Builder role docs on PR creation - always use 'Closes #X' syntax."
+```
+
+**References:**
+- Builder role: `defaults/roles/builder.md` - PR creation requirements
+- Judge role: `defaults/roles/judge.md` - PR link verification checklist
+- Guide role: `defaults/roles/guide.md` - Verification procedures
+
+### Forgetting to Update PR Labels
+
+**Problem**: Worker creates PR but forgets to add `loom:review-requested` label.
+
+**Impact**: Reviewer (Judge) won't find the PR, delaying review.
+
+**Prevention**:
+```bash
+# Always include label when creating PR
+gh pr create --label "loom:review-requested"
+```
+
+### Claiming Blocked Dependencies
+
+**Problem**: Worker claims issue before checking if dependencies are complete.
+
+**Impact**: Gets stuck mid-work, wastes time.
+
+**Prevention**:
+```bash
+# Before claiming, check for Dependencies section
+gh issue view 42 --comments
+
+# Only claim if all checkboxes are marked
+# Dependencies
+# - [x] #120: Database migration
+# - [x] #121: API endpoint
+```
+
+### Multiple Agents Claiming Same Work
+
+**Problem**: Two Workers claim the same `loom:issue` simultaneously.
+
+**Impact**: Duplicate work, wasted effort.
+
+**Prevention**:
+- Remove `loom:issue` label immediately after claiming
+- If you see an issue already has `loom:in-progress`, don't claim it
+- FIFO queue: claim oldest first
+
 ## Troubleshooting
 
 **Issue stuck without labels**
