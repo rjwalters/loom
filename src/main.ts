@@ -1,9 +1,10 @@
 import "./style.css";
-import { ask, open } from "@tauri-apps/api/dialog";
+import { ask } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
 import { getAppLevelState } from "./lib/app-state";
 import { saveConfig, saveState, setConfigWorkspace, splitTerminals } from "./lib/config";
+import { initConsoleLogger } from "./lib/console-logger";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
 import { getHealthMonitor } from "./lib/health-monitor";
 import { Logger } from "./lib/logger";
@@ -16,8 +17,7 @@ import {
   reconnectTerminals as reconnectTerminalsCore,
   verifyTerminalSessions as verifyTerminalSessionsCore,
 } from "./lib/terminal-lifecycle";
-// NOTE: launchAgentsForTerminals, reconnectTerminals, and saveCurrentConfig
-// are defined locally in this file, not imported from terminal-lifecycle
+// NOTE: saveCurrentConfig is defined locally in this file
 import { getTerminalManager } from "./lib/terminal-manager";
 import { showTerminalSettingsModal } from "./lib/terminal-settings-modal";
 import { initTheme, toggleTheme } from "./lib/theme";
@@ -29,53 +29,16 @@ import {
 } from "./lib/ui";
 import { attachWorkspaceEventListeners, setupTooltips } from "./lib/ui-event-handlers";
 import { handleWorkspacePathInput as handleWorkspacePathInputCore } from "./lib/workspace-lifecycle";
-import { clearWorkspaceError, showWorkspaceError } from "./lib/workspace-utils";
+import {
+  browseWorkspace,
+  generateNextConfigId,
+  validateWorkspacePath,
+} from "./lib/workspace-utils";
 
-// NOTE: validateWorkspacePath and browseWorkspace are defined locally in this file
-// handleWorkspacePathInput is now in src/lib/workspace-lifecycle.ts
-// launchAgentsForTerminals, reconnectTerminals, verifyTerminalSessions are now in src/lib/terminal-lifecycle.ts
+// NOTE: handleWorkspacePathInput is a local wrapper that calls handleWorkspacePathInputCore from src/lib/workspace-lifecycle.ts
 
-// =================================================================
-// CONSOLE LOGGING TO FILE - For MCP access to browser console
-// =================================================================
-// Intercept console methods and write to ~/.loom/console.log
-// This allows MCP tools to read console output for debugging
-
-const originalConsoleLog = console.log;
-const originalConsoleError = console.error;
-const originalConsoleWarn = console.warn;
-
-async function writeToConsoleLog(level: string, ...args: unknown[]) {
-  const timestamp = new Date().toISOString();
-  const message = args
-    .map((arg) => (typeof arg === "object" ? JSON.stringify(arg) : String(arg)))
-    .join(" ");
-  const logLine = `[${timestamp}] [${level}] ${message}\n`;
-
-  try {
-    await invoke("append_to_console_log", { content: logLine });
-  } catch (error) {
-    // Silent fail - don't want logging errors to break the app
-    // Only log to original console if something goes wrong
-    originalConsoleError("[console-logger] Failed to write to log file:", error);
-  }
-}
-
-// Override console methods
-console.log = (...args: unknown[]) => {
-  originalConsoleLog(...args);
-  writeToConsoleLog("INFO", ...args);
-};
-
-console.error = (...args: unknown[]) => {
-  originalConsoleError(...args);
-  writeToConsoleLog("ERROR", ...args);
-};
-
-console.warn = (...args: unknown[]) => {
-  originalConsoleWarn(...args);
-  writeToConsoleLog("WARN", ...args);
-};
+// Initialize console logging to file for MCP access
+initConsoleLogger();
 
 // Create logger for main component
 const logger = Logger.forComponent("main");
@@ -216,7 +179,7 @@ function render() {
   if (!hasWorkspace) {
     attachWorkspaceEventListeners(
       handleWorkspacePathInput,
-      browseWorkspace,
+      browseWorkspaceWithCallback,
       () => state.getWorkspace() || ""
     );
   }
@@ -643,7 +606,8 @@ if (!eventListenersRegistered) {
         setCurrentAttachedTerminalId: (id) => {
           getAppLevelState().setCurrentAttachedTerminalId(id);
         },
-        launchAgentsForTerminals,
+        launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
+          launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
         render,
         markTerminalsHealthChecked: (terminalIds) => {
           terminalIds.forEach((id) => healthCheckedTerminals.add(id));
@@ -683,7 +647,8 @@ if (!eventListenersRegistered) {
         setCurrentAttachedTerminalId: (id) => {
           getAppLevelState().setCurrentAttachedTerminalId(id);
         },
-        launchAgentsForTerminals,
+        launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
+          launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
         render,
         markTerminalsHealthChecked: (terminalIds) => {
           terminalIds.forEach((id) => healthCheckedTerminals.add(id));
@@ -743,7 +708,8 @@ if (!eventListenersRegistered) {
           setCurrentAttachedTerminalId: (id) => {
             getAppLevelState().setCurrentAttachedTerminalId(id);
           },
-          launchAgentsForTerminals,
+          launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
+            launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
           render,
         },
         "factory-reset-workspace"
@@ -784,7 +750,8 @@ if (!eventListenersRegistered) {
           setCurrentAttachedTerminalId: (id) => {
             getAppLevelState().setCurrentAttachedTerminalId(id);
           },
-          launchAgentsForTerminals,
+          launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
+            launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
           render,
         },
         "force-factory-reset-workspace"
@@ -871,7 +838,11 @@ async function showDaemonStatusDialog() {
 
       if (shouldReconnect) {
         logger.info("User requested terminal reconnection");
-        await reconnectTerminals();
+        await reconnectTerminalsCore({
+          state,
+          initializeTerminalDisplay,
+          saveCurrentConfig,
+        });
         alert("Terminal reconnection complete! Check the console for details.");
       }
     } else {
@@ -904,64 +875,7 @@ async function saveCurrentConfig() {
   });
 }
 
-// Workspace error UI helpers and path utilities are now in src/lib/workspace-utils.ts
-
-// Validate workspace path
-async function validateWorkspacePath(path: string): Promise<boolean> {
-  logger.info("Validating workspace path", { path });
-  if (!path || path.trim() === "") {
-    logger.info("Empty path, clearing error");
-    clearWorkspaceError();
-    return false;
-  }
-
-  try {
-    await invoke<boolean>("validate_git_repo", { path });
-    logger.info("Workspace validation passed", { path });
-    clearWorkspaceError();
-    return true;
-  } catch (error) {
-    const errorMessage =
-      typeof error === "string"
-        ? error
-        : (error as { message?: string })?.message || "Invalid workspace path";
-    logger.warn("Workspace validation failed", { path, errorMessage });
-    showWorkspaceError(errorMessage);
-    return false;
-  }
-}
-
-// Browse for workspace folder
-async function browseWorkspace() {
-  try {
-    const selected = await open({
-      directory: true,
-      multiple: false,
-      title: "Select workspace folder",
-    });
-
-    if (selected && typeof selected === "string") {
-      await handleWorkspacePathInput(selected);
-    }
-  } catch (error) {
-    logger.error("Error selecting workspace", error);
-    alert("Failed to select workspace. Please try again.");
-  }
-}
-
-// Helper to generate next config ID
-function generateNextConfigId(): string {
-  const terminals = state.getTerminals();
-  const existingIds = new Set(terminals.map((t) => t.id));
-
-  // Find the next available terminal-N ID
-  let i = 1;
-  while (existingIds.has(`terminal-${i}`)) {
-    i++;
-  }
-
-  return `terminal-${i}`;
-}
+// Workspace utilities (validation, browsing, ID generation) are now in src/lib/workspace-utils.ts
 
 // Create a plain shell terminal
 async function createPlainTerminal() {
@@ -977,7 +891,7 @@ async function createPlainTerminal() {
 
   try {
     // Generate stable ID first
-    const id = generateNextConfigId();
+    const id = generateNextConfigId(state.getTerminals());
 
     // Get instance number for this terminal
     const instanceNumber = state.getNextTerminalNumber();
@@ -1021,35 +935,21 @@ async function createPlainTerminal() {
   }
 }
 
-// Launch agents for terminals (wrapper for terminal-lifecycle module)
-async function launchAgentsForTerminals(workspacePath: string, terminals: Terminal[]) {
-  await launchAgentsForTerminalsCore(workspacePath, terminals, { state });
-}
-
-// Verify terminal sessions health (wrapper for terminal-lifecycle module)
-async function verifyTerminalSessions(): Promise<void> {
-  await verifyTerminalSessionsCore({ state });
-}
-
-// Reconnect terminals to daemon (wrapper for terminal-lifecycle module)
-async function reconnectTerminals() {
-  await reconnectTerminalsCore({
-    state,
-    initializeTerminalDisplay,
-    saveCurrentConfig,
-  });
-}
-
 // Handle manual workspace path entry (wrapper for workspace-lifecycle module)
 async function handleWorkspacePathInput(path: string) {
   await handleWorkspacePathInputCore(path, {
     state,
     validateWorkspacePath,
-    launchAgentsForTerminals,
-    reconnectTerminals,
-    verifyTerminalSessions,
+    launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
+      launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
+    reconnectTerminals: async () =>
+      reconnectTerminalsCore({ state, initializeTerminalDisplay, saveCurrentConfig }),
+    verifyTerminalSessions: async () => verifyTerminalSessionsCore({ state }),
   });
 }
+
+// Wrapper for browseWorkspace to bind the handleWorkspacePathInput callback
+const browseWorkspaceWithCallback = () => browseWorkspace(handleWorkspacePathInput);
 
 // Terminal action handlers are now in src/lib/terminal-actions.ts
 // Recovery handlers are now in src/lib/recovery-handlers.ts
