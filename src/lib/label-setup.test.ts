@@ -24,9 +24,10 @@ describe("label-setup", () => {
     it("contains all required issue labels", () => {
       const labelNames = LOOM_LABELS.map((l) => l.name);
 
-      expect(labelNames).toContain("loom:proposal");
+      expect(labelNames).toContain("loom:architect-suggestion");
       expect(labelNames).toContain("loom:critic-suggestion");
-      expect(labelNames).toContain("loom:ready");
+      expect(labelNames).toContain("loom:curated");
+      expect(labelNames).toContain("loom:issue");
       expect(labelNames).toContain("loom:in-progress");
       expect(labelNames).toContain("loom:blocked");
       expect(labelNames).toContain("loom:urgent");
@@ -62,7 +63,7 @@ describe("label-setup", () => {
 
       const result = await setupLoomLabels();
 
-      expect(result.created.length).toBe(9); // All 9 labels
+      expect(result.created.length).toBe(10); // All 10 labels
       expect(result.updated.length).toBe(0);
       expect(result.skipped.length).toBe(0);
       expect(result.errors.length).toBe(0);
@@ -77,7 +78,7 @@ describe("label-setup", () => {
 
       expect(result.created.length).toBe(0);
       expect(result.updated.length).toBe(0);
-      expect(result.skipped.length).toBe(9); // All 9 labels skipped
+      expect(result.skipped.length).toBe(10); // All 10 labels skipped
       expect(result.errors.length).toBe(0);
     });
 
@@ -89,7 +90,7 @@ describe("label-setup", () => {
       const result = await setupLoomLabels(true);
 
       expect(result.created.length).toBe(0);
-      expect(result.updated.length).toBe(9); // All 9 labels updated
+      expect(result.updated.length).toBe(10); // All 10 labels updated
       expect(result.skipped.length).toBe(0);
       expect(result.errors.length).toBe(0);
     });
@@ -131,7 +132,7 @@ describe("label-setup", () => {
   describe("formatSetupResult", () => {
     it("formats created labels", () => {
       const result: LabelSetupResult = {
-        created: ["loom:ready", "loom:in-progress"],
+        created: ["loom:curated", "loom:in-progress"],
         updated: [],
         skipped: [],
         errors: [],
@@ -140,14 +141,14 @@ describe("label-setup", () => {
       const formatted = formatSetupResult(result);
 
       expect(formatted).toContain("Created 2 labels");
-      expect(formatted).toContain("loom:ready");
+      expect(formatted).toContain("loom:curated");
       expect(formatted).toContain("loom:in-progress");
     });
 
     it("formats updated labels", () => {
       const result: LabelSetupResult = {
         created: [],
-        updated: ["loom:ready"],
+        updated: ["loom:issue"],
         skipped: [],
         errors: [],
       };
@@ -155,21 +156,21 @@ describe("label-setup", () => {
       const formatted = formatSetupResult(result);
 
       expect(formatted).toContain("Updated 1 label");
-      expect(formatted).toContain("loom:ready");
+      expect(formatted).toContain("loom:issue");
     });
 
     it("formats skipped labels", () => {
       const result: LabelSetupResult = {
         created: [],
         updated: [],
-        skipped: ["loom:ready", "loom:in-progress", "loom:blocked"],
+        skipped: ["loom:curated", "loom:in-progress", "loom:blocked"],
         errors: [],
       };
 
       const formatted = formatSetupResult(result);
 
       expect(formatted).toContain("Skipped 3 existing labels");
-      expect(formatted).toContain("loom:ready");
+      expect(formatted).toContain("loom:curated");
     });
 
     it("formats errors", () => {
@@ -178,7 +179,7 @@ describe("label-setup", () => {
         updated: [],
         skipped: [],
         errors: [
-          { label: "loom:ready", error: "API rate limit exceeded" },
+          { label: "loom:issue", error: "API rate limit exceeded" },
           { label: "loom:in-progress", error: "Network error" },
         ],
       };
@@ -186,13 +187,13 @@ describe("label-setup", () => {
       const formatted = formatSetupResult(result);
 
       expect(formatted).toContain("Failed 2 labels");
-      expect(formatted).toContain("loom:ready: API rate limit exceeded");
+      expect(formatted).toContain("loom:issue: API rate limit exceeded");
       expect(formatted).toContain("loom:in-progress: Network error");
     });
 
     it("formats mixed results", () => {
       const result: LabelSetupResult = {
-        created: ["loom:ready"],
+        created: ["loom:curated"],
         updated: ["loom:in-progress"],
         skipped: ["loom:blocked"],
         errors: [{ label: "loom:urgent", error: "Failed" }],
