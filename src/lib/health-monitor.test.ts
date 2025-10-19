@@ -25,6 +25,29 @@ vi.mock("./output-poller", () => ({
 import { invoke } from "@tauri-apps/api/tauri";
 import { getOutputPoller } from "./output-poller";
 import { getAppState } from "./state";
+import type { LogEntry } from "./logger";
+
+// Helper function to parse JSON log entries from console spies
+function parseLogEntry(consoleCall: any[]): LogEntry {
+  const jsonString = consoleCall[0];
+  return JSON.parse(jsonString) as LogEntry;
+}
+
+// Helper function to find log entry with matching message
+function findLogWithMessage(spy: ReturnType<typeof vi.spyOn>, message: string): LogEntry | undefined {
+  const calls = spy.mock.calls;
+  for (const call of calls) {
+    try {
+      const entry = parseLogEntry(call);
+      if (entry.message === message || entry.message.includes(message)) {
+        return entry;
+      }
+    } catch {
+      // Skip non-JSON calls
+    }
+  }
+  return undefined;
+}
 
 describe("HealthMonitor", () => {
   let monitor: HealthMonitor;
@@ -96,7 +119,9 @@ describe("HealthMonitor", () => {
     it("starts monitoring with initial checks", async () => {
       monitor.start();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Starting health monitoring");
+      const logEntry = findLogWithMessage(consoleLogSpy, "Starting health monitoring");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("health-monitor");
 
       // Should perform initial health check and ping
       await vi.advanceTimersByTimeAsync(0);
@@ -111,14 +136,18 @@ describe("HealthMonitor", () => {
       monitor.start();
       monitor.start();
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("[HealthMonitor] Already running");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Already running");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("health-monitor");
     });
 
     it("stops monitoring and clears timers", () => {
       monitor.start();
       monitor.stop();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Stopping health monitoring");
+      const logEntry = findLogWithMessage(consoleLogSpy, "Stopping health monitoring");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("health-monitor");
 
       // Verify no more periodic checks after stop
       const invokeCallsBefore = vi.mocked(invoke).mock.calls.length;
@@ -143,9 +172,11 @@ describe("HealthMonitor", () => {
 
       monitor.recordActivity("terminal-1");
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        `[HealthMonitor] Activity recorded for terminal-1 at ${now}`
-      );
+      const logEntry = findLogWithMessage(consoleLogSpy, "Activity recorded");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("health-monitor");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
+      expect(logEntry?.context.timestamp).toBe(now);
 
       const lastActivity = monitor.getLastActivity("terminal-1");
       expect(lastActivity).toBe(now);
@@ -252,10 +283,11 @@ describe("HealthMonitor", () => {
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("[HealthMonitor] Health check failed for terminal-1"),
-        expect.any(Error)
-      );
+      const logEntry = findLogWithMessage(consoleErrorSpy, "Health check failed");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("health-monitor");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
+      expect(logEntry?.context.errorMessage).toBe("IPC timeout");
 
       // Should not set missingSession on IPC failure
       expect(mockState.updateTerminal).not.toHaveBeenCalled();
@@ -524,10 +556,10 @@ describe("HealthMonitor", () => {
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        "[HealthMonitor] Error in health callback:",
-        expect.any(Error)
-      );
+      const logEntry = findLogWithMessage(consoleErrorSpy, "Error in health callback");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("health-monitor");
+      expect(logEntry?.context.errorMessage).toBe("Callback error");
 
       // Good callback should still be called
       expect(goodCallback).toHaveBeenCalled();

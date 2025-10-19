@@ -13,6 +13,29 @@ vi.mock("./terminal-manager", () => ({
 
 import { invoke } from "@tauri-apps/api/tauri";
 import { getTerminalManager } from "./terminal-manager";
+import type { LogEntry } from "./logger";
+
+// Helper function to parse JSON log entries from console spies
+function parseLogEntry(consoleCall: any[]): LogEntry {
+  const jsonString = consoleCall[0];
+  return JSON.parse(jsonString) as LogEntry;
+}
+
+// Helper function to find log entry with matching message
+function findLogWithMessage(spy: ReturnType<typeof vi.spyOn>, message: string): LogEntry | undefined {
+  const calls = spy.mock.calls;
+  for (const call of calls) {
+    try {
+      const entry = parseLogEntry(call);
+      if (entry.message === message || entry.message.includes(message)) {
+        return entry;
+      }
+    } catch {
+      // Skip non-JSON calls
+    }
+  }
+  return undefined;
+}
 
 describe("OutputPoller", () => {
   let poller: OutputPoller;
@@ -90,7 +113,10 @@ describe("OutputPoller", () => {
       poller.startPolling("terminal-1");
       poller.startPolling("terminal-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Already polling terminal terminal-1");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Already polling terminal");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("stops polling and clears state", async () => {
@@ -189,9 +215,10 @@ describe("OutputPoller", () => {
 
       poller.resumePolling("terminal-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith(
-        "Terminal terminal-1 is already actively polling"
-      );
+      const logEntry = findLogWithMessage(consoleWarnSpy, "already actively polling");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("handles pause on non-existent terminal gracefully", () => {
@@ -333,9 +360,11 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       expect(poller.isPolling("terminal-1")).toBe(false);
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        "Stopping polling for terminal terminal-1 after 3 consecutive errors"
-      );
+
+      const logEntry = findLogWithMessage(consoleErrorSpy, "Stopping polling after max consecutive errors");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("calls error callback on max consecutive errors", async () => {
@@ -383,10 +412,11 @@ describe("OutputPoller", () => {
       poller.startPolling("terminal-1");
       await vi.runOnlyPendingTimersAsync();
 
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Error polling terminal terminal-1"),
-        "string error"
-      );
+      const logEntry = findLogWithMessage(consoleErrorSpy, "Error polling terminal");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
+      expect(logEntry?.context.errorMessage).toBe("string error");
     });
   });
 
@@ -421,15 +451,10 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should log frequency reduction
-      const frequencyLogs = consoleLogSpy.mock.calls.filter((call) =>
-        call.some(
-          (arg) =>
-            typeof arg === "string" &&
-            arg.includes("Terminal terminal-1 idle for") &&
-            arg.includes("reducing poll frequency to 10000ms")
-        )
-      );
-      expect(frequencyLogs.length).toBeGreaterThan(0);
+      const logEntry = findLogWithMessage(consoleLogSpy, "Terminal idle - reducing poll frequency");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("speeds up polling when activity resumes", async () => {
@@ -453,9 +478,10 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should log frequency increase
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("active, increasing poll frequency to 50ms")
-      );
+      const logEntry = findLogWithMessage(consoleLogSpy, "Terminal active - increasing poll frequency");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("maintains idle frequency for inactive terminals", async () => {
@@ -685,9 +711,10 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should have switched to idle polling
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("reducing poll frequency to 10000ms")
-      );
+      const logEntry = findLogWithMessage(consoleLogSpy, "Terminal idle - reducing poll frequency");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("output-poller");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
 
       // New output arrives
       vi.mocked(invoke).mockResolvedValueOnce(createMockOutput("resumed", 14));

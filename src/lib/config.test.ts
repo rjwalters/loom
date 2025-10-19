@@ -69,10 +69,8 @@ describe("config", () => {
       expect(config).toEqual(mockConfig);
     });
 
-    it("should return empty config if no workspace is set", async () => {
-      const config = await loadConfig();
-
-      expect(config).toEqual({ terminals: [] });
+    it("should throw error if no workspace is set", async () => {
+      await expect(loadConfig()).rejects.toThrow("No workspace configured");
       expect(invoke).not.toHaveBeenCalled();
     });
 
@@ -162,13 +160,13 @@ describe("config", () => {
       });
     });
 
-    it("should not save if no workspace is set", async () => {
+    it("should handle missing workspace error when saving", async () => {
       const config: LoomConfig = {
         terminals: [],
       };
 
-      await saveConfig(config);
-
+      // saveConfig catches the error internally and logs it, doesn't throw
+      await expect(saveConfig(config)).resolves.toBeUndefined();
       expect(invoke).not.toHaveBeenCalled();
     });
 
@@ -299,13 +297,8 @@ describe("config", () => {
       expect(state).toEqual(mockState);
     });
 
-    it("should return empty state if no workspace is set", async () => {
-      const state = await loadState();
-
-      expect(state).toEqual({
-        nextAgentNumber: 1,
-        terminals: [],
-      });
+    it("should throw error if no workspace is set", async () => {
+      await expect(loadState()).rejects.toThrow("No workspace configured");
       expect(invoke).not.toHaveBeenCalled();
     });
 
@@ -346,14 +339,14 @@ describe("config", () => {
       });
     });
 
-    it("should not save if no workspace is set", async () => {
+    it("should handle missing workspace error when saving", async () => {
       const state: LoomState = {
         nextAgentNumber: 1,
         terminals: [],
       };
 
-      await saveState(state);
-
+      // saveState catches the error internally and logs it, doesn't throw
+      await expect(saveState(state)).resolves.toBeUndefined();
       expect(invoke).not.toHaveBeenCalled();
     });
 

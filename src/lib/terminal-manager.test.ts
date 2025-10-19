@@ -107,6 +107,29 @@ vi.mock("./state", () => ({
 import { invoke } from "@tauri-apps/api/tauri";
 import { Terminal } from "@xterm/xterm";
 import { getAppState, TerminalStatus } from "./state";
+import type { LogEntry } from "./logger";
+
+// Helper function to parse JSON log entries from console spies
+function parseLogEntry(consoleCall: any[]): LogEntry {
+  const jsonString = consoleCall[0];
+  return JSON.parse(jsonString) as LogEntry;
+}
+
+// Helper function to find log entry with matching message
+function findLogWithMessage(spy: ReturnType<typeof vi.spyOn>, message: string): LogEntry | undefined {
+  const calls = spy.mock.calls;
+  for (const call of calls) {
+    try {
+      const entry = parseLogEntry(call);
+      if (entry.message === message || entry.message.includes(message)) {
+        return entry;
+      }
+    } catch {
+      // Skip non-JSON calls
+    }
+  }
+  return undefined;
+}
 
 describe("TerminalManager", () => {
   let manager: TerminalManager;
@@ -284,10 +307,11 @@ describe("TerminalManager", () => {
 
       manager.createTerminal("terminal-1", "container-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("WebGL addon failed to load"),
-        expect.any(Error)
-      );
+      const logEntry = findLogWithMessage(consoleWarnSpy, "WebGL addon failed to load");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
+      expect(logEntry?.context.errorMessage).toBeDefined();
 
       // Reset flag
       webglShouldThrow = false;
@@ -297,7 +321,10 @@ describe("TerminalManager", () => {
       manager.createTerminal("terminal-1", "container-1");
       const second = manager.createTerminal("terminal-1", "container-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal terminal-1 already exists");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Terminal already exists");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
       expect(second).not.toBeNull(); // Returns existing
     });
 
@@ -307,9 +334,9 @@ describe("TerminalManager", () => {
       const managed = manager.createTerminal("terminal-1", "container-1");
 
       expect(managed).toBeNull();
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        "persistent-xterm-containers not found - UI not initialized"
-      );
+      const logEntry = findLogWithMessage(consoleErrorSpy, "persistent-xterm-containers not found");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
     });
 
     it("uses saved font size from localStorage", () => {
@@ -381,10 +408,11 @@ describe("TerminalManager", () => {
       await dataCallback("test");
 
       await vi.waitFor(() => {
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Failed to send input for terminal-1"),
-          expect.any(Error)
-        );
+        const logEntry = findLogWithMessage(consoleErrorSpy, "Failed to send input");
+        expect(logEntry).toBeDefined();
+        expect(logEntry?.context.component).toBe("terminal-manager");
+        expect(logEntry?.context.terminalId).toBe("terminal-1");
+        expect(logEntry?.context.errorMessage).toBeDefined();
       });
     });
   });
@@ -457,7 +485,10 @@ describe("TerminalManager", () => {
       manager.showTerminal("terminal-1");
 
       expect(container.style.display).toBe("block");
-      expect(consoleLogSpy).toHaveBeenCalledWith("[terminal-manager] Showing terminal terminal-1");
+      const logEntry = findLogWithMessage(consoleLogSpy, "Showing terminal");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("hides terminal by updating display style", () => {
@@ -468,19 +499,28 @@ describe("TerminalManager", () => {
       manager.hideTerminal("terminal-1");
 
       expect(container.style.display).toBe("none");
-      expect(consoleLogSpy).toHaveBeenCalledWith("[terminal-manager] Hiding terminal terminal-1");
+      const logEntry = findLogWithMessage(consoleLogSpy, "Hiding terminal");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("terminal-1");
     });
 
     it("warns when showing non-existent terminal", () => {
       manager.showTerminal("non-existent");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Terminal not found");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("non-existent");
     });
 
     it("warns when hiding non-existent terminal", () => {
       manager.hideTerminal("non-existent");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Terminal not found");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("non-existent");
     });
 
     it("hides all terminals", () => {
@@ -512,7 +552,10 @@ describe("TerminalManager", () => {
     it("warns when writing to non-existent terminal", () => {
       manager.writeToTerminal("non-existent", "test");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Terminal not found");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("non-existent");
       expect(mockTerminalInstance.write).not.toHaveBeenCalled();
     });
 
@@ -529,7 +572,10 @@ describe("TerminalManager", () => {
     it("warns when clearing and writing to non-existent terminal", () => {
       manager.clearAndWriteTerminal("non-existent", "test");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Terminal not found");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("non-existent");
       expect(mockTerminalInstance.clear).not.toHaveBeenCalled();
     });
 
@@ -544,7 +590,10 @@ describe("TerminalManager", () => {
     it("warns when clearing non-existent terminal", () => {
       manager.clearTerminal("non-existent");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal non-existent not found");
+      const logEntry = findLogWithMessage(consoleWarnSpy, "Terminal not found");
+      expect(logEntry).toBeDefined();
+      expect(logEntry?.context.component).toBe("terminal-manager");
+      expect(logEntry?.context.terminalId).toBe("non-existent");
     });
   });
 
