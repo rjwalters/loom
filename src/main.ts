@@ -795,6 +795,21 @@ if (!eventListenersRegistered) {
     }
   });
 
+  // Restart Terminal - triggered by MCP command
+  listen("restart-terminal", async (event) => {
+    const terminalId = event.payload as string;
+    if (!terminalId) {
+      logger.error(
+        "Restart terminal event received without terminal ID",
+        new Error("Missing terminal ID")
+      );
+      return;
+    }
+
+    logger.info("Restarting terminal via MCP command", { terminalId });
+    await handleRestartTerminal(terminalId, { state, saveCurrentConfig });
+  });
+
   listen("toggle-theme", () => {
     toggleTheme();
   });
@@ -984,13 +999,14 @@ async function createPlainTerminal() {
     const worktreePath = await setupWorktreeForAgent(id, workspacePath);
     logger.info("Created worktree", { name, id, worktreePath });
 
-    // Add to state (no role assigned - plain shell)
+    // Add to state with default role (plain shell / driver)
     state.addTerminal({
       id,
       name,
       worktreePath,
       status: TerminalStatus.Idle,
       isPrimary: false,
+      role: "default",
       theme: "default",
     });
 

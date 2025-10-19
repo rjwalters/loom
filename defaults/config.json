@@ -25,7 +25,7 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "codex",
+        "workerType": "claude",
         "roleFile": "curator.md",
         "targetInterval": 300000,
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
@@ -137,7 +137,7 @@
       "isPrimary": false,
       "role": "claude-code-worker",
       "roleConfig": {
-        "workerType": "codex",
+        "workerType": "claude",
         "roleFile": "builder.md",
         "targetInterval": 60000,
         "intervalPrompt": "Find and implement loom:ready issues"
