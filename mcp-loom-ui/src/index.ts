@@ -153,6 +153,13 @@ async function triggerForceFactoryReset(): Promise<string> {
 }
 
 /**
+ * Trigger terminal restart - destroys and recreates a terminal with the same configuration
+ */
+async function triggerRestartTerminal(terminalId: string): Promise<string> {
+  return await writeMCPCommand(`restart_terminal:${terminalId}`);
+}
+
+/**
  * Read the Loom state file
  */
 async function readStateFile(): Promise<string> {
@@ -433,6 +440,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "trigger_restart_terminal",
+        description:
+          "Restart a specific terminal by destroying and recreating it with the same configuration. The terminal will preserve its name, role, worktree path, and agent configuration. Useful for recovering from stuck terminals or testing terminal lifecycle.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminalId: {
+              type: "string",
+              description: "The ID of the terminal to restart (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminalId"],
+        },
+      },
+      {
         name: "get_random_file",
         description:
           "Get a random file path from the workspace. Respects .gitignore and excludes common build artifacts. Useful for the Critic agent to pick files to review.",
@@ -556,6 +578,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: heartbeat,
+            },
+          ],
+        };
+      }
+
+      case "trigger_restart_terminal": {
+        const terminalId = args?.terminalId as string;
+        if (!terminalId) {
+          throw new Error("terminalId parameter is required");
+        }
+        const result = await triggerRestartTerminal(terminalId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
             },
           ],
         };
