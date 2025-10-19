@@ -2,6 +2,15 @@
 
 This directory contains Claude Code configuration for the Loom project.
 
+## Configuration Philosophy
+
+Loom maintains a minimal `.claude/` configuration focused on:
+- **Permissions**: Pre-approved commands for common workflows
+- **MCP Servers**: Tool integration for testing and debugging
+- **Documentation**: Clear explanation of available capabilities
+
+We intentionally keep the structure simple and avoid over-configuration. Additional directories (`agents/`, `commands/`, `hooks/`) can be added later if specific needs arise.
+
 ## Files
 
 - **`settings.json`**: Team-wide permissions and settings (committed to git)
@@ -31,6 +40,7 @@ The `settings.json` file pre-approves common development commands to streamline 
 - `pnpm daemon:dev` - Run daemon in dev mode
 - `pnpm check:all` - Run all checks
 - `pnpm check:ci` - Run CI checks locally
+- `pnpm worktree` - Create git worktree for issue development
 
 ### Code Quality
 - `pnpm lint` - Biome linting
