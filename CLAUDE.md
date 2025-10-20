@@ -45,7 +45,17 @@ loom/
 ├── src/                          # TypeScript frontend
 │   ├── main.ts                   # Entry point, state init, events
 │   └── lib/                      # State, config, UI, theme
-├── src-tauri/                    # Rust backend (IPC commands)
+├── src-tauri/                    # Rust backend (Tauri commands)
+│   ├── src/
+│   │   ├── main.rs               # Entry point, command registration
+│   │   ├── commands/             # Domain-specific command modules
+│   │   │   ├── terminal.rs       # Terminal management
+│   │   │   ├── workspace.rs      # Workspace operations
+│   │   │   ├── config.rs         # Config/state I/O
+│   │   │   ├── github.rs         # GitHub integration
+│   │   │   └── ...               # 9 modules total, 51 commands
+│   │   └── menu.rs               # Menu building
+│   └── tauri.conf.json           # Tauri configuration
 ├── loom-daemon/                  # Rust daemon (terminal management)
 ├── .loom/                        # Workspace config (gitignored)
 │   ├── config.json               # Agent counter, terminal roles
