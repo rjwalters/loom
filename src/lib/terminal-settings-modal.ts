@@ -1,6 +1,9 @@
-import { saveConfig, saveState, splitTerminals } from "./config";
+import { saveCurrentConfiguration } from "./config";
+import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
+
+const logger = Logger.forComponent("terminal-settings-modal");
 
 export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   const modal = document.createElement("div");
@@ -229,7 +232,7 @@ export async function showTerminalSettingsModal(
       workerTypeSelect.innerHTML = '<option value="">No agents available</option>';
     }
   } catch (error) {
-    console.error("Failed to load available worker types:", error);
+    logger.error("Failed to load available worker types", error as Error);
     workerTypeSelect.innerHTML = '<option value="">Error loading agents</option>';
   }
 
@@ -255,7 +258,9 @@ export async function showTerminalSettingsModal(
         roleFileSelect.innerHTML = '<option value="">No role files found</option>';
       }
     } catch (error) {
-      console.error("Failed to load role files:", error);
+      logger.error("Failed to load role files", error as Error, {
+        workspacePath: workspacePath || "unknown",
+      });
       const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
       if (roleFileSelect) {
         roleFileSelect.innerHTML = '<option value="">Error loading roles</option>';
@@ -375,7 +380,10 @@ export async function showTerminalSettingsModal(
         }
       }
     } catch (error) {
-      console.error("Failed to load role metadata:", error);
+      logger.error("Failed to load role metadata", error as Error, {
+        workspacePath: workspacePath || "unknown",
+        roleFile: selectedFile,
+      });
     }
   });
 
@@ -389,21 +397,6 @@ export async function showTerminalSettingsModal(
   });
 
   // Worker type dropdown is now handled in applySettings
-
-  // Wire up reset prompt button
-  const resetPromptBtn = modal.querySelector("#reset-prompt-btn");
-  const systemPromptTextarea = modal.querySelector("#system-prompt") as HTMLTextAreaElement;
-
-  resetPromptBtn?.addEventListener("click", async () => {
-    // Get workspace path to format default prompt
-    const workspacePath = state.getWorkspace();
-    if (!workspacePath) {
-      return;
-    }
-
-    const { DEFAULT_WORKER_PROMPT, formatPrompt } = await import("./prompts");
-    systemPromptTextarea.value = formatPrompt(DEFAULT_WORKER_PROMPT, workspacePath);
-  });
 
   // Wire up buttons
   const cancelBtn = modal.querySelector("#cancel-settings-btn");
@@ -485,14 +478,7 @@ async function applySettings(
     state.setTerminalTheme(terminal.id, selectedTheme);
 
     // Save config and state files
-    const terminals = state.getTerminals();
-    const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
-
-    await saveConfig({ terminals: terminalConfigs });
-    await saveState({
-      nextAgentNumber: state.getCurrentTerminalNumber(),
-      terminals: terminalStates,
-    });
+    await saveCurrentConfiguration(state);
 
     // Launch agent if role was set/changed
     if (roleChanged && hasNewRole) {
@@ -536,15 +522,20 @@ async function applySettings(
                 gitIdentity = metadata.gitIdentity;
               }
             } catch (error) {
-              console.warn("Failed to load git identity from role metadata:", error);
+              logger.warn("Failed to load git identity from role metadata", {
+                workspacePath,
+                roleFile: roleConfig.roleFile,
+                error: String(error),
+              });
             }
 
             // Verify terminal has worktree, create if it doesn't exist yet
             let worktreePath = terminal.worktreePath;
             if (!worktreePath) {
-              console.log(
-                `[terminal-settings-modal] Terminal ${terminal.name} missing worktree, creating now...`
-              );
+              logger.info("Terminal missing worktree, creating now", {
+                terminalId: terminal.id,
+                terminalName: terminal.name,
+              });
               const { setupWorktreeForAgent } = await import("./worktree-manager");
               worktreePath = await setupWorktreeForAgent(terminal.id, workspacePath, gitIdentity);
               // Store worktree path in terminal state
@@ -560,7 +551,11 @@ async function applySettings(
             );
           }
         } catch (error) {
-          console.error("Failed to launch agent:", error);
+          logger.error("Failed to launch agent", error as Error, {
+            terminalId: terminal.id,
+            workspacePath,
+            workerType,
+          });
           alert(`Failed to launch agent: ${error}`);
         }
       }
@@ -574,11 +569,11 @@ async function applySettings(
       // Start or restart autonomous mode
       const updatedTerminal = state.getTerminal(terminal.id);
       if (updatedTerminal) {
-        autonomousManager.restartAutonomous(updatedTerminal);
+        await autonomousManager.restartAutonomous(updatedTerminal);
       }
     } else {
       // Stop autonomous mode if disabled
-      autonomousManager.stopAutonomous(terminal.id);
+      await autonomousManager.stopAutonomous(terminal.id);
     }
 
     // Close modal and re-render

@@ -16,6 +16,25 @@ impl TerminalManager {
         }
     }
 
+    /// Validate terminal ID to prevent command injection
+    /// Only allows alphanumeric characters, hyphens, and underscores
+    fn validate_terminal_id(id: &str) -> Result<()> {
+        if id.is_empty() {
+            return Err(anyhow!("Terminal ID cannot be empty"));
+        }
+
+        if !id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(anyhow!(
+                "Invalid terminal ID: '{id}'. Only alphanumeric characters, hyphens, and underscores are allowed"
+            ));
+        }
+
+        Ok(())
+    }
+
     pub fn create_terminal(
         &mut self,
         config_id: &str,
@@ -24,6 +43,9 @@ impl TerminalManager {
         role: Option<&String>,
         instance_number: Option<u32>,
     ) -> Result<TerminalId> {
+        // Validate terminal ID to prevent command injection
+        Self::validate_terminal_id(config_id)?;
+
         // Use config_id directly as the terminal ID
         let id = config_id.to_string();
         let role_part = role.map_or("default", String::as_str);
@@ -80,6 +102,7 @@ impl TerminalManager {
             tmux_session,
             working_dir,
             created_at: chrono::Utc::now().timestamp(),
+            role: role.cloned(),
             worktree_path: None,
             agent_pid: None,
             agent_status: crate::types::AgentStatus::default(),
@@ -263,7 +286,7 @@ impl TerminalManager {
 
         let mut buffer = vec![0u8; bytes_to_read];
         file.read_exact(&mut buffer)?;
-        log::debug!("Read {} bytes successfully", buffer.len());
+        log::debug!("Read {len} bytes successfully", len = buffer.len());
 
         Ok((buffer, file_size))
     }
@@ -298,17 +321,66 @@ impl TerminalManager {
             .args(["list-sessions", "-F", "#{session_name}"])
             .output()?;
 
+        // Enhanced logging: Check for tmux server failure
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Distinguish failure modes
+            if stderr.contains("no server running") {
+                log::error!(
+                    "🚨 TMUX SERVER DEAD - Socket should be at /private/tmp/tmux-$UID/loom"
+                );
+            } else if stderr.contains("no such session") || stderr.contains("no sessions") {
+                log::debug!("No tmux sessions found: {stderr}");
+            } else {
+                log::error!("tmux list-sessions failed: {stderr}");
+            }
+
+            // Return early with empty list if server is dead
+            return Ok(());
+        }
+
         let sessions = String::from_utf8_lossy(&output.stdout);
+        let session_count = sessions.lines().count();
+        log::info!("📊 tmux server status: {session_count} total sessions");
 
         for session in sessions.lines() {
             if let Some(remainder) = session.strip_prefix("loom-") {
                 // Session format: loom-{config_id}-{role}-{instance}
-                // Extract config_id (everything before the first hyphen after "loom-")
-                // For backwards compatibility, if no hyphens, use entire remainder as ID
-                let id = remainder.split_once('-').map_or_else(
-                    || remainder.to_string(),
-                    |(config_id, _rest)| config_id.to_string(),
-                );
+                // Extract config_id by checking for the "terminal-{number}" pattern
+                //
+                // Example session: loom-terminal-1-claude-code-worker-64
+                // After strip_prefix: terminal-1-claude-code-worker-64
+                // Split by '-': ["terminal", "1", "claude", "code", "worker", "64"]
+                //
+                // Strategy: If format is "terminal-{number}-...", extract "terminal-{number}"
+                // Otherwise use first part for backwards compatibility
+
+                let parts: Vec<&str> = remainder.split('-').collect();
+                if parts.is_empty() {
+                    log::warn!("Skipping malformed session name: {session}");
+                    continue;
+                }
+
+                // Check if this matches the "terminal-{number}" pattern
+                let id = if parts.len() >= 2
+                    && parts[0] == "terminal"
+                    && parts[1].chars().all(|c| c.is_ascii_digit())
+                {
+                    // Format: terminal-{number}-{role}-{instance}
+                    // Extract "terminal-{number}" as the ID
+                    format!("{}-{}", parts[0], parts[1])
+                } else {
+                    // For backwards compatibility with old format (no hyphens in ID),
+                    // use first part as the terminal ID
+                    parts[0].to_string()
+                };
+
+                // Validate terminal ID to prevent command injection
+                if let Err(e) = Self::validate_terminal_id(&id) {
+                    log::warn!("Skipping invalid terminal ID from tmux session {session}: {e}");
+                    continue;
+                }
 
                 // Clear any existing pipe-pane for this session to avoid duplicates
                 log::debug!("Clearing existing pipe-pane for session {session}");
@@ -343,6 +415,7 @@ impl TerminalManager {
                         tmux_session: session.to_string(),
                         working_dir: None,
                         created_at: chrono::Utc::now().timestamp(),
+                        role: None,
                         worktree_path: None,
                         agent_pid: None,
                         agent_status: crate::types::AgentStatus::default(),
@@ -356,20 +429,34 @@ impl TerminalManager {
 
     /// Check if a tmux session exists for the given terminal ID
     pub fn has_tmux_session(&self, id: &TerminalId) -> Result<bool> {
+        log::info!("🔍 has_tmux_session called for terminal id: '{id}'");
+        log::info!(
+            "📋 Registry has {} terminals: {:?}",
+            self.terminals.len(),
+            self.terminals.keys().collect::<Vec<_>>()
+        );
+
         // First check if we have this terminal registered
         if let Some(info) = self.terminals.get(id) {
             // Terminal is registered - check its specific tmux session
+            log::info!(
+                "✅ Terminal '{}' found in registry, checking session: '{}'",
+                id,
+                info.tmux_session
+            );
             let output = Command::new("tmux")
                 .args(["-L", "loom"])
                 .args(["has-session", "-t", &info.tmux_session])
                 .output()?;
 
-            return Ok(output.status.success());
+            let result = output.status.success();
+            log::info!("📊 tmux has-session result for '{}': {}", info.tmux_session, result);
+            return Ok(result);
         }
 
         // Terminal not registered yet - check if ANY loom session with this ID exists
         // This handles the race condition where frontend creates state before daemon registers
-        log::debug!("Terminal {id} not found in registry, checking tmux sessions directly");
+        log::warn!("⚠️  Terminal '{id}' NOT found in registry, checking tmux sessions directly");
 
         let output = Command::new("tmux")
             .args(["-L", "loom"])
@@ -377,7 +464,19 @@ impl TerminalManager {
             .output()?;
 
         if !output.status.success() {
-            // tmux server not running or no sessions
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Enhanced logging: Distinguish failure modes
+            if stderr.contains("no server running") {
+                log::error!(
+                    "🚨 TMUX SERVER DEAD during has_tmux_session check - Socket should be at /private/tmp/tmux-$UID/loom"
+                );
+            } else if stderr.contains("no sessions") {
+                log::debug!("No tmux sessions exist: {stderr}");
+            } else {
+                log::error!("tmux list-sessions failed: {stderr}");
+            }
+
             return Ok(false);
         }
 
@@ -405,15 +504,36 @@ impl TerminalManager {
 
         // If tmux list-sessions fails (no server running), return empty vec
         let Ok(output) = output else {
+            log::error!("Failed to execute tmux list-sessions command");
             return Vec::new();
         };
 
+        // Enhanced logging: Check for tmux server failure
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            if stderr.contains("no server running") {
+                log::error!(
+                    "🚨 TMUX SERVER DEAD during list_available_sessions - Socket should be at /private/tmp/tmux-$UID/loom"
+                );
+            } else if stderr.contains("no sessions") {
+                log::debug!("No tmux sessions exist");
+            } else {
+                log::error!("tmux list-sessions failed: {stderr}");
+            }
+
+            return Vec::new();
+        }
+
         let sessions = String::from_utf8_lossy(&output.stdout);
-        sessions
+        let loom_sessions: Vec<String> = sessions
             .lines()
             .filter(|s| s.starts_with("loom-"))
             .map(std::string::ToString::to_string)
-            .collect()
+            .collect();
+
+        log::info!("📊 Found {} loom sessions", loom_sessions.len());
+        loom_sessions
     }
 
     /// Attach an existing terminal record to a different tmux session
@@ -430,6 +550,17 @@ impl TerminalManager {
             .output()?;
 
         if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Enhanced logging: Distinguish failure modes
+            if stderr.contains("no server running") {
+                log::error!(
+                    "🚨 TMUX SERVER DEAD during attach_to_session - Socket should be at /private/tmp/tmux-$UID/loom"
+                );
+                return Err(anyhow!("tmux server is not running"));
+            }
+
+            log::error!("tmux has-session failed for '{session_name}': {stderr}");
             return Err(anyhow!("Tmux session '{session_name}' does not exist"));
         }
 
@@ -449,6 +580,17 @@ impl TerminalManager {
             .output()?;
 
         if !check_output.status.success() {
+            let stderr = String::from_utf8_lossy(&check_output.stderr);
+
+            // Enhanced logging: Distinguish failure modes
+            if stderr.contains("no server running") {
+                log::error!(
+                    "🚨 TMUX SERVER DEAD during kill_session - Socket should be at /private/tmp/tmux-$UID/loom"
+                );
+                return Err(anyhow!("tmux server is not running"));
+            }
+
+            log::error!("tmux has-session failed for '{session_name}': {stderr}");
             return Err(anyhow!("Tmux session '{session_name}' does not exist"));
         }
 

@@ -1,5 +1,10 @@
-# Loom 🧵  
-**Multi-terminal orchestration for AI-powered development.**
+# Loom 🧵
+
+[![codecov](https://codecov.io/gh/rjwalters/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/rjwalters/loom)
+
+> *An orchestration of archetypal forces for AI-powered development*
+
+**Multi-terminal workspace where AI agents embody distinct roles—Worker, Curator, Architect, Reviewer, Critic, Fixer—weaving chaos into creation.**
 
 Loom turns **GitHub itself** into the ultimate *vibe coding interface*.  
 Each issue, label, and pull request becomes part of a living workflow orchestrated by AI workers that read, write, and review code — all through your existing GitHub repo.
@@ -82,16 +87,25 @@ Goal: **scale Loom beyond your laptop** — one repo, many AI workers, distribut
 
 Loom uses GitHub labels to coordinate work between different agent roles:
 
-| Label | Created By | Reviewed By | Meaning |
-|-------|-----------|-------------|---------|
-| (no label) | Anyone | Architect triages | Unreviewed issue |
-| `loom:architect-suggestion` | Architect | User accepts | Triaged, awaiting approval |
-| `loom:accepted` | User | Curator enhances | Approved, awaiting enhancement |
-| `loom:ready` | Curator | Worker implements | Enhanced, ready for work |
-| `loom:in-progress` | Worker | Worker completes | Being implemented |
-| `loom:blocked` | Worker | User/Worker resolves | Blocked, needs help |
-| `loom:review-requested` | Worker | Reviewer reviews | PR ready for review |
-| `loom:reviewing` | Reviewer | Reviewer completes | PR under review |
+### Issue Labels
+
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:architect-suggestion` | 🔵 Blue | Architect | Suggestion awaiting approval |
+| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
+| `loom:curated` | 🟠 Orange | Curator | Enhanced, awaiting human approval |
+| `loom:issue` | 🟢 Green | Human | Approved for Worker to implement |
+| `loom:in-progress` | 🟡 Amber | Worker | Being implemented |
+| `loom:blocked` | 🔴 Red | Worker | Blocked, needs help |
+| `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
+
+### PR Labels
+
+| Label | Color | Created By | Meaning |
+|-------|-------|-----------|---------|
+| `loom:review-requested` | 🟢 Green | Worker/Fixer | PR ready for Reviewer |
+| `loom:changes-requested` | 🟡 Amber | Reviewer | PR needs fixes from Fixer |
+| `loom:pr` | 🔵 Blue | Reviewer | Approved, ready to merge |
 
 For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
@@ -99,22 +113,24 @@ For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 ## 🧵 Example Workflow
 
-1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an unlabeled issue:
+1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an issue with `loom:architect-suggestion` label:
    > "Add search functionality to terminal history"
 
-   Then triages it by adding `loom:architect-suggestion` label.
+2. **You** review the proposal. Remove `loom:architect-suggestion` to approve it for curation (or close the issue to reject).
 
-2. **You** review the suggestion and add `loom:accepted` label to approve it.
+3. **Curator Bot** (autonomous, runs every 5 minutes) finds the approved issue, adds implementation details, test plans, and code references. Marks it as `loom:curated`.
 
-3. **Curator Bot** (autonomous, runs every 5 minutes) finds the `loom:accepted` issue, adds implementation details, test plans, and code references. Removes `loom:accepted` and adds `loom:ready`.
+4. **You** review the curated issue and explicitly add `loom:issue` label to approve it for implementation.
 
-4. **Worker Bot** (manual or on-demand) finds `loom:ready` issues, claims it by adding `loom:in-progress`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
+5. **Worker Bot** (manual or on-demand) finds `loom:issue` issues, claims it by adding `loom:in-progress`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
 
-5. **Reviewer Bot** (autonomous, runs every 5 minutes) finds the PR, reviews the code, runs tests, and approves or requests changes. Removes `loom:reviewing` when complete.
+6. **Reviewer Bot** (autonomous, runs every 5 minutes) finds the PR, reviews the code, runs tests, and either:
+   - Approves: adds `loom:pr` (ready for you to merge)
+   - Requests changes: adds `loom:changes-requested` (for Fixer bot to address)
 
-6. **You** merge the approved PR. GitHub automatically closes the linked issue.
+7. **You** merge the approved PR with `loom:pr` label. GitHub automatically closes the linked issue.
 
-GitHub shows the whole lifecycle — Loom orchestrates it through labels and autonomous terminals.
+GitHub shows the whole lifecycle — Loom orchestrates it through labels and autonomous terminals with explicit human approval gates.
 
 ---
 
@@ -188,6 +204,44 @@ pnpm run app:dev
 
 ### CLI Usage
 
+#### Workspace Initialization (Headless Mode)
+
+Initialize a Loom workspace without launching the GUI app - perfect for CI/CD, headless servers, or manual orchestration:
+
+```bash
+# Initialize current directory
+loom-daemon init
+
+# Initialize specific repository
+loom-daemon init /path/to/your/repo
+
+# Preview changes without applying them
+loom-daemon init --dry-run
+
+# Overwrite existing .loom directory
+loom-daemon init --force
+
+# Custom defaults directory
+loom-daemon init --defaults ./custom-defaults
+```
+
+**What Gets Installed**:
+- `.loom/` - Configuration directory with terminal roles and settings
+- `CLAUDE.md` - AI context documentation for Claude Code
+- `AGENTS.md` - Agent workflow and coordination guide
+- `.claude/` - Claude Code slash commands and configuration
+- `.codex/` - Codex configuration (if available)
+- `.github/` - GitHub workflow templates and label definitions
+- `.gitignore` - Updated with Loom ephemeral patterns
+
+**Use Cases**:
+- **Manual Orchestration**: Set up Loom in a repo and run agents manually (`claude --role builder`)
+- **CI/CD Pipelines**: Initialize Loom as part of your build/deploy process
+- **Headless Servers**: Install Loom configuration without GUI dependencies
+- **Bulk Setup**: Script initialization across multiple repositories
+
+#### Launching the GUI
+
 Loom supports command-line arguments for headless automation and remote development workflows:
 
 ```bash
@@ -200,7 +254,6 @@ Loom supports command-line arguments for headless automation and remote developm
 
 **Use Cases**:
 - Automated deployment: Launch Loom with a pre-configured workspace on server startup
-- CI/CD integration: Run Loom headlessly in containerized environments
 - Remote development: Start Loom via SSH with a specific repository path
 
 The app will validate the workspace path and automatically load the configuration from `.loom/config.json` if it exists.
@@ -231,6 +284,24 @@ mcp__loom-terminals__list_terminals()
 ```
 
 **Full documentation**: [docs/mcp/README.md](docs/mcp/README.md)
+
+### Documentation
+
+**Essential Guides**:
+- **[Troubleshooting Guide](docs/guides/troubleshooting.md)** - Debug common issues and use diagnostic tools
+- **[API Reference](docs/api/README.md)** - Complete API documentation for Tauri commands, state, and daemon IPC
+- **[Architecture Overview](docs/architecture/system-overview.md)** - System design, component diagrams, and data flow
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines and development setup
+
+**Development Guides**:
+- **[Architecture Patterns](docs/guides/architecture-patterns.md)** - Observer pattern, pure functions, IPC, worktrees
+- **[TypeScript Conventions](docs/guides/typescript-conventions.md)** - Strict mode, type safety, pitfalls
+- **[Code Quality](docs/guides/code-quality.md)** - Linting, formatting, CI/CD, development workflow
+- **[Testing](docs/guides/testing.md)** - Daemon tests, MCP instrumentation, debugging
+- **[Git Workflow](docs/guides/git-workflow.md)** - Branch strategy, commits, PR checklist
+
+**Architecture Decisions**:
+- **[ADR Index](docs/adr/README.md)** - Complete list of architecture decision records
 
 ### Configuring Terminal Roles
 
@@ -272,28 +343,42 @@ cargo test --test integration_basic test_ping_pong -- --nocapture
 Loom aims to make **autonomous, self-improving development** natural —
 you define goals, and the system builds, reviews, and learns from itself.
 
+### 🌙 The Archetypal System
+
+Each terminal can embody one of six archetypal forces (see [Agent Archetypes](docs/philosophy/agent-archetypes.md)):
+
+- 🔮 **Worker** (The Magician) - Transforms ideas into reality
+- 📚 **Curator** (The High Priestess) - Refines chaos into clarity
+- 🏛️ **Architect** (The Emperor) - Envisions structure and design
+- ⚖️ **Reviewer** (Justice) - Maintains quality through discernment
+- 🔍 **Critic** (The Hermit) - Questions to find truth
+- 🔧 **Fixer** (The Hanged Man) - Heals what is broken
+
+*Like the Tarot's Major Arcana or Jung's archetypes, each role represents a universal pattern in software development. When working in harmony, they transform chaos into creation.*
+
 ---
 
 ### 🧩 Architecture Bot (Human-in-the-Loop Design)
 
-In Loom’s future ecosystem, an **Architecture Bot** will run periodically to scan the codebase, documentation, and open issues to surface structural opportunities — not tasks.
+In Loom's future ecosystem, an **Architecture Bot** will run periodically to scan the codebase, documentation, and open issues to surface structural opportunities — not tasks.
 
-It creates new GitHub issues labelled **`suggestion`**, which might include:
+It creates new GitHub issues labelled **`loom:architect-suggestion`**, which might include:
 
-- “Refactor terminal session handling into a reusable module”
-- “Extract common code between Claude and GPT workers”
-- “Add healthcheck endpoints to remote sandboxes”
-- “Document the worker orchestration state machine”
+- "Refactor terminal session handling into a reusable module"
+- "Extract common code between Claude and GPT workers"
+- "Add healthcheck endpoints to remote sandboxes"
+- "Document the worker orchestration state machine"
 
 These issues are **never acted on automatically**.
 
-They are **owned by the human** — the architect who defines the system’s intent and approves direction.  
-The **`suggestion`** label acts as a *safety interlock*:  
+They are **owned by the human** — the architect who defines the system's intent and approves direction.
+The **`loom:architect-suggestion`** label acts as a *safety interlock*:
 
-- As long as `suggestion` is present, Loom’s Issue Bot will ignore the issue.  
-- Once the human removes the label (confirming it’s worth pursuing), the Issue Bot can refine and re-label it as `ready`, enabling the normal worker lifecycle.
+- As long as `loom:architect-suggestion` is present, the Curator Bot will ignore the issue.
+- Once the human removes the label (confirming it's worth pursuing), the Curator Bot can refine and re-label it as `loom:curated`.
+- The human must then explicitly add `loom:issue` to approve it for implementation, enabling the normal Worker lifecycle.
 
-This keeps the feedback loop safe and directional:
+This keeps the feedback loop safe and directional with two explicit human approval gates:
 
 ## 🪪 License
 

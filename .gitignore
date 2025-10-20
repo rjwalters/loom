@@ -11,6 +11,9 @@ src-tauri/target/
 .env
 .env.local
 
+# MCP configuration (generated locally by setup-mcp.sh)
+.mcp.json
+
 # OS
 .DS_Store
 Thumbs.db
@@ -22,10 +25,6 @@ Thumbs.db
 
 # Logs
 *.log
-
-# Daemon management
-.daemon.pid
-.daemon.log
 
 # Loom runtime state (don't commit these)
 .loom/.daemon.pid

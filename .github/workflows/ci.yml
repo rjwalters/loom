@@ -78,7 +78,7 @@ jobs:
           pnpm run lint &
           pnpm run format &
           pnpm exec tsc --noEmit &
-          pnpm run test:unit &
+          pnpm run test:unit:coverage &
           wait
 
       - name: Build frontend
@@ -91,6 +91,15 @@ jobs:
           name: coverage-report
           path: coverage/
           retention-days: 7
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage/coverage-final.json
+          flags: frontend
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload build artifacts
         if: success()

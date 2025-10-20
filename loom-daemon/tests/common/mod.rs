@@ -135,6 +135,7 @@ impl TestClient {
     }
 
     /// Helper: Send Ping request
+    #[allow(dead_code)]
     pub async fn ping(&mut self) -> Result<()> {
         let request = serde_json::json!({"type": "Ping"});
         let response = self.send_request(request).await?;
@@ -147,20 +148,57 @@ impl TestClient {
     }
 
     /// Helper: Create terminal
+    ///
+    /// For security tests, the first parameter (id) is used as the `config_id`.
+    /// For non-security tests that need unique IDs, use `create_terminal_with_unique_id` instead.
+    #[allow(dead_code)]
     pub async fn create_terminal(
+        &mut self,
+        id: impl Into<String>,
+        working_dir: Option<String>,
+    ) -> Result<String> {
+        let id_str: String = id.into();
+        // Use the provided ID as both config_id and name for security testing
+        self.create_terminal_with_config(&id_str, &id_str, working_dir, None, None)
+            .await
+    }
+
+    /// Helper: Create terminal with auto-generated unique ID
+    ///
+    /// Use this for non-security tests that need valid, unique terminal IDs.
+    #[allow(dead_code)]
+    pub async fn create_terminal_with_unique_id(
         &mut self,
         name: impl Into<String>,
         working_dir: Option<String>,
     ) -> Result<String> {
         // Generate a unique config_id for this test terminal
         let config_id = format!("test-{}", uuid::Uuid::new_v4());
+        self.create_terminal_with_config(config_id, name, working_dir, None, None)
+            .await
+    }
+
+    /// Helper: Create terminal with explicit configuration parameters
+    #[allow(dead_code)]
+    pub async fn create_terminal_with_config(
+        &mut self,
+        config_id: impl Into<String>,
+        name: impl Into<String>,
+        working_dir: Option<String>,
+        role: Option<String>,
+        instance_number: Option<u32>,
+    ) -> Result<String> {
+        let config_id: String = config_id.into();
+        let name: String = name.into();
 
         let request = serde_json::json!({
             "type": "CreateTerminal",
             "payload": {
                 "config_id": config_id,
-                "name": name.into(),
-                "working_dir": working_dir
+                "name": name,
+                "working_dir": working_dir,
+                "role": role,
+                "instance_number": instance_number
             }
         });
 
@@ -175,6 +213,7 @@ impl TestClient {
     }
 
     /// Helper: List terminals
+    #[allow(dead_code)]
     pub async fn list_terminals(&mut self) -> Result<Vec<serde_json::Value>> {
         let request = serde_json::json!({"type": "ListTerminals"});
         let response = self.send_request(request).await?;
@@ -188,6 +227,7 @@ impl TestClient {
     }
 
     /// Helper: Destroy terminal
+    #[allow(dead_code)]
     pub async fn destroy_terminal(&mut self, id: &str) -> Result<()> {
         let request = serde_json::json!({
             "type": "DestroyTerminal",
@@ -204,6 +244,7 @@ impl TestClient {
     }
 
     /// Helper: Send input to terminal
+    #[allow(dead_code)]
     pub async fn send_input(&mut self, id: &str, data: &str) -> Result<()> {
         let request = serde_json::json!({
             "type": "SendInput",
@@ -218,9 +259,29 @@ impl TestClient {
 
         Ok(())
     }
+
+    /// Helper: Check session health for a terminal ID
+    #[allow(dead_code)]
+    pub async fn check_session_health(&mut self, id: &str) -> Result<bool> {
+        let request = serde_json::json!({
+            "type": "CheckSessionHealth",
+            "payload": { "id": id }
+        });
+
+        let response = self.send_request(request).await?;
+
+        if let Some(payload) = response.get("payload") {
+            if let Some(has_session) = payload.get("has_session") {
+                return Ok(has_session.as_bool().unwrap_or(false));
+            }
+        }
+
+        anyhow::bail!("Unexpected response: {response:?}");
+    }
 }
 
 /// Helper: Check if a tmux session exists
+#[allow(dead_code)]
 pub fn tmux_session_exists(session_name: &str) -> bool {
     Command::new("tmux")
         .args(["-L", "loom", "has-session", "-t", session_name])
@@ -257,4 +318,28 @@ pub fn cleanup_all_loom_sessions() {
     for session in get_loom_tmux_sessions() {
         kill_tmux_session(&session);
     }
+}
+
+/// Helper: Capture terminal output using tmux capture-pane
+///
+/// Uses tmux's built-in capture mechanism to read the terminal's pane content.
+/// Returns the captured output as a String.
+///
+/// # Arguments
+/// * `session_name` - The tmux session name to capture from
+///
+/// # Returns
+/// * `Result<String>` - The captured output or an error message
+#[allow(dead_code)]
+pub fn capture_terminal_output(session_name: &str) -> Result<String> {
+    let output = Command::new("tmux")
+        .args(["-L", "loom", "capture-pane", "-t", session_name, "-p"])
+        .output()
+        .context("Failed to execute tmux capture-pane")?;
+
+    if !output.status.success() {
+        anyhow::bail!("tmux capture-pane failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    String::from_utf8(output.stdout).context("Invalid UTF-8 in captured output")
 }

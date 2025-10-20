@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
+import { detectTerminalState, type TerminalState } from "./terminal-state-parser";
 
 const logger = Logger.forComponent("agent-launcher");
 
@@ -10,6 +11,43 @@ const logger = Logger.forComponent("agent-launcher");
  * - terminalId parameters are sessionIds used for IPC operations (send_input, etc.)
  * - Callers should use configId for state management, look up sessionId for launching
  */
+
+/**
+ * Detect what type of process is running in a terminal (passive detection)
+ *
+ * Uses passive detection by reading and parsing terminal output instead of
+ * sending probe commands. This approach is:
+ * - Non-intrusive: No commands sent to terminal
+ * - Real-time: Can detect state immediately
+ * - More informative: Can detect multiple states (working, paused, waiting, etc.)
+ *
+ * This is useful for:
+ * - Verifying an agent was launched successfully
+ * - Detecting bypass permissions prompt
+ * - Distinguishing between shells and agents
+ * - Debugging agent launch issues
+ *
+ * @param terminalId - The terminal ID to check
+ * @param lineCount - Number of lines to analyze (default: 20)
+ * @returns Promise resolving to the terminal state with detected type and status
+ */
+export async function detectTerminalType(
+  terminalId: string,
+  lineCount = 20
+): Promise<TerminalState> {
+  logger.info("Detecting terminal type with passive parsing", { terminalId, lineCount });
+
+  const state = await detectTerminalState(terminalId, lineCount);
+
+  logger.info("Terminal type detection complete", {
+    terminalId,
+    type: state.type,
+    status: state.status,
+    hasPrompt: !!state.lastPrompt,
+  });
+
+  return state;
+}
 
 /**
  * Launch a Claude agent in a terminal by sending the Claude CLI command
@@ -90,70 +128,125 @@ export async function launchAgentInTerminal(
     data: "\r",
   });
 
-  // Add initial delay to allow Claude Code to start
-  // This prevents the "2" from concatenating with the previous command
-  logger.info("Initial wait for Claude Code to start", { terminalId, delayMs: 1000 });
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Poll for bypass permissions prompt using passive detection
+  // Instead of blindly sending "2", detect the prompt first, then respond
+  const maxAttempts = 10; // Max polling attempts
+  const pollInterval = 1000; // Check every 1 second
+  let bypassAccepted = false;
 
-  // Retry accepting the bypass permissions warning with exponential backoff
-  // Claude Code initialization time varies, so we try multiple times with increasing delays
-  const maxRetries = 3;
-  const baseDelay = 2000; // Base delay: 2 seconds
+  logger.info("Polling for bypass permissions prompt", { terminalId, maxAttempts, pollInterval });
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const delay = baseDelay * attempt; // Exponential backoff: 2s, 4s, 6s
-    logger.info("Waiting for bypass permissions prompt", {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, pollInterval));
+
+    // Check terminal state using passive detection
+    const state = await detectTerminalType(terminalId, 10);
+
+    logger.info("Bypass polling attempt", {
       terminalId,
       attempt,
-      maxRetries,
-      delayMs: delay,
+      detectedType: state.type,
+      detectedStatus: state.status,
     });
-    await new Promise((resolve) => setTimeout(resolve, delay));
 
-    // Accept the bypass permissions warning by selecting option 2
-    logger.info("Sending acceptance input for bypass permissions", { terminalId, attempt });
+    if (state.status === "bypass-prompt") {
+      // Bypass prompt detected - send "2" to accept
+      logger.info("Bypass prompt detected, accepting", { terminalId, attempt });
+
+      await invoke("send_terminal_input", {
+        id: terminalId,
+        data: "2",
+      });
+
+      // Small delay before Enter
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      await invoke("send_terminal_input", {
+        id: terminalId,
+        data: "\r",
+      });
+
+      bypassAccepted = true;
+      logger.info("Bypass permissions accepted", { terminalId });
+      break;
+    } else if (state.status === "waiting-input") {
+      // Agent already ready, no bypass prompt needed
+      logger.info("Agent already ready, skipping bypass", { terminalId, attempt });
+      bypassAccepted = true;
+      break;
+    }
+
+    // Continue polling
+  }
+
+  if (!bypassAccepted) {
+    logger.error(
+      "Bypass permissions prompt not detected within timeout",
+      new Error("Timeout waiting for bypass prompt"),
+      { terminalId, maxAttempts }
+    );
+  }
+
+  // Wait for Claude Code to be ready to receive input and send role prompt
+  // Wrapped in try-catch to capture any silent failures
+  try {
+    logger.info("Waiting for Claude Code to initialize", { terminalId, delayMs: 2000 });
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    logger.info("Wait complete, proceeding to send role prompt", { terminalId });
+
+    // Send the role prompt as the first message
+    logger.info("Sending role prompt as first message", {
+      terminalId,
+      promptLength: processedPrompt.length,
+    });
     await invoke("send_terminal_input", {
       id: terminalId,
-      data: "2",
+      data: processedPrompt,
     });
+    logger.info("Role prompt sent successfully", { terminalId });
 
-    // Small delay before pressing Enter to ensure "2" is processed
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
-    // Press Enter to confirm selection
-    logger.info("Sending Enter to confirm bypass permissions", { terminalId, attempt });
+    // Press Enter to submit the prompt
+    logger.info("Sending Enter to submit role prompt", { terminalId });
     await invoke("send_terminal_input", {
       id: terminalId,
       data: "\r",
     });
-
-    // If this isn't the last attempt, wait a bit before retrying
-    if (attempt < maxRetries) {
-      logger.info("Waiting before retry", { terminalId, delayMs: 500 });
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
+    logger.info("Enter sent successfully", { terminalId });
+  } catch (error) {
+    logger.error("Failed to send role prompt or Enter", error as Error, {
+      terminalId,
+      promptLength: processedPrompt.length,
+    });
+    throw error; // Re-throw to let caller handle
   }
 
-  // Wait for Claude Code to be ready to receive input
-  logger.info("Waiting for Claude Code to initialize", { terminalId, delayMs: 2000 });
+  // Wait for the agent to process the role prompt
+  logger.info("Waiting for agent to process role prompt", { terminalId, delayMs: 2000 });
   await new Promise((resolve) => setTimeout(resolve, 2000));
 
-  // Send the role prompt as the first message
-  logger.info("Sending role prompt as first message", {
-    terminalId,
-    promptLength: processedPrompt.length,
-  });
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: processedPrompt,
-  });
+  // Verify agent launched successfully using passive detection
+  logger.info("Verifying agent launch with passive detection", { terminalId });
+  const state = await detectTerminalType(terminalId, 20);
 
-  // Press Enter to submit the prompt
-  logger.info("Sending Enter to submit role prompt", { terminalId });
-  await invoke("send_terminal_input", {
-    id: terminalId,
-    data: "\r",
-  });
+  if (state.type === "claude-code" && state.status === "waiting-input") {
+    logger.info("Agent launch verified successfully", {
+      terminalId,
+      type: state.type,
+      status: state.status,
+    });
+  } else if (state.type === "shell") {
+    logger.error(
+      "Agent launch verification failed: detected shell instead of agent",
+      new Error("Shell detected after agent launch"),
+      { terminalId, detectedState: state }
+    );
+  } else {
+    logger.error(
+      "Agent launch verification inconclusive: unexpected state",
+      new Error("Unexpected terminal state detected"),
+      { terminalId, type: state.type, status: state.status }
+    );
+  }
 
   logger.info("Agent launch complete", { terminalId, agentWorkingDir });
 }
@@ -384,6 +477,34 @@ export async function launchCodexAgent(
     id: terminalId,
     data: "\r",
   });
+
+  // Wait for the agent to initialize and process the role prompt
+  logger.info("Waiting for Codex agent to initialize", { terminalId, delayMs: 2000 });
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Verify agent launched successfully using passive detection
+  logger.info("Verifying Codex agent launch with passive detection", { terminalId });
+  const state = await detectTerminalType(terminalId, 20);
+
+  if (state.type === "codex") {
+    logger.info("Codex agent launch verified successfully", {
+      terminalId,
+      type: state.type,
+      status: state.status,
+    });
+  } else if (state.type === "shell") {
+    logger.error(
+      "Codex agent launch verification failed: detected shell instead of agent",
+      new Error("Shell detected after Codex launch"),
+      { terminalId, detectedState: state }
+    );
+  } else {
+    logger.error(
+      "Codex agent launch verification inconclusive: unexpected state",
+      new Error("Unexpected terminal state detected after Codex launch"),
+      { terminalId, type: state.type, status: state.status }
+    );
+  }
 
   logger.info("Codex agent launch complete", { terminalId, agentWorkingDir });
 }

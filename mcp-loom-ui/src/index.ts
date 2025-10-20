@@ -15,6 +15,8 @@ import { join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import fg from "fast-glob";
+import ignore from "ignore";
 
 const LOOM_DIR = join(homedir(), ".loom");
 const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
@@ -43,19 +45,27 @@ async function readConsoleLog(lines = 100): Promise<string> {
 }
 
 /**
- * Write MCP command to control file for Loom to pick up
- * This is a simple file-based IPC mechanism that doesn't require AppleScript
+ * Write MCP command to control file for Loom to pick up with retry and exponential backoff
+ * This is a file-based IPC mechanism with acknowledgment
  */
 async function writeMCPCommand(command: string): Promise<string> {
-  const { writeFile, mkdir } = await import("node:fs/promises");
+  const { writeFile, mkdir, access, readFile, rm } = await import("node:fs/promises");
   const loomDir = join(homedir(), ".loom");
   const commandFile = join(loomDir, "mcp-command.json");
+  const ackFile = join(loomDir, "mcp-ack.json");
 
   // Ensure .loom directory exists
   try {
     await mkdir(loomDir, { recursive: true });
   } catch (_error) {
     // Directory might already exist, that's fine
+  }
+
+  // Clean up old acknowledgment file before writing new command
+  try {
+    await rm(ackFile);
+  } catch (_error) {
+    // Ack file might not exist, that's fine
   }
 
   // Write command with timestamp
@@ -66,7 +76,50 @@ async function writeMCPCommand(command: string): Promise<string> {
 
   await writeFile(commandFile, JSON.stringify(commandData, null, 2));
 
-  return `MCP command '${command}' written to ${commandFile}. The Loom app's MCP watcher will process this command within 500ms.`;
+  // Retry with exponential backoff to wait for acknowledgment
+  const maxRetries = 8; // Max 8 retries
+  const baseDelay = 100; // Start with 100ms
+  const maxDelay = 5000; // Cap at 5 seconds
+  let totalWaitTime = 0;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Calculate exponential backoff delay: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms, 5000ms
+    const delay = Math.min(baseDelay * 2 ** attempt, maxDelay);
+    totalWaitTime += delay;
+
+    // Wait before checking for acknowledgment
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    // Check if acknowledgment file exists
+    try {
+      await access(ackFile);
+
+      // Read acknowledgment data
+      const ackContent = await readFile(ackFile, "utf-8");
+      const ackData = JSON.parse(ackContent);
+
+      // Verify the ack is for our command
+      if (ackData.command === command && ackData.timestamp === commandData.timestamp) {
+        // Clean up acknowledgment file
+        try {
+          await rm(ackFile);
+        } catch (_error) {
+          // Ignore cleanup errors
+        }
+
+        if (ackData.success) {
+          return `MCP command '${command}' processed successfully (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        } else {
+          return `MCP command '${command}' acknowledged but execution failed (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        }
+      }
+    } catch (_error) {
+      // Ack file doesn't exist yet or couldn't be read, continue retrying
+    }
+  }
+
+  // Max retries exceeded - give up but don't error
+  return `MCP command '${command}' written but no acknowledgment received after ${maxRetries} retries (${totalWaitTime}ms total). The command may still be processing.`;
 }
 
 /**
@@ -89,6 +142,21 @@ async function triggerForceStart(): Promise<string> {
  */
 async function triggerFactoryReset(): Promise<string> {
   return await writeMCPCommand("trigger_factory_reset");
+}
+
+/**
+ * Trigger force factory reset - overwrites config with defaults (NO confirmation dialog)
+ * Note: Factory reset does NOT auto-start. User must run "Start" after reset.
+ */
+async function triggerForceFactoryReset(): Promise<string> {
+  return await writeMCPCommand("trigger_force_factory_reset");
+}
+
+/**
+ * Trigger terminal restart - destroys and recreates a terminal with the same configuration
+ */
+async function triggerRestartTerminal(terminalId: string): Promise<string> {
+  return await writeMCPCommand(`restart_terminal:${terminalId}`);
 }
 
 /**
@@ -210,6 +278,72 @@ async function getHeartbeat(): Promise<string> {
   }
 }
 
+/**
+ * Get a random file from the workspace
+ * Respects .gitignore and allows custom include/exclude patterns
+ */
+async function getRandomFile(options?: {
+  includePatterns?: string[];
+  excludePatterns?: string[];
+}): Promise<string> {
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+
+    // Default exclude patterns
+    const defaultExcludes = [
+      "**/node_modules/**",
+      "**/.git/**",
+      "**/dist/**",
+      "**/build/**",
+      "**/target/**",
+      "**/.loom/worktrees/**",
+      "**/*.log",
+      "**/package-lock.json",
+      "**/pnpm-lock.yaml",
+      "**/yarn.lock",
+    ];
+
+    const excludePatterns = [...defaultExcludes, ...(options?.excludePatterns || [])];
+    const includePatterns = options?.includePatterns || ["**/*"];
+
+    // Read .gitignore if it exists
+    const gitignorePath = join(workspacePath, ".gitignore");
+    let ig = ignore();
+    try {
+      const gitignoreContent = await readFile(gitignorePath, "utf-8");
+      ig = ignore().add(gitignoreContent);
+    } catch {
+      // .gitignore doesn't exist or can't be read, that's fine
+    }
+
+    // Find all files
+    const files = await fg(includePatterns, {
+      cwd: workspacePath,
+      ignore: excludePatterns,
+      onlyFiles: true,
+      dot: false,
+      absolute: false,
+    });
+
+    // Filter by .gitignore
+    const filteredFiles = files.filter((file) => !ig.ignores(file));
+
+    if (filteredFiles.length === 0) {
+      return "No files found matching the criteria";
+    }
+
+    // Pick a random file
+    const randomIndex = Math.floor(Math.random() * filteredFiles.length);
+    const randomFile = filteredFiles[randomIndex];
+
+    // Return absolute path
+    return join(workspacePath, randomFile);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to get random file: ${errorMessage}`);
+  }
+}
+
 // Create server instance
 const server = new Server(
   {
@@ -263,7 +397,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "trigger_factory_reset",
         description:
-          "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. Use this to reset configuration to clean state for testing.",
+          "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog that requires user interaction. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. For MCP automation, use trigger_force_factory_reset instead to bypass the confirmation dialog.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "trigger_force_factory_reset",
+        description:
+          "Reset workspace to factory defaults WITHOUT confirmation dialog. Same as trigger_factory_reset but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to reset. Does NOT auto-start - must run trigger_force_start after reset to create terminals.",
         inputSchema: {
           type: "object",
           properties: {},
@@ -294,6 +437,43 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      {
+        name: "trigger_restart_terminal",
+        description:
+          "Restart a specific terminal by destroying and recreating it with the same configuration. The terminal will preserve its name, role, worktree path, and agent configuration. Useful for recovering from stuck terminals or testing terminal lifecycle.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminalId: {
+              type: "string",
+              description: "The ID of the terminal to restart (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminalId"],
+        },
+      },
+      {
+        name: "get_random_file",
+        description:
+          "Get a random file path from the workspace. Respects .gitignore and excludes common build artifacts. Useful for the Critic agent to pick files to review.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            includePatterns: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Optional glob patterns to include (e.g., ['src/**/*.ts']). Defaults to all files.",
+            },
+            excludePatterns: {
+              type: "array",
+              items: { type: "string" },
+              description:
+                "Optional glob patterns to exclude in addition to defaults (node_modules, .git, dist, etc.)",
+            },
+          },
         },
       },
     ],
@@ -355,6 +535,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "trigger_force_factory_reset": {
+        const result = await triggerForceFactoryReset();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
       case "read_state_file": {
         const state = await readStateFile();
         return {
@@ -386,6 +578,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: heartbeat,
+            },
+          ],
+        };
+      }
+
+      case "trigger_restart_terminal": {
+        const terminalId = args?.terminalId as string;
+        if (!terminalId) {
+          throw new Error("terminalId parameter is required");
+        }
+        const result = await triggerRestartTerminal(terminalId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "get_random_file": {
+        const includePatterns = args?.includePatterns as string[] | undefined;
+        const excludePatterns = args?.excludePatterns as string[] | undefined;
+        const randomFile = await getRandomFile({ includePatterns, excludePatterns });
+        return {
+          content: [
+            {
+              type: "text",
+              text: randomFile,
             },
           ],
         };

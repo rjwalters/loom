@@ -16,7 +16,7 @@ export interface LabelDefinition {
 /**
  * Standard Loom workflow labels
  *
- * See scripts/LABEL_WORKFLOW.md for complete documentation.
+ * See WORKFLOWS.md for complete documentation.
  *
  * Color semantics:
  * - Blue: Human action needed
@@ -25,20 +25,30 @@ export interface LabelDefinition {
  * - Red: Blocked/needs help
  *
  * Labels are separated into Issue labels and PR labels:
- * - Issue labels: loom:proposal, loom:ready, loom:in-progress, loom:blocked, loom:urgent
- * - PR labels: loom:review-requested, loom:reviewing, loom:approved
+ * - Issue labels: loom:architect-suggestion, loom:critic-suggestion, loom:curated, loom:issue, loom:in-progress, loom:blocked, loom:urgent
+ * - PR labels: loom:review-requested, loom:changes-requested, loom:pr
  */
 export const LOOM_LABELS: LabelDefinition[] = [
   // Issue Labels
   {
-    name: "loom:proposal",
+    name: "loom:architect-suggestion",
     description: "Architect suggestion awaiting user approval",
     color: "3B82F6", // Blue - human action needed
   },
   {
-    name: "loom:ready",
-    description: "Issue ready for Worker to claim and implement",
+    name: "loom:critic-suggestion",
+    description: "Critic removal/simplification proposal awaiting user approval",
+    color: "3B82F6", // Blue - human action needed
+  },
+  {
+    name: "loom:curated",
+    description: "Curator enhanced, awaiting human approval for work",
     color: "10B981", // Green - Loom bot action needed
+  },
+  {
+    name: "loom:issue",
+    description: "Human approved, ready for Worker to claim and implement",
+    color: "10B981", // Green - ready for work
   },
   {
     name: "loom:in-progress",
@@ -62,12 +72,12 @@ export const LOOM_LABELS: LabelDefinition[] = [
     color: "10B981", // Green - Loom bot action needed
   },
   {
-    name: "loom:reviewing",
-    description: "Reviewer actively reviewing this PR",
+    name: "loom:changes-requested",
+    description: "PR needs fixes from Fixer",
     color: "F59E0B", // Amber - work in progress
   },
   {
-    name: "loom:approved",
+    name: "loom:pr",
     description: "PR approved by Reviewer, ready for human to merge",
     color: "3B82F6", // Blue - human action needed
   },

@@ -127,16 +127,46 @@ if ! [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
-# Check if already in a worktree
+# Check if already in a worktree and automatically handle it
 if check_if_in_worktree; then
-    print_error "You are already in a worktree!"
+    print_warning "Currently in a worktree, auto-navigating to main workspace..."
     echo ""
     get_worktree_info
     echo ""
-    print_info "To create a new worktree:"
-    echo "  1. Return to main: cd \$(git rev-parse --show-toplevel)/../.. && git checkout main"
-    echo "  2. Then run: pnpm worktree $ISSUE_NUMBER"
-    exit 1
+
+    # Find the git root (common directory for all worktrees)
+    GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
+    if [[ -z "$GIT_COMMON_DIR" ]]; then
+        print_error "Failed to find git common directory"
+        exit 1
+    fi
+
+    # The main workspace is the parent of .git (or the directory containing .git)
+    MAIN_WORKSPACE=$(dirname "$GIT_COMMON_DIR")
+    print_info "Found main workspace: $MAIN_WORKSPACE"
+
+    # Change to main workspace
+    if cd "$MAIN_WORKSPACE" 2>/dev/null; then
+        print_success "Switched to main workspace"
+
+        # Check if we're on main branch, if not switch to it
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        if [[ "$CURRENT_BRANCH" != "main" ]]; then
+            print_info "Switching from $CURRENT_BRANCH to main branch..."
+            if git checkout main 2>/dev/null; then
+                print_success "Switched to main branch"
+            else
+                print_error "Failed to switch to main branch"
+                print_info "Please manually run: git checkout main"
+                exit 1
+            fi
+        fi
+    else
+        print_error "Failed to change to main workspace: $MAIN_WORKSPACE"
+        print_info "Please manually run: cd $MAIN_WORKSPACE"
+        exit 1
+    fi
+    echo ""
 fi
 
 # Determine branch name

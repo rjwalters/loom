@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { Logger } from "./logger";
 import { getTerminalManager } from "./terminal-manager";
+
+const logger = Logger.forComponent("output-poller");
 
 interface TerminalOutput {
   output: string;
@@ -40,7 +43,7 @@ export class OutputPoller {
   startPolling(terminalId: string): void {
     // If already polling, do nothing
     if (this.pollers.has(terminalId)) {
-      console.warn(`Already polling terminal ${terminalId}`);
+      logger.warn("Already polling terminal", { terminalId });
       return;
     }
 
@@ -96,7 +99,7 @@ export class OutputPoller {
 
     // Already polling?
     if (state.polling && state.intervalId !== null) {
-      console.warn(`Terminal ${terminalId} is already actively polling`);
+      logger.warn("Terminal is already actively polling", { terminalId });
       return;
     }
 
@@ -161,23 +164,33 @@ export class OutputPoller {
       if (result.output && result.output.length > 0) {
         // Decode base64 to raw bytes
         const decodedBytes = this.base64ToBytes(result.output);
-        console.log(`[poller] Decoded ${decodedBytes.length} bytes from base64`);
+        logger.info("Decoded output from base64", {
+          terminalId: state.terminalId,
+          byteCount: decodedBytes.length,
+        });
 
         // Convert bytes to string (UTF-8)
         const text = new TextDecoder("utf-8").decode(decodedBytes);
-        console.log(
-          `[poller] Decoded text length: ${text.length}, preview: ${text.substring(0, 100).replace(/\n/g, "\\n").replace(/\r/g, "\\r")}`
-        );
+        const preview = text.substring(0, 100).replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+        logger.info("Decoded text", {
+          terminalId: state.terminalId,
+          textLength: text.length,
+          preview,
+        });
 
         const terminalManager = getTerminalManager();
 
         // First poll: clear and write fresh state
         if (state.lastByteCount === 0) {
-          console.log(`[poller] First poll - clearing and writing to terminal ${state.terminalId}`);
+          logger.info("First poll - clearing and writing to terminal", {
+            terminalId: state.terminalId,
+          });
           terminalManager.clearAndWriteTerminal(state.terminalId, text);
         } else {
           // Subsequent polls: append new content incrementally
-          console.log(`[poller] Incremental update - writing to terminal ${state.terminalId}`);
+          logger.info("Incremental update - writing to terminal", {
+            terminalId: state.terminalId,
+          });
           terminalManager.writeToTerminal(state.terminalId, text);
         }
 
@@ -210,17 +223,18 @@ export class OutputPoller {
 
       // Only log errors occasionally to avoid spam (every 5th error, or first error)
       if (state.consecutiveErrors === 1 || state.consecutiveErrors % 5 === 0) {
-        console.error(
-          `Error polling terminal ${state.terminalId} (${state.consecutiveErrors} consecutive errors):`,
-          errorMessage
-        );
+        logger.error("Error polling terminal", error, {
+          terminalId: state.terminalId,
+          consecutiveErrors: state.consecutiveErrors,
+        });
       }
 
       // Stop polling after max consecutive errors
       if (state.consecutiveErrors >= this.maxConsecutiveErrors) {
-        console.error(
-          `Stopping polling for terminal ${state.terminalId} after ${this.maxConsecutiveErrors} consecutive errors`
-        );
+        logger.error("Stopping polling after max consecutive errors", {
+          terminalId: state.terminalId,
+          maxErrors: this.maxConsecutiveErrors,
+        });
 
         // Notify error callback if registered
         if (this.errorCallback) {
@@ -313,17 +327,20 @@ export class OutputPoller {
     // If terminal has been inactive for activityTimeout, slow down polling
     if (timeSinceActivity > this.activityTimeout) {
       if (state.currentPollInterval !== this.idlePollInterval) {
-        console.log(
-          `[poller] Terminal ${state.terminalId} idle for ${Math.round(timeSinceActivity / 1000)}s, reducing poll frequency to ${this.idlePollInterval}ms`
-        );
+        logger.info("Terminal idle - reducing poll frequency", {
+          terminalId: state.terminalId,
+          idleSeconds: Math.round(timeSinceActivity / 1000),
+          newInterval: this.idlePollInterval,
+        });
         state.currentPollInterval = this.idlePollInterval;
       }
     } else {
       // Terminal is active, use fast polling
       if (state.currentPollInterval !== this.pollInterval) {
-        console.log(
-          `[poller] Terminal ${state.terminalId} active, increasing poll frequency to ${this.pollInterval}ms`
-        );
+        logger.info("Terminal active - increasing poll frequency", {
+          terminalId: state.terminalId,
+          newInterval: this.pollInterval,
+        });
         state.currentPollInterval = this.pollInterval;
       }
     }

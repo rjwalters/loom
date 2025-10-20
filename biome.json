@@ -25,13 +25,62 @@
         "noUnusedVariables": "warn"
       },
       "suspicious": {
+        "noConsole": "error",
         "noExplicitAny": "warn",
         "noDebugger": "warn",
         "noUnknownAtRules": "off",
         "useIterableCallbackReturn": "off"
+      },
+      "style": {
+        "noNonNullAssertion": "warn"
       }
     }
   },
+  "overrides": [
+    {
+      "includes": ["**/*.test.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noExplicitAny": "off"
+          },
+          "style": {
+            "noNonNullAssertion": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/lib/logger.ts", "src/main.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["mcp-*/src/**/*.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["src/lib/terminal-state-parser.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noControlCharactersInRegex": "off"
+          }
+        }
+      }
+    }
+  ],
   "javascript": {
     "formatter": {
       "quoteStyle": "double",

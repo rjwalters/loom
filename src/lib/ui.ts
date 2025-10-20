@@ -1,5 +1,9 @@
+import { Logger } from "./logger";
 import { type Terminal, TerminalStatus } from "./state";
+import { getTarotCardPath } from "./tarot-cards";
 import { getTheme, getThemeStyles, isDarkMode } from "./themes";
+
+const logger = Logger.forComponent("ui");
 
 /**
  * Format milliseconds into a human-readable duration
@@ -67,15 +71,68 @@ export function renderLoadingState(message: string = "Resetting workspace..."): 
 
   container.innerHTML = `
     <div class="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-      <div class="flex flex-col items-center gap-4">
-        <div class="relative">
-          <div class="w-16 h-16 border-4 border-blue-200 dark:border-blue-900 rounded-full"></div>
-          <div class="absolute top-0 left-0 w-16 h-16 border-4 border-blue-600 dark:border-blue-400 border-t-transparent rounded-full animate-spin"></div>
+      <div class="flex flex-col items-center gap-6">
+        <!-- Loom weaving animation -->
+        <div class="relative w-32 h-32">
+          <!-- Vertical warp threads -->
+          <div class="absolute inset-0 flex justify-around items-center">
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 0ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 200ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 400ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 600ms; animation-duration: 1.5s;"></div>
+            <div class="w-1 h-full bg-blue-400 dark:bg-blue-600 opacity-60 animate-pulse" style="animation-delay: 800ms; animation-duration: 1.5s;"></div>
+          </div>
+
+          <!-- Horizontal weft shuttle -->
+          <div class="absolute inset-0 flex items-center overflow-hidden">
+            <div class="w-full h-1 bg-gradient-to-r from-transparent via-blue-500 dark:via-blue-400 to-transparent animate-pulse" style="animation-duration: 2s;"></div>
+          </div>
+
+          <!-- Weaving shuttle moving across and up -->
+          <div class="absolute inset-0 flex items-center">
+            <div class="h-2 w-6 bg-blue-600 dark:bg-blue-400 rounded-full shadow-lg" style="animation: shuttle 4s ease-in-out infinite;"></div>
+          </div>
         </div>
-        <p class="text-lg font-medium text-gray-700 dark:text-gray-300">${escapeHtml(message)}</p>
-        <p class="text-sm text-gray-500 dark:text-gray-400">This may take a few moments...</p>
+
+        <!-- Animated message -->
+        <div class="text-center">
+          <p class="text-lg font-semibold text-gray-700 dark:text-gray-300 animate-pulse">${escapeHtml(message)}</p>
+          <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">This may take a few moments...</p>
+        </div>
       </div>
     </div>
+
+    <style>
+      @keyframes shuttle {
+        0% {
+          transform: translateX(-200%) translateY(50%);
+        }
+        22% {
+          transform: translateX(600%) translateY(50%);
+        }
+        25% {
+          transform: translateX(600%) translateY(30%);
+        }
+        47% {
+          transform: translateX(-200%) translateY(30%);
+        }
+        50% {
+          transform: translateX(-200%) translateY(10%);
+        }
+        72% {
+          transform: translateX(600%) translateY(10%);
+        }
+        75% {
+          transform: translateX(600%) translateY(-10%);
+        }
+        97% {
+          transform: translateX(-200%) translateY(-10%);
+        }
+        100% {
+          transform: translateX(-200%) translateY(50%);
+        }
+      }
+    </style>
   `;
 }
 
@@ -178,6 +235,8 @@ export function renderPrimaryTerminal(
         <span class="text-xs text-gray-500 dark:text-gray-400">• ${roleLabel}</span>
       </div>
       <div class="flex items-center gap-1">
+        ${createRestartButtonHTML(terminal, "primary")}
+        ${createRunNowButtonHTML(terminal, "primary")}
         <button
           id="terminal-clear-btn"
           data-terminal-id="${terminal.id}"
@@ -203,6 +262,16 @@ export function renderPrimaryTerminal(
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
           </svg>
         </button>
+        <button
+          id="terminal-close-btn"
+          data-terminal-id="${terminal.id}"
+          data-tooltip="Close terminal"
+          data-tooltip-position="bottom"
+          class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors text-gray-600 dark:text-gray-300 hover:text-red-500 dark:hover:text-red-400 font-bold text-lg"
+          title="Close terminal"
+        >
+          ×
+        </button>
       </div>
     `;
     headerContainer.style.backgroundColor = styles.backgroundColor;
@@ -216,27 +285,91 @@ export function renderPrimaryTerminal(
 
   // If missing session, render error UI inside the content container after DOM update
   if (hasMissingSession) {
-    console.log(
-      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=true, will render error overlay`
-    );
-    setTimeout(() => {
-      renderMissingSessionError(terminal.id, terminal.id);
+    logger.info("Terminal has missing session, rendering error overlay", {
+      terminalId: terminal.id,
+    });
+    setTimeout(async () => {
+      // Get health check timing from health monitor
+      const { getHealthMonitor } = await import("./health-monitor");
+      const healthMonitor = getHealthMonitor();
+      const healthTiming = healthMonitor.getHealthCheckTiming();
+
+      renderMissingSessionError(terminal.id, terminal.id, healthTiming);
     }, 0);
   } else {
-    console.log(
-      `[renderPrimaryTerminal] Terminal ${terminal.id} has missingSession=${terminal.missingSession}, will show xterm`
-    );
+    logger.info("Terminal session valid, showing xterm", {
+      terminalId: terminal.id,
+      missingSession: terminal.missingSession,
+    });
   }
 }
 
-export function renderMissingSessionError(sessionId: string, configId: string): void {
-  console.log(`[renderMissingSessionError] Rendering error overlay for terminal ${sessionId}`);
+export interface HealthCheckTiming {
+  lastCheckTime: number | null;
+  nextCheckTime: number | null;
+  checkIntervalMs: number;
+}
+
+export function renderMissingSessionError(
+  sessionId: string,
+  configId: string,
+  healthTiming?: HealthCheckTiming
+): void {
+  logger.info("Rendering missing session error overlay", {
+    sessionId,
+    configId,
+  });
   const container = document.getElementById(`xterm-container-${sessionId}`);
   if (!container) {
-    console.warn(`[renderMissingSessionError] Container #xterm-container-${sessionId} not found!`);
+    logger.warn("Container not found for session", {
+      sessionId,
+      containerId: `xterm-container-${sessionId}`,
+    });
     return;
   }
-  console.log(`[renderMissingSessionError] Found container, replacing with error UI`);
+  logger.info("Found container, replacing with error UI", { sessionId });
+
+  // Calculate health check timing info
+  let healthCheckInfo = "";
+  if (healthTiming) {
+    const now = Date.now();
+    const lastCheckText = healthTiming.lastCheckTime
+      ? formatDuration(now - healthTiming.lastCheckTime)
+      : "never";
+    const nextCheckText = healthTiming.nextCheckTime
+      ? formatDuration(healthTiming.nextCheckTime - now)
+      : "unknown";
+
+    healthCheckInfo = `
+      <div class="mt-4 p-4 bg-gray-100 dark:bg-gray-800 rounded-lg border border-gray-300 dark:border-gray-600">
+        <h4 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-3">Health Check Diagnostics</h4>
+        <div class="grid grid-cols-2 gap-3 text-xs">
+          <div class="flex flex-col">
+            <span class="text-gray-500 dark:text-gray-400">Last Check:</span>
+            <span class="font-mono font-semibold text-gray-700 dark:text-gray-300">${lastCheckText} ago</span>
+          </div>
+          <div class="flex flex-col">
+            <span class="text-gray-500 dark:text-gray-400">Next Check:</span>
+            <span class="font-mono font-semibold text-gray-700 dark:text-gray-300">in ${nextCheckText}</span>
+          </div>
+          <div class="flex flex-col col-span-2">
+            <span class="text-gray-500 dark:text-gray-400">Check Interval:</span>
+            <span class="font-mono font-semibold text-gray-700 dark:text-gray-300">${formatDuration(healthTiming.checkIntervalMs)}</span>
+          </div>
+        </div>
+        <button
+          id="check-now-btn"
+          data-terminal-id="${configId}"
+          class="mt-3 w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg font-medium transition-colors flex items-center justify-center gap-2"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+          </svg>
+          Check Now
+        </button>
+      </div>
+    `;
+  }
 
   container.innerHTML = `
     <div class="h-full flex items-center justify-center bg-red-50 dark:bg-red-900/20">
@@ -247,78 +380,14 @@ export function renderMissingSessionError(sessionId: string, configId: string): 
           </svg>
         </div>
         <h3 class="text-lg font-semibold text-red-700 dark:text-red-300 mb-2">Terminal Session Missing</h3>
-        <p class="text-sm text-red-600 dark:text-red-400 mb-6">
+        <p class="text-sm text-red-600 dark:text-red-400 mb-4">
           The tmux session for this terminal no longer exists. This can happen if the daemon was restarted or the session was killed.
         </p>
-        <div class="flex flex-col gap-3 items-center">
-          <button
-            id="recover-new-session-btn"
-            data-terminal-id="${configId}"
-            class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition-colors"
-          >
-            Create New Session
-          </button>
-          <button
-            id="recover-attach-session-btn"
-            data-terminal-id="${configId}"
-            class="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg font-medium transition-colors"
-          >
-            Attach to Existing Session
-          </button>
-          <div id="available-sessions-${sessionId}" class="mt-4 w-full max-w-md"></div>
-        </div>
+        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6">
+          The app will automatically recreate the session on next restart, or you can trigger a health check below.
+        </p>
+        ${healthCheckInfo}
       </div>
-    </div>
-  `;
-}
-
-export function renderAvailableSessionsList(
-  sessionId: string,
-  configId: string,
-  sessions: string[]
-): void {
-  const container = document.getElementById(`available-sessions-${sessionId}`);
-  if (!container) return;
-
-  if (sessions.length === 0) {
-    container.innerHTML = `
-      <p class="text-sm text-gray-500 dark:text-gray-400">No available loom sessions found</p>
-    `;
-    return;
-  }
-
-  const sessionItems = sessions
-    .map(
-      (session) => `
-      <div class="flex items-center gap-2">
-        <button
-          class="attach-session-item flex-1 px-4 py-2 text-left bg-white dark:bg-gray-700 hover:bg-gray-100 dark:hover:bg-gray-600 border border-gray-300 dark:border-gray-600 rounded transition-colors"
-          data-terminal-id="${configId}"
-          data-session-name="${escapeHtml(session)}"
-        >
-          <div class="flex items-center justify-between">
-            <span class="text-sm font-mono">${escapeHtml(session)}</span>
-            <span class="text-xs text-gray-500 dark:text-gray-400">Attach</span>
-          </div>
-        </button>
-        <button
-          class="kill-session-btn px-3 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
-          data-session-name="${escapeHtml(session)}"
-          title="Kill session"
-        >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
-          </svg>
-        </button>
-      </div>
-    `
-    )
-    .join("");
-
-  container.innerHTML = `
-    <div class="flex flex-col gap-2">
-      <p class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Available Sessions:</p>
-      ${sessionItems}
     </div>
   `;
 }
@@ -352,13 +421,95 @@ export function renderMiniTerminals(
         id="add-terminal-btn"
         data-tooltip="${addButtonTitle}"
         data-tooltip-position="auto"
-        class="flex-shrink-0 w-32 h-32 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
+        class="flex-shrink-0 w-40 h-40 flex items-center justify-center ${addButtonClasses} rounded-lg border-2 border-dashed border-gray-300 dark:border-gray-600 transition-colors"
         title="${addButtonTitle}"
         ${addButtonDisabled}
       >
         <span class="text-3xl text-gray-400">+</span>
       </button>
     </div>
+  `;
+}
+
+/**
+ * Create "Restart Terminal" button HTML
+ *
+ * Shown for all terminals to allow quick restart of the tmux session
+ *
+ * @param terminal - The terminal to create the button for
+ * @param context - Whether this is for "primary" or "mini" view
+ * @returns HTML string for the button
+ */
+function createRestartButtonHTML(terminal: Terminal, context: "primary" | "mini"): string {
+  // Different styling for primary vs mini view
+  const buttonClasses =
+    context === "primary"
+      ? "p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors restart-terminal-btn"
+      : "p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors restart-terminal-btn";
+
+  const iconClasses =
+    context === "primary"
+      ? "w-4 h-4 text-gray-600 dark:text-gray-300"
+      : "w-3 h-3 text-gray-600 dark:text-gray-300";
+
+  return `
+    <button
+      data-terminal-id="${terminal.id}"
+      data-tooltip="Restart terminal"
+      data-tooltip-position="bottom"
+      class="${buttonClasses}"
+      title="Restart terminal"
+    >
+      <svg class="${iconClasses}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+      </svg>
+    </button>
+  `;
+}
+
+/**
+ * Create "Run Now" button HTML for interval mode terminals
+ *
+ * Only shown for terminals with autonomous mode enabled (targetInterval > 0)
+ *
+ * @param terminal - The terminal to create the button for
+ * @param context - Whether this is for "primary" or "mini" view
+ * @returns HTML string for the button, or empty string if not applicable
+ */
+function createRunNowButtonHTML(terminal: Terminal, context: "primary" | "mini"): string {
+  // Check if terminal has interval mode enabled
+  const hasInterval =
+    terminal.roleConfig?.targetInterval !== undefined &&
+    (terminal.roleConfig.targetInterval as number) > 0;
+
+  if (!hasInterval) {
+    return ""; // Don't show button for non-interval terminals
+  }
+
+  // Different styling for primary vs mini view
+  const buttonClasses =
+    context === "primary"
+      ? "p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors run-now-btn"
+      : "p-1 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors run-now-btn";
+
+  const iconClasses =
+    context === "primary"
+      ? "w-4 h-4 text-gray-600 dark:text-gray-300"
+      : "w-3 h-3 text-gray-600 dark:text-gray-300";
+
+  return `
+    <button
+      data-terminal-id="${terminal.id}"
+      data-tooltip="Run interval prompt now"
+      data-tooltip-position="bottom"
+      class="${buttonClasses}"
+      title="Run interval prompt now"
+    >
+      <svg class="${iconClasses}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path>
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+      </svg>
+    </button>
   `;
 }
 
@@ -449,39 +600,54 @@ function createMiniTerminalHTML(
     }
   }
 
+  // Get tarot card path for this terminal's role
+  const tarotCardPath = getTarotCardPath(terminal.role);
+
   return `
     <div class="p-1 flex-shrink-0">
       <div class="relative">
         ${needsInputBadge}
         <div
-          class="terminal-card group w-40 h-32 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all"
+          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all relative overflow-hidden"
           style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
           draggable="true"
         >
-        <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
-          <div class="flex items-center gap-2 flex-1 min-w-0">
-            <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
-            <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
+          <!-- Regular terminal card content -->
+          <div class="terminal-card-content">
+            <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
+              <div class="flex items-center gap-2 flex-1 min-w-0">
+                <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
+                <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
+              </div>
+              <div class="flex items-center gap-0.5 flex-shrink-0">
+                ${createRestartButtonHTML(terminal, "mini")}
+                ${createRunNowButtonHTML(terminal, "mini")}
+                <button
+                  class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
+                  data-terminal-id="${terminal.id}"
+                  data-tooltip="Close terminal"
+                  data-tooltip-position="top"
+                  title="Close terminal"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+            <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
+              <div class="flex items-center justify-between">
+                <span>${terminal.status}</span>
+                <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+              </div>
+              ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
+              ${createTimerDisplayHTML(terminal)}
+            </div>
           </div>
-          <button
-            class="close-terminal-btn flex-shrink-0 text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
-            data-terminal-id="${terminal.id}"
-            data-tooltip="Close terminal"
-            data-tooltip-position="top"
-            title="Close terminal"
-          >
-            ×
-          </button>
-        </div>
-        <div class="p-2 text-xs text-gray-500 dark:text-gray-400 flex flex-col gap-1">
-          <div class="flex items-center justify-between">
-            <span>${terminal.status}</span>
-            <span class="font-mono font-bold text-blue-600 dark:text-blue-400">#${index}</span>
+
+          <!-- Tarot card overlay (hidden by default, shown during drag) -->
+          <div class="tarot-card-overlay absolute inset-0 pointer-events-none flex items-center justify-center bg-gray-900 dark:bg-black rounded-lg">
+            <img src="${tarotCardPath}" alt="Tarot card" class="h-full w-full object-contain p-2" />
           </div>
-          ${activityInfo ? `<div class="flex items-center justify-between">${activityInfo}</div>` : ""}
-          ${createTimerDisplayHTML(terminal)}
-        </div>
         </div>
       </div>
     </div>
