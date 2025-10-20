@@ -1,13 +1,98 @@
 # Loom API Reference
 
-This document provides a comprehensive reference for Loom's APIs, including Tauri IPC commands, frontend state management, and daemon IPC protocol.
+This document provides a comprehensive reference for Loom's APIs, including daemon CLI commands, Tauri IPC commands, frontend state management, and daemon IPC protocol.
 
 ## Table of Contents
 
+- [Daemon CLI Commands](#daemon-cli-commands)
 - [Tauri IPC Commands](#tauri-ipc-commands)
 - [Frontend State API](#frontend-state-api)
 - [Daemon IPC Protocol](#daemon-ipc-protocol)
 - [MCP Server APIs](#mcp-server-apis)
+
+## Daemon CLI Commands
+
+The `loom-daemon` binary provides command-line interface for headless operations.
+
+### `loom-daemon init`
+
+Initialize a Loom workspace in a git repository.
+
+**Synopsis:**
+```bash
+loom-daemon init [OPTIONS] [PATH]
+```
+
+**Arguments:**
+
+| Argument | Type | Description | Default |
+|----------|------|-------------|---------|
+| `PATH` | String | Target directory to initialize | Current directory (`.`) |
+
+**Options:**
+
+| Flag | Type | Description |
+|------|------|-------------|
+| `--force` | Boolean | Overwrite existing `.loom` directory |
+| `--dry-run` | Boolean | Preview changes without applying |
+| `--defaults <PATH>` | String | Custom defaults directory path |
+
+**Description:**
+
+Initializes a Loom workspace by:
+1. Validating the target is a git repository
+2. Copying `.loom/` configuration from defaults
+3. Installing repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .github/)
+4. Updating `.gitignore` with Loom ephemeral patterns
+
+**Examples:**
+
+```bash
+# Initialize current directory
+loom-daemon init
+
+# Initialize specific repository
+loom-daemon init /path/to/repo
+
+# Preview changes
+loom-daemon init --dry-run
+
+# Force reinitialization
+loom-daemon init --force
+
+# Use custom defaults
+loom-daemon init --defaults ./org-defaults
+
+# Combine flags
+loom-daemon init --force --defaults ./custom /path/to/repo
+```
+
+**Exit Codes:**
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success - workspace initialized |
+| `1` | Error - see stderr for details |
+
+**Common Errors:**
+
+| Error Message | Cause | Solution |
+|---------------|-------|----------|
+| "Not a git repository (no .git directory found)" | Target lacks `.git` | Run `git init` first |
+| "Workspace already initialized (.loom directory exists)" | `.loom/` exists | Use `--force` or skip if already set up |
+| "Failed to create .loom directory: Permission denied" | Insufficient permissions | Check ownership with `ls -la` |
+| "Defaults directory not found" | Cannot locate defaults | Specify with `--defaults /path` |
+
+**Implementation:**
+
+- **File:** `loom-daemon/src/init.rs`
+- **Function:** `initialize_workspace(workspace_path, defaults_path, force)`
+- **CLI Parser:** `loom-daemon/src/main.rs` (Clap argument parsing)
+
+**See Also:**
+- [CLI Reference Guide](../guides/cli-reference.md) - Complete command documentation
+- [Getting Started Guide](../guides/getting-started.md) - Installation walkthrough
+- [CI/CD Setup Guide](../guides/ci-cd-setup.md) - Pipeline integration
 
 ## Tauri IPC Commands
 
