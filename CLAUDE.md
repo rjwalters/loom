@@ -211,6 +211,80 @@ gh pr list --label="loom:approved"     # Find approved PRs
 gh pr review 123 --approve             # Approve PR
 ```
 
+### Workspace Initialization (Headless Mode)
+
+The `loom-daemon init` command sets up Loom workspaces without requiring the GUI:
+
+```bash
+loom-daemon init                       # Initialize current directory
+loom-daemon init /path/to/repo         # Initialize specific repository
+loom-daemon init --dry-run             # Preview changes without applying
+loom-daemon init --force               # Overwrite existing .loom directory
+loom-daemon init --defaults ./custom   # Use custom defaults directory
+```
+
+**What it does:**
+1. Validates target is a git repository
+2. Copies `.loom/` configuration from `defaults/`
+3. Installs repository scaffolding:
+   - `CLAUDE.md` - AI context documentation
+   - `AGENTS.md` - Agent workflow guide
+   - `.claude/` - Claude Code configuration
+   - `.github/` - GitHub labels and workflows
+4. Updates `.gitignore` with Loom ephemeral patterns
+
+**Use cases:**
+- **CI/CD Integration**: Initialize Loom in deployment pipelines
+- **Bulk Setup**: Script initialization across multiple repositories
+- **Testing**: Set up test environments with custom defaults
+- **Development**: Reset workspace to factory defaults
+
+**Under the Hood** (Implementation details for implementing init-related features):
+
+The initialization process is implemented in `loom-daemon/src/init.rs`:
+
+```rust
+pub fn initialize_workspace(
+    workspace_path: &str,
+    defaults_path: &str,
+    force: bool,
+) -> Result<(), String>
+```
+
+**Key implementation details:**
+- **Defaults Resolution**: Tries multiple paths (dev, git root, bundled resources)
+- **Idempotent**: Only creates files that don't exist (unless `--force`)
+- **Scaffolding**: Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, .github/
+- **Gitignore Updates**: Merges ephemeral patterns without duplicates
+- **Validation**: Ensures target is a git repository before proceeding
+
+**Testing initialization changes:**
+```bash
+# Test with dry run
+loom-daemon init --dry-run
+
+# Test with custom defaults
+mkdir test-defaults
+cp -r defaults/* test-defaults/
+# Modify test-defaults...
+loom-daemon init --force --defaults ./test-defaults /tmp/test-repo
+
+# Verify scaffolding
+ls -la /tmp/test-repo/.loom
+diff defaults/config.json /tmp/test-repo/.loom/config.json
+```
+
+**Common errors and recovery:**
+- "Not a git repository": Target lacks `.git` directory - run `git init` first
+- ".loom already exists": Use `--force` to overwrite or remove manually
+- "Permission denied": Check directory ownership and permissions
+- "Defaults not found": Specify path explicitly with `--defaults`
+
+**See complete documentation:**
+- [Getting Started Guide](docs/guides/getting-started.md) - Installation walkthrough
+- [CLI Reference](docs/guides/cli-reference.md) - Full command syntax and flags
+- [CI/CD Setup](docs/guides/ci-cd-setup.md) - Pipeline integration examples
+
 ## MCP Testing & Debugging
 
 Loom provides MCP servers for AI-powered testing:

@@ -240,6 +240,21 @@ loom-daemon init --defaults ./custom-defaults
 - **Headless Servers**: Install Loom configuration without GUI dependencies
 - **Bulk Setup**: Script initialization across multiple repositories
 
+**Common Issues**:
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| "Not a git repository" | No `.git` directory found | Run `git init` first or use correct path |
+| ".loom already exists" | Workspace already initialized | Use `--force` to overwrite or skip if already set up |
+| "Permission denied" | Insufficient write permissions | Check directory ownership: `ls -la` |
+| "Defaults directory not found" | Cannot locate defaults | Specify explicitly: `--defaults /path/to/loom/defaults` |
+
+**Comprehensive Documentation**:
+- **[Getting Started Guide](docs/guides/getting-started.md)** - Complete installation walkthrough
+- **[CLI Reference](docs/guides/cli-reference.md)** - Full command documentation with all flags and exit codes
+- **[CI/CD Setup](docs/guides/ci-cd-setup.md)** - Integration examples for GitHub Actions, GitLab CI, Jenkins, and more
+- **[Troubleshooting](docs/guides/troubleshooting.md#initialization-issues)** - Debug initialization failures
+
 #### Launching the GUI
 
 Loom supports command-line arguments for headless automation and remote development workflows:

@@ -78,6 +78,32 @@ pnpm install
 pnpm app:dev
 ```
 
+### Alternative: Headless Installation
+
+You can also initialize Loom in a repository using the CLI without the GUI:
+
+```bash
+# Build the daemon
+cd loom
+cargo build --release -p loom-daemon
+
+# Initialize a repository
+./target/release/loom-daemon init /path/to/repo
+
+# Or initialize the Loom repo itself
+./target/release/loom-daemon init .
+```
+
+This is useful for:
+- Testing initialization logic
+- Setting up Loom in CI/CD environments
+- Bulk repository initialization
+- Development without running the full GUI
+
+**See also:**
+- [Getting Started Guide](docs/guides/getting-started.md) - Complete setup walkthrough
+- [CLI Reference](docs/guides/cli-reference.md) - Full `loom-daemon init` documentation
+
 For detailed development workflows, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
 
 ## Development Workflow
