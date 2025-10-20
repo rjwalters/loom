@@ -32,11 +32,6 @@ struct GhIssue {
 }
 
 #[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {name}! Welcome to Loom.")
-}
-
-#[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn get_cli_workspace(cli_workspace: tauri::State<CliWorkspace>) -> Option<String> {
     cli_workspace.0.lock().ok()?.clone()
@@ -1763,7 +1758,6 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_cli_workspace,
             check_system_dependencies,
             validate_git_repo,
