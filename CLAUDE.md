@@ -135,6 +135,89 @@ Each terminal can be assigned a specialized role from `defaults/roles/`:
 
 See [WORKFLOWS.md](WORKFLOWS.md) and [Agent Archetypes](docs/philosophy/agent-archetypes.md) for complete details.
 
+## Offline Mode
+
+**Purpose**: Stabilize UI and daemon development without the complexity of AI agent processes.
+
+When `offlineMode: true` is set in `.loom/config.json`, Loom skips launching AI agents (Claude Code, Codex, etc.) and instead sends periodic status echoes to terminals to validate they're responsive. This provides a clean environment for:
+
+- **UI Development**: Work on Loom's interface without agent complexity
+- **Daemon Development**: Test terminal management and IPC without AI processes
+- **Debugging**: Isolate Tauri/tmux issues from agent behavior
+
+**How to Enable**:
+
+Edit `.loom/config.json` (or `defaults/config.json` for new workspaces):
+
+```json
+{
+  "offlineMode": true,
+  "terminals": [...]
+}
+```
+
+**What Changes in Offline Mode**:
+
+1. **No Agent Launches**: `launchAgentsForTerminals()` skips all AI agent launches
+2. **Status Echoes**: Terminals receive periodic status messages every 30 seconds:
+   ```
+   ✓ Status echo - still alive - 2025-10-20T12:34:56.789Z
+   ```
+3. **UI Indicator**: Header shows "⚠️ OFFLINE MODE" badge (yellow styling, dark mode compatible)
+4. **Terminals Still Created**: All terminals are created normally, just not running agents
+5. **Idle Status**: Terminals remain in idle state (not busy with agent processes)
+
+**Use Cases**:
+
+```bash
+# Scenario 1: Developing Loom UI features
+# Enable offline mode to avoid agent restart loops
+echo '{"offlineMode": true, "terminals": [...]}' > .loom/config.json
+pnpm app:preview
+
+# Scenario 2: Testing daemon terminal management
+# Verify terminals respond without AI agent complexity
+pnpm daemon:dev
+# In another terminal: run Loom with offline mode enabled
+
+# Scenario 3: Debugging tmux integration
+# Isolate tmux session issues from agent behavior
+# Enable offline mode, observe status echoes in terminals
+```
+
+**Implementation Details**:
+
+- **Config Field**: `offlineMode?: boolean` in `LoomConfig` interface (src/lib/config.ts:24)
+- **Agent Launch Guard**: `launchAgentsForTerminals()` checks config and returns early (src/lib/terminal-lifecycle.ts:50-72)
+- **Offline Scheduler**: `startOfflineScheduler()` sends periodic echoes (src/lib/offline-scheduler.ts)
+- **UI Indicator**: `renderHeader()` displays badge when enabled (src/lib/ui.ts:44-49)
+- **State Management**: `AppState.offlineMode` stores flag (src/lib/state.ts:138)
+
+**Status Echo Format**:
+
+Echoes use ANSI color codes for visibility:
+- Green checkmark: `\033[32m✓ Status echo - still alive\033[0m`
+- Cyan timestamp: `\033[36m${timestamp}\033[0m`
+
+**Stopping the Scheduler**:
+
+The offline scheduler automatically stops when the workspace is closed. To manually stop:
+
+```typescript
+import { stopOfflineScheduler } from "./offline-scheduler";
+stopOfflineScheduler();
+```
+
+**Comparison: Normal Mode vs Offline Mode**:
+
+| Aspect | Normal Mode | Offline Mode |
+|--------|-------------|--------------|
+| Agent Launch | ✅ Launches AI agents | ❌ Skips agent launches |
+| Terminal Creation | ✅ Creates all terminals | ✅ Creates all terminals |
+| Status Echoes | ❌ No echoes | ✅ Every 30 seconds |
+| UI Indicator | None | "⚠️ OFFLINE MODE" badge |
+| Use Case | Production development | UI/daemon development |
+
 ## Development Workflow
 
 ### Before Starting

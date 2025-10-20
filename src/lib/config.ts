@@ -40,6 +40,8 @@ export interface TerminalConfig {
 export interface LoomConfig {
   /** Array of terminal configurations */
   terminals: TerminalConfig[];
+  /** Offline mode flag - when true, skips Claude Code agent launch and uses simple status echoes */
+  offlineMode?: boolean;
 }
 
 /**
@@ -473,18 +475,20 @@ export async function saveCurrentConfiguration(state: AppState): Promise<void> {
  * This provides backward compatibility for existing code that expects the
  * { nextAgentNumber, agents } structure instead of separate config/state.
  *
- * @returns Object containing nextAgentNumber counter and merged terminals array (as "agents")
+ * @returns Object containing nextAgentNumber counter, merged terminals array (as "agents"), and offline mode flag
  *
  * @example
  * ```ts
- * const { nextAgentNumber, agents } = await loadWorkspaceConfig();
+ * const { nextAgentNumber, agents, offlineMode } = await loadWorkspaceConfig();
  * state.setNextAgentNumber(nextAgentNumber);
  * state.loadAgents(agents);
+ * state.setOfflineMode(offlineMode);
  * ```
  */
 export async function loadWorkspaceConfig(): Promise<{
   nextAgentNumber: number;
   agents: Terminal[];
+  offlineMode: boolean;
 }> {
   const config = await loadConfig();
   const state = await loadState();
@@ -493,6 +497,7 @@ export async function loadWorkspaceConfig(): Promise<{
   return {
     nextAgentNumber: merged.nextAgentNumber,
     agents: merged.terminals,
+    offlineMode: config.offlineMode || false,
   };
 }
 
