@@ -111,8 +111,8 @@ async fn test_create_terminal_with_working_dir() {
     let session_name = format!("loom-{terminal_id}-default-0");
     assert!(tmux_session_exists(&session_name));
 
-    // Wait for terminal shell to initialize
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // Wait longer for terminal shell to fully initialize with custom working directory
+    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
 
     // Send pwd command to verify working directory
     client
@@ -121,7 +121,7 @@ async fn test_create_terminal_with_working_dir() {
         .expect("Failed to send pwd command");
 
     // Wait for command to execute and output to appear
-    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
     // Capture terminal output
     let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
