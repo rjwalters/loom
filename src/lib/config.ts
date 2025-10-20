@@ -6,6 +6,14 @@ import { TerminalStatus } from "./state";
 const logger = Logger.forComponent("config");
 
 /**
+ * State validation options
+ */
+interface StateValidationOptions {
+  /** Maximum age in milliseconds for input requests (default: 1 hour) */
+  maxInputRequestAge?: number;
+}
+
+/**
  * Persistent configuration stored in .loom/config.json (committed to git).
  * Contains team-shareable terminal definitions (roles, themes, intervals).
  * This file should be committed to git so all team members share the same terminal setup.
@@ -479,4 +487,148 @@ export async function loadWorkspaceConfig(): Promise<{
     nextAgentNumber: merged.nextAgentNumber,
     agents: merged.terminals,
   };
+}
+
+/**
+ * Check if a process ID is still alive.
+ * Uses the approach of sending signal 0, which doesn't actually send a signal
+ * but checks if the process exists.
+ *
+ * @param pid - Process ID to check
+ * @returns True if the process is alive, false otherwise
+ */
+async function isProcessAlive(pid: number): Promise<boolean> {
+  try {
+    // Use 'kill -0' which checks if process exists without sending a signal
+    const result = await invoke<boolean>("check_process_alive", { pid });
+    return result;
+  } catch {
+    // If the command fails, assume process is dead
+    return false;
+  }
+}
+
+/**
+ * Check if a file or directory path exists.
+ *
+ * @param path - Path to check
+ * @returns True if the path exists, false otherwise
+ */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await invoke("check_path_exists", { path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validates and cleans up terminal state.
+ * Performs the following checks and cleanup:
+ * 1. Verifies agent PIDs are still alive
+ * 2. Checks worktree paths still exist
+ * 3. Removes stale input requests (older than threshold)
+ *
+ * @param terminals - Array of terminals to validate
+ * @param options - Validation options (maxInputRequestAge, etc.)
+ * @returns Validated and cleaned terminals array
+ *
+ * @example
+ * ```ts
+ * const config = await loadConfig();
+ * const state = await loadState();
+ * const { terminals } = mergeConfigAndState(config, state);
+ *
+ * // Validate and clean up state
+ * const validatedTerminals = await validateTerminalState(terminals);
+ *
+ * // Save cleaned state
+ * await saveState({
+ *   nextAgentNumber: state.nextAgentNumber,
+ *   terminals: validatedTerminals.map(t => ({ ...t }))
+ * });
+ * ```
+ */
+export async function validateTerminalState(
+  terminals: Terminal[],
+  options: StateValidationOptions = {}
+): Promise<Terminal[]> {
+  const { maxInputRequestAge = 60 * 60 * 1000 } = options; // Default: 1 hour
+  const now = Date.now();
+
+  logger.info("Validating terminal state", {
+    terminalCount: terminals.length,
+    maxInputRequestAge,
+  });
+
+  const validated = await Promise.all(
+    terminals.map(async (terminal) => {
+      const updates: Partial<Terminal> = {};
+      let needsUpdate = false;
+
+      // 1. Check if agent PID is still alive
+      if (terminal.agentPid) {
+        const isAlive = await isProcessAlive(terminal.agentPid);
+        if (!isAlive) {
+          logger.warn("Agent process no longer alive, clearing PID", {
+            terminalId: terminal.id,
+            terminalName: terminal.name,
+            agentPid: terminal.agentPid,
+          });
+          updates.agentPid = undefined;
+          updates.agentStatus = undefined;
+          needsUpdate = true;
+        }
+      }
+
+      // 2. Check if worktree path still exists
+      if (terminal.worktreePath) {
+        const exists = await pathExists(terminal.worktreePath);
+        if (!exists) {
+          logger.warn("Worktree path no longer exists, clearing", {
+            terminalId: terminal.id,
+            terminalName: terminal.name,
+            worktreePath: terminal.worktreePath,
+          });
+          updates.worktreePath = undefined;
+          needsUpdate = true;
+        }
+      }
+
+      // 3. Remove stale input requests
+      if (terminal.pendingInputRequests && terminal.pendingInputRequests.length > 0) {
+        const freshRequests = terminal.pendingInputRequests.filter((req) => {
+          const age = now - req.timestamp;
+          const isStale = age > maxInputRequestAge;
+          if (isStale) {
+            logger.warn("Removing stale input request", {
+              terminalId: terminal.id,
+              terminalName: terminal.name,
+              requestId: req.id,
+              ageMs: age,
+            });
+          }
+          return !isStale;
+        });
+
+        if (freshRequests.length !== terminal.pendingInputRequests.length) {
+          updates.pendingInputRequests = freshRequests;
+          needsUpdate = true;
+        }
+      }
+
+      // Return updated terminal if needed, otherwise return original
+      if (needsUpdate) {
+        return { ...terminal, ...updates };
+      }
+      return terminal;
+    })
+  );
+
+  logger.info("Terminal state validation complete", {
+    terminalCount: validated.length,
+  });
+
+  return validated;
 }
