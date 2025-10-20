@@ -21,12 +21,12 @@
     "fs:allow-read-dir",
     "fs:allow-read-file",
     "fs:allow-write-file",
-    "fs:allow-create-dir",
+    "fs:allow-mkdir",
     "fs:allow-exists",
     "fs:scope-home",
-    "fs:scope-app-config",
-    "fs:scope-app-data",
-    "fs:scope-app-log",
-    "path:default"
+    "fs:scope-appconfig",
+    "fs:scope-appdata",
+    "fs:scope-applog",
+    "core:path:default"
   ]
 }

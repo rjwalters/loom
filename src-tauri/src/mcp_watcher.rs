@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
-use tauri::Window;
+use tauri::{Emitter, WebviewWindow};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct MCPCommand {
@@ -11,7 +11,7 @@ struct MCPCommand {
 }
 
 /// Start watching for MCP commands in ~/.loom/mcp-command.json
-pub fn start_mcp_watcher(window: Window) {
+pub fn start_mcp_watcher(window: WebviewWindow) {
     // Spawn a background thread to poll for commands
     std::thread::spawn(move || {
         let mut last_processed: Option<SystemTime> = None;
