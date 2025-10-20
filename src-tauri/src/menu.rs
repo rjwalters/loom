@@ -1,159 +1,207 @@
-use tauri::{CustomMenuItem, Manager, Menu, MenuItem, Submenu};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder},
+    Emitter, Manager,
+};
 
-pub fn build_menu() -> Menu {
+#[allow(clippy::too_many_lines)]
+pub fn build_menu<R: tauri::Runtime>(
+    handle: &impl tauri::Manager<R>,
+) -> Result<tauri::menu::Menu<R>, tauri::Error> {
     // Build File menu
-    let new_terminal =
-        CustomMenuItem::new("new_terminal", "New Terminal").accelerator("CmdOrCtrl+T");
-    let close_terminal =
-        CustomMenuItem::new("close_terminal", "Close Terminal").accelerator("CmdOrCtrl+Shift+W");
-    let close_workspace =
-        CustomMenuItem::new("close_workspace", "Close Workspace").accelerator("CmdOrCtrl+W");
-    let start_workspace =
-        CustomMenuItem::new("start_workspace", "Start...").accelerator("CmdOrCtrl+Shift+R");
-    let force_start_workspace = CustomMenuItem::new("force_start_workspace", "Force Start")
-        .accelerator("CmdOrCtrl+Shift+Alt+R");
-    let factory_reset_workspace =
-        CustomMenuItem::new("factory_reset_workspace", "Factory Reset...");
+    let new_terminal = MenuItemBuilder::new("New Terminal")
+        .id("new_terminal")
+        .accelerator("CmdOrCtrl+T")
+        .build(handle)?;
+    let close_terminal = MenuItemBuilder::new("Close Terminal")
+        .id("close_terminal")
+        .accelerator("CmdOrCtrl+Shift+W")
+        .build(handle)?;
+    let close_workspace = MenuItemBuilder::new("Close Workspace")
+        .id("close_workspace")
+        .accelerator("CmdOrCtrl+W")
+        .build(handle)?;
+    let start_workspace = MenuItemBuilder::new("Start...")
+        .id("start_workspace")
+        .accelerator("CmdOrCtrl+Shift+R")
+        .build(handle)?;
+    let force_start_workspace = MenuItemBuilder::new("Force Start")
+        .id("force_start_workspace")
+        .accelerator("CmdOrCtrl+Shift+Alt+R")
+        .build(handle)?;
+    let factory_reset_workspace = MenuItemBuilder::new("Factory Reset...")
+        .id("factory_reset_workspace")
+        .build(handle)?;
 
-    let file_menu = Submenu::new(
-        "File",
-        Menu::new()
-            .add_item(new_terminal)
-            .add_item(close_terminal)
-            .add_native_item(MenuItem::Separator)
-            .add_item(close_workspace)
-            .add_item(start_workspace)
-            .add_item(force_start_workspace)
-            .add_item(factory_reset_workspace)
-            .add_native_item(MenuItem::Separator)
-            .add_native_item(MenuItem::Quit),
-    );
+    let file_menu = SubmenuBuilder::new(handle, "File")
+        .item(&new_terminal)
+        .item(&close_terminal)
+        .separator()
+        .item(&close_workspace)
+        .item(&start_workspace)
+        .item(&force_start_workspace)
+        .item(&factory_reset_workspace)
+        .separator()
+        .quit()
+        .build()?;
 
     // Build Edit menu
-    let edit_menu = Submenu::new(
-        "Edit",
-        Menu::new()
-            .add_native_item(MenuItem::Cut)
-            .add_native_item(MenuItem::Copy)
-            .add_native_item(MenuItem::Paste)
-            .add_native_item(MenuItem::Separator)
-            .add_native_item(MenuItem::SelectAll),
-    );
+    let edit_menu = SubmenuBuilder::new(handle, "Edit")
+        .cut()
+        .copy()
+        .paste()
+        .separator()
+        .select_all()
+        .build()?;
 
     // Build View menu
-    let toggle_theme =
-        CustomMenuItem::new("toggle_theme", "Toggle Theme").accelerator("CmdOrCtrl+Shift+T");
-    let zoom_in = CustomMenuItem::new("zoom_in", "Zoom In").accelerator("CmdOrCtrl+=");
-    let zoom_out = CustomMenuItem::new("zoom_out", "Zoom Out").accelerator("CmdOrCtrl+-");
-    let reset_zoom = CustomMenuItem::new("reset_zoom", "Reset Zoom").accelerator("CmdOrCtrl+0");
+    let toggle_theme = MenuItemBuilder::new("Toggle Theme")
+        .id("toggle_theme")
+        .accelerator("CmdOrCtrl+Shift+T")
+        .build(handle)?;
+    let zoom_in = MenuItemBuilder::new("Zoom In")
+        .id("zoom_in")
+        .accelerator("CmdOrCtrl+=")
+        .build(handle)?;
+    let zoom_out = MenuItemBuilder::new("Zoom Out")
+        .id("zoom_out")
+        .accelerator("CmdOrCtrl+-")
+        .build(handle)?;
+    let reset_zoom = MenuItemBuilder::new("Reset Zoom")
+        .id("reset_zoom")
+        .accelerator("CmdOrCtrl+0")
+        .build(handle)?;
 
-    let view_menu = Submenu::new(
-        "View",
-        Menu::new()
-            .add_item(toggle_theme)
-            .add_native_item(MenuItem::Separator)
-            .add_item(zoom_in)
-            .add_item(zoom_out)
-            .add_item(reset_zoom)
-            .add_native_item(MenuItem::Separator)
-            .add_native_item(MenuItem::EnterFullScreen),
-    );
+    let view_menu = SubmenuBuilder::new(handle, "View")
+        .item(&toggle_theme)
+        .separator()
+        .item(&zoom_in)
+        .item(&zoom_out)
+        .item(&reset_zoom)
+        .separator()
+        .fullscreen()
+        .build()?;
 
     // Build Window menu
-    let window_menu = Submenu::new(
-        "Window",
-        Menu::new()
-            .add_native_item(MenuItem::Minimize)
-            .add_native_item(MenuItem::Zoom),
-    );
+    let window_menu = SubmenuBuilder::new(handle, "Window")
+        .minimize()
+        .maximize()
+        .build()?;
 
     // Build Help menu
-    let documentation = CustomMenuItem::new("documentation", "Documentation");
-    let view_github = CustomMenuItem::new("view_github", "View on GitHub");
-    let report_issue = CustomMenuItem::new("report_issue", "Report Issue");
-    let daemon_status = CustomMenuItem::new("daemon_status", "Daemon Status...");
-    let keyboard_shortcuts =
-        CustomMenuItem::new("keyboard_shortcuts", "Keyboard Shortcuts").accelerator("CmdOrCtrl+/");
+    let documentation = MenuItemBuilder::new("Documentation")
+        .id("documentation")
+        .build(handle)?;
+    let view_github = MenuItemBuilder::new("View on GitHub")
+        .id("view_github")
+        .build(handle)?;
+    let report_issue = MenuItemBuilder::new("Report Issue")
+        .id("report_issue")
+        .build(handle)?;
+    let daemon_status = MenuItemBuilder::new("Daemon Status...")
+        .id("daemon_status")
+        .build(handle)?;
+    let keyboard_shortcuts = MenuItemBuilder::new("Keyboard Shortcuts")
+        .id("keyboard_shortcuts")
+        .accelerator("CmdOrCtrl+/")
+        .build(handle)?;
 
-    let help_menu = Submenu::new(
-        "Help",
-        Menu::new()
-            .add_item(documentation)
-            .add_item(view_github)
-            .add_item(report_issue)
-            .add_native_item(MenuItem::Separator)
-            .add_item(daemon_status)
-            .add_item(keyboard_shortcuts),
-    );
+    let help_menu = SubmenuBuilder::new(handle, "Help")
+        .item(&documentation)
+        .item(&view_github)
+        .item(&report_issue)
+        .separator()
+        .item(&daemon_status)
+        .item(&keyboard_shortcuts)
+        .build()?;
 
-    Menu::new()
-        .add_submenu(file_menu)
-        .add_submenu(edit_menu)
-        .add_submenu(view_menu)
-        .add_submenu(window_menu)
-        .add_submenu(help_menu)
+    MenuBuilder::new(handle)
+        .item(&file_menu)
+        .item(&edit_menu)
+        .item(&view_menu)
+        .item(&window_menu)
+        .item(&help_menu)
+        .build()
 }
 
-pub fn handle_menu_event(event: &tauri::WindowMenuEvent) {
-    let menu_id = event.menu_item_id();
+#[allow(clippy::needless_pass_by_value)]
+pub fn handle_menu_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    event: tauri::menu::MenuEvent,
+) {
+    let menu_id = event.id().as_ref();
 
     match menu_id {
         "new_terminal" => {
-            let _ = event.window().emit("new-terminal", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("new-terminal", ());
+            }
         }
         "close_terminal" => {
-            let _ = event.window().emit("close-terminal", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("close-terminal", ());
+            }
         }
         "close_workspace" => {
-            let _ = event.window().emit("close-workspace", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("close-workspace", ());
+            }
         }
         "start_workspace" => {
-            let _ = event.window().emit("start-workspace", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("start-workspace", ());
+            }
         }
         "force_start_workspace" => {
-            let _ = event.window().emit("force-start-workspace", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("force-start-workspace", ());
+            }
         }
         "factory_reset_workspace" => {
-            let _ = event.window().emit("factory-reset-workspace", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("factory-reset-workspace", ());
+            }
         }
         "toggle_theme" => {
-            let _ = event.window().emit("toggle-theme", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("toggle-theme", ());
+            }
         }
         "zoom_in" => {
-            let _ = event.window().emit("zoom-in", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("zoom-in", ());
+            }
         }
         "zoom_out" => {
-            let _ = event.window().emit("zoom-out", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("zoom-out", ());
+            }
         }
         "reset_zoom" => {
-            let _ = event.window().emit("reset-zoom", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("reset-zoom", ());
+            }
         }
         "documentation" => {
-            let _ = tauri::api::shell::open(
-                &event.window().shell_scope(),
-                "https://github.com/rjwalters/loom#readme",
-                None,
-            );
+            let _ = tauri_plugin_opener::OpenerExt::opener(app)
+                .open_url("https://github.com/rjwalters/loom#readme", None::<&str>);
         }
         "view_github" => {
-            let _ = tauri::api::shell::open(
-                &event.window().shell_scope(),
-                "https://github.com/rjwalters/loom",
-                None,
-            );
+            let _ = tauri_plugin_opener::OpenerExt::opener(app)
+                .open_url("https://github.com/rjwalters/loom", None::<&str>);
         }
         "report_issue" => {
-            let _ = tauri::api::shell::open(
-                &event.window().shell_scope(),
-                "https://github.com/rjwalters/loom/issues/new",
-                None,
-            );
+            let _ = tauri_plugin_opener::OpenerExt::opener(app)
+                .open_url("https://github.com/rjwalters/loom/issues/new", None::<&str>);
         }
         "keyboard_shortcuts" => {
-            let _ = event.window().emit("show-keyboard-shortcuts", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-shortcuts", ());
+            }
         }
         "daemon_status" => {
-            let _ = event.window().emit("show-daemon-status", ());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-daemon-status", ());
+            }
         }
         _ => {}
     }

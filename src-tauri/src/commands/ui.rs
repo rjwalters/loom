@@ -1,3 +1,5 @@
+use tauri::Emitter;
+
 /// Emit a menu event programmatically (for MCP control)
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]

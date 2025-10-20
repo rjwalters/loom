@@ -108,6 +108,32 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { Terminal } from "@xterm/xterm";
 import { getAppState, TerminalStatus } from "./state";
 
+// Helper to assert JSON structured log messages
+function assertLogMessage(spy: { mock: { calls: unknown[][] } }, expectedMessage: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: unknown[]) => {
+    try {
+      const log = JSON.parse(call[0] as string);
+      return log.message === expectedMessage;
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
+}
+
+function assertLogContains(spy: { mock: { calls: unknown[][] } }, expectedSubstring: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: unknown[]) => {
+    try {
+      const log = JSON.parse(call[0] as string);
+      return log.message?.includes(expectedSubstring);
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log containing: ${expectedSubstring}`).toBe(true);
+}
 describe("TerminalManager", () => {
   let manager: TerminalManager;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
@@ -284,10 +310,20 @@ describe("TerminalManager", () => {
 
       manager.createTerminal("terminal-1", "container-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith(
-        expect.stringContaining("WebGL addon failed to load"),
-        expect.any(Error)
-      );
+      // Check for warn log with message containing "WebGL addon failed"
+      const warnCalls = consoleWarnSpy.mock.calls;
+      const warnCall = warnCalls.find((call) => {
+        try {
+          const log = JSON.parse(call[0] as string);
+          return log.message?.includes("WebGL addon failed");
+        } catch {
+          return false;
+        }
+      });
+      expect(warnCall, "Expected warn log with 'WebGL addon failed'").toBeDefined();
+      // Verify error is in context (as string, not full Error object)
+      const log = JSON.parse(warnCall![0] as string);
+      expect(log.context.error).toBeDefined();
 
       // Reset flag
       webglShouldThrow = false;
@@ -297,7 +333,7 @@ describe("TerminalManager", () => {
       manager.createTerminal("terminal-1", "container-1");
       const second = manager.createTerminal("terminal-1", "container-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Terminal terminal-1 already exists");
+      assertLogContains(consoleWarnSpy, "already exists");
       expect(second).not.toBeNull(); // Returns existing
     });
 
@@ -307,7 +343,8 @@ describe("TerminalManager", () => {
       const managed = manager.createTerminal("terminal-1", "container-1");
 
       expect(managed).toBeNull();
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
+      assertLogMessage(
+        consoleErrorSpy,
         "persistent-xterm-containers not found - UI not initialized"
       );
     });
@@ -381,10 +418,7 @@ describe("TerminalManager", () => {
       await dataCallback("test");
 
       await vi.waitFor(() => {
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Failed to send input for terminal-1"),
-          expect.any(Error)
-        );
+        assertLogContains(consoleErrorSpy, "Failed to send input");
       });
     });
   });
@@ -457,7 +491,7 @@ describe("TerminalManager", () => {
       manager.showTerminal("terminal-1");
 
       expect(container.style.display).toBe("block");
-      expect(consoleLogSpy).toHaveBeenCalledWith("[terminal-manager] Showing terminal terminal-1");
+      assertLogMessage(consoleLogSpy, "Showing terminal");
     });
 
     it("hides terminal by updating display style", () => {
@@ -468,7 +502,7 @@ describe("TerminalManager", () => {
       manager.hideTerminal("terminal-1");
 
       expect(container.style.display).toBe("none");
-      expect(consoleLogSpy).toHaveBeenCalledWith("[terminal-manager] Hiding terminal terminal-1");
+      assertLogMessage(consoleLogSpy, "Hiding terminal");
     });
 
     it("warns when showing non-existent terminal", () => {

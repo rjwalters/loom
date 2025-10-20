@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::process::Command;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 mod daemon_client;
 mod daemon_manager;
@@ -33,13 +33,19 @@ fn main() {
     // Load .env file
     dotenvy::dotenv().ok();
 
-    let menu = menu::build_menu();
-
     // Create CLI workspace state
     let cli_workspace_state = CliWorkspace::default();
 
     if let Err(e) = tauri::Builder::default()
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_cli::init())
         .setup(|app| {
+            // Build menu with Tauri 2.x API
+            let menu = menu::build_menu(app)?;
+            app.set_menu(menu)?;
             // Check if we're in development or production mode
             let is_production = !cfg!(debug_assertions);
 
@@ -52,8 +58,8 @@ fn main() {
                 }
             );
 
-            // Handle CLI arguments
-            match app.get_cli_matches() {
+            // Handle CLI arguments using Tauri 2.x plugin API
+            match tauri_plugin_cli::CliExt::cli(app).matches() {
                 Ok(matches) => {
                     // Check for --workspace argument
                     if let Some(workspace_arg) = matches.args.get("workspace") {
@@ -68,7 +74,7 @@ fn main() {
                             }
 
                             // Get the main window
-                            if let Some(window) = app.get_window("main") {
+                            if let Some(window) = app.get_webview_window("main") {
                                 // Emit event to frontend with workspace path (for backward compatibility)
                                 window.emit("cli-workspace", workspace_path).map_err(|e| {
                                     format!("Failed to emit cli-workspace event: {e}")
@@ -97,7 +103,7 @@ fn main() {
 
             // Start MCP command file watcher
             let window = app
-                .get_window("main")
+                .get_webview_window("main")
                 .ok_or_else(|| "Failed to get main window".to_string())?;
             mcp_watcher::start_mcp_watcher(window);
             safe_eprintln!("[Loom] MCP command watcher started");
@@ -105,19 +111,17 @@ fn main() {
             Ok(())
         })
         .manage(cli_workspace_state)
-        .menu(menu)
-        .on_menu_event(|event| menu::handle_menu_event(&event))
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event.event() {
+        .on_menu_event(menu::handle_menu_event)
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
                 // App is quitting - clean up resources
                 safe_eprintln!("[Loom] App closing - cleaning up...");
 
                 let is_production = !cfg!(debug_assertions);
 
                 // Get daemon manager from app state
-                if let Some(daemon_manager_mutex) = event
-                    .window()
-                    .try_state::<std::sync::Mutex<daemon_manager::DaemonManager>>()
+                if let Some(daemon_manager_mutex) =
+                    window.try_state::<std::sync::Mutex<daemon_manager::DaemonManager>>()
                 {
                     if let Ok(mut daemon_manager) = daemon_manager_mutex.lock() {
                         // Kill daemon if we spawned it (production mode only)

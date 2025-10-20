@@ -26,6 +26,19 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { getOutputPoller } from "./output-poller";
 import { getAppState } from "./state";
 
+// Helper to assert JSON structured log messages
+function assertLogMessage(spy: { mock: { calls: unknown[][] } }, expectedMessage: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: unknown[]) => {
+    try {
+      const log = JSON.parse(call[0] as string);
+      return log.message === expectedMessage;
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
+}
 describe("HealthMonitor", () => {
   let monitor: HealthMonitor;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
@@ -96,7 +109,7 @@ describe("HealthMonitor", () => {
     it("starts monitoring with initial checks", async () => {
       monitor.start();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Starting health monitoring");
+      assertLogMessage(consoleLogSpy, "Starting health monitoring");
 
       // Should perform initial health check and ping
       await vi.advanceTimersByTimeAsync(0);
@@ -111,14 +124,14 @@ describe("HealthMonitor", () => {
       monitor.start();
       monitor.start();
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("[HealthMonitor] Already running");
+      assertLogMessage(consoleWarnSpy, "Already running");
     });
 
     it("stops monitoring and clears timers", () => {
       monitor.start();
       monitor.stop();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Stopping health monitoring");
+      assertLogMessage(consoleLogSpy, "Stopping health monitoring");
 
       // Verify no more periodic checks after stop
       const invokeCallsBefore = vi.mocked(invoke).mock.calls.length;
@@ -143,9 +156,7 @@ describe("HealthMonitor", () => {
 
       monitor.recordActivity("terminal-1");
 
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        `[HealthMonitor] Activity recorded for terminal-1 at ${now}`
-      );
+      assertLogMessage(consoleLogSpy, "Activity recorded");
 
       const lastActivity = monitor.getLastActivity("terminal-1");
       expect(lastActivity).toBe(now);
@@ -252,10 +263,21 @@ describe("HealthMonitor", () => {
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("[HealthMonitor] Health check failed for terminal-1"),
-        expect.any(Error)
-      );
+      // Check for error log with message containing "Health check failed"
+      const errorCalls = consoleErrorSpy.mock.calls;
+      const errorCall = errorCalls.find((call) => {
+        try {
+          const log = JSON.parse(call[0] as string);
+          return log.message?.includes("Health check failed");
+        } catch {
+          return false;
+        }
+      });
+      expect(errorCall, "Expected error log with 'Health check failed'").toBeDefined();
+      // Verify error details are in context
+      const log = JSON.parse(errorCall![0] as string);
+      expect(log.context.errorMessage).toBeDefined();
+      expect(log.context.errorStack).toBeDefined();
 
       // Should not set missingSession on IPC failure
       expect(mockState.updateTerminal).not.toHaveBeenCalled();
@@ -524,10 +546,21 @@ describe("HealthMonitor", () => {
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        "[HealthMonitor] Error in health callback:",
-        expect.any(Error)
-      );
+      // Check for error log with message "Error in health callback"
+      const errorCalls = consoleErrorSpy.mock.calls;
+      const errorCall = errorCalls.find((call) => {
+        try {
+          const log = JSON.parse(call[0] as string);
+          return log.message === "Error in health callback";
+        } catch {
+          return false;
+        }
+      });
+      expect(errorCall, "Expected error log with 'Error in health callback'").toBeDefined();
+      // Verify error details are in context
+      const log = JSON.parse(errorCall![0] as string);
+      expect(log.context.errorMessage).toBeDefined();
+      expect(log.context.errorStack).toBeDefined();
 
       // Good callback should still be called
       expect(goodCallback).toHaveBeenCalled();

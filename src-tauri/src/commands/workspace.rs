@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use tauri::Manager;
 
 /// Workspace data structure for storing last opened workspace
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -170,9 +171,9 @@ pub fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
 /// Helper function to get workspace file path
 fn get_workspace_file_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
     let app_data_dir = app_handle
-        .path_resolver()
+        .path()
         .app_data_dir()
-        .ok_or_else(|| "Failed to get app data directory".to_string())?;
+        .map_err(|e| format!("Failed to get app data directory: {e}"))?;
 
     // Ensure app data directory exists
     if !app_data_dir.exists() {
