@@ -196,13 +196,30 @@ pnpm run app:dev
 
 **For detailed development workflows, troubleshooting, and advanced usage, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
 
+---
+
+## 🚀 Getting Started
+
+### New to Loom? Start Here
+
+**[📖 Quickstart Tutorial](docs/guides/quickstart-tutorial.md)** - **10-15 minute walkthrough** of your first complete workflow in Manual Orchestration Mode (MOM). Learn by doing:
+
+- ✅ Create and curate an issue
+- ✅ Implement a feature with worktrees
+- ✅ Create and review a pull request
+- ✅ Understand the complete label workflow
+
+**Perfect for:** First-time users who want to understand how Loom coordinates AI agents through GitHub.
+
 ### Additional Development Resources
 - [DEV_WORKFLOW.md](DEV_WORKFLOW.md) - Detailed development workflow with hot reload
 - [DEVELOPMENT.md](DEVELOPMENT.md) - Code quality, testing, and best practices
 - [WORKFLOWS.md](WORKFLOWS.md) - Agent coordination via GitHub labels
 - [scripts/README.md](scripts/README.md) - Daemon management scripts
 
-### CLI Usage
+---
+
+## 🖥️ CLI Usage
 
 #### Workspace Initialization (Headless Mode)
 
