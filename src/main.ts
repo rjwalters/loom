@@ -180,12 +180,13 @@ function render() {
   // Get health data from health monitor
   const systemHealth = healthMonitor.getHealth();
 
-  // Render header with daemon health
+  // Render header with daemon health and offline mode indicator
   renderHeader(
     state.getDisplayedWorkspace(),
     hasWorkspace,
     systemHealth.daemon.connected,
-    systemHealth.daemon.lastPing
+    systemHealth.daemon.lastPing,
+    state.isOfflineMode()
   );
 
   // Show loading state if initializing

@@ -1,4 +1,5 @@
 {
+  "offlineMode": false,
   "terminals": [
     {
       "id": "terminal-1",

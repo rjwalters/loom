@@ -135,6 +135,7 @@ export class AppState {
   private isInitializing: boolean = false; // Loading state during app startup
   private autoSaveTimer: ReturnType<typeof setTimeout> | null = null; // Timer for debounced auto-save
   private autoSaveCallback: (() => Promise<void>) | null = null; // Callback for auto-saving state
+  private offlineMode: boolean = false; // Offline mode flag - when true, skips AI agent launches
 
   /**
    * Adds a new terminal to the application state.
@@ -532,6 +533,25 @@ export class AppState {
    */
   isAppInitializing(): boolean {
     return this.isInitializing;
+  }
+
+  /**
+   * Sets offline mode flag.
+   *
+   * @param offlineMode - True to enable offline mode (skip AI agent launches), false to disable
+   */
+  setOfflineMode(offlineMode: boolean): void {
+    this.offlineMode = offlineMode;
+    this.notify();
+  }
+
+  /**
+   * Checks if offline mode is enabled.
+   *
+   * @returns True if offline mode is enabled, false otherwise
+   */
+  isOfflineMode(): boolean {
+    return this.offlineMode;
   }
 
   /**

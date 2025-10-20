@@ -73,10 +73,12 @@ export async function startWorkspaceEngine(
     setConfigWorkspace(workspacePath);
     const config = await loadWorkspaceConfig();
     state.setNextTerminalNumber(config.nextAgentNumber);
+    state.setOfflineMode(config.offlineMode);
 
     logger.info("Loaded config", {
       workspacePath,
       terminalCount: config.agents?.length || 0,
+      offlineMode: config.offlineMode,
       source: logPrefix,
     });
 
