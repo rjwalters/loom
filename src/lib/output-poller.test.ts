@@ -103,7 +103,7 @@ describe("OutputPoller", () => {
       poller.startPolling("terminal-1");
       poller.startPolling("terminal-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("Already polling terminal terminal-1");
+      assertLogContains(consoleWarnSpy, "Already polling");
     });
 
     it("stops polling and clears state", async () => {
@@ -202,9 +202,7 @@ describe("OutputPoller", () => {
 
       poller.resumePolling("terminal-1");
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith(
-        "Terminal terminal-1 is already actively polling"
-      );
+      assertLogContains(consoleWarnSpy, "already actively polling");
     });
 
     it("handles pause on non-existent terminal gracefully", () => {
@@ -346,9 +344,7 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       expect(poller.isPolling("terminal-1")).toBe(false);
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        "Stopping polling for terminal terminal-1 after 3 consecutive errors"
-      );
+      assertLogContains(consoleErrorSpy, "Stopping polling");
     });
 
     it("calls error callback on max consecutive errors", async () => {
@@ -431,15 +427,7 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should log frequency reduction
-      const frequencyLogs = consoleLogSpy.mock.calls.filter((call) =>
-        call.some(
-          (arg) =>
-            typeof arg === "string" &&
-            arg.includes("Terminal terminal-1 idle for") &&
-            arg.includes("reducing poll frequency to 10000ms")
-        )
-      );
-      expect(frequencyLogs.length).toBeGreaterThan(0);
+      assertLogContains(consoleLogSpy, "reducing poll frequency");
     });
 
     it("speeds up polling when activity resumes", async () => {

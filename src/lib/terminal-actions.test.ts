@@ -6,14 +6,14 @@ import {
   type TerminalActionDependencies,
 } from "./terminal-actions";
 
-// Mock dynamic import of autonomous-manager
+// Mock autonomous manager with stable instance
+const mockRunNow = vi.fn().mockResolvedValue(undefined);
+const mockAutonomousManager = {
+  runNow: mockRunNow,
+};
+
 vi.mock("./autonomous-manager", () => ({
-  getAutonomousManager: vi.fn(
-    () =>
-      ({
-        runNow: vi.fn().mockResolvedValue(undefined),
-      }) as any
-  ),
+  getAutonomousManager: vi.fn(() => mockAutonomousManager),
 }));
 
 describe("terminal-actions", () => {
