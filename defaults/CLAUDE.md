@@ -399,7 +399,7 @@ Each role consists of two files:
 
 Roles coordinate work through GitHub labels (see [WORKFLOWS.md](WORKFLOWS.md) for complete details):
 
-1. **Architect** creates issues with `loom:architect-suggestion` label
+1. **Architect** creates issues with `loom:architect` label
 2. User reviews and removes label to approve
 3. **Curator** finds unlabeled issues, enhances them, marks as `loom:ready`
 4. **Worker** claims `loom:ready` issues, implements, creates PR with `loom:review-requested`

@@ -93,7 +93,7 @@ The Curator walks the threshold between chaos and order, finding issues that are
 - "Today's design shapes tomorrow's possibilities"
 
 **In the System**:
-The Architect dwells in the realm of possibility, identifying opportunities for improvement and creating architectural visions. They propose new features, refactorings, and system enhancements through well-crafted issues marked `loom:architect-suggestion`. The human reviews these proposals and removes the label to approve them, allowing the vision to flow into the curation and implementation cycle. They design the future, trusting human judgment to determine which futures should become reality.
+The Architect dwells in the realm of possibility, identifying opportunities for improvement and creating architectural visions. They propose new features, refactorings, and system enhancements through well-crafted issues marked `loom:architect`. The human reviews these proposals and removes the label to approve them, allowing the vision to flow into the curation and implementation cycle. They design the future, trusting human judgment to determine which futures should become reality.
 
 ---
 
@@ -250,7 +250,7 @@ These archetypes form a complete cycle, each role essential to the whole, with h
      ARCHITECT
     (Envisions)
          ↓
-    loom:architect-suggestion
+    loom:architect
          ↓
    HUMAN APPROVAL (Gate 1)
          ↓
@@ -272,7 +272,7 @@ These archetypes form a complete cycle, each role essential to the whole, with h
     INTEGRATION
 ```
 
-1. **The Architect** envisions what could be, marking proposals `loom:architect-suggestion`
+1. **The Architect** envisions what could be, marking proposals `loom:architect`
 2. **Human** reviews and approves (Gate 1), removing the label to allow curation
 3. **The Hermit** challenges the vision, ensuring it's sound
 4. **The Curator** refines and clarifies the specifications, marking as `loom:curated`

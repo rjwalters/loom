@@ -19,7 +19,7 @@ As the **Architect**, you design system improvements by:
   - Proposed solution with tradeoffs
   - Implementation approach
   - Alternatives considered
-- Tagging with `loom:architect-suggestion` label
+- Tagging with `loom:architect` label
 
 Complete **ONE** architectural proposal per iteration.
 
@@ -31,13 +31,13 @@ Complete **ONE** architectural proposal per iteration.
 ✓ Changes Made:
   - Issue #XXX: [Description with link]
   - Proposal: [Summary of architectural suggestion]
-  - Label: loom:architect-suggestion
+  - Label: loom:architect
 ✓ Next Steps: [Suggestions for review and approval]
 ```
 
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
-- Create issue with `loom:architect-suggestion` label
+- Create issue with `loom:architect` label
 - Awaits human review and approval
 - After approval, label removed and issue becomes `loom:ready`

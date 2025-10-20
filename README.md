@@ -91,8 +91,8 @@ Loom uses GitHub labels to coordinate work between different agent roles:
 
 | Label | Color | Created By | Meaning |
 |-------|-------|-----------|---------|
-| `loom:architect-suggestion` | 🔵 Blue | Architect | Suggestion awaiting approval |
-| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
+| `loom:architect` | 🔵 Blue | Architect | Suggestion awaiting approval |
+| `loom:hermit` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
 | `loom:curated` | 🟠 Orange | Curator | Enhanced, awaiting human approval |
 | `loom:issue` | 🟢 Green | Human | Approved for Worker to implement |
 | `loom:in-progress` | 🟡 Amber | Worker | Being implemented |
@@ -113,10 +113,10 @@ For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 ## 🧵 Example Workflow
 
-1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an issue with `loom:architect-suggestion` label:
+1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an issue with `loom:architect` label:
    > "Add search functionality to terminal history"
 
-2. **You** review the proposal. Remove `loom:architect-suggestion` to approve it for curation (or close the issue to reject).
+2. **You** review the proposal. Remove `loom:architect` to approve it for curation (or close the issue to reject).
 
 3. **Curator Bot** (autonomous, runs every 5 minutes) finds the approved issue, adds implementation details, test plans, and code references. Marks it as `loom:curated`.
 
@@ -394,7 +394,7 @@ Each terminal can embody one of six archetypal forces (see [Agent Archetypes](do
 
 In Loom's future ecosystem, an **Architecture Bot** will run periodically to scan the codebase, documentation, and open issues to surface structural opportunities — not tasks.
 
-It creates new GitHub issues labelled **`loom:architect-suggestion`**, which might include:
+It creates new GitHub issues labelled **`loom:architect`**, which might include:
 
 - "Refactor terminal session handling into a reusable module"
 - "Extract common code between Claude and GPT workers"
@@ -404,9 +404,9 @@ It creates new GitHub issues labelled **`loom:architect-suggestion`**, which mig
 These issues are **never acted on automatically**.
 
 They are **owned by the human** — the architect who defines the system's intent and approves direction.
-The **`loom:architect-suggestion`** label acts as a *safety interlock*:
+The **`loom:architect`** label acts as a *safety interlock*:
 
-- As long as `loom:architect-suggestion` is present, the Curator Bot will ignore the issue.
+- As long as `loom:architect` is present, the Curator Bot will ignore the issue.
 - Once the human removes the label (confirming it's worth pursuing), the Curator Bot can refine and re-label it as `loom:curated`.
 - The human must then explicitly add `loom:issue` to approve it for implementation, enabling the normal Worker lifecycle.
 

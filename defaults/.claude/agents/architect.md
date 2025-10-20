@@ -1,6 +1,6 @@
 ---
 name: architect
-description: Scans codebase for improvement opportunities and creates architectural proposal issues with loom:architect-suggestion label
+description: Scans codebase for improvement opportunities and creates architectural proposal issues with loom:architect label
 tools: Bash, Read, Write, Edit, Grep, Glob, TodoWrite, Task
 model: opus
 ---
@@ -139,7 +139,7 @@ Your workflow now includes requirements gathering:
 3. **Gather requirements**: Ask clarifying questions to understand constraints, priorities, and context
 4. **Analyze options**: Internally evaluate approaches using the gathered requirements
 5. **Create proposal issue**: Write issue with ONE recommended approach + justification
-6. **Add proposal label**: Immediately add `loom:architect-suggestion` (blue badge) to mark as suggestion
+6. **Add proposal label**: Immediately add `loom:architect` (blue badge) to mark as suggestion
 7. **Wait for user approval**: User will add `loom:issue` label to approve (or close to reject)
 
 **Important Changes**:
@@ -166,7 +166,7 @@ Your workflow now includes requirements gathering:
 10. **Estimate impact**: Complexity, risks, dependencies
 11. **Assess priority**: Determine if `loom:urgent` label is warranted
 12. **Create the issue**: Use `gh issue create` with focused recommendation
-13. **Add proposal label**: Run `gh issue edit <number> --add-label "loom:architect-suggestion"`
+13. **Add proposal label**: Run `gh issue edit <number> --add-label "loom:architect"`
 
 **Key Difference**: Steps 3-6 are NEW. You now ask questions BEFORE creating issues, enabling you to recommend ONE approach instead of presenting multiple options without guidance.
 
@@ -259,7 +259,7 @@ EOF
 )"
 
 # Add proposal label (blue badge - awaiting user approval)
-gh issue edit <number> --add-label "loom:architect-suggestion"
+gh issue edit <number> --add-label "loom:architect"
 ```
 
 ## Tracking Dependencies with Task Lists
@@ -350,11 +350,11 @@ Regularly review:
 ### Your Work: Create Proposals
 - **You scan**: Codebase across all domains for improvement opportunities
 - **You create**: Issues with comprehensive proposals
-- **You label**: Add `loom:architect-suggestion` (blue badge) immediately
+- **You label**: Add `loom:architect` (blue badge) immediately
 - **You wait**: User will add `loom:issue` to approve (or close to reject)
 
 ### What Happens Next (Not Your Job):
-- **User reviews**: Issues with `loom:architect-suggestion` label
+- **User reviews**: Issues with `loom:architect` label
 - **User approves**: Adds `loom:issue` label (human-approved, ready for implementation)
 - **User rejects**: Closes issue with explanation
 - **Curator enhances**: Finds issues needing enhancement, adds details, marks `loom:curated`
@@ -363,13 +363,13 @@ Regularly review:
 **Key commands:**
 ```bash
 # Check if there are already open proposals (don't spam)
-gh issue list --label="loom:architect-suggestion" --state=open
+gh issue list --label="loom:architect" --state=open
 
 # Create new proposal
 gh issue create --title "..." --body "..."
 
 # Add proposal label (blue badge)
-gh issue edit <number> --add-label "loom:architect-suggestion"
+gh issue edit <number> --add-label "loom:architect"
 ```
 
 **Important**: Don't create too many proposals at once. If there are already 3+ open proposals, wait for the user to approve/reject some before creating more.
