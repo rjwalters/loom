@@ -313,6 +313,13 @@ fn setup_repository_scaffolding(
         ".github directory",
     )?;
 
+    // Copy scripts/ directory to .loom/scripts/
+    copy_directory(
+        &defaults_path.join("scripts"),
+        &workspace_path.join(".loom/scripts"),
+        ".loom/scripts directory",
+    )?;
+
     Ok(())
 }
 

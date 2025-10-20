@@ -18,5 +18,28 @@ Rust suites run through `pnpm test` (aliased to `cargo test --workspace --locked
 ## Commit & Pull Request Guidelines
 Commits use imperative, title-cased subjects with the related issue in parentheses (e.g., `Fix tmux socket mismatch (#144)`). Group work logically and include generated artifacts or schema updates in the same change. Pull requests should outline intent, list the commands you ran, and link issues or Loom workflow references. Attach screenshots or terminal excerpts for UX-facing updates and call out any skipped checks.
 
+## Git Worktree Workflow
+Use the worktree helper script for isolated work on issues:
+
+```bash
+# Create worktree for issue #42
+./.loom/scripts/worktree.sh 42
+# → Creates: .loom/worktrees/issue-42
+# → Branch: feature/issue-42
+
+# Change to worktree
+cd .loom/worktrees/issue-42
+
+# Do your work, then commit and push
+git add -A
+git commit -m "Your message"
+git push -u origin feature/issue-42
+
+# Return to main workspace
+cd ../..
+```
+
+Worktrees provide isolated directories for parallel work without conflicts. The script prevents nested worktrees and ensures sandbox-safe paths.
+
 ## Daemon & Configuration Notes
 Agent role prompts live under `.loom/roles/`; keep Markdown and any sibling JSON metadata in sync. Workspace overrides persist in `~/.loom/`, so mention reset steps (`Help → Daemon Status → Yes`) when altering stateful behavior. Document new environment variables or defaults under `defaults/` before requesting review.
