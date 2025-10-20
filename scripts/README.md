@@ -135,6 +135,47 @@ pnpm run daemon:start
 
 The stop script handles this automatically by checking if the PID is still alive.
 
+## Maintenance Scripts
+
+### cleanup.sh
+**Removes build artifacts and orphaned worktrees**
+
+Cleans up:
+- `target/` - Rust build artifacts
+- `node_modules/` - Node dependencies
+- Orphaned git worktrees (with confirmation)
+
+Usage:
+```bash
+./scripts/cleanup.sh
+```
+
+### cleanup-branches.sh
+**Removes feature branches for closed issues**
+
+Automatically cleans up stale feature branches by:
+1. Scanning all `feature/issue-*` branches
+2. Checking GitHub issue status (`gh issue view`)
+3. Deleting branches for `CLOSED` issues
+4. Preserving branches for `OPEN` issues
+
+Usage:
+```bash
+# Preview what would be deleted
+./scripts/cleanup-branches.sh --dry-run
+
+# Actually delete stale branches
+./scripts/cleanup-branches.sh
+```
+
+Features:
+- Color-coded output (green=deleted, blue=kept, yellow=error)
+- Summary statistics
+- Safe: Only deletes confirmed closed issues
+- Fast: Checks all branches in one run
+
+**When to use**: After merging several PRs to keep branch list clean.
+
 ## Development Notes
 
 - Scripts use `set -e` to exit on error
