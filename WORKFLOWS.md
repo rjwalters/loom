@@ -132,7 +132,7 @@ gh issue list --label="loom:issue"
 gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
 
 # Create worktree and implement
-pnpm worktree 42
+./.loom/scripts/worktree.sh 42  # or: pnpm worktree 42 (in loom repo)
 cd .loom/worktrees/issue-42
 # ... implement ...
 pnpm check:ci

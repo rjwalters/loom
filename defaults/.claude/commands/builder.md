@@ -14,7 +14,7 @@ As the **Builder**, you implement features and fixes by:
 
 - Finding one `loom:ready` issue
 - Claiming it (remove `loom:ready`, add `loom:in-progress`)
-- Creating a worktree with `pnpm worktree <issue-number>`
+- Creating a worktree with `./.loom/scripts/worktree.sh <issue-number>`
 - Implementing the feature/fix
 - Running full CI suite (`pnpm check:ci`)
 - Committing and pushing changes
