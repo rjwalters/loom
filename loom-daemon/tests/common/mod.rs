@@ -96,17 +96,37 @@ pub struct TestClient {
 }
 
 impl TestClient {
-    /// Connect to daemon at given socket path
+    /// Connect to daemon at given socket path with retry logic
+    ///
+    /// The daemon creates the socket file before it starts listening, creating a race condition.
+    /// This method retries with exponential backoff to handle this race.
     pub async fn connect(socket_path: &Path) -> Result<Self> {
-        let stream = timeout(Duration::from_secs(2), UnixStream::connect(socket_path))
-            .await
-            .context("Timeout connecting to daemon")?
-            .context("Failed to connect to daemon")?;
+        let max_retries = 5;
+        let mut retry_delay = Duration::from_millis(50);
 
-        let (reader, writer) = tokio::io::split(stream);
-        let reader = BufReader::new(reader);
+        for attempt in 0..max_retries {
+            match timeout(Duration::from_secs(2), UnixStream::connect(socket_path)).await {
+                Ok(Ok(stream)) => {
+                    let (reader, writer) = tokio::io::split(stream);
+                    let reader = BufReader::new(reader);
+                    return Ok(Self { reader, writer });
+                }
+                Ok(Err(_e)) if attempt < max_retries - 1 => {
+                    // Connection failed, retry with backoff
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay *= 2; // Exponential backoff
+                }
+                Ok(Err(e)) => {
+                    // Final attempt failed
+                    return Err(e).context("Failed to connect to daemon");
+                }
+                Err(_) => {
+                    return Err(anyhow::anyhow!("Timeout connecting to daemon"));
+                }
+            }
+        }
 
-        Ok(Self { reader, writer })
+        unreachable!("Loop should always return before reaching here")
     }
 
     /// Send a request and receive a response

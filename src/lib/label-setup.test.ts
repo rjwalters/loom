@@ -24,8 +24,8 @@ describe("label-setup", () => {
     it("contains all required issue labels", () => {
       const labelNames = LOOM_LABELS.map((l) => l.name);
 
-      expect(labelNames).toContain("loom:architect-suggestion");
-      expect(labelNames).toContain("loom:critic-suggestion");
+      expect(labelNames).toContain("loom:architect");
+      expect(labelNames).toContain("loom:hermit");
       expect(labelNames).toContain("loom:curated");
       expect(labelNames).toContain("loom:issue");
       expect(labelNames).toContain("loom:in-progress");
