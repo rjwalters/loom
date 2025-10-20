@@ -226,7 +226,12 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
  * @throws Never throws - returns empty config on error and logs the error
  */
 export async function loadConfig(): Promise<LoomConfig> {
-  const workspacePath = assertWorkspace();
+  // Return empty config if no workspace is set
+  if (!cachedWorkspacePath) {
+    return { terminals: [] };
+  }
+
+  const workspacePath = cachedWorkspacePath;
 
   try {
     const contents = await invoke<string>("read_config", {
@@ -264,8 +269,13 @@ export async function loadConfig(): Promise<LoomConfig> {
  * @throws Never throws - logs error and continues on failure
  */
 export async function saveConfig(config: LoomConfig): Promise<void> {
+  // Do nothing if no workspace is set
+  if (!cachedWorkspacePath) {
+    return;
+  }
+
   try {
-    const workspacePath = assertWorkspace();
+    const workspacePath = cachedWorkspacePath;
 
     const contents = JSON.stringify(config, null, 2);
     await invoke("write_config", {
@@ -273,7 +283,7 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
       configJson: contents,
     });
   } catch (error) {
-    logger.error("Failed to save config", error as Error, { workspacePath: assertWorkspace() });
+    logger.error("Failed to save config", error as Error, { workspacePath: cachedWorkspacePath });
   }
 }
 
@@ -285,8 +295,16 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
  * @throws Never throws - returns default state on error and logs the error
  */
 export async function loadState(): Promise<LoomState> {
+  // Return default state if no workspace is set
+  if (!cachedWorkspacePath) {
+    return {
+      nextAgentNumber: 1,
+      terminals: [],
+    };
+  }
+
   try {
-    const workspacePath = assertWorkspace();
+    const workspacePath = cachedWorkspacePath;
 
     const contents = await invoke<string>("read_state", {
       workspacePath,
@@ -294,7 +312,7 @@ export async function loadState(): Promise<LoomState> {
 
     return JSON.parse(contents) as LoomState;
   } catch (error) {
-    logger.error("Failed to load state", error as Error, { workspacePath: assertWorkspace() });
+    logger.error("Failed to load state", error as Error, { workspacePath: cachedWorkspacePath });
     // Return empty state on error
     return {
       nextAgentNumber: 1,
@@ -313,8 +331,13 @@ export async function loadState(): Promise<LoomState> {
  * @throws Never throws - logs error and continues on failure
  */
 export async function saveState(state: LoomState): Promise<void> {
+  // Do nothing if no workspace is set
+  if (!cachedWorkspacePath) {
+    return;
+  }
+
   try {
-    const workspacePath = assertWorkspace();
+    const workspacePath = cachedWorkspacePath;
 
     // Strip runtime-only flags before persisting
     // missingSession is a runtime status indicator that should be re-evaluated on startup
@@ -341,7 +364,7 @@ export async function saveState(state: LoomState): Promise<void> {
       stateJson: contents,
     });
   } catch (error) {
-    logger.error("Failed to save state", error as Error, { workspacePath: assertWorkspace() });
+    logger.error("Failed to save state", error as Error, { workspacePath: cachedWorkspacePath });
   }
 }
 
