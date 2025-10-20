@@ -4,10 +4,34 @@ use crate::types::{Request, Response};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+
+/// Get the current git branch for a given directory
+/// Returns None if not in a git repository or if the command fails
+fn get_git_branch(working_dir: Option<&String>) -> Option<String> {
+    let dir = working_dir?;
+
+    let output = Command::new("git")
+        .arg("rev-parse")
+        .arg("--abbrev-ref")
+        .arg("HEAD")
+        .current_dir(dir)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        String::from_utf8(output.stdout)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    }
+}
 
 pub struct IpcServer {
     socket_path: PathBuf,
@@ -129,15 +153,39 @@ fn handle_request(
         }
 
         Request::SendInput { id, data } => {
-            // Record input to activity database
+            // Get terminal info to extract role and workspace context
+            let mut tm = terminal_manager
+                .lock()
+                .expect("Terminal manager mutex poisoned");
+
+            let terminal_info = tm.list_terminals().into_iter().find(|t| t.id == id);
+
+            // Extract context from terminal info
+            let (agent_role, working_dir, worktree_path) = if let Some(info) = terminal_info {
+                (info.role, info.working_dir, info.worktree_path)
+            } else {
+                (None, None, None)
+            };
+
+            // Determine workspace path (prefer worktree, fallback to working_dir)
+            let workspace_path = worktree_path.or(working_dir.clone());
+
+            // Get git branch from workspace
+            let git_branch = get_git_branch(workspace_path.as_ref());
+
+            // Record input to activity database with full context
             let input = AgentInput {
                 id: None,
                 terminal_id: id.clone(),
                 timestamp: Utc::now(),
-                input_type: InputType::Manual, // Default to manual, could be enhanced later
+                input_type: InputType::Manual, // Default to manual
                 content: data.clone(),
-                agent_role: None, // Could be populated from terminal metadata
-                context: InputContext::default(),
+                agent_role,
+                context: InputContext {
+                    workspace: workspace_path,
+                    branch: git_branch,
+                    ..Default::default()
+                },
             };
 
             if let Ok(db) = activity_db.lock() {
@@ -147,9 +195,6 @@ fn handle_request(
             }
 
             // Send input to terminal
-            let tm = terminal_manager
-                .lock()
-                .expect("Terminal manager mutex poisoned");
             match tm.send_input(&id, &data) {
                 Ok(()) => Response::Success,
                 Err(e) => Response::Error {

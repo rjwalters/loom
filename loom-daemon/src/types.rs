@@ -69,6 +69,7 @@ pub struct TerminalInfo {
     pub working_dir: Option<String>,
     pub created_at: i64,
     // Agent-specific fields
+    pub role: Option<String>,
     pub worktree_path: Option<String>,
     pub agent_pid: Option<u32>,
     #[serde(default)]
