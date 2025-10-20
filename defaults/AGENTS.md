@@ -39,7 +39,19 @@ git push -u origin feature/issue-42
 cd ../..
 ```
 
-Worktrees provide isolated directories for parallel work without conflicts. The script prevents nested worktrees and ensures sandbox-safe paths.
+### Resuming Abandoned Work
+
+If a previous agent abandoned work on an issue, you can resume seamlessly:
+
+```bash
+# The branch feature/issue-42 exists, but worktree was removed
+./.loom/scripts/worktree.sh 42
+# → Reuses existing branch (no prompt)
+# → Creates fresh worktree
+# → Continue where previous agent left off
+```
+
+The script is **non-interactive** and automatically reuses existing branches, making it safe for AI agents to resume abandoned work without user intervention.
 
 ## Daemon & Configuration Notes
 Agent role prompts live under `.loom/roles/`; keep Markdown and any sibling JSON metadata in sync. Workspace overrides persist in `~/.loom/`, so mention reset steps (`Help → Daemon Status → Yes`) when altering stateful behavior. Document new environment variables or defaults under `defaults/` before requesting review.

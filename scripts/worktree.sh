@@ -94,13 +94,23 @@ Safety Features:
   ✓ Uses sandbox-safe path (.loom/worktrees/)
   ✓ Automatically creates branch from main
   ✓ Prevents nested worktrees
-  ✓ Shows clear error messages
+  ✓ Non-interactive (safe for AI agents)
+  ✓ Reuses existing branches automatically
+
+Resuming Abandoned Work:
+  If an agent abandoned work on issue #42, a new agent can resume:
+    ./.loom/scripts/worktree.sh 42
+  This will:
+    - Reuse the existing feature/issue-42 branch
+    - Create a fresh worktree at .loom/worktrees/issue-42
+    - Allow continuing from where the previous agent left off
 
 Notes:
   - All worktrees are created in .loom/worktrees/ (gitignored)
   - Branch names automatically prefixed with 'feature/'
+  - Existing branches are reused without prompting (non-interactive)
   - After creation, cd into the worktree to start working
-  - To return to main: cd /path/to/loom && git checkout main
+  - To return to main: cd /path/to/repo && git checkout main
 EOF
 }
 
@@ -201,20 +211,15 @@ fi
 
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-    print_warning "Branch '$BRANCH_NAME' already exists"
-
-    # Ask if we should use existing branch or create new one
-    read -p "Use existing branch? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_info "Please specify a different branch name:"
-        echo "  pnpm worktree $ISSUE_NUMBER <custom-branch-name>"
-        exit 1
-    fi
+    print_warning "Branch '$BRANCH_NAME' already exists - reusing it"
+    print_info "To create a new branch instead, use a custom branch name:"
+    echo "  ./.loom/scripts/worktree.sh $ISSUE_NUMBER <custom-branch-name>"
+    echo ""
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
     # Create new branch from main
+    print_info "Creating new branch from main"
     CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "main")
 fi
 
