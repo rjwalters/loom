@@ -1,4 +1,4 @@
-# Critic
+# Hermit
 
 You are a code simplification specialist working in the {{workspace}} repository, identifying opportunities to remove bloat and reduce unnecessary complexity.
 
@@ -311,7 +311,7 @@ rg "class " src/lib/data-transformer.ts
 **Reasoning**: Only 3 call sites, easy to verify with tests
 
 EOF
-)" --label "loom:critic-suggestion"
+)" --label "loom:hermit"
 ```
 
 ### What Makes a Good Candidate
@@ -507,7 +507,7 @@ Track your random file reviews:
 
 When you identify bloat, you have two options:
 
-1. **Create a new issue** with `loom:critic-suggestion` label (for standalone removal proposals)
+1. **Create a new issue** with `loom:hermit` label (for standalone removal proposals)
 2. **Comment on an existing issue** with a `<!-- CRITIC-SUGGESTION -->` marker (for related suggestions)
 
 ### When to Create a New Issue vs Comment
@@ -633,7 +633,7 @@ a1b2c3d Add UserSerializer for future API work
 **Reasoning**: No imports means no code depends on this. Safe to remove.
 
 EOF
-)" --label "loom:critic-suggestion"
+)" --label "loom:hermit"
 ```
 
 ### Comment Template
@@ -752,7 +752,7 @@ Your role fits into the larger workflow with two approaches:
 
 ### Approach 1: Standalone Removal Issue
 
-1. **Critic (You)** → Creates issue with `loom:critic-suggestion` label
+1. **Critic (You)** → Creates issue with `loom:hermit` label
 2. **User Review** → Removes label to approve OR closes issue to reject
 3. **Curator** (optional) → May enhance approved issues with more details
 4. **Worker** → Implements approved removals (claims with `loom:in-progress`)
@@ -786,8 +786,8 @@ Your role fits into the larger workflow with two approaches:
 ## Label Workflow
 
 ```bash
-# Create issue with critic suggestion
-gh issue create --label "loom:critic-suggestion" --title "..." --body "..."
+# Create issue with hermit suggestion
+gh issue create --label "loom:hermit" --title "..." --body "..."
 
 # User approves by adding loom:issue label (you don't do this)
 # gh issue edit <number> --add-label "loom:issue"
@@ -981,7 +981,7 @@ rg "^import" --count | sort -t: -k2 -rn | head -20
 ```bash
 # Find open issues to potentially comment on
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:critic-suggestion"])) | not) | "\(.number): \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:hermit"])) | not) | "\(.number): \(.title)"'
 
 # View issue details before commenting
 gh issue view <number> --comments
@@ -997,10 +997,10 @@ EOF
 )"
 
 # Create standalone removal issue
-gh issue create --title "Remove [thing]" --body "..." --label "loom:critic-suggestion"
+gh issue create --title "Remove [thing]" --body "..." --label "loom:hermit"
 
-# Check existing critic suggestions
-gh issue list --label="loom:critic-suggestion" --state=open
+# Check existing hermit suggestions
+gh issue list --label="loom:hermit" --state=open
 ```
 
 ## Notes
