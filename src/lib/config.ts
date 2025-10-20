@@ -119,22 +119,6 @@ export function setConfigWorkspace(workspacePath: string): void {
 }
 
 /**
- * Asserts that workspace is configured before file operations.
- * Internal helper to ensure setConfigWorkspace() was called before file I/O.
- *
- * @returns The configured workspace path
- * @throws {Error} If workspace is not set (setConfigWorkspace() not called)
- */
-function assertWorkspace(): string {
-  if (!cachedWorkspacePath) {
-    throw new Error(
-      "No workspace configured - call setConfigWorkspace() before loading/saving config"
-    );
-  }
-  return cachedWorkspacePath;
-}
-
-/**
  * Migrates legacy config format to new split format.
  * Handles three cases of legacy IDs:
  * 1. Dual-ID system (configId field) - uses existing configId
