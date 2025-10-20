@@ -65,13 +65,12 @@ export TARGET_PATH
 info "Launching Claude Code with /install-loom command..."
 echo ""
 
-# Launch Claude Code in target repository with slash command
-cd "$TARGET_PATH"
-
 # Check if claude CLI is available
 if ! command -v claude &> /dev/null; then
   error "Claude Code CLI (claude) is not installed or not in PATH"
 fi
 
-# Launch Claude Code with the install-loom slash command
+# Launch Claude Code from Loom repo (where /install-loom command exists)
+# Target path is passed via TARGET_PATH environment variable
+cd "$LOOM_ROOT"
 exec claude code "/install-loom"
