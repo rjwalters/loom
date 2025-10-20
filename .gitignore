@@ -8,6 +8,9 @@ dist-ssr/
 src-tauri/target/
 src-tauri/gen/
 
+# Test outputs
+coverage/
+
 # Env files
 .env
 .env.local
