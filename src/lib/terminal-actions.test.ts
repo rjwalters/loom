@@ -6,32 +6,6 @@ import {
   type TerminalActionDependencies,
 } from "./terminal-actions";
 
-// Helper to assert JSON structured log messages
-function assertLogMessage(spy: any, expectedMessage: string) {
-  const calls = spy.mock.calls;
-  const found = calls.some((call: any[]) => {
-    try {
-      const log = JSON.parse(call[0]);
-      return log.message === expectedMessage;
-    } catch {
-      return false;
-    }
-  });
-  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
-}
-
-function assertLogContains(spy: any, expectedSubstring: string) {
-  const calls = spy.mock.calls;
-  const found = calls.some((call: any[]) => {
-    try {
-      const log = JSON.parse(call[0]);
-      return log.message && log.message.includes(expectedSubstring);
-    } catch {
-      return false;
-    }
-  });
-  expect(found, `Expected log containing: ${expectedSubstring}`).toBe(true);
-}
 // Mock dynamic import of autonomous-manager
 vi.mock("./autonomous-manager", () => ({
   getAutonomousManager: vi.fn(

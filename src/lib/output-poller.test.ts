@@ -15,25 +15,12 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { getTerminalManager } from "./terminal-manager";
 
 // Helper to assert JSON structured log messages
-function assertLogMessage(spy: any, expectedMessage: string) {
+function assertLogContains(spy: { mock: { calls: unknown[][] } }, expectedSubstring: string) {
   const calls = spy.mock.calls;
-  const found = calls.some((call: any[]) => {
+  const found = calls.some((call: unknown[]) => {
     try {
-      const log = JSON.parse(call[0]);
-      return log.message === expectedMessage;
-    } catch {
-      return false;
-    }
-  });
-  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
-}
-
-function assertLogContains(spy: any, expectedSubstring: string) {
-  const calls = spy.mock.calls;
-  const found = calls.some((call: any[]) => {
-    try {
-      const log = JSON.parse(call[0]);
-      return log.message && log.message.includes(expectedSubstring);
+      const log = JSON.parse(call[0] as string);
+      return log.message?.includes(expectedSubstring);
     } catch {
       return false;
     }

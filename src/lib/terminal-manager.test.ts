@@ -109,11 +109,11 @@ import { Terminal } from "@xterm/xterm";
 import { getAppState, TerminalStatus } from "./state";
 
 // Helper to assert JSON structured log messages
-function assertLogMessage(spy: any, expectedMessage: string) {
+function assertLogMessage(spy: { mock: { calls: unknown[][] } }, expectedMessage: string) {
   const calls = spy.mock.calls;
-  const found = calls.some((call: any[]) => {
+  const found = calls.some((call: unknown[]) => {
     try {
-      const log = JSON.parse(call[0]);
+      const log = JSON.parse(call[0] as string);
       return log.message === expectedMessage;
     } catch {
       return false;
@@ -122,12 +122,12 @@ function assertLogMessage(spy: any, expectedMessage: string) {
   expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
 }
 
-function assertLogContains(spy: any, expectedSubstring: string) {
+function assertLogContains(spy: { mock: { calls: unknown[][] } }, expectedSubstring: string) {
   const calls = spy.mock.calls;
-  const found = calls.some((call: any[]) => {
+  const found = calls.some((call: unknown[]) => {
     try {
-      const log = JSON.parse(call[0]);
-      return log.message && log.message.includes(expectedSubstring);
+      const log = JSON.parse(call[0] as string);
+      return log.message?.includes(expectedSubstring);
     } catch {
       return false;
     }
