@@ -86,13 +86,22 @@ graph TB
 ### Backend Layer
 
 #### Tauri Commands
-- **Location:** `src-tauri/src/main.rs`
-- **Responsibilities:**
-  - Validate git repositories
-  - Read role files and metadata
-  - Manage GitHub labels
-  - Write console logs
-  - Communicate with daemon
+- **Location:** `src-tauri/src/commands/` (domain-specific modules)
+- **Entry Point:** `src-tauri/src/main.rs` (command registration, minimal setup)
+- **Module Organization:**
+  - `terminal.rs` (12 commands) - Terminal lifecycle, I/O, session management
+  - `workspace.rs` (7 commands) - Git repo validation, Loom initialization, worktree helpers
+  - `config.rs` (5 commands) - Config/state file operations, role metadata
+  - `github.rs` (5 commands) - Label management, remote validation, issue operations
+  - `project.rs` (2 commands) - Local and GitHub project creation
+  - `daemon.rs` (2 commands) - Health checks and status queries
+  - `filesystem.rs` (3 commands) - File read/write, console logging
+  - `system.rs` (5 commands) - Dependency checks, environment variables, process checks
+  - `ui.rs` (5 commands) - Event emission, workspace triggers
+- **Benefits:**
+  - Clear domain boundaries reduce merge conflicts
+  - Easier to locate and maintain command implementations
+  - Modular structure scales well as command count grows
 
 #### Daemon Client
 - **Location:** `src-tauri/src/daemon_client.rs`
@@ -428,8 +437,24 @@ loom/
 │
 ├── src-tauri/                    # Backend (Rust)
 │   ├── src/
-│   │   ├── main.rs               # Tauri commands
-│   │   └── daemon_client.rs      # Daemon communication
+│   │   ├── main.rs               # App entry point, command registration
+│   │   ├── commands/             # Domain-specific command modules
+│   │   │   ├── mod.rs            # Module index with re-exports
+│   │   │   ├── terminal.rs       # Terminal management (12 commands)
+│   │   │   ├── workspace.rs      # Workspace operations (7 commands)
+│   │   │   ├── config.rs         # Config/state I/O (5 commands)
+│   │   │   ├── github.rs         # GitHub integration (5 commands)
+│   │   │   ├── project.rs        # Project creation (2 commands)
+│   │   │   ├── daemon.rs         # Daemon health (2 commands)
+│   │   │   ├── filesystem.rs     # File operations (3 commands)
+│   │   │   ├── system.rs         # System checks (5 commands)
+│   │   │   └── ui.rs             # UI events (5 commands)
+│   │   ├── menu.rs               # Menu building and event handling
+│   │   ├── daemon_client.rs      # Daemon communication
+│   │   ├── daemon_manager.rs     # Daemon lifecycle management
+│   │   ├── dependency_checker.rs # System dependency validation
+│   │   ├── logging.rs            # Logging macros
+│   │   └── mcp_watcher.rs        # MCP command file watcher
 │   ├── tauri.conf.json           # Tauri configuration
 │   └── Cargo.toml                # Rust dependencies
 │
