@@ -26,6 +26,32 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { getOutputPoller } from "./output-poller";
 import { getAppState } from "./state";
 
+// Helper to assert JSON structured log messages
+function assertLogMessage(spy: any, expectedMessage: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: any[]) => {
+    try {
+      const log = JSON.parse(call[0]);
+      return log.message === expectedMessage;
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
+}
+
+function assertLogContains(spy: any, expectedSubstring: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: any[]) => {
+    try {
+      const log = JSON.parse(call[0]);
+      return log.message && log.message.includes(expectedSubstring);
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log containing: ${expectedSubstring}`).toBe(true);
+}
 describe("HealthMonitor", () => {
   let monitor: HealthMonitor;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
@@ -96,7 +122,7 @@ describe("HealthMonitor", () => {
     it("starts monitoring with initial checks", async () => {
       monitor.start();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Starting health monitoring");
+      assertLogMessage(consoleLogSpy, "Starting health monitoring");
 
       // Should perform initial health check and ping
       await vi.advanceTimersByTimeAsync(0);
@@ -111,14 +137,14 @@ describe("HealthMonitor", () => {
       monitor.start();
       monitor.start();
 
-      expect(consoleWarnSpy).toHaveBeenCalledWith("[HealthMonitor] Already running");
+      assertLogMessage(consoleWarnSpy, "Already running");
     });
 
     it("stops monitoring and clears timers", () => {
       monitor.start();
       monitor.stop();
 
-      expect(consoleLogSpy).toHaveBeenCalledWith("[HealthMonitor] Stopping health monitoring");
+      assertLogMessage(consoleLogSpy, "Stopping health monitoring");
 
       // Verify no more periodic checks after stop
       const invokeCallsBefore = vi.mocked(invoke).mock.calls.length;

@@ -14,6 +14,32 @@ vi.mock("./terminal-manager", () => ({
 import { invoke } from "@tauri-apps/api/tauri";
 import { getTerminalManager } from "./terminal-manager";
 
+// Helper to assert JSON structured log messages
+function assertLogMessage(spy: any, expectedMessage: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: any[]) => {
+    try {
+      const log = JSON.parse(call[0]);
+      return log.message === expectedMessage;
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
+}
+
+function assertLogContains(spy: any, expectedSubstring: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: any[]) => {
+    try {
+      const log = JSON.parse(call[0]);
+      return log.message && log.message.includes(expectedSubstring);
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log containing: ${expectedSubstring}`).toBe(true);
+}
 describe("OutputPoller", () => {
   let poller: OutputPoller;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
@@ -383,10 +409,7 @@ describe("OutputPoller", () => {
       poller.startPolling("terminal-1");
       await vi.runOnlyPendingTimersAsync();
 
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Error polling terminal terminal-1"),
-        "string error"
-      );
+      assertLogContains(consoleErrorSpy, "Error polling terminal");
     });
   });
 
@@ -453,9 +476,7 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should log frequency increase
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("active, increasing poll frequency to 50ms")
-      );
+      assertLogContains(consoleLogSpy, "increasing poll frequency");
     });
 
     it("maintains idle frequency for inactive terminals", async () => {
@@ -685,9 +706,7 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should have switched to idle polling
-      expect(consoleLogSpy).toHaveBeenCalledWith(
-        expect.stringContaining("reducing poll frequency to 10000ms")
-      );
+      assertLogContains(consoleLogSpy, "reducing poll frequency");
 
       // New output arrives
       vi.mocked(invoke).mockResolvedValueOnce(createMockOutput("resumed", 14));

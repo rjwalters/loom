@@ -108,6 +108,32 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { Terminal } from "@xterm/xterm";
 import { getAppState, TerminalStatus } from "./state";
 
+// Helper to assert JSON structured log messages
+function assertLogMessage(spy: any, expectedMessage: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: any[]) => {
+    try {
+      const log = JSON.parse(call[0]);
+      return log.message === expectedMessage;
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log with message: ${expectedMessage}`).toBe(true);
+}
+
+function assertLogContains(spy: any, expectedSubstring: string) {
+  const calls = spy.mock.calls;
+  const found = calls.some((call: any[]) => {
+    try {
+      const log = JSON.parse(call[0]);
+      return log.message && log.message.includes(expectedSubstring);
+    } catch {
+      return false;
+    }
+  });
+  expect(found, `Expected log containing: ${expectedSubstring}`).toBe(true);
+}
 describe("TerminalManager", () => {
   let manager: TerminalManager;
   let consoleLogSpy: ReturnType<typeof vi.spyOn>;
@@ -307,7 +333,8 @@ describe("TerminalManager", () => {
       const managed = manager.createTerminal("terminal-1", "container-1");
 
       expect(managed).toBeNull();
-      expect(consoleErrorSpy).toHaveBeenCalledWith(
+      assertLogMessage(
+        consoleErrorSpy,
         "persistent-xterm-containers not found - UI not initialized"
       );
     });
@@ -381,10 +408,7 @@ describe("TerminalManager", () => {
       await dataCallback("test");
 
       await vi.waitFor(() => {
-        expect(consoleErrorSpy).toHaveBeenCalledWith(
-          expect.stringContaining("Failed to send input for terminal-1"),
-          expect.any(Error)
-        );
+        assertLogContains(consoleErrorSpy, "Failed to send input");
       });
     });
   });
@@ -457,7 +481,7 @@ describe("TerminalManager", () => {
       manager.showTerminal("terminal-1");
 
       expect(container.style.display).toBe("block");
-      expect(consoleLogSpy).toHaveBeenCalledWith("[terminal-manager] Showing terminal terminal-1");
+      assertLogMessage(consoleLogSpy, "Showing terminal terminal-1");
     });
 
     it("hides terminal by updating display style", () => {
@@ -468,7 +492,7 @@ describe("TerminalManager", () => {
       manager.hideTerminal("terminal-1");
 
       expect(container.style.display).toBe("none");
-      expect(consoleLogSpy).toHaveBeenCalledWith("[terminal-manager] Hiding terminal terminal-1");
+      assertLogMessage(consoleLogSpy, "Hiding terminal terminal-1");
     });
 
     it("warns when showing non-existent terminal", () => {
