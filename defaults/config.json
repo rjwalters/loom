@@ -92,7 +92,7 @@
         "workerType": "claude",
         "roleFile": "hermit.md",
         "targetInterval": 900000,
-        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:critic-suggestion label if you find something concrete"
+        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:hermit label if you find something concrete"
       },
       "theme": "gray"
     },
