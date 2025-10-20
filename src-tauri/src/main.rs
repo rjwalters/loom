@@ -22,12 +22,6 @@ use commands::*;
 #[derive(Default)]
 struct CliWorkspace(std::sync::Mutex<Option<String>>);
 
-// Simple greet command (deprecated, will be removed in future)
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {name}! Welcome to Loom.")
-}
-
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn get_cli_workspace(cli_workspace: tauri::State<CliWorkspace>) -> Option<String> {
@@ -160,7 +154,6 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             // Legacy commands
-            greet,
             get_cli_workspace,
             // System commands
             check_system_dependencies,
