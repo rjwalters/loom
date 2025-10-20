@@ -1325,6 +1325,7 @@ fn kill_all_loom_sessions() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_menu<R: tauri::Runtime>(
     handle: &impl tauri::Manager<R>,
 ) -> Result<tauri::menu::Menu<R>, tauri::Error> {
@@ -1444,6 +1445,7 @@ fn build_menu<R: tauri::Runtime>(
         .build()
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn handle_menu_event<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: tauri::menu::MenuEvent) {
     let menu_id = event.id().as_ref();
 
