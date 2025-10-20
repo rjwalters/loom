@@ -13,9 +13,10 @@ pub struct ActivityDb {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum InputType {
-    Manual,     // User-initiated command
-    Autonomous, // Agent autonomous action
-    System,     // System-initiated (e.g., setup commands)
+    Manual,          // User-initiated command (direct keyboard input)
+    Autonomous,      // Agent autonomous action (interval prompts)
+    System,          // System-initiated (e.g., setup commands)
+    UserInstruction, // User-initiated prompts via UI buttons
 }
 
 impl InputType {
@@ -24,6 +25,7 @@ impl InputType {
             Self::Manual => "manual",
             Self::Autonomous => "autonomous",
             Self::System => "system",
+            Self::UserInstruction => "user_instruction",
         }
     }
 
@@ -33,6 +35,7 @@ impl InputType {
             "manual" => Some(Self::Manual),
             "autonomous" => Some(Self::Autonomous),
             "system" => Some(Self::System),
+            "user_instruction" => Some(Self::UserInstruction),
             _ => None,
         }
     }
