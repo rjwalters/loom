@@ -234,6 +234,10 @@ logger.error("Failed to load", error, { workspacePath });
 - Daemon: `~/.loom/daemon.log`
 - Terminals: `/tmp/loom-terminal-{id}.out`
 
+**Log rotation**: Automatic rotation when files exceed 10MB (keeps last 10 files: `*.log.1` through `*.log.10`)
+
+**See full documentation**: [docs/guides/common-tasks.md#structured-logging](docs/guides/common-tasks.md#structured-logging) for conventions, querying, and migration guide
+
 ## Critical AI Agent Requirements
 
 ### Pre-PR Checklist (MANDATORY)

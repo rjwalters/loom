@@ -1307,7 +1307,41 @@ fn emit_event(window: tauri::Window, event: &str) -> Result<(), String> {
         .map_err(|e| format!("Failed to emit event: {e}"))
 }
 
+/// Rotate log file if it exceeds max size
+/// Keeps last 10 files (log.1, log.2, ..., log.10)
+fn rotate_log_file(log_path: &Path, max_size: u64, max_files: usize) -> io::Result<()> {
+    // Check if rotation is needed
+    if !log_path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(log_path)?;
+    if metadata.len() < max_size {
+        return Ok(()); // No rotation needed
+    }
+
+    // Remove oldest rotated file if it exists (log.10)
+    let oldest_file = format!("{}.{max_files}", log_path.display());
+    let _ = fs::remove_file(&oldest_file); // Ignore error if file doesn't exist
+
+    // Shift existing rotated files (log.9 -> log.10, log.8 -> log.9, etc.)
+    for i in (1..max_files).rev() {
+        let old_path = format!("{}.{i}", log_path.display());
+        let new_path = format!("{}.{}", log_path.display(), i + 1);
+        if Path::new(&old_path).exists() {
+            let _ = fs::rename(&old_path, &new_path); // Ignore errors
+        }
+    }
+
+    // Rotate current log file to log.1
+    let rotated_path = format!("{}.1", log_path.display());
+    fs::rename(log_path, rotated_path)?;
+
+    Ok(())
+}
+
 /// Append console log message to file for MCP access
+/// Automatically rotates log files when they exceed 10MB (keeps last 10 files)
 #[tauri::command]
 fn append_to_console_log(content: &str) -> Result<(), String> {
     use std::io::Write;
@@ -1324,6 +1358,10 @@ fn append_to_console_log(content: &str) -> Result<(), String> {
                 .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
         }
     }
+
+    // Rotate log if it's too large (10MB max, keep 10 files)
+    rotate_log_file(&log_path, 10 * 1024 * 1024, 10)
+        .map_err(|e| format!("Failed to rotate log file: {e}"))?;
 
     // Open file in append mode (create if doesn't exist)
     let mut file = std::fs::OpenOptions::new()
