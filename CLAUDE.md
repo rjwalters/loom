@@ -289,6 +289,61 @@ diff defaults/config.json /tmp/test-repo/.loom/config.json
 - [CLI Reference](docs/guides/cli-reference.md) - Full command syntax and flags
 - [CI/CD Setup](docs/guides/ci-cd-setup.md) - Pipeline integration examples
 
+### Enhanced Loom Installation Workflow (Issue #442)
+
+For a streamlined installation experience with GitHub integration, use the automated installation workflow:
+
+```bash
+# From Loom repository
+cd /path/to/loom
+./scripts/install-loom.sh /path/to/target-repo
+```
+
+**What it does:**
+1. Creates GitHub tracking issue in target repository
+2. Creates installation worktree at `.loom/worktrees/issue-{NUMBER}`
+3. Runs `loom-daemon init` to install Loom files
+4. Syncs GitHub labels from `.github/labels.yml`
+5. Creates pull request that closes the tracking issue
+
+**Installation Components:**
+
+The installation includes:
+- **Modular Scripts** (`scripts/install/`):
+  - `validate-target.sh` - Validates prerequisites (git repo, gh CLI)
+  - `create-issue.sh` - Creates tracking issue with Loom version info
+  - `create-worktree.sh` - Creates git worktree for installation
+  - `sync-labels.sh` - Syncs GitHub workflow labels
+  - `create-pr.sh` - Commits changes and creates PR
+- **Slash Command** (`.claude/commands/install-loom.md`):
+  - Orchestrates the installation process
+  - Provides detailed error handling and recovery
+  - Launched automatically by `install-loom.sh`
+- **Documentation Templates** (`defaults/.loom/`):
+  - `CLAUDE.md` - Repository-specific usage guide
+  - `AGENTS.md` - Agent workflow documentation
+- **GitHub Labels** (`defaults/.github/labels.yml`):
+  - Canonical Loom workflow labels
+  - Synced via `gh label sync`
+
+**Workflow:**
+1. User runs `./scripts/install-loom.sh /target/repo`
+2. Script extracts Loom version and commit
+3. Launches Claude Code with `/install-loom` command
+4. Agent orchestrates all installation steps
+5. Creates PR for human review and merge
+
+**Benefits:**
+- **Trackable**: GitHub issue documents the installation
+- **Reviewable**: PR allows team review before merge
+- **Automated**: Minimal manual steps required
+- **Version-Stamped**: Documentation includes Loom version info
+
+**See also:**
+- `scripts/install-loom.sh` - Main entry point
+- `defaults/.claude/commands/install-loom.md` - Orchestration guide
+- `defaults/.loom/CLAUDE.md` - Target repo documentation template
+
 ## MCP Testing & Debugging
 
 Loom provides MCP servers for AI-powered testing:
