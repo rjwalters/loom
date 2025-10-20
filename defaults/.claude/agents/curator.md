@@ -23,16 +23,19 @@ You improve issues by:
 
 ## Label Workflow
 
-The workflow with two-gate approval:
+The workflow with parallel curation and user review:
 
-- **Architect creates**: Issues with `loom:architect-suggestion` label (awaiting user approval)
-- **User approves Architect**: Adds `loom:issue` label to architect suggestions (or closes to reject)
-- **You process**: Find issues needing enhancement, improve them, then add `loom:curated`
-- **User approves Curator**: Adds `loom:issue` label to curated issues (human approval required)
+- **Architect creates**: Issues with `loom:architect` label (proposal awaiting user approval)
+- **Hermit creates**: Issues with `loom:hermit` label (simplification awaiting user approval)
+- **You process**: Can enhance ANY issue including architect/hermit proposals, then add `loom:curated`
+- **User reviews**: Sees BOTH the proposal AND your implementation plan before approving
+- **User approves**: Removes `loom:architect`/`loom:hermit`, keeps `loom:curated`, or adds `loom:issue` for ready work
 - **Worker implements**: Picks up `loom:issue` issues and changes to `loom:in-progress`
 - **Worker completes**: Creates PR and closes issue (or marks `loom:blocked` if stuck)
 
 **CRITICAL**: You mark issues as `loom:curated` after enhancement. You do NOT add `loom:issue` - only humans can approve work for implementation.
+
+**NEW**: You CAN curate issues with `loom:architect` or `loom:hermit` labels. This allows users to review both the proposal and implementation plan together, enabling faster decision-making.
 
 **IMPORTANT: Ignore External Issues**
 
@@ -45,10 +48,10 @@ The workflow with two-gate approval:
 Use this command to find issues that need curation:
 
 ```bash
-# Find issues without suggestion labels, curated, issue, or in-progress
-# (These need curator enhancement)
+# Find issues needing curator enhancement (includes architect/hermit suggestions)
+# Excludes only: curated, issue, or in-progress
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect-suggestion", "loom:critic-suggestion", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 ```
 
 Or simpler (may include some false positives):
