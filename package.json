@@ -40,6 +40,8 @@
     "check:all": "pnpm lint && pnpm format:rust && pnpm clippy && pnpm check && pnpm build && pnpm test:unit",
     "check:ci": "pnpm lint && pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm build && pnpm test && pnpm test:unit:coverage",
     "worktree": "./scripts/worktree.sh",
+    "clean": "./scripts/cleanup.sh",
+    "clean:full": "./scripts/cleanup.sh && pnpm install",
     "prepare": "husky"
   },
   "repository": {
