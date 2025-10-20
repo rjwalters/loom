@@ -138,6 +138,39 @@ fn check_tmux_installed() -> Result<()> {
         .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
 }
 
+/// Rotate log file if it exceeds max size
+/// Keeps last 10 files (log.1, log.2, ..., log.10)
+fn rotate_log_file(log_path: &std::path::Path, max_size: u64, max_files: usize) -> Result<()> {
+    // Check if rotation is needed
+    if !log_path.exists() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(log_path)?;
+    if metadata.len() < max_size {
+        return Ok(()); // No rotation needed
+    }
+
+    // Remove oldest rotated file if it exists (log.10)
+    let oldest_file = format!("{}.{max_files}", log_path.display());
+    let _ = fs::remove_file(&oldest_file); // Ignore error if file doesn't exist
+
+    // Shift existing rotated files (log.9 -> log.10, log.8 -> log.9, etc.)
+    for i in (1..max_files).rev() {
+        let old_path = format!("{}.{i}", log_path.display());
+        let new_path = format!("{}.{}", log_path.display(), i + 1);
+        if std::path::Path::new(&old_path).exists() {
+            let _ = fs::rename(&old_path, &new_path); // Ignore errors
+        }
+    }
+
+    // Rotate current log file to log.1
+    let rotated_path = format!("{}.1", log_path.display());
+    fs::rename(log_path, rotated_path)?;
+
+    Ok(())
+}
+
 fn setup_logging() -> Result<()> {
     // Get log file path: ~/.loom/daemon.log
     let log_path = dirs::home_dir()
@@ -148,6 +181,9 @@ fn setup_logging() -> Result<()> {
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
+
+    // Rotate log file if it exceeds 10MB (keeps last 10 files)
+    rotate_log_file(&log_path, 10 * 1024 * 1024, 10)?;
 
     // Open log file in append mode
     let log_file = fs::OpenOptions::new()
