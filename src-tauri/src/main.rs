@@ -414,7 +414,16 @@ fn find_git_root() -> Option<std::path::PathBuf> {
 
     loop {
         let git_dir = current.join(".git");
+
+        // Security: Check if .git exists and is NOT a symlink
+        // Prevents symlink-based directory traversal attacks (CWE-59)
         if git_dir.exists() {
+            if let Ok(metadata) = git_dir.symlink_metadata() {
+                if metadata.is_symlink() {
+                    // Reject symlinks to prevent directory escape
+                    return None;
+                }
+            }
             return Some(current);
         }
 
@@ -1747,5 +1756,67 @@ fn main() {
     {
         safe_eprintln!("Error while running tauri application: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Unwrap is acceptable in tests
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs as unix_fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_find_git_root_rejects_symlink() {
+        // Create temp directory with .git symlink
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create a target directory to symlink to
+        let target_dir = temp_dir.path().join("target");
+        fs::create_dir(&target_dir).unwrap();
+
+        // Create symlink: .git -> target
+        let git_symlink = temp_path.join(".git");
+        unix_fs::symlink(&target_dir, &git_symlink).unwrap();
+
+        // Change to temp directory
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_path).unwrap();
+
+        // Verify find_git_root() returns None (rejects symlink)
+        let result = find_git_root();
+        assert!(result.is_none(), "find_git_root() should reject .git symlinks");
+
+        // Restore original directory
+        std::env::set_current_dir(original_dir).unwrap();
+    }
+
+    #[test]
+    fn test_find_git_root_accepts_real_git_directory() {
+        // Create temp directory with real .git directory
+        let temp_dir = TempDir::new().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create real .git directory
+        let git_dir = temp_path.join(".git");
+        fs::create_dir(&git_dir).unwrap();
+
+        // Change to temp directory
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(temp_path).unwrap();
+
+        // Verify find_git_root() returns Some with correct path
+        let result = find_git_root();
+        assert!(result.is_some(), "find_git_root() should accept real .git directories");
+        assert_eq!(
+            result.unwrap().canonicalize().unwrap(),
+            temp_path.canonicalize().unwrap(),
+            "Should return the directory containing .git"
+        );
+
+        // Restore original directory
+        std::env::set_current_dir(original_dir).unwrap();
     }
 }
