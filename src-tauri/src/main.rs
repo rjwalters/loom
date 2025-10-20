@@ -714,6 +714,29 @@ fn check_claude_code() -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn check_process_alive(pid: u32) -> Result<bool, String> {
+    // Use kill -0 which checks if process exists without sending a signal
+    let output = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("Failed to check process: {e}"))?;
+
+    // kill -0 returns success (0) if process exists, error otherwise
+    Ok(output.status.success())
+}
+
+#[tauri::command]
+fn check_path_exists(path: &str) -> Result<(), String> {
+    let file_path = Path::new(path);
+
+    if !file_path.exists() {
+        return Err(format!("Path does not exist: {path}"));
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 fn read_text_file(path: &str) -> Result<String, String> {
     let file_path = Path::new(path);
 
@@ -1770,6 +1793,8 @@ fn main() {
             set_worktree_path,
             get_env_var,
             check_claude_code,
+            check_process_alive,
+            check_path_exists,
             get_stored_workspace,
             set_stored_workspace,
             clear_stored_workspace,
