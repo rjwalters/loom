@@ -379,7 +379,13 @@ This runs:
 
 ## Project Philosophy
 
-Loom embraces archetypal roles (Builder, Judge, Curator, Architect, Hermit, Healer, Guide, Driver) that work in harmony through label-based coordination. Each role embodies a universal pattern from Tarot's Major Arcana, with specific purposes and rhythms. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the complete philosophical framework.
+Loom is built on three philosophical pillars:
+
+1. **[Agent Archetypes](docs/philosophy/agent-archetypes.md)** - Each role (Builder, Judge, Curator, Architect, Hermit, Healer, Guide, Driver) embodies a universal pattern from Tarot's Major Arcana, working in harmony through label-based coordination.
+
+2. **[Working with AI](docs/philosophy/working-with-ai.md)** - Insights from building Loom: the shift from writing code to specifying intent, creating machine-readable debugging surfaces, and the evolution of the programmer's craft.
+
+3. **[Loom Intelligence](docs/philosophy/loom-intelligence.md)** - The vision for Loom as a learning system that gets smarter over time, analyzing agent activity to answer strategic questions about effectiveness, cost, and patterns.
 
 ## Maintaining Documentation
 
