@@ -79,7 +79,7 @@ pub fn initialize_workspace(
     update_gitignore(workspace)?;
 
     // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
-    setup_repository_scaffolding(workspace, &defaults)?;
+    setup_repository_scaffolding(workspace, &defaults, force)?;
 
     Ok(())
 }
@@ -218,60 +218,107 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Merge directory recursively
+///
+/// Copies files from src to dst, but only if they don't already exist in dst.
+/// This allows merging new files from defaults while preserving existing customizations.
+fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if file_type.is_dir() {
+            // Recursively merge subdirectories
+            merge_dir_recursive(&src_path, &dst_path)?;
+        } else if !dst_path.exists() {
+            // Only copy if destination file doesn't exist
+            fs::copy(&src_path, &dst_path)?;
+        }
+        // If dst_path exists, skip (preserve existing file)
+    }
+
+    Ok(())
+}
+
 /// Setup repository scaffolding files
 ///
-/// Copies CLAUDE.md, AGENTS.md, .claude/, and .codex/ to the workspace if they don't exist.
-/// Only creates files that are missing - never overwrites existing files.
-fn setup_repository_scaffolding(workspace_path: &Path, defaults_path: &Path) -> Result<(), String> {
-    // Copy CLAUDE.md if it doesn't exist
-    let claude_md_dst = workspace_path.join("CLAUDE.md");
-    if !claude_md_dst.exists() {
-        let claude_md_src = defaults_path.join("CLAUDE.md");
-        if claude_md_src.exists() {
-            fs::copy(&claude_md_src, &claude_md_dst)
-                .map_err(|e| format!("Failed to copy CLAUDE.md: {e}"))?;
+/// Copies CLAUDE.md, AGENTS.md, .claude/, and .codex/ to the workspace.
+/// - Force mode: Overwrites existing files/directories
+/// - Non-force mode: Merges directories (copies missing files, keeps existing ones)
+fn setup_repository_scaffolding(
+    workspace_path: &Path,
+    defaults_path: &Path,
+    force: bool,
+) -> Result<(), String> {
+    // Helper to copy file with force logic
+    let copy_file = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
+        if src.exists() {
+            if force && dst.exists() {
+                fs::remove_file(dst)
+                    .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+            }
+            if force || !dst.exists() {
+                fs::copy(src, dst).map_err(|e| format!("Failed to copy {name}: {e}"))?;
+            }
         }
-    }
+        Ok(())
+    };
 
-    // Copy AGENTS.md if it doesn't exist
-    let agents_md_dst = workspace_path.join("AGENTS.md");
-    if !agents_md_dst.exists() {
-        let agents_md_src = defaults_path.join("AGENTS.md");
-        if agents_md_src.exists() {
-            fs::copy(&agents_md_src, &agents_md_dst)
-                .map_err(|e| format!("Failed to copy AGENTS.md: {e}"))?;
+    // Helper to copy directory with force logic
+    let copy_directory = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
+        if src.exists() {
+            if force && dst.exists() {
+                fs::remove_dir_all(dst)
+                    .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+            }
+            if force || !dst.exists() {
+                copy_dir_recursive(src, dst).map_err(|e| format!("Failed to copy {name}: {e}"))?;
+            } else {
+                // Merge mode: copy files that don't exist
+                merge_dir_recursive(src, dst)
+                    .map_err(|e| format!("Failed to merge {name}: {e}"))?;
+            }
         }
-    }
+        Ok(())
+    };
 
-    // Copy .claude/ directory if it doesn't exist
-    let claude_dir_dst = workspace_path.join(".claude");
-    if !claude_dir_dst.exists() {
-        let claude_dir_src = defaults_path.join(".claude");
-        if claude_dir_src.exists() {
-            copy_dir_recursive(&claude_dir_src, &claude_dir_dst)
-                .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
-        }
-    }
+    // Copy CLAUDE.md
+    copy_file(&defaults_path.join("CLAUDE.md"), &workspace_path.join("CLAUDE.md"), "CLAUDE.md")?;
 
-    // Copy .codex/ directory if it doesn't exist
-    let codex_dir_dst = workspace_path.join(".codex");
-    if !codex_dir_dst.exists() {
-        let codex_dir_src = defaults_path.join(".codex");
-        if codex_dir_src.exists() {
-            copy_dir_recursive(&codex_dir_src, &codex_dir_dst)
-                .map_err(|e| format!("Failed to copy .codex directory: {e}"))?;
-        }
-    }
+    // Copy AGENTS.md
+    copy_file(&defaults_path.join("AGENTS.md"), &workspace_path.join("AGENTS.md"), "AGENTS.md")?;
 
-    // Copy .github/ directory if it doesn't exist
-    let github_dir_dst = workspace_path.join(".github");
-    if !github_dir_dst.exists() {
-        let github_dir_src = defaults_path.join(".github");
-        if github_dir_src.exists() {
-            copy_dir_recursive(&github_dir_src, &github_dir_dst)
-                .map_err(|e| format!("Failed to copy .github directory: {e}"))?;
-        }
-    }
+    // Copy .claude/ directory
+    copy_directory(
+        &defaults_path.join(".claude"),
+        &workspace_path.join(".claude"),
+        ".claude directory",
+    )?;
+
+    // Copy .codex/ directory
+    copy_directory(
+        &defaults_path.join(".codex"),
+        &workspace_path.join(".codex"),
+        ".codex directory",
+    )?;
+
+    // Copy .github/ directory
+    copy_directory(
+        &defaults_path.join(".github"),
+        &workspace_path.join(".github"),
+        ".github directory",
+    )?;
+
+    // Copy scripts/ directory to .loom/scripts/
+    copy_directory(
+        &defaults_path.join("scripts"),
+        &workspace_path.join(".loom/scripts"),
+        ".loom/scripts directory",
+    )?;
 
     Ok(())
 }
@@ -381,5 +428,175 @@ mod tests {
 
         let content2 = fs::read_to_string(dst.join("subdir").join("file2.txt")).unwrap();
         assert_eq!(content2, "content2");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_merge_dir_recursive() {
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        // Create source structure
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("file1.txt"), "new content 1").unwrap();
+        fs::write(src.join("file2.txt"), "new content 2").unwrap();
+        fs::create_dir(src.join("subdir")).unwrap();
+        fs::write(src.join("subdir").join("file3.txt"), "new content 3").unwrap();
+
+        // Create destination with existing file
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("file1.txt"), "existing content").unwrap();
+        fs::write(dst.join("existing.txt"), "preserve me").unwrap();
+
+        // Merge directories
+        merge_dir_recursive(&src, &dst).unwrap();
+
+        // Verify: file1.txt should be preserved (not overwritten)
+        let content1 = fs::read_to_string(dst.join("file1.txt")).unwrap();
+        assert_eq!(content1, "existing content");
+
+        // Verify: file2.txt should be copied (new file)
+        assert!(dst.join("file2.txt").exists());
+        let content2 = fs::read_to_string(dst.join("file2.txt")).unwrap();
+        assert_eq!(content2, "new content 2");
+
+        // Verify: subdir and file3.txt should be created
+        assert!(dst.join("subdir").exists());
+        assert!(dst.join("subdir").join("file3.txt").exists());
+        let content3 = fs::read_to_string(dst.join("subdir").join("file3.txt")).unwrap();
+        assert_eq!(content3, "new content 3");
+
+        // Verify: existing.txt should still exist
+        assert!(dst.join("existing.txt").exists());
+        let existing = fs::read_to_string(dst.join("existing.txt")).unwrap();
+        assert_eq!(existing, "preserve me");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_setup_repository_scaffolding_force_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults directory with .claude commands
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("commands").join("loom.md"),
+            "loom command from defaults",
+        )
+        .unwrap();
+        fs::write(
+            defaults.join(".claude").join("commands").join("builder.md"),
+            "builder command from defaults",
+        )
+        .unwrap();
+
+        // Create existing .claude directory in workspace with custom commands
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("commands").join("custom.md"),
+            "my custom command",
+        )
+        .unwrap();
+        fs::write(workspace.join(".claude").join("commands").join("loom.md"), "old loom command")
+            .unwrap();
+
+        // Run setup with force=true
+        setup_repository_scaffolding(workspace, &defaults, true).unwrap();
+
+        // Verify .claude was overwritten (custom commands removed)
+        assert!(!workspace
+            .join(".claude")
+            .join("commands")
+            .join("custom.md")
+            .exists());
+
+        // Verify loom.md was overwritten with new content
+        let loom_content =
+            fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
+        assert_eq!(loom_content, "loom command from defaults");
+
+        // Verify builder.md exists
+        assert!(workspace
+            .join(".claude")
+            .join("commands")
+            .join("builder.md")
+            .exists());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_setup_repository_scaffolding_merge_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults directory with .claude commands
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("commands").join("loom.md"),
+            "loom command from defaults",
+        )
+        .unwrap();
+        fs::write(
+            defaults.join(".claude").join("commands").join("builder.md"),
+            "builder command from defaults",
+        )
+        .unwrap();
+
+        // Create existing .claude directory in workspace with custom commands
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("commands").join("custom.md"),
+            "my custom command",
+        )
+        .unwrap();
+        fs::write(
+            workspace.join(".claude").join("commands").join("loom.md"),
+            "custom loom command",
+        )
+        .unwrap();
+
+        // Run setup with force=false (merge mode)
+        setup_repository_scaffolding(workspace, &defaults, false).unwrap();
+
+        // Verify custom.md still exists (preserved)
+        assert!(workspace
+            .join(".claude")
+            .join("commands")
+            .join("custom.md")
+            .exists());
+        let custom_content =
+            fs::read_to_string(workspace.join(".claude").join("commands").join("custom.md"))
+                .unwrap();
+        assert_eq!(custom_content, "my custom command");
+
+        // Verify loom.md was NOT overwritten (preserved)
+        let loom_content =
+            fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
+        assert_eq!(loom_content, "custom loom command");
+
+        // Verify builder.md was added (new file)
+        assert!(workspace
+            .join(".claude")
+            .join("commands")
+            .join("builder.md")
+            .exists());
+        let builder_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("builder.md"),
+        )
+        .unwrap();
+        assert_eq!(builder_content, "builder command from defaults");
     }
 }

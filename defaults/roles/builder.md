@@ -37,7 +37,7 @@ When working on issues, you should **create worktrees on-demand** to isolate you
 
 ### IMPORTANT: Use the Worktree Helper Script
 
-**Always use `pnpm worktree <issue-number>` to create worktrees.** This helper script ensures:
+**Always use `./.loom/scripts/worktree.sh <issue-number>` to create worktrees.** This helper script ensures:
 - Correct path (`.loom/worktrees/issue-{number}`)
 - Prevents nested worktrees
 - Consistent branch naming
@@ -45,7 +45,7 @@ When working on issues, you should **create worktrees on-demand** to isolate you
 
 ```bash
 # CORRECT - Use the helper script
-pnpm worktree 84
+./.loom/scripts/worktree.sh 84
 
 # WRONG - Don't use git worktree directly
 git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
@@ -66,7 +66,7 @@ git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 gh issue edit 84 --remove-label "loom:issue" --add-label "loom:in-progress"
 
 # 2. Create worktree using helper
-pnpm worktree 84
+./.loom/scripts/worktree.sh 84
 # → Creates: .loom/worktrees/issue-84
 # → Branch: feature/issue-84
 
@@ -93,12 +93,12 @@ The worktree helper script prevents common errors:
 
 ```bash
 # If you're already in a worktree
-pnpm worktree 84
+./.loom/scripts/worktree.sh 84
 # → ERROR: You are already in a worktree!
 # → Instructions to return to main before creating new worktree
 
 # If directory already exists
-pnpm worktree 84
+./.loom/scripts/worktree.sh 84
 # → Checks if it's a valid worktree or needs cleanup
 ```
 

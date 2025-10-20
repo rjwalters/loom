@@ -118,7 +118,7 @@ export class AppState {
 ### Configuration & Worktrees
 
 - **Config**: `.loom/config.json` (workspace-specific, gitignored)
-- **Worktrees**: On-demand creation using `pnpm worktree <issue-number>`
+- **Worktrees**: On-demand creation using `./.loom/scripts/worktree.sh <issue-number>` (or `pnpm worktree` in loom itself)
 - **Agents start in main workspace**, create worktrees when claiming issues
 
 ### Terminal Roles
@@ -198,9 +198,13 @@ pnpm app:preview       # Rebuild and launch (recommended)
 ### Git Worktree Helper
 
 ```bash
-pnpm worktree 42              # Create worktree for issue #42
-pnpm worktree --check         # Check current worktree status
-pnpm worktree --help          # Show help
+# Portable version (works in any loom-initialized repo)
+./.loom/scripts/worktree.sh 42       # Create worktree for issue #42
+./.loom/scripts/worktree.sh --check  # Check current worktree status
+./.loom/scripts/worktree.sh --help   # Show help
+
+# Shorthand (only works in loom repo itself)
+pnpm worktree 42                     # Alias for the script above
 ```
 
 ### GitHub CLI
@@ -352,10 +356,10 @@ This runs:
 
 ### Worktree Best Practices
 
-- **Always** use `pnpm worktree <issue>`, never `git worktree` directly
+- **Always** use `./.loom/scripts/worktree.sh <issue>` (or `pnpm worktree` in loom), never `git worktree` directly
 - Agents start in **main workspace**, create worktrees on-demand
 - Worktrees named by issue: `.loom/worktrees/issue-42`
-- Check status: `pnpm worktree --check`
+- Check status: `./.loom/scripts/worktree.sh --check`
 
 ## Resources
 
