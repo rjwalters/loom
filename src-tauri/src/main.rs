@@ -182,6 +182,10 @@ fn main() {
             list_role_files,
             read_role_file,
             read_role_metadata,
+            // Activity logging commands
+            log_activity,
+            read_recent_activity,
+            get_activity_by_role,
             // Terminal commands
             create_terminal,
             list_terminals,

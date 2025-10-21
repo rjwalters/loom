@@ -1,5 +1,6 @@
 // Command modules organized by domain
 
+pub mod activity;
 pub mod config;
 pub mod daemon;
 pub mod filesystem;
@@ -11,6 +12,7 @@ pub mod ui;
 pub mod workspace;
 
 // Re-export all command functions for easy registration
+pub use activity::*;
 pub use config::*;
 pub use daemon::*;
 pub use filesystem::*;
