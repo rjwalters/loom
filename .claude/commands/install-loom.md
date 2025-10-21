@@ -200,7 +200,7 @@ After PR is merged, verify the installation works:
 
 # Test in MOM Mode
 # 1. Open Claude Code in target repository
-# 2. Use slash commands: /builder, /judge, /curator, etc.
+# 2. Use slash commands: /builder, /judge, /curator, /champion, etc.
 # 3. Verify MCP servers work (if target-specific ones were added)
 ```
 
