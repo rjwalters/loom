@@ -1,0 +1,16 @@
+coverage:
+  status:
+    project:
+      default:
+        # Don't fail PR if project coverage decreases
+        informational: true
+    patch:
+      default:
+        # Don't fail PR if patch coverage is low
+        informational: true
+
+comment:
+  # Still post coverage reports as comments
+  layout: "reach,diff,flags,tree"
+  behavior: default
+  require_changes: false
