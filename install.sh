@@ -143,8 +143,25 @@ echo "   - Uses git worktree for clean separation"
 echo "   - Syncs labels and creates PR for review"
 echo "   - Recommended for team projects"
 echo ""
-read -r -p "Choose installation method [1/2]: " -n 1 METHOD
-echo ""
+
+# Retry loop for method selection (up to 3 attempts)
+METHOD=""
+for attempt in 1 2 3; do
+  read -r -p "Choose installation method [1/2]: " -n 1 METHOD
+  echo ""
+
+  if [[ "$METHOD" == "1" || "$METHOD" == "2" ]]; then
+    break
+  fi
+
+  if [[ $attempt -lt 3 ]]; then
+    warning "Invalid choice '$METHOD'. Please enter 1 or 2."
+    echo ""
+  else
+    error "Invalid choice after 3 attempts. Please run again and select 1 or 2."
+  fi
+done
+
 echo ""
 
 case "$METHOD" in
@@ -217,10 +234,6 @@ case "$METHOD" in
 
     # Run the full installation workflow
     exec "$LOOM_ROOT/scripts/install-loom.sh" "$TARGET_PATH"
-    ;;
-
-  *)
-    error "Invalid choice. Please run again and select 1 or 2."
     ;;
 esac
 
