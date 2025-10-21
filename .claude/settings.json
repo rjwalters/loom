@@ -6,7 +6,7 @@
       "Bash(pnpm:*)",
       "Bash(cargo:*)",
       "Bash(node:*)",
-      "Bash(./scripts/**:*)",
+      "Bash(./.loom/scripts/**:*)",
       "Bash(tmux:*)",
       "Bash(lsof:*)",
       "Bash(cat:*)",
