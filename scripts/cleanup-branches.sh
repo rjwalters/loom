@@ -33,7 +33,7 @@ if [[ "$1" == "--dry-run" ]]; then
 fi
 
 # Get all feature branches
-branches=$(git branch | grep "feature/issue-" | sed 's/^[* ]*//' || true)
+branches=$(git branch | grep "feature/issue-" | sed 's/^[*+ ]*//' || true)
 
 if [ -z "$branches" ]; then
   echo "No feature branches found matching pattern 'feature/issue-*'"
