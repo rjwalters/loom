@@ -56,7 +56,7 @@ info "Creating installation issue..."
 # Create issue and capture the URL from output
 # (Compatible with older gh CLI versions that don't support --json)
 ISSUE_URL=$(gh issue create \
-  --title "Install Loom ${LOOM_VERSION}" \
+  --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$ISSUE_BODY" \
   --label "loom:in-progress" 2>&1 | grep -o 'https://[^ ]*')
 
