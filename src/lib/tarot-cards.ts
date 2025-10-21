@@ -8,6 +8,7 @@
 export type TarotRole =
   | "worker"
   | "curator"
+  | "champion"
   | "architect"
   | "reviewer"
   | "critic"
@@ -26,6 +27,7 @@ export function getTarotCardPath(role: string | undefined): string {
   const roleToCard: Record<TarotRole, string> = {
     worker: "assets/tarot-cards/worker.svg",
     curator: "assets/tarot-cards/curator.svg",
+    champion: "assets/tarot-cards/champion.svg",
     architect: "assets/tarot-cards/architect.svg",
     reviewer: "assets/tarot-cards/reviewer.svg",
     critic: "assets/tarot-cards/critic.svg",
@@ -55,6 +57,9 @@ function normalizeRole(role: string | undefined): TarotRole {
   if (lowerRole.includes("curator")) {
     return "curator";
   }
+  if (lowerRole.includes("champion")) {
+    return "champion";
+  }
   if (lowerRole.includes("architect")) {
     return "architect";
   }
@@ -82,6 +87,7 @@ export function getTarotArchetype(role: string | undefined): string {
   const roleToArchetype: Record<TarotRole, string> = {
     worker: "The Magician",
     curator: "The High Priestess",
+    champion: "Strength",
     architect: "The Emperor",
     reviewer: "Justice",
     critic: "The Hermit",
