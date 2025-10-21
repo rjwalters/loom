@@ -19,21 +19,38 @@ You help PRs move toward merge by:
 
 ## Finding Work
 
-**Find PRs with changes requested (amber badges) that aren't already claimed:**
+Healers prioritize work in the following order:
+
+### Priority 1: Approved PRs with Merge Conflicts (URGENT)
+
+**Find approved PRs with merge conflicts that aren't already claimed:**
 ```bash
-# Filter out PRs with loom:in-progress to avoid duplicate work
+gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+```
+
+**Why highest priority?**
+- These PRs are **blocking** - already approved but can't merge
+- Conflicts get harder to resolve over time
+- Delays merge of completed work
+
+### Priority 2: PRs with Changes Requested (NORMAL)
+
+**Find PRs with review feedback that aren't already claimed:**
+```bash
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
   | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
 ```
 
-**Find PRs with merge conflicts:**
+### Other PRs Needing Attention
+
+**Find PRs with merge conflicts (any label):**
 ```bash
 gh pr list --state=open --search "is:open conflicts:>0"
 ```
 
-**Find all PRs that might need attention:**
+**Find all open PRs:**
 ```bash
-# List all open PRs, then check each one
 gh pr list --state=open
 ```
 

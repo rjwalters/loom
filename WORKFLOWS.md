@@ -163,8 +163,14 @@ gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:changes-r
 
 ### Fixer Workflow
 
+**Healers prioritize work in the following order:**
+
 ```bash
-# Find PRs needing fixes (exclude already claimed)
+# Priority 1 (URGENT): Approved PRs with merge conflicts - BLOCKING
+gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+
+# Priority 2 (NORMAL): PRs with review feedback
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
   | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
 
@@ -173,7 +179,7 @@ gh pr edit 50 --add-label "loom:in-progress"
 
 # Fix and signal ready for re-review (amber → green, remove in-progress)
 gh pr checkout 50
-# ... address feedback ...
+# ... address feedback or resolve conflicts ...
 pnpm check:ci
 git push
 gh pr edit 50 --remove-label "loom:changes-requested" --remove-label "loom:in-progress" --add-label "loom:review-requested"
