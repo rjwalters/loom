@@ -47,3 +47,5 @@ Thumbs.db
 # - settings.json: Team-wide permissions (DO commit)
 # - settings.local.json: Personal preferences (gitignored)
 .claude/settings.local.json
+.loom/*.log
+.loom/*.sock

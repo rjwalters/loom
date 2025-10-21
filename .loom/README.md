@@ -1,17 +1,8 @@
 # Loom Workspace Configuration
 
-> **This is the Loom project's own workspace configuration.** Loom uses itself for development! This directory demonstrates how to configure a complete AI-powered development workflow.
+> **This project uses [Loom](https://github.com/rjwalters/loom)** - A multi-terminal desktop application that orchestrates AI-powered development agents using git worktrees and GitHub as the coordination layer.
 
 This directory contains workspace-specific Loom configuration that should be committed to version control for team sharing.
-
-## Why Loom Has Its Own .loom/ Directory
-
-This configuration allows the Loom project to use Loom for its own development, providing:
-- **Real-world testing** of all features and roles
-- **Working example** for users to reference
-- **Team coordination** for contributors using Loom
-
-For template configurations to copy to your own projects, see [../examples/](../examples/).
 
 ## Files in This Directory
 

@@ -5,7 +5,7 @@
       "Bash(git:*)",
       "Bash(pnpm:*)",
       "Bash(cargo:*)",
-      "Bash(./scripts/**:*)",
+      "Bash(./.loom/scripts/**:*)",
       "Bash(tmux:*)",
       "Bash(cat:*)",
       "Bash(ls:*)",
