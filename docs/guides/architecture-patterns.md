@@ -282,7 +282,7 @@ Each role consists of two files:
 
 Roles coordinate work through GitHub labels with two human approval gates (see [WORKFLOWS.md](../../WORKFLOWS.md) for complete details):
 
-1. **Architect** creates issues with `loom:architect-suggestion` label
+1. **Architect** creates issues with `loom:architect` label
 2. **Human approval (Gate 1)**: User reviews and removes label to approve proposal
 3. **Curator** finds unlabeled issues, enhances them, marks as `loom:curated`
 4. **Human approval (Gate 2)**: User reviews and changes `loom:curated` to `loom:issue` to authorize work
@@ -563,3 +563,173 @@ if (useWorktree && !worktreePath) {
 - Command execution ordering
 - Path handling with spaces and special characters
 - Terminal input simulation
+## 9. Command Module Organization
+
+**Files**: `src-tauri/src/commands/`, `src-tauri/src/main.rs`
+
+Tauri commands are organized into domain-specific modules rather than a monolithic main.rs file. This pattern improves maintainability, reduces merge conflicts, and makes the codebase easier to navigate.
+
+### Module Structure
+
+```
+src-tauri/src/
+├── main.rs                # Minimal entry point (command registration, app setup)
+├── commands/
+│   ├── mod.rs             # Module index with re-exports
+│   ├── terminal.rs        # Terminal management (12 commands)
+│   ├── workspace.rs       # Workspace operations (7 commands)
+│   ├── config.rs          # Config/state I/O (5 commands)
+│   ├── github.rs          # GitHub integration (5 commands)
+│   ├── project.rs         # Project creation (2 commands)
+│   ├── daemon.rs          # Daemon health checks (2 commands)
+│   ├── filesystem.rs      # File operations (3 commands)
+│   ├── system.rs          # System checks (5 commands)
+│   └── ui.rs              # UI events (5 commands)
+└── menu.rs                # Menu building and event handling
+```
+
+### Why Domain-Specific Modules?
+
+**Before Refactoring** (Issue #421):
+- 1,885 lines in main.rs
+- All 51 commands in one file
+- High risk of merge conflicts
+- Difficult to navigate and locate commands
+
+**After Refactoring**:
+- 290 lines in main.rs (85% reduction)
+- Commands grouped by domain
+- Clear boundaries reduce conflicts
+- Easy to find related functionality
+
+### Implementation Pattern
+
+**1. Command Module** (`src-tauri/src/commands/workspace.rs`):
+```rust
+use std::path::Path;
+
+#[tauri::command]
+pub fn validate_git_repo(path: &str) -> Result<bool, String> {
+    let workspace_path = Path::new(path);
+    
+    if !workspace_path.exists() {
+        return Err("Path does not exist".to_string());
+    }
+    
+    if !workspace_path.is_dir() {
+        return Err("Path is not a directory".to_string());
+    }
+    
+    let git_path = workspace_path.join(".git");
+    if !git_path.exists() {
+        return Err("Not a git repository".to_string());
+    }
+    
+    Ok(true)
+}
+
+// Helper functions (also pub for use by other modules if needed)
+pub fn find_git_root() -> Option<PathBuf> {
+    // Implementation...
+}
+```
+
+**2. Module Index** (`src-tauri/src/commands/mod.rs`):
+```rust
+pub mod config;
+pub mod daemon;
+pub mod filesystem;
+pub mod github;
+pub mod project;
+pub mod system;
+pub mod terminal;
+pub mod ui;
+pub mod workspace;
+
+// Re-export all command functions
+pub use config::*;
+pub use daemon::*;
+pub use filesystem::*;
+pub use github::*;
+pub use project::*;
+pub use system::*;
+pub use terminal::*;
+pub use ui::*;
+pub use workspace::*;
+```
+
+**3. Main Entry Point** (`src-tauri/src/main.rs`):
+```rust
+mod commands;
+mod menu;
+
+#[allow(clippy::wildcard_imports)]
+use commands::*;
+
+fn main() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![
+            // Legacy commands
+            get_cli_workspace,
+            // System commands
+            check_system_dependencies,
+            get_env_var,
+            // ... all 51 commands registered here ...
+        ])
+        .run(tauri::generate_context!())
+}
+```
+
+### Domain Boundaries
+
+| Module | Responsibility | Key Commands |
+|--------|---------------|--------------|
+| `terminal.rs` | Terminal lifecycle and I/O | `create_terminal`, `send_terminal_input`, `get_terminal_output` |
+| `workspace.rs` | Git repo validation and setup | `validate_git_repo`, `initialize_loom_workspace` |
+| `config.rs` | Configuration and state persistence | `read_config`, `write_state`, `read_role_file` |
+| `github.rs` | GitHub API integration | `check_label_exists`, `reset_github_labels` |
+| `project.rs` | Project creation workflows | `create_local_project`, `create_github_repository` |
+| `daemon.rs` | Daemon health monitoring | `check_daemon_health`, `get_daemon_status` |
+| `filesystem.rs` | File I/O operations | `read_text_file`, `write_file`, `append_to_console_log` |
+| `system.rs` | System dependency checks | `check_system_dependencies`, `check_claude_code` |
+| `ui.rs` | UI events and triggers | `emit_event`, `trigger_start`, `trigger_factory_reset` |
+
+### Guidelines for Adding Commands
+
+1. **Choose the Right Module**: Place commands in the module that matches their primary responsibility
+2. **Keep Functions Public**: Command functions and shared helpers must be `pub`
+3. **Re-export in mod.rs**: Add `pub use module_name::*;` for new modules
+4. **Register in main.rs**: Add command to `generate_handler![]` macro
+5. **Maintain Domain Purity**: Avoid cross-domain dependencies where possible
+
+### Benefits
+
+1. **Reduced Merge Conflicts**: Smaller files mean less chance of simultaneous edits
+2. **Improved Navigation**: Jump to domain module instead of searching large file
+3. **Clear Ownership**: Each module has a focused responsibility
+4. **Scalability**: Easy to add new domains as command count grows
+5. **Better Testing**: Can test domain modules independently
+6. **Code Review**: Reviewers can focus on specific domains
+
+### Example: Adding a New Command
+
+```rust
+// 1. Add to appropriate module (commands/workspace.rs)
+#[tauri::command]
+pub fn check_workspace_clean(path: &str) -> Result<bool, String> {
+    // Implementation
+    Ok(true)
+}
+
+// 2. Re-export from commands/mod.rs (already done via `pub use workspace::*;`)
+
+// 3. Register in main.rs
+.invoke_handler(tauri::generate_handler![
+    // ... existing commands ...
+    check_workspace_clean,  // Add here
+])
+```
+
+**See Also**:
+- [docs/guides/common-tasks.md](common-tasks.md#adding-a-new-tauri-command) - Step-by-step guide for adding commands
+- [docs/architecture/system-overview.md](../architecture/system-overview.md) - Full system architecture

@@ -25,19 +25,19 @@ export interface LabelDefinition {
  * - Red: Blocked/needs help
  *
  * Labels are separated into Issue labels and PR labels:
- * - Issue labels: loom:architect-suggestion, loom:critic-suggestion, loom:curated, loom:issue, loom:in-progress, loom:blocked, loom:urgent
+ * - Issue labels: loom:architect, loom:hermit, loom:curated, loom:issue, loom:in-progress, loom:blocked, loom:urgent
  * - PR labels: loom:review-requested, loom:changes-requested, loom:pr
  */
 export const LOOM_LABELS: LabelDefinition[] = [
   // Issue Labels
   {
-    name: "loom:architect-suggestion",
+    name: "loom:architect",
     description: "Architect suggestion awaiting user approval",
     color: "3B82F6", // Blue - human action needed
   },
   {
-    name: "loom:critic-suggestion",
-    description: "Critic removal/simplification proposal awaiting user approval",
+    name: "loom:hermit",
+    description: "Hermit removal/simplification proposal awaiting user approval",
     color: "3B82F6", // Blue - human action needed
   },
   {

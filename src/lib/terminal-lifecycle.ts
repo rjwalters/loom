@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { loadConfig } from "./config";
 import { Logger } from "./logger";
+import { startOfflineScheduler } from "./offline-scheduler";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 
@@ -44,6 +46,31 @@ export async function launchAgentsForTerminals(
     workspacePath,
     terminals: terminals.map((t) => `${t.name}=${t.id}, role=${t.role}`),
   });
+
+  // Check if offline mode is enabled
+  const config = await loadConfig();
+  if (config.offlineMode) {
+    logger.info("Offline mode enabled, skipping agent launches", {
+      workspacePath,
+      terminalCount: terminals.length,
+    });
+
+    // Set all terminals to idle status (they're already created, just not running agents)
+    for (const terminal of terminals) {
+      state.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
+    }
+
+    logger.info("All terminals set to idle (offline mode)", {
+      workspacePath,
+      terminalCount: terminals.length,
+    });
+
+    // Start offline scheduler to send periodic status echoes
+    startOfflineScheduler(terminals, workspacePath);
+
+    logger.info("Offline mode setup complete", { workspacePath });
+    return;
+  }
 
   // Filter terminals that have Claude Code worker role
   const workersToLaunch = terminals.filter(

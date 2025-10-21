@@ -45,7 +45,17 @@ loom/
 ├── src/                          # TypeScript frontend
 │   ├── main.ts                   # Entry point, state init, events
 │   └── lib/                      # State, config, UI, theme
-├── src-tauri/                    # Rust backend (IPC commands)
+├── src-tauri/                    # Rust backend (Tauri commands)
+│   ├── src/
+│   │   ├── main.rs               # Entry point, command registration
+│   │   ├── commands/             # Domain-specific command modules
+│   │   │   ├── terminal.rs       # Terminal management
+│   │   │   ├── workspace.rs      # Workspace operations
+│   │   │   ├── config.rs         # Config/state I/O
+│   │   │   ├── github.rs         # GitHub integration
+│   │   │   └── ...               # 9 modules total, 51 commands
+│   │   └── menu.rs               # Menu building
+│   └── tauri.conf.json           # Tauri configuration
 ├── loom-daemon/                  # Rust daemon (terminal management)
 ├── .loom/                        # Workspace config (gitignored)
 │   ├── config.json               # Agent counter, terminal roles
@@ -108,7 +118,7 @@ export class AppState {
 ### Configuration & Worktrees
 
 - **Config**: `.loom/config.json` (workspace-specific, gitignored)
-- **Worktrees**: On-demand creation using `pnpm worktree <issue-number>`
+- **Worktrees**: On-demand creation using `./.loom/scripts/worktree.sh <issue-number>` (or `pnpm worktree` in loom itself)
 - **Agents start in main workspace**, create worktrees when claiming issues
 
 ### Terminal Roles
@@ -124,6 +134,89 @@ Each terminal can be assigned a specialized role from `defaults/roles/`:
 - **Driver** (manual, driver.md): Plain shell, direct action
 
 See [WORKFLOWS.md](WORKFLOWS.md) and [Agent Archetypes](docs/philosophy/agent-archetypes.md) for complete details.
+
+## Offline Mode
+
+**Purpose**: Stabilize UI and daemon development without the complexity of AI agent processes.
+
+When `offlineMode: true` is set in `.loom/config.json`, Loom skips launching AI agents (Claude Code, Codex, etc.) and instead sends periodic status echoes to terminals to validate they're responsive. This provides a clean environment for:
+
+- **UI Development**: Work on Loom's interface without agent complexity
+- **Daemon Development**: Test terminal management and IPC without AI processes
+- **Debugging**: Isolate Tauri/tmux issues from agent behavior
+
+**How to Enable**:
+
+Edit `.loom/config.json` (or `defaults/config.json` for new workspaces):
+
+```json
+{
+  "offlineMode": true,
+  "terminals": [...]
+}
+```
+
+**What Changes in Offline Mode**:
+
+1. **No Agent Launches**: `launchAgentsForTerminals()` skips all AI agent launches
+2. **Status Echoes**: Terminals receive periodic status messages every 30 seconds:
+   ```
+   ✓ Status echo - still alive - 2025-10-20T12:34:56.789Z
+   ```
+3. **UI Indicator**: Header shows "⚠️ OFFLINE MODE" badge (yellow styling, dark mode compatible)
+4. **Terminals Still Created**: All terminals are created normally, just not running agents
+5. **Idle Status**: Terminals remain in idle state (not busy with agent processes)
+
+**Use Cases**:
+
+```bash
+# Scenario 1: Developing Loom UI features
+# Enable offline mode to avoid agent restart loops
+echo '{"offlineMode": true, "terminals": [...]}' > .loom/config.json
+pnpm app:preview
+
+# Scenario 2: Testing daemon terminal management
+# Verify terminals respond without AI agent complexity
+pnpm daemon:dev
+# In another terminal: run Loom with offline mode enabled
+
+# Scenario 3: Debugging tmux integration
+# Isolate tmux session issues from agent behavior
+# Enable offline mode, observe status echoes in terminals
+```
+
+**Implementation Details**:
+
+- **Config Field**: `offlineMode?: boolean` in `LoomConfig` interface (src/lib/config.ts:24)
+- **Agent Launch Guard**: `launchAgentsForTerminals()` checks config and returns early (src/lib/terminal-lifecycle.ts:50-72)
+- **Offline Scheduler**: `startOfflineScheduler()` sends periodic echoes (src/lib/offline-scheduler.ts)
+- **UI Indicator**: `renderHeader()` displays badge when enabled (src/lib/ui.ts:44-49)
+- **State Management**: `AppState.offlineMode` stores flag (src/lib/state.ts:138)
+
+**Status Echo Format**:
+
+Echoes use ANSI color codes for visibility:
+- Green checkmark: `\033[32m✓ Status echo - still alive\033[0m`
+- Cyan timestamp: `\033[36m${timestamp}\033[0m`
+
+**Stopping the Scheduler**:
+
+The offline scheduler automatically stops when the workspace is closed. To manually stop:
+
+```typescript
+import { stopOfflineScheduler } from "./offline-scheduler";
+stopOfflineScheduler();
+```
+
+**Comparison: Normal Mode vs Offline Mode**:
+
+| Aspect | Normal Mode | Offline Mode |
+|--------|-------------|--------------|
+| Agent Launch | ✅ Launches AI agents | ❌ Skips agent launches |
+| Terminal Creation | ✅ Creates all terminals | ✅ Creates all terminals |
+| Status Echoes | ❌ No echoes | ✅ Every 30 seconds |
+| UI Indicator | None | "⚠️ OFFLINE MODE" badge |
+| Use Case | Production development | UI/daemon development |
 
 ## Development Workflow
 
@@ -188,9 +281,13 @@ pnpm app:preview       # Rebuild and launch (recommended)
 ### Git Worktree Helper
 
 ```bash
-pnpm worktree 42              # Create worktree for issue #42
-pnpm worktree --check         # Check current worktree status
-pnpm worktree --help          # Show help
+# Portable version (works in any loom-initialized repo)
+./.loom/scripts/worktree.sh 42       # Create worktree for issue #42
+./.loom/scripts/worktree.sh --check  # Check current worktree status
+./.loom/scripts/worktree.sh --help   # Show help
+
+# Shorthand (only works in loom repo itself)
+pnpm worktree 42                     # Alias for the script above
 ```
 
 ### GitHub CLI
@@ -200,6 +297,169 @@ gh issue list --label="loom:ready"     # Find ready issues
 gh pr list --label="loom:approved"     # Find approved PRs
 gh pr review 123 --approve             # Approve PR
 ```
+
+### Workspace Initialization (Headless Mode)
+
+The `loom-daemon init` command sets up Loom workspaces without requiring the GUI:
+
+```bash
+loom-daemon init                       # Initialize current directory
+loom-daemon init /path/to/repo         # Initialize specific repository
+loom-daemon init --dry-run             # Preview changes without applying
+loom-daemon init --force               # Overwrite existing .loom directory
+loom-daemon init --defaults ./custom   # Use custom defaults directory
+```
+
+**What it does:**
+1. Validates target is a git repository
+2. Copies `.loom/` configuration from `defaults/`
+3. Installs repository scaffolding:
+   - `CLAUDE.md` - AI context documentation
+   - `AGENTS.md` - Agent workflow guide
+   - `.claude/` - Claude Code configuration
+   - `.github/` - GitHub labels and workflows
+4. Updates `.gitignore` with Loom ephemeral patterns
+
+**Use cases:**
+- **CI/CD Integration**: Initialize Loom in deployment pipelines
+- **Bulk Setup**: Script initialization across multiple repositories
+- **Testing**: Set up test environments with custom defaults
+- **Development**: Reset workspace to factory defaults
+
+**Under the Hood** (Implementation details for implementing init-related features):
+
+The initialization process is implemented in `loom-daemon/src/init.rs`:
+
+```rust
+pub fn initialize_workspace(
+    workspace_path: &str,
+    defaults_path: &str,
+    force: bool,
+) -> Result<(), String>
+```
+
+**Key implementation details:**
+- **Defaults Resolution**: Tries multiple paths (dev, git root, bundled resources)
+- **Idempotent**: Only creates files that don't exist (unless `--force`)
+- **Scaffolding**: Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, .github/
+- **Gitignore Updates**: Merges ephemeral patterns without duplicates
+- **Validation**: Ensures target is a git repository before proceeding
+
+**Testing initialization changes:**
+```bash
+# Test with dry run
+loom-daemon init --dry-run
+
+# Test with custom defaults
+mkdir test-defaults
+cp -r defaults/* test-defaults/
+# Modify test-defaults...
+loom-daemon init --force --defaults ./test-defaults /tmp/test-repo
+
+# Verify scaffolding
+ls -la /tmp/test-repo/.loom
+diff defaults/config.json /tmp/test-repo/.loom/config.json
+```
+
+**Common errors and recovery:**
+- "Not a git repository": Target lacks `.git` directory - run `git init` first
+- ".loom already exists": Use `--force` to overwrite or remove manually
+- "Permission denied": Check directory ownership and permissions
+- "Defaults not found": Specify path explicitly with `--defaults`
+
+**See complete documentation:**
+- [Getting Started Guide](docs/guides/getting-started.md) - Installation walkthrough
+- [CLI Reference](docs/guides/cli-reference.md) - Full command syntax and flags
+- [CI/CD Setup](docs/guides/ci-cd-setup.md) - Pipeline integration examples
+
+### Enhanced Loom Installation Workflow (Issue #442)
+
+For a streamlined installation experience with GitHub integration, use the automated installation workflow:
+
+```bash
+# From Loom repository
+cd /path/to/loom
+./scripts/install-loom.sh /path/to/target-repo
+```
+
+**What it does:**
+1. Creates GitHub tracking issue in target repository
+2. Creates installation worktree at `.loom/worktrees/issue-{NUMBER}`
+3. Runs `loom-daemon init` to install Loom files
+4. Syncs GitHub labels from `.github/labels.yml`
+5. Creates pull request that closes the tracking issue
+
+**Installation Components:**
+
+The installation includes:
+- **Modular Scripts** (`scripts/install/`):
+  - `validate-target.sh` - Validates prerequisites (git repo, gh CLI)
+  - `create-issue.sh` - Creates tracking issue with Loom version info
+  - `create-worktree.sh` - Creates git worktree for installation
+  - `sync-labels.sh` - Syncs GitHub workflow labels
+  - `create-pr.sh` - Commits changes and creates PR
+- **Slash Command** (`.claude/commands/install-loom.md`):
+  - Orchestrates the installation process
+  - Provides detailed error handling and recovery
+  - Launched automatically by `install-loom.sh`
+- **Documentation Templates** (`defaults/.loom/`):
+  - `CLAUDE.md` - Repository-specific usage guide
+  - `AGENTS.md` - Agent workflow documentation
+- **GitHub Labels** (`defaults/.github/labels.yml`):
+  - Canonical Loom workflow labels
+  - Synced via `gh label sync`
+
+**Workflow:**
+1. User runs `./scripts/install-loom.sh /target/repo`
+2. Script extracts Loom version and commit
+3. Launches Claude Code with `/install-loom` command
+4. Agent orchestrates all installation steps
+5. Creates PR for human review and merge
+
+**Benefits:**
+- **Trackable**: GitHub issue documents the installation
+- **Reviewable**: PR allows team review before merge
+- **Automated**: Minimal manual steps required
+- **Version-Stamped**: Documentation includes Loom version info
+
+**See also:**
+- `scripts/install-loom.sh` - Main entry point
+- `defaults/.claude/commands/install-loom.md` - Orchestration guide
+- `defaults/.loom/CLAUDE.md` - Target repo documentation template
+
+## Testing Strategy
+
+Loom uses a hybrid testing approach combining unit tests, integration tests, and manual E2E validation.
+
+### Test Stack
+
+- **Frontend**: Vitest with `@tauri-apps/api/mocks`
+- **Backend**: Rust integration tests with tmux
+- **Coverage**: 80% threshold (lines, functions, branches, statements)
+
+### Running Tests
+
+```bash
+pnpm test:unit              # Run all frontend unit tests
+pnpm test:unit:coverage     # With coverage report
+pnpm daemon:test            # Run daemon integration tests
+pnpm check:ci               # Full CI suite (REQUIRED before PR)
+```
+
+### What We Test
+
+- **Unit Tests**: State management, UI rendering, utility functions, IPC patterns (mocked)
+- **Integration Tests**: Daemon protocol, terminal lifecycle, security validation
+- **Manual E2E**: Full workflows (workspace start, agent launch, factory reset)
+
+### Key Features
+
+1. **Tauri Mocks**: Global WebCrypto polyfill + IPC mocks configured in `src/test/setup.ts`
+2. **UI Rendering Tests**: Comprehensive tests for all rendering functions with XSS protection
+3. **Fast Feedback**: ~20 seconds for 500+ frontend tests
+4. **Hybrid Strategy**: Why no automated E2E? See [Testing Guide](docs/testing/README.md) for full rationale
+
+**📖 Complete Guide**: [docs/testing/README.md](docs/testing/README.md)
 
 ## MCP Testing & Debugging
 
@@ -234,6 +494,10 @@ logger.error("Failed to load", error, { workspacePath });
 - Daemon: `~/.loom/daemon.log`
 - Terminals: `/tmp/loom-terminal-{id}.out`
 
+**Log rotation**: Automatic rotation when files exceed 10MB (keeps last 10 files: `*.log.1` through `*.log.10`)
+
+**See full documentation**: [docs/guides/common-tasks.md#structured-logging](docs/guides/common-tasks.md#structured-logging) for conventions, querying, and migration guide
+
 ## Critical AI Agent Requirements
 
 ### Pre-PR Checklist (MANDATORY)
@@ -264,10 +528,10 @@ This runs:
 
 ### Worktree Best Practices
 
-- **Always** use `pnpm worktree <issue>`, never `git worktree` directly
+- **Always** use `./.loom/scripts/worktree.sh <issue>` (or `pnpm worktree` in loom), never `git worktree` directly
 - Agents start in **main workspace**, create worktrees on-demand
 - Worktrees named by issue: `.loom/worktrees/issue-42`
-- Check status: `pnpm worktree --check`
+- Check status: `./.loom/scripts/worktree.sh --check`
 
 ## Resources
 
@@ -287,7 +551,13 @@ This runs:
 
 ## Project Philosophy
 
-Loom embraces archetypal roles (Builder, Judge, Curator, Architect, Hermit, Healer, Guide, Driver) that work in harmony through label-based coordination. Each role embodies a universal pattern from Tarot's Major Arcana, with specific purposes and rhythms. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the complete philosophical framework.
+Loom is built on three philosophical pillars:
+
+1. **[Agent Archetypes](docs/philosophy/agent-archetypes.md)** - Each role (Builder, Judge, Curator, Architect, Hermit, Healer, Guide, Driver) embodies a universal pattern from Tarot's Major Arcana, working in harmony through label-based coordination.
+
+2. **[Working with AI](docs/philosophy/working-with-ai.md)** - Insights from building Loom: the shift from writing code to specifying intent, creating machine-readable debugging surfaces, and the evolution of the programmer's craft.
+
+3. **[Loom Intelligence](docs/philosophy/loom-intelligence.md)** - The vision for Loom as a learning system that gets smarter over time, analyzing agent activity to answer strategic questions about effectiveness, cost, and patterns.
 
 ## Maintaining Documentation
 

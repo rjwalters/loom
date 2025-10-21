@@ -144,6 +144,7 @@ export interface Terminal {
  * - Terminal display order
  * - Workspace path validation
  * - Application initialization state
+ * - Automatic state persistence with debouncing
  *
  * All state mutations automatically notify registered listeners via the onChange() callback system.
  */
@@ -157,6 +158,9 @@ export class AppState {
   private nextTerminalNumber: number = 1; // Counter for terminal numbering (always increments)
   private isResettingWorkspace: boolean = false; // Loading state during factory reset
   private isInitializing: boolean = false; // Loading state during app startup
+  private autoSaveTimer: ReturnType<typeof setTimeout> | null = null; // Timer for debounced auto-save
+  private autoSaveCallback: (() => Promise<void>) | null = null; // Callback for auto-saving state
+  private offlineMode: boolean = false; // Offline mode flag - when true, skips AI agent launches
 
   /**
    * Adds a new terminal to the application state.
@@ -557,6 +561,25 @@ export class AppState {
   }
 
   /**
+   * Sets offline mode flag.
+   *
+   * @param offlineMode - True to enable offline mode (skip AI agent launches), false to disable
+   */
+  setOfflineMode(offlineMode: boolean): void {
+    this.offlineMode = offlineMode;
+    this.notify();
+  }
+
+  /**
+   * Checks if offline mode is enabled.
+   *
+   * @returns True if offline mode is enabled, false otherwise
+   */
+  isOfflineMode(): boolean {
+    return this.offlineMode;
+  }
+
+  /**
    * Gets the next available terminal number and increments the counter.
    * Terminal numbering is monotonic and never reused, even after terminal deletion.
    *
@@ -688,8 +711,67 @@ export class AppState {
     return () => this.listeners.delete(callback);
   }
 
+  /**
+   * Sets the auto-save callback for automatic state persistence.
+   * When set, state will be automatically saved 2 seconds after the last change.
+   * This implements debounced auto-save to prevent excessive file I/O.
+   *
+   * @param callback - Async function that saves the current state
+   *
+   * @example
+   * ```ts
+   * import { saveCurrentConfiguration } from './config';
+   *
+   * appState.setAutoSave(async () => {
+   *   await saveCurrentConfiguration(appState);
+   * });
+   * ```
+   */
+  setAutoSave(callback: () => Promise<void>): void {
+    this.autoSaveCallback = callback;
+  }
+
+  /**
+   * Triggers an immediate save of the current state.
+   * Bypasses the debounce timer and saves state immediately.
+   * Useful for critical operations like app shutdown.
+   *
+   * @returns Promise that resolves when save is complete
+   */
+  async saveNow(): Promise<void> {
+    // Cancel pending debounced save
+    if (this.autoSaveTimer) {
+      clearTimeout(this.autoSaveTimer);
+      this.autoSaveTimer = null;
+    }
+
+    // Execute save immediately if callback is set
+    if (this.autoSaveCallback) {
+      await this.autoSaveCallback();
+    }
+  }
+
   private notify(): void {
+    // Notify UI listeners
     this.listeners.forEach((cb) => cb());
+
+    // Trigger debounced auto-save if enabled
+    if (this.autoSaveCallback) {
+      // Clear existing timer
+      if (this.autoSaveTimer) {
+        clearTimeout(this.autoSaveTimer);
+      }
+
+      // Set new timer for 2 seconds from now
+      this.autoSaveTimer = setTimeout(() => {
+        if (this.autoSaveCallback) {
+          this.autoSaveCallback().catch((error) => {
+            logger.error("Auto-save failed", error as Error);
+          });
+        }
+        this.autoSaveTimer = null;
+      }, 2000);
+    }
   }
 }
 

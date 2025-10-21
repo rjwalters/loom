@@ -58,6 +58,45 @@ initTheme();
 const state = new AppState();
 setAppState(state); // Register singleton so terminal-manager can access it
 
+// Set up auto-save (saves state 2 seconds after last change)
+state.setAutoSave(async () => {
+  if (state.hasWorkspace()) {
+    logger.info("Auto-saving state");
+    await saveCurrentConfiguration(state);
+  }
+});
+logger.info("Auto-save enabled (2-second debounce)");
+
+// Save state immediately on window close (before app quits)
+// Handle both browser beforeunload and Tauri window close events
+window.addEventListener("beforeunload", async () => {
+  if (state.hasWorkspace()) {
+    logger.info("Window closing (beforeunload) - saving state immediately");
+    try {
+      // Save state synchronously if possible
+      await state.saveNow();
+      logger.info("State saved successfully on beforeunload");
+    } catch (error) {
+      logger.error("Failed to save state on beforeunload", error as Error);
+    }
+  }
+});
+
+// Listen for Tauri window close event (more reliable in Tauri apps)
+listen("tauri://close-requested", async () => {
+  logger.info("Window close requested (Tauri event) - saving state");
+  if (state.hasWorkspace()) {
+    try {
+      await state.saveNow();
+      logger.info("State saved successfully on close-requested");
+    } catch (error) {
+      logger.error("Failed to save state on close-requested", error as Error);
+    }
+  }
+}).catch((error) => {
+  logger.error("Failed to register close-requested listener", error as Error);
+});
+
 // Get terminal manager, output poller, and health monitor
 const terminalManager = getTerminalManager();
 const outputPoller = getOutputPoller();
@@ -97,17 +136,11 @@ healthMonitor.onHealthUpdate(() => {
 logger.info("Subscribed to health monitor updates");
 
 // Update timer displays every second
-let renderLoopCount = 0;
 window.setInterval(() => {
   // Re-render to update timer displays without full state change
   // This ensures busy/idle timers update in real-time
   const terminals = state.getTerminals();
   if (terminals.length > 0) {
-    renderLoopCount++;
-    logger.info("Render loop triggered", {
-      renderLoopCount,
-      terminalCount: terminals.length,
-    });
     render();
   }
 }, 1000);
@@ -147,12 +180,13 @@ function render() {
   // Get health data from health monitor
   const systemHealth = healthMonitor.getHealth();
 
-  // Render header with daemon health
+  // Render header with daemon health and offline mode indicator
   renderHeader(
     state.getDisplayedWorkspace(),
     hasWorkspace,
     systemHealth.daemon.connected,
-    systemHealth.daemon.lastPing
+    systemHealth.daemon.lastPing,
+    state.isOfflineMode()
   );
 
   // Show loading state if initializing

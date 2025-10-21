@@ -25,6 +25,57 @@ These files are committed to git to serve as:
 - Documentation of available settings
 - Default values for new workspaces
 
+### CLI Initialization
+
+The `loom-daemon init` command uses this directory to initialize workspaces:
+
+```bash
+# Initialize with default configuration
+loom-daemon init /path/to/repo
+
+# Initialize with custom defaults
+loom-daemon init --defaults /path/to/custom-defaults /path/to/repo
+```
+
+**What happens during initialization:**
+1. Validates target is a git repository
+2. Copies this entire `defaults/` directory to `.loom/`
+3. Copies scaffolding files to workspace root:
+   - `CLAUDE.md` - AI development context
+   - `AGENTS.md` - Agent workflow guide
+   - `.claude/` - Claude Code configuration
+   - `.github/` - GitHub labels and workflows
+4. Updates `.gitignore` with Loom ephemeral patterns
+
+**Default Resolution** (when using `--defaults`):
+1. Development mode: Uses provided path relative to current directory
+2. Git worktree mode: Searches git repository root
+3. Production mode: Uses bundled resources in app bundle
+
+**Custom Organizational Defaults:**
+
+Organizations can maintain their own defaults repository:
+
+```bash
+# 1. Create defaults repository
+mkdir my-org-loom-defaults
+cp -r defaults/* my-org-loom-defaults/
+
+# 2. Customize for your organization
+# - Edit config.json (default terminals)
+# - Modify roles/ (custom role definitions)
+# - Update CLAUDE.md template
+# - Add org-specific workflows
+
+# 3. Use in projects
+loom-daemon init --defaults /path/to/my-org-loom-defaults /path/to/project
+```
+
+**See also:**
+- [Getting Started Guide](../docs/guides/getting-started.md) - Installation walkthrough
+- [CLI Reference](../docs/guides/cli-reference.md) - Complete `loom-daemon init` documentation
+- [CI/CD Setup](../docs/guides/ci-cd-setup.md) - Pipeline integration examples
+
 ### Repository Scaffolding
 During workspace initialization, Loom automatically copies scaffolding files to the workspace root **if they don't already exist**:
 - `CLAUDE.md` → `<workspace>/CLAUDE.md`

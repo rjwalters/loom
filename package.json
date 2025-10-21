@@ -40,6 +40,8 @@
     "check:all": "pnpm lint && pnpm format:rust && pnpm clippy && pnpm check && pnpm build && pnpm test:unit",
     "check:ci": "pnpm lint && pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm build && pnpm test && pnpm test:unit:coverage",
     "worktree": "./scripts/worktree.sh",
+    "clean": "./scripts/cleanup.sh",
+    "clean:full": "./scripts/cleanup.sh && pnpm install",
     "prepare": "husky"
   },
   "repository": {
@@ -63,7 +65,7 @@
   "devDependencies": {
     "@biomejs/biome": "^2.2.6",
     "@tailwindcss/postcss": "^4.1.14",
-    "@tauri-apps/cli": "^1.6.3",
+    "@tauri-apps/cli": "^2.8.4",
     "@vitest/coverage-v8": "^3.2.4",
     "@vitest/ui": "^3.2.4",
     "autoprefixer": "^10.4.21",

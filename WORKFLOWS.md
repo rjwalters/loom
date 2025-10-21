@@ -10,8 +10,8 @@ Loom uses GitHub labels as a coordination protocol. Each agent type has a specif
 
 In Loom, development follows an ancient pattern of archetypal forces working in harmony:
 
-1. 🏛️ **The Architect** envisions → creates proposals (`loom:architect-suggestion`)
-2. 🔍 **The Critic** questions → identifies bloat and simplification opportunities (`loom:critic-suggestion`)
+1. 🏛️ **The Architect** envisions → creates proposals (`loom:architect`)
+2. 🔍 **The Hermit** questions → identifies bloat and simplification opportunities (`loom:hermit`)
 3. 📚 **The Curator** refines → enhances and adds `loom:curated` (human then approves with `loom:issue`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
 5. 🔧 **The Fixer** heals → addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
@@ -22,7 +22,7 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 ### Color-coded Workflow
 
 - 🔵 **Blue** = Human action needed
-  - Issues: `loom:architect-suggestion` (Architect suggestion awaiting approval)
+  - Issues: `loom:architect` (Architect suggestion awaiting approval)
   - PRs: `loom:pr` (Approved PR ready to merge)
 - 🟢 **Green** = Loom bot action needed
   - Issues: `loom:curated` (Curator enhanced), `loom:issue` (human approved)
@@ -39,8 +39,8 @@ See [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFLOW.md) for detailed label st
 ## Complete Feature Flow
 
 ```
-ARCHITECT creates proposal (🔵 loom:architect-suggestion)
-         ↓ (human removes loom:architect-suggestion to approve)
+ARCHITECT creates proposal (🔵 loom:architect)
+         ↓ (human removes loom:architect to approve)
 CURATOR enhances issue (🟢 loom:curated)
          ↓ (human adds loom:issue to approve for work)
 WORKER implements (🟡 loom:in-progress → 🟢 loom:review-requested PR)
@@ -96,8 +96,8 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 | Agent | Interval | Autonomous | Watches For | Creates |
 |-------|----------|-----------|-------------|---------|
-| **Architect** | 15 min | Yes | N/A (scans codebase) | `loom:architect-suggestion` (blue) |
-| **Critic** | 15 min | Yes | N/A (scans code/issues) | `loom:critic-suggestion` (blue) |
+| **Architect** | 15 min | Yes | N/A (scans codebase) | `loom:architect` (blue) |
+| **Hermit** | 15 min | Yes | N/A (scans code/issues) | `loom:hermit` (blue) |
 | **Curator** | 5 min | Yes | Approved issues (no suggestion labels) | `loom:curated` (green) |
 | **Triage** | 15 min | Yes | `loom:issue` | `loom:urgent` (red) |
 | **Worker** | Manual | No | `loom:issue` | `loom:in-progress`, `loom:review-requested` |
@@ -108,9 +108,9 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 ### Quick Role Descriptions
 
-**Architect**: Scans codebase for improvements across all domains (architecture, code quality, docs, tests, CI, performance). Creates comprehensive proposals with `loom:architect-suggestion` label.
+**Architect**: Scans codebase for improvements across all domains (architecture, code quality, docs, tests, CI, performance). Creates comprehensive proposals with `loom:architect` label.
 
-**Critic**: Identifies bloat, unused code, over-engineering. Creates removal proposals or adds simplification comments to existing issues.
+**Hermit**: Identifies bloat, unused code, over-engineering. Creates removal proposals or adds simplification comments to existing issues.
 
 **Curator**: Enhances approved issues with implementation details, test plans, multiple options. Adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
 
@@ -132,7 +132,7 @@ gh issue list --label="loom:issue"
 gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
 
 # Create worktree and implement
-pnpm worktree 42
+./.loom/scripts/worktree.sh 42  # or: pnpm worktree 42 (in loom repo)
 cd .loom/worktrees/issue-42
 # ... implement ...
 pnpm check:ci
@@ -180,7 +180,7 @@ gh pr edit 50 --remove-label "loom:changes-requested" --add-label "loom:review-r
 ```bash
 # Find approved issues (no suggestion labels, not loom:issue/in-progress)
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect-suggestion", "loom:critic-suggestion", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 
 # Enhance and mark as curated
 gh issue edit 42 --add-label "loom:curated"
@@ -190,9 +190,9 @@ gh issue edit 42 --add-label "loom:curated"
 
 ```bash
 # Review proposals
-gh issue list --label="loom:architect-suggestion"
-gh issue edit 42 --remove-label "loom:architect-suggestion"  # Approve
-gh issue close 42 --comment "Not needed"                      # Reject
+gh issue list --label="loom:architect"
+gh issue edit 42 --remove-label "loom:architect"  # Approve
+gh issue close 42 --comment "Not needed"           # Reject
 
 # Approve curated issues for work
 gh issue list --label="loom:curated"
@@ -209,8 +209,8 @@ gh pr merge 50
 
 | Label | Color | Set By | Meaning |
 |-------|-------|--------|---------|
-| `loom:architect-suggestion` | 🔵 Blue | Architect | Architect suggestion awaiting human approval |
-| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification awaiting human approval |
+| `loom:architect` | 🔵 Blue | Architect | Architect suggestion awaiting human approval |
+| `loom:hermit` | 🔵 Blue | Hermit | Removal/simplification awaiting human approval |
 | `loom:curated` | 🟢 Green | Curator | Curator enhanced, awaiting human approval for work |
 | `loom:issue` | 🟢 Green | Human | Human approved, ready for Worker to implement |
 | `loom:in-progress` | 🟡 Amber | Worker | Worker actively implementing |
@@ -245,7 +245,7 @@ Users can override these in the Terminal Settings modal.
 
 ### For Users
 1. Review suggestions promptly (blue labels need approval)
-2. Remove `loom:architect-suggestion` to approve, or close to reject
+2. Remove `loom:architect` to approve, or close to reject
 3. Add `loom:issue` to curated issues to approve for work
 4. Merge `loom:pr` PRs after final review
 

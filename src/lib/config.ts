@@ -6,6 +6,14 @@ import { TerminalStatus } from "./state";
 const logger = Logger.forComponent("config");
 
 /**
+ * State validation options
+ */
+interface StateValidationOptions {
+  /** Maximum age in milliseconds for input requests (default: 1 hour) */
+  maxInputRequestAge?: number;
+}
+
+/**
  * Persistent configuration stored in .loom/config.json (committed to git).
  * Contains team-shareable terminal definitions (roles, themes, intervals).
  * This file should be committed to git so all team members share the same terminal setup.
@@ -32,6 +40,8 @@ export interface TerminalConfig {
 export interface LoomConfig {
   /** Array of terminal configurations */
   terminals: TerminalConfig[];
+  /** Offline mode flag - when true, skips Claude Code agent launch and uses simple status echoes */
+  offlineMode?: boolean;
 }
 
 /**
@@ -108,22 +118,6 @@ let cachedWorkspacePath: string | null = null;
  */
 export function setConfigWorkspace(workspacePath: string): void {
   cachedWorkspacePath = workspacePath;
-}
-
-/**
- * Asserts that workspace is configured before file operations.
- * Internal helper to ensure setConfigWorkspace() was called before file I/O.
- *
- * @returns The configured workspace path
- * @throws {Error} If workspace is not set (setConfigWorkspace() not called)
- */
-function assertWorkspace(): string {
-  if (!cachedWorkspacePath) {
-    throw new Error(
-      "No workspace configured - call setConfigWorkspace() before loading/saving config"
-    );
-  }
-  return cachedWorkspacePath;
 }
 
 /**
@@ -218,7 +212,12 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
  * @throws Never throws - returns empty config on error and logs the error
  */
 export async function loadConfig(): Promise<LoomConfig> {
-  const workspacePath = assertWorkspace();
+  // Return empty config if no workspace is set
+  if (!cachedWorkspacePath) {
+    return { terminals: [] };
+  }
+
+  const workspacePath = cachedWorkspacePath;
 
   try {
     const contents = await invoke<string>("read_config", {
@@ -256,8 +255,13 @@ export async function loadConfig(): Promise<LoomConfig> {
  * @throws Never throws - logs error and continues on failure
  */
 export async function saveConfig(config: LoomConfig): Promise<void> {
+  // Do nothing if no workspace is set
+  if (!cachedWorkspacePath) {
+    return;
+  }
+
   try {
-    const workspacePath = assertWorkspace();
+    const workspacePath = cachedWorkspacePath;
 
     const contents = JSON.stringify(config, null, 2);
     await invoke("write_config", {
@@ -265,7 +269,7 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
       configJson: contents,
     });
   } catch (error) {
-    logger.error("Failed to save config", error as Error, { workspacePath: assertWorkspace() });
+    logger.error("Failed to save config", error as Error, { workspacePath: cachedWorkspacePath });
   }
 }
 
@@ -277,8 +281,16 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
  * @throws Never throws - returns default state on error and logs the error
  */
 export async function loadState(): Promise<LoomState> {
+  // Return default state if no workspace is set
+  if (!cachedWorkspacePath) {
+    return {
+      nextAgentNumber: 1,
+      terminals: [],
+    };
+  }
+
   try {
-    const workspacePath = assertWorkspace();
+    const workspacePath = cachedWorkspacePath;
 
     const contents = await invoke<string>("read_state", {
       workspacePath,
@@ -286,7 +298,7 @@ export async function loadState(): Promise<LoomState> {
 
     return JSON.parse(contents) as LoomState;
   } catch (error) {
-    logger.error("Failed to load state", error as Error, { workspacePath: assertWorkspace() });
+    logger.error("Failed to load state", error as Error, { workspacePath: cachedWorkspacePath });
     // Return empty state on error
     return {
       nextAgentNumber: 1,
@@ -305,8 +317,13 @@ export async function loadState(): Promise<LoomState> {
  * @throws Never throws - logs error and continues on failure
  */
 export async function saveState(state: LoomState): Promise<void> {
+  // Do nothing if no workspace is set
+  if (!cachedWorkspacePath) {
+    return;
+  }
+
   try {
-    const workspacePath = assertWorkspace();
+    const workspacePath = cachedWorkspacePath;
 
     // Strip runtime-only flags before persisting
     // missingSession is a runtime status indicator that should be re-evaluated on startup
@@ -333,7 +350,7 @@ export async function saveState(state: LoomState): Promise<void> {
       stateJson: contents,
     });
   } catch (error) {
-    logger.error("Failed to save state", error as Error, { workspacePath: assertWorkspace() });
+    logger.error("Failed to save state", error as Error, { workspacePath: cachedWorkspacePath });
   }
 }
 
@@ -458,18 +475,20 @@ export async function saveCurrentConfiguration(state: AppState): Promise<void> {
  * This provides backward compatibility for existing code that expects the
  * { nextAgentNumber, agents } structure instead of separate config/state.
  *
- * @returns Object containing nextAgentNumber counter and merged terminals array (as "agents")
+ * @returns Object containing nextAgentNumber counter, merged terminals array (as "agents"), and offline mode flag
  *
  * @example
  * ```ts
- * const { nextAgentNumber, agents } = await loadWorkspaceConfig();
+ * const { nextAgentNumber, agents, offlineMode } = await loadWorkspaceConfig();
  * state.setNextAgentNumber(nextAgentNumber);
  * state.loadAgents(agents);
+ * state.setOfflineMode(offlineMode);
  * ```
  */
 export async function loadWorkspaceConfig(): Promise<{
   nextAgentNumber: number;
   agents: Terminal[];
+  offlineMode: boolean;
 }> {
   const config = await loadConfig();
   const state = await loadState();
@@ -478,5 +497,150 @@ export async function loadWorkspaceConfig(): Promise<{
   return {
     nextAgentNumber: merged.nextAgentNumber,
     agents: merged.terminals,
+    offlineMode: config.offlineMode || false,
   };
+}
+
+/**
+ * Check if a process ID is still alive.
+ * Uses the approach of sending signal 0, which doesn't actually send a signal
+ * but checks if the process exists.
+ *
+ * @param pid - Process ID to check
+ * @returns True if the process is alive, false otherwise
+ */
+async function isProcessAlive(pid: number): Promise<boolean> {
+  try {
+    // Use 'kill -0' which checks if process exists without sending a signal
+    const result = await invoke<boolean>("check_process_alive", { pid });
+    return result;
+  } catch {
+    // If the command fails, assume process is dead
+    return false;
+  }
+}
+
+/**
+ * Check if a file or directory path exists.
+ *
+ * @param path - Path to check
+ * @returns True if the path exists, false otherwise
+ */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await invoke("check_path_exists", { path });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Validates and cleans up terminal state.
+ * Performs the following checks and cleanup:
+ * 1. Verifies agent PIDs are still alive
+ * 2. Checks worktree paths still exist
+ * 3. Removes stale input requests (older than threshold)
+ *
+ * @param terminals - Array of terminals to validate
+ * @param options - Validation options (maxInputRequestAge, etc.)
+ * @returns Validated and cleaned terminals array
+ *
+ * @example
+ * ```ts
+ * const config = await loadConfig();
+ * const state = await loadState();
+ * const { terminals } = mergeConfigAndState(config, state);
+ *
+ * // Validate and clean up state
+ * const validatedTerminals = await validateTerminalState(terminals);
+ *
+ * // Save cleaned state
+ * await saveState({
+ *   nextAgentNumber: state.nextAgentNumber,
+ *   terminals: validatedTerminals.map(t => ({ ...t }))
+ * });
+ * ```
+ */
+export async function validateTerminalState(
+  terminals: Terminal[],
+  options: StateValidationOptions = {}
+): Promise<Terminal[]> {
+  const { maxInputRequestAge = 60 * 60 * 1000 } = options; // Default: 1 hour
+  const now = Date.now();
+
+  logger.info("Validating terminal state", {
+    terminalCount: terminals.length,
+    maxInputRequestAge,
+  });
+
+  const validated = await Promise.all(
+    terminals.map(async (terminal) => {
+      const updates: Partial<Terminal> = {};
+      let needsUpdate = false;
+
+      // 1. Check if agent PID is still alive
+      if (terminal.agentPid) {
+        const isAlive = await isProcessAlive(terminal.agentPid);
+        if (!isAlive) {
+          logger.warn("Agent process no longer alive, clearing PID", {
+            terminalId: terminal.id,
+            terminalName: terminal.name,
+            agentPid: terminal.agentPid,
+          });
+          updates.agentPid = undefined;
+          updates.agentStatus = undefined;
+          needsUpdate = true;
+        }
+      }
+
+      // 2. Check if worktree path still exists
+      if (terminal.worktreePath) {
+        const exists = await pathExists(terminal.worktreePath);
+        if (!exists) {
+          logger.warn("Worktree path no longer exists, clearing", {
+            terminalId: terminal.id,
+            terminalName: terminal.name,
+            worktreePath: terminal.worktreePath,
+          });
+          updates.worktreePath = undefined;
+          needsUpdate = true;
+        }
+      }
+
+      // 3. Remove stale input requests
+      if (terminal.pendingInputRequests && terminal.pendingInputRequests.length > 0) {
+        const freshRequests = terminal.pendingInputRequests.filter((req) => {
+          const age = now - req.timestamp;
+          const isStale = age > maxInputRequestAge;
+          if (isStale) {
+            logger.warn("Removing stale input request", {
+              terminalId: terminal.id,
+              terminalName: terminal.name,
+              requestId: req.id,
+              ageMs: age,
+            });
+          }
+          return !isStale;
+        });
+
+        if (freshRequests.length !== terminal.pendingInputRequests.length) {
+          updates.pendingInputRequests = freshRequests;
+          needsUpdate = true;
+        }
+      }
+
+      // Return updated terminal if needed, otherwise return original
+      if (needsUpdate) {
+        return { ...terminal, ...updates };
+      }
+      return terminal;
+    })
+  );
+
+  logger.info("Terminal state validation complete", {
+    terminalCount: validated.length,
+  });
+
+  return validated;
 }

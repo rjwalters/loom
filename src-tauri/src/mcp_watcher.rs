@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::mpsc::channel;
 use std::time::Duration;
-use tauri::Window;
+use tauri::{Emitter, WebviewWindow};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct MCPCommand {
@@ -14,7 +14,7 @@ struct MCPCommand {
 }
 
 /// Start watching for MCP commands in ~/.loom/mcp-command.json using filesystem events
-pub fn start_mcp_watcher(window: Window) {
+pub fn start_mcp_watcher(window: WebviewWindow) {
     // Spawn a background thread for the file watcher
     std::thread::spawn(move || {
         let command_file = get_command_file_path();
@@ -95,7 +95,7 @@ fn event_matches_command_file(event: &Event, command_file: &PathBuf) -> bool {
 }
 
 /// Process the MCP command file
-fn process_command_file(window: &Window, command_file: &PathBuf) {
+fn process_command_file(window: &WebviewWindow, command_file: &PathBuf) {
     // Check if command file exists
     if !command_file.exists() {
         return;
@@ -187,7 +187,7 @@ fn process_command_file(window: &Window, command_file: &PathBuf) {
 }
 
 /// Fallback to polling if notify fails to initialize
-fn fallback_polling_watcher(window: &Window) {
+fn fallback_polling_watcher(window: &WebviewWindow) {
     use std::time::SystemTime;
 
     let mut last_processed: Option<SystemTime> = None;

@@ -1,80 +1,51 @@
 {
-  "$schema": "../node_modules/@tauri-apps/cli/schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Loom",
+  "version": "0.1.0",
+  "identifier": "com.github.rjwalters.loom",
   "build": {
     "beforeBuildCommand": "pnpm build",
     "beforeDevCommand": "pnpm dev",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist"
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
   },
-  "package": {
-    "productName": "Loom",
-    "version": "0.1.0"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "dialog": {
-        "all": false,
-        "open": true,
-        "message": true,
-        "ask": true
-      },
-      "path": {
-        "all": true
-      },
-      "fs": {
-        "all": true
-      }
+  "bundle": {
+    "active": true,
+    "category": "DeveloperTool",
+    "copyright": "",
+    "externalBin": ["../target/release/loom-daemon"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "longDescription": "",
+    "macOS": {
+      "entitlements": null,
+      "exceptionDomain": "",
+      "frameworks": [],
+      "providerShortName": null,
+      "signingIdentity": null
     },
-    "cli": {
-      "description": "Loom - AI-powered development orchestration",
-      "args": [
-        {
-          "name": "workspace",
-          "short": "w",
-          "takesValue": true,
-          "description": "Path to git repository workspace"
-        }
-      ]
-    },
-    "bundle": {
-      "active": true,
-      "category": "DeveloperTool",
-      "copyright": "",
+    "resources": ["../defaults"],
+    "shortDescription": "",
+    "targets": "all",
+    "linux": {
       "deb": {
         "depends": []
-      },
-      "externalBin": ["../target/release/loom-daemon"],
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ],
-      "identifier": "com.github.rjwalters.loom",
-      "longDescription": "",
-      "macOS": {
-        "entitlements": null,
-        "exceptionDomain": "",
-        "frameworks": [],
-        "providerShortName": null,
-        "signingIdentity": null
-      },
-      "resources": ["../defaults"],
-      "shortDescription": "",
-      "targets": "all",
-      "windows": {
-        "certificateThumbprint": null,
-        "digestAlgorithm": "sha256",
-        "timestampUrl": ""
       }
     },
+    "windows": {
+      "certificateThumbprint": null,
+      "digestAlgorithm": "sha256",
+      "timestampUrl": ""
+    }
+  },
+  "app": {
     "security": {
       "csp": null
-    },
-    "updater": {
-      "active": false
     },
     "windows": [
       {
@@ -87,5 +58,18 @@
         "fullscreen": false
       }
     ]
+  },
+  "plugins": {
+    "cli": {
+      "description": "Loom - AI-powered development orchestration",
+      "args": [
+        {
+          "name": "workspace",
+          "short": "w",
+          "takesValue": true,
+          "description": "Path to git repository workspace"
+        }
+      ]
+    }
   }
 }

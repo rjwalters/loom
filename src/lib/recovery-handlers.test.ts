@@ -68,7 +68,7 @@ describe("recovery-handlers", () => {
       });
 
       expect(state.getTerminal("term-new")).toBeDefined();
-      expect(state.getTerminal("term-old")).toBeUndefined();
+      expect(state.getTerminal("term-old")).toBeNull();
       expect(state.getPrimary()?.id).toBe("term-new");
       expect(mockSaveCurrentConfig).toHaveBeenCalled();
     });

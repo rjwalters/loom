@@ -91,8 +91,8 @@ Loom uses GitHub labels to coordinate work between different agent roles:
 
 | Label | Color | Created By | Meaning |
 |-------|-------|-----------|---------|
-| `loom:architect-suggestion` | 🔵 Blue | Architect | Suggestion awaiting approval |
-| `loom:critic-suggestion` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
+| `loom:architect` | 🔵 Blue | Architect | Suggestion awaiting approval |
+| `loom:hermit` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
 | `loom:curated` | 🟠 Orange | Curator | Enhanced, awaiting human approval |
 | `loom:issue` | 🟢 Green | Human | Approved for Worker to implement |
 | `loom:in-progress` | 🟡 Amber | Worker | Being implemented |
@@ -113,10 +113,10 @@ For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 ## 🧵 Example Workflow
 
-1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an issue with `loom:architect-suggestion` label:
+1. **Architect Bot** (autonomous, runs every 15 minutes) scans the codebase and creates an issue with `loom:architect` label:
    > "Add search functionality to terminal history"
 
-2. **You** review the proposal. Remove `loom:architect-suggestion` to approve it for curation (or close the issue to reject).
+2. **You** review the proposal. Remove `loom:architect` to approve it for curation (or close the issue to reject).
 
 3. **Curator Bot** (autonomous, runs every 5 minutes) finds the approved issue, adds implementation details, test plans, and code references. Marks it as `loom:curated`.
 
@@ -180,7 +180,101 @@ GitHub shows the whole lifecycle — Loom orchestrates it through labels and aut
 
 ---
 
+## 📋 Prerequisites
+
+Before installing Loom, ensure you have these tools installed:
+
+### Required Tools
+
+1. **Rust** (for Tauri backend compilation)
+   ```bash
+   # Install Rust via rustup (recommended)
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+   # Verify installation
+   rustc --version
+   cargo --version
+   ```
+
+   **Alternative:** Download from https://www.rust-lang.org/tools/install
+
+2. **System Dependencies** (for Tauri)
+
+   **macOS:**
+   ```bash
+   xcode-select --install
+   ```
+
+   **Linux (Ubuntu/Debian):**
+   ```bash
+   sudo apt update
+   sudo apt install libwebkit2gtk-4.0-dev \
+     build-essential \
+     curl \
+     wget \
+     file \
+     libssl-dev \
+     libgtk-3-dev \
+     libayatana-appindicator3-dev \
+     librsvg2-dev
+   ```
+
+   See [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/) for other platforms.
+
+3. **Node.js** (v18 or later)
+   ```bash
+   # Install via nvm (recommended)
+   nvm install 18
+
+   # Verify installation
+   node --version  # Should be v18+
+   ```
+
+4. **pnpm** (package manager)
+   ```bash
+   npm install -g pnpm
+
+   # Verify installation
+   pnpm --version
+   ```
+
+5. **GitHub CLI** (optional, for agent workflows)
+   ```bash
+   # macOS
+   brew install gh
+
+   # Linux
+   # See https://cli.github.com/ for installation instructions
+
+   # Authenticate
+   gh auth login
+   ```
+
+### Verify Your Setup
+
+Run these commands to verify all prerequisites are installed:
+
+```bash
+# Check Rust
+rustc --version && cargo --version
+
+# Check Node.js
+node --version
+
+# Check pnpm
+pnpm --version
+
+# Check GitHub CLI (optional)
+gh --version
+```
+
+If all commands succeed, you're ready to proceed!
+
+---
+
 ## ⚙️ Development Setup
+
+**Prerequisites:** Ensure you've completed the [Prerequisites](#-prerequisites) section above.
 
 ```bash
 # Clone the repository
@@ -190,11 +284,47 @@ cd loom
 # Install dependencies
 pnpm install
 
+# Build daemon (first time only)
+pnpm daemon:build
+
 # Start development environment (daemon + GUI)
 pnpm run app:dev
 ```
 
 **For detailed development workflows, troubleshooting, and advanced usage, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
+
+### Common Installation Issues
+
+**Error: `cargo: command not found`**
+- **Cause:** Rust is not installed
+- **Solution:** Install Rust following the [Prerequisites](#-prerequisites) section
+
+**Error: `failed to run 'cargo metadata'`**
+- **Cause:** Rust is not in PATH after installation
+- **Solution:** Restart your terminal or run `source $HOME/.cargo/env`
+
+**Error: Package dependencies failed**
+- **Cause:** System libraries missing (Linux)
+- **Solution:** Install Tauri system dependencies for your platform
+
+**Error: `pnpm: command not found`**
+- **Cause:** pnpm is not installed
+- **Solution:** Run `npm install -g pnpm`
+
+---
+
+## 🚀 Getting Started
+
+### New to Loom? Start Here
+
+**[📖 Quickstart Tutorial](docs/guides/quickstart-tutorial.md)** - **10-15 minute walkthrough** of your first complete workflow in Manual Orchestration Mode (MOM). Learn by doing:
+
+- ✅ Create and curate an issue
+- ✅ Implement a feature with worktrees
+- ✅ Create and review a pull request
+- ✅ Understand the complete label workflow
+
+**Perfect for:** First-time users who want to understand how Loom coordinates AI agents through GitHub.
 
 ### Additional Development Resources
 - [DEV_WORKFLOW.md](DEV_WORKFLOW.md) - Detailed development workflow with hot reload
@@ -202,7 +332,9 @@ pnpm run app:dev
 - [WORKFLOWS.md](WORKFLOWS.md) - Agent coordination via GitHub labels
 - [scripts/README.md](scripts/README.md) - Daemon management scripts
 
-### CLI Usage
+---
+
+## 🖥️ CLI Usage
 
 #### Workspace Initialization (Headless Mode)
 
@@ -239,6 +371,21 @@ loom-daemon init --defaults ./custom-defaults
 - **CI/CD Pipelines**: Initialize Loom as part of your build/deploy process
 - **Headless Servers**: Install Loom configuration without GUI dependencies
 - **Bulk Setup**: Script initialization across multiple repositories
+
+**Common Issues**:
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| "Not a git repository" | No `.git` directory found | Run `git init` first or use correct path |
+| ".loom already exists" | Workspace already initialized | Use `--force` to overwrite or skip if already set up |
+| "Permission denied" | Insufficient write permissions | Check directory ownership: `ls -la` |
+| "Defaults directory not found" | Cannot locate defaults | Specify explicitly: `--defaults /path/to/loom/defaults` |
+
+**Comprehensive Documentation**:
+- **[Getting Started Guide](docs/guides/getting-started.md)** - Complete installation walkthrough
+- **[CLI Reference](docs/guides/cli-reference.md)** - Full command documentation with all flags and exit codes
+- **[CI/CD Setup](docs/guides/ci-cd-setup.md)** - Integration examples for GitHub Actions, GitLab CI, Jenkins, and more
+- **[Troubleshooting](docs/guides/troubleshooting.md#initialization-issues)** - Debug initialization failures
 
 #### Launching the GUI
 
@@ -362,7 +509,7 @@ Each terminal can embody one of six archetypal forces (see [Agent Archetypes](do
 
 In Loom's future ecosystem, an **Architecture Bot** will run periodically to scan the codebase, documentation, and open issues to surface structural opportunities — not tasks.
 
-It creates new GitHub issues labelled **`loom:architect-suggestion`**, which might include:
+It creates new GitHub issues labelled **`loom:architect`**, which might include:
 
 - "Refactor terminal session handling into a reusable module"
 - "Extract common code between Claude and GPT workers"
@@ -372,9 +519,9 @@ It creates new GitHub issues labelled **`loom:architect-suggestion`**, which mig
 These issues are **never acted on automatically**.
 
 They are **owned by the human** — the architect who defines the system's intent and approves direction.
-The **`loom:architect-suggestion`** label acts as a *safety interlock*:
+The **`loom:architect`** label acts as a *safety interlock*:
 
-- As long as `loom:architect-suggestion` is present, the Curator Bot will ignore the issue.
+- As long as `loom:architect` is present, the Curator Bot will ignore the issue.
 - Once the human removes the label (confirming it's worth pursuing), the Curator Bot can refine and re-label it as `loom:curated`.
 - The human must then explicitly add `loom:issue` to approve it for implementation, enabling the normal Worker lifecycle.
 

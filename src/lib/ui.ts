@@ -24,7 +24,8 @@ export function renderHeader(
   displayedWorkspacePath: string,
   hasWorkspace: boolean,
   daemonConnected?: boolean,
-  lastPing?: number | null
+  lastPing?: number | null,
+  offlineMode?: boolean
 ): void {
   const container = document.getElementById("workspace-name");
   if (!container) return;
@@ -37,6 +38,14 @@ export function renderHeader(
   } else {
     // Show "Loom" title when no workspace
     headerContent = "Loom";
+  }
+
+  // Add offline mode indicator if enabled
+  if (offlineMode) {
+    headerContent += ` <span class="inline-flex items-center gap-1 ml-2 px-2 py-0.5 rounded-md bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-300 text-xs font-medium border border-yellow-300 dark:border-yellow-700" data-tooltip="Offline Mode: AI agents disabled, using status echoes" data-tooltip-position="bottom">
+      <span class="text-xs">⚠️</span>
+      <span>OFFLINE MODE</span>
+    </span>`;
   }
 
   // Add daemon health indicator if we have that data
