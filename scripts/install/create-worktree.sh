@@ -61,7 +61,7 @@ while true; do
   fi
 
   # Try to create worktree with this branch name
-  if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$CURRENT_BRANCH" 2>/dev/null; then
+  if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$CURRENT_BRANCH" >&2 2>&1; then
     # Success! Branch name is available
     break
   fi
