@@ -66,10 +66,52 @@ done
 # - Create missing labels
 # - Update existing labels with new descriptions/colors
 info "Syncing Loom workflow labels..."
-if gh label sync --file "$LABELS_FILE" --force; then
-  success "GitHub labels synced"
+
+# Parse YAML file and sync labels
+# YAML format: - name: label-name\n  description: desc\n  color: "HEXCODE"
+label_count=0
+while IFS= read -r line; do
+  # Extract label name
+  if [[ "$line" =~ ^-\ name:\ (.+)$ ]]; then
+    name="${BASH_REMATCH[1]}"
+    # Read next two lines for description and color
+    read -r desc_line
+    read -r color_line
+
+    # Extract description and color
+    if [[ "$desc_line" =~ description:\ (.+)$ ]]; then
+      description="${BASH_REMATCH[1]}"
+      # Remove quotes if present
+      description="${description//\"/}"
+    fi
+
+    if [[ "$color_line" =~ color:\ \"?([0-9A-Fa-f]{6})\"?.*$ ]]; then
+      color="${BASH_REMATCH[1]}"
+    fi
+
+    # Try to create or update the label
+    if gh label list --json name --jq '.[].name' | grep -q "^${name}$"; then
+      # Label exists, update it
+      if gh label edit "$name" --description "$description" --color "$color" 2>/dev/null; then
+        info "Updated label: $name"
+      else
+        warning "Failed to update label: $name"
+      fi
+    else
+      # Label doesn't exist, create it
+      if gh label create "$name" --description "$description" --color "$color" 2>/dev/null; then
+        info "Created label: $name"
+      else
+        warning "Failed to create label: $name"
+      fi
+    fi
+
+    ((label_count++))
+  fi
+done < "$LABELS_FILE"
+
+if [ "$label_count" -gt 0 ]; then
+  success "Synced $label_count labels"
 else
-  error "Label sync failed"
-  error "Please sync labels manually: gh label sync --file $LABELS_FILE --force"
-  exit 1
+  warning "No labels found in $LABELS_FILE"
 fi
