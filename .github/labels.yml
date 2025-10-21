@@ -1,6 +1,7 @@
 # Loom Workflow Labels
 # These labels coordinate the Loom AI agent workflow
-# Sync with: gh label sync --file .github/labels.yml
+# Sync with: ./scripts/install/sync-labels.sh . (from workspace root)
+# Or manually: gh label create/edit commands
 
 # Core Workflow States
 - name: loom:issue
