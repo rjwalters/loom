@@ -56,7 +56,9 @@ cleanup_on_error() {
       info "Cleaning up worktree: ${WORKTREE_PATH}..."
       cd "$TARGET_PATH" 2>/dev/null || true
       git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
-      git branch -D "feature/loom-installation" 2>/dev/null || true
+      if [[ -n "${BRANCH_NAME:-}" ]]; then
+        git branch -D "${BRANCH_NAME}" 2>/dev/null || true
+      fi
     fi
 
     echo ""
@@ -164,8 +166,12 @@ if [[ ! -x "$LOOM_ROOT/scripts/install/create-worktree.sh" ]]; then
   error "Installation script not found: create-worktree.sh"
 fi
 
-WORKTREE_PATH=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH" "$ISSUE_NUMBER") || \
+WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH" "$ISSUE_NUMBER") || \
   error "Failed to create worktree"
+
+# Parse output: WORKTREE_PATH|BRANCH_NAME
+WORKTREE_PATH=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f1)
+BRANCH_NAME=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f2)
 
 # Validate worktree path format (should be relative path starting with .loom/worktrees/)
 if [[ ! "$WORKTREE_PATH" =~ ^\.loom/worktrees/ ]]; then
@@ -177,6 +183,7 @@ if [[ ! -d "$TARGET_PATH/$WORKTREE_PATH" ]]; then
 fi
 
 info "Worktree: $WORKTREE_PATH"
+info "Branch: $BRANCH_NAME"
 echo ""
 
 # ============================================================================

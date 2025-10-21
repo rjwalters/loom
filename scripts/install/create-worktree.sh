@@ -35,7 +35,7 @@ cd "$TARGET_PATH"
 mkdir -p .loom/worktrees
 
 WORKTREE_PATH=".loom/worktrees/issue-${ISSUE_NUMBER}"
-BRANCH_NAME="feature/loom-installation"
+BASE_BRANCH_NAME="feature/loom-installation"
 
 info "Creating worktree for issue #${ISSUE_NUMBER}..."
 
@@ -49,17 +49,41 @@ if [[ -d "$WORKTREE_PATH" ]]; then
   git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
 fi
 
-# Clean up any existing local branch
-if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-  info "Removing existing local branch: $BRANCH_NAME"
-  git branch -D "$BRANCH_NAME" 2>/dev/null || true
+# Find an available branch name (handle case where remote branch exists)
+BRANCH_NAME="$BASE_BRANCH_NAME"
+SUFFIX=2
+
+while true; do
+  # Clean up any existing local branch with this name
+  if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+    info "Removing existing local branch: $BRANCH_NAME"
+    git branch -D "$BRANCH_NAME" 2>/dev/null || true
+  fi
+
+  # Try to create worktree with this branch name
+  if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$CURRENT_BRANCH" 2>/dev/null; then
+    # Success! Branch name is available
+    break
+  fi
+
+  # Branch exists (likely remote), try next suffix
+  info "Branch '$BRANCH_NAME' already exists, trying alternative..."
+  BRANCH_NAME="${BASE_BRANCH_NAME}-${SUFFIX}"
+  SUFFIX=$((SUFFIX + 1))
+
+  # Safety limit to prevent infinite loop
+  if [[ $SUFFIX -gt 100 ]]; then
+    error "Could not find available branch name after 100 attempts"
+  fi
+done
+
+if [[ "$BRANCH_NAME" != "$BASE_BRANCH_NAME" ]]; then
+  info "Using alternative branch name: $BRANCH_NAME"
 fi
 
-# Create worktree (will create new local branch from current branch)
-git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$CURRENT_BRANCH" || \
-  error "Failed to create worktree"
-
 success "Worktree created: $WORKTREE_PATH"
+success "Branch name: $BRANCH_NAME"
 
-# Output the worktree path (stdout, so it can be captured by caller)
-echo "$WORKTREE_PATH"
+# Output the worktree path and branch name (stdout, so it can be captured by caller)
+# Format: WORKTREE_PATH|BRANCH_NAME
+echo "${WORKTREE_PATH}|${BRANCH_NAME}"
