@@ -267,8 +267,6 @@ EXPECTED_FILES=(
   ".loom/config.json"
   ".loom/roles"
   ".loom/scripts/worktree.sh"
-  ".loom/scripts/cleanup.sh"
-  ".loom/scripts/cleanup-branches.sh"
   "CLAUDE.md"
   ".github/labels.yml"
 )
