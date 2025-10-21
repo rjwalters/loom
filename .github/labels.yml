@@ -1,0 +1,42 @@
+# Loom Workflow Labels
+# These labels coordinate the Loom AI agent workflow
+# Sync with: gh label sync --file .github/labels.yml
+
+# Core Workflow States
+- name: loom:issue
+  description: Approved for work by human (ready for Builder to claim)
+  color: "3B82F6"  # blue-500
+
+- name: loom:in-progress
+  description: "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback"
+  color: "F59E0B"  # amber-500
+
+- name: loom:review-requested
+  description: PR ready for Judge to review
+  color: "10B981"  # emerald-500
+
+- name: loom:pr
+  description: PR approved by Judge, ready for human to merge
+  color: "3B82F6"  # blue-500
+
+# Agent Proposal Labels
+- name: loom:architect
+  description: Architect proposal awaiting user approval
+  color: "3B82F6"  # blue-500
+
+- name: loom:hermit
+  description: Hermit removal/simplification proposal awaiting user approval
+  color: "3B82F6"  # blue-500
+
+- name: loom:curated
+  description: Enhanced by Curator, awaiting human approval
+  color: "10B981"  # emerald-500
+
+# Status Labels
+- name: loom:blocked
+  description: Implementation blocked, needs help or clarification
+  color: "EF4444"  # red-500
+
+- name: loom:urgent
+  description: Critical/blocking issue requiring immediate attention
+  color: "DC2626"  # red-600

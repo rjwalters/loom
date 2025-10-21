@@ -12,10 +12,12 @@ Each prompt consists of two files:
 
 - **`default.md`** - Plain shell environment, no specialized role
 - **`worker.md`** - General development worker for features, bugs, and refactoring
-- **`issues.md`** - Specialist for creating well-structured GitHub issues
 - **`reviewer.md`** - Code review specialist for thorough PR reviews
 - **`architect.md`** - System architecture and technical decision making
 - **`curator.md`** - Issue maintenance and quality improvement
+- **`critic.md`** - Critical analysis and architectural review specialist
+- **`fixer.md`** - Bug fixing and PR maintenance specialist
+- **`triage.md`** - Issue prioritization and focus management
 
 ## Usage
 
