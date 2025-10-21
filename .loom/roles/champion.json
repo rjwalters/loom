@@ -1,0 +1,8 @@
+{
+  "name": "Champion",
+  "description": "Promotes high-quality curated issues to approved status",
+  "defaultInterval": 600000,
+  "defaultIntervalPrompt": "Check for curated issues ready to promote to approved status",
+  "autonomousRecommended": true,
+  "suggestedWorkerType": "claude"
+}
