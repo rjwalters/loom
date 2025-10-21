@@ -66,22 +66,24 @@ Provides two installation workflows:
 - **Quick Install**: Direct installation via `loom-daemon init`
 - **Full Install**: Creates GitHub issue, worktree, and PR for review
 
-**Cleanup Helper** (`./clean.sh`):
+**Cleanup Helper** (`./clean.sh` in Loom repo, `./.loom/scripts/clean.sh` in target repos):
 ```bash
-# Standard cleanup (safe defaults)
-./clean.sh
-
-# Deep cleanup (includes build artifacts)
-./clean.sh --deep
-
-# Preview what would be cleaned
+# In Loom repository
 ./clean.sh --dry-run
+
+# In target repositories (after installation)
+./.loom/scripts/clean.sh --dry-run
+
+# Options
+--deep       # Include build artifacts (target/, node_modules/)
+--dry-run    # Preview what would be cleaned
 ```
 
 Safely removes:
 - Orphaned worktrees and stale branches
 - Loom tmux sessions
 - Build artifacts (with `--deep`)
+- **Installed automatically** to `.loom/scripts/` in target repositories
 
 ---
 
@@ -98,6 +100,7 @@ Running `loom-daemon init` creates these files in your repository:
 **Configuration (Commit these)**:
 - `.loom/config.json` - Terminal settings and role assignments
 - `.loom/roles/` - Custom agent role definitions (optional)
+- `.loom/scripts/` - Helper scripts (worktree.sh, clean.sh)
 
 **Documentation (Commit these)**:
 - `CLAUDE.md` - AI context document for Claude Code (11KB template)
