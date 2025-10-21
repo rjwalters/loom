@@ -107,7 +107,8 @@ loom/
 │       ├── issues.md        # GitHub issue creation specialist
 │       ├── reviewer.md      # Code review specialist
 │       ├── architect.md     # System architecture and design
-│       └── curator.md       # Issue maintenance and enhancement
+│       ├── curator.md       # Issue maintenance and enhancement
+│       └── champion.md      # Quality champion promoting curated issues
 ├── index.html               # HTML structure (header, primary, mini row)
 ├── tsconfig.json            # TypeScript strict mode config
 ├── tailwind.config.js       # Tailwind with dark mode: 'class'
@@ -388,6 +389,7 @@ Each role consists of two files:
 | **Reviewer** | `reviewer.md` | Yes | 5 min | Code review specialist for thorough PR reviews |
 | **Architect** | `architect.md` | Yes | 15 min | System architecture and technical decision making |
 | **Curator** | `curator.md` | Yes | 5 min | Issue maintenance and quality improvement |
+| **Champion** | `champion.md` | Yes | 10 min | Quality champion promoting curated issues to approved status |
 
 **Autonomous Mode**:
 - When `targetInterval > 0`, the terminal will automatically execute the `intervalPrompt` at regular intervals

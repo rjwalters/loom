@@ -45,7 +45,7 @@ impl Default for TmuxHealthState {
 /// * `interval_secs` - How often to check tmux server health (in seconds)
 ///
 /// # Returns
-/// A tuple of (JoinHandle, Arc<TmuxHealthState>) for monitoring and querying health status
+/// A tuple of (`JoinHandle`, `Arc<TmuxHealthState>`) for monitoring and querying health status
 ///
 /// # Example
 /// ```
@@ -161,41 +161,36 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
 /// Check if health monitoring is enabled and get the interval
 ///
 /// Returns the monitoring interval in seconds:
-/// - If LOOM_TMUX_HEALTH_MONITOR is set to a number > 0, use that interval
-/// - If LOOM_TMUX_HEALTH_MONITOR is set to 0, health monitoring is disabled
-/// - If LOOM_TMUX_HEALTH_MONITOR is not set, default to 60 seconds (enabled by default)
+/// - If `LOOM_TMUX_HEALTH_MONITOR` is set to a number > 0, use that interval
+/// - If `LOOM_TMUX_HEALTH_MONITOR` is set to 0, health monitoring is disabled
+/// - If `LOOM_TMUX_HEALTH_MONITOR` is not set, default to 60 seconds (enabled by default)
 ///
 /// # Returns
 /// `Some(interval_secs)` if enabled, `None` if explicitly disabled
 pub fn check_env_enabled() -> Option<u64> {
-    match std::env::var("LOOM_TMUX_HEALTH_MONITOR") {
-        Ok(val) => {
-            match val.parse::<u64>() {
-                Ok(0) => {
-                    // Explicitly disabled
-                    log::info!(
-                        "tmux health monitoring explicitly disabled via LOOM_TMUX_HEALTH_MONITOR=0"
-                    );
-                    None
-                }
-                Ok(interval) => {
-                    // Custom interval
-                    log::info!("tmux health monitoring enabled with custom interval: {interval}s");
-                    Some(interval)
-                }
-                Err(_) => {
-                    // Invalid value, use default
-                    log::warn!(
-                        "Invalid LOOM_TMUX_HEALTH_MONITOR value: '{val}', using default 60s"
-                    );
-                    Some(60)
-                }
+    if let Ok(val) = std::env::var("LOOM_TMUX_HEALTH_MONITOR") {
+        match val.parse::<u64>() {
+            Ok(0) => {
+                // Explicitly disabled
+                log::info!(
+                    "tmux health monitoring explicitly disabled via LOOM_TMUX_HEALTH_MONITOR=0"
+                );
+                None
+            }
+            Ok(interval) => {
+                // Custom interval
+                log::info!("tmux health monitoring enabled with custom interval: {interval}s");
+                Some(interval)
+            }
+            Err(_) => {
+                // Invalid value, use default
+                log::warn!("Invalid LOOM_TMUX_HEALTH_MONITOR value: '{val}', using default 60s");
+                Some(60)
             }
         }
-        Err(_) => {
-            // Not set, use default (enabled by default)
-            log::info!("tmux health monitoring enabled by default (60s interval)");
-            Some(60)
-        }
+    } else {
+        // Not set, use default (enabled by default)
+        log::info!("tmux health monitoring enabled by default (60s interval)");
+        Some(60)
     }
 }

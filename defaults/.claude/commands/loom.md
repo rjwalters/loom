@@ -12,9 +12,10 @@ Randomly select and assume an archetypal role from the Loom orchestration system
 
 ## Available Roles
 
-- **builder.md** - Claim `loom:ready` issue, implement feature/fix, create PR with `loom:review-requested`
+- **builder.md** - Claim `loom:issue` issue, implement feature/fix, create PR with `loom:review-requested`
 - **judge.md** - Review PR with `loom:review-requested`, approve or request changes, update labels
-- **curator.md** - Find unlabeled issue, enhance with technical details, mark as `loom:ready`
+- **curator.md** - Find unlabeled issue, enhance with technical details, mark as `loom:curated`
+- **champion.md** - Evaluate `loom:curated` issues, promote to `loom:issue` or provide feedback
 - **architect.md** - Create architectural proposal issue with `loom:architect` label
 - **hermit.md** - Analyze codebase complexity, create bloat removal issue with `loom:hermit`
 - **healer.md** - Fix bug or address PR feedback, maintain existing PRs
@@ -27,9 +28,10 @@ Complete **ONE** meaningful task following the selected role's guidelines, then 
 
 ### Task Examples by Role
 
-**Builder**: Claim one `loom:ready` issue → implement → test → commit → create PR
+**Builder**: Claim one `loom:issue` issue → implement → test → commit → create PR
 **Judge**: Review one PR with `loom:review-requested` → provide feedback → approve/request changes
-**Curator**: Find one unlabeled issue → add context → tag as `loom:ready`
+**Curator**: Find one unlabeled issue → add context → tag as `loom:curated`
+**Champion**: Evaluate `loom:curated` issues (max 2) → promote to `loom:issue` or provide feedback
 **Architect**: Identify one architectural need → create detailed proposal issue
 **Hermit**: Analyze codebase section → identify bloat → create removal issue
 **Healer**: Fix one bug or address one PR comment → update PR → push changes
@@ -54,8 +56,8 @@ After completing your iteration, report:
 
 Follow the label-based coordination system (ADR-0006):
 
-- Issues: `loom:ready` → `loom:in-progress` → closed
-- PRs: `loom:review-requested` → `loom:approved` → merged
+- Issues: `loom:curated` → `loom:issue` → `loom:in-progress` → closed
+- PRs: `loom:review-requested` → `loom:pr` → merged
 - Proposals: `loom:architect` → reviewed → implemented or closed
 - Suggestions: `loom:hermit` → reviewed → implemented or closed
 
