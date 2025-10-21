@@ -79,7 +79,9 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                         .collect();
 
                     let session_count = sessions.len() as u64;
-                    health_state_clone.server_alive.store(true, Ordering::Relaxed);
+                    health_state_clone
+                        .server_alive
+                        .store(true, Ordering::Relaxed);
                     health_state_clone
                         .last_session_count
                         .store(session_count, Ordering::Relaxed);
@@ -125,19 +127,29 @@ pub fn start_tmux_health_monitor(interval_secs: u64) -> (JoinHandle<()>, Arc<Tmu
                             log::error!("   3. Restart Loom terminals from the UI");
                         }
 
-                        health_state_clone.last_session_count.store(0, Ordering::Relaxed);
+                        health_state_clone
+                            .last_session_count
+                            .store(0, Ordering::Relaxed);
                     } else if stderr.contains("no sessions") {
-                        health_state_clone.server_alive.store(true, Ordering::Relaxed);
-                        health_state_clone.last_session_count.store(0, Ordering::Relaxed);
+                        health_state_clone
+                            .server_alive
+                            .store(true, Ordering::Relaxed);
+                        health_state_clone
+                            .last_session_count
+                            .store(0, Ordering::Relaxed);
                         log::debug!("tmux server running but no sessions exist");
                     } else {
                         log::error!("🚨 tmux server not responding: {stderr}");
-                        health_state_clone.server_alive.store(false, Ordering::Relaxed);
+                        health_state_clone
+                            .server_alive
+                            .store(false, Ordering::Relaxed);
                     }
                 }
                 Err(e) => {
                     log::error!("Failed to check tmux health: {e}");
-                    health_state_clone.server_alive.store(false, Ordering::Relaxed);
+                    health_state_clone
+                        .server_alive
+                        .store(false, Ordering::Relaxed);
                 }
             }
         }
@@ -161,7 +173,9 @@ pub fn check_env_enabled() -> Option<u64> {
             match val.parse::<u64>() {
                 Ok(0) => {
                     // Explicitly disabled
-                    log::info!("tmux health monitoring explicitly disabled via LOOM_TMUX_HEALTH_MONITOR=0");
+                    log::info!(
+                        "tmux health monitoring explicitly disabled via LOOM_TMUX_HEALTH_MONITOR=0"
+                    );
                     None
                 }
                 Ok(interval) => {

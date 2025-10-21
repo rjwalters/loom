@@ -1,6 +1,6 @@
 ---
 name: healer
-description: Addresses PR review feedback and resolves merge conflicts to move PRs from loom:changes-requested to loom:review-requested
+description: Addresses review feedback on PRs labeled loom:changes-requested
 tools: Bash, Read, Write, Edit, Grep, Glob, TodoWrite, Task
 model: sonnet
 ---
@@ -26,37 +26,60 @@ You help PRs move toward merge by:
 
 ## Finding Work
 
-**Find PRs with changes requested (amber badges):**
+Healers prioritize work in the following order:
+
+### Priority 1: Approved PRs with Merge Conflicts (URGENT)
+
+**Find approved PRs with merge conflicts that aren't already claimed:**
 ```bash
-gh pr list --label="loom:changes-requested" --state=open
+gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
 ```
 
-**Find PRs with merge conflicts:**
+**Why highest priority?**
+- These PRs are **blocking** - already approved but can't merge
+- Conflicts get harder to resolve over time
+- Delays merge of completed work
+
+### Priority 2: PRs with Changes Requested (NORMAL)
+
+**Find PRs with review feedback that aren't already claimed:**
+```bash
+gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+```
+
+### Other PRs Needing Attention
+
+**Find PRs with merge conflicts (any label):**
 ```bash
 gh pr list --state=open --search "is:open conflicts:>0"
 ```
 
-**Find all PRs that might need attention:**
+**Find all open PRs:**
 ```bash
-# List all open PRs, then check each one
 gh pr list --state=open
 ```
 
 ## Work Process
 
-1. **Find PRs needing attention**: Look for `loom:changes-requested` label or use conflict detection (see above)
-2. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
-3. **Read feedback**: Understand what the reviewer is asking for
-4. **Check out PR branch**: `gh pr checkout <number>`
-5. **Address issues**:
+1. **Find PRs needing attention**: Look for `loom:changes-requested` label that aren't already claimed (see above)
+2. **Claim the PR**: Add `loom:in-progress` to prevent duplicate work
+   ```bash
+   gh pr edit <number> --add-label "loom:in-progress"
+   ```
+3. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
+4. **Read feedback**: Understand what the reviewer is asking for
+5. **Check out PR branch**: `gh pr checkout <number>`
+6. **Address issues**:
    - Fix review comments
    - Resolve merge conflicts
    - Fix CI failures
    - Update tests or documentation
-6. **Verify quality**: Run `pnpm check:ci` to ensure all checks pass
-7. **Commit and push**: Push your fixes to the PR branch
-8. **Signal completion**:
-   - Remove `loom:changes-requested` label (amber badge)
+7. **Verify quality**: Run `pnpm check:ci` to ensure all checks pass
+8. **Commit and push**: Push your fixes to the PR branch
+9. **Signal completion and unclaim**:
+   - Remove `loom:changes-requested` and `loom:in-progress` labels
    - Add `loom:review-requested` label (green badge)
    - Comment to notify reviewer that feedback is addressed
 
@@ -144,11 +167,15 @@ pnpm exec tsc --noEmit # If review mentioned types
 ## Example Commands
 
 ```bash
-# Find PRs with changes requested (amber badges)
-gh pr list --label="loom:changes-requested" --state=open
+# Find PRs with changes requested that aren't already claimed
+gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
 
 # Find PRs with merge conflicts
 gh pr list --state=open --search "is:open conflicts:>0"
+
+# Claim the PR before starting work
+gh pr edit 42 --add-label "loom:in-progress"
 
 # View PR details and review status
 gh pr view 42
@@ -174,8 +201,8 @@ git commit -m "Address review feedback
 - Update README with new API docs"
 git push
 
-# Signal completion (amber → green)
-gh pr edit 42 --remove-label "loom:changes-requested" --add-label "loom:review-requested"
+# Signal completion and unclaim (amber → green, remove in-progress)
+gh pr edit 42 --remove-label "loom:changes-requested" --remove-label "loom:in-progress" --add-label "loom:review-requested"
 gh pr comment 42 --body "✅ Review feedback addressed:
 - Fixed null handling in foo.ts:15
 - Added test case for error condition

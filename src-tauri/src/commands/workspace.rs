@@ -33,8 +33,7 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 /// Helper function to selectively copy .loom configuration from defaults
 /// Only copies files/directories that belong in .loom/, not workspace root
 pub fn copy_loom_config(defaults_path: &Path, loom_path: &Path) -> Result<(), String> {
-    fs::create_dir_all(loom_path)
-        .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+    fs::create_dir_all(loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
     // Files/directories that should be copied to .loom/
     // Note: README.md is handled separately via .loom-README.md copy
@@ -49,8 +48,7 @@ pub fn copy_loom_config(defaults_path: &Path, loom_path: &Path) -> Result<(), St
         }
 
         if src.is_dir() {
-            copy_dir_recursive(&src, &dst)
-                .map_err(|e| format!("Failed to copy {item}: {e}"))?;
+            copy_dir_recursive(&src, &dst).map_err(|e| format!("Failed to copy {item}: {e}"))?;
         } else {
             fs::copy(&src, &dst).map_err(|e| format!("Failed to copy {item}: {e}"))?;
         }
