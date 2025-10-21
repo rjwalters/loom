@@ -15,7 +15,7 @@
     "daemon:preview": "cargo run --package loom-daemon --release",
     "daemon:build": "cargo build --package loom-daemon --release && rm -f target/release/loom-daemon-aarch64-apple-darwin && cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin",
     "daemon:test": "cargo test --package loom-daemon",
-    "app:dev": "./scripts/setup-mcp.sh && pnpm daemon:dev & sleep 2 && pnpm tauri:dev",
+    "app:dev": "./scripts/dev-app.sh",
     "app:preview": "pnpm build && pnpm tauri build --debug --bundles app && RUST_LOG=info pnpm daemon:preview & sleep 5 && ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom --workspace \"$(pwd)\"",
     "app:build": "pnpm daemon:build && pnpm tauri:build",
     "test:factory-reset": "pnpm build && pnpm tauri build --debug --bundles app && RUST_LOG=info pnpm daemon:preview & sleep 5 && ./target/debug/bundle/macos/Loom.app/Contents/MacOS/Loom --workspace \"$(pwd)\"",
