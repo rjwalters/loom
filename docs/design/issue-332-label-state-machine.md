@@ -5,7 +5,7 @@
 The current label workflow has several issues:
 1. **Ambiguous `loom:ready`**: Overloaded for both issues AND PRs
 2. **Automatic approval**: Curator marks issues ready without human approval
-3. **Inconsistent naming**: `loom:proposal` vs `loom:critic-suggestion`
+3. **Inconsistent naming**: `loom:proposal` vs `loom:hermit`
 4. **Duplicate labels**: Both `loom:approved` and `loom:pr` for merged PRs
 5. **Unclear external contributor path**: How do external issues enter the workflow?
 
@@ -23,8 +23,8 @@ The current label workflow has several issues:
 
 | Label | Color | Set By | Meaning |
 |-------|-------|--------|---------|
-| `loom:architect-suggestion` | 🔵 #3B82F6 | Architect | Proposal awaiting human review |
-| `loom:critic-suggestion` | 🟣 #9333EA | Critic | Removal/simplification awaiting review |
+| `loom:architect` | 🔵 #3B82F6 | Architect | Proposal awaiting human review |
+| `loom:hermit` | 🟣 #9333EA | Critic | Removal/simplification awaiting review |
 | `loom:curated` | 🟢 #10B981 | Curator | Enhanced with implementation details |
 | `loom:issue` | 🔵 #3B82F6 | **Human** | **Approved for work** (replaces `loom:ready`) |
 | `loom:in-progress` | 🟡 #F59E0B | Worker | Being implemented |
@@ -41,7 +41,7 @@ The current label workflow has several issues:
 
 **Removed Labels:**
 - ❌ `loom:ready` (replaced by `loom:issue` for issues, `loom:review-requested` already exists for PRs)
-- ❌ `loom:proposal` (renamed to `loom:architect-suggestion`)
+- ❌ `loom:proposal` (renamed to `loom:architect`)
 - ❌ `loom:approved` (duplicate of `loom:pr`)
 - ❌ `loom:reviewing` (not needed - use assignee instead)
 
@@ -52,13 +52,13 @@ The current label workflow has several issues:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ ARCHITECT: Creates proposal                                 │
-│   Action: Create issue with loom:architect-suggestion       │
+│   Action: Create issue with loom:architect       │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ HUMAN: Review proposal                                       │
-│   Approve: Remove loom:architect-suggestion                 │
+│   Approve: Remove loom:architect                 │
 │   Reject:  Close issue with comment                         │
 └────────────────────────┬────────────────────────────────────┘
                          │ (approved - suggestion removed)
@@ -122,13 +122,13 @@ The current label workflow has several issues:
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │ CRITIC: Identifies bloat/over-engineering                    │
-│   Action: Create issue with loom:critic-suggestion          │
+│   Action: Create issue with loom:hermit          │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ HUMAN: Review suggestion                                     │
-│   Approve: Remove loom:critic-suggestion                    │
+│   Approve: Remove loom:hermit                    │
 │   Reject:  Close issue                                      │
 └────────────────────────┬────────────────────────────────────┘
                          │ (approved - continues as internal flow)
@@ -206,12 +206,12 @@ The current label workflow has several issues:
 - Creates issues with `loom:proposal`
 
 **New Behavior:**
-- Creates issues with `loom:architect-suggestion`
+- Creates issues with `loom:architect`
 - Consistent with Critic naming pattern
 
 ### Critic
 
-**Behavior:** No change (already uses `loom:critic-suggestion`)
+**Behavior:** No change (already uses `loom:hermit`)
 
 ### Reviewer
 
@@ -227,7 +227,7 @@ The current label workflow has several issues:
 
 ```bash
 # Create new labels
-gh label create "loom:architect-suggestion" --color "3B82F6" --description "Architect proposal awaiting human review"
+gh label create "loom:architect" --color "3B82F6" --description "Architect proposal awaiting human review"
 gh label create "loom:curated" --color "10B981" --description "Enhanced by Curator, awaiting human approval"
 gh label edit "loom:issue" --color "3B82F6" --description "Approved for work by human (replaces loom:ready)"
 ```
@@ -235,9 +235,9 @@ gh label edit "loom:issue" --color "3B82F6" --description "Approved for work by 
 ### Phase 2: Migrate Existing Issues
 
 ```bash
-# Find issues with loom:proposal, rename to loom:architect-suggestion
+# Find issues with loom:proposal, rename to loom:architect
 gh issue list --label="loom:proposal" --json number --jq '.[].number' | \
-  xargs -I {} gh issue edit {} --remove-label "loom:proposal" --add-label "loom:architect-suggestion"
+  xargs -I {} gh issue edit {} --remove-label "loom:proposal" --add-label "loom:architect"
 
 # Find issues with loom:ready, change to loom:issue
 gh issue list --label="loom:ready" --json number --jq '.[].number' | \

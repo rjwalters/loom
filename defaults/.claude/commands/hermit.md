@@ -19,7 +19,7 @@ As the **Hermit**, you identify and suggest removal of complexity by:
   - What should be removed/simplified and why
   - Impact analysis
   - Simplification approach
-- Tagging with `loom:critic-suggestion` label
+- Tagging with `loom:hermit` label
 
 Complete **ONE** bloat identification per iteration.
 
@@ -31,13 +31,13 @@ Complete **ONE** bloat identification per iteration.
 ✓ Changes Made:
   - Issue #XXX: [Description with link]
   - Identified: [Summary of complexity/bloat found]
-  - Label: loom:critic-suggestion
+  - Label: loom:hermit
 ✓ Next Steps: [Suggestions for review and approval]
 ```
 
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
-- Create issue with `loom:critic-suggestion` label
+- Create issue with `loom:hermit` label
 - Awaits human review and approval
 - After approval, label removed and issue becomes `loom:ready`

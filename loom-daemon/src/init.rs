@@ -63,11 +63,37 @@ pub fn initialize_workspace(
     // Resolve defaults path (development mode or bundled resource)
     let defaults = resolve_defaults_path(defaults_path)?;
 
-    // Copy defaults to .loom
-    copy_dir_recursive(&defaults, &loom_path)
-        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+    // Create .loom directory
+    fs::create_dir_all(&loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
-    // Copy workspace-specific README (overwriting defaults/README.md)
+    // Copy only .loom-specific files from defaults
+    // (NOT entire defaults/ tree which would create duplicates)
+
+    // Copy config.json
+    let config_src = defaults.join("config.json");
+    let config_dst = loom_path.join("config.json");
+    if config_src.exists() {
+        fs::copy(&config_src, &config_dst)
+            .map_err(|e| format!("Failed to copy config.json: {e}"))?;
+    }
+
+    // Copy roles/ directory
+    let roles_src = defaults.join("roles");
+    let roles_dst = loom_path.join("roles");
+    if roles_src.exists() {
+        copy_dir_recursive(&roles_src, &roles_dst)
+            .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
+    }
+
+    // Copy scripts/ directory
+    let scripts_src = defaults.join("scripts");
+    let scripts_dst = loom_path.join("scripts");
+    if scripts_src.exists() {
+        copy_dir_recursive(&scripts_src, &scripts_dst)
+            .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
+    }
+
+    // Copy .loom-specific README
     let loom_readme_src = defaults.join(".loom-README.md");
     let loom_readme_dst = loom_path.join("README.md");
     if loom_readme_src.exists() {
@@ -286,15 +312,19 @@ fn setup_repository_scaffolding(
         Ok(())
     };
 
-    // Copy LOOM_USAGE.md as CLAUDE.md (usage documentation, not internal dev docs)
+    // Copy target-repo-specific CLAUDE.md and AGENTS.md from defaults/.loom/
+    // (NOT defaults/CLAUDE.md which is for Loom repo itself)
     copy_file(
-        &defaults_path.join("LOOM_USAGE.md"),
+        &defaults_path.join(".loom").join("CLAUDE.md"),
         &workspace_path.join("CLAUDE.md"),
         "CLAUDE.md",
     )?;
 
-    // Copy AGENTS.md
-    copy_file(&defaults_path.join("AGENTS.md"), &workspace_path.join("AGENTS.md"), "AGENTS.md")?;
+    copy_file(
+        &defaults_path.join(".loom").join("AGENTS.md"),
+        &workspace_path.join("AGENTS.md"),
+        "AGENTS.md",
+    )?;
 
     // Copy .claude/ directory
     copy_directory(
@@ -317,12 +347,8 @@ fn setup_repository_scaffolding(
         ".github directory",
     )?;
 
-    // Copy scripts/ directory to .loom/scripts/
-    copy_directory(
-        &defaults_path.join("scripts"),
-        &workspace_path.join(".loom/scripts"),
-        ".loom/scripts directory",
-    )?;
+    // Note: scripts/ is now copied earlier in initialize_workspace()
+    // to .loom/scripts/ along with other .loom-specific files
 
     Ok(())
 }
