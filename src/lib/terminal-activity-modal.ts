@@ -9,6 +9,7 @@ import { save } from "@tauri-apps/api/dialog";
 import { writeTextFile } from "@tauri-apps/api/fs";
 import { invoke } from "@tauri-apps/api/tauri";
 import type { ActivityEntry } from "./state";
+import { showToast } from "./toast";
 
 /**
  * Show the activity modal for a specific terminal
@@ -285,11 +286,10 @@ async function exportActivity(terminalId: string, format: "csv" | "json"): Promi
 
     if (filePath) {
       await writeTextFile(filePath, content);
-      // TODO: Show success toast instead of alert
-      alert(`Activity exported to ${filePath}`);
+      showToast(`Activity exported to ${filePath}`, "success");
     }
   } catch (error) {
-    alert(`Export failed: ${error}`);
+    showToast(`Export failed: ${error}`, "error");
   }
 }
 

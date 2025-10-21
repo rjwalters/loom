@@ -3,6 +3,7 @@ import type { OutputPoller } from "./output-poller";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
 import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
+import { showToast } from "./toast";
 import { cleanupWorkspace } from "./workspace-cleanup";
 
 const logger = Logger.forComponent("workspace-start");
@@ -143,9 +144,10 @@ export async function startWorkspaceEngine(
           }
         );
 
-        alert(
-          `Failed to create ${failed.length} terminal(s) after retries: ${failedNames}\n\n` +
-            `Successfully created ${succeeded.length} of ${config.agents.length} terminals.`
+        showToast(
+          `Failed to create ${failed.length} terminal(s) after retries: ${failedNames}. Successfully created ${succeeded.length} of ${config.agents.length} terminals.`,
+          "error",
+          7000
         );
       }
 
@@ -253,7 +255,7 @@ export async function startWorkspaceEngine(
       workspacePath,
       source: logPrefix,
     });
-    alert(`Failed to start Loom engine: ${error}`);
+    showToast(`Failed to start Loom engine: ${error}`, "error");
   }
 
   // Re-render

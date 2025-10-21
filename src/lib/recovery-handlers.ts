@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
+import { showToast } from "./toast";
 
 const logger = Logger.forComponent("recovery-handlers");
 
@@ -40,7 +41,7 @@ export async function handleRecoverNewSession(
 
   try {
     if (!state.hasWorkspace()) {
-      alert("Cannot recover: no workspace selected");
+      showToast("Cannot recover: no workspace selected", "error");
       return;
     }
 
@@ -48,7 +49,7 @@ export async function handleRecoverNewSession(
     const terminal = state.getTerminals().find((t) => t.id === terminalId);
 
     if (!terminal) {
-      alert("Cannot recover: terminal not found");
+      showToast("Cannot recover: terminal not found", "error");
       return;
     }
 
@@ -87,7 +88,7 @@ export async function handleRecoverNewSession(
     logger.info("Recovery complete", { terminalId: newTerminalId });
   } catch (error) {
     logger.error("Failed to recover terminal", error, { terminalId });
-    alert(`Failed to create new session: ${error}`);
+    showToast(`Failed to create new session: ${error}`, "error");
   }
 }
 
@@ -118,7 +119,7 @@ export async function handleRecoverAttachSession(id: string, state: AppState): P
     // Manual recovery handlers are deprecated but kept for compatibility
   } catch (error) {
     logger.error("Failed to list sessions", error, { terminalId: id });
-    alert(`Failed to list available sessions: ${error}`);
+    showToast(`Failed to list available sessions: ${error}`, "error");
   }
 }
 
@@ -161,7 +162,7 @@ export async function handleAttachToSession(
     logger.info("Attached successfully", { terminalId, sessionName });
   } catch (error) {
     logger.error("Failed to attach to session", error, { terminalId, sessionName });
-    alert(`Failed to attach to session: ${error}`);
+    showToast(`Failed to attach to session: ${error}`, "error");
   }
 }
 
@@ -197,6 +198,6 @@ export async function handleKillSession(sessionName: string, _state: AppState): 
     // Manual recovery handlers are deprecated but kept for compatibility
   } catch (error) {
     logger.error("Failed to kill session", error, { sessionName });
-    alert(`Failed to kill session: ${error}`);
+    showToast(`Failed to kill session: ${error}`, "error");
   }
 }

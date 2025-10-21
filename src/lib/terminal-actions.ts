@@ -13,6 +13,7 @@ import type { OutputPoller } from "./output-poller";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
 import type { TerminalManager } from "./terminal-manager";
+import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-actions");
 
@@ -72,7 +73,7 @@ export async function handleRunNowClick(
     logger.error("Failed to execute interval prompt", error as Error, {
       terminalId,
     });
-    alert(`Failed to run interval prompt: ${error}`);
+    showToast(`Failed to run interval prompt: ${error}`, "error");
   }
 }
 
@@ -176,7 +177,7 @@ export async function handleRestartTerminal(
     });
     // Reset status to idle on error
     state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
-    alert(`Failed to restart terminal: ${error}`);
+    showToast(`Failed to restart terminal: ${error}`, "error");
   }
 }
 
@@ -376,6 +377,6 @@ export async function createPlainTerminal(deps: {
     state.setPrimary(id);
   } catch (error) {
     logger.error("Failed to create terminal", error, { workspacePath });
-    alert(`Failed to create terminal: ${error}`);
+    showToast(`Failed to create terminal: ${error}`, "error");
   }
 }

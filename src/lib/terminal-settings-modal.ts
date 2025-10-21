@@ -2,6 +2,7 @@ import { saveCurrentConfiguration } from "./config";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
+import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-settings-modal");
 
@@ -445,7 +446,7 @@ async function applySettings(
     const roleFile = roleFileSelect.value;
 
     if (!name) {
-      alert("Please enter a terminal name");
+      showToast("Please enter a terminal name", "error");
       return;
     }
 
@@ -556,7 +557,7 @@ async function applySettings(
             workspacePath,
             workerType,
           });
-          alert(`Failed to launch agent: ${error}`);
+          showToast(`Failed to launch agent: ${error}`, "error");
         }
       }
     }
@@ -580,6 +581,6 @@ async function applySettings(
     modal.remove();
     renderFn();
   } catch (error) {
-    alert(`Failed to apply settings: ${error}`);
+    showToast(`Failed to apply settings: ${error}`, "error");
   }
 }

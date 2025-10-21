@@ -10,6 +10,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { invoke } from "@tauri-apps/api/tauri";
 import { Logger } from "./logger";
 import type { Terminal } from "./state";
+import { showToast } from "./toast";
 
 const logger = Logger.forComponent("workspace-utils");
 
@@ -140,7 +141,7 @@ export async function browseWorkspace(
     }
   } catch (error) {
     logger.error("Error selecting workspace", error);
-    alert("Failed to select workspace. Please try again.");
+    showToast("Failed to select workspace. Please try again.", "error");
   }
 }
 

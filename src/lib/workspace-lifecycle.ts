@@ -4,6 +4,7 @@ import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } fro
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+import { showToast } from "./toast";
 import { expandTildePath } from "./workspace-utils";
 
 const logger = Logger.forComponent("workspace-lifecycle");
@@ -134,7 +135,7 @@ export async function handleWorkspacePathInput(
         logger.error("Failed to initialize workspace", error as Error, {
           workspacePath: expandedPath,
         });
-        alert(`Failed to initialize workspace: ${error}`);
+        showToast(`Failed to initialize workspace: ${error}`, "error");
         return;
       }
 
@@ -176,7 +177,7 @@ export async function handleWorkspacePathInput(
               terminalName: agent.name,
               workspacePath: expandedPath,
             });
-            alert(`Failed to create terminal ${agent.name}: ${error}`);
+            showToast(`Failed to create terminal ${agent.name}: ${error}`, "error");
           }
         }
 
@@ -377,6 +378,6 @@ export async function handleWorkspacePathInput(
     }
   } catch (error) {
     logger.error("Error handling workspace", error as Error, { workspacePath: expandedPath });
-    alert(`Error: ${error}`);
+    showToast(`Error: ${error}`, "error");
   }
 }

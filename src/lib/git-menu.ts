@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/tauri";
+import { showToast } from "./toast";
 
 /**
  * git-menu.ts - Git menu UI and branch management
@@ -310,7 +311,7 @@ export async function openBranchListDialog(workspacePath: string): Promise<void>
         })
       );
     } catch (error) {
-      alert(`Failed to switch branch: ${error}`);
+      showToast(`Failed to switch branch: ${error}`, "error");
     }
   });
 
@@ -334,7 +335,7 @@ export async function openBranchListDialog(workspacePath: string): Promise<void>
       document.body.removeChild(modal);
       openBranchListDialog(workspacePath);
     } catch (error) {
-      alert(`Failed to delete branch: ${error}`);
+      showToast(`Failed to delete branch: ${error}`, "error");
     }
   });
 }
