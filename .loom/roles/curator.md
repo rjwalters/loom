@@ -41,7 +41,7 @@ Use this command to find issues that need curation (already filters out claimed 
 # Find issues without suggestion labels, curated, issue, or in-progress
 # (These need curator enhancement)
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 ```
 
 Or simpler (may include some false positives):
