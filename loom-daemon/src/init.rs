@@ -286,8 +286,12 @@ fn setup_repository_scaffolding(
         Ok(())
     };
 
-    // Copy CLAUDE.md
-    copy_file(&defaults_path.join("CLAUDE.md"), &workspace_path.join("CLAUDE.md"), "CLAUDE.md")?;
+    // Copy LOOM_USAGE.md as CLAUDE.md (usage documentation, not internal dev docs)
+    copy_file(
+        &defaults_path.join("LOOM_USAGE.md"),
+        &workspace_path.join("CLAUDE.md"),
+        "CLAUDE.md",
+    )?;
 
     // Copy AGENTS.md
     copy_file(&defaults_path.join("AGENTS.md"), &workspace_path.join("AGENTS.md"), "AGENTS.md")?;
