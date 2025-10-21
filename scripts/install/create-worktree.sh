@@ -39,9 +39,31 @@ BASE_BRANCH_NAME="feature/loom-installation"
 
 info "Creating worktree for issue #${ISSUE_NUMBER}..."
 
-# Get current branch to base from
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-info "Branching from: ${CURRENT_BRANCH}"
+# Detect the default branch (usually 'main' or 'master')
+# First try to get it from the remote HEAD
+DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "")
+
+# If that fails, check if 'main' or 'master' exists locally
+if [[ -z "$DEFAULT_BRANCH" ]]; then
+  if git show-ref --verify --quiet refs/heads/main; then
+    DEFAULT_BRANCH="main"
+  elif git show-ref --verify --quiet refs/heads/master; then
+    DEFAULT_BRANCH="master"
+  else
+    # Fall back to current branch if we can't determine default
+    DEFAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    info "Could not detect default branch, using current branch"
+  fi
+fi
+
+# Ensure we're branching from the latest state
+if [[ "$DEFAULT_BRANCH" == "main" ]] || [[ "$DEFAULT_BRANCH" == "master" ]]; then
+  info "Fetching latest changes from origin/${DEFAULT_BRANCH}..."
+  git fetch origin "${DEFAULT_BRANCH}:${DEFAULT_BRANCH}" 2>/dev/null || true
+fi
+
+info "Branching from: ${DEFAULT_BRANCH}"
+BASE_BRANCH="$DEFAULT_BRANCH"
 
 # Clean up any existing worktree
 if [[ -d "$WORKTREE_PATH" ]]; then
@@ -57,11 +79,11 @@ while true; do
   # Clean up any existing local branch with this name
   if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     info "Removing existing local branch: $BRANCH_NAME"
-    git branch -D "$BRANCH_NAME" 2>/dev/null || true
+    git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
   fi
 
   # Try to create worktree with this branch name
-  if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$CURRENT_BRANCH" >&2 2>&1; then
+  if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$BASE_BRANCH" >&2 2>&1; then
     # Success! Branch name is available
     break
   fi
