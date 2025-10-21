@@ -95,12 +95,12 @@ async fn main() -> Result<()> {
 
     let tm = Arc::new(Mutex::new(tm));
 
-    // Start optional health monitoring if enabled via environment variable
+    // Start health monitoring (enabled by default)
     if let Some(interval) = health_monitor::check_env_enabled() {
-        health_monitor::start_tmux_health_monitor(interval);
+        let (_health_handle, _health_state) = health_monitor::start_tmux_health_monitor(interval);
         log::info!("✅ tmux health monitoring enabled (interval: {interval}s)");
-    } else {
-        log::debug!("tmux health monitoring disabled (set LOOM_TMUX_HEALTH_MONITOR to enable)");
+        // Note: health_handle is dropped here, but the thread keeps running
+        // health_state could be stored for querying crash status if needed
     }
 
     // Start IPC server
