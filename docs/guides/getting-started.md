@@ -329,7 +329,7 @@ These roles run automatically at configured intervals:
 
 - **Judge** (5 min) - Reviews PRs with `loom:review-requested`
 - **Curator** (5 min) - Enhances issues, marks as `loom:ready`
-- **Architect** (15 min) - Creates `loom:architect-suggestion` proposals
+- **Architect** (15 min) - Creates `loom:architect` proposals
 - **Hermit** (15 min) - Identifies bloat, creates `loom:hermit` issues
 - **Guide** (15 min) - Prioritizes issues with `loom:priority-*` labels
 

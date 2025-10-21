@@ -282,7 +282,7 @@ Each role consists of two files:
 
 Roles coordinate work through GitHub labels with two human approval gates (see [WORKFLOWS.md](../../WORKFLOWS.md) for complete details):
 
-1. **Architect** creates issues with `loom:architect-suggestion` label
+1. **Architect** creates issues with `loom:architect` label
 2. **Human approval (Gate 1)**: User reviews and removes label to approve proposal
 3. **Curator** finds unlabeled issues, enhances them, marks as `loom:curated`
 4. **Human approval (Gate 2)**: User reviews and changes `loom:curated` to `loom:issue` to authorize work

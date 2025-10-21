@@ -109,7 +109,7 @@ The `agents/` directory contains Claude Code subagents that are automatically in
 | **builder** | Implements features for `loom:issue` issues and creates PRs | Full (Write, Edit, TodoWrite) | Sonnet |
 | **judge** | Reviews PRs with `loom:review-requested` label | Read-only | Sonnet |
 | **curator** | Enhances issues and marks them as `loom:curated` | Read-only | Sonnet |
-| **architect** | Creates architectural proposals with `loom:architect-suggestion` | Full (can write docs) | Opus |
+| **architect** | Creates architectural proposals with `loom:architect` | Full (can write docs) | Opus |
 | **hermit** | Identifies bloat and creates simplification issues | Read-only | Sonnet |
 | **healer** | Addresses PR feedback and resolves conflicts | Full (fixes PRs) | Sonnet |
 | **guide** | Triages issues and applies `loom:urgent` to top 3 | Read-only | Sonnet |
@@ -136,7 +136,7 @@ The `agents/` directory contains Claude Code subagents that are automatically in
 
 The subagents work together following the label-based workflow:
 
-1. **architect** scans codebase → creates proposals with `loom:architect-suggestion`
+1. **architect** scans codebase → creates proposals with `loom:architect`
 2. **User approves** → adds `loom:issue` label
 3. **curator** enhances issues → marks as `loom:curated`
 4. **User approves** → adds `loom:issue` label

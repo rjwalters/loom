@@ -20,7 +20,7 @@ Traditional approaches (database, API, message queue) add complexity and infrast
 Use **GitHub labels as a state machine** to coordinate agent workflows:
 
 **Label State Machine**:
-1. `loom:architect-suggestion` → Issue created by Architect (requires user approval)
+1. `loom:architect` → Issue created by Architect (requires user approval)
 2. (No label) → Unlabeled issues ready for Curator enhancement
 3. `loom:curated` → Curator-enhanced, awaiting human approval
 4. `loom:issue` → Human-approved, ready for Worker to claim
@@ -30,7 +30,7 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 8. `loom:blocked` → Work blocked on dependency
 
 **Workflow**:
-- **Architect**: Creates issues with `loom:architect-suggestion`
+- **Architect**: Creates issues with `loom:architect`
 - **User**: Reviews suggestions, removes label to approve for curation
 - **Curator**: Finds unlabeled issues, enhances, marks `loom:curated`
 - **User**: Reviews curated issues, adds `loom:issue` to explicitly approve work

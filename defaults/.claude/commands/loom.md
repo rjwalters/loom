@@ -15,8 +15,8 @@ Randomly select and assume an archetypal role from the Loom orchestration system
 - **builder.md** - Claim `loom:ready` issue, implement feature/fix, create PR with `loom:review-requested`
 - **judge.md** - Review PR with `loom:review-requested`, approve or request changes, update labels
 - **curator.md** - Find unlabeled issue, enhance with technical details, mark as `loom:ready`
-- **architect.md** - Create architectural proposal issue with `loom:architect-suggestion` label
-- **hermit.md** - Analyze codebase complexity, create bloat removal issue with `loom:critic-suggestion`
+- **architect.md** - Create architectural proposal issue with `loom:architect` label
+- **hermit.md** - Analyze codebase complexity, create bloat removal issue with `loom:hermit`
 - **healer.md** - Fix bug or address PR feedback, maintain existing PRs
 - **guide.md** - Triage batch of issues, update priorities and labels for workflow
 - **driver.md** - Execute direct task or command (plain shell, no specific workflow)
@@ -56,8 +56,8 @@ Follow the label-based coordination system (ADR-0006):
 
 - Issues: `loom:ready` → `loom:in-progress` → closed
 - PRs: `loom:review-requested` → `loom:approved` → merged
-- Proposals: `loom:architect-suggestion` → reviewed → implemented or closed
-- Suggestions: `loom:critic-suggestion` → reviewed → implemented or closed
+- Proposals: `loom:architect` → reviewed → implemented or closed
+- Suggestions: `loom:hermit` → reviewed → implemented or closed
 
 ## Notes
 
