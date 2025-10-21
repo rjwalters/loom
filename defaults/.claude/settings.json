@@ -54,7 +54,9 @@
       "Bash(convert:*)",
       "Bash(magick:*)",
       "Bash(iconutil:*)",
-      "WebSearch"
+      "WebSearch",
+      "Read(/tmp/**)",
+      "Write(/tmp/**)"
     ]
   }
 }
