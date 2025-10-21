@@ -185,10 +185,6 @@ case "$METHOD" in
       error "GitHub CLI (gh) is required for full installation\n       Install: brew install gh"
     fi
 
-    if ! command -v claude &> /dev/null; then
-      error "Claude Code CLI is required for full installation\n       See: https://claude.com/claude-code"
-    fi
-
     # Check GitHub authentication
     if ! gh auth status &> /dev/null; then
       warning "GitHub CLI is not authenticated"
@@ -219,7 +215,7 @@ case "$METHOD" in
     fi
     echo ""
 
-    # Run the full installation workflow via wrapper script
+    # Run the full installation workflow
     exec "$LOOM_ROOT/scripts/install-loom.sh" "$TARGET_PATH"
     ;;
 
