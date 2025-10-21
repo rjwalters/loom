@@ -17,11 +17,11 @@ Loom turns **GitHub itself** into the ultimate development interface. Each issue
 Skip the prerequisites and get Loom installed in your repository:
 
 ```bash
-# Option 1: Interactive Setup (Easiest)
-# Clone Loom and run the setup script
+# Option 1: Interactive Install (Easiest)
+# Clone Loom and run the install script
 git clone https://github.com/rjwalters/loom
 cd loom
-./setup.sh /path/to/your/repo
+./install.sh /path/to/your/repo
 
 # Option 2: Direct CLI Initialization
 # Download and run loom-daemon to initialize your repository
@@ -48,6 +48,40 @@ pnpm app:dev
 ```
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for complete development setup and guidelines.
+
+### Repository Maintenance
+
+Two convenience scripts are available at the repository root:
+
+**Installation Helper** (`./install.sh`):
+```bash
+# Interactive installer with guided prompts
+./install.sh
+
+# Install to specific repository
+./install.sh /path/to/your/repo
+```
+
+Provides two installation workflows:
+- **Quick Install**: Direct installation via `loom-daemon init`
+- **Full Install**: Creates GitHub issue, worktree, and PR for review
+
+**Cleanup Helper** (`./clean.sh`):
+```bash
+# Standard cleanup (safe defaults)
+./clean.sh
+
+# Deep cleanup (includes build artifacts)
+./clean.sh --deep
+
+# Preview what would be cleaned
+./clean.sh --dry-run
+```
+
+Safely removes:
+- Orphaned worktrees and stale branches
+- Loom tmux sessions
+- Build artifacts (with `--deep`)
 
 ---
 

@@ -212,17 +212,17 @@ pnpm daemon:build
 
 **Next:** See [DEVELOPMENT.md](../../DEVELOPMENT.md) for development workflow.
 
-### Option 3: Interactive Setup Script (Recommended)
+### Option 3: Interactive Install Script (Recommended)
 
-Uses the interactive setup script for guided installation with two workflows.
+Uses the interactive install script for guided installation with two workflows.
 
 ```bash
 # Clone Loom first (if you haven't)
 git clone https://github.com/rjwalters/loom
 cd loom
 
-# Run interactive setup (will prompt for target repo if not provided)
-./setup.sh /path/to/your/repo
+# Run interactive installer (will prompt for target repo if not provided)
+./install.sh /path/to/your/repo
 ```
 
 **What this provides:**
