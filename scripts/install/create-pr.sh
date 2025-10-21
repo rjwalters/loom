@@ -115,7 +115,7 @@ EOF
 # Create pull request
 # Output goes to stderr so it doesn't interfere with URL capture
 PR_OUTPUT=$(gh pr create \
-  --title "Install Loom ${LOOM_VERSION}" \
+  --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$PR_BODY" \
   --label "loom:review-requested" 2>&1)
 
