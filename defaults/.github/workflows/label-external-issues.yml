@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   label_external:
+    if: github.event_name == 'issues'
     runs-on: ubuntu-latest
     steps:
       - name: Check if author is a collaborator
@@ -54,11 +55,11 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `Thank you for submitting a task to Loom! 🙏
+              body: `Thank you for submitting an issue! 🙏
 
 This issue has been automatically labeled as \`external\` and will be reviewed by the maintainers.
 
-**Note**: Loom's AI agents focus on the internal development workflow, so external issues require manual triage before being assigned to agents. We appreciate your patience while we review your submission.
+**Note**: External issues require manual triage before being assigned. We appreciate your patience while we review your submission.
 
-For questions or discussions, please use [GitHub Discussions](https://github.com/rjwalters/loom/discussions). For more information about contributing, see [CONTRIBUTING.md](../blob/main/CONTRIBUTING.md).`
+For questions or discussions, please use [GitHub Discussions](https://github.com/{{REPO_OWNER}}/{{REPO_NAME}}/discussions).`
             });
