@@ -63,14 +63,14 @@ Closes #${ISSUE_NUMBER}
 EOF
 )
 
-# Commit changes
-git commit -m "$COMMIT_MSG"
+# Commit changes (redirect output to stderr so it doesn't interfere with PR URL capture)
+git commit -m "$COMMIT_MSG" >&2
 success "Changes committed"
 
 info "Pushing branch: $BRANCH_NAME"
 
-# Push branch
-git push -u origin "$BRANCH_NAME"
+# Push branch (redirect output to stderr so it doesn't interfere with PR URL capture)
+git push -u origin "$BRANCH_NAME" >&2
 success "Branch pushed"
 
 info "Creating pull request..."
@@ -108,11 +108,18 @@ EOF
 )
 
 # Create pull request
-# (Compatible with older gh CLI versions that don't support --json)
-PR_URL=$(gh pr create \
+# Output goes to stderr so it doesn't interfere with URL capture
+PR_OUTPUT=$(gh pr create \
   --title "Install Loom ${LOOM_VERSION}" \
   --body "$PR_BODY" \
-  --label "loom:review-requested" 2>&1 | grep -o 'https://[^ ]*')
+  --label "loom:review-requested" 2>&1)
+
+# Extract URL from output (last line that contains https://)
+PR_URL=$(echo "$PR_OUTPUT" | grep -o 'https://[^ ]*' | tail -1)
+
+if [[ -z "$PR_URL" ]]; then
+  error "Failed to extract PR URL from gh output"
+fi
 
 success "Pull request created: $PR_URL"
 

@@ -1,14 +1,54 @@
 #!/usr/bin/env bash
 # Install Loom into a target repository using the full workflow
-# Usage: ./scripts/install-loom.sh /path/to/target-repo
+#
+# AGENT USAGE INSTRUCTIONS:
+#   This script installs Loom orchestration into a target Git repository.
+#
+#   Non-interactive mode (for Claude Code):
+#     ./scripts/install-loom.sh --yes /path/to/target-repo
+#     ./scripts/install-loom.sh -y /path/to/target-repo
+#
+#   Interactive mode (prompts for confirmations):
+#     ./scripts/install-loom.sh /path/to/target-repo
+#
+#   What this script does:
+#     1. Validates target repository (must be a Git repo)
+#     2. Creates tracking issue in target repository
+#     3. Creates installation worktree (.loom/worktrees/issue-XXX)
+#     4. Initializes Loom configuration (copies defaults to .loom/)
+#     5. Syncs GitHub labels for Loom workflow
+#     6. Creates pull request with loom:review-requested label
+#
+#   Requirements:
+#     - Target must be a Git repository
+#     - GitHub CLI (gh) must be authenticated
+#     - loom-daemon binary must be built (pnpm daemon:build)
+#
+#   After installation:
+#     - Merge the generated PR in the target repository
+#     - Loom will be ready to use in that workspace
 
 set -euo pipefail
 
+# Parse command line arguments
+NON_INTERACTIVE=false
+TARGET_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -y|--yes)
+      NON_INTERACTIVE=true
+      shift
+      ;;
+    *)
+      TARGET_PATH="$1"
+      shift
+      ;;
+  esac
+done
+
 # Determine Loom repository root (where this script lives)
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# Target repository path (required argument)
-TARGET_PATH="${1:-}"
 
 # ANSI color codes
 RED='\033[0;31m'
@@ -70,12 +110,15 @@ trap cleanup_on_error EXIT
 
 # Validate arguments
 if [[ -z "$TARGET_PATH" ]]; then
-  error "Target repository path required\nUsage: $0 /path/to/target-repo"
+  error "Target repository path required\nUsage: $0 [--yes|-y] /path/to/target-repo"
 fi
+
+# Export for sub-scripts
+export NON_INTERACTIVE
 
 # Resolve target to absolute path
 TARGET_PATH="$(cd "$TARGET_PATH" && pwd 2>/dev/null)" || \
-  error "Target path does not exist: $1"
+  error "Target path does not exist: $TARGET_PATH"
 
 echo ""
 header "╔═══════════════════════════════════════════════════════════╗"
@@ -213,7 +256,8 @@ success "loom-daemon binary ready"
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
 # Use --force in case .loom already exists in the target repo
-"$LOOM_ROOT/target/release/loom-daemon" init --force . || \
+# Use --defaults to point to Loom's defaults directory
+"$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" . || \
   error "loom-daemon init failed"
 
 echo ""
