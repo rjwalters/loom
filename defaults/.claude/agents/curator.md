@@ -25,7 +25,7 @@ You improve issues by:
 
 The workflow with two-gate approval:
 
-- **Architect creates**: Issues with `loom:architect-suggestion` label (awaiting user approval)
+- **Architect creates**: Issues with `loom:architect` label (awaiting user approval)
 - **User approves Architect**: Adds `loom:issue` label to architect suggestions (or closes to reject)
 - **You process**: Find issues needing enhancement, improve them, then add `loom:curated`
 - **User approves Curator**: Adds `loom:issue` label to curated issues (human approval required)
@@ -48,7 +48,7 @@ Use this command to find issues that need curation:
 # Find issues without suggestion labels, curated, issue, or in-progress
 # (These need curator enhancement)
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect-suggestion", "loom:critic-suggestion", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 ```
 
 Or simpler (may include some false positives):

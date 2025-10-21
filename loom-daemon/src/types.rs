@@ -1,3 +1,4 @@
+use crate::activity::ActivityEntry;
 use serde::{Deserialize, Serialize};
 
 pub type TerminalId = String;
@@ -45,6 +46,10 @@ pub enum Request {
         id: TerminalId,
         worktree_path: String,
     },
+    GetTerminalActivity {
+        id: TerminalId,
+        limit: usize,
+    },
     Shutdown,
 }
 
@@ -57,6 +62,7 @@ pub enum Response {
     TerminalOutput { output: String, byte_count: usize },
     SessionHealth { has_session: bool },
     AvailableSessions { sessions: Vec<String> },
+    TerminalActivity { entries: Vec<ActivityEntry> },
     Success,
     Error { message: String },
 }

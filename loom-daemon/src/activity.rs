@@ -124,6 +124,23 @@ pub struct TokenUsage {
     pub estimated_cost_usd: f64,
 }
 
+/// Combined activity entry (input + output)
+/// Used for displaying terminal activity history in UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    pub input_id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub input_type: InputType,
+    pub prompt: String,
+    pub agent_role: Option<String>,
+    pub git_branch: Option<String>,
+
+    // Output data (optional, joined from agent_outputs)
+    pub output_preview: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output_timestamp: Option<DateTime<Utc>>,
+}
+
 /// Type alias for productivity summary: (`agent_system`, `tasks_completed`, `avg_minutes`, `avg_tokens`, `total_cost`)
 pub type ProductivitySummary = Vec<(String, i64, f64, f64, f64)>;
 
@@ -606,6 +623,78 @@ impl ActivityDb {
         })?;
 
         results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Get terminal activity history (inputs joined with outputs)
+    /// Returns entries in reverse chronological order (most recent first)
+    #[allow(dead_code)]
+    pub fn get_terminal_activity(
+        &self,
+        terminal_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ActivityEntry>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT
+                i.id as input_id,
+                i.timestamp as input_timestamp,
+                i.input_type,
+                i.content as prompt,
+                i.agent_role,
+                i.context,
+                o.content_preview as output_preview,
+                o.exit_code,
+                o.timestamp as output_timestamp
+            FROM agent_inputs i
+            LEFT JOIN agent_outputs o ON i.id = o.input_id
+            WHERE i.terminal_id = ?1
+            ORDER BY i.timestamp DESC
+            LIMIT ?2
+            ",
+        )?;
+
+        let entries = stmt.query_map(params![terminal_id, limit], |row| {
+            // Parse context JSON to extract git_branch
+            let ctx_json: String = row.get(5)?;
+            let ctx: InputContext = serde_json::from_str(&ctx_json).unwrap_or_default();
+
+            // Parse input timestamp
+            let input_ts_str: String = row.get(1)?;
+            let input_timestamp = DateTime::parse_from_rfc3339(&input_ts_str)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                .with_timezone(&Utc);
+
+            // Parse input type
+            let input_type_str: String = row.get(2)?;
+            let input_type = InputType::from_str(&input_type_str).ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    format!("Invalid input_type: {input_type_str}").into(),
+                )
+            })?;
+
+            // Parse output timestamp (optional)
+            let output_timestamp = if let Ok(Some(ts_str)) = row.get::<_, Option<String>>(8) {
+                DateTime::parse_from_rfc3339(&ts_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            } else {
+                None
+            };
+
+            Ok(ActivityEntry {
+                input_id: row.get(0)?,
+                timestamp: input_timestamp,
+                input_type,
+                prompt: row.get(3)?,
+                agent_role: row.get(4)?,
+                git_branch: ctx.branch,
+                output_preview: row.get(6)?,
+                exit_code: row.get(7)?,
+                output_timestamp,
+            })
+        })?;
+
+        entries.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 }
 

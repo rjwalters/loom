@@ -427,6 +427,40 @@ The installation includes:
 - `defaults/.claude/commands/install-loom.md` - Orchestration guide
 - `defaults/.loom/CLAUDE.md` - Target repo documentation template
 
+## Testing Strategy
+
+Loom uses a hybrid testing approach combining unit tests, integration tests, and manual E2E validation.
+
+### Test Stack
+
+- **Frontend**: Vitest with `@tauri-apps/api/mocks`
+- **Backend**: Rust integration tests with tmux
+- **Coverage**: 80% threshold (lines, functions, branches, statements)
+
+### Running Tests
+
+```bash
+pnpm test:unit              # Run all frontend unit tests
+pnpm test:unit:coverage     # With coverage report
+pnpm daemon:test            # Run daemon integration tests
+pnpm check:ci               # Full CI suite (REQUIRED before PR)
+```
+
+### What We Test
+
+- **Unit Tests**: State management, UI rendering, utility functions, IPC patterns (mocked)
+- **Integration Tests**: Daemon protocol, terminal lifecycle, security validation
+- **Manual E2E**: Full workflows (workspace start, agent launch, factory reset)
+
+### Key Features
+
+1. **Tauri Mocks**: Global WebCrypto polyfill + IPC mocks configured in `src/test/setup.ts`
+2. **UI Rendering Tests**: Comprehensive tests for all rendering functions with XSS protection
+3. **Fast Feedback**: ~20 seconds for 500+ frontend tests
+4. **Hybrid Strategy**: Why no automated E2E? See [Testing Guide](docs/testing/README.md) for full rationale
+
+**📖 Complete Guide**: [docs/testing/README.md](docs/testing/README.md)
+
 ## MCP Testing & Debugging
 
 Loom provides MCP servers for AI-powered testing:

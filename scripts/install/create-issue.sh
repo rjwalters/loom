@@ -53,12 +53,15 @@ EOF
 
 info "Creating installation issue..."
 
-# Create issue and capture the number
-ISSUE_NUMBER=$(gh issue create \
+# Create issue and capture the URL from output
+# (Compatible with older gh CLI versions that don't support --json)
+ISSUE_URL=$(gh issue create \
   --title "Install Loom ${LOOM_VERSION}" \
   --body "$ISSUE_BODY" \
-  --label "loom:in-progress" \
-  --json number --jq '.number')
+  --label "loom:in-progress" 2>&1 | grep -o 'https://[^ ]*')
+
+# Extract issue number from URL
+ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]*$')
 
 success "Created issue #${ISSUE_NUMBER}"
 

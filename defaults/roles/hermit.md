@@ -574,7 +574,7 @@ rg "functionName" --type ts
 **Reasoning**: [Why this risk level]
 
 EOF
-)" --label "loom:critic-suggestion"
+)" --label "loom:hermit"
 ```
 
 ### Example Issue

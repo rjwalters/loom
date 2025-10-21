@@ -188,6 +188,7 @@ fn main() {
             destroy_terminal,
             send_terminal_input,
             get_terminal_output,
+            get_terminal_activity,
             resize_terminal,
             check_session_health,
             list_available_sessions,

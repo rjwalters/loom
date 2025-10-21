@@ -108,11 +108,11 @@ EOF
 )
 
 # Create pull request
+# (Compatible with older gh CLI versions that don't support --json)
 PR_URL=$(gh pr create \
   --title "Install Loom ${LOOM_VERSION}" \
   --body "$PR_BODY" \
-  --label "loom:review-requested" \
-  --json url --jq '.url')
+  --label "loom:review-requested" 2>&1 | grep -o 'https://[^ ]*')
 
 success "Pull request created: $PR_URL"
 
