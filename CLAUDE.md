@@ -87,8 +87,13 @@ Loom provides specialized roles for different development tasks. Each role follo
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
-- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:issue`
+- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated`
 - **When to use**: Issue backlog maintenance, quality improvement
+
+**Champion** (Autonomous 10min, `champion.md`)
+- **Purpose**: Promote high-quality curated issues to approved status
+- **Workflow**: Evaluates `loom:curated` issues → promotes to `loom:issue` or provides feedback
+- **When to use**: Quality gate between curation and implementation
 
 **Architect** (Autonomous 15min, `architect.md`)
 - **Purpose**: Create architectural proposals
@@ -131,8 +136,8 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 **Issue Lifecycle**:
 ```
-(created) → loom:issue → loom:in-progress → (closed)
-           ↑ Curator      ↑ Builder
+(created) → loom:curated → loom:issue → loom:in-progress → (closed)
+           ↑ Curator      ↑ Champion  ↑ Builder
 ```
 
 **PR Lifecycle**:
