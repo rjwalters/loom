@@ -428,44 +428,61 @@ $ wc -l src/components/Button.tsx
 
 ### Integration with Autonomous Mode
 
-When running autonomously (every 15 minutes), the Critic should balance:
+When running autonomously (every 15 minutes), each Hermit run should **randomly select ONE check** to perform. This prevents duplicate issues when multiple Hermits run in parallel.
 
-**70% - Systematic Checks:**
-- Run depcheck for unused dependencies
-- Search for dead code (unused exports)
-- Find commented-out code
-- Check for TODOs/FIXMEs
+**Selection Strategy (Weighted Random):**
 
-**30% - Random File Review:**
-- Pick 1 random file
-- Quick scan (2-3 minutes)
-- Create issue only if high-value
+Each run randomly picks ONE check from this weighted distribution:
 
-**Rationale**: Systematic checks are more reliable but miss over-complexity. Random reviews complement them with opportunistic discovery.
+- **70% - Systematic Checks** (pick one at random):
+  1. **Unused dependencies**: `npx depcheck`
+  2. **Dead code**: Search for unused exports (`rg "export.*function|export.*class"`)
+  3. **Commented code**: Find commented-out code (`rg "^\\s*//.*{|^\\s*//.*function"`)
+  4. **Old TODOs**: Find TODOs/FIXMEs (`rg "TODO|FIXME" -n --context 2`)
+  5. **Large files**: Find files >300 lines that might need splitting
 
-**Example autonomous session:**
+- **30% - Random File Review**:
+  - Pick 1 random file via `mcp__loom-ui__get_random_file`
+  - Quick scan (2-3 minutes)
+  - Create issue only if high-value
+
+**Rationale for Randomization**:
+
+- **Prevents duplicates**: When 5 Hermits run in parallel, they perform different checks instead of all running depcheck simultaneously
+- **Better coverage**: Work distributed across bloat categories instead of focused on one area
+- **Scalable**: Works with 1 or 100 parallel Hermits
+- **Maintains balance**: Still 70% systematic, 30% opportunistic over time
+
+**Example Parallel Execution:**
 
 ```bash
-# Autonomous run 1 (systematic)
-cd {{workspace}}
-npx depcheck                    # Find unused dependencies
-# → Found 2 unused packages, create issue
+# 5 Hermits running simultaneously at 3:00 PM
 
-# Autonomous run 2 (random)
-mcp__loom-ui__get_random_file  # Pick random file
-cat <file-path>                 # Scan for simplification
+# Hermit Terminal 1 (random selection: dead-code)
+cd {{workspace}}
+rg "export.*function|export.*class" -n
+# Check which exports are never imported
+# → Found unused function, create issue
+
+# Hermit Terminal 2 (random selection: random-file)
+mcp__loom-ui__get_random_file
+cat <file-path>
 # → Found over-engineered class, create issue
 
-# Autonomous run 3 (systematic)
-rg "TODO|FIXME" -n              # Find old TODOs
-# → Found 5 TODOs > 6 months old, create issue
+# Hermit Terminal 3 (random selection: unused-dependencies)
+npx depcheck
+# → Found @types/jsdom, create issue
 
-# Autonomous run 4 (random)
-mcp__loom-ui__get_random_file  # Pick random file
-cat <file-path>                 # Scan for simplification
-# → File is clean, skip
+# Hermit Terminal 4 (random selection: commented-code)
+rg "^\\s*//.*{|^\\s*//.*function" -n
+# → Found old commented functions, create issue
 
-# Pattern: Alternate between systematic and random
+# Hermit Terminal 5 (random selection: old-todos)
+rg "TODO|FIXME" -n --context 2
+git log --all --format=%cd --date=short <file> | head -1
+# → Found TODOs from 2023, create issue
+
+# Result: All 5 Hermits performed different checks, no duplicates!
 ```
 
 ### Best Practices
