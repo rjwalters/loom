@@ -30,25 +30,59 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Helper function to selectively copy .loom configuration from defaults
+/// Only copies files/directories that belong in .loom/, not workspace root
+pub fn copy_loom_config(defaults_path: &Path, loom_path: &Path) -> Result<(), String> {
+    fs::create_dir_all(loom_path)
+        .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
+
+    // Files/directories that should be copied to .loom/
+    // Note: README.md is handled separately via .loom-README.md copy
+    let loom_items = ["config.json", "roles", "scripts"];
+
+    for item in &loom_items {
+        let src = defaults_path.join(item);
+        let dst = loom_path.join(item);
+
+        if !src.exists() {
+            continue; // Skip if source doesn't exist
+        }
+
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)
+                .map_err(|e| format!("Failed to copy {item}: {e}"))?;
+        } else {
+            fs::copy(&src, &dst).map_err(|e| format!("Failed to copy {item}: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Helper function to setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+///
+/// Copies workspace-root files from defaults/.loom/ (templates for target repos).
+/// Note: defaults/CLAUDE.md and defaults/AGENTS.md are for the Loom repo itself (dogfooding).
 pub fn setup_repository_scaffolding(
     workspace_path: &Path,
     defaults_path: &Path,
 ) -> Result<(), String> {
-    // Copy CLAUDE.md if it doesn't exist
+    // Copy target-repo-specific CLAUDE.md from defaults/.loom/
+    // (NOT defaults/CLAUDE.md which is for Loom repo itself)
     let claude_md_dst = workspace_path.join("CLAUDE.md");
     if !claude_md_dst.exists() {
-        let claude_md_src = defaults_path.join("CLAUDE.md");
+        let claude_md_src = defaults_path.join(".loom").join("CLAUDE.md");
         if claude_md_src.exists() {
             fs::copy(&claude_md_src, &claude_md_dst)
                 .map_err(|e| format!("Failed to copy CLAUDE.md: {e}"))?;
         }
     }
 
-    // Copy AGENTS.md if it doesn't exist
+    // Copy target-repo-specific AGENTS.md from defaults/.loom/
+    // (NOT defaults/AGENTS.md which is for Loom repo itself)
     let agents_md_dst = workspace_path.join("AGENTS.md");
     if !agents_md_dst.exists() {
-        let agents_md_src = defaults_path.join("AGENTS.md");
+        let agents_md_src = defaults_path.join(".loom").join("AGENTS.md");
         if agents_md_src.exists() {
             fs::copy(&agents_md_src, &agents_md_dst)
                 .map_err(|e| format!("Failed to copy AGENTS.md: {e}"))?;
@@ -72,6 +106,16 @@ pub fn setup_repository_scaffolding(
         if codex_dir_src.exists() {
             copy_dir_recursive(&codex_dir_src, &codex_dir_dst)
                 .map_err(|e| format!("Failed to copy .codex directory: {e}"))?;
+        }
+    }
+
+    // Copy .github/ directory if it doesn't exist
+    let github_dir_dst = workspace_path.join(".github");
+    if !github_dir_dst.exists() {
+        let github_dir_src = defaults_path.join(".github");
+        if github_dir_src.exists() {
+            copy_dir_recursive(&github_dir_src, &github_dir_dst)
+                .map_err(|e| format!("Failed to copy .github directory: {e}"))?;
         }
     }
 
@@ -247,11 +291,10 @@ pub fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), 
         return Err("Workspace already initialized (.loom directory exists)".to_string());
     }
 
-    // Copy defaults to .loom
+    // Copy defaults to .loom (only .loom-specific files, not workspace root files)
     let defaults = resolve_defaults_path(defaults_path)?;
 
-    copy_dir_recursive(&defaults, &loom_path)
-        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+    copy_loom_config(&defaults, &loom_path)?;
 
     // Copy workspace-specific README (overwriting defaults/README.md)
     let loom_readme_src = defaults.join(".loom-README.md");
@@ -383,11 +426,10 @@ pub fn reset_workspace_to_defaults(
         fs::remove_dir_all(&loom_path).map_err(|e| format!("Failed to delete .loom: {e}"))?;
     }
 
-    // Copy defaults back
+    // Copy defaults back (only .loom-specific files, not workspace root files)
     let defaults = resolve_defaults_path(defaults_path)?;
 
-    copy_dir_recursive(&defaults, &loom_path)
-        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+    copy_loom_config(&defaults, &loom_path)?;
 
     // Copy workspace-specific README (overwriting defaults/README.md)
     let loom_readme_src = defaults.join(".loom-README.md");
