@@ -57,7 +57,7 @@ while true; do
   # Clean up any existing local branch with this name
   if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
     info "Removing existing local branch: $BRANCH_NAME"
-    git branch -D "$BRANCH_NAME" 2>/dev/null || true
+    git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
   fi
 
   # Try to create worktree with this branch name
