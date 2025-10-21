@@ -43,7 +43,11 @@ git add -A
 
 # Check if there are changes to commit
 if git diff --staged --quiet; then
-  error "No changes to commit"
+  info "No changes to commit - Loom is already installed"
+  info "Skipping commit and PR creation"
+  # Exit successfully with a special marker that the caller can detect
+  echo "NO_CHANGES_NEEDED"
+  exit 0
 fi
 
 # Create commit message

@@ -322,6 +322,29 @@ fi
 PR_URL=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER") || \
   error "Failed to create pull request"
 
+# Check if installation was already complete (no changes needed)
+if [[ "$PR_URL" == "NO_CHANGES_NEEDED" ]]; then
+  info "Loom is already installed - cleaning up..."
+
+  # Close the tracking issue
+  cd "$TARGET_PATH"
+  gh issue close "${ISSUE_NUMBER}" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
+
+  # Remove the worktree
+  git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
+  git branch -D "${BRANCH_NAME}" 2>/dev/null || true
+
+  # Disable error trap and exit successfully
+  trap - EXIT
+
+  echo ""
+  success "Loom is already installed in this repository"
+  echo ""
+  info "No pull request was created because all files are up to date."
+  echo ""
+  exit 0
+fi
+
 if [[ ! "$PR_URL" =~ ^https:// ]]; then
   error "Invalid PR URL returned: $PR_URL"
 fi
