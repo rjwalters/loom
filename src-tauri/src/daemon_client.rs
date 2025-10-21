@@ -49,6 +49,10 @@ pub enum Request {
         id: TerminalId,
         worktree_path: String,
     },
+    GetTerminalActivity {
+        id: TerminalId,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,6 +64,7 @@ pub enum Response {
     TerminalOutput { output: String, byte_count: usize },
     SessionHealth { has_session: bool },
     AvailableSessions { sessions: Vec<String> },
+    TerminalActivity { entries: Vec<ActivityEntry> },
     Success,
     Error { message: String },
 }
@@ -71,6 +76,19 @@ pub struct TerminalInfo {
     pub tmux_session: String,
     pub working_dir: Option<String>,
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    pub input_id: i64,
+    pub timestamp: String,
+    pub input_type: String,
+    pub prompt: String,
+    pub agent_role: Option<String>,
+    pub git_branch: Option<String>,
+    pub output_preview: Option<String>,
+    pub exit_code: Option<i32>,
+    pub output_timestamp: Option<String>,
 }
 
 pub struct DaemonClient {

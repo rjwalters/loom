@@ -323,6 +323,24 @@ fn handle_request(
             }
         }
 
+        Request::GetTerminalActivity { id, limit } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.get_terminal_activity(&id, limit) {
+                    Ok(entries) => Response::TerminalActivity { entries },
+                    Err(e) => {
+                        log::error!("Failed to get terminal activity: {e}");
+                        Response::Error {
+                            message: format!("Failed to get activity: {e}"),
+                        }
+                    }
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);
