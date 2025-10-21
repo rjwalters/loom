@@ -72,8 +72,8 @@ while true; do
   SUFFIX=$((SUFFIX + 1))
 
   # Safety limit to prevent infinite loop
-  if [[ $SUFFIX -gt 100 ]]; then
-    error "Could not find available branch name after 100 attempts"
+  if [[ $SUFFIX -gt 10 ]]; then
+    error "Could not find available branch name after 10 attempts"
   fi
 done
 
