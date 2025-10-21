@@ -37,7 +37,8 @@ pub fn copy_loom_config(defaults_path: &Path, loom_path: &Path) -> Result<(), St
         .map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
     // Files/directories that should be copied to .loom/
-    let loom_items = ["config.json", "README.md", "roles", "scripts"];
+    // Note: README.md is handled separately via .loom-README.md copy
+    let loom_items = ["config.json", "roles", "scripts"];
 
     for item in &loom_items {
         let src = defaults_path.join(item);
