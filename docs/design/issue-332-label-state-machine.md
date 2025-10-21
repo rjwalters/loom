@@ -23,7 +23,7 @@ The current label workflow has several issues:
 
 | Label | Color | Set By | Meaning |
 |-------|-------|--------|---------|
-| `loom:architect` | 🔵 #3B82F6 | Architect | Proposal awaiting human review |
+| `loom:architect` | 🟣 #9333EA | Architect | Proposal awaiting human review |
 | `loom:hermit` | 🟣 #9333EA | Critic | Removal/simplification awaiting review |
 | `loom:curated` | 🟢 #10B981 | Curator | Enhanced with implementation details |
 | `loom:issue` | 🔵 #3B82F6 | **Human** | **Approved for work** (replaces `loom:ready`) |
@@ -227,7 +227,7 @@ The current label workflow has several issues:
 
 ```bash
 # Create new labels
-gh label create "loom:architect" --color "3B82F6" --description "Architect proposal awaiting human review"
+gh label create "loom:architect" --color "9333EA" --description "Architect proposal awaiting human review"
 gh label create "loom:curated" --color "10B981" --description "Enhanced by Curator, awaiting human approval"
 gh label edit "loom:issue" --color "3B82F6" --description "Approved for work by human (replaces loom:ready)"
 ```
