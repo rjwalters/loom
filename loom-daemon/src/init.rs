@@ -14,6 +14,75 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// Extract repository owner and name from git remote URL
+///
+/// Parses both HTTPS and SSH git remote URLs to extract owner/repo.
+/// Returns None if git remote is not available or URL format is unexpected.
+///
+/// # Examples
+///
+/// ```ignore
+/// // HTTPS: https://github.com/owner/repo.git -> Some(("owner", "repo"))
+/// // SSH: git@github.com:owner/repo.git -> Some(("owner", "repo"))
+/// ```
+fn extract_repo_info(workspace_path: &Path) -> Option<(String, String)> {
+    // Get git remote URL
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(workspace_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let remote_url = String::from_utf8(output.stdout).ok()?;
+    let remote_url = remote_url.trim();
+
+    // Parse HTTPS URL: https://github.com/owner/repo.git
+    if let Some(https_path) = remote_url.strip_prefix("https://github.com/") {
+        let path = https_path.strip_suffix(".git").unwrap_or(https_path);
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    // Parse SSH URL: git@github.com:owner/repo.git
+    if let Some(ssh_path) = remote_url.strip_prefix("git@github.com:") {
+        let path = ssh_path.strip_suffix(".git").unwrap_or(ssh_path);
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    None
+}
+
+/// Replace template variables in a string
+///
+/// Replaces the following template variables:
+/// - `{{REPO_OWNER}}`: Repository owner from git remote
+/// - `{{REPO_NAME}}`: Repository name from git remote
+///
+/// If repo info is not available (non-GitHub remote or no remote),
+/// falls back to generic placeholders.
+fn substitute_template_variables(
+    content: &str,
+    repo_owner: Option<&str>,
+    repo_name: Option<&str>,
+) -> String {
+    let owner = repo_owner.unwrap_or("OWNER");
+    let name = repo_name.unwrap_or("REPO");
+
+    content
+        .replace("{{REPO_OWNER}}", owner)
+        .replace("{{REPO_NAME}}", name)
+}
 
 /// Initialize a Loom workspace in the target directory
 ///
@@ -272,14 +341,21 @@ fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Setup repository scaffolding files
 ///
-/// Copies CLAUDE.md, AGENTS.md, .claude/, and .codex/ to the workspace.
+/// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
 /// - Force mode: Overwrites existing files/directories
 /// - Non-force mode: Merges directories (copies missing files, keeps existing ones)
+/// - Template variables: Substitutes `{{REPO_OWNER}}` and `{{REPO_NAME}}` in workflow files
 fn setup_repository_scaffolding(
     workspace_path: &Path,
     defaults_path: &Path,
     force: bool,
 ) -> Result<(), String> {
+    // Extract repository owner and name for template substitution
+    let repo_info = extract_repo_info(workspace_path);
+    let (repo_owner, repo_name) = match repo_info {
+        Some((owner, name)) => (Some(owner), Some(name)),
+        None => (None, None),
+    };
     // Helper to copy file with force logic
     let copy_file = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
         if src.exists() {
@@ -346,6 +422,23 @@ fn setup_repository_scaffolding(
         &workspace_path.join(".github"),
         ".github directory",
     )?;
+
+    // Process workflow files with template variable substitution
+    let workflow_file = workspace_path
+        .join(".github")
+        .join("workflows")
+        .join("label-external-issues.yml");
+
+    if workflow_file.exists() {
+        let content = fs::read_to_string(&workflow_file)
+            .map_err(|e| format!("Failed to read workflow file: {e}"))?;
+
+        let substituted =
+            substitute_template_variables(&content, repo_owner.as_deref(), repo_name.as_deref());
+
+        fs::write(&workflow_file, substituted)
+            .map_err(|e| format!("Failed to write workflow file: {e}"))?;
+    }
 
     // Note: scripts/ is now copied earlier in initialize_workspace()
     // to .loom/scripts/ along with other .loom-specific files
