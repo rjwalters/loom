@@ -1,50 +1,244 @@
 # Getting Started with Loom
 
-This guide will walk you through setting up Loom for the first time, whether you prefer using the GUI application or the headless CLI approach.
+This comprehensive guide walks you through installing and setting up Loom, whether you're an end user wanting to use Loom in your repository or a contributor building Loom itself.
 
 ## Table of Contents
 
+- [Before You Install](#before-you-install)
 - [Prerequisites](#prerequisites)
 - [Installation Options](#installation-options)
-  - [Option 1: GUI Installation (Recommended)](#option-1-gui-installation-recommended)
-  - [Option 2: CLI Installation (Headless)](#option-2-cli-installation-headless)
+  - [Option 1: Download Binary (Easiest)](#option-1-download-binary-easiest)
+  - [Option 2: Build from Source](#option-2-build-from-source)
+  - [Option 3: Interactive Install Script](#option-3-interactive-install-script)
+  - [Option 4: GUI Application](#option-4-gui-application)
 - [First-Time Setup](#first-time-setup)
 - [Verifying Your Setup](#verifying-your-setup)
 - [Next Steps](#next-steps)
 - [Troubleshooting](#troubleshooting)
 
+## Before You Install
+
+### What Loom Does
+
+Loom transforms your repository into an AI-orchestrated workspace where agents coordinate through GitHub issues, PRs, and labels. Each terminal can embody a specialized role (Worker, Curator, Architect, Reviewer) working autonomously or on-demand.
+
+### What Gets Installed
+
+Running `loom-daemon init` creates these files in your repository:
+
+**Configuration (Commit these)**:
+- `.loom/config.json` - Terminal settings and role assignments
+- `.loom/roles/` - Custom agent role definitions (optional)
+
+**Documentation (Commit these)**:
+- `CLAUDE.md` - AI context document for Claude Code (11KB template)
+- `AGENTS.md` - Workflow coordination guide for agents
+
+**Tooling (Commit these)**:
+- `.claude/commands/` - Claude Code slash commands for each role
+- `.codex/` - Codex configuration (if available)
+- `.github/labels.yml` - Workflow label definitions
+
+**Gitignored (Local only)**:
+- `.loom/state.json` - Runtime terminal state
+- `.loom/worktrees/` - Git worktrees for isolated work
+- `.loom/*.log` - Application log files
+
+### What Gets Modified
+
+- **`.gitignore`** - Adds patterns for `.loom/state.json`, `.loom/worktrees/`, `~/.loom/console.log`, etc.
+
+That's it! Loom is non-invasive and everything important can be committed to version control so your team shares the same agent configuration.
+
 ## Prerequisites
 
-Before installing Loom, ensure you have:
+### For End Users (Using Loom)
 
-1. **macOS** (Loom is currently macOS-only)
-2. **Git repository** - Loom works within git repositories
-3. **tmux** - Terminal multiplexer (usually pre-installed on macOS)
-4. **Claude Code** - For AI agent integration (optional but recommended)
+Minimal requirements to use Loom:
 
-To verify prerequisites:
+1. **macOS** (currently macOS-only, Linux support planned)
+2. **Git repository** (any existing project)
+3. **tmux** (usually pre-installed on macOS)
+   ```bash
+   # Verify tmux is installed
+   tmux -V
+
+   # Install if needed (macOS)
+   brew install tmux
+   ```
+4. **Claude Code** (optional, for AI agents)
+   ```bash
+   # Verify Claude Code is installed
+   claude --version
+
+   # See https://claude.com/claude-code for installation
+   ```
+
+That's all you need to use Loom!
+
+### For Contributors (Developing Loom)
+
+Additional requirements to build and contribute to Loom:
+
+1. **Rust** (for Tauri backend compilation)
+   ```bash
+   # Install Rust via rustup (recommended)
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+   # Verify installation
+   rustc --version
+   cargo --version
+   ```
+
+2. **System Dependencies** (for Tauri)
+
+   **macOS:**
+   ```bash
+   xcode-select --install
+   ```
+
+   **Linux (Ubuntu/Debian):**
+   ```bash
+   sudo apt update
+   sudo apt install libwebkit2gtk-4.0-dev \
+     build-essential \
+     curl \
+     wget \
+     file \
+     libssl-dev \
+     libgtk-3-dev \
+     libayatana-appindicator3-dev \
+     librsvg2-dev
+   ```
+
+3. **Node.js** (v18 or later)
+   ```bash
+   # Install via nvm (recommended)
+   nvm install 18
+
+   # Verify installation
+   node --version  # Should be v18+
+   ```
+
+4. **pnpm** (package manager)
+   ```bash
+   npm install -g pnpm
+
+   # Verify installation
+   pnpm --version
+   ```
+
+5. **GitHub CLI** (optional, for agent workflows)
+   ```bash
+   # macOS
+   brew install gh
+
+   # Linux - see https://cli.github.com/
+
+   # Authenticate
+   gh auth login
+   ```
+
+To verify all prerequisites:
 
 ```bash
-# Check git
-git --version
+# Check Rust (contributors only)
+rustc --version && cargo --version
 
-# Check tmux
+# Check Node.js (contributors only)
+node --version
+
+# Check pnpm (contributors only)
+pnpm --version
+
+# Check tmux (all users)
 tmux -V
 
-# Check Claude Code (if using AI agents)
+# Check Claude Code (optional)
 claude --version
+
+# Check GitHub CLI (optional)
+gh --version
 ```
 
 ## Installation Options
 
-Loom supports two installation approaches:
+Choose the installation method that best fits your needs:
 
-1. **GUI Installation** - Launch the Loom app and select a workspace
-2. **CLI Installation** - Use `loom-daemon init` for headless setup
+### Option 1: Download Binary (Easiest)
 
-### Option 1: GUI Installation (Recommended)
+Perfect for end users who want to use Loom without building from source.
 
-The GUI provides the easiest getting-started experience with visual feedback and workspace management.
+```bash
+# Download latest release
+curl -L https://github.com/rjwalters/loom/releases/latest/download/loom-daemon -o loom-daemon
+chmod +x loom-daemon
+
+# Initialize your repository
+./loom-daemon init /path/to/your/repo
+```
+
+**What this does:**
+- Downloads the pre-built daemon binary
+- Makes it executable
+- Initializes your repository with Loom configuration
+
+**Next:** See [First-Time Setup](#first-time-setup) to explore what was created.
+
+### Option 2: Build from Source
+
+For contributors or users who want the latest development version.
+
+```bash
+# Clone Loom repository
+git clone https://github.com/rjwalters/loom
+cd loom
+
+# Install dependencies
+pnpm install
+
+# Build daemon
+pnpm daemon:build
+
+# Initialize your repository
+./target/release/loom-daemon init /path/to/your/repo
+```
+
+**What this does:**
+- Clones the Loom source code
+- Installs Node.js dependencies via pnpm
+- Builds the Rust daemon from source
+- Initializes your repository
+
+**Next:** See [DEVELOPMENT.md](../../DEVELOPMENT.md) for development workflow.
+
+### Option 3: Interactive Install Script
+
+Uses the install helper script for guided setup with validation.
+
+```bash
+# Clone Loom first (if you haven't)
+git clone https://github.com/rjwalters/loom
+cd loom
+
+# Build daemon
+pnpm daemon:build
+
+# Run interactive installer
+./scripts/install-loom.sh /path/to/your/repo
+```
+
+**What this provides:**
+- Git repository validation before making changes
+- Preview of what will be created
+- Confirmation prompts at each step
+- Clear error messages if prerequisites missing
+
+**Next:** Review the output to understand what was created.
+
+### Option 4: GUI Application
+
+Visual application with workspace management and terminal controls.
 
 #### Steps
 
@@ -67,63 +261,34 @@ The GUI provides the easiest getting-started experience with visual feedback and
 4. **Create Terminals**
    - Click "+" to create agent terminals
    - Configure each terminal's role via the settings icon
-   - Assign specialized roles (Builder, Judge, Curator, etc.)
+   - Assign specialized roles (Worker, Curator, Reviewer, etc.)
 
 5. **Start Working**
    - Terminals are now ready for manual commands or AI agents
    - See [WORKFLOWS.md](../../WORKFLOWS.md) for agent coordination patterns
 
-### Option 2: CLI Installation (Headless)
+**Next:** Configure terminal roles via the settings UI.
 
-Perfect for CI/CD pipelines, headless servers, or scripted setups.
+### Initialization Flags
 
-#### Steps
+The `loom-daemon init` command supports several flags for customization:
 
-1. **Build the Daemon** (if from source)
-   ```bash
-   cd /path/to/loom
-   cargo build --release -p loom-daemon
+```bash
+# Initialize current directory
+loom-daemon init
 
-   # Binary will be at: target/release/loom-daemon
-   ```
+# Initialize specific repository
+loom-daemon init /path/to/your/repo
 
-2. **Add to PATH** (optional)
-   ```bash
-   # Option A: Symlink to /usr/local/bin
-   ln -s /path/to/loom/target/release/loom-daemon /usr/local/bin/loom-daemon
+# Preview changes without applying them
+loom-daemon init --dry-run
 
-   # Option B: Add to PATH in shell config
-   echo 'export PATH="/path/to/loom/target/release:$PATH"' >> ~/.zshrc
-   source ~/.zshrc
-   ```
+# Overwrite existing .loom directory
+loom-daemon init --force
 
-3. **Initialize Your Repository**
-   ```bash
-   # Navigate to your git repository
-   cd /path/to/your/repo
-
-   # Initialize Loom workspace
-   loom-daemon init
-   ```
-
-4. **Verify Installation**
-   ```bash
-   # Check that .loom directory was created
-   ls -la .loom
-
-   # Should show:
-   # - config.json
-   # - roles/
-   # - README.md
-   ```
-
-5. **Review Configuration**
-   ```bash
-   # Check what was installed
-   cat .loom/config.json
-   cat CLAUDE.md
-   cat AGENTS.md
-   ```
+# Use custom defaults directory
+loom-daemon init --defaults ./custom-defaults
+```
 
 ## First-Time Setup
 
