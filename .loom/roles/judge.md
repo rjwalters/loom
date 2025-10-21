@@ -286,6 +286,84 @@ EOF
 )"
 ```
 
+## Creating Follow-Up Issues
+
+When reviewing PRs, you may approve code that is functional and correct, but identify opportunities for non-blocking improvements (refactoring, documentation, performance optimizations, etc.). Rather than letting these suggestions get lost in PR comments, create follow-up issues to track them.
+
+### When to Create Follow-Up Issues
+
+**Create follow-up issues for:**
+- Non-blocking improvements (refactoring, optimization)
+- Documentation enhancements
+- Future feature additions suggested by the PR
+- Technical debt discovered during review
+- Minor quality improvements not worth blocking the PR
+
+**Do NOT create follow-up issues for:**
+- Blocking issues (use "Changes Requested" instead)
+- Critical bugs (request changes to fix in current PR)
+- Issues already tracked elsewhere
+
+### How to Create Follow-Up Issues
+
+After deciding to approve a PR, but before adding the `loom:pr` label:
+
+```bash
+# Create unlabeled follow-up issue (Curator will enhance it)
+gh issue create --title "Add rate limiting to login endpoint" --body "$(cat <<'EOF'
+## Follow-up from PR #123
+
+While reviewing the authentication implementation in PR #123, identified an opportunity to add rate limiting to the login endpoint.
+
+**Suggested approach:**
+- Use existing rate-limit middleware
+- Apply 5 attempts per 15 minutes per IP
+- Return 429 status code when exceeded
+
+**Context**: PR #123 successfully implements core authentication, but rate limiting would improve security against brute-force attacks.
+EOF
+)"
+
+# Create additional follow-up issues as needed
+gh issue create --title "Document password reset flow in README" --body "..."
+
+# Then proceed with PR approval
+gh pr comment 123 --body "$(cat <<'EOF'
+✅ **Approved!** Authentication implementation is solid.
+
+Created follow-up issues for suggested improvements:
+- #124: Add rate limiting to login endpoint
+- #125: Document password reset flow in README
+
+Code quality is excellent, tests pass, ready to merge.
+EOF
+)"
+gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:pr"
+```
+
+### Follow-Up Issue Template
+
+Use this format for consistency:
+
+```markdown
+## Follow-up from PR #XXX
+
+[Brief description of the improvement opportunity]
+
+**Suggested approach:**
+- [Specific recommendation 1]
+- [Specific recommendation 2]
+
+**Context**: [Why this came up during review, why it wasn't blocking]
+```
+
+### Important Notes
+
+- **Create as unlabeled issues**: Curator will enhance them with full specs
+- **Reference the PR**: Always include "Follow-up from PR #XXX" in the body
+- **Be specific**: Provide enough context for Curator/Builder to understand
+- **Don't over-create**: Only track improvements that add real value
+
 ## Example Commands
 
 ```bash
