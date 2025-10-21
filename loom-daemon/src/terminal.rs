@@ -54,6 +54,24 @@ impl TerminalManager {
 
         log::info!("Creating tmux session: {tmux_session}, working_dir: {working_dir:?}");
 
+        // First, verify tmux server is responsive
+        let check_output = Command::new("tmux")
+            .args(["-L", "loom", "list-sessions"])
+            .output();
+
+        match check_output {
+            Ok(out) if !out.status.success() => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stderr.contains("no server running") {
+                    log::warn!("tmux server not running, will start on first session creation");
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to check tmux server status: {e}");
+            }
+            _ => {}
+        }
+
         let mut cmd = Command::new("tmux");
         cmd.args(["-L", "loom"]);
         cmd.args([
@@ -76,7 +94,17 @@ impl TerminalManager {
         log::info!("Tmux command completed with status: {result}");
 
         if !result.success() {
-            return Err(anyhow!("Failed to create tmux session"));
+            // Get more details about the failure
+            let stderr_output = Command::new("tmux")
+                .args(["-L", "loom", "list-sessions"])
+                .output();
+
+            if let Ok(out) = stderr_output {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                log::error!("tmux session creation failed. Server status: {stderr}");
+            }
+
+            return Err(anyhow!("Failed to create tmux session '{tmux_session}'"));
         }
 
         // Set up pipe-pane to capture all output to a file
@@ -91,10 +119,24 @@ impl TerminalManager {
 
         if !result.status.success() {
             let stderr = String::from_utf8_lossy(&result.stderr);
-            log::error!("pipe-pane failed: {stderr}");
-            return Err(anyhow!("Failed to set up pipe-pane: {stderr}"));
+            log::error!("pipe-pane failed for session {tmux_session}: {stderr}");
+
+            // Check if session still exists
+            let check = Command::new("tmux")
+                .args(["-L", "loom", "has-session", "-t", &tmux_session])
+                .output();
+
+            if let Ok(out) = check {
+                if out.status.success() {
+                    log::error!("Session {tmux_session} exists but pipe-pane setup failed");
+                } else {
+                    log::error!("Session {tmux_session} disappeared during pipe-pane setup!");
+                }
+            }
+
+            return Err(anyhow!("Failed to set up pipe-pane for {tmux_session}: {stderr}"));
         }
-        log::info!("pipe-pane setup successful");
+        log::info!("pipe-pane setup successful for session {tmux_session}");
 
         let info = TerminalInfo {
             id: id.clone(),
