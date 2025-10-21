@@ -1,7 +1,24 @@
 #!/usr/bin/env bash
 # Generate .claude/agents/ files from .loom/roles/ source files
-# This script ensures .loom/roles/ is the single source of truth for role definitions
-# while .claude/agents/ files are generated with YAML frontmatter for Claude Code
+#
+# CONTEXT: This script is used in the Loom repository during development.
+#
+# LOOM REPOSITORY (where this script runs):
+#   - Source of truth: defaults/roles/*.md
+#   - Generated files: defaults/.claude/agents/*.md
+#   - Purpose: Maintain default role definitions for distribution
+#
+# TARGET REPOSITORIES (after installation):
+#   - Loom copies defaults/roles/ → .loom/roles/
+#   - Loom copies defaults/.claude/agents/ → .claude/agents/
+#   - Files are pre-generated and ready to use
+#   - Regeneration NOT needed in target repos
+#
+# WHY THIS PATTERN?
+#   Claude Code agents cannot reference external files - they must be self-contained.
+#   We generate .claude/agents/ files with YAML frontmatter at build-time from a
+#   single source of truth (defaults/roles/), ensuring consistency without manual
+#   synchronization.
 
 set -euo pipefail
 
