@@ -3,6 +3,7 @@ import { saveCurrentConfiguration } from "./config";
 import { Logger } from "./logger";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
+import { showToast } from "./toast";
 
 const logger = Logger.forComponent("worker-modal");
 
@@ -82,7 +83,7 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
   // Get workspace path from state
   const workspacePath = state.getWorkspace();
   if (!workspacePath) {
-    alert("No workspace selected");
+    showToast("No workspace selected", "error");
     return;
   }
 
@@ -97,8 +98,10 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
 
     if (!hasApiKey) {
       logger.warn("ANTHROPIC_API_KEY not set", { workspacePath });
-      alert(
-        "Warning: ANTHROPIC_API_KEY not set in .env file.\n\nWorkers won't function without it. Add the key to your .env file and restart Loom."
+      showToast(
+        "Warning: ANTHROPIC_API_KEY not set in .env file. Workers won't function without it.",
+        "error",
+        5000
       );
     }
 
@@ -106,8 +109,10 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
     const hasClaudeCode = await invoke<boolean>("check_claude_code");
     if (!hasClaudeCode) {
       logger.warn("Claude Code not found in PATH", { workspacePath });
-      alert(
-        "Warning: Claude Code not found in PATH.\n\nWorkers won't function without it. Install with:\nnpm install -g @anthropic-ai/claude-code"
+      showToast(
+        "Warning: Claude Code not found in PATH. Install with: npm install -g @anthropic-ai/claude-code",
+        "error",
+        5000
       );
     }
 
@@ -167,7 +172,7 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
     };
     document.addEventListener("keydown", escapeHandler);
   } catch (error) {
-    alert(`Failed to open worker modal: ${error}`);
+    showToast(`Failed to open worker modal: ${error}`, "error");
   }
 }
 
@@ -198,12 +203,12 @@ async function launchWorker(
   const prompt = promptTextarea.value.trim();
 
   if (!name) {
-    alert("Please enter a worker name");
+    showToast("Please enter a worker name", "error");
     return;
   }
 
   if (!prompt) {
-    alert("Please enter a system prompt");
+    showToast("Please enter a system prompt", "error");
     return;
   }
 
@@ -262,6 +267,6 @@ async function launchWorker(
     state.setPrimary(id);
     renderFn();
   } catch (error) {
-    alert(`Failed to launch worker: ${error}`);
+    showToast(`Failed to launch worker: ${error}`, "error");
   }
 }

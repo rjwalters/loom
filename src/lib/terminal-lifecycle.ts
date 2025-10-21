@@ -4,6 +4,7 @@ import { Logger } from "./logger";
 import { startOfflineScheduler } from "./offline-scheduler";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-lifecycle");
 
@@ -204,7 +205,7 @@ export async function launchAgentsForTerminals(
       launchedTerminalIds.push(terminal.id);
 
       // Show error to user so they know what failed
-      alert(errorMessage);
+      showToast(errorMessage, "error", 5000);
 
       // Continue with other terminals even if one fails
     }
@@ -404,10 +405,10 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
   } catch (error) {
     logger.error("Failed to reconnect terminals", error as Error);
     // Non-fatal - workspace is still loaded
-    alert(
-      `Warning: Could not reconnect to daemon terminals.\n\n` +
-        `Error: ${error}\n\n` +
-        `Terminals may need to be recreated. Check Help → Daemon Status for more info.`
+    showToast(
+      `Warning: Could not reconnect to daemon terminals. Error: ${error}. Terminals may need to be recreated.`,
+      "error",
+      7000
     );
   }
 }

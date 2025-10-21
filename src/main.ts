@@ -25,6 +25,7 @@ import {
 // NOTE: saveCurrentConfig is defined locally in this file
 import { getTerminalManager } from "./lib/terminal-manager";
 import { initTheme, toggleTheme } from "./lib/theme";
+import { showToast } from "./lib/toast";
 import {
   renderHeader,
   renderLoadingState,
@@ -737,14 +738,14 @@ async function showDaemonStatusDialog() {
           initializeTerminalDisplay,
           saveCurrentConfig,
         });
-        alert("Terminal reconnection complete! Check the console for details.");
+        showToast("Terminal reconnection complete! Check the console for details.", "success");
       }
     } else {
       // Just show status without reconnect option
-      alert(`Daemon Status\n\n${statusText}\n\nSocket: ${status.socket_path}`);
+      showToast(`Daemon Status: ${statusText}. Socket: ${status.socket_path}`, "info", 5000);
     }
   } catch (error) {
-    alert(`Failed to get daemon status: ${error}`);
+    showToast(`Failed to get daemon status: ${error}`, "error");
   }
 }
 
