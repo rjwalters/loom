@@ -101,8 +101,15 @@ if [[ ${#CLOSED_ISSUE_WORKTREES[@]} -gt 0 ]]; then
 
   # Auto-remove in non-interactive mode
   if [ "$NON_INTERACTIVE" = true ]; then
-    echo "Non-interactive mode: skipping closed issue worktree removal"
-    echo "ℹ Run with manual confirmation to remove them"
+    echo "Non-interactive mode: automatically removing closed issue worktrees"
+    for entry in "${CLOSED_ISSUE_WORKTREES[@]}"; do
+      worktree_path="${entry%%:*}"
+      issue_num="${entry##*:}"
+      echo "Removing worktree for closed issue #$issue_num..."
+      git worktree remove "$worktree_path" --force
+      echo "✓ Removed: $worktree_path"
+    done
+    echo "✓ Removed ${#CLOSED_ISSUE_WORKTREES[@]} closed issue worktree(s)"
   else
     echo "Found ${#CLOSED_ISSUE_WORKTREES[@]} worktree(s) for closed issues."
     read -p "Force remove all closed issue worktrees? (y/N) " -n 1 -r
