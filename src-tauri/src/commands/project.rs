@@ -14,9 +14,8 @@ fn init_loom_directory(project_path: &Path) -> Result<(), String> {
     // Copy default config from defaults directory
     let defaults_dir = resolve_defaults_path("defaults")?;
 
-    // Copy entire defaults directory structure to .loom
-    super::workspace::copy_dir_recursive(&defaults_dir, &loom_dir)
-        .map_err(|e| format!("Failed to copy defaults: {e}"))?;
+    // Copy .loom-specific files (not workspace root files)
+    super::workspace::copy_loom_config(&defaults_dir, &loom_dir)?;
 
     // Copy .loom-README.md to .loom/README.md if it exists
     let loom_readme_src = defaults_dir.join(".loom-README.md");
