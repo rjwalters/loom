@@ -18,6 +18,7 @@ import {
   handleRunNowClick,
   startRename,
 } from "./terminal-actions";
+import { showTerminalActivityModal } from "./terminal-activity-modal";
 import type { TerminalManager } from "./terminal-manager";
 import { showTerminalSettingsModal } from "./terminal-settings-modal";
 import { toggleTheme } from "./theme";
@@ -306,6 +307,20 @@ export function setupMainEventListeners(deps: {
         const id = runNowBtn.getAttribute("data-terminal-id");
         if (id) {
           handleRunNowClick(id, { state });
+        }
+        return;
+      }
+
+      // Handle Show Activity button clicks
+      const activityBtn = target.closest(".show-activity-btn");
+      if (activityBtn) {
+        e.stopPropagation();
+        const id = activityBtn.getAttribute("data-terminal-id");
+        if (id) {
+          const terminal = state.getTerminal(id);
+          if (terminal) {
+            showTerminalActivityModal(id, terminal.name);
+          }
         }
         return;
       }

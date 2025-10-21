@@ -14,7 +14,7 @@ mod dependency_checker;
 mod logging;
 mod mcp_watcher;
 
-use daemon_client::{DaemonClient, Request, Response, TerminalInfo};
+use daemon_client::{ActivityEntry, DaemonClient, Request, Response, TerminalInfo};
 
 // App state to hold CLI workspace argument
 #[derive(Default)]
@@ -135,6 +135,27 @@ async fn get_terminal_output(
         Response::TerminalOutput { output, byte_count } => {
             Ok(TerminalOutput { output, byte_count })
         }
+        Response::Error { message } => Err(message),
+        _ => Err("Unexpected response".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn get_terminal_activity(
+    terminal_id: String,
+    limit: usize,
+) -> Result<Vec<ActivityEntry>, String> {
+    let client = DaemonClient::new().map_err(|e| e.to_string())?;
+    let response = client
+        .send_request(Request::GetTerminalActivity {
+            id: terminal_id,
+            limit,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    match response {
+        Response::TerminalActivity { entries } => Ok(entries),
         Response::Error { message } => Err(message),
         _ => Err("Unexpected response".to_string()),
     }
@@ -1713,6 +1734,7 @@ fn main() {
             destroy_terminal,
             send_terminal_input,
             get_terminal_output,
+            get_terminal_activity,
             resize_terminal,
             check_session_health,
             check_daemon_health,

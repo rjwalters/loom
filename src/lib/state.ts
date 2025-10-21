@@ -69,6 +69,31 @@ export interface InputRequest {
 }
 
 /**
+ * Represents a single activity entry (input + output) from terminal history.
+ * Used for displaying terminal activity timeline in the activity modal.
+ */
+export interface ActivityEntry {
+  /** Unique database ID for this input */
+  inputId: number;
+  /** ISO 8601 timestamp of when the input was sent */
+  timestamp: string;
+  /** Type of input: manual, autonomous, system, or user_instruction */
+  inputType: "manual" | "autonomous" | "system" | "user_instruction";
+  /** The full prompt/command text */
+  prompt: string;
+  /** Agent role at time of input (e.g., "builder", "judge") */
+  agentRole: string | null;
+  /** Git branch at time of input */
+  gitBranch: string | null;
+  /** Preview of terminal output (first ~1KB) */
+  outputPreview: string | null;
+  /** Exit code from command (0 = success, non-zero = error) */
+  exitCode: number | null;
+  /** ISO 8601 timestamp of output (if captured) */
+  outputTimestamp: string | null;
+}
+
+/**
  * Represents a terminal instance in the application.
  * Terminals can be plain shells or AI agents with specialized roles.
  */

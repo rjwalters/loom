@@ -624,6 +624,15 @@ function createMiniTerminalHTML(
                 ${createRestartButtonHTML(terminal, "mini")}
                 ${createRunNowButtonHTML(terminal, "mini")}
                 <button
+                  class="show-activity-btn text-gray-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors text-base"
+                  data-terminal-id="${terminal.id}"
+                  data-tooltip="View activity"
+                  data-tooltip-position="top"
+                  title="View activity"
+                >
+                  📊
+                </button>
+                <button
                   class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
                   data-terminal-id="${terminal.id}"
                   data-tooltip="Close terminal"
