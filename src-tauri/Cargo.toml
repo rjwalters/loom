@@ -29,6 +29,7 @@ dirs = "5.0"
 dotenvy = "0.15"
 chrono = "0.4"
 notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3.8"
