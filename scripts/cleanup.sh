@@ -1,7 +1,35 @@
 #!/bin/bash
 # Loom Cleanup Script - Remove build artifacts and orphaned worktrees
+#
+# AGENT USAGE INSTRUCTIONS:
+#   This script cleans up Loom build artifacts and orphaned worktrees.
+#
+#   Non-interactive mode (for Claude Code):
+#     ./scripts/cleanup.sh --yes
+#     ./scripts/cleanup.sh -y
+#
+#   Interactive mode (prompts for confirmation):
+#     ./scripts/cleanup.sh
+#
+#   What this script does:
+#     1. Removes target/ directory (Rust build artifacts)
+#     2. Removes node_modules/ directory (Node dependencies)
+#     3. Prunes orphaned git worktrees (with confirmation unless --yes)
+#
+#   After running, restore dependencies with: pnpm install
 
 set -e  # Exit on error
+
+# Parse command line arguments
+NON_INTERACTIVE=false
+for arg in "$@"; do
+  case $arg in
+    -y|--yes)
+      NON_INTERACTIVE=true
+      shift
+      ;;
+  esac
+done
 
 echo "🧹 Loom Cleanup"
 echo ""
@@ -44,13 +72,21 @@ PRUNE_OUTPUT=$(git worktree prune --dry-run --verbose 2>&1 || true)
 if [ -n "$PRUNE_OUTPUT" ]; then
   echo "$PRUNE_OUTPUT"
   echo ""
-  read -p "Remove orphaned worktrees? (y/N) " -n 1 -r
-  echo
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
+
+  # Auto-confirm in non-interactive mode
+  if [ "$NON_INTERACTIVE" = true ]; then
+    echo "Non-interactive mode: automatically removing orphaned worktrees"
     git worktree prune --verbose
     echo "✓ Orphaned worktrees removed"
   else
-    echo "ℹ Skipped worktree cleanup"
+    read -p "Remove orphaned worktrees? (y/N) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+      git worktree prune --verbose
+      echo "✓ Orphaned worktrees removed"
+    else
+      echo "ℹ Skipped worktree cleanup"
+    fi
   fi
 else
   echo "✓ No orphaned worktrees found"
