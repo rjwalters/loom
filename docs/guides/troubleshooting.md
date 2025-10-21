@@ -4,6 +4,47 @@ This guide helps you diagnose and fix common issues in Loom.
 
 ## Common Issues
 
+### Installation Issues
+
+**Symptom:** `./install.sh` fails during the Full Install workflow at Step 3: Creating Installation Worktree
+
+**Error message:**
+```
+✗ Error: Invalid worktree path returned: HEAD is now at...
+.loom/worktrees/issue-XXX
+```
+
+**Cause:** This was a bug in versions prior to v0.1.1 where the `create-worktree.sh` script didn't properly redirect git output, causing the installation script to receive multi-line output instead of the expected pipe-delimited format.
+
+**Solution:**
+1. **Update to latest version** (v0.1.1+):
+   ```bash
+   cd /path/to/loom
+   git pull
+   pnpm daemon:build
+   ```
+
+2. **Or manually fix** (if using older version):
+   - Edit `scripts/install/create-worktree.sh`
+   - Find line with `git worktree add -b "$BRANCH_NAME"`
+   - Change `2>/dev/null` to `>&2 2>&1`
+   - This redirects git's output to stderr, keeping stdout clean
+
+3. **Cleanup and retry:**
+   ```bash
+   # Clean up any partial installation
+   cd /path/to/target-repo
+   git worktree list  # Find orphaned worktrees
+   git worktree remove .loom/worktrees/issue-XXX --force
+   git branch -D feature/loom-installation-X
+   gh issue close XXX --comment "Retrying installation"
+
+   # Retry installation
+   /path/to/loom/install.sh /path/to/target-repo
+   ```
+
+**Note:** This issue only affects the Full Install workflow (Option 2). The Quick Install workflow (Option 1) is unaffected.
+
 ### Daemon Won't Start
 
 **Symptom:** Red daemon indicator, "Disconnected" status in the UI
