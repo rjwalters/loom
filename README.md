@@ -180,7 +180,101 @@ GitHub shows the whole lifecycle — Loom orchestrates it through labels and aut
 
 ---
 
+## 📋 Prerequisites
+
+Before installing Loom, ensure you have these tools installed:
+
+### Required Tools
+
+1. **Rust** (for Tauri backend compilation)
+   ```bash
+   # Install Rust via rustup (recommended)
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+   # Verify installation
+   rustc --version
+   cargo --version
+   ```
+
+   **Alternative:** Download from https://www.rust-lang.org/tools/install
+
+2. **System Dependencies** (for Tauri)
+
+   **macOS:**
+   ```bash
+   xcode-select --install
+   ```
+
+   **Linux (Ubuntu/Debian):**
+   ```bash
+   sudo apt update
+   sudo apt install libwebkit2gtk-4.0-dev \
+     build-essential \
+     curl \
+     wget \
+     file \
+     libssl-dev \
+     libgtk-3-dev \
+     libayatana-appindicator3-dev \
+     librsvg2-dev
+   ```
+
+   See [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/) for other platforms.
+
+3. **Node.js** (v18 or later)
+   ```bash
+   # Install via nvm (recommended)
+   nvm install 18
+
+   # Verify installation
+   node --version  # Should be v18+
+   ```
+
+4. **pnpm** (package manager)
+   ```bash
+   npm install -g pnpm
+
+   # Verify installation
+   pnpm --version
+   ```
+
+5. **GitHub CLI** (optional, for agent workflows)
+   ```bash
+   # macOS
+   brew install gh
+
+   # Linux
+   # See https://cli.github.com/ for installation instructions
+
+   # Authenticate
+   gh auth login
+   ```
+
+### Verify Your Setup
+
+Run these commands to verify all prerequisites are installed:
+
+```bash
+# Check Rust
+rustc --version && cargo --version
+
+# Check Node.js
+node --version
+
+# Check pnpm
+pnpm --version
+
+# Check GitHub CLI (optional)
+gh --version
+```
+
+If all commands succeed, you're ready to proceed!
+
+---
+
 ## ⚙️ Development Setup
+
+**Prerequisites:** Ensure you've completed the [Prerequisites](#-prerequisites) section above.
 
 ```bash
 # Clone the repository
@@ -190,11 +284,32 @@ cd loom
 # Install dependencies
 pnpm install
 
+# Build daemon (first time only)
+pnpm daemon:build
+
 # Start development environment (daemon + GUI)
 pnpm run app:dev
 ```
 
 **For detailed development workflows, troubleshooting, and advanced usage, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).**
+
+### Common Installation Issues
+
+**Error: `cargo: command not found`**
+- **Cause:** Rust is not installed
+- **Solution:** Install Rust following the [Prerequisites](#-prerequisites) section
+
+**Error: `failed to run 'cargo metadata'`**
+- **Cause:** Rust is not in PATH after installation
+- **Solution:** Restart your terminal or run `source $HOME/.cargo/env`
+
+**Error: Package dependencies failed**
+- **Cause:** System libraries missing (Linux)
+- **Solution:** Install Tauri system dependencies for your platform
+
+**Error: `pnpm: command not found`**
+- **Cause:** pnpm is not installed
+- **Solution:** Run `npm install -g pnpm`
 
 ---
 
