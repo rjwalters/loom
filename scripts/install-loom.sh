@@ -212,7 +212,8 @@ success "loom-daemon binary ready"
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
-"$LOOM_ROOT/target/release/loom-daemon" init . || \
+# Use --force in case .loom already exists in the target repo
+"$LOOM_ROOT/target/release/loom-daemon" init --force . || \
   error "loom-daemon init failed"
 
 echo ""
