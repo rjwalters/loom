@@ -399,7 +399,7 @@ Each role consists of two files:
 
 Roles coordinate work through GitHub labels (see [WORKFLOWS.md](WORKFLOWS.md) for complete details):
 
-1. **Architect** creates issues with `loom:architect-suggestion` label
+1. **Architect** creates issues with `loom:architect` label
 2. User reviews and removes label to approve
 3. **Curator** finds unlabeled issues, enhances them, marks as `loom:ready`
 4. **Worker** claims `loom:ready` issues, implements, creates PR with `loom:review-requested`
@@ -494,7 +494,7 @@ Agents create worktrees when claiming issues using the helper script:
 
 ```bash
 # Agent claims issue and creates worktree
-pnpm worktree 42
+./.loom/scripts/worktree.sh 42
 
 # This runs the helper script which:
 # 1. Validates issue number
@@ -535,12 +535,12 @@ There are **two completely different contexts** for worktrees in Loom, and this 
 **Agents start in the main workspace, not in worktrees.** Worktrees are created on-demand when claiming issues:
 
 - Agents begin in the main workspace directory (not isolated)
-- To work on an issue: `pnpm worktree <issue-number>` creates `.loom/worktrees/issue-{number}`
+- To work on an issue: `./.loom/scripts/worktree.sh <issue-number>` creates `.loom/worktrees/issue-{number}`
 - Helper script prevents nested worktrees and ensures proper paths
 - Multiple agents can work simultaneously by each claiming their own issue
 - Worktrees are named semantically by issue number, not terminal ID
 
-**For agents**: Use `pnpm worktree <issue>` when claiming an issue. Create feature branches in your worktree.
+**For agents**: Use `./.loom/scripts/worktree.sh <issue>` when claiming an issue. Create feature branches in your worktree.
 
 ### Context 2: Human Developers Working on Loom's Codebase (Dogfooding)
 
@@ -548,13 +548,13 @@ When **human developers** (not agents) want to work on Loom issues manually outs
 
 ```bash
 # ✅ CORRECT - Use the helper script
-pnpm worktree 84
+./.loom/scripts/worktree.sh 84
 
 # ✅ With custom branch name
-pnpm worktree 84 my-custom-branch
+./.loom/scripts/worktree.sh 84 my-custom-branch
 
 # ✅ Check if you're already in a worktree
-pnpm worktree --check
+./.loom/scripts/worktree.sh --check
 
 # ❌ WRONG - Don't run git worktree commands directly
 git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
@@ -572,21 +572,21 @@ git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 
 ```bash
 # Basic usage - creates worktree for issue #42
-pnpm worktree 42
+./.loom/scripts/worktree.sh 42
 # → Creates: .loom/worktrees/issue-42
 # → Branch: feature/issue-42
 
 # Custom branch name
-pnpm worktree 42 fix-critical-bug
+./.loom/scripts/worktree.sh 42 fix-critical-bug
 # → Creates: .loom/worktrees/issue-42
 # → Branch: feature/fix-critical-bug
 
 # Check current worktree status
-pnpm worktree --check
+./.loom/scripts/worktree.sh --check
 # → Shows: Current worktree path and branch (or confirms you're in main)
 
 # Show help
-pnpm worktree --help
+./.loom/scripts/worktree.sh --help
 ```
 
 **When to Use the Helper Script**:
@@ -600,12 +600,12 @@ pnpm worktree --help
 ```bash
 # 1. Starting work on issue #123 (from main workspace)
 cd /Users/rwalters/GitHub/loom
-pnpm worktree 123
+./.loom/scripts/worktree.sh 123
 cd .loom/worktrees/issue-123
 # Work on the issue, commit, push, create PR
 
 # 2. Check if you're in a worktree
-pnpm worktree --check
+./.loom/scripts/worktree.sh --check
 
 # 3. Returning to main after finishing
 cd /Users/rwalters/GitHub/loom
@@ -630,7 +630,7 @@ When agents running inside Loom work on issues:
 ```bash
 # 1. Claim issue and create worktree
 gh issue edit 42 --remove-label "loom:ready" --add-label "loom:in-progress"
-pnpm worktree 42
+./.loom/scripts/worktree.sh 42
 # → Creates: .loom/worktrees/issue-42
 # → Branch: feature/issue-42
 
@@ -1284,7 +1284,7 @@ mcp__loom-ui__trigger_factory_reset
 - ✅ No "command not found" or "duplicate session" errors
 - ✅ Console logs show successful agent launch sequence
 
-**Note**: Agents now start in the main workspace and create worktrees on-demand using `pnpm worktree <issue>` when claiming GitHub issues. This prevents resource waste and provides semantic naming (`.loom/worktrees/issue-42` instead of `terminal-1`).
+**Note**: Agents now start in the main workspace and create worktrees on-demand using `./.loom/scripts/worktree.sh <issue>` when claiming GitHub issues. This prevents resource waste and provides semantic naming (`.loom/worktrees/issue-42` instead of `terminal-1`).
 
 **Factory Reset + Start Workflow**:
 
