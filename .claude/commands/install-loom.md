@@ -1,8 +1,24 @@
 # Install Loom into Target Repository
 
-Orchestrate the complete Loom installation workflow including GitHub issue creation, worktree setup, label sync, and PR creation.
+**DEPRECATED**: This slash command is no longer used. The installation is now fully automated via shell scripts.
 
-## Prerequisites
+## Current Installation Method
+
+Use the `install.sh` script directly:
+
+```bash
+cd /path/to/loom
+./install.sh
+# Select option 2 for Full Install with Workflow
+```
+
+The installation is now orchestrated by `scripts/install-loom.sh` which directly executes all installation steps without requiring Claude Code.
+
+---
+
+## Legacy Documentation (For Reference Only)
+
+This command was originally designed to orchestrate the complete Loom installation workflow including GitHub issue creation, worktree setup, label sync, and PR creation.
 
 This command should be launched via the `install-loom.sh` wrapper script, which sets required environment variables:
 

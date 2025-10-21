@@ -222,6 +222,9 @@ git clone https://github.com/rjwalters/loom
 cd loom
 
 # Run interactive installer (will prompt for target repo if not provided)
+./install.sh
+
+# Or specify target repository directly
 ./install.sh /path/to/your/repo
 ```
 
@@ -229,8 +232,8 @@ cd loom
 - Interactive prompts for repository path
 - Shows exactly what will be installed before proceeding
 - Two installation methods:
-  - **Quick Install**: Direct installation with `loom-daemon init`
-  - **Full Install**: Creates GitHub issue, worktree, and PR for review
+  - **Quick Install (Option 1)**: Direct installation with `loom-daemon init`
+  - **Full Install (Option 2)**: Automated workflow with GitHub issue, worktree, and PR
 - Git repository validation
 - GitHub authentication checks (for Full Install)
 - Confirmation prompts at each step
@@ -240,17 +243,30 @@ cd loom
 - Personal projects or quick testing
 - Solo development
 - No need for GitHub issue tracking
+- Want minimal setup
 
 **When to use Full Install:**
 - Team projects requiring review
-- Want installation tracked in GitHub issue
-- Prefer git worktree isolation
-- Need labels synced to repository
+- Want installation tracked in GitHub issue and PR
+- Prefer git worktree isolation for clean separation
+- Need labels automatically synced to repository
+- Want to review changes before merging
+
+The Full Install workflow:
+1. Creates a GitHub issue to track the installation
+2. Creates a git worktree for isolated work
+3. Runs `loom-daemon init` in the worktree
+4. Syncs GitHub labels from `.github/labels.yml`
+5. Creates a pull request with all changes
+6. Automatic cleanup if any step fails
 
 **Advanced:** For programmatic installation without prompts, use:
 ```bash
+# Automated full workflow (no interactive prompts)
 ./scripts/install-loom.sh /path/to/your/repo
 ```
+
+This runs the complete Full Install workflow automatically.
 
 **Next:** Review the output to understand what was created.
 

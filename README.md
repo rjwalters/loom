@@ -174,16 +174,27 @@ pnpm daemon:build
 
 ```bash
 # Use the install helper (validates and confirms before applying)
-./scripts/install-loom.sh /path/to/your/repo
+./install.sh
 
-# This runs loom-daemon init with automatic validation
+# Or specify target repository directly
+./install.sh /path/to/your/repo
 ```
 
-The install script provides:
+The install script provides two workflows:
+- **Quick Install (Option 1)**: Direct installation using `loom-daemon init`
+- **Full Install (Option 2)**: Automated workflow with GitHub issue, worktree, and PR creation
+
+Both options include:
 - Git repository validation before making changes
 - Preview of what will be created
 - Confirmation prompts at each step
 - Clear error messages if prerequisites missing
+
+For programmatic installation, use:
+```bash
+# Automated full workflow (no prompts)
+./scripts/install-loom.sh /path/to/your/repo
+```
 
 #### Option 4: GUI Application
 
