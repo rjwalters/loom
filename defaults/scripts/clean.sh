@@ -230,7 +230,7 @@ if [[ -f "scripts/cleanup-branches.sh" ]]; then
   fi
 else
   # Manual branch cleanup for target repositories
-  branches=$(git branch | grep "feature/issue-" | sed 's/^[* ]*//' || true)
+  branches=$(git branch | grep "feature/issue-" | sed 's/^[*+ ]*//' || true)
 
   if [[ -z "$branches" ]]; then
     success "No feature branches found"
