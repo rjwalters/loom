@@ -35,7 +35,7 @@ The workflow with two-gate approval:
 
 ## Finding Work
 
-Use this command to find issues that need curation:
+Use this command to find issues that need curation (already filters out claimed issues):
 
 ```bash
 # Find issues without suggestion labels, curated, issue, or in-progress
@@ -50,6 +50,17 @@ Or simpler (may include some false positives):
 gh issue list --state=open --limit=20
 # Then manually check which ones need curation
 ```
+
+## Claiming Work
+
+**Before starting enhancement work on an issue, claim it to prevent duplicate work:**
+
+```bash
+# Claim the issue before starting enhancement
+gh issue edit <number> --add-label "loom:in-progress"
+```
+
+This signals to other Curators that you're working on this issue. The search command above already filters out claimed issues, so you won't see issues other Curators are enhancing.
 
 ## Triage: Ready or Needs Enhancement?
 
@@ -68,7 +79,8 @@ When you find an unlabeled issue, **first assess if it's already implementation-
 ✅ **Mark it `loom:curated` immediately** - the issue is already well-formed:
 
 ```bash
-gh issue edit <number> --add-label "loom:curated"
+# Signal completion by removing in-progress and adding curated
+gh issue edit <number> --remove-label "loom:in-progress" --add-label "loom:curated"
 ```
 
 **IMPORTANT**: Do NOT add `loom:issue` - only humans can approve work for implementation.
@@ -92,7 +104,7 @@ Issue #84: "Expand frontend unit test coverage"
 - ✅ Includes test plan (Phase 1, 2, 3 approach)
 - ✅ No dependencies mentioned
 
-→ Action: `gh issue edit 84 --add-label "loom:curated"`
+→ Action: `gh issue edit 84 --remove-label "loom:in-progress" --add-label "loom:curated"`
 → Result: Awaits human approval (`loom:issue`) before Worker can start
 ```
 
@@ -182,8 +194,8 @@ gh issue comment 100 --body "$(cat <<'EOF'
 EOF
 )"
 
-# 3. Mark as curated (human will approve with loom:issue)
-gh issue edit 100 --add-label "loom:curated"
+# 3. Mark as curated and unclaim (human will approve with loom:issue)
+gh issue edit 100 --remove-label "loom:in-progress" --add-label "loom:curated"
 ```
 
 ### When to Amend Description (Improve Original)
@@ -294,8 +306,8 @@ gh issue edit <number> --add-label "loom:blocked"
 ### When Dependencies Complete
 
 GitHub automatically checks boxes when issues close. When you see all boxes checked:
-1. Remove `loom:blocked` label
-2. Add `loom:curated` label
+1. Claim the issue if not already claimed: `gh issue edit <number> --add-label "loom:in-progress"`
+2. Remove `loom:blocked` label and add `loom:curated`: `gh issue edit <number> --remove-label "loom:blocked" --remove-label "loom:in-progress" --add-label "loom:curated"`
 3. Issue awaits human approval (`loom:issue`) before Workers can claim
 
 ## Issue Quality Checklist
@@ -316,11 +328,15 @@ Before marking an issue as `loom:curated`, ensure it has:
 ## Working Style
 
 - **Find work**: See "Finding Work" section above for commands
+- **Claim the issue**: Before starting enhancement work
+  ```bash
+  gh issue edit <number> --add-label "loom:in-progress"
+  ```
 - **Review issue**: Read description, check code references, understand context
 - **Enhance issue**: Add missing details, implementation options, test plans
-- **Mark curated** (NOT approved for work):
+- **Mark curated and unclaim** (NOT approved for work):
   ```bash
-  gh issue edit <number> --add-label "loom:curated"
+  gh issue edit <number> --remove-label "loom:in-progress" --add-label "loom:curated"
   ```
 - **NEVER add `loom:issue`**: Only humans can approve work for implementation
 - **Monitor workflow**: Check for `loom:blocked` issues that need help

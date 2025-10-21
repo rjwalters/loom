@@ -112,7 +112,7 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 **Hermit**: Identifies bloat, unused code, over-engineering. Creates removal proposals or adds simplification comments to existing issues.
 
-**Curator**: Enhances approved issues with implementation details, test plans, multiple options. Adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
+**Curator**: Enhances approved issues with implementation details, test plans, multiple options. Claims issues with `loom:in-progress` before starting, removes it and adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
 
 **Triage**: Dynamically prioritizes `loom:issue` issues, maintains top 3 as `loom:urgent` based on strategic impact and time sensitivity.
 
@@ -190,10 +190,16 @@ gh pr edit 50 --remove-label "loom:changes-requested" --remove-label "loom:in-pr
 ```bash
 # Find approved issues (no suggestion labels, not loom:issue/in-progress)
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
 
-# Enhance and mark as curated
-gh issue edit 42 --add-label "loom:curated"
+# Claim the issue before starting enhancement
+gh issue edit 42 --add-label "loom:in-progress"
+
+# Enhance issue (add details, test plans, implementation options)
+# ...
+
+# Mark as curated and unclaim
+gh issue edit 42 --remove-label "loom:in-progress" --add-label "loom:curated"
 ```
 
 ### User (Manual) Workflow
