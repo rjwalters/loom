@@ -4,6 +4,7 @@
       "Bash(gh:*)",
       "Bash(git:*)",
       "Bash(pnpm:*)",
+      "Bash(npx:*)",
       "Bash(cargo:*)",
       "Bash(node:*)",
       "Bash(./scripts/**:*)",
