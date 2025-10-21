@@ -106,7 +106,7 @@ cleanup_on_error() {
   fi
 }
 
-trap cleanup_on_error EXIT
+trap cleanup_on_error EXIT SIGINT SIGTERM
 
 # Validate arguments
 if [[ -z "$TARGET_PATH" ]]; then
@@ -335,7 +335,7 @@ if [[ "$PR_URL" == "NO_CHANGES_NEEDED" ]]; then
   git branch -D "${BRANCH_NAME}" 2>/dev/null || true
 
   # Disable error trap and exit successfully
-  trap - EXIT
+  trap - EXIT SIGINT SIGTERM
 
   echo ""
   success "Loom is already installed in this repository"
@@ -358,7 +358,7 @@ echo ""
 CURRENT_STEP="Complete"
 
 # Disable error trap - we completed successfully
-trap - EXIT
+trap - EXIT SIGINT SIGTERM
 
 echo ""
 header "╔═══════════════════════════════════════════════════════════╗"
