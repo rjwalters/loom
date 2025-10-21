@@ -56,8 +56,11 @@ DEFAULT_LABELS=(
 
 info "Removing default GitHub labels..."
 for label in "${DEFAULT_LABELS[@]}"; do
-  if gh label delete "$label" --yes 2>/dev/null; then
+  if output=$(gh label delete "$label" --yes 2>&1); then
     info "Deleted default label: $label"
+  elif ! echo "$output" | grep -qi "not found\|404"; then
+    # Only warn if it failed for a reason other than "not found" or 404
+    warning "Could not delete label '$label': $output"
   fi
 done
 
@@ -90,19 +93,33 @@ while IFS= read -r line; do
     fi
 
     # Try to create or update the label
-    if gh label list --json name --jq '.[].name' | grep -q "^${name}$"; then
+    # Use gh label list to check existence, suppressing grep's stderr only
+    if gh label list --json name --jq '.[].name' 2>&1 | grep -q "^${name}$" 2>/dev/null; then
       # Label exists, update it
-      if gh label edit "$name" --description "$description" --color "$color" 2>/dev/null; then
+      if output=$(gh label edit "$name" --description "$description" --color "$color" 2>&1); then
         info "Updated label: $name"
       else
         warning "Failed to update label: $name"
+        echo "$output" >&2
       fi
     else
       # Label doesn't exist, create it
-      if gh label create "$name" --description "$description" --color "$color" 2>/dev/null; then
+      if output=$(gh label create "$name" --description "$description" --color "$color" 2>&1); then
         info "Created label: $name"
       else
-        warning "Failed to create label: $name"
+        # Check if it failed because the label already exists
+        if echo "$output" | grep -q "already exists"; then
+          info "Label '$name' already exists, attempting update instead..."
+          if update_output=$(gh label edit "$name" --description "$description" --color "$color" 2>&1); then
+            info "Updated label: $name"
+          else
+            warning "Failed to update label: $name"
+            echo "$update_output" >&2
+          fi
+        else
+          warning "Failed to create label: $name"
+          echo "$output" >&2
+        fi
       fi
     fi
 
