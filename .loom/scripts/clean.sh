@@ -40,6 +40,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || \
 # Parse arguments
 DRY_RUN=false
 DEEP_CLEAN=false
+FORCE=false
 
 for arg in "$@"; do
   case $arg in
@@ -51,6 +52,10 @@ for arg in "$@"; do
       DEEP_CLEAN=true
       shift
       ;;
+    --force|-f)
+      FORCE=true
+      shift
+      ;;
     --help|-h)
       echo "Loom Cleanup - Restore repository to clean state"
       echo ""
@@ -59,6 +64,7 @@ for arg in "$@"; do
       echo "Options:"
       echo "  --dry-run    Show what would be cleaned without making changes"
       echo "  --deep       Deep clean (includes build artifacts)"
+      echo "  -f, --force  Non-interactive mode (auto-confirm all prompts)"
       echo "  -h, --help   Show this help message"
       echo ""
       echo "Standard cleanup:"
@@ -147,6 +153,9 @@ echo ""
 if [[ "$DRY_RUN" == true ]]; then
   warning "DRY RUN - No changes will be made"
   CONFIRM=y
+elif [[ "$FORCE" == true ]]; then
+  info "FORCE MODE - Auto-confirming all prompts"
+  CONFIRM=y
 else
   read -r -p "Proceed with cleanup? [y/N] " -n 1 CONFIRM
   echo ""
@@ -188,8 +197,23 @@ if [[ "$SKIP_ACTIVE" == true ]]; then
 
             if [[ "$status" == "CLOSED" ]]; then
               warning "Worktree for closed issue #$issue_num is still active"
-              info "Skipping: $worktree_dir"
-              echo "  Run manually: git worktree remove $worktree_path --force"
+
+              if [[ "$DRY_RUN" == true ]]; then
+                info "Would remove: $worktree_dir"
+              elif [[ "$FORCE" == true ]]; then
+                info "Auto-removing: $worktree_dir"
+                git worktree remove "$worktree_path" --force && success "Removed: $worktree_dir" || warning "Failed to remove: $worktree_dir"
+              else
+                read -r -p "  Force remove this worktree? [y/N] " -n 1 REMOVE_WORKTREE
+                echo ""
+
+                if [[ $REMOVE_WORKTREE =~ ^[Yy]$ ]]; then
+                  git worktree remove "$worktree_path" --force && success "Removed: $worktree_dir" || warning "Failed to remove: $worktree_dir"
+                else
+                  info "Skipping: $worktree_dir"
+                  echo "  Run manually: git worktree remove $worktree_path --force"
+                fi
+              fi
             else
               info "Preserving active worktree for issue #$issue_num ($status)"
             fi

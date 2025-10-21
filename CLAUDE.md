@@ -349,12 +349,45 @@ EOF
 
 ### Common Issues
 
-**Worktree already exists**:
+**Cleaning Up Stale Worktrees and Branches**:
+
+Use the `clean.sh` helper script to restore your repository to a clean state:
+
+```bash
+# Interactive mode - prompts for confirmation (default)
+./.loom/scripts/clean.sh
+
+# Preview mode - shows what would be cleaned without making changes
+./.loom/scripts/clean.sh --dry-run
+
+# Non-interactive mode - auto-confirms all prompts (for CI/automation)
+./.loom/scripts/clean.sh --force
+
+# Deep clean - also removes build artifacts (target/, node_modules/)
+./.loom/scripts/clean.sh --deep
+
+# Combine flags
+./.loom/scripts/clean.sh --deep --force  # Non-interactive deep clean
+./.loom/scripts/clean.sh --deep --dry-run  # Preview deep clean
+```
+
+**What clean.sh does**:
+- Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
+- Deletes local feature branches for closed issues
+- Cleans up Loom tmux sessions
+- (Optional with `--deep`) Removes `target/` and `node_modules/` directories
+
+**IMPORTANT**: For **CI pipelines and automation**, always use `--force` flag to prevent hanging on prompts:
+```bash
+./.loom/scripts/clean.sh --force  # Non-interactive, safe for automation
+```
+
+**Manual cleanup** (if needed):
 ```bash
 # List worktrees
 git worktree list
 
-# Remove stale worktree
+# Remove specific stale worktree
 git worktree remove .loom/worktrees/issue-42 --force
 
 # Prune orphaned worktrees
