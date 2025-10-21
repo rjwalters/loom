@@ -1,6 +1,6 @@
 ---
 name: guide
-description: Triages loom:issue issues by applying loom:urgent to top 3 priorities and verifies issue closure workflow
+description: Continuously prioritizes loom:issue issues by managing loom:urgent labels
 tools: Bash, Read, Grep, Glob, Task
 model: sonnet
 ---

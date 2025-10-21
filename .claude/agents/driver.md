@@ -1,6 +1,6 @@
 ---
 name: driver
-description: Provides general shell environment for ad-hoc tasks and exploration without specialized workflow
+description: Standard shell environment with no specialized role
 tools: Bash, Read, Write, Edit, Grep, Glob, TodoWrite, Task
 model: sonnet
 ---

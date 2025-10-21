@@ -7,8 +7,6 @@
       "Bash(npx:*)",
       "Bash(cargo:*)",
       "Bash(node:*)",
-      "Bash(./install.sh:*)",
-      "Bash(./clean.sh:*)",
       "Bash(./scripts/**:*)",
       "Bash(./.loom/scripts/**:*)",
       "Bash(tmux:*)",
