@@ -17,11 +17,17 @@ Loom turns **GitHub itself** into the ultimate development interface. Each issue
 Skip the prerequisites and get Loom installed in your repository:
 
 ```bash
-# Option 1: CLI Initialization (Recommended)
+# Option 1: Interactive Install (Easiest)
+# Clone Loom and run the install script
+git clone https://github.com/rjwalters/loom
+cd loom
+./install.sh /path/to/your/repo
+
+# Option 2: Direct CLI Initialization
 # Download and run loom-daemon to initialize your repository
 ./loom-daemon init /path/to/your/repo
 
-# Option 2: GUI Application
+# Option 3: GUI Application
 # Download Loom.app from releases and open with your workspace
 open -a Loom --args --workspace /path/to/your/repo
 ```
@@ -43,6 +49,42 @@ pnpm app:dev
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for complete development setup and guidelines.
 
+### Repository Maintenance
+
+Two convenience scripts are available at the repository root:
+
+**Installation Helper** (`./install.sh`):
+```bash
+# Interactive installer with guided prompts
+./install.sh
+
+# Install to specific repository
+./install.sh /path/to/your/repo
+```
+
+Provides two installation workflows:
+- **Quick Install**: Direct installation via `loom-daemon init`
+- **Full Install**: Creates GitHub issue, worktree, and PR for review
+
+**Cleanup Helper** (`./clean.sh` in Loom repo, `./.loom/scripts/clean.sh` in target repos):
+```bash
+# In Loom repository
+./clean.sh --dry-run
+
+# In target repositories (after installation)
+./.loom/scripts/clean.sh --dry-run
+
+# Options
+--deep       # Include build artifacts (target/, node_modules/)
+--dry-run    # Preview what would be cleaned
+```
+
+Safely removes:
+- Orphaned worktrees and stale branches
+- Loom tmux sessions
+- Build artifacts (with `--deep`)
+- **Installed automatically** to `.loom/scripts/` in target repositories
+
 ---
 
 ## Before You Install
@@ -58,6 +100,7 @@ Running `loom-daemon init` creates these files in your repository:
 **Configuration (Commit these)**:
 - `.loom/config.json` - Terminal settings and role assignments
 - `.loom/roles/` - Custom agent role definitions (optional)
+- `.loom/scripts/` - Helper scripts (worktree.sh, clean.sh)
 
 **Documentation (Commit these)**:
 - `CLAUDE.md` - AI context document for Claude Code (11KB template)
