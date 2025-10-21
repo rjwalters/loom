@@ -41,16 +41,35 @@ fi
 
 info "Syncing GitHub labels from $LABELS_FILE..."
 
-# Sync labels using gh CLI
+# Remove default GitHub labels that clutter issue tracking
+DEFAULT_LABELS=(
+  "bug"
+  "documentation"
+  "duplicate"
+  "enhancement"
+  "good first issue"
+  "help wanted"
+  "invalid"
+  "question"
+  "wontfix"
+)
+
+info "Removing default GitHub labels..."
+for label in "${DEFAULT_LABELS[@]}"; do
+  if gh label delete "$label" --yes 2>/dev/null; then
+    info "Deleted default label: $label"
+  fi
+done
+
+# Sync Loom workflow labels
 # This will:
 # - Create missing labels
 # - Update existing labels with new descriptions/colors
-# - NOT delete labels that aren't in the file (safe for existing repos)
-if gh label sync --file "$LABELS_FILE" --dry-run; then
-  info "Label sync dry-run successful, applying changes..."
-  gh label sync --file "$LABELS_FILE"
+info "Syncing Loom workflow labels..."
+if gh label sync --file "$LABELS_FILE" --force; then
   success "GitHub labels synced"
 else
-  warning "Label sync failed, continuing anyway"
-  warning "You may need to sync labels manually: gh label sync --file $LABELS_FILE"
+  error "Label sync failed"
+  error "Please sync labels manually: gh label sync --file $LABELS_FILE --force"
+  exit 1
 fi
