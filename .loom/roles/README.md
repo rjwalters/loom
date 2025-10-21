@@ -2,6 +2,24 @@
 
 This directory contains role definition templates for different terminal roles in Loom.
 
+## ⚠️ Important: Source of Truth
+
+**This directory is the single source of truth for all Loom role definitions.**
+
+- **Edit role files HERE** (in `defaults/roles/*.md`)
+- **Do NOT edit** `.claude/agents/*.md` files directly - they are auto-generated
+- **After editing**, run `pnpm generate:agents` to regenerate Claude Code agent files
+
+### Why This Pattern?
+
+Claude Code agents cannot reference external files - they must be self-contained. To solve this:
+
+1. **Source**: `defaults/roles/*.md` (edit these)
+2. **Generate**: Run `pnpm generate:agents`
+3. **Result**: `.claude/agents/*.md` (YAML frontmatter + role content)
+
+This prevents duplication errors and ensures `.loom/roles/` is always the authoritative source.
+
 ## Available Prompts
 
 Each prompt consists of two files:

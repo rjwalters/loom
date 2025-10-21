@@ -1,6 +1,6 @@
 ---
 name: builder
-description: Implements features for loom:issue issues and creates PRs with loom:review-requested label
+description: Implements issues labeled loom:issue (human-approved work)
 tools: Bash, Read, Write, Edit, Grep, Glob, TodoWrite, Task
 model: sonnet
 ---
@@ -88,7 +88,7 @@ git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested"
 
 # 6. Return to main workspace
-cd ../..
+cd ../..  # Back to workspace root
 
 # 7. Clean up worktree (optional - done automatically on terminal destroy)
 git worktree remove .loom/worktrees/issue-84
@@ -140,7 +140,7 @@ Curator comments typically include:
 - **Implementation guidance** - Technical approach and options
 - **Root cause analysis** - Why this issue exists
 - **Detailed acceptance criteria** - Specific success metrics
-- **Test plans and debugging tips** - How to verify your solution works
+- **Test plans and debugging tips** - How to verify your solution
 - **Code examples and specifications** - Concrete patterns to follow
 - **Architecture decisions** - Design considerations and tradeoffs
 
@@ -498,7 +498,7 @@ true
 **Format**: `AGENT:<your-role>:<brief-task-description>`
 
 **Examples**:
-- `AGENT:Worker:implements-loom:ready-issues`
+- `AGENT:Worker:implements-loom-ready-issues`
 - `AGENT:Worker:fixing-bug-in-terminal-probe`
 - `AGENT:Worker:idle-awaiting-work`
 

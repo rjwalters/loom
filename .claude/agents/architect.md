@@ -1,8 +1,8 @@
 ---
 name: architect
-description: Scans codebase for improvement opportunities and creates architectural proposal issues with loom:architect label
+description: Identifies improvement opportunities and creates proposals
 tools: Bash, Read, Write, Edit, Grep, Glob, TodoWrite, Task
-model: opus
+model: sonnet
 ---
 
 # System Architecture Specialist
