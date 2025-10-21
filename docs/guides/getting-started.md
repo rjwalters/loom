@@ -212,27 +212,45 @@ pnpm daemon:build
 
 **Next:** See [DEVELOPMENT.md](../../DEVELOPMENT.md) for development workflow.
 
-### Option 3: Interactive Install Script
+### Option 3: Interactive Setup Script (Recommended)
 
-Uses the install helper script for guided setup with validation.
+Uses the interactive setup script for guided installation with two workflows.
 
 ```bash
 # Clone Loom first (if you haven't)
 git clone https://github.com/rjwalters/loom
 cd loom
 
-# Build daemon
-pnpm daemon:build
-
-# Run interactive installer
-./scripts/install-loom.sh /path/to/your/repo
+# Run interactive setup (will prompt for target repo if not provided)
+./setup.sh /path/to/your/repo
 ```
 
 **What this provides:**
-- Git repository validation before making changes
-- Preview of what will be created
+- Interactive prompts for repository path
+- Shows exactly what will be installed before proceeding
+- Two installation methods:
+  - **Quick Install**: Direct installation with `loom-daemon init`
+  - **Full Install**: Creates GitHub issue, worktree, and PR for review
+- Git repository validation
+- GitHub authentication checks (for Full Install)
 - Confirmation prompts at each step
-- Clear error messages if prerequisites missing
+- Clear error messages and recovery suggestions
+
+**When to use Quick Install:**
+- Personal projects or quick testing
+- Solo development
+- No need for GitHub issue tracking
+
+**When to use Full Install:**
+- Team projects requiring review
+- Want installation tracked in GitHub issue
+- Prefer git worktree isolation
+- Need labels synced to repository
+
+**Advanced:** For programmatic installation without prompts, use:
+```bash
+./scripts/install-loom.sh /path/to/your/repo
+```
 
 **Next:** Review the output to understand what was created.
 

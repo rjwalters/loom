@@ -17,11 +17,17 @@ Loom turns **GitHub itself** into the ultimate development interface. Each issue
 Skip the prerequisites and get Loom installed in your repository:
 
 ```bash
-# Option 1: CLI Initialization (Recommended)
+# Option 1: Interactive Setup (Easiest)
+# Clone Loom and run the setup script
+git clone https://github.com/rjwalters/loom
+cd loom
+./setup.sh /path/to/your/repo
+
+# Option 2: Direct CLI Initialization
 # Download and run loom-daemon to initialize your repository
 ./loom-daemon init /path/to/your/repo
 
-# Option 2: GUI Application
+# Option 3: GUI Application
 # Download Loom.app from releases and open with your workspace
 open -a Loom --args --workspace /path/to/your/repo
 ```
