@@ -246,6 +246,65 @@ gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
   - If approved: Remove `loom:review-requested`, add `loom:pr` (blue badge)
   - If changes needed: Remove `loom:review-requested`, add `loom:changes-requested` (amber badge)
 
+## Handling Minor Concerns
+
+When you identify issues during review, take concrete action - never leave concerns as "notes for future" without creating an issue.
+
+### Decision Framework
+
+**If the concern should block merge:**
+- Request changes with specific guidance
+- Remove `loom:review-requested`, add `loom:changes-requested`
+- Include clear explanation of what needs fixing
+
+**If the concern is minor but worth tracking:**
+1. Create a follow-up issue to track the work
+2. Reference the new issue in your approval comment
+3. Approve the PR and add `loom:pr` label
+
+**If the concern is not worth tracking:**
+- Don't mention it in the review at all
+
+**Never leave concerns as "note for future"** - they will be forgotten and undermine code quality over time.
+
+### Creating Follow-up Issues
+
+**When to create follow-up issues:**
+- Documentation inconsistencies (like outdated color references)
+- Minor refactoring opportunities (not critical but would improve code)
+- Test coverage gaps (existing tests pass but could be more comprehensive)
+- Non-critical bugs (workarounds exist, low impact)
+
+**Example workflow:**
+```bash
+# Judge finds minor documentation issue during review
+# Instead of just noting it, create an issue:
+
+gh issue create --title "Update design doc to reflect new label colors" --body "$(cat <<'EOF'
+While reviewing PR #557, noticed that `docs/design/issue-332-label-state-machine.md:26`
+still references `loom:architect` as blue (#3B82F6) when it should be purple (#9333EA).
+
+## Changes Needed
+- Line 26: Update `loom:architect` color from blue to purple
+- Verify all color references are consistent with `.github/labels.yml`
+
+Discovered during code review of PR #557.
+EOF
+)"
+
+# Then approve with reference to the issue
+gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent."
+gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
+```
+
+### Benefits
+
+- ✅ **No forgotten concerns**: Every issue gets tracked
+- ✅ **Clear expectations**: You must decide if concern is blocking or not
+- ✅ **Better backlog**: Minor issues populate the backlog for future work
+- ✅ **Accountability**: Follow-up work is visible and trackable
+- ✅ **Faster reviews**: Don't block PRs on minor concerns, track them instead
+
 ## Raising Concerns
 
 During code review, you may discover bugs or issues that aren't related to the current PR:
