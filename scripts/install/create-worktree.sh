@@ -43,11 +43,19 @@ info "Creating worktree for issue #${ISSUE_NUMBER}..."
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 info "Branching from: ${CURRENT_BRANCH}"
 
-# Create worktree
+# Clean up any existing worktree
 if [[ -d "$WORKTREE_PATH" ]]; then
-  error "Worktree already exists: $WORKTREE_PATH"
+  info "Removing existing worktree: $WORKTREE_PATH"
+  git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
 fi
 
+# Clean up any existing local branch
+if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+  info "Removing existing local branch: $BRANCH_NAME"
+  git branch -D "$BRANCH_NAME" 2>/dev/null || true
+fi
+
+# Create worktree (will create new local branch from current branch)
 git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$CURRENT_BRANCH" || \
   error "Failed to create worktree"
 
