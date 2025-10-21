@@ -69,8 +69,9 @@ success "Changes committed"
 
 info "Pushing branch: $BRANCH_NAME"
 
-# Push branch (redirect output to stderr so it doesn't interfere with PR URL capture)
-git push -u origin "$BRANCH_NAME" >&2
+# Push branch (use --force in case branch exists remotely from previous failed installation)
+# Redirect output to stderr so it doesn't interfere with PR URL capture
+git push -u origin "$BRANCH_NAME" --force >&2
 success "Branch pushed"
 
 info "Creating pull request..."
