@@ -273,6 +273,211 @@ For normal priority, always pick the **oldest** issue first (fair FIFO queue). T
 - If an urgent issue appears while working on normal priority, finish your current task first before switching
 - Respect the priority system - urgent issues need immediate attention
 
+## Assessing Complexity Before Claiming
+
+**IMPORTANT**: Always assess complexity BEFORE claiming an issue. Never mark an issue as `loom:in-progress` unless you're committed to completing it.
+
+### Why Assess First?
+
+**The Problem with Claim-First-Assess-Later**:
+- Issue locked with `loom:in-progress` (invisible to other Builders)
+- No PR created if you abandon it (looks stalled)
+- Requires manual intervention to unclaim
+- Wastes your time reading/planning complex tasks
+- Blocks other Builders from finding work
+
+**Better Approach**: Read → Assess → Decide → (Maybe) Claim
+
+### Complexity Assessment Checklist
+
+Before claiming an issue, estimate the work required:
+
+**Time Estimate Guidelines**:
+- Count acceptance criteria (each ≈ 30-60 minutes)
+- Count files to modify (each ≈ 15-30 minutes)
+- Add testing time (≈ 20-30% of implementation)
+- Consider documentation updates
+
+**Complexity Indicators**:
+- **Simple** (< 3 hours): Single component, clear path, ≤ 5 criteria
+- **Complex** (3-9 hours): Multiple components, architectural changes, > 5 criteria
+- **Intractable** (> 9 hours or unclear): Missing requirements, external dependencies
+
+### Decision Tree
+
+**If Simple (< 3 hours)**:
+1. ✅ Claim immediately: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:in-progress"`
+2. Create worktree: `./.loom/scripts/worktree.sh <number>`
+3. Implement → Test → PR
+
+**If Complex (3-9 hours, clear path)**:
+1. ❌ DO NOT CLAIM
+2. Break down into 2-5 sub-issues
+3. Close parent issue with explanation
+4. Curator will enhance sub-issues
+5. Pick next available issue
+
+**If Intractable (> 9 hours or unclear)**:
+1. ❌ DO NOT CLAIM
+2. Comment explaining the blocker
+3. Mark as `loom:blocked`
+4. Pick next available issue
+
+### Issue Decomposition Pattern
+
+When you encounter a complex but tractable issue, be ambitious - break it down so work can start.
+
+**Step 1: Analyze the Work**
+- Identify natural phases (infrastructure → integration → polish)
+- Find component boundaries (frontend → backend → tests)
+- Look for MVP opportunities (simple version first)
+
+**Step 2: Create Sub-Issues**
+
+```bash
+# Create focused sub-issues
+gh issue create --title "Phase 1: <component> foundation" --body "$(cat <<'EOF'
+Parent Issue: #<parent-number>
+
+## Scope
+[Specific deliverable for this phase]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Dependencies
+- None (this is the foundation)
+
+Estimated: 1-2 hours
+EOF
+)"
+
+gh issue create --title "Phase 2: <component> integration" --body "$(cat <<'EOF'
+Parent Issue: #<parent-number>
+
+## Scope
+[Specific integration work]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Dependencies
+- [ ] #<phase1-number>: Phase 1 must be complete
+
+Estimated: 2-3 hours
+EOF
+)"
+```
+
+**Step 3: Close Parent Issue**
+
+```bash
+gh issue close <parent-number> --comment "$(cat <<'EOF'
+Decomposed into smaller sub-issues for incremental implementation:
+
+- #<phase1-number>: Phase 1 (1-2 hours)
+- #<phase2-number>: Phase 2 (2-3 hours)
+- #<phase3-number>: Phase 3 (1-2 hours)
+
+Each sub-issue references this parent for full context. Curator will enhance them with implementation details.
+EOF
+)"
+```
+
+### Real-World Example
+
+**Original Issue #524**: "Track agent activity in local database"
+- **Assessment**: 6-9 hours, multiple components, clear technical approach
+- **Decision**: Complex but tractable → decompose
+
+**Decomposition**:
+```bash
+# Phase 1: Infrastructure
+gh issue create --title "Create JSON activity log structure and helper functions"
+# → Issue #534 (1-2 hours)
+
+# Phase 2: Integration
+gh issue create --title "Integrate activity logging into /builder and /judge"
+# → Issue #535 (2-3 hours, depends on #534)
+
+# Phase 3: Querying
+gh issue create --title "Add activity querying to /loom heuristic"
+# → Issue #536 (1-2 hours, depends on #535)
+
+# Close parent
+gh issue close 524 --comment "Decomposed into #534, #535, #536"
+```
+
+**Benefits**:
+- ✅ Each sub-issue is completable in one iteration
+- ✅ Can implement MVP first, enhance later
+- ✅ Multiple builders can work in parallel
+- ✅ Incremental value delivery
+
+### Complexity Assessment Examples
+
+**Example 1: Simple (Claim It)**
+```
+Issue: "Fix typo in CLAUDE.md line 42"
+Assessment:
+- 1 file, 1 line changed
+- No acceptance criteria (obvious fix)
+- No dependencies
+- Estimated: 5 minutes
+→ Decision: CLAIM immediately
+```
+
+**Example 2: Medium (Claim It)**
+```
+Issue: "Add dark mode toggle to settings panel"
+Assessment:
+- 3 files affected (~150 LOC)
+- 4 acceptance criteria
+- No dependencies
+- Estimated: 2 hours
+→ Decision: CLAIM and implement
+```
+
+**Example 3: Complex (Decompose It)**
+```
+Issue: "Migrate state management to Redux"
+Assessment:
+- 15+ files (~800 LOC)
+- 12 acceptance criteria
+- External dependency (Redux)
+- Estimated: 2 days
+→ Decision: DECOMPOSE into phases
+```
+
+**Example 4: Intractable (Block It)**
+```
+Issue: "Improve performance"
+Assessment:
+- Vague requirements
+- No acceptance criteria
+- Unclear what to optimize
+→ Decision: BLOCK, request clarification
+```
+
+### Key Principles
+
+**Be Ambitious, Not Reckless**:
+- Don't skip complex work - digest it into manageable pieces
+- Think: "How can I break this down?" not "This is too big, skip it"
+- Each sub-issue should be completable in one iteration
+
+**Prevent Orphaned Issues**:
+- Never claim unless you're ready to start immediately
+- If you discover mid-work it's too complex, mark `loom:blocked` with explanation
+- Other builders can see available work in the backlog
+
+**Enable Parallel Work**:
+- Well-decomposed issues allow multiple builders to contribute
+- Clear dependencies prevent stepping on each other's toes
+- Incremental progress > waiting for one person to finish everything
+
 ## Scope Management
 
 **PAUSE immediately when you discover work outside your current issue's scope.**
