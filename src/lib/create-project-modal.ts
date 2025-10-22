@@ -18,13 +18,16 @@ export async function showCreateProjectModal(
   const modal = document.createElement("div");
   modal.className =
     "bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md mx-4 animate-scale-in";
+  modal.setAttribute("role", "dialog");
+  modal.setAttribute("aria-modal", "true");
+  modal.setAttribute("aria-labelledby", "create-project-title");
 
   // Get default location
   const defaultLocation = await homeDir();
 
   modal.innerHTML = `
     <div class="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
-      <h2 class="text-xl font-semibold text-gray-900 dark:text-gray-100">Create New Project</h2>
+      <h2 id="create-project-title" class="text-xl font-semibold text-gray-900 dark:text-gray-100">Create New Project</h2>
     </div>
     <form id="create-project-form" class="px-6 py-4 space-y-4">
       <!-- Project Name -->

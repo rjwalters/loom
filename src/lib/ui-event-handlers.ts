@@ -11,6 +11,7 @@ import type { setupDragAndDrop } from "./drag-drop-manager";
 import type { HealthMonitor } from "./health-monitor";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
+import { announceTerminalSelection } from "./screen-reader-announcer";
 import type { AppState, Terminal } from "./state";
 import {
   closeTerminalWithConfirmation,
@@ -364,7 +365,11 @@ export function setupMainEventListeners(deps: {
       if (card) {
         const id = card.getAttribute("data-terminal-id");
         if (id) {
+          const terminal = state.getTerminals().find((t) => t.id === id);
           state.setPrimary(id);
+          if (terminal) {
+            announceTerminalSelection(terminal.name);
+          }
         }
       }
     });

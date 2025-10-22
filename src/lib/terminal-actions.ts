@@ -10,6 +10,10 @@ import { invoke } from "@tauri-apps/api/tauri";
 import type { AppLevelState } from "./app-state";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
+import {
+  announceTerminalCreated,
+  announceTerminalRemoved,
+} from "./screen-reader-announcer";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
 import type { TerminalManager } from "./terminal-manager";
@@ -301,6 +305,10 @@ export async function closeTerminalWithConfirmation(
   outputPoller.stopPolling(terminalId);
   terminalManager.destroyTerminal(terminalId);
 
+  // Get terminal name before removing
+  const terminalToRemove = state.getTerminals().find((t) => t.id === terminalId);
+  const terminalName = terminalToRemove?.name || "Unknown";
+
   // Clear attached terminal ID if it matches
   if (appLevelState.getCurrentAttachedTerminalId() === terminalId) {
     appLevelState.setCurrentAttachedTerminalId(null);
@@ -308,6 +316,9 @@ export async function closeTerminalWithConfirmation(
 
   // Remove from state
   state.removeTerminal(terminalId);
+
+  // Announce terminal removal to screen readers
+  announceTerminalRemoved(terminalName);
 
   // Save configuration
   await saveCurrentConfig();
@@ -369,6 +380,9 @@ export async function createPlainTerminal(deps: {
       role: "default",
       theme: "default",
     });
+
+    // Announce terminal creation to screen readers
+    announceTerminalCreated(name);
 
     // Save updated state to config
     await saveCurrentConfig();

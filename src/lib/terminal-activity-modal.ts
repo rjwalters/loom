@@ -40,10 +40,15 @@ function createActivityModal(terminalId: string, terminalName: string): HTMLElem
   modal.dataset.terminalId = terminalId;
 
   modal.innerHTML = `
-    <div class="bg-white dark:bg-gray-800 rounded-lg w-[800px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700">
+    <div
+      class="bg-white dark:bg-gray-800 rounded-lg w-[800px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="terminal-activity-title"
+    >
       <!-- Header -->
       <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-        <h2 class="text-xl font-bold text-gray-900 dark:text-gray-100">
+        <h2 id="terminal-activity-title" class="text-xl font-bold text-gray-900 dark:text-gray-100">
           📊 Terminal Activity: ${escapeHtml(terminalName)}
         </h2>
         <div class="flex gap-2">
