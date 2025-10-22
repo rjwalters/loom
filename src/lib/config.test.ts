@@ -862,6 +862,7 @@ describe("config", () => {
         offlineMode: false,
       };
 
+      setConfigWorkspace("/path/to/workspace");
       vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1Config));
 
       const config = await loadConfig();
@@ -886,6 +887,7 @@ describe("config", () => {
         offlineMode: true,
       };
 
+      setConfigWorkspace("/path/to/workspace");
       vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1Config));
 
       const config = await loadConfig();
@@ -902,6 +904,7 @@ describe("config", () => {
         offlineMode: false,
       };
 
+      setConfigWorkspace("/path/to/workspace");
       vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v2Config));
 
       const config = await loadConfig();
@@ -918,6 +921,7 @@ describe("config", () => {
         terminals: [],
       };
 
+      setConfigWorkspace("/path/to/workspace");
       vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(futureConfig));
 
       const config = await loadConfig();
@@ -932,6 +936,7 @@ describe("config", () => {
         terminals: [{ id: "terminal-1", name: "Test" }],
       };
 
+      setConfigWorkspace("/path/to/workspace");
       vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1ConfigNoVersion));
 
       const config = await loadConfig();
@@ -954,6 +959,7 @@ describe("config", () => {
         offlineMode: true,
       };
 
+      setConfigWorkspace("/path/to/workspace");
       vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1Config));
 
       const config = await loadConfig();
@@ -969,6 +975,7 @@ describe("config", () => {
         offlineMode: false,
       } as any;
 
+      setConfigWorkspace("/path/to/workspace");
       await saveConfig(configWithoutVersion);
 
       expect(invoke).toHaveBeenCalledWith(
