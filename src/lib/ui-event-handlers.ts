@@ -232,6 +232,57 @@ export function setupMainEventListeners(deps: {
         return;
       }
 
+      // Search button
+      const searchBtn = target.closest("#terminal-search-btn");
+      if (searchBtn) {
+        e.stopPropagation();
+        const searchPanel = document.getElementById("terminal-search-panel");
+        const searchInput = document.getElementById("terminal-search-input") as HTMLInputElement;
+        if (searchPanel && searchInput) {
+          searchPanel.classList.remove("hidden");
+          searchInput.focus();
+          searchInput.select();
+        }
+        return;
+      }
+
+      // Search panel - Close button
+      const searchCloseBtn = target.closest("#terminal-search-close");
+      if (searchCloseBtn) {
+        e.stopPropagation();
+        const searchPanel = document.getElementById("terminal-search-panel");
+        if (searchPanel) {
+          searchPanel.classList.add("hidden");
+          const terminal = state.getPrimary();
+          if (terminal) {
+            terminalManager.clearSearch(terminal.id);
+          }
+        }
+        return;
+      }
+
+      // Search panel - Next button
+      const searchNextBtn = target.closest("#terminal-search-next");
+      if (searchNextBtn) {
+        e.stopPropagation();
+        const terminal = state.getPrimary();
+        if (terminal) {
+          terminalManager.findNext(terminal.id);
+        }
+        return;
+      }
+
+      // Search panel - Previous button
+      const searchPrevBtn = target.closest("#terminal-search-prev");
+      if (searchPrevBtn) {
+        e.stopPropagation();
+        const terminal = state.getPrimary();
+        if (terminal) {
+          terminalManager.findPrevious(terminal.id);
+        }
+        return;
+      }
+
       // Close button
       const closeBtn = target.closest("#terminal-close-btn");
       if (closeBtn) {
@@ -279,6 +330,96 @@ export function setupMainEventListeners(deps: {
         const id = target.getAttribute("data-terminal-id");
         if (id) {
           startRename(id, target, { state, saveCurrentConfig, render });
+        }
+      }
+    });
+
+    // Search input - handle input changes
+    primaryTerminal.addEventListener("input", (e) => {
+      const target = e.target as HTMLElement;
+      if (target.id === "terminal-search-input") {
+        const input = target as HTMLInputElement;
+        const caseSensitive =
+          (document.getElementById("terminal-search-case-sensitive") as HTMLInputElement)
+            ?.checked || false;
+        const regex =
+          (document.getElementById("terminal-search-regex") as HTMLInputElement)?.checked || false;
+        const terminal = state.getPrimary();
+
+        if (terminal && input.value) {
+          terminalManager.searchTerminal(terminal.id, input.value, {
+            caseSensitive,
+            regex,
+          });
+        } else if (terminal) {
+          terminalManager.clearSearch(terminal.id);
+        }
+      }
+    });
+
+    // Search options - handle checkbox changes
+    primaryTerminal.addEventListener("change", (e) => {
+      const target = e.target as HTMLElement;
+      if (target.id === "terminal-search-case-sensitive" || target.id === "terminal-search-regex") {
+        // Re-run search with updated options
+        const input = document.getElementById("terminal-search-input") as HTMLInputElement;
+        const caseSensitive =
+          (document.getElementById("terminal-search-case-sensitive") as HTMLInputElement)
+            ?.checked || false;
+        const regex =
+          (document.getElementById("terminal-search-regex") as HTMLInputElement)?.checked || false;
+        const terminal = state.getPrimary();
+
+        if (terminal && input && input.value) {
+          terminalManager.searchTerminal(terminal.id, input.value, {
+            caseSensitive,
+            regex,
+          });
+        }
+      }
+    });
+
+    // Search input - handle keyboard shortcuts
+    primaryTerminal.addEventListener("keydown", (e) => {
+      const target = e.target as HTMLElement;
+
+      // Search input shortcuts
+      if (target.id === "terminal-search-input") {
+        const terminal = state.getPrimary();
+
+        if (e.key === "Enter" && terminal) {
+          e.preventDefault();
+          if (e.shiftKey) {
+            // Shift+Enter: Previous match
+            terminalManager.findPrevious(terminal.id);
+          } else {
+            // Enter: Next match
+            terminalManager.findNext(terminal.id);
+          }
+        } else if (e.key === "Escape") {
+          // Esc: Close search panel
+          e.preventDefault();
+          const searchPanel = document.getElementById("terminal-search-panel");
+          if (searchPanel) {
+            searchPanel.classList.add("hidden");
+            if (terminal) {
+              terminalManager.clearSearch(terminal.id);
+            }
+          }
+        }
+      }
+    });
+
+    // Global keyboard shortcut: Cmd+F to open search
+    primaryTerminal.addEventListener("keydown", (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "f") {
+        e.preventDefault();
+        const searchPanel = document.getElementById("terminal-search-panel");
+        const searchInput = document.getElementById("terminal-search-input") as HTMLInputElement;
+        if (searchPanel && searchInput) {
+          searchPanel.classList.remove("hidden");
+          searchInput.focus();
+          searchInput.select();
         }
       }
     });

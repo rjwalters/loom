@@ -1,6 +1,11 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::panic)]
+#![allow(clippy::manual_assert)]
+
 use rusqlite::{Connection, Result as SqliteResult};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Helper to create a temporary workspace directory
@@ -11,7 +16,7 @@ fn create_temp_workspace() -> (TempDir, PathBuf) {
 }
 
 /// Helper to open a connection to the activity database
-fn open_test_db(workspace_path: &PathBuf) -> SqliteResult<Connection> {
+fn open_test_db(workspace_path: &Path) -> SqliteResult<Connection> {
     let loom_dir = workspace_path.join(".loom");
     fs::create_dir_all(&loom_dir).unwrap();
     let db_path = loom_dir.join("activity.db");
@@ -40,15 +45,15 @@ fn test_fresh_database_creation() {
             notes TEXT
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Simulate migration to v2
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)",
-        [],
-    ).unwrap();
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)", [])
+        .unwrap();
 
-    conn.execute("INSERT INTO schema_version (version) VALUES (2)", []).unwrap();
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])
+        .unwrap();
 
     // Create v2 tables
     conn.execute(
@@ -62,7 +67,8 @@ fn test_fresh_database_creation() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS code_changes (
@@ -75,7 +81,8 @@ fn test_fresh_database_creation() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS github_events (
@@ -90,7 +97,8 @@ fn test_fresh_database_creation() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify all tables exist
     let table_count: i32 = conn
@@ -131,7 +139,8 @@ fn test_v1_to_v2_migration() {
             notes TEXT
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Insert some v1 data
     conn.execute(
@@ -147,11 +156,10 @@ fn test_v1_to_v2_migration() {
     assert_eq!(count, 1, "V1 data should exist");
 
     // Simulate migration
-    conn.execute(
-        "CREATE TABLE schema_version (version INTEGER NOT NULL)",
-        [],
-    ).unwrap();
-    conn.execute("INSERT INTO schema_version (version) VALUES (2)", []).unwrap();
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)", [])
+        .unwrap();
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])
+        .unwrap();
 
     // Create v2 tables
     conn.execute(
@@ -165,7 +173,8 @@ fn test_v1_to_v2_migration() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute(
         "CREATE TABLE code_changes (
@@ -178,7 +187,8 @@ fn test_v1_to_v2_migration() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute(
         "CREATE TABLE github_events (
@@ -193,7 +203,8 @@ fn test_v1_to_v2_migration() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Verify v1 data preserved
     let preserved_count: i32 = conn
@@ -250,13 +261,13 @@ fn test_idempotent_migration() {
             notes TEXT
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
-    conn.execute(
-        "CREATE TABLE schema_version (version INTEGER NOT NULL)",
-        [],
-    ).unwrap();
-    conn.execute("INSERT INTO schema_version (version) VALUES (2)", []).unwrap();
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)", [])
+        .unwrap();
+    conn.execute("INSERT INTO schema_version (version) VALUES (2)", [])
+        .unwrap();
 
     conn.execute(
         "CREATE TABLE token_usage (
@@ -268,7 +279,8 @@ fn test_idempotent_migration() {
             model TEXT
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Run "migration" again (should be idempotent)
     let current_version: i32 = conn
@@ -320,7 +332,8 @@ fn test_foreign_key_constraints() {
             notes TEXT
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     conn.execute(
         "CREATE TABLE token_usage (
@@ -333,14 +346,16 @@ fn test_foreign_key_constraints() {
             FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
         )",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Insert valid activity
     conn.execute(
         "INSERT INTO agent_activity (timestamp, role, trigger, work_found, outcome)
          VALUES ('2025-10-22T08:00:00Z', 'builder', 'manual', 1, 'success')",
         [],
-    ).unwrap();
+    )
+    .unwrap();
 
     let activity_id: i32 = conn.last_insert_rowid() as i32;
 

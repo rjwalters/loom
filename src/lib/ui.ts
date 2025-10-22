@@ -229,6 +229,70 @@ export function renderPrimaryTerminal(
         </div>
         <div id="persistent-xterm-containers" class="flex-1 overflow-auto relative">
           <!-- Persistent xterm containers created by terminal-manager, shown/hidden via display style -->
+
+          <!-- Search panel (hidden by default) -->
+          <div id="terminal-search-panel" class="hidden absolute top-4 right-4 z-50 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg p-3" style="backdrop-filter: blur(10px); background-color: rgba(255, 255, 255, 0.95); dark:background-color: rgba(31, 41, 55, 0.95);">
+            <div class="flex items-center gap-2 mb-2">
+              <input
+                id="terminal-search-input"
+                type="text"
+                placeholder="Search terminal output..."
+                class="flex-1 px-2 py-1 text-sm bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-500 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                aria-label="Search terminal output"
+              />
+              <button
+                id="terminal-search-close"
+                class="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded"
+                aria-label="Close search"
+                title="Close (Esc)"
+              >
+                <svg class="w-4 h-4 text-gray-600 dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                </svg>
+              </button>
+            </div>
+            <div class="flex items-center gap-2">
+              <label class="flex items-center gap-1 text-xs text-gray-600 dark:text-gray-300">
+                <input
+                  id="terminal-search-case-sensitive"
+                  type="checkbox"
+                  class="rounded"
+                  aria-label="Case sensitive search"
+                />
+                Aa
+              </label>
+              <label class="flex items-center gap-1 text-xs text-gray-600 dark:text-gray-300">
+                <input
+                  id="terminal-search-regex"
+                  type="checkbox"
+                  class="rounded"
+                  aria-label="Regular expression search"
+                />
+                .*
+              </label>
+              <div class="flex-1"></div>
+              <button
+                id="terminal-search-prev"
+                class="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded text-gray-600 dark:text-gray-300"
+                aria-label="Previous match"
+                title="Previous (Shift+Enter)"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"></path>
+                </svg>
+              </button>
+              <button
+                id="terminal-search-next"
+                class="p-1 hover:bg-gray-100 dark:hover:bg-gray-600 rounded text-gray-600 dark:text-gray-300"
+                aria-label="Next match"
+                title="Next (Enter)"
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path>
+                </svg>
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     `;
@@ -246,6 +310,19 @@ export function renderPrimaryTerminal(
       <div class="flex items-center gap-1">
         ${createRestartButtonHTML(terminal, "primary")}
         ${createRunNowButtonHTML(terminal, "primary")}
+        <button
+          id="terminal-search-btn"
+          data-terminal-id="${terminal.id}"
+          data-tooltip="Search terminal output (⌘F)"
+          data-tooltip-position="bottom"
+          class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
+          title="Search"
+          aria-label="Search ${escapeHtml(terminal.name)} terminal output"
+        >
+          <svg class="w-4 h-4 text-gray-600 dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path>
+          </svg>
+        </button>
         <button
           id="terminal-clear-btn"
           data-terminal-id="${terminal.id}"

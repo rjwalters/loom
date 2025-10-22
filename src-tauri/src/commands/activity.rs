@@ -33,10 +33,8 @@ fn get_schema_version(conn: &Connection) -> SqliteResult<i32> {
     }
 
     // Read version from table
-    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
-        row.get(0)
-    })
-    .or(Ok(1)) // Default to v1 if no row exists
+    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| row.get(0))
+        .or(Ok(1)) // Default to v1 if no row exists
 }
 
 /// Update schema version in database
@@ -202,9 +200,10 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
 
 /// Log activity entry to SQLite database
 #[tauri::command]
-pub fn log_activity(workspace_path: &str, entry: &ActivityEntry) -> Result<(), String> {
+#[allow(clippy::needless_pass_by_value)]
+pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), String> {
     let conn =
-        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
     conn.execute(
         "INSERT INTO agent_activity (

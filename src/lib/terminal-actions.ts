@@ -10,10 +10,7 @@ import { invoke } from "@tauri-apps/api/tauri";
 import type { AppLevelState } from "./app-state";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
-import {
-  announceTerminalCreated,
-  announceTerminalRemoved,
-} from "./screen-reader-announcer";
+import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
 import type { TerminalManager } from "./terminal-manager";
