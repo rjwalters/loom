@@ -801,21 +801,3 @@ export function getAppState(): AppState {
 export function setAppState(state: AppState): void {
   appStateInstance = state;
 }
-
-/**
- * Type guard to check if a value is a valid Terminal.
- * Useful for filtering and narrowing types in array operations.
- *
- * @param t - The value to check
- * @returns True if the value is a valid Terminal with a non-empty ID
- *
- * @example
- * ```ts
- * const terminals = [terminal1, null, terminal2, undefined];
- * const validTerminals = terminals.filter(isValidTerminal);
- * // validTerminals is now Terminal[] (not (Terminal | null | undefined)[])
- * ```
- */
-export function isValidTerminal(t: Terminal | null | undefined): t is Terminal {
-  return t !== null && t !== undefined && typeof t.id === "string" && t.id.length > 0;
-}
