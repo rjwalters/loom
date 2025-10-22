@@ -262,7 +262,7 @@ console.log('GitHub labels synchronized');
 - `loom:proposal` - Architect proposal awaiting approval
 - `loom:review-requested` - PR ready for review
 - `loom:reviewing` - PR currently under review
-- `loom:approved` - PR approved
+- `loom:pr` - PR approved
 - `loom:urgent` - High-priority issue
 
 #### `reset_github_labels`

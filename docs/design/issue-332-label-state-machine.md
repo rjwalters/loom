@@ -6,7 +6,7 @@ The current label workflow has several issues:
 1. **Ambiguous `loom:ready`**: Overloaded for both issues AND PRs
 2. **Automatic approval**: Curator marks issues ready without human approval
 3. **Inconsistent naming**: `loom:proposal` vs `loom:hermit`
-4. **Duplicate labels**: Both `loom:approved` and `loom:pr` for merged PRs
+4. **Duplicate labels**: Both `loom:pr` and `loom:pr` for merged PRs
 5. **Unclear external contributor path**: How do external issues enter the workflow?
 
 ## Design Goals
@@ -42,7 +42,7 @@ The current label workflow has several issues:
 **Removed Labels:**
 - ❌ `loom:ready` (replaced by `loom:issue` for issues, `loom:review-requested` already exists for PRs)
 - ❌ `loom:proposal` (renamed to `loom:architect`)
-- ❌ `loom:approved` (duplicate of `loom:pr`)
+- ❌ `loom:pr` (duplicate of `loom:pr`)
 - ❌ `loom:reviewing` (not needed - use assignee instead)
 
 ## State Transitions
@@ -248,9 +248,9 @@ gh issue list --label="loom:ready" --json number --jq '.[].number' | \
 
 ```bash
 # PRs already use loom:review-requested correctly
-# Remove loom:approved if present, replace with loom:pr
-gh pr list --label="loom:approved" --json number --jq '.[].number' | \
-  xargs -I {} gh pr edit {} --remove-label "loom:approved" --add-label "loom:pr"
+# Remove loom:pr if present, replace with loom:pr
+gh pr list --label="loom:pr" --json number --jq '.[].number' | \
+  xargs -I {} gh pr edit {} --remove-label "loom:pr" --add-label "loom:pr"
 ```
 
 ### Phase 4: Delete Old Labels
@@ -259,7 +259,7 @@ gh pr list --label="loom:approved" --json number --jq '.[].number' | \
 # After confirming migration complete
 gh label delete "loom:ready"
 gh label delete "loom:proposal"
-gh label delete "loom:approved"
+gh label delete "loom:pr"
 gh label delete "loom:reviewing"  # if exists
 ```
 

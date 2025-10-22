@@ -152,7 +152,7 @@ Found PR #401 - 'Add terminal restart functionality'
 ✓ Task Completed: Reviewed PR #401
 ✓ Changes Made:
   - PR #401: Added detailed review comment with 3 suggestions
-  - Label changed: loom:review-requested → loom:approved
+  - Label changed: loom:review-requested → loom:pr
   - Approved PR for merge
 ✓ Next Steps: Ready for maintainer to merge
 

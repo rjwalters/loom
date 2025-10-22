@@ -29,7 +29,7 @@ echo "✅ Prerequisites check passed"
 echo
 
 # Test labels (from src/lib/label-setup.ts LOOM_LABELS)
-declare -a LABEL_NAMES=("loom:proposal" "loom:hermit" "loom:ready" "loom:building" "loom:blocked" "loom:urgent" "loom:review-requested" "loom:reviewing" "loom:approved")
+declare -a LABEL_NAMES=("loom:proposal" "loom:hermit" "loom:ready" "loom:building" "loom:blocked" "loom:urgent" "loom:review-requested" "loom:reviewing" "loom:pr")
 declare -a LABEL_DESCS=(
   "Architect suggestion awaiting user approval"
   "Critic removal/simplification proposal awaiting user approval"

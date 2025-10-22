@@ -26,7 +26,7 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 4. `loom:issue` → Human-approved, ready for Worker to claim
 5. `loom:building` → Worker actively implementing
 6. `loom:review-requested` → PR ready for Reviewer
-7. `loom:approved` → Reviewer approved, ready to merge
+7. `loom:pr` → Reviewer approved, ready to merge
 8. `loom:blocked` → Work blocked on dependency
 
 **Workflow**:
@@ -35,7 +35,7 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 - **Curator**: Finds unlabeled issues, enhances, marks `loom:curated`
 - **User**: Reviews curated issues, adds `loom:issue` to explicitly approve work
 - **Worker**: Claims `loom:issue`, implements, creates PR with `loom:review-requested`
-- **Reviewer**: Finds `loom:review-requested`, reviews, marks `loom:approved`
+- **Reviewer**: Finds `loom:review-requested`, reviews, marks `loom:pr`
 - **User**: Merges approved PRs
 
 ## Consequences

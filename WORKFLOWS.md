@@ -167,8 +167,8 @@ gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:changes-r
 
 ```bash
 # Priority 1 (URGENT): Approved PRs with merge conflicts - BLOCKING
-gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:building")) | "#\(.number): \(.title)"'
+gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 
 # Priority 2 (NORMAL): PRs with review feedback
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \

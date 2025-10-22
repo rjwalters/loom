@@ -32,7 +32,7 @@ Healers prioritize work in the following order:
 
 **Find approved PRs with merge conflicts that aren't already claimed:**
 ```bash
-gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" --json number,title,labels \
+gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number,title,labels \
   | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 ```
 

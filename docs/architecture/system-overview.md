@@ -307,7 +307,7 @@ stateDiagram-v2
     InProgress --> ReviewRequested: PR created<br/>Add loom:review-requested
     ReviewRequested --> Reviewing: Reviewer claims<br/>Add loom:reviewing
     Reviewing --> ReviewRequested: Request changes<br/>Back to loom:review-requested
-    Reviewing --> Approved: Approve<br/>Add loom:approved
+    Reviewing --> Approved: Approve<br/>Add loom:pr
     Approved --> [*]: Merge PR<br/>Auto-close issue
 
     note right of Proposal: Blue badge<br/>User decision
@@ -340,7 +340,7 @@ graph TB
     Curator -->|loom:ready| Repo
     Worker -->|loom:building| Repo
     Worker -->|PR + loom:review-requested| Repo
-    Reviewer -->|loom:approved| Repo
+    Reviewer -->|loom:pr| Repo
     Issues -->|New issues| Repo
 
     style Architect fill:#e1bee7

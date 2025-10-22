@@ -228,7 +228,7 @@ Loom uses GitHub labels for coordination:
 - **`loom:building`**: Issue is being worked on
 - **`loom:review-requested`**: PR ready for review
 - **`loom:changes-requested`**: PR needs fixes
-- **`loom:approved`**: PR approved, ready to merge
+- **`loom:pr`**: PR approved, ready to merge
 
 See [WORKFLOWS.md](WORKFLOWS.md) for complete label workflow documentation.
 
