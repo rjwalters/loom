@@ -119,7 +119,7 @@ echo "  • .gitignore will be updated with Loom patterns"
 echo ""
 info "GitHub Changes (if using Full Install):"
 echo "  • Creates GitHub labels for workflow coordination"
-echo "  • Creates tracking issue with 'loom:in-progress' label"
+echo "  • Creates tracking issue with 'loom:building' label"
 echo "  • Creates pull request with 'loom:review-requested' label"
 echo ""
 read -r -p "Proceed with installation? [y/N] " -n 1 PROCEED

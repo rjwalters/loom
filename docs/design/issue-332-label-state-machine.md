@@ -6,7 +6,7 @@ The current label workflow has several issues:
 1. **Ambiguous `loom:ready`**: Overloaded for both issues AND PRs
 2. **Automatic approval**: Curator marks issues ready without human approval
 3. **Inconsistent naming**: `loom:proposal` vs `loom:hermit`
-4. **Duplicate labels**: Both `loom:approved` and `loom:pr` for merged PRs
+4. **Duplicate labels**: Both `loom:pr` and `loom:pr` for merged PRs
 5. **Unclear external contributor path**: How do external issues enter the workflow?
 
 ## Design Goals
@@ -27,7 +27,7 @@ The current label workflow has several issues:
 | `loom:hermit` | 🟣 #9333EA | Critic | Removal/simplification awaiting review |
 | `loom:curated` | 🟢 #10B981 | Curator | Enhanced with implementation details |
 | `loom:issue` | 🔵 #3B82F6 | **Human** | **Approved for work** (replaces `loom:ready`) |
-| `loom:in-progress` | 🟡 #F59E0B | Worker | Being implemented |
+| `loom:building` | 🟡 #F59E0B | Worker | Being implemented |
 | `loom:blocked` | 🔴 #EF4444 | Anyone | Implementation blocked |
 | `loom:urgent` | 🔴 #DC2626 | Triage/Human | High priority (max 3) |
 
@@ -42,7 +42,7 @@ The current label workflow has several issues:
 **Removed Labels:**
 - ❌ `loom:ready` (replaced by `loom:issue` for issues, `loom:review-requested` already exists for PRs)
 - ❌ `loom:proposal` (renamed to `loom:architect`)
-- ❌ `loom:approved` (duplicate of `loom:pr`)
+- ❌ `loom:pr` (duplicate of `loom:pr`)
 - ❌ `loom:reviewing` (not needed - use assignee instead)
 
 ## State Transitions
@@ -86,7 +86,7 @@ The current label workflow has several issues:
                          ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ WORKER: Claim and implement                                  │
-│   Action: Remove loom:issue, add loom:in-progress           │
+│   Action: Remove loom:issue, add loom:building           │
 │   Result: Create PR with loom:review-requested              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -170,12 +170,12 @@ The current label workflow has several issues:
 ### Curator
 
 **Old Behavior:**
-- Finds approved issues (no `loom:proposal`, not `loom:ready`/`loom:in-progress`)
+- Finds approved issues (no `loom:proposal`, not `loom:ready`/`loom:building`)
 - Enhances issue
 - **Automatically adds `loom:ready`** ❌
 
 **New Behavior:**
-- Finds approved issues (no suggestion labels, not `loom:issue`/`loom:in-progress`)
+- Finds approved issues (no suggestion labels, not `loom:issue`/`loom:building`)
 - Enhances issue
 - **Adds `loom:curated` only** ✅
 - **Human must explicitly add `loom:issue`** ✅
@@ -188,7 +188,7 @@ The current label workflow has several issues:
 **New Behavior:**
 - Searches for `loom:issue` issues
 - Prioritizes `loom:urgent` first
-- Claims by removing `loom:issue`, adding `loom:in-progress`
+- Claims by removing `loom:issue`, adding `loom:building`
 
 ### Triage
 
@@ -248,9 +248,9 @@ gh issue list --label="loom:ready" --json number --jq '.[].number' | \
 
 ```bash
 # PRs already use loom:review-requested correctly
-# Remove loom:approved if present, replace with loom:pr
-gh pr list --label="loom:approved" --json number --jq '.[].number' | \
-  xargs -I {} gh pr edit {} --remove-label "loom:approved" --add-label "loom:pr"
+# Remove loom:pr if present, replace with loom:pr
+gh pr list --label="loom:pr" --json number --jq '.[].number' | \
+  xargs -I {} gh pr edit {} --remove-label "loom:pr" --add-label "loom:pr"
 ```
 
 ### Phase 4: Delete Old Labels
@@ -259,7 +259,7 @@ gh pr list --label="loom:approved" --json number --jq '.[].number' | \
 # After confirming migration complete
 gh label delete "loom:ready"
 gh label delete "loom:proposal"
-gh label delete "loom:approved"
+gh label delete "loom:pr"
 gh label delete "loom:reviewing"  # if exists
 ```
 

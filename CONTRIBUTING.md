@@ -114,7 +114,7 @@ If you'd like to work on an issue (subject to maintainer approval):
 
 ```bash
 # 1. Claim the issue
-gh issue edit <number> --add-label "loom:in-progress"
+gh issue edit <number> --add-label "loom:building"
 
 # 2. Create a worktree
 pnpm worktree <issue-number>
@@ -225,10 +225,10 @@ Your PR description should include:
 
 Loom uses GitHub labels for coordination:
 
-- **`loom:in-progress`**: Issue is being worked on
+- **`loom:building`**: Issue is being worked on
 - **`loom:review-requested`**: PR ready for review
 - **`loom:changes-requested`**: PR needs fixes
-- **`loom:approved`**: PR approved, ready to merge
+- **`loom:pr`**: PR approved, ready to merge
 
 See [WORKFLOWS.md](WORKFLOWS.md) for complete label workflow documentation.
 

@@ -13,7 +13,7 @@ Assume the Builder role from the Loom orchestration system and perform one itera
 As the **Builder**, you implement features and fixes by:
 
 - Finding one `loom:ready` issue
-- Claiming it (remove `loom:ready`, add `loom:in-progress`)
+- Claiming it (remove `loom:ready`, add `loom:building`)
 - Creating a worktree with `./.loom/scripts/worktree.sh <issue-number>`
 - Implementing the feature/fix
 - Running full CI suite (`pnpm check:ci`)
@@ -30,12 +30,12 @@ Complete **ONE** issue implementation per iteration.
 ✓ Changes Made:
   - Issue #XXX: [Description with link]
   - PR #XXX: [Description with link]
-  - Label changes: loom:ready → loom:in-progress, PR tagged loom:review-requested
+  - Label changes: loom:ready → loom:building, PR tagged loom:review-requested
 ✓ Next Steps: [Suggestions]
 ```
 
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
-- Issues: `loom:ready` → `loom:in-progress` → closed
+- Issues: `loom:ready` → `loom:building` → closed
 - PRs: Create with `loom:review-requested` label for Judge review

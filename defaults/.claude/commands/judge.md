@@ -15,7 +15,7 @@ As the **Judge**, you review code quality by:
 - Finding one PR with `loom:review-requested` label
 - Performing thorough code review following role guidelines
 - Checking code quality, tests, documentation, and CI status
-- Approving (add `loom:approved`) or requesting changes
+- Approving (add `loom:pr`) or requesting changes
 - Providing constructive feedback with specific suggestions
 
 Complete **ONE** PR review per iteration.
@@ -28,7 +28,7 @@ Complete **ONE** PR review per iteration.
 ✓ Changes Made:
   - PR #XXX: [Description with link]
   - Review: [Approved / Changes Requested]
-  - Label changes: loom:review-requested → loom:approved (or kept for revisions)
+  - Label changes: loom:review-requested → loom:pr (or kept for revisions)
   - Feedback provided: [Summary of comments]
 ✓ Next Steps: [Suggestions]
 ```
@@ -36,5 +36,5 @@ Complete **ONE** PR review per iteration.
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
-- PRs: `loom:review-requested` → `loom:approved` (if approved) or keep label (if changes requested)
+- PRs: `loom:review-requested` → `loom:pr` (if approved) or keep label (if changes requested)
 - After approval, ready for maintainer merge

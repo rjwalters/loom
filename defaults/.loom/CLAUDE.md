@@ -131,7 +131,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 **Issue Lifecycle**:
 ```
-(created) → loom:issue → loom:in-progress → (closed)
+(created) → loom:issue → loom:building → (closed)
            ↑ Curator      ↑ Builder
 ```
 
@@ -153,7 +153,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 ### Label Definitions
 
 - **`loom:issue`**: Issue approved for work, ready for Builder to claim
-- **`loom:in-progress`**: Issue being implemented OR PR under review
+- **`loom:building`**: Issue being implemented OR PR under review
 - **`loom:review-requested`**: PR ready for Judge to review
 - **`loom:pr`**: PR approved by Judge, ready for human to merge
 - **`loom:architect`**: Architectural proposal awaiting user approval
@@ -172,7 +172,7 @@ When claiming an issue, create a worktree:
 
 ```bash
 # Agent claims issue #42
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
+gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
 
 # Create worktree for issue
 ./.loom/scripts/worktree.sh 42
@@ -222,7 +222,7 @@ gh pr create --label "loom:review-requested"
 
 2. **Claim issue**:
    ```bash
-   gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
+   gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
    ```
 
 3. **Create worktree**:
@@ -273,7 +273,7 @@ gh pr create --label "loom:review-requested"
 
 1. **Find unlabeled issues**:
    ```bash
-   gh issue list --label="!loom:issue,!loom:in-progress,!loom:architect,!loom:hermit"
+   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit"
    ```
 
 2. **Enhance issue**:
