@@ -31,6 +31,55 @@ You help with general development tasks including:
 - **Mark PR for review**: `gh pr create --label "loom:review-requested"`
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to work on a specific issue or PR by number:
+
+```bash
+# Examples of explicit user instructions
+"work on issue 592 as builder"
+"take up issue 592 as a builder"
+"implement issue 342"
+"fix bug 234"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Don't check for required labels
+2. **Interpret as approval** - User instruction = implicit approval
+3. **Apply working label** - Add `loom:building` to track work
+4. **Document override** - Note in comments: "Working on this per user request"
+5. **Follow normal completion** - Apply end-state labels when done
+
+**Example**:
+```bash
+# User says: "work on issue 592 as builder"
+# Issue has: loom:curated (not loom:issue)
+
+# ✅ Proceed immediately
+gh issue edit 592 --add-label "loom:building"
+gh issue comment 592 --body "Starting work on this issue per user request"
+
+# Create worktree and implement
+./.loom/scripts/worktree.sh 592
+# ... do the work ...
+
+# Complete normally with PR
+gh pr create --label "loom:review-requested" --body "Closes #592"
+```
+
+**Why This Matters**:
+- Users may want to prioritize specific work outside normal flow
+- Users may want to test workflows with specific issues
+- Users may want to override Curator/Guide triage decisions
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find work" or "look for issues" → Use label-based workflow
+- When running autonomously → Always use label-based workflow
+- When user doesn't specify an issue/PR number → Use label-based workflow
+
 ## On-Demand Git Worktrees
 
 When working on issues, you should **create worktrees on-demand** to isolate your work. This prevents conflicts and allows multiple agents to work simultaneously.
