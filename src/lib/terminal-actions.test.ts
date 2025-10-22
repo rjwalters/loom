@@ -5,6 +5,7 @@ import {
   startRename,
   type TerminalActionDependencies,
 } from "./terminal-actions";
+import { showToast } from "./toast";
 
 // Mock autonomous manager with stable instance
 const mockRunNow = vi.fn().mockResolvedValue(undefined);
@@ -16,12 +17,15 @@ vi.mock("./autonomous-manager", () => ({
   getAutonomousManager: vi.fn(() => mockAutonomousManager),
 }));
 
+vi.mock("./toast", () => ({
+  showToast: vi.fn(),
+}));
+
 describe("terminal-actions", () => {
   let state: AppState;
   let mockSaveCurrentConfig: ReturnType<typeof vi.fn>;
   let mockRender: ReturnType<typeof vi.fn>;
   let deps: TerminalActionDependencies;
-  let alertSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     state = new AppState();
@@ -34,7 +38,6 @@ describe("terminal-actions", () => {
       render: mockRender,
     };
 
-    alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
     vi.clearAllMocks();
   });
 
@@ -78,8 +81,9 @@ describe("terminal-actions", () => {
 
       await handleRunNowClick("term-1", { state });
 
-      expect(alertSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to run interval prompt")
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to run interval prompt"),
+        "error"
       );
     });
   });
