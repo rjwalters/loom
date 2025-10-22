@@ -24,6 +24,11 @@ import {
 } from "./lib/terminal-lifecycle";
 // NOTE: saveCurrentConfig is defined locally in this file
 import { getTerminalManager } from "./lib/terminal-manager";
+import {
+  initializeKeyboardNavigation,
+  initializeModalEscapeHandler,
+} from "./lib/keyboard-navigation";
+import { initializeScreenReaderAnnouncer } from "./lib/screen-reader-announcer";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { showToast } from "./lib/toast";
 import {
@@ -55,9 +60,16 @@ const logger = Logger.forComponent("main");
 // Initialize theme
 initTheme();
 
+// Initialize accessibility features
+initializeScreenReaderAnnouncer();
+initializeModalEscapeHandler();
+
 // Initialize state (no agents until workspace is selected)
 const state = new AppState();
 setAppState(state); // Register singleton so terminal-manager can access it
+
+// Initialize keyboard navigation
+initializeKeyboardNavigation(state);
 
 // Set up auto-save (saves state 2 seconds after last change)
 state.setAutoSave(async () => {
