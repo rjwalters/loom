@@ -840,4 +840,150 @@ describe("config", () => {
       expect(merged.terminals).toEqual(originalTerminals);
     });
   });
+
+  describe("Config Version Migration", () => {
+    it("migrates v1 config (no version field) to v2", async () => {
+      const v1Config = {
+        terminals: [
+          { id: "terminal-1", name: "Test" },
+        ],
+        offlineMode: false,
+      };
+
+      vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1Config));
+
+      const config = await loadConfig();
+
+      expect(config.version).toBe("2");
+      expect(config.terminals).toEqual(v1Config.terminals);
+      expect(config.offlineMode).toBe(false);
+
+      // Should have saved migrated config
+      expect(invoke).toHaveBeenCalledWith(
+        "write_config",
+        expect.objectContaining({
+          configJson: expect.stringContaining('"version": "2"'),
+        })
+      );
+    });
+
+    it("migrates v1 config (explicit version:1) to v2", async () => {
+      const v1Config = {
+        version: "1",
+        terminals: [{ id: "terminal-1", name: "Test" }],
+        offlineMode: true,
+      };
+
+      vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1Config));
+
+      const config = await loadConfig();
+
+      expect(config.version).toBe("2");
+      expect(config.terminals).toEqual(v1Config.terminals);
+      expect(config.offlineMode).toBe(true);
+    });
+
+    it("loads v2 config without migration", async () => {
+      const v2Config = {
+        version: "2",
+        terminals: [{ id: "terminal-1", name: "Test" }],
+        offlineMode: false,
+      };
+
+      vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v2Config));
+
+      const config = await loadConfig();
+
+      expect(config).toEqual(v2Config);
+
+      // Should NOT have saved (no migration needed)
+      expect(invoke).not.toHaveBeenCalledWith("write_config", expect.anything());
+    });
+
+    it("rejects unsupported future versions", async () => {
+      const futureConfig = {
+        version: "999",
+        terminals: [],
+      };
+
+      vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(futureConfig));
+
+      const config = await loadConfig();
+
+      // Should return empty config on error
+      expect(config.version).toBe("2");
+      expect(config.terminals).toEqual([]);
+    });
+
+    it("treats missing version as v1", async () => {
+      const v1ConfigNoVersion = {
+        terminals: [{ id: "terminal-1", name: "Test" }],
+      };
+
+      vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1ConfigNoVersion));
+
+      const config = await loadConfig();
+
+      expect(config.version).toBe("2");
+      expect(config.terminals).toEqual(v1ConfigNoVersion.terminals);
+    });
+
+    it("preserves all fields during v1 to v2 migration", async () => {
+      const v1Config = {
+        terminals: [
+          {
+            id: "terminal-1",
+            name: "Builder",
+            role: "claude-code-worker",
+            roleConfig: { workerType: "claude" },
+            theme: "forest",
+          },
+        ],
+        offlineMode: true,
+      };
+
+      vi.mocked(invoke).mockResolvedValueOnce(JSON.stringify(v1Config));
+
+      const config = await loadConfig();
+
+      expect(config.version).toBe("2");
+      expect(config.terminals).toEqual(v1Config.terminals);
+      expect(config.offlineMode).toBe(true);
+    });
+
+    it("saveConfig always saves with version 2", async () => {
+      const configWithoutVersion = {
+        terminals: [{ id: "terminal-1", name: "Test" }],
+        offlineMode: false,
+      } as any;
+
+      await saveConfig(configWithoutVersion);
+
+      expect(invoke).toHaveBeenCalledWith(
+        "write_config",
+        expect.objectContaining({
+          configJson: expect.stringContaining('"version": "2"'),
+        })
+      );
+
+      const savedConfig = JSON.parse(
+        (invoke as any).mock.calls.find(
+          (call: any) => call[0] === "write_config"
+        )[1].configJson
+      );
+
+      expect(savedConfig.version).toBe("2");
+    });
+
+    it("loadConfig returns v2 config when no workspace set", async () => {
+      // Simulate no workspace set
+      vi.mocked(invoke).mockClear();
+
+      const config = await loadConfig();
+
+      expect(config.version).toBe("2");
+      expect(config.terminals).toEqual([]);
+      expect(invoke).not.toHaveBeenCalled();
+    });
+  });
 });
