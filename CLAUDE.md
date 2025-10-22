@@ -130,20 +130,10 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 ### Label Flow
 
 **Issue Lifecycle**:
-
-*With Curator Enhancement (preferred):*
-```
-(created) → loom:issue → loom:curated → loom:in-progress → (closed)
-           ↑ Human      ↑ Curator      ↑ Builder
-```
-
-*Without Curator (fallback):*
 ```
 (created) → loom:issue → loom:in-progress → (closed)
-           ↑ Human      ↑ Builder
+           ↑ Curator      ↑ Builder
 ```
-
-Builder prioritizes `loom:issue` + `loom:curated` but can proceed with `loom:issue` alone if no curated work is available.
 
 **PR Lifecycle**:
 ```
@@ -424,48 +414,63 @@ which claude
 
 ### Error Recovery Workflows
 
-**Terminal Missing Session Recovery**
+Loom provides several recovery workflows for common failure scenarios. Understanding these patterns helps diagnose and resolve issues quickly.
 
-When a terminal loses its tmux session:
+#### Terminal Missing Session Recovery
 
-1. **Detection**: Health monitor detects missing session
-2. **State Update**: Terminal marked with `missingSession: true`
-3. **User Prompt**: UI shows "Restart" button
-4. **Recovery**: User clicks restart → daemon creates new session
-5. **State Sync**: Terminal reconnected, `missingSession` cleared
+When a terminal loses its tmux session (daemon crash, manual termination, etc.):
 
-**Implementation**: See `src/lib/health-monitor.ts:218-296`
+**Detection**: Health monitor periodically checks for tmux session existence via `check_session_health` IPC call.
 
-**Daemon Reconnection**
+**State Update**: Terminal marked with `missingSession: true`, status changes to `Error`.
 
-When daemon connection is lost:
+**User Prompt**: UI displays "Session missing" warning with a "Restart" button.
 
-1. **Detection**: IPC socket write fails
-2. **Retry**: Exponential backoff (2s, 4s, 8s, max 30s)
-3. **Fallback**: If daemon unresponsive, prompt user to restart app
-4. **State Preservation**: Terminal configs saved to `.loom/config.json`
+**Recovery Process**:
+1. User clicks "Restart" button on the affected terminal
+2. Frontend calls `restart_terminal(id)` Tauri command
+3. Daemon destroys any orphaned tmux session (if exists)
+4. Daemon creates fresh tmux session with same configuration
+5. Frontend clears `missingSession` flag, status returns to `Idle`
+6. Output poller resumes streaming terminal output
 
-**Implementation**: See `src/lib/daemon-client.ts`
+**Implementation**: See health-monitor.ts:250-351 (detection), workspace-reset.ts:149-181 (restart flow).
 
-**State Cleanup After Crash**
+#### Daemon Reconnection
 
-After app crash:
+When IPC connection to the daemon is lost (daemon crash, socket permission issue, etc.):
 
-1. **Orphaned tmux sessions**: Run `tmux -L loom kill-server`
-2. **Stale worktrees**: Run `git worktree prune`
-3. **Corrupted config**: Factory reset loads `defaults/config.json`
-4. **Terminal logs**: Inspect `~/.loom/console.log`, `~/.loom/daemon.log`
+**Detection**: IPC operations fail with connection errors, daemon ping failures increment `consecutiveFailures`.
 
-**Tools**: Use MCP servers to inspect state:
-- `mcp__loom-ui__read_state_file`
-- `mcp__loom-logs__tail_daemon_log`
+**Retry Logic**: Exponential backoff with configurable intervals (default: 2s, 4s, 8s, max 30s).
 
-**Worktree Orphan Cleanup**
+**Fallback**: After 3 consecutive ping failures, daemon marked as `connected: false`.
 
-When worktrees remain after terminal deletion:
+**User Action**: UI prompts user to restart the Loom application (daemon auto-starts on app launch).
 
+**State Preservation**: Terminal configurations persist in `.loom/config.json`, survive daemon restarts.
+
+**Implementation**: See health-monitor.ts:356-387 (ping cycle), daemon-client.ts (IPC layer).
+
+#### State Cleanup After Crash
+
+When the Loom app crashes or is force-quit, manual cleanup may be necessary:
+
+**Orphaned tmux sessions**:
 ```bash
-# List all worktrees
+# List all loom sessions
+tmux -L loom list-sessions
+
+# Kill all loom sessions (nuclear option)
+tmux -L loom kill-server
+
+# Kill specific session
+tmux -L loom kill-session -t loom-terminal-1
+```
+
+**Stale worktrees**:
+```bash
+# List all worktrees (shows orphaned paths)
 git worktree list
 
 # Remove specific worktree
@@ -475,7 +480,73 @@ git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 ```
 
-**Prevention**: Daemon auto-cleanup in `loom-daemon/src/terminal.rs:87-102`
+**Corrupted config**:
+```bash
+# Reset to factory defaults (from workspace root)
+cp defaults/config.json .loom/config.json
+
+# Or use MCP tool
+mcp__loom-ui__trigger_factory_reset
+```
+
+**Terminal logs inspection**:
+```bash
+# Browser console logs (frontend activity)
+tail -f ~/.loom/console.log
+
+# Daemon logs (IPC, terminal lifecycle)
+tail -f ~/.loom/daemon.log
+
+# Terminal output logs (raw tmux output)
+tail -f /tmp/loom-terminal-1.out
+```
+
+**MCP Diagnostic Tools**: Use MCP servers to inspect state without manual file reading:
+- `mcp__loom-ui__read_state_file` - Current runtime state
+- `mcp__loom-ui__read_config_file` - Terminal configurations
+- `mcp__loom-logs__tail_daemon_log` - Recent daemon activity
+- `mcp__loom-terminals__check_tmux_server_health` - Tmux server status
+
+#### Worktree Orphan Cleanup
+
+When worktrees remain after terminal deletion or failed cleanup:
+
+**Automatic Cleanup**: Daemon attempts to remove worktrees when destroying terminals (terminal.rs:87-102).
+
+**Manual Cleanup** (when automatic fails):
+```bash
+# Identify orphaned worktrees
+git worktree list
+# Look for paths like .loom/worktrees/terminal-X with missing directories
+
+# Remove worktree from git tracking
+git worktree remove .loom/worktrees/issue-42 --force
+
+# Prune all orphaned references
+git worktree prune
+
+# Clean up leftover directories (if any)
+rm -rf .loom/worktrees/issue-42
+```
+
+**Prevention**: Use the `./.loom/scripts/worktree.sh` helper script for manual worktree creation:
+- Prevents nested worktrees
+- Validates paths before creation
+- Provides clear error messages for existing directories
+
+**Bulk Cleanup**: Use the `clean.sh` script to remove worktrees for closed issues:
+```bash
+# Interactive cleanup (prompts per worktree)
+./.loom/scripts/clean.sh
+
+# Preview what would be cleaned
+./.loom/scripts/clean.sh --dry-run
+
+# Auto-cleanup for CI/automation
+./.loom/scripts/clean.sh --force
+```
+
+**Implementation**: See loom-daemon/src/terminal.rs:87-102 (auto-cleanup), scripts/clean.sh (bulk cleanup), scripts/worktree.sh (prevention).
 
 ## Resources
 
