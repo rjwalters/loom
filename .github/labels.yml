@@ -23,7 +23,7 @@
 
 - name: loom:healing
   description: Healer is fixing this bug or addressing PR feedback
-  color: "1d76db"  # blue
+  color: "d93f0b"  # red
 
 - name: loom:review-requested
   description: PR ready for Judge to review
