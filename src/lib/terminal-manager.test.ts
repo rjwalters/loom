@@ -300,8 +300,8 @@ describe("TerminalManager", () => {
     it("loads terminal addons", () => {
       manager.createTerminal("terminal-1", "container-1");
 
-      // Should load FitAddon, WebLinksAddon, and attempt WebglAddon
-      expect(mockTerminalInstance.loadAddon).toHaveBeenCalledTimes(3);
+      // Should load FitAddon, WebLinksAddon, SearchAddon, and attempt WebglAddon
+      expect(mockTerminalInstance.loadAddon).toHaveBeenCalledTimes(4);
     });
 
     it("handles WebGL addon failure gracefully", () => {

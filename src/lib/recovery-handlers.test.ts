@@ -17,15 +17,19 @@ vi.mock("@tauri-apps/api/dialog", () => ({
   ask: vi.fn(),
 }));
 
+vi.mock("./toast", () => ({
+  showToast: vi.fn(),
+}));
+
 import { ask } from "@tauri-apps/api/dialog";
 import { invoke } from "@tauri-apps/api/tauri";
+import { showToast } from "./toast";
 
 describe("recovery-handlers", () => {
   let state: AppState;
   let mockGenerateNextConfigId: ReturnType<typeof vi.fn>;
   let mockSaveCurrentConfig: ReturnType<typeof vi.fn>;
   let deps: RecoveryDependencies;
-  let alertSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     state = new AppState();
@@ -39,8 +43,6 @@ describe("recovery-handlers", () => {
       generateNextConfigId: mockGenerateNextConfigId,
       saveCurrentConfig: mockSaveCurrentConfig,
     };
-
-    alertSpy = vi.spyOn(window, "alert").mockImplementation(() => {});
 
     vi.clearAllMocks();
   });
@@ -101,14 +103,14 @@ describe("recovery-handlers", () => {
 
       await handleRecoverNewSession("term-1", deps);
 
-      expect(alertSpy).toHaveBeenCalledWith("Cannot recover: no workspace selected");
+      expect(showToast).toHaveBeenCalledWith("Cannot recover: no workspace selected", "error");
       expect(invoke).not.toHaveBeenCalled();
     });
 
     it("shows alert when terminal not found", async () => {
       await handleRecoverNewSession("nonexistent", deps);
 
-      expect(alertSpy).toHaveBeenCalledWith("Cannot recover: terminal not found");
+      expect(showToast).toHaveBeenCalledWith("Cannot recover: terminal not found", "error");
       expect(invoke).not.toHaveBeenCalled();
     });
 
@@ -125,8 +127,9 @@ describe("recovery-handlers", () => {
 
       await handleRecoverNewSession("term-1", deps);
 
-      expect(alertSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to create new session")
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to create new session"),
+        "error"
       );
     });
 
@@ -185,8 +188,9 @@ describe("recovery-handlers", () => {
 
       await handleRecoverAttachSession("term-1", state);
 
-      expect(alertSpy).toHaveBeenCalledWith(
-        expect.stringContaining("Failed to list available sessions")
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to list available sessions"),
+        "error"
       );
     });
   });
@@ -238,7 +242,10 @@ describe("recovery-handlers", () => {
 
       await handleAttachToSession("term-1", "session-1", deps);
 
-      expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to attach to session"));
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to attach to session"),
+        "error"
+      );
     });
   });
 
@@ -275,7 +282,10 @@ describe("recovery-handlers", () => {
 
       await handleKillSession("session-1", state);
 
-      expect(alertSpy).toHaveBeenCalledWith(expect.stringContaining("Failed to kill session"));
+      expect(showToast).toHaveBeenCalledWith(
+        expect.stringContaining("Failed to kill session"),
+        "error"
+      );
     });
   });
 });
