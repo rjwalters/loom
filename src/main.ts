@@ -8,8 +8,13 @@ import { saveCurrentConfiguration, setConfigWorkspace } from "./lib/config";
 import { initConsoleLogger } from "./lib/console-logger";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
 import { getHealthMonitor } from "./lib/health-monitor";
+import {
+  initializeKeyboardNavigation,
+  initializeModalEscapeHandler,
+} from "./lib/keyboard-navigation";
 import { Logger } from "./lib/logger";
 import { getOutputPoller } from "./lib/output-poller";
+import { initializeScreenReaderAnnouncer } from "./lib/screen-reader-announcer";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
 import {
@@ -24,11 +29,6 @@ import {
 } from "./lib/terminal-lifecycle";
 // NOTE: saveCurrentConfig is defined locally in this file
 import { getTerminalManager } from "./lib/terminal-manager";
-import {
-  initializeKeyboardNavigation,
-  initializeModalEscapeHandler,
-} from "./lib/keyboard-navigation";
-import { initializeScreenReaderAnnouncer } from "./lib/screen-reader-announcer";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { showToast } from "./lib/toast";
 import {

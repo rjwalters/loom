@@ -53,16 +53,14 @@ export interface ActivityEntry {
  * @param workspacePath - Absolute path to workspace
  * @param entry - Activity entry to log
  */
-export async function logActivity(
-  workspacePath: string,
-  entry: ActivityEntry,
-): Promise<void> {
+export async function logActivity(workspacePath: string, entry: ActivityEntry): Promise<void> {
   try {
     await invoke("log_activity", {
       workspacePath,
       entry,
     });
   } catch (error) {
+    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
     console.error("[activity-logger] Failed to log activity:", error);
     // Non-blocking - don't throw
   }
@@ -77,7 +75,7 @@ export async function logActivity(
  */
 export async function readRecentActivity(
   workspacePath: string,
-  limit = 100,
+  limit = 100
 ): Promise<ActivityEntry[]> {
   try {
     return await invoke("read_recent_activity", {
@@ -85,6 +83,7 @@ export async function readRecentActivity(
       limit,
     });
   } catch (error) {
+    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
     console.error("[activity-logger] Failed to read recent activity:", error);
     return [];
   }
@@ -101,7 +100,7 @@ export async function readRecentActivity(
 export async function getActivityByRole(
   workspacePath: string,
   role: string,
-  limit = 100,
+  limit = 100
 ): Promise<ActivityEntry[]> {
   try {
     return await invoke("get_activity_by_role", {
@@ -110,10 +109,8 @@ export async function getActivityByRole(
       limit,
     });
   } catch (error) {
-    console.error(
-      `[activity-logger] Failed to get activity for role ${role}:`,
-      error,
-    );
+    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
+    console.error(`[activity-logger] Failed to get activity for role ${role}:`, error);
     return [];
   }
 }
