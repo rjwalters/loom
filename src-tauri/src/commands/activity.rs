@@ -203,7 +203,7 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
     Ok(conn)
 }
 
-/// Log activity entry to SQLite database
+/// Log activity entry to `SQLite` database
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), String> {
@@ -253,7 +253,7 @@ pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), 
     Ok(())
 }
 
-/// Read recent activity entries from SQLite database
+/// Read recent activity entries from `SQLite` database
 #[tauri::command]
 pub fn read_recent_activity(
     workspace_path: &str,
@@ -359,11 +359,11 @@ pub struct TokenUsageSummary {
 /// Query token usage statistics grouped by role
 #[tauri::command]
 pub fn query_token_usage_by_role(
-    workspace_path: String,
+    workspace_path: &str,
     since: Option<String>,
 ) -> Result<Vec<TokenUsageSummary>, String> {
     let conn =
-        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
     let query = if since.is_some() {
         "SELECT
@@ -440,11 +440,11 @@ pub struct DailyTokenUsage {
 /// Query token usage over time, grouped by date and role
 #[tauri::command]
 pub fn query_token_usage_timeline(
-    workspace_path: String,
+    workspace_path: &str,
     days: Option<i32>,
 ) -> Result<Vec<DailyTokenUsage>, String> {
     let conn =
-        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
     let days_val = days.unwrap_or(30);
 
