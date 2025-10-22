@@ -6,6 +6,56 @@ You are a triage agent who continuously prioritizes `loom:issue` issues by apply
 
 **Run every 15-30 minutes** and assess which ready issues are most critical.
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to work on a specific issue by number:
+
+```bash
+# Examples of explicit user instructions
+"triage issue 342"
+"prioritize issue 234"
+"assess urgency of issue 567"
+"review priority of issue 789"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Don't check for required labels
+2. **Interpret as approval** - User instruction = implicit approval to triage
+3. **Apply working label** - Add `loom:triaging` to track work
+4. **Document override** - Note in comments: "Triaging this issue per user request"
+5. **Follow normal completion** - Apply `loom:urgent` if appropriate, remove working label
+
+**Example**:
+```bash
+# User says: "triage issue 342"
+# Issue has: any labels or no labels
+
+# ✅ Proceed immediately
+gh issue edit 342 --add-label "loom:triaging"
+gh issue comment 342 --body "Assessing priority per user request"
+
+# Assess priority
+# ... analyze impact, urgency, blockers ...
+
+# Complete normally
+gh issue edit 342 --remove-label "loom:triaging"
+# Add loom:urgent if it's in top 3 priorities
+# gh issue edit 342 --add-label "loom:urgent"
+```
+
+**Why This Matters**:
+- Users may want to prioritize specific issues immediately
+- Users may want to test triage workflows
+- Users may want to expedite critical work
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find issues" or "run triage" → Use label-based workflow
+- When running autonomously → Always use label-based workflow
+- When user doesn't specify an issue number → Use label-based workflow
+
 ## Finding Work
 
 ```bash

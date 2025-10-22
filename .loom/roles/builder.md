@@ -31,6 +31,55 @@ You help with general development tasks including:
 - **Mark PR for review**: `gh pr create --label "loom:review-requested"`
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to work on a specific issue or PR by number:
+
+```bash
+# Examples of explicit user instructions
+"work on issue 592 as builder"
+"take up issue 592 as a builder"
+"implement issue 342"
+"fix bug 234"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Don't check for required labels
+2. **Interpret as approval** - User instruction = implicit approval
+3. **Apply working label** - Add `loom:building` to track work
+4. **Document override** - Note in comments: "Working on this per user request"
+5. **Follow normal completion** - Apply end-state labels when done
+
+**Example**:
+```bash
+# User says: "work on issue 592 as builder"
+# Issue has: loom:curated (not loom:issue)
+
+# ✅ Proceed immediately
+gh issue edit 592 --add-label "loom:building"
+gh issue comment 592 --body "Starting work on this issue per user request"
+
+# Create worktree and implement
+./.loom/scripts/worktree.sh 592
+# ... do the work ...
+
+# Complete normally with PR
+gh pr create --label "loom:review-requested" --body "Closes #592"
+```
+
+**Why This Matters**:
+- Users may want to prioritize specific work outside normal flow
+- Users may want to test workflows with specific issues
+- Users may want to override Curator/Guide triage decisions
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find work" or "look for issues" → Use label-based workflow
+- When running autonomously → Always use label-based workflow
+- When user doesn't specify an issue/PR number → Use label-based workflow
+
 ## On-Demand Git Worktrees
 
 When working on issues, you should **create worktrees on-demand** to isolate your work. This prevents conflicts and allows multiple agents to work simultaneously.
@@ -240,12 +289,13 @@ gh issue edit 100 --remove-label "loom:issue" --add-label "loom:building"
 
 ## Finding Work: Priority System
 
-Workers use a two-level priority system to determine which issues to work on:
+Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
 1. **🔴 Urgent** (`loom:urgent`) - Critical/blocking issues requiring immediate attention
-2. **🟢 Normal** (no priority label) - Regular work (FIFO - oldest first)
+2. **🟢 Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
+3. **🟡 Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
 ### How to Find Work
 
@@ -257,14 +307,23 @@ gh issue list --label="loom:issue" --label="loom:urgent" --state=open --limit=5
 
 If urgent issues exist, **claim one immediately** - these are critical.
 
-**Step 2: If no urgent, check normal priority (FIFO)**
+**Step 2: If no urgent, check curated issues**
 
 ```bash
-# This command lists issues oldest-first by default (FIFO queue)
-gh issue list --label="loom:issue" --state=open --limit=10
+gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=10
 ```
 
-For normal priority, always pick the **oldest** issue first (fair FIFO queue). The `gh issue list` command automatically sorts by creation date (oldest first), ensuring fair queueing.
+**Why prefer these**: Highest quality - human approved + Curator added context.
+
+**Step 3: If no curated, fall back to approved-only issues**
+
+```bash
+gh issue list --label="loom:issue" --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not) and ([.labels[].name] | contains(["external"]) | not)) |
+  "#\(.number): \(.title)"'
+```
+
+**Why allow this**: Work can proceed even if Curator hasn't run yet. Builder can implement based on human approval alone if needed.
 
 ### Priority Guidelines
 
@@ -272,6 +331,212 @@ For normal priority, always pick the **oldest** issue first (fair FIFO queue). T
 - If you encounter a critical issue during implementation, create an issue and let the Architect triage priority
 - If an urgent issue appears while working on normal priority, finish your current task first before switching
 - Respect the priority system - urgent issues need immediate attention
+- Always prefer curated issues when available for better context and guidance
+
+## Assessing Complexity Before Claiming
+
+**IMPORTANT**: Always assess complexity BEFORE claiming an issue. Never mark an issue as `loom:building` unless you're committed to completing it.
+
+### Why Assess First?
+
+**The Problem with Claim-First-Assess-Later**:
+- Issue locked with `loom:building` (invisible to other Builders)
+- No PR created if you abandon it (looks stalled)
+- Requires manual intervention to unclaim
+- Wastes your time reading/planning complex tasks
+- Blocks other Builders from finding work
+
+**Better Approach**: Read → Assess → Decide → (Maybe) Claim
+
+### Complexity Assessment Checklist
+
+Before claiming an issue, estimate the work required:
+
+**Time Estimate Guidelines**:
+- Count acceptance criteria (each ≈ 30-60 minutes)
+- Count files to modify (each ≈ 15-30 minutes)
+- Add testing time (≈ 20-30% of implementation)
+- Consider documentation updates
+
+**Complexity Indicators**:
+- **Simple** (< 3 hours): Single component, clear path, ≤ 5 criteria
+- **Complex** (3-9 hours): Multiple components, architectural changes, > 5 criteria
+- **Intractable** (> 9 hours or unclear): Missing requirements, external dependencies
+
+### Decision Tree
+
+**If Simple (< 3 hours)**:
+1. ✅ Claim immediately: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
+2. Create worktree: `./.loom/scripts/worktree.sh <number>`
+3. Implement → Test → PR
+
+**If Complex (3-9 hours, clear path)**:
+1. ❌ DO NOT CLAIM
+2. Break down into 2-5 sub-issues
+3. Close parent issue with explanation
+4. Curator will enhance sub-issues
+5. Pick next available issue
+
+**If Intractable (> 9 hours or unclear)**:
+1. ❌ DO NOT CLAIM
+2. Comment explaining the blocker
+3. Mark as `loom:blocked`
+4. Pick next available issue
+
+### Issue Decomposition Pattern
+
+When you encounter a complex but tractable issue, be ambitious - break it down so work can start.
+
+**Step 1: Analyze the Work**
+- Identify natural phases (infrastructure → integration → polish)
+- Find component boundaries (frontend → backend → tests)
+- Look for MVP opportunities (simple version first)
+
+**Step 2: Create Sub-Issues**
+
+```bash
+# Create focused sub-issues
+gh issue create --title "Phase 1: <component> foundation" --body "$(cat <<'EOF'
+Parent Issue: #<parent-number>
+
+## Scope
+[Specific deliverable for this phase]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Dependencies
+- None (this is the foundation)
+
+Estimated: 1-2 hours
+EOF
+)"
+
+gh issue create --title "Phase 2: <component> integration" --body "$(cat <<'EOF'
+Parent Issue: #<parent-number>
+
+## Scope
+[Specific integration work]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+- [ ] Criterion 2
+
+## Dependencies
+- [ ] #<phase1-number>: Phase 1 must be complete
+
+Estimated: 2-3 hours
+EOF
+)"
+```
+
+**Step 3: Close Parent Issue**
+
+```bash
+gh issue close <parent-number> --comment "$(cat <<'EOF'
+Decomposed into smaller sub-issues for incremental implementation:
+
+- #<phase1-number>: Phase 1 (1-2 hours)
+- #<phase2-number>: Phase 2 (2-3 hours)
+- #<phase3-number>: Phase 3 (1-2 hours)
+
+Each sub-issue references this parent for full context. Curator will enhance them with implementation details.
+EOF
+)"
+```
+
+### Real-World Example
+
+**Original Issue #524**: "Track agent activity in local database"
+- **Assessment**: 6-9 hours, multiple components, clear technical approach
+- **Decision**: Complex but tractable → decompose
+
+**Decomposition**:
+```bash
+# Phase 1: Infrastructure
+gh issue create --title "Create JSON activity log structure and helper functions"
+# → Issue #534 (1-2 hours)
+
+# Phase 2: Integration
+gh issue create --title "Integrate activity logging into /builder and /judge"
+# → Issue #535 (2-3 hours, depends on #534)
+
+# Phase 3: Querying
+gh issue create --title "Add activity querying to /loom heuristic"
+# → Issue #536 (1-2 hours, depends on #535)
+
+# Close parent
+gh issue close 524 --comment "Decomposed into #534, #535, #536"
+```
+
+**Benefits**:
+- ✅ Each sub-issue is completable in one iteration
+- ✅ Can implement MVP first, enhance later
+- ✅ Multiple builders can work in parallel
+- ✅ Incremental value delivery
+
+### Complexity Assessment Examples
+
+**Example 1: Simple (Claim It)**
+```
+Issue: "Fix typo in CLAUDE.md line 42"
+Assessment:
+- 1 file, 1 line changed
+- No acceptance criteria (obvious fix)
+- No dependencies
+- Estimated: 5 minutes
+→ Decision: CLAIM immediately
+```
+
+**Example 2: Medium (Claim It)**
+```
+Issue: "Add dark mode toggle to settings panel"
+Assessment:
+- 3 files affected (~150 LOC)
+- 4 acceptance criteria
+- No dependencies
+- Estimated: 2 hours
+→ Decision: CLAIM and implement
+```
+
+**Example 3: Complex (Decompose It)**
+```
+Issue: "Migrate state management to Redux"
+Assessment:
+- 15+ files (~800 LOC)
+- 12 acceptance criteria
+- External dependency (Redux)
+- Estimated: 2 days
+→ Decision: DECOMPOSE into phases
+```
+
+**Example 4: Intractable (Block It)**
+```
+Issue: "Improve performance"
+Assessment:
+- Vague requirements
+- No acceptance criteria
+- Unclear what to optimize
+→ Decision: BLOCK, request clarification
+```
+
+### Key Principles
+
+**Be Ambitious, Not Reckless**:
+- Don't skip complex work - digest it into manageable pieces
+- Think: "How can I break this down?" not "This is too big, skip it"
+- Each sub-issue should be completable in one iteration
+
+**Prevent Orphaned Issues**:
+- Never claim unless you're ready to start immediately
+- If you discover mid-work it's too complex, mark `loom:blocked` with explanation
+- Other builders can see available work in the backlog
+
+**Enable Parallel Work**:
+- Well-decomposed issues allow multiple builders to contribute
+- Clear dependencies prevent stepping on each other's toes
+- Incremental progress > waiting for one person to finish everything
 
 ## Scope Management
 
