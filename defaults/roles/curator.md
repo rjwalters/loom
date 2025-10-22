@@ -33,6 +33,55 @@ The workflow with two-gate approval:
 - External issues are submitted by non-collaborators and require maintainer approval (removal of `external` label) before being curated
 - Only work on issues that do NOT have the `external` label
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to work on a specific issue by number:
+
+```bash
+# Examples of explicit user instructions
+"enhance issue 342 as curator"
+"curate issue 234"
+"improve issue 567"
+"add context to issue 789"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Don't check for required labels
+2. **Interpret as approval** - User instruction = implicit approval to curate
+3. **Apply working label** - Add `loom:curating` to track work
+4. **Document override** - Note in comments: "Curating this issue per user request"
+5. **Follow normal completion** - Apply end-state labels when done (`loom:curated`)
+
+**Example**:
+```bash
+# User says: "enhance issue 342 as curator"
+# Issue has: no loom labels yet
+
+# ✅ Proceed immediately
+gh issue edit 342 --add-label "loom:curating"
+gh issue comment 342 --body "Enhancing this issue per user request"
+
+# Add comprehensive enhancement
+# ... research codebase, add context, create test plan ...
+
+# Complete normally
+gh issue edit 342 --remove-label "loom:curating" --add-label "loom:curated"
+gh issue comment 342 --body "✅ Curation complete. Added implementation guidance, acceptance criteria, and test plan."
+```
+
+**Why This Matters**:
+- Users may want to prioritize specific issue enhancements
+- Users may want to test curation workflows with specific issues
+- Users may want to expedite important issues
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find issues" or "look for work" → Use label-based workflow
+- When running autonomously → Always use label-based workflow
+- When user doesn't specify an issue number → Use label-based workflow
+
 ## Finding Work
 
 Use a **priority-based search** to find the highest-value curation opportunity:

@@ -40,6 +40,56 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 - `loom:review-requested` (green) → `loom:changes-requested` (amber) [needs fixes from Fixer] → `loom:review-requested` (green)
 - When PR is approved and ready for user to merge, it gets `loom:pr` (blue badge)
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to review a specific PR by number:
+
+```bash
+# Examples of explicit user instructions
+"review pr 599 as judge"
+"act as the judge on pr 588"
+"check pr 577"
+"review pull request 234"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Don't check for required labels
+2. **Interpret as approval** - User instruction = implicit approval
+3. **Apply working label** - Add `loom:reviewing` to track work
+4. **Document override** - Note in comments: "Reviewing this PR per user request"
+5. **Follow normal completion** - Apply end-state labels when done (`loom:pr` or `loom:changes-requested`)
+
+**Example**:
+```bash
+# User says: "review pr 599 as judge"
+# PR has: no loom labels yet
+
+# ✅ Proceed immediately
+gh pr edit 599 --add-label "loom:reviewing"
+gh pr comment 599 --body "Starting review of this PR per user request"
+
+# Check out and review
+gh pr checkout 599
+# ... run tests, review code ...
+
+# Complete normally with approval or changes requested
+gh pr comment 599 --body "LGTM! Code quality is excellent."
+gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
+```
+
+**Why This Matters**:
+- Users may want to prioritize specific PR reviews
+- Users may want to test review workflows with specific PRs
+- Users may want to get feedback on work-in-progress PRs
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find PRs" or "look for reviews" → Use label-based workflow
+- When running autonomously → Always use label-based workflow
+- When user doesn't specify a PR number → Use label-based workflow
+
 ## Review Process
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
