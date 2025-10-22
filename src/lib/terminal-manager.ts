@@ -1,4 +1,5 @@
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
@@ -29,6 +30,11 @@ export interface ManagedTerminal {
  */
 export class TerminalManager {
   private terminals: Map<string, ManagedTerminal> = new Map();
+  private searchAddons: Map<string, SearchAddon> = new Map();
+  private searchState: Map<
+    string,
+    { term: string; options?: { caseSensitive?: boolean; regex?: boolean; wholeWord?: boolean } }
+  > = new Map();
 
   /**
    * Create a new xterm.js terminal instance and attach it to a persistent container
@@ -100,9 +106,14 @@ export class TerminalManager {
     // Create and load addons
     const fitAddon = new FitAddon(); // Keep for compatibility but don't use for resizing
     const webLinksAddon = new WebLinksAddon();
+    const searchAddon = new SearchAddon();
 
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(webLinksAddon);
+    terminal.loadAddon(searchAddon);
+
+    // Store search addon for later use
+    this.searchAddons.set(terminalId, searchAddon);
 
     // Try to load WebGL addon (fallback if it fails)
     try {
@@ -290,8 +301,10 @@ export class TerminalManager {
     // Dispose of the terminal
     managed.terminal.dispose();
 
-    // Remove from map
+    // Remove from maps
     this.terminals.delete(terminalId);
+    this.searchAddons.delete(terminalId);
+    this.searchState.delete(terminalId);
   }
 
   /**
@@ -444,6 +457,67 @@ export class TerminalManager {
       }
     }
     return 14; // default
+  }
+
+  /**
+   * Search terminal output for a query string
+   */
+  searchTerminal(
+    terminalId: string,
+    query: string,
+    options?: { caseSensitive?: boolean; regex?: boolean; wholeWord?: boolean }
+  ): boolean {
+    const searchAddon = this.searchAddons.get(terminalId);
+    if (!searchAddon || !query) {
+      return false;
+    }
+
+    // Store search state for next/previous navigation
+    this.searchState.set(terminalId, { term: query, options });
+
+    return searchAddon.findNext(query, options);
+  }
+
+  /**
+   * Find next match for current search query
+   */
+  findNext(terminalId: string): boolean {
+    const searchAddon = this.searchAddons.get(terminalId);
+    const state = this.searchState.get(terminalId);
+
+    if (!searchAddon || !state) {
+      return false;
+    }
+
+    return searchAddon.findNext(state.term, state.options);
+  }
+
+  /**
+   * Find previous match for current search query
+   */
+  findPrevious(terminalId: string): boolean {
+    const searchAddon = this.searchAddons.get(terminalId);
+    const state = this.searchState.get(terminalId);
+
+    if (!searchAddon || !state) {
+      return false;
+    }
+
+    return searchAddon.findPrevious(state.term, state.options);
+  }
+
+  /**
+   * Clear search decorations from terminal
+   */
+  clearSearch(terminalId: string): void {
+    const searchAddon = this.searchAddons.get(terminalId);
+    if (!searchAddon) {
+      return;
+    }
+
+    searchAddon.clearDecorations();
+    // Clear search state
+    this.searchState.delete(terminalId);
   }
 
   private setupResizeHandling(terminalId: string, managed: ManagedTerminal): void {
