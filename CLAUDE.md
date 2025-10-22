@@ -43,7 +43,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 # Terminal 3: Curator maintaining issues
 /curator
-# Enhances unlabeled issues, marks as loom:issue
+# Enhances unlabeled issues, marks as loom:curated
 ```
 
 ### 2. Tauri App Mode
