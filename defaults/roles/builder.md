@@ -240,12 +240,13 @@ gh issue edit 100 --remove-label "loom:issue" --add-label "loom:in-progress"
 
 ## Finding Work: Priority System
 
-Workers use a two-level priority system to determine which issues to work on:
+Workers use a three-level priority system to determine which issues to work on:
 
 ### Priority Order
 
 1. **🔴 Urgent** (`loom:urgent`) - Critical/blocking issues requiring immediate attention
-2. **🟢 Normal** (no priority label) - Regular work (FIFO - oldest first)
+2. **🟢 Curated** (`loom:issue` + `loom:curated`) - Approved and enhanced issues (highest quality)
+3. **🟡 Approved Only** (`loom:issue` without `loom:curated`) - Approved but not yet curated (fallback)
 
 ### How to Find Work
 
@@ -257,14 +258,23 @@ gh issue list --label="loom:issue" --label="loom:urgent" --state=open --limit=5
 
 If urgent issues exist, **claim one immediately** - these are critical.
 
-**Step 2: If no urgent, check normal priority (FIFO)**
+**Step 2: If no urgent, check curated issues**
 
 ```bash
-# This command lists issues oldest-first by default (FIFO queue)
-gh issue list --label="loom:issue" --state=open --limit=10
+gh issue list --label="loom:issue" --label="loom:curated" --state=open --limit=10
 ```
 
-For normal priority, always pick the **oldest** issue first (fair FIFO queue). The `gh issue list` command automatically sorts by creation date (oldest first), ensuring fair queueing.
+**Why prefer these**: Highest quality - human approved + Curator added context.
+
+**Step 3: If no curated, fall back to approved-only issues**
+
+```bash
+gh issue list --label="loom:issue" --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not) and ([.labels[].name] | contains(["external"]) | not)) |
+  "#\(.number): \(.title)"'
+```
+
+**Why allow this**: Work can proceed even if Curator hasn't run yet. Builder can implement based on human approval alone if needed.
 
 ### Priority Guidelines
 
@@ -272,6 +282,7 @@ For normal priority, always pick the **oldest** issue first (fair FIFO queue). T
 - If you encounter a critical issue during implementation, create an issue and let the Architect triage priority
 - If an urgent issue appears while working on normal priority, finish your current task first before switching
 - Respect the priority system - urgent issues need immediate attention
+- Always prefer curated issues when available for better context and guidance
 
 ## Assessing Complexity Before Claiming
 
