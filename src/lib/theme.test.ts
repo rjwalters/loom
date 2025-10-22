@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getCurrentTheme, initTheme, toggleTheme } from "./theme";
+import { initTheme, toggleTheme } from "./theme";
 
 describe("theme", () => {
   let matchMediaMock: any;
@@ -100,66 +100,52 @@ describe("theme", () => {
       document.documentElement.classList.remove("dark");
 
       toggleTheme(); // light -> dark
-      expect(getCurrentTheme()).toBe("dark");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
 
       toggleTheme(); // dark -> light
-      expect(getCurrentTheme()).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
 
       toggleTheme(); // light -> dark
-      expect(getCurrentTheme()).toBe("dark");
-    });
-  });
-
-  describe("getCurrentTheme", () => {
-    it("returns 'dark' when dark class is present", () => {
-      document.documentElement.classList.add("dark");
-
-      expect(getCurrentTheme()).toBe("dark");
-    });
-
-    it("returns 'light' when dark class is absent", () => {
-      document.documentElement.classList.remove("dark");
-
-      expect(getCurrentTheme()).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
     });
   });
 
   describe("integration", () => {
-    it("initTheme and getCurrentTheme work together", () => {
+    it("initTheme sets dark class correctly", () => {
       localStorage.setItem("theme", "dark");
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();
 
-      expect(getCurrentTheme()).toBe("dark");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
     });
 
-    it("toggleTheme and getCurrentTheme work together", () => {
+    it("toggleTheme updates dark class correctly", () => {
       document.documentElement.classList.remove("dark");
 
-      expect(getCurrentTheme()).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
 
       toggleTheme();
 
-      expect(getCurrentTheme()).toBe("dark");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
 
       toggleTheme();
 
-      expect(getCurrentTheme()).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
     });
 
-    it("full workflow: init -> toggle -> getCurrentTheme", () => {
+    it("full workflow: init -> toggle -> check dark class", () => {
       localStorage.setItem("theme", "light");
       matchMediaMock.mockReturnValue({ matches: false });
 
       initTheme();
-      expect(getCurrentTheme()).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
 
       toggleTheme();
-      expect(getCurrentTheme()).toBe("dark");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
 
       toggleTheme();
-      expect(getCurrentTheme()).toBe("light");
+      expect(document.documentElement.classList.contains("dark")).toBe(false);
     });
   });
 });
