@@ -200,6 +200,7 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
 
 /// Log activity entry to SQLite database
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), String> {
     let conn =
         open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
