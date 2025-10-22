@@ -104,7 +104,12 @@ If no Priority 1 issues exist, find unlabeled issues:
 
 ```bash
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:curating", "external"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(
+    ([.labels[].name] | contains(["loom:curated"]) | not) and
+    ([.labels[].name] | contains(["loom:curating"]) | not) and
+    ([.labels[].name] | contains(["loom:issue"]) | not) and
+    ([.labels[].name] | contains(["external"]) | not)
+  ) | "#\(.number) \(.title)"'
 ```
 
 **Workflow**:
