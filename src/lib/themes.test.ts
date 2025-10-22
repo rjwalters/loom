@@ -120,20 +120,46 @@ describe("themes", () => {
   });
 
   describe("getThemeForRole", () => {
+    // Analysis/strategic roles → lavender (purple)
     it("should map architect role to lavender theme", () => {
       expect(getThemeForRole("architect.md")).toBe("lavender");
     });
 
+    it("should map judge role to lavender theme", () => {
+      expect(getThemeForRole("judge.md")).toBe("lavender");
+    });
+
+    // Organization/curation roles → ocean (cyan)
     it("should map curator role to ocean theme", () => {
       expect(getThemeForRole("curator.md")).toBe("ocean");
     });
 
-    it("should map reviewer role to rose theme", () => {
-      expect(getThemeForRole("reviewer.md")).toBe("rose");
+    it("should map guide role to ocean theme", () => {
+      expect(getThemeForRole("guide.md")).toBe("ocean");
     });
 
-    it("should map worker role to forest theme", () => {
-      expect(getThemeForRole("worker.md")).toBe("forest");
+    // Building/implementation roles → forest (green)
+    it("should map builder role to forest theme", () => {
+      expect(getThemeForRole("builder.md")).toBe("forest");
+    });
+
+    it("should map hermit role to forest theme", () => {
+      expect(getThemeForRole("hermit.md")).toBe("forest");
+    });
+
+    // Fixing/healing role → rose (pink)
+    it("should map healer role to rose theme", () => {
+      expect(getThemeForRole("healer.md")).toBe("rose");
+    });
+
+    // Leadership/visibility role → sunset (orange)
+    it("should map champion role to sunset theme", () => {
+      expect(getThemeForRole("champion.md")).toBe("sunset");
+    });
+
+    // General-purpose role → slate (gray)
+    it("should map driver role to slate theme", () => {
+      expect(getThemeForRole("driver.md")).toBe("slate");
     });
 
     it("should return default for plain shell (undefined role)", () => {

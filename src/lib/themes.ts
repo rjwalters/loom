@@ -127,18 +127,31 @@ export function isDarkMode(): boolean {
 /**
  * Get theme based on terminal role
  * Maps role files to consistent theme colors
+ *
+ * Theme assignments follow semantic patterns:
+ * - Analysis/strategic roles → Purple (lavender) - thoughtful, analytical
+ * - Organization/curation → Cyan (ocean) - calm, organizing
+ * - Building/implementation → Green (forest) - growth, construction
+ * - Fixing/healing → Pink (rose) - gentle care
+ * - Leadership/visibility → Orange (sunset) - energy, prominence
+ * - General-purpose → Gray (slate) - neutral, flexible
  */
 export function getThemeForRole(roleFile?: string): string {
   if (!roleFile) {
     return "default"; // Plain shell terminals
   }
 
-  // Map role files to themes
+  // Map role files to semantically appropriate themes
   const roleThemeMap: Record<string, string> = {
-    "architect.md": "lavender",
-    "curator.md": "ocean",
-    "reviewer.md": "rose",
-    "worker.md": "forest",
+    "architect.md": "lavender", // Strategic analysis
+    "builder.md": "forest", // Implementation
+    "champion.md": "sunset", // Leadership/visibility
+    "curator.md": "ocean", // Organization
+    "driver.md": "slate", // General-purpose
+    "guide.md": "ocean", // Prioritization/organization
+    "healer.md": "rose", // Fixing/healing
+    "hermit.md": "forest", // Simplification
+    "judge.md": "lavender", // Code review/analysis
   };
 
   return roleThemeMap[roleFile] || "default";
