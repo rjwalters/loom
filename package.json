@@ -42,7 +42,6 @@
     "worktree": "./scripts/worktree.sh",
     "clean": "./scripts/cleanup.sh",
     "clean:full": "./scripts/cleanup.sh && pnpm install",
-    "generate:agents": "./scripts/generate-agents.sh",
     "prepare": "husky"
   },
   "repository": {

@@ -1,56 +1,68 @@
-# ⚠️ DO NOT EDIT THESE FILES DIRECTLY
+# .claude/agents Directory - Not Used by Loom
 
-This directory contains **auto-generated** Claude Code agent files.
+This directory is intentionally empty. Loom does not use the `.claude/agents/` directory.
 
-## Context: Loom Repository vs Target Repositories
+## Why This Directory is Empty
 
-This README serves two contexts:
+The `.claude/agents/` directory previously contained auto-generated agent files that duplicated content from `.loom/roles/*.md`. These files have been removed because:
 
-### 1. In the Loom Repository (Development)
+1. **Slash commands use references**: Loom's slash commands (`.claude/commands/*.md`) reference `.loom/roles/*.md` directly
+2. **No automatic delegation**: Loom doesn't use Claude Code's automatic agent delegation feature
+3. **Unnecessary duplication**: Each agent file contained ~500 lines duplicating role definitions
+4. **Hermit flagged for removal**: The auto-generated files were correctly identified as redundant
 
-When working on Loom itself:
-- **Source**: `defaults/roles/*.md` (edit these)
-- **Generated**: `defaults/.claude/agents/*.md` (auto-generated)
-- **Script**: `scripts/generate-agents.sh`
+## How Loom Works
 
+Loom uses **slash commands** for role-based workflows:
+
+```bash
+# Use slash commands to assume roles
+/builder    # Implements features from .loom/roles/builder.md
+/judge      # Reviews PRs from .loom/roles/judge.md
+/curator    # Maintains issues from .loom/roles/curator.md
+# ... and more
 ```
-defaults/roles/builder.md (SOURCE - edit this)
-    ↓
-    pnpm generate:agents
-    ↓
-defaults/.claude/agents/builder.md (GENERATED - don't edit)
-```
 
-### 2. In Target Repositories (After Installation)
+Each slash command:
+- Is defined in `.claude/commands/<role>.md` (lightweight, ~40 lines)
+- References the full role definition in `.loom/roles/<role>.md`
+- Tells Claude to load the role definition and follow its workflow
 
-When Loom is installed into a target repository:
-- **Source**: `.loom/roles/*.md` (copied from `defaults/roles/` during installation)
-- **Agents**: `.claude/agents/*.md` (copied from `defaults/.claude/agents/` during installation)
-- These files are **pre-generated** and ready to use
+## Role Definitions
 
-In target repos, both directories are installed from Loom:
-- `.loom/roles/` ← copied from `defaults/roles/`
-- `.claude/agents/` ← copied from `defaults/.claude/agents/`
+All role definitions are in `.loom/roles/`:
 
-## Why This Pattern?
+- `.loom/roles/builder.md` - Implementation specialist
+- `.loom/roles/judge.md` - Code review specialist
+- `.loom/roles/curator.md` - Issue maintenance specialist
+- `.loom/roles/architect.md` - System design specialist
+- `.loom/roles/hermit.md` - Code simplification specialist
+- `.loom/roles/healer.md` - Bug fix specialist
+- `.loom/roles/guide.md` - Issue prioritization specialist
+- `.loom/roles/driver.md` - General shell environment
 
-Claude Code agents **cannot reference external files** - they must be self-contained. We solve this by:
+## Historical Context
 
-1. **Loom repo**: Maintain source in `defaults/roles/`, generate `.claude/agents/`
-2. **Target repos**: Install both as-is, `.loom/roles/` is source of truth
-3. **Regeneration**: Only needed in Loom repo when updating default roles
+Prior to this change:
+- `scripts/generate-agents.sh` generated `.claude/agents/*.md` files
+- Each file contained YAML frontmatter + full role definition
+- Files were copied during installation from `defaults/.claude/agents/`
+- This was based on an assumption that Claude Code agents couldn't reference external files
 
-## Making Changes (Loom Repository Only)
+The assumption was incorrect - slash commands can and do reference external files. The agent files were never actually used.
 
-If you're working on the Loom repository and need to update default roles:
+## Verification
 
-1. **Edit source files**: `defaults/roles/*.md`
-2. **Regenerate agents**: `pnpm generate:agents`
-3. **Commit both**: Source and generated files
+Issue #571 tracks verification that removing `.claude/agents/` doesn't break functionality. Testing showed:
+- ✅ All slash commands work correctly
+- ✅ Autonomous agents run without errors
+- ✅ Fresh installations work properly
+- ✅ No errors about missing agent files
 
-**DO NOT edit `.claude/agents/*.md` manually** - they will be overwritten.
+**Conclusion**: `.claude/agents/` was legacy code that has been safely removed.
 
-## See Also
+---
 
-- **defaults/roles/README.md**: Full documentation on the source of truth pattern
-- **scripts/generate-agents.sh**: Generation script implementation (Loom repo only)
+**Related Issues**:
+- #527 - Removed `.claude/agents/` directory
+- #571 - Verified removal doesn't break functionality
