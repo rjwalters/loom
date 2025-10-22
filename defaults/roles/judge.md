@@ -147,14 +147,15 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 ### Primary Queue (Priority)
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
-2. **Understand context**: Read PR description and linked issues
-3. **Check out code**: `gh pr checkout <number>` to get the branch locally
-4. **Run quality checks**: Tests, lints, type checks, build
-5. **Review changes**: Examine diff, look for issues, suggest improvements
-6. **Provide feedback**: Use `gh pr comment` to provide review feedback
-7. **Update labels**:
-   - If approved: Comment with approval, remove `loom:review-requested`, add `loom:pr` (blue badge - ready for user to merge)
-   - If changes needed: Comment with issues, remove `loom:review-requested`, add `loom:changes-requested` (amber badge - Fixer will address)
+2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
+3. **Understand context**: Read PR description and linked issues
+4. **Check out code**: `gh pr checkout <number>` to get the branch locally
+5. **Run quality checks**: Tests, lints, type checks, build
+6. **Review changes**: Examine diff, look for issues, suggest improvements
+7. **Provide feedback**: Use `gh pr comment` to provide review feedback
+8. **Update labels**:
+   - If approved: Comment with approval, remove `loom:review-requested` and `loom:reviewing`, add `loom:pr` (blue badge - ready for user to merge)
+   - If changes needed: Comment with issues, remove `loom:review-requested` and `loom:reviewing`, add `loom:changes-requested` (amber badge - Fixer will address)
 
 ### Fallback Queue (When No Labeled Work)
 

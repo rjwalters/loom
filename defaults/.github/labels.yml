@@ -29,6 +29,10 @@
   description: Healer is fixing this bug or addressing PR feedback
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
+- name: loom:reviewing
+  description: Judge is actively reviewing this PR
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
 - name: loom:review-requested
   description: PR ready for Judge to review
   color: "10B981"  # emerald-500
