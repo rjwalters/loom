@@ -16,6 +16,19 @@
   description: "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback"
   color: "F59E0B"  # amber-500
 
+# Role-Specific Workflow Labels
+- name: loom:building
+  description: Builder is implementing this issue
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
+- name: loom:curating
+  description: Curator is enhancing this issue
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
+- name: loom:healing
+  description: Healer is fixing this bug or addressing PR feedback
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
 - name: loom:review-requested
   description: PR ready for Judge to review
   color: "10B981"  # emerald-500
