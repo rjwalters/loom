@@ -6,7 +6,7 @@
  * - Currently attached terminal ID (xterm.js instance management)
  * - Drag and drop state for terminal reordering
  *
- * Extracted from main.ts and drag-drop-manager.ts as part of Issue #118 PR 1.
+ * Simplified from class-based implementation to plain object (Issue #629).
  */
 
 /**
@@ -24,138 +24,41 @@ export interface DragState {
 }
 
 /**
- * App-level state manager for UI-specific state
- *
- * This class manages state that is specific to the UI layer and doesn't
- * belong in the domain model. It uses the singleton pattern for global access.
+ * App-level state interface for UI-specific state
  */
-export class AppLevelState {
-  private currentAttachedTerminalId: string | null = null;
-  private dragState: DragState = {
+export interface AppLevelState {
+  /** ID of the currently attached terminal (xterm.js instance) */
+  currentAttachedTerminalId: string | null;
+  /** Drag and drop state */
+  dragState: DragState;
+}
+
+/**
+ * Global app-level state singleton
+ *
+ * Simple mutable object for managing UI state. Access properties directly.
+ * Use resetDragState() helper to reset drag state to initial values.
+ */
+export const appLevelState: AppLevelState = {
+  currentAttachedTerminalId: null,
+  dragState: {
+    draggedConfigId: null,
+    dropTargetConfigId: null,
+    dropInsertBefore: false,
+    isDragging: false,
+  },
+};
+
+/**
+ * Resets all drag state to initial values
+ *
+ * Helper function for the most common drag state operation.
+ */
+export function resetDragState(): void {
+  appLevelState.dragState = {
     draggedConfigId: null,
     dropTargetConfigId: null,
     dropInsertBefore: false,
     isDragging: false,
   };
-
-  /**
-   * Gets the ID of the currently attached terminal (xterm.js instance)
-   */
-  getCurrentAttachedTerminalId(): string | null {
-    return this.currentAttachedTerminalId;
-  }
-
-  /**
-   * Sets the ID of the currently attached terminal
-   * @param id - The terminal ID, or null to clear
-   */
-  setCurrentAttachedTerminalId(id: string | null): void {
-    this.currentAttachedTerminalId = id;
-  }
-
-  /**
-   * Gets the ID of the terminal being dragged
-   */
-  getDraggedConfigId(): string | null {
-    return this.dragState.draggedConfigId;
-  }
-
-  /**
-   * Sets the ID of the terminal being dragged
-   * @param id - The terminal ID, or null to clear
-   */
-  setDraggedConfigId(id: string | null): void {
-    this.dragState.draggedConfigId = id;
-  }
-
-  /**
-   * Gets the ID of the terminal being dropped onto
-   */
-  getDropTargetConfigId(): string | null {
-    return this.dragState.dropTargetConfigId;
-  }
-
-  /**
-   * Sets the ID of the terminal being dropped onto
-   * @param id - The terminal ID, or null to clear
-   */
-  setDropTargetConfigId(id: string | null): void {
-    this.dragState.dropTargetConfigId = id;
-  }
-
-  /**
-   * Gets whether to insert before (true) or after (false) the drop target
-   */
-  getDropInsertBefore(): boolean {
-    return this.dragState.dropInsertBefore;
-  }
-
-  /**
-   * Sets whether to insert before (true) or after (false) the drop target
-   * @param insertBefore - True to insert before, false to insert after
-   */
-  setDropInsertBefore(insertBefore: boolean): void {
-    this.dragState.dropInsertBefore = insertBefore;
-  }
-
-  /**
-   * Gets whether a drag operation is currently in progress
-   */
-  getIsDragging(): boolean {
-    return this.dragState.isDragging;
-  }
-
-  /**
-   * Sets whether a drag operation is currently in progress
-   * @param isDragging - True if dragging, false otherwise
-   */
-  setIsDragging(isDragging: boolean): void {
-    this.dragState.isDragging = isDragging;
-  }
-
-  /**
-   * Gets all drag state at once
-   */
-  getDragState(): DragState {
-    return { ...this.dragState };
-  }
-
-  /**
-   * Resets all drag state to initial values
-   */
-  resetDragState(): void {
-    this.dragState = {
-      draggedConfigId: null,
-      dropTargetConfigId: null,
-      dropInsertBefore: false,
-      isDragging: false,
-    };
-  }
-}
-
-// Singleton instance for accessing app-level state from anywhere
-let appLevelStateInstance: AppLevelState | null = null;
-
-/**
- * Gets the singleton AppLevelState instance.
- * Creates a new instance if one doesn't exist.
- * Use this to access app-level UI state from anywhere in the codebase.
- *
- * @returns The singleton AppLevelState instance
- */
-export function getAppLevelState(): AppLevelState {
-  if (!appLevelStateInstance) {
-    appLevelStateInstance = new AppLevelState();
-  }
-  return appLevelStateInstance;
-}
-
-/**
- * Sets the singleton AppLevelState instance.
- * Primarily used for testing to inject a mock state instance.
- *
- * @param state - The AppLevelState instance to use as the singleton
- */
-export function setAppLevelState(state: AppLevelState): void {
-  appLevelStateInstance = state;
 }
