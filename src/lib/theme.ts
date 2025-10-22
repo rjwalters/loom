@@ -10,7 +10,3 @@ export function toggleTheme(): void {
   const isDark = document.documentElement.classList.toggle("dark");
   localStorage.setItem("theme", isDark ? "dark" : "light");
 }
-
-export function getCurrentTheme(): "dark" | "light" {
-  return document.documentElement.classList.contains("dark") ? "dark" : "light";
-}
