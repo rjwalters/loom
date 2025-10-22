@@ -3,6 +3,7 @@ mod health_monitor;
 mod init;
 mod ipc;
 mod logging;
+mod metrics_collector;
 mod terminal;
 mod types;
 
@@ -83,7 +84,7 @@ async fn main() -> Result<()> {
 
     // Initialize activity database
     let db_path = loom_dir.join("activity.db");
-    let activity_db = ActivityDb::new(db_path)?;
+    let activity_db = ActivityDb::new(db_path.clone())?;
     log::info!("Activity database initialized");
 
     let activity_db = Arc::new(Mutex::new(activity_db));
@@ -101,6 +102,19 @@ async fn main() -> Result<()> {
         log::info!("✅ tmux health monitoring enabled (interval: {interval}s)");
         // Note: health_handle is dropped here, but the thread keeps running
         // health_state could be stored for querying crash status if needed
+    }
+
+    // Start GitHub metrics collection (if workspace is set)
+    // Workspace can be set via LOOM_WORKSPACE environment variable
+    let workspace_from_env = std::env::var("LOOM_WORKSPACE").ok();
+    let db_path_str = db_path.to_str().map(|s| s.to_string());
+
+    if let (Some(workspace), Some(db_path_string)) = (workspace_from_env.as_deref(), db_path_str) {
+        let _metrics_handle = metrics_collector::try_init_metrics_collector(
+            Some(workspace),
+            &db_path_string,
+        );
+        // Note: metrics_handle is dropped here, but the thread keeps running if enabled
     }
 
     // Start IPC server
