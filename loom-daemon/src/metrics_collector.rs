@@ -456,7 +456,9 @@ fn insert_github_event(
         params![activity_id, event_type, event_time, pr_number, issue_number, commit_sha, author],
     )?;
 
-    log::debug!("Inserted {event_type} event: PR#{pr_number:?} Issue#{issue_number:?} at {event_time}");
+    log::debug!(
+        "Inserted {event_type} event: PR#{pr_number:?} Issue#{issue_number:?} at {event_time}"
+    );
 
     Ok(true)
 }
