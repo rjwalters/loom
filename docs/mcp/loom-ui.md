@@ -323,7 +323,7 @@ Status message indicating the command was written to the MCP command file.
 2. Shows confirmation dialog to user
 3. Creates terminals based on config
 4. Launches agents with configured roles
-5. Resets GitHub labels (`loom:in-progress` → removed, `loom:reviewing` → `loom:review-requested`)
+5. Resets GitHub labels (`loom:building` → removed, `loom:reviewing` → `loom:review-requested`)
 
 **Error Conditions:**
 

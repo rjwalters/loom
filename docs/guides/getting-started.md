@@ -516,7 +516,7 @@ claude --role builder
 
 # Follow the Builder workflow
 # 1. Find "loom:ready" issue
-# 2. Claim issue (add "loom:in-progress" label)
+# 2. Claim issue (add "loom:building" label)
 # 3. Create worktree: pnpm worktree <issue-number>
 # 4. Implement, test, commit
 # 5. Create PR with "loom:review-requested" label

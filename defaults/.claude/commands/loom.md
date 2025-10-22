@@ -56,7 +56,7 @@ After completing your iteration, report:
 
 Follow the label-based coordination system (ADR-0006):
 
-- Issues: `loom:curated` → `loom:issue` → `loom:in-progress` → closed
+- Issues: `loom:curated` → `loom:issue` → `loom:building` → closed
 - PRs: `loom:review-requested` → `loom:pr` → merged
 - Proposals: `loom:architect` → reviewed → implemented or closed
 - Suggestions: `loom:hermit` → reviewed → implemented or closed

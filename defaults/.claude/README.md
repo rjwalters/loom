@@ -92,7 +92,7 @@ Interact with the Loom application UI and state:
 - `trigger_force_start` - Trigger force start without confirmation (immediate reset)
 
 **Label State Machine Reset**: When workspace is started (via `trigger_start` or `trigger_force_start`), the `reset_github_labels` Tauri command automatically resets the GitHub label state machine:
-- Removes `loom:in-progress` from all open issues (workers can reclaim them)
+- Removes `loom:building` from all open issues (workers can reclaim them)
 - Replaces `loom:reviewing` with `loom:review-requested` on all open PRs (reviewer can re-review)
 - This ensures a clean state when restarting the workspace with fresh agent terminals
 
