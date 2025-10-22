@@ -42,6 +42,8 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 
 ## Review Process
 
+### Primary Queue (Priority)
+
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
 2. **Understand context**: Read PR description and linked issues
 3. **Check out code**: `gh pr checkout <number>` to get the branch locally
@@ -51,6 +53,85 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 7. **Update labels**:
    - If approved: Comment with approval, remove `loom:review-requested`, add `loom:pr` (blue badge - ready for user to merge)
    - If changes needed: Comment with issues, remove `loom:review-requested`, add `loom:changes-requested` (amber badge - Fixer will address)
+
+### Fallback Queue (When No Labeled Work)
+
+If no PRs have the `loom:review-requested` label, the Judge can proactively review unlabeled PRs to maximize utilization and catch issues early.
+
+**Fallback search**:
+```bash
+# Find PRs without any loom: labels
+gh pr list --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number) \(.title)"'
+```
+
+**Decision tree**:
+```
+Judge starts iteration
+    ↓
+Search for loom:review-requested PRs
+    ↓
+    ├─→ Found? → Review as normal (add loom:pr or loom:changes-requested)
+    │
+    └─→ None found
+            ↓
+        Search for unlabeled open PRs
+            ↓
+            ├─→ Found? → Review but leave labels unchanged
+            │              (external/manual PR, no workflow labels)
+            │
+            └─→ None found → No work available, exit iteration
+```
+
+**IMPORTANT: Fallback mode behavior**:
+- **DO review the code** thoroughly with same standards as labeled PRs
+- **DO provide feedback** via comments
+- **DO NOT add workflow labels** (`loom:pr`, `loom:changes-requested`) to unlabeled PRs
+- **DO NOT update PR labels** at all - these may be external contributor PRs outside the Loom workflow
+
+**Example fallback workflow**:
+```bash
+# 1. Check primary queue
+LABELED_PRS=$(gh pr list --label="loom:review-requested" --json number --jq 'length')
+
+if [ "$LABELED_PRS" -gt 0 ]; then
+  echo "Found $LABELED_PRS PRs with loom:review-requested"
+  # Normal workflow: review and update labels
+else
+  echo "No loom:review-requested PRs found, checking unlabeled PRs..."
+
+  # 2. Check fallback queue
+  UNLABELED_PR=$(gh pr list --state=open --json number,labels \
+    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
+    | head -n 1)
+
+  if [ -n "$UNLABELED_PR" ]; then
+    echo "Reviewing unlabeled PR #$UNLABELED_PR (fallback mode)"
+
+    # Check out and review the PR
+    gh pr checkout $UNLABELED_PR
+    # ... run checks, review code ...
+
+    # Provide feedback but DO NOT add workflow labels
+    gh pr comment $UNLABELED_PR --body "$(cat <<'EOF'
+Code review feedback...
+
+Note: This PR was reviewed in fallback mode (no loom:review-requested label).
+Consider adding loom:review-requested if you want it in the priority queue.
+EOF
+)"
+  else
+    echo "No work available - both queues empty"
+    exit 0
+  fi
+fi
+```
+
+**Benefits of fallback queue**:
+- Maximizes Judge utilization during low-activity periods
+- Provides proactive code review on external contributor PRs
+- Catches issues before they accumulate
+- Respects external PRs by not adding workflow labels
 
 ## Review Focus Areas
 
