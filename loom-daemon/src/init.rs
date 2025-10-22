@@ -211,7 +211,16 @@ fn find_git_root() -> Option<PathBuf> {
 
     loop {
         let git_dir = current.join(".git");
+
+        // Security: Check if .git exists and is NOT a symlink
+        // Prevents symlink-based directory traversal attacks (CWE-59)
         if git_dir.exists() {
+            if let Ok(metadata) = git_dir.symlink_metadata() {
+                if metadata.is_symlink() {
+                    // Reject symlinks to prevent directory escape
+                    return None;
+                }
+            }
             return Some(current);
         }
 
