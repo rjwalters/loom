@@ -3,8 +3,8 @@ import { TerminalStateManager } from "./terminal-state-manager";
 import { WorkspaceStateManager } from "./workspace-state-manager";
 
 // Re-export types and enums for backward compatibility
-export type { Terminal, ColorTheme, InputRequest, ActivityEntry } from "./types";
-export { TerminalStatus, AgentStatus, isValidTerminal } from "./types";
+export type { ActivityEntry, ColorTheme, InputRequest, Terminal } from "./types";
+export { AgentStatus, isValidTerminal, TerminalStatus } from "./types";
 
 const logger = Logger.forComponent("state");
 
@@ -376,4 +376,3 @@ export function getAppState(): AppState {
 export function setAppState(state: AppState): void {
   appStateInstance = state;
 }
-

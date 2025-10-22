@@ -1,5 +1,5 @@
 import { Logger } from "./logger";
-import type { Terminal, TerminalStatus, ColorTheme } from "./types";
+import type { ColorTheme, Terminal, TerminalStatus } from "./types";
 
 const logger = Logger.forComponent("terminal-state-manager");
 
