@@ -5,7 +5,7 @@ use tempfile::TempDir;
 fn benchmark_terminal_creation(c: &mut Criterion) {
     c.bench_function("create_temp_dir", |b| {
         b.iter(|| {
-            let temp_dir = TempDir::new().unwrap();
+            let temp_dir = TempDir::new().expect("Failed to create temp dir for benchmark");
             let path = temp_dir.path().to_path_buf();
             black_box(path);
         });
