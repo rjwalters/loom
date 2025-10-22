@@ -38,6 +38,8 @@ export interface TerminalConfig {
  * Stored in .loom/config.json and committed to version control.
  */
 export interface LoomConfig {
+  /** Configuration format version - enables safe future migrations */
+  version: "2";
   /** Array of terminal configurations */
   terminals: TerminalConfig[];
   /** Offline mode flag - when true, skips Claude Code agent launch and uses simple status echoes */
@@ -204,17 +206,68 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
 }
 
 /**
+ * Migrates config from v1 (no version field or version:"1") to v2 format.
+ * v1 configs are identified by missing version field or explicit "1" value.
+ *
+ * @param raw - The raw v1 config object
+ * @returns Migrated v2 config with version field
+ */
+function migrateFromV1(raw: unknown): LoomConfig {
+  const v1 = raw as { terminals?: TerminalConfig[]; offlineMode?: boolean };
+
+  logger.info("Migrating config from v1 to v2", {
+    terminalCount: v1.terminals?.length ?? 0,
+  });
+
+  return {
+    version: "2",
+    terminals: v1.terminals ?? [],
+    offlineMode: v1.offlineMode,
+  };
+}
+
+/**
+ * Migrates config to the latest version based on explicit version field.
+ * Handles version detection and delegates to specific migration functions.
+ *
+ * @param raw - The raw config object (may be any version)
+ * @returns Migrated config at latest version (v2)
+ * @throws Error if config version is unsupported (future versions)
+ */
+function migrateToLatest(raw: unknown): LoomConfig {
+  // Safely extract version field
+  const version = (raw as { version?: string }).version ?? "1";
+
+  logger.info("Checking config version for migration", { version });
+
+  switch (version) {
+    case "1":
+      // Treat missing version or explicit "1" as v1
+      return migrateFromV1(raw);
+    case "2":
+      // Already latest version
+      return raw as LoomConfig;
+    default:
+      // Unknown version from the future - fail fast with clear error
+      throw new Error(
+        `Unsupported config version "${version}". This version of Loom only supports versions 1-2. Please upgrade Loom to work with this config.`
+      );
+  }
+}
+
+/**
  * Loads configuration from .loom/config.json.
  * Automatically migrates legacy format if detected (has "agents" field instead of "terminals").
+ * Also migrates from v1 (no version field) to v2 (explicit version).
  * Returns empty config on error.
  *
  * @returns The loaded configuration, or empty config if file doesn't exist or is invalid
  * @throws Never throws - returns empty config on error and logs the error
  */
 export async function loadConfig(): Promise<LoomConfig> {
-  // Return empty config if no workspace is set
+  // Return empty v2 config if no workspace is set
   if (!cachedWorkspacePath) {
-    return { terminals: [] };
+    return { version: "2", terminals: [] };
   }
 
   const workspacePath = cachedWorkspacePath;
@@ -231,18 +284,32 @@ export async function loadConfig(): Promise<LoomConfig> {
       logger.info("Detected legacy format, migrating");
       const { config, state } = migrateLegacyConfig(parsed as LegacyConfig);
 
+      // Ensure version field is set after legacy migration
+      const configWithVersion: LoomConfig = {
+        ...config,
+        version: "2",
+      };
+
       // Save migrated versions
-      await saveConfig(config);
+      await saveConfig(configWithVersion);
       await saveState(state);
 
-      return config;
+      return configWithVersion;
     }
 
-    return parsed as LoomConfig;
+    // Migrate to latest version if needed
+    const migratedConfig = migrateToLatest(parsed);
+
+    // Save migrated config if version changed
+    if (!parsed.version || parsed.version !== "2") {
+      await saveConfig(migratedConfig);
+    }
+
+    return migratedConfig;
   } catch (error) {
     logger.error("Failed to load config", error as Error, { workspacePath });
-    // Return empty config on error
-    return { terminals: [] };
+    // Return empty v2 config on error
+    return { version: "2", terminals: [] };
   }
 }
 
@@ -250,6 +317,7 @@ export async function loadConfig(): Promise<LoomConfig> {
  * Saves configuration to .loom/config.json.
  * Creates the .loom directory if it doesn't exist.
  * Formats JSON with 2-space indentation for readability.
+ * Always saves with current version ("2") to ensure version field is present.
  *
  * @param config - The configuration to save
  * @throws Never throws - logs error and continues on failure
@@ -263,7 +331,13 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
   try {
     const workspacePath = cachedWorkspacePath;
 
-    const contents = JSON.stringify(config, null, 2);
+    // Ensure version field is always set to current version
+    const configWithVersion: LoomConfig = {
+      ...config,
+      version: "2",
+    };
+
+    const contents = JSON.stringify(configWithVersion, null, 2);
     await invoke("write_config", {
       workspacePath,
       configJson: contents,

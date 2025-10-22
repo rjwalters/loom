@@ -276,6 +276,7 @@ Loom stores workspace-specific configuration in `.loom/config.json` within each 
 
 ```json
 {
+  "version": "2",
   "nextAgentNumber": 4,
   "agents": [
     {
@@ -300,6 +301,63 @@ Loom stores workspace-specific configuration in `.loom/config.json` within each 
   ]
 }
 ```
+
+**Config Versioning**:
+
+Loom uses an explicit `version` field to enable safe future migrations:
+
+- **Current version**: `"2"` (string literal, not number)
+- **Migration**: Happens automatically when loading config files
+- **v1 → v2**: Detects configs missing `version` field or with `"version": "1"`
+- **Future-proof**: Unknown versions throw clear error prompting user to upgrade Loom
+
+**Example Migration**:
+```typescript
+// Old config (v1) without version field
+{
+  "nextAgentNumber": 4,
+  "agents": [...]
+}
+
+// Automatically migrated to v2 on load
+{
+  "version": "2",
+  "nextAgentNumber": 4,
+  "agents": [...]
+}
+
+// Config auto-saved with version after migration
+```
+
+**Adding Future Versions** (example for v3):
+
+When config schema changes:
+
+1. Add new migration function in `src/lib/config.ts`:
+   ```typescript
+   function migrateFromV2(raw: unknown): LoomConfig {
+     const v2 = raw as V2Config;
+
+     // Transform v2 → v3 (e.g., rename field, add new required field)
+     return {
+       version: "3",
+       terminals: v2.agents.map(transformAgent),
+       // ... new fields ...
+     };
+   }
+   ```
+
+2. Update `migrateToLatest()` switch:
+   ```typescript
+   switch (version) {
+     case "1": return migrateFromV2(migrateFromV1(raw));
+     case "2": return migrateFromV2(raw);
+     case "3": return raw as LoomConfig;
+     default: throw new Error(`Unsupported version "${version}"`);
+   }
+   ```
+
+3. Update version constant and save logic to use `"3"`
 
 **Why Workspace-Specific Config?**
 - Each git repo has independent agent numbering and terminal configurations
