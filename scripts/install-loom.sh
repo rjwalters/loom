@@ -308,6 +308,17 @@ fi
 
 echo ""
 
+# Now that labels are synced, ensure the tracking issue has the loom:building label
+info "Ensuring tracking issue has loom:building label..."
+cd "$TARGET_PATH"
+if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" 2>/dev/null; then
+  success "Added loom:building label to issue #${ISSUE_NUMBER}"
+else
+  warning "Could not add loom:building label to issue #${ISSUE_NUMBER}"
+fi
+
+echo ""
+
 # ============================================================================
 # STEP 6: Create Pull Request
 # ============================================================================
