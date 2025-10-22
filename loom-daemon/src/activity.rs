@@ -278,6 +278,25 @@ impl ActivityDb {
             CREATE INDEX IF NOT EXISTS idx_token_usage_input_id ON token_usage(input_id);
             CREATE INDEX IF NOT EXISTS idx_token_usage_metric_id ON token_usage(metric_id);
             CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+
+            -- GitHub events for correlating agent activity with GitHub actions
+            CREATE TABLE IF NOT EXISTS github_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_id INTEGER,
+                event_type TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                pr_number INTEGER,
+                issue_number INTEGER,
+                commit_sha TEXT,
+                author TEXT,
+                FOREIGN KEY (activity_id) REFERENCES agent_metrics(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_github_events_activity_id ON github_events(activity_id);
+            CREATE INDEX IF NOT EXISTS idx_github_events_event_type ON github_events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_github_events_event_time ON github_events(event_time);
+            CREATE INDEX IF NOT EXISTS idx_github_events_pr_number ON github_events(pr_number);
+            CREATE INDEX IF NOT EXISTS idx_github_events_issue_number ON github_events(issue_number);
             ",
         )?;
 
