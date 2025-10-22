@@ -16,6 +16,140 @@ pub struct ActivityEntry {
     pub notes: Option<String>,
 }
 
+/// Get current schema version from database
+fn get_schema_version(conn: &Connection) -> SqliteResult<i32> {
+    // Check if schema_version table exists
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .map(|count: i32| count > 0)?;
+
+    if !table_exists {
+        // No version table = v1 schema
+        return Ok(1);
+    }
+
+    // Read version from table
+    conn.query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+        row.get(0)
+    })
+    .or(Ok(1)) // Default to v1 if no row exists
+}
+
+/// Update schema version in database
+fn set_schema_version(conn: &Connection, version: i32) -> SqliteResult<()> {
+    // Create table if it doesn't exist
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER NOT NULL
+        )",
+        [],
+    )?;
+
+    // Check if version row exists
+    let row_exists: bool = conn
+        .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
+        .map(|count: i32| count > 0)?;
+
+    if row_exists {
+        conn.execute("UPDATE schema_version SET version = ?1", [version])?;
+    } else {
+        conn.execute("INSERT INTO schema_version (version) VALUES (?1)", [version])?;
+    }
+
+    Ok(())
+}
+
+/// Migrate schema from v1 to v2
+fn migrate_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
+    // Create token_usage table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_id INTEGER NOT NULL,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            model TEXT,
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_token_usage_activity_id ON token_usage(activity_id)",
+        [],
+    )?;
+
+    // Create code_changes table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS code_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_id INTEGER NOT NULL,
+            files_modified INTEGER NOT NULL,
+            lines_added INTEGER NOT NULL,
+            lines_removed INTEGER NOT NULL,
+            commit_sha TEXT,
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_code_changes_activity_id ON code_changes(activity_id)",
+        [],
+    )?;
+
+    // Create github_events table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS github_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_id INTEGER,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            pr_number INTEGER,
+            issue_number INTEGER,
+            commit_sha TEXT,
+            author TEXT,
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_github_events_activity_id ON github_events(activity_id)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_github_events_event_type ON github_events(event_type)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_github_events_event_time ON github_events(event_time)",
+        [],
+    )?;
+
+    Ok(())
+}
+
+/// Run all pending migrations
+fn run_migrations(conn: &Connection) -> SqliteResult<()> {
+    let current_version = get_schema_version(conn)?;
+
+    // Migrate to v2 if needed
+    if current_version < 2 {
+        migrate_v1_to_v2(conn)?;
+        set_schema_version(conn, 2)?;
+    }
+
+    Ok(())
+}
+
 /// Open `SQLite` connection to activity database
 fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
     let loom_dir = Path::new(workspace_path).join(".loom");
@@ -29,7 +163,7 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
 
     let conn = Connection::open(&db_path)?;
 
-    // Create table and indexes if they don't exist
+    // Create v1 tables if they don't exist (for new databases)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS agent_activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +193,9 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
         "CREATE INDEX IF NOT EXISTS idx_activity_work_found ON agent_activity(work_found)",
         [],
     )?;
+
+    // Run migrations to latest version
+    run_migrations(&conn)?;
 
     Ok(conn)
 }
