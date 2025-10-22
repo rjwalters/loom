@@ -34,5 +34,10 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Build loom-daemon
+        run: |
+          cargo build --release --bin loom-daemon
+          cp target/release/loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
+
       - name: Run checks
         run: pnpm check:ci
