@@ -39,5 +39,8 @@ jobs:
           cargo build --release --bin loom-daemon
           cp target/release/loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
 
+      - name: Build frontend
+        run: pnpm build
+
       - name: Run checks
         run: pnpm check:ci
