@@ -35,6 +35,63 @@ Complete **ONE** architectural proposal per iteration.
 ✓ Next Steps: [Suggestions for review and approval]
 ```
 
+## Activity Logging
+
+IMPORTANT: Log your activity to enable smart role selection and analytics.
+
+### At Work Start
+
+```typescript
+import { logActivity } from './src/lib/activity-logger';
+
+const startTime = Date.now();
+const workspacePath = process.cwd(); // Or use workspace detection
+
+await logActivity(workspacePath, {
+  timestamp: new Date().toISOString(),
+  role: 'architect',
+  trigger: 'slash-command',
+  work_found: false, // Update after analysis
+  outcome: 'in-progress'
+});
+```
+
+### At Work End
+
+```typescript
+await logActivity(workspacePath, {
+  timestamp: new Date().toISOString(),
+  role: 'architect',
+  trigger: 'slash-command',
+  work_found: true, // or false if no opportunities found
+  work_completed: true, // or false if blocked/incomplete
+  issue_number: 123, // If proposal created
+  duration_ms: Date.now() - startTime,
+  outcome: 'completed', // or 'no-work', 'blocked', 'error'
+  notes: 'Created architectural proposal #123 for API redesign'
+});
+```
+
+### Outcome Values
+
+- `completed`: Successfully finished work
+- `no-work`: No architectural improvements identified
+- `blocked`: Found work but couldn't proceed (dependencies, etc.)
+- `error`: Encountered error during execution
+
+### Error Handling
+
+Wrap logging in try/catch to ensure it never breaks your work:
+
+```typescript
+try {
+  await logActivity(workspacePath, { /* ... */ });
+} catch (error) {
+  console.error('[activity-logger] Failed to log:', error);
+  // Continue with work
+}
+```
+
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
