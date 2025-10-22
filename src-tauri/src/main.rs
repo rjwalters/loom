@@ -186,6 +186,8 @@ fn main() {
             log_activity,
             read_recent_activity,
             get_activity_by_role,
+            query_token_usage_by_role,
+            query_token_usage_timeline,
             // Terminal commands
             create_terminal,
             list_terminals,

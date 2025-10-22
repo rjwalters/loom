@@ -43,6 +43,14 @@ export interface ActivityEntry {
 
   /** Additional notes or error messages */
   notes?: string;
+
+  /** Token usage tracking (optional) */
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+
+  /** Model used for this activity (e.g., "claude-sonnet-4-5") */
+  model?: string;
 }
 
 /**
@@ -114,6 +122,71 @@ export async function getActivityByRole(
       `[activity-logger] Failed to get activity for role ${role}:`,
       error,
     );
+    return [];
+  }
+}
+
+/**
+ * Token usage summary by role
+ */
+export interface TokenUsageSummary {
+  role: string;
+  total_prompt_tokens: number;
+  total_completion_tokens: number;
+  total_tokens: number;
+  activity_count: number;
+  avg_tokens_per_activity: number;
+}
+
+/**
+ * Query token usage statistics grouped by role
+ *
+ * @param workspacePath - Absolute path to workspace
+ * @param since - Optional ISO 8601 timestamp to filter activities after this time
+ * @returns Array of token usage summaries by role
+ */
+export async function queryTokenUsageByRole(
+  workspacePath: string,
+  since?: string,
+): Promise<TokenUsageSummary[]> {
+  try {
+    return await invoke("query_token_usage_by_role", {
+      workspacePath,
+      since,
+    });
+  } catch (error) {
+    console.error("[activity-logger] Failed to query token usage:", error);
+    return [];
+  }
+}
+
+/**
+ * Daily token usage entry
+ */
+export interface DailyTokenUsage {
+  date: string;
+  role: string;
+  total_tokens: number;
+}
+
+/**
+ * Query token usage timeline (daily aggregation)
+ *
+ * @param workspacePath - Absolute path to workspace
+ * @param days - Number of days to look back (default: 30)
+ * @returns Array of daily token usage entries
+ */
+export async function queryTokenUsageTimeline(
+  workspacePath: string,
+  days = 30,
+): Promise<DailyTokenUsage[]> {
+  try {
+    return await invoke("query_token_usage_timeline", {
+      workspacePath,
+      days,
+    });
+  } catch (error) {
+    console.error("[activity-logger] Failed to query token timeline:", error);
     return [];
   }
 }
