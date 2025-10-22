@@ -35,7 +35,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 ```bash
 # Terminal 1: Builder working on feature
 /builder
-# Claims loom:ready issue, implements, creates PR
+# Claims loom:issue issue, implements, creates PR
 
 # Terminal 2: Judge reviewing PRs
 /judge
@@ -43,7 +43,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 # Terminal 3: Curator maintaining issues
 /curator
-# Enhances unlabeled issues, marks as loom:ready
+# Enhances unlabeled issues, marks as loom:curated
 ```
 
 ### 2. Tauri App Mode
@@ -130,26 +130,10 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 ### Label Flow
 
 **Issue Lifecycle**:
-
-*With Curator Enhancement (preferred):*
-```
-(created) → loom:issue → loom:curated → loom:in-progress → (closed)
-           ↑ Human      ↑ Curator      ↑ Builder
-```
-
-*Without Curator (fallback):*
 ```
 (created) → loom:issue → loom:building → (closed)
            ↑ Curator      ↑ Builder
-
-(created) → loom:curating → loom:curated → loom:issue
-           ↑ Curator        ↑ Curator      ↑ Human approves
-
-(bug) → loom:healing → (fixed)
-       ↑ Healer
 ```
-
-Builder prioritizes `loom:issue` + `loom:curated` but can proceed with `loom:issue` alone if no curated work is available.
 
 **PR Lifecycle**:
 ```
@@ -168,21 +152,14 @@ Builder prioritizes `loom:issue` + `loom:curated` but can proceed with `loom:iss
 
 ### Label Definitions
 
-**Workflow Labels**:
 - **`loom:issue`**: Issue approved for work, ready for Builder to claim
-- **`loom:building`**: Builder is actively implementing this issue
-- **`loom:curating`**: Curator is actively enhancing this issue
-- **`loom:healing`**: Healer is actively fixing this bug or addressing PR feedback
+- **`loom:building`**: Issue being implemented OR PR under review
 - **`loom:review-requested`**: PR ready for Judge to review
 - **`loom:pr`**: PR approved by Judge, ready for human to merge
-
-**Proposal Labels**:
 - **`loom:architect`**: Architectural proposal awaiting user approval
 - **`loom:hermit`**: Simplification proposal awaiting user approval
-- **`loom:curated`**: Issue enhanced by Curator, awaiting human approval
-
-**Status Labels**:
-- **`loom:blocked`**: Implementation blocked, needs help or clarification
+- **`loom:curated`**: Issue enhanced by Curator, awaiting approval
+- **`loom:blocked`**: Implementation blocked, needs help
 - **`loom:urgent`**: Critical issue requiring immediate attention
 
 ## Git Worktree Workflow
@@ -296,7 +273,7 @@ gh pr create --label "loom:review-requested"
 
 1. **Find unlabeled issues**:
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:curating,!loom:healing,!loom:architect,!loom:hermit"
+   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit"
    ```
 
 2. **Enhance issue**:
@@ -434,61 +411,6 @@ which claude
 
 # Install if missing (see Claude Code documentation)
 ```
-
-### Error Recovery Workflows
-
-**Terminal Missing Session Recovery**
-
-When a terminal loses its tmux session:
-
-1. **Detection**: Health monitor detects missing session
-2. **State Update**: Terminal marked with `missingSession: true`
-3. **User Prompt**: UI shows "Restart" button
-4. **Recovery**: User clicks restart → daemon creates new session
-5. **State Sync**: Terminal reconnected, `missingSession` cleared
-
-**Implementation**: See `src/lib/health-monitor.ts:218-296`
-
-**Daemon Reconnection**
-
-When daemon connection is lost:
-
-1. **Detection**: IPC socket write fails
-2. **Retry**: Exponential backoff (2s, 4s, 8s, max 30s)
-3. **Fallback**: If daemon unresponsive, prompt user to restart app
-4. **State Preservation**: Terminal configs saved to `.loom/config.json`
-
-**Implementation**: See `src/lib/daemon-client.ts`
-
-**State Cleanup After Crash**
-
-After app crash:
-
-1. **Orphaned tmux sessions**: Run `tmux -L loom kill-server`
-2. **Stale worktrees**: Run `git worktree prune`
-3. **Corrupted config**: Factory reset loads `defaults/config.json`
-4. **Terminal logs**: Inspect `~/.loom/console.log`, `~/.loom/daemon.log`
-
-**Tools**: Use MCP servers to inspect state:
-- `mcp__loom-ui__read_state_file`
-- `mcp__loom-logs__tail_daemon_log`
-
-**Worktree Orphan Cleanup**
-
-When worktrees remain after terminal deletion:
-
-```bash
-# List all worktrees
-git worktree list
-
-# Remove specific worktree
-git worktree remove .loom/worktrees/issue-42 --force
-
-# Prune all orphaned worktrees
-git worktree prune
-```
-
-**Prevention**: Daemon auto-cleanup in `loom-daemon/src/terminal.rs:87-102`
 
 ## Resources
 

@@ -3,7 +3,7 @@ import { ask } from "@tauri-apps/api/dialog";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/tauri";
 import { initializeApp } from "./lib/app-initializer";
-import { getAppLevelState } from "./lib/app-state";
+import { appLevelState } from "./lib/app-state";
 import { saveCurrentConfiguration, setConfigWorkspace } from "./lib/config";
 import { initConsoleLogger } from "./lib/console-logger";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
@@ -334,8 +334,7 @@ async function initializeTerminalDisplay(terminalId: string) {
     logger.info("Terminal already exists, using show/hide", { terminalId });
 
     // Hide previous terminal (if different)
-    const appLevelState = getAppLevelState();
-    const currentAttachedTerminalId = appLevelState.getCurrentAttachedTerminalId();
+    const currentAttachedTerminalId = appLevelState.currentAttachedTerminalId;
     if (currentAttachedTerminalId && currentAttachedTerminalId !== terminalId) {
       logger.info("Hiding previous terminal", {
         terminalId: currentAttachedTerminalId,
@@ -352,7 +351,7 @@ async function initializeTerminalDisplay(terminalId: string) {
     logger.info("Resuming polling for terminal", { terminalId });
     outputPoller.resumePolling(terminalId);
 
-    appLevelState.setCurrentAttachedTerminalId(terminalId);
+    appLevelState.currentAttachedTerminalId = terminalId;
     return;
   }
 
@@ -362,8 +361,7 @@ async function initializeTerminalDisplay(terminalId: string) {
   // Wait for DOM to be ready
   setTimeout(() => {
     // Hide all other terminals first
-    const appLevelState = getAppLevelState();
-    const currentAttachedTerminalId = appLevelState.getCurrentAttachedTerminalId();
+    const currentAttachedTerminalId = appLevelState.currentAttachedTerminalId;
     if (currentAttachedTerminalId) {
       terminalManager.hideTerminal(currentAttachedTerminalId);
       outputPoller.pausePolling(currentAttachedTerminalId);
@@ -377,7 +375,7 @@ async function initializeTerminalDisplay(terminalId: string) {
 
       // Start polling for output
       outputPoller.startPolling(terminalId);
-      appLevelState.setCurrentAttachedTerminalId(terminalId);
+      appLevelState.currentAttachedTerminalId = terminalId;
 
       logger.info("Created and showing terminal", { terminalId });
     }
@@ -424,7 +422,7 @@ if (!eventListenersRegistered) {
         state,
         outputPoller,
         terminalManager,
-        appLevelState: getAppLevelState(),
+        appLevelState,
         saveCurrentConfig,
       });
     }
@@ -459,7 +457,7 @@ if (!eventListenersRegistered) {
     // Clear runtime state
     state.clearAll();
     setConfigWorkspace("");
-    getAppLevelState().setCurrentAttachedTerminalId(null);
+    appLevelState.currentAttachedTerminalId = null;
 
     // Phase 3: Clear health check tracking when workspace closes
     const previousSize = healthCheckedTerminals.size;
@@ -511,7 +509,7 @@ if (!eventListenersRegistered) {
         outputPoller,
         terminalManager,
         setCurrentAttachedTerminalId: (id) => {
-          getAppLevelState().setCurrentAttachedTerminalId(id);
+          appLevelState.currentAttachedTerminalId = id;
         },
         launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
           launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
@@ -552,7 +550,7 @@ if (!eventListenersRegistered) {
         outputPoller,
         terminalManager,
         setCurrentAttachedTerminalId: (id) => {
-          getAppLevelState().setCurrentAttachedTerminalId(id);
+          appLevelState.currentAttachedTerminalId = id;
         },
         launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
           launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
@@ -613,7 +611,7 @@ if (!eventListenersRegistered) {
           outputPoller,
           terminalManager,
           setCurrentAttachedTerminalId: (id) => {
-            getAppLevelState().setCurrentAttachedTerminalId(id);
+            appLevelState.currentAttachedTerminalId = id;
           },
           launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
             launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
@@ -655,7 +653,7 @@ if (!eventListenersRegistered) {
           outputPoller,
           terminalManager,
           setCurrentAttachedTerminalId: (id) => {
-            getAppLevelState().setCurrentAttachedTerminalId(id);
+            appLevelState.currentAttachedTerminalId = id;
           },
           launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
             launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
@@ -810,7 +808,7 @@ setupMainEventListeners({
   terminalManager,
   outputPoller,
   healthMonitor,
-  appLevelState: getAppLevelState(),
+  appLevelState,
   createPlainTerminal,
   generateNextConfigId,
   setupDragAndDrop,

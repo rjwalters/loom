@@ -40,7 +40,59 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 - `loom:review-requested` (green) → `loom:changes-requested` (amber) [needs fixes from Fixer] → `loom:review-requested` (green)
 - When PR is approved and ready for user to merge, it gets `loom:pr` (blue badge)
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to review a specific PR by number:
+
+```bash
+# Examples of explicit user instructions
+"review pr 599 as judge"
+"act as the judge on pr 588"
+"check pr 577"
+"review pull request 234"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Don't check for required labels
+2. **Interpret as approval** - User instruction = implicit approval
+3. **Apply working label** - Add `loom:reviewing` to track work
+4. **Document override** - Note in comments: "Reviewing this PR per user request"
+5. **Follow normal completion** - Apply end-state labels when done (`loom:pr` or `loom:changes-requested`)
+
+**Example**:
+```bash
+# User says: "review pr 599 as judge"
+# PR has: no loom labels yet
+
+# ✅ Proceed immediately
+gh pr edit 599 --add-label "loom:reviewing"
+gh pr comment 599 --body "Starting review of this PR per user request"
+
+# Check out and review
+gh pr checkout 599
+# ... run tests, review code ...
+
+# Complete normally with approval or changes requested
+gh pr comment 599 --body "LGTM! Code quality is excellent."
+gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
+```
+
+**Why This Matters**:
+- Users may want to prioritize specific PR reviews
+- Users may want to test review workflows with specific PRs
+- Users may want to get feedback on work-in-progress PRs
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find PRs" or "look for reviews" → Use label-based workflow
+- When running autonomously → Always use label-based workflow
+- When user doesn't specify a PR number → Use label-based workflow
+
 ## Review Process
+
+### Primary Queue (Priority)
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
 2. **Understand context**: Read PR description and linked issues
@@ -51,6 +103,85 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 7. **Update labels**:
    - If approved: Comment with approval, remove `loom:review-requested`, add `loom:pr` (blue badge - ready for user to merge)
    - If changes needed: Comment with issues, remove `loom:review-requested`, add `loom:changes-requested` (amber badge - Fixer will address)
+
+### Fallback Queue (When No Labeled Work)
+
+If no PRs have the `loom:review-requested` label, the Judge can proactively review unlabeled PRs to maximize utilization and catch issues early.
+
+**Fallback search**:
+```bash
+# Find PRs without any loom: labels
+gh pr list --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number) \(.title)"'
+```
+
+**Decision tree**:
+```
+Judge starts iteration
+    ↓
+Search for loom:review-requested PRs
+    ↓
+    ├─→ Found? → Review as normal (add loom:pr or loom:changes-requested)
+    │
+    └─→ None found
+            ↓
+        Search for unlabeled open PRs
+            ↓
+            ├─→ Found? → Review but leave labels unchanged
+            │              (external/manual PR, no workflow labels)
+            │
+            └─→ None found → No work available, exit iteration
+```
+
+**IMPORTANT: Fallback mode behavior**:
+- **DO review the code** thoroughly with same standards as labeled PRs
+- **DO provide feedback** via comments
+- **DO NOT add workflow labels** (`loom:pr`, `loom:changes-requested`) to unlabeled PRs
+- **DO NOT update PR labels** at all - these may be external contributor PRs outside the Loom workflow
+
+**Example fallback workflow**:
+```bash
+# 1. Check primary queue
+LABELED_PRS=$(gh pr list --label="loom:review-requested" --json number --jq 'length')
+
+if [ "$LABELED_PRS" -gt 0 ]; then
+  echo "Found $LABELED_PRS PRs with loom:review-requested"
+  # Normal workflow: review and update labels
+else
+  echo "No loom:review-requested PRs found, checking unlabeled PRs..."
+
+  # 2. Check fallback queue
+  UNLABELED_PR=$(gh pr list --state=open --json number,labels \
+    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
+    | head -n 1)
+
+  if [ -n "$UNLABELED_PR" ]; then
+    echo "Reviewing unlabeled PR #$UNLABELED_PR (fallback mode)"
+
+    # Check out and review the PR
+    gh pr checkout $UNLABELED_PR
+    # ... run checks, review code ...
+
+    # Provide feedback but DO NOT add workflow labels
+    gh pr comment $UNLABELED_PR --body "$(cat <<'EOF'
+Code review feedback...
+
+Note: This PR was reviewed in fallback mode (no loom:review-requested label).
+Consider adding loom:review-requested if you want it in the priority queue.
+EOF
+)"
+  else
+    echo "No work available - both queues empty"
+    exit 0
+  fi
+fi
+```
+
+**Benefits of fallback queue**:
+- Maximizes Judge utilization during low-activity periods
+- Provides proactive code review on external contributor PRs
+- Catches issues before they accumulate
+- Respects external PRs by not adding workflow labels
 
 ## Review Focus Areas
 
@@ -246,6 +377,65 @@ gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
   - If approved: Remove `loom:review-requested`, add `loom:pr` (blue badge)
   - If changes needed: Remove `loom:review-requested`, add `loom:changes-requested` (amber badge)
 
+## Handling Minor Concerns
+
+When you identify issues during review, take concrete action - never leave concerns as "notes for future" without creating an issue.
+
+### Decision Framework
+
+**If the concern should block merge:**
+- Request changes with specific guidance
+- Remove `loom:review-requested`, add `loom:changes-requested`
+- Include clear explanation of what needs fixing
+
+**If the concern is minor but worth tracking:**
+1. Create a follow-up issue to track the work
+2. Reference the new issue in your approval comment
+3. Approve the PR and add `loom:pr` label
+
+**If the concern is not worth tracking:**
+- Don't mention it in the review at all
+
+**Never leave concerns as "note for future"** - they will be forgotten and undermine code quality over time.
+
+### Creating Follow-up Issues
+
+**When to create follow-up issues:**
+- Documentation inconsistencies (like outdated color references)
+- Minor refactoring opportunities (not critical but would improve code)
+- Test coverage gaps (existing tests pass but could be more comprehensive)
+- Non-critical bugs (workarounds exist, low impact)
+
+**Example workflow:**
+```bash
+# Judge finds minor documentation issue during review
+# Instead of just noting it, create an issue:
+
+gh issue create --title "Update design doc to reflect new label colors" --body "$(cat <<'EOF'
+While reviewing PR #557, noticed that `docs/design/issue-332-label-state-machine.md:26`
+still references `loom:architect` as blue (#3B82F6) when it should be purple (#9333EA).
+
+## Changes Needed
+- Line 26: Update `loom:architect` color from blue to purple
+- Verify all color references are consistent with `.github/labels.yml`
+
+Discovered during code review of PR #557.
+EOF
+)"
+
+# Then approve with reference to the issue
+gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent."
+gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
+```
+
+### Benefits
+
+- ✅ **No forgotten concerns**: Every issue gets tracked
+- ✅ **Clear expectations**: You must decide if concern is blocking or not
+- ✅ **Better backlog**: Minor issues populate the backlog for future work
+- ✅ **Accountability**: Follow-up work is visible and trackable
+- ✅ **Faster reviews**: Don't block PRs on minor concerns, track them instead
+
 ## Raising Concerns
 
 During code review, you may discover bugs or issues that aren't related to the current PR:
@@ -285,84 +475,6 @@ Discovered while reviewing PR #45
 EOF
 )"
 ```
-
-## Creating Follow-Up Issues
-
-When reviewing PRs, you may approve code that is functional and correct, but identify opportunities for non-blocking improvements (refactoring, documentation, performance optimizations, etc.). Rather than letting these suggestions get lost in PR comments, create follow-up issues to track them.
-
-### When to Create Follow-Up Issues
-
-**Create follow-up issues for:**
-- Non-blocking improvements (refactoring, optimization)
-- Documentation enhancements
-- Future feature additions suggested by the PR
-- Technical debt discovered during review
-- Minor quality improvements not worth blocking the PR
-
-**Do NOT create follow-up issues for:**
-- Blocking issues (use "Changes Requested" instead)
-- Critical bugs (request changes to fix in current PR)
-- Issues already tracked elsewhere
-
-### How to Create Follow-Up Issues
-
-After deciding to approve a PR, but before adding the `loom:pr` label:
-
-```bash
-# Create unlabeled follow-up issue (Curator will enhance it)
-gh issue create --title "Add rate limiting to login endpoint" --body "$(cat <<'EOF'
-## Follow-up from PR #123
-
-While reviewing the authentication implementation in PR #123, identified an opportunity to add rate limiting to the login endpoint.
-
-**Suggested approach:**
-- Use existing rate-limit middleware
-- Apply 5 attempts per 15 minutes per IP
-- Return 429 status code when exceeded
-
-**Context**: PR #123 successfully implements core authentication, but rate limiting would improve security against brute-force attacks.
-EOF
-)"
-
-# Create additional follow-up issues as needed
-gh issue create --title "Document password reset flow in README" --body "..."
-
-# Then proceed with PR approval
-gh pr comment 123 --body "$(cat <<'EOF'
-✅ **Approved!** Authentication implementation is solid.
-
-Created follow-up issues for suggested improvements:
-- #124: Add rate limiting to login endpoint
-- #125: Document password reset flow in README
-
-Code quality is excellent, tests pass, ready to merge.
-EOF
-)"
-gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:pr"
-```
-
-### Follow-Up Issue Template
-
-Use this format for consistency:
-
-```markdown
-## Follow-up from PR #XXX
-
-[Brief description of the improvement opportunity]
-
-**Suggested approach:**
-- [Specific recommendation 1]
-- [Specific recommendation 2]
-
-**Context**: [Why this came up during review, why it wasn't blocking]
-```
-
-### Important Notes
-
-- **Create as unlabeled issues**: Curator will enhance them with full specs
-- **Reference the PR**: Always include "Follow-up from PR #XXX" in the body
-- **Be specific**: Provide enough context for Curator/Builder to understand
-- **Don't over-create**: Only track improvements that add real value
 
 ## Example Commands
 

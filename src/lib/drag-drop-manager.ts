@@ -1,4 +1,4 @@
-import { getAppLevelState } from "./app-state";
+import { appLevelState, resetDragState } from "./app-state";
 import type { AppState } from "./state";
 
 /**
@@ -29,13 +29,12 @@ export function setupDragAndDrop(
 
   // HTML5 drag events for visual feedback
   miniRow.addEventListener("dragstart", (e) => {
-    const appLevelState = getAppLevelState();
     const target = e.target as HTMLElement;
     const card = target.closest(".terminal-card") as HTMLElement;
 
     if (card) {
-      appLevelState.setIsDragging(true);
-      appLevelState.setDraggedConfigId(card.getAttribute("data-terminal-id")); // Will be configId after Phase 3
+      appLevelState.dragState.isDragging = true;
+      appLevelState.dragState.draggedConfigId = card.getAttribute("data-terminal-id"); // Will be configId after Phase 3
       card.classList.add("dragging");
 
       if (e.dataTransfer) {
@@ -46,10 +45,9 @@ export function setupDragAndDrop(
   });
 
   miniRow.addEventListener("dragend", (e) => {
-    const appLevelState = getAppLevelState();
-    const draggedConfigId = appLevelState.getDraggedConfigId();
-    const dropTargetConfigId = appLevelState.getDropTargetConfigId();
-    const dropInsertBefore = appLevelState.getDropInsertBefore();
+    const draggedConfigId = appLevelState.dragState.draggedConfigId;
+    const dropTargetConfigId = appLevelState.dragState.dropTargetConfigId;
+    const dropInsertBefore = appLevelState.dragState.dropInsertBefore;
 
     // Perform reorder if valid (uses configId for state operation)
     if (draggedConfigId && dropTargetConfigId && dropTargetConfigId !== draggedConfigId) {
@@ -70,7 +68,7 @@ export function setupDragAndDrop(
     }
 
     document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
-    appLevelState.resetDragState();
+    resetDragState();
   });
 
   // dragover for tracking position and showing indicator
@@ -80,9 +78,8 @@ export function setupDragAndDrop(
       e.dataTransfer.dropEffect = "move";
     }
 
-    const appLevelState = getAppLevelState();
-    const isDragging = appLevelState.getIsDragging();
-    const draggedConfigId = appLevelState.getDraggedConfigId();
+    const isDragging = appLevelState.dragState.isDragging;
+    const draggedConfigId = appLevelState.dragState.draggedConfigId;
 
     if (!isDragging || !draggedConfigId) return;
 
@@ -101,8 +98,8 @@ export function setupDragAndDrop(
       const insertBefore = e.clientX < midpoint;
 
       // Store drop target info (configId)
-      appLevelState.setDropTargetConfigId(targetId);
-      appLevelState.setDropInsertBefore(insertBefore);
+      appLevelState.dragState.dropTargetConfigId = targetId;
+      appLevelState.dragState.dropInsertBefore = insertBefore;
 
       // Create and position insertion indicator - insert at wrapper level
       const wrapper = card.parentElement;
@@ -122,8 +119,8 @@ export function setupDragAndDrop(
           document.querySelectorAll(".drop-indicator").forEach((el) => el.remove());
 
           // Drop after the last card
-          appLevelState.setDropTargetConfigId(lastId);
-          appLevelState.setDropInsertBefore(false);
+          appLevelState.dragState.dropTargetConfigId = lastId;
+          appLevelState.dragState.dropInsertBefore = false;
 
           // Create and position insertion indicator after last card - insert at wrapper level
           const wrapper = lastCard.parentElement;

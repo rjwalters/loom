@@ -367,6 +367,64 @@ gh issue edit <number> --add-label "loom:architect"
 
 **Important**: Don't create too many proposals at once. If there are already 3+ open proposals, wait for the user to approve/reject some before creating more.
 
+## Exception: Explicit User Instructions
+
+**User commands override the label-based state machine.**
+
+When the user explicitly instructs you to analyze a specific area or create a proposal:
+
+```bash
+# Examples of explicit user instructions
+"analyze the terminal state management architecture"
+"create a proposal for improving error handling"
+"review the daemon architecture for improvements"
+"analyze performance optimization opportunities"
+```
+
+**Behavior**:
+1. **Proceed immediately** - Focus on the specified area
+2. **Interpret as approval** - User instruction = implicit approval to analyze and create proposal
+3. **Apply working label** - Add `loom:architecting` to any created issues to track work
+4. **Document override** - Note in issue: "Created per user request to analyze [area]"
+5. **Follow normal completion** - Apply `loom:architect` label to proposal
+
+**Example**:
+```bash
+# User says: "analyze the terminal state management architecture"
+
+# ✅ Proceed immediately
+# Analyze the specified area
+# ... examine code, identify opportunities ...
+
+# Create proposal with clear context
+gh issue create --title "Refactor terminal state management to use reducer pattern" --body "$(cat <<'EOF'
+## Problem Statement
+Per user request to analyze terminal state management architecture...
+
+## Current State
+[Analysis of current implementation]
+
+## Recommended Solution
+[Detailed proposal]
+EOF
+)"
+
+# Apply architect label
+gh issue edit <number> --add-label "loom:architect" --add-label "loom:architecting"
+gh issue comment <number> --body "Created per user request to analyze terminal state management"
+```
+
+**Why This Matters**:
+- Users may want proposals for specific areas immediately
+- Users may want to test architectural workflows
+- Users may have insights about areas needing attention
+- Flexibility is important for manual orchestration mode
+
+**When NOT to Override**:
+- When user says "find opportunities" or "scan codebase" → Use autonomous workflow
+- When running autonomously → Always use autonomous scanning workflow
+- When user doesn't specify a topic/area → Use autonomous workflow
+
 ## Terminal Probe Protocol
 
 Loom uses an intelligent probe system to detect what's running in each terminal. When you receive a probe command, respond according to this protocol.

@@ -307,8 +307,8 @@ export async function closeTerminalWithConfirmation(
   const terminalName = terminalToRemove?.name || "Unknown";
 
   // Clear attached terminal ID if it matches
-  if (appLevelState.getCurrentAttachedTerminalId() === terminalId) {
-    appLevelState.setCurrentAttachedTerminalId(null);
+  if (appLevelState.currentAttachedTerminalId === terminalId) {
+    appLevelState.currentAttachedTerminalId = null;
   }
 
   // Remove from state
