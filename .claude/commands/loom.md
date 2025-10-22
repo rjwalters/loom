@@ -61,6 +61,71 @@ Follow the label-based coordination system (ADR-0006):
 - Proposals: `loom:architect` → reviewed → implemented or closed
 - Suggestions: `loom:hermit` → reviewed → implemented or closed
 
+## Activity Logging
+
+IMPORTANT: Log your activity to enable smart role selection and analytics. Use `trigger: 'heuristic'` to mark this as automatic role selection.
+
+### At Work Start
+
+```typescript
+import { logActivity } from './src/lib/activity-logger';
+
+const startTime = Date.now();
+const workspacePath = process.cwd(); // Or use workspace detection
+const selectedRole = '<role-name>'; // e.g., 'builder', 'judge', etc.
+
+await logActivity(workspacePath, {
+  timestamp: new Date().toISOString(),
+  role: selectedRole,
+  trigger: 'heuristic', // IMPORTANT: Use 'heuristic' for /loom command
+  work_found: false, // Update after checking for work
+  outcome: 'in-progress'
+});
+```
+
+### At Work End
+
+```typescript
+await logActivity(workspacePath, {
+  timestamp: new Date().toISOString(),
+  role: selectedRole,
+  trigger: 'heuristic', // IMPORTANT: Use 'heuristic' for /loom command
+  work_found: true, // or false if no work found
+  work_completed: true, // or false if blocked/incomplete
+  issue_number: 123, // If applicable
+  duration_ms: Date.now() - startTime,
+  outcome: 'completed', // or 'no-work', 'blocked', 'error'
+  notes: 'Selected role via /loom, completed task'
+});
+```
+
+### Outcome Values
+
+- `completed`: Successfully finished work
+- `no-work`: No work found for selected role
+- `blocked`: Found work but couldn't proceed (dependencies, etc.)
+- `error`: Encountered error during execution
+
+### Trigger Value
+
+For the `/loom` command, ALWAYS use:
+- `trigger: 'heuristic'` - Indicates automatic role selection (NOT manual /builder, /judge, etc.)
+
+This allows tracking which work came from random selection vs explicit role invocation.
+
+### Error Handling
+
+Wrap logging in try/catch to ensure it never breaks your work:
+
+```typescript
+try {
+  await logActivity(workspacePath, { /* ... */ });
+} catch (error) {
+  console.error('[activity-logger] Failed to log:', error);
+  // Continue with work
+}
+```
+
 ## Notes
 
 - This command simulates one terminal's work in the Loom multi-terminal orchestration system
