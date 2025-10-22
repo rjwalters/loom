@@ -130,10 +130,20 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 ### Label Flow
 
 **Issue Lifecycle**:
+
+*With Curator Enhancement (preferred):*
+```
+(created) → loom:issue → loom:curated → loom:in-progress → (closed)
+           ↑ Human      ↑ Curator      ↑ Builder
+```
+
+*Without Curator (fallback):*
 ```
 (created) → loom:issue → loom:in-progress → (closed)
-           ↑ Curator      ↑ Builder
+           ↑ Human      ↑ Builder
 ```
+
+Builder prioritizes `loom:issue` + `loom:curated` but can proceed with `loom:issue` alone if no curated work is available.
 
 **PR Lifecycle**:
 ```

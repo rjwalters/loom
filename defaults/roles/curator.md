@@ -35,21 +35,36 @@ The workflow with two-gate approval:
 
 ## Finding Work
 
-Use this command to find issues that need curation (already filters out claimed issues):
+Use a **priority-based search** to find the highest-value curation opportunity:
+
+### Priority 1: Approved Issues Needing Curation
+
+Issues with `loom:issue` (human-approved) but missing `loom:curated`:
 
 ```bash
-# Find issues without suggestion labels, curated, issue, or in-progress
-# (These need curator enhancement)
+gh issue list --label="loom:issue" --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not) and ([.labels[].name] | contains(["external"]) | not)) |
+  "#\(.number): \(.title)"'
+```
+
+**Why prioritize these**: Human already approved the concept, Curator adds technical detail before Builder starts.
+
+### Priority 2: Unlabeled Issues (Fallback)
+
+If no Priority 1 issues exist, find unlabeled issues:
+
+```bash
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] |
+  inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:in-progress", "external"]) | not)) |
+  "#\(.number): \(.title)"'
 ```
 
-Or simpler (may include some false positives):
-```bash
-# Look for recently created/updated issues
-gh issue list --state=open --limit=20
-# Then manually check which ones need curation
-```
+**Workflow**:
+1. Try Priority 1 search first
+2. If no results, use Priority 2
+3. Pick oldest issue from selected priority
+4. Enhance and mark as `loom:curated`
 
 ## Claiming Work
 
