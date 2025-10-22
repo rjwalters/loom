@@ -361,7 +361,7 @@ Loom uses GitHub labels to coordinate work between different agent roles:
 | `loom:hermit` | 🔵 Blue | Critic | Removal/simplification awaiting approval |
 | `loom:curated` | 🟠 Orange | Curator | Enhanced, awaiting human approval |
 | `loom:issue` | 🟢 Green | Human | Approved for Worker to implement |
-| `loom:in-progress` | 🟡 Amber | Worker | Being implemented |
+| `loom:building` | 🟡 Amber | Worker | Being implemented |
 | `loom:blocked` | 🔴 Red | Worker | Blocked, needs help |
 | `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
 
@@ -386,7 +386,7 @@ For complete workflow documentation, see [WORKFLOWS.md](WORKFLOWS.md).
 
 4. **You** review the curated issue and explicitly add `loom:issue` label to approve it for implementation.
 
-5. **Worker Bot** (manual or on-demand) finds `loom:issue` issues, claims it by adding `loom:in-progress`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
+5. **Worker Bot** (manual or on-demand) finds `loom:issue` issues, claims it by adding `loom:building`, implements the feature, creates a PR with "Closes #X", and adds `loom:review-requested`.
 
 6. **Reviewer Bot** (autonomous, runs every 5 minutes) finds the PR, reviews the code, runs tests, and either:
    - Approves: adds `loom:pr` (ready for you to merge)

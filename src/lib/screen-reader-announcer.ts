@@ -31,6 +31,7 @@ export function initializeScreenReaderAnnouncer(): void {
 export function announce(message: string, priority: "polite" | "assertive" = "polite"): void {
   const liveRegion = document.getElementById("sr-announcements");
   if (!liveRegion) {
+    // biome-ignore lint/suspicious/noConsole: Warning for missing DOM element
     console.warn("Screen reader announcer not initialized");
     return;
   }

@@ -15,7 +15,7 @@ You provide high-quality code reviews by:
 
 ## Label Workflow
 
-**IMPORTANT**: Update labels on the **PR**, not the Issue. The Issue stays at `loom:in-progress` until the PR is merged.
+**IMPORTANT**: Update labels on the **PR**, not the Issue. The Issue stays at `loom:building` until the PR is merged.
 
 **Find PRs ready for review (green badges):**
 ```bash

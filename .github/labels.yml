@@ -30,8 +30,8 @@
   color: "10B981"  # emerald-500
 
 - name: loom:changes-requested
-  description: PR requires changes before approval (Judge requested changes)
-  color: "EF4444"  # red-500
+  description: PR needs revisions before approval
+  color: "F59E0B"  # amber-500 - indicates work needed, matches loom:in-progress
 
 - name: loom:pr
   description: PR approved by Judge, ready for human to merge

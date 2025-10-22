@@ -197,7 +197,7 @@ function migrateLegacyConfig(legacy: LegacyConfig): {
   });
 
   return {
-    config: { terminals },
+    config: { version: "2", terminals },
     state: {
       nextAgentNumber: legacy.nextAgentNumber,
       terminals: terminalStates,
@@ -537,7 +537,7 @@ export async function saveCurrentConfiguration(state: AppState): Promise<void> {
   const terminals = state.getTerminals();
   const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
 
-  await saveConfig({ terminals: terminalConfigs });
+  await saveConfig({ version: "2", terminals: terminalConfigs });
   await saveState({
     nextAgentNumber: state.getCurrentTerminalNumber(),
     terminals: terminalStates,

@@ -45,7 +45,7 @@ This directory contains GitHub configuration templates that Loom installs into n
    - Curator enhances → adds `loom:ready`
    - Worker implements → adds `loom:in-progress`
    - Creates PR → adds `loom:review-requested`
-   - Reviewer approves → adds `loom:approved`
+   - Reviewer approves → adds `loom:pr`
    - Merge completes workflow
 
 ## Installation
@@ -88,7 +88,7 @@ The issue template integrates with Loom's label-based workflow coordination:
 | `loom:in-progress` | Being worked on | Worker agent |
 | `loom:review-requested` | PR needs review | Worker agent |
 | `loom:reviewing` | Under review | Reviewer agent |
-| `loom:approved` | Approved for merge | Reviewer agent |
+| `loom:pr` | Approved for merge | Reviewer agent |
 
 See [WORKFLOWS.md](../../WORKFLOWS.md) for complete workflow documentation.
 

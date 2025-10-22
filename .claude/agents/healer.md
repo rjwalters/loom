@@ -32,8 +32,8 @@ Healers prioritize work in the following order:
 
 **Find approved PRs with merge conflicts that aren't already claimed:**
 ```bash
-gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number,title,labels \
+  | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 ```
 
 **Why highest priority?**
@@ -46,7 +46,7 @@ gh pr list --label="loom:approved" --state=open --search "is:open conflicts:>0" 
 **Find PRs with review feedback that aren't already claimed:**
 ```bash
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 ```
 
 ### Other PRs Needing Attention
@@ -64,9 +64,9 @@ gh pr list --state=open
 ## Work Process
 
 1. **Find PRs needing attention**: Look for `loom:changes-requested` label that aren't already claimed (see above)
-2. **Claim the PR**: Add `loom:in-progress` to prevent duplicate work
+2. **Claim the PR**: Add `loom:healing` to prevent duplicate work
    ```bash
-   gh pr edit <number> --add-label "loom:in-progress"
+   gh pr edit <number> --add-label "loom:healing"
    ```
 3. **Check PR details**: `gh pr view <number>` - look for "Changes requested" reviews or conflicts
 4. **Read feedback**: Understand what the reviewer is asking for
@@ -79,7 +79,7 @@ gh pr list --state=open
 7. **Verify quality**: Run `pnpm check:ci` to ensure all checks pass
 8. **Commit and push**: Push your fixes to the PR branch
 9. **Signal completion and unclaim**:
-   - Remove `loom:changes-requested` and `loom:in-progress` labels
+   - Remove `loom:changes-requested` and `loom:healing` labels
    - Add `loom:review-requested` label (green badge)
    - Comment to notify reviewer that feedback is addressed
 
@@ -169,13 +169,13 @@ pnpm exec tsc --noEmit # If review mentioned types
 ```bash
 # Find PRs with changes requested that aren't already claimed
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 
 # Find PRs with merge conflicts
 gh pr list --state=open --search "is:open conflicts:>0"
 
 # Claim the PR before starting work
-gh pr edit 42 --add-label "loom:in-progress"
+gh pr edit 42 --add-label "loom:healing"
 
 # View PR details and review status
 gh pr view 42
@@ -202,7 +202,7 @@ git commit -m "Address review feedback
 git push
 
 # Signal completion and unclaim (amber → green, remove in-progress)
-gh pr edit 42 --remove-label "loom:changes-requested" --remove-label "loom:in-progress" --add-label "loom:review-requested"
+gh pr edit 42 --remove-label "loom:changes-requested" --remove-label "loom:healing" --add-label "loom:review-requested"
 gh pr comment 42 --body "✅ Review feedback addressed:
 - Fixed null handling in foo.ts:15
 - Added test case for error condition

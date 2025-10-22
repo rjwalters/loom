@@ -37,6 +37,7 @@ describe("config", () => {
   describe("loadConfig", () => {
     it("should load config from .loom/config.json", async () => {
       const mockConfig: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -72,7 +73,7 @@ describe("config", () => {
     it("should return empty config if no workspace is set", async () => {
       const config = await loadConfig();
 
-      expect(config).toEqual({ terminals: [] });
+      expect(config).toEqual({ version: "2", terminals: [] });
       expect(invoke).not.toHaveBeenCalled();
     });
 
@@ -82,7 +83,7 @@ describe("config", () => {
 
       const config = await loadConfig();
 
-      expect(config).toEqual({ terminals: [] });
+      expect(config).toEqual({ version: "2", terminals: [] });
     });
 
     it("should handle malformed JSON by returning empty config", async () => {
@@ -91,11 +92,12 @@ describe("config", () => {
 
       const config = await loadConfig();
 
-      expect(config).toEqual({ terminals: [] });
+      expect(config).toEqual({ version: "2", terminals: [] });
     });
 
     it("should load config with empty terminals array", async () => {
       const mockConfig: LoomConfig = {
+        version: "2",
         terminals: [],
       };
 
@@ -109,6 +111,7 @@ describe("config", () => {
 
     it("should load config with terminal role configuration", async () => {
       const mockConfig: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -143,6 +146,7 @@ describe("config", () => {
   describe("saveConfig", () => {
     it("should save config to .loom/config.json", async () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -164,6 +168,7 @@ describe("config", () => {
 
     it("should not save if no workspace is set", async () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [],
       };
 
@@ -177,6 +182,7 @@ describe("config", () => {
       setConfigWorkspace("/path/to/workspace");
 
       const config: LoomConfig = {
+        version: "2",
         terminals: [],
       };
 
@@ -186,6 +192,7 @@ describe("config", () => {
 
     it("should format JSON with 2-space indentation", async () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [],
       };
 
@@ -202,6 +209,7 @@ describe("config", () => {
 
     it("should save config with multiple terminals", async () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -240,6 +248,7 @@ describe("config", () => {
 
     it("should save config with terminal role and theme configuration", async () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -374,6 +383,7 @@ describe("config", () => {
   describe("mergeConfigAndState", () => {
     it("should merge config and state into full Terminal objects", () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -445,6 +455,7 @@ describe("config", () => {
 
     it("should use default state values if terminal not in state", () => {
       const config: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -543,6 +554,7 @@ describe("config", () => {
   describe("loadWorkspaceConfig", () => {
     it("should load and merge config and state, returning legacy format", async () => {
       const mockConfig: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -709,6 +721,7 @@ describe("config", () => {
 
     it("should not migrate already-migrated config", async () => {
       const currentConfig: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -762,6 +775,7 @@ describe("config", () => {
   describe("loadConfig and saveConfig integration", () => {
     it("should round-trip config data correctly", async () => {
       const originalConfig: LoomConfig = {
+        version: "2",
         terminals: [
           {
             id: "terminal-1",
@@ -833,7 +847,7 @@ describe("config", () => {
 
       // Merge back
       const merged = mergeConfigAndState(
-        { terminals: config },
+        { version: "2", terminals: config },
         { nextAgentNumber: 3, terminals: state }
       );
 
@@ -844,9 +858,7 @@ describe("config", () => {
   describe("Config Version Migration", () => {
     it("migrates v1 config (no version field) to v2", async () => {
       const v1Config = {
-        terminals: [
-          { id: "terminal-1", name: "Test" },
-        ],
+        terminals: [{ id: "terminal-1", name: "Test" }],
         offlineMode: false,
       };
 
@@ -967,9 +979,7 @@ describe("config", () => {
       );
 
       const savedConfig = JSON.parse(
-        (invoke as any).mock.calls.find(
-          (call: any) => call[0] === "write_config"
-        )[1].configJson
+        (invoke as any).mock.calls.find((call: any) => call[0] === "write_config")[1].configJson
       );
 
       expect(savedConfig.version).toBe("2");
