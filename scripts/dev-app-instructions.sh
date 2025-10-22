@@ -11,7 +11,19 @@ cat << 'EOF'
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-🎯 RECOMMENDED APPROACH - Two Separate Terminals:
+🎯 RECOMMENDED - Headless Development Mode:
+
+   $ pnpm app:dev:headless
+
+   This command works in non-TTY environments (Claude Code, CI, etc.):
+   ✅ Starts daemon in background with logs at ~/.loom/daemon-dev.log
+   ✅ Runs Tauri dev in foreground with hot reload
+   ✅ Single command, no manual coordination needed
+   ✅ Clean shutdown with Ctrl+C
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 ALTERNATIVE - Two Separate Terminals:
 
    Terminal 1 (Daemon Monitoring):
    $ cd /Users/rwalters/GitHub/loom
