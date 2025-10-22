@@ -303,6 +303,78 @@ loom/
 - **[TypeScript Documentation](https://www.typescriptlang.org/docs/)** - TypeScript language
 - **[TailwindCSS Documentation](https://tailwindcss.com/docs)** - Utility-first CSS
 
+## Release Process
+
+Loom uses automated release workflows to build and distribute binaries.
+
+### Creating a Release
+
+Releases are triggered automatically when a version tag is pushed:
+
+```bash
+# 1. Update version in Cargo.toml files
+# loom-daemon/Cargo.toml
+# src-tauri/Cargo.toml
+
+# 2. Create and push version tag
+git tag -a v0.2.0 -m "Release v0.2.0"
+git push origin v0.2.0
+```
+
+### Release Workflow
+
+The release workflow (`.github/workflows/release.yml`) automatically:
+
+1. **Builds macOS binary** - Compiles Tauri app for macOS
+2. **Creates DMG installer** - Packages app into distributable DMG
+3. **Generates changelog** - Auto-generates from merged PRs and commits
+4. **Creates GitHub Release** - Publishes release with changelog and DMG attachment
+
+### Changelog Generation
+
+Changelogs are auto-generated from GitHub PR labels:
+
+- **Features** (`enhancement`, `feature` labels) → 🚀 Features section
+- **Bug Fixes** (`bug` label) → 🐛 Bug Fixes section
+- **Documentation** (`documentation` label) → 📚 Documentation section
+- **Maintenance** (`chore`, `dependencies` labels) → 🧹 Maintenance section
+
+**Best Practice**: Always label PRs appropriately before merging to ensure accurate changelogs.
+
+### Performance Benchmarks
+
+The benchmark workflow (`.github/workflows/benchmark.yml`) runs automatically on:
+
+- **Push to main** - Tracks performance over time
+- **Pull requests** - Detects performance regressions
+
+Benchmark results are stored and tracked using `github-action-benchmark`:
+
+- **Alert threshold**: 150% (warns if performance degrades by >50%)
+- **Fail on alert**: true (fails CI if threshold exceeded)
+- **Comment on PRs**: Automatically posts performance comparison
+
+### Running Benchmarks Locally
+
+```bash
+# Run all Criterion benchmarks
+cargo bench --workspace
+
+# Run specific benchmark
+cargo bench --package loom-daemon --bench terminal_benchmarks
+
+# View results
+open target/criterion/report/index.html
+```
+
+### Distribution
+
+Release artifacts are attached to GitHub releases:
+
+- **Loom-macOS.dmg** - macOS installer for Apple Silicon and Intel
+
+Users can download the DMG from the [Releases page](https://github.com/rjwalters/loom/releases).
+
 ## Code of Conduct
 
 Be respectful and constructive in all interactions:
