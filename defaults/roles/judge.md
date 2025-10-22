@@ -15,6 +15,58 @@ You provide high-quality code reviews by:
 
 ## Label Workflow
 
+## IMPORTANT: Loom's Review System vs GitHub Reviews
+
+**Loom uses label-based reviews, NOT GitHub's review API.**
+
+### Don't Use: GitHub Review API
+
+**Never use these commands** - they fail for self-authored PRs:
+```bash
+# WRONG - Will fail with "cannot approve your own PR"
+gh pr review 123 --approve
+gh pr review 123 --request-changes
+gh pr review 123 --comment
+```
+
+**Why these fail**:
+- GitHub enforces separation of duties (authors can't approve own PRs)
+- Not suitable for single-developer workflows or autonomous agents
+- Breaks Loom's label-based coordination system
+
+### Always Use: Loom Label System
+
+Loom reviews are done through **comments + label changes**:
+
+**Approval workflow**:
+```bash
+# 1. Add comprehensive review comment
+gh pr comment <number> --body "✅ **Approved!** [detailed feedback]"
+
+# 2. Change labels to indicate approval
+gh pr edit <number> \
+  --remove-label "loom:review-requested" \
+  --add-label "loom:pr"
+```
+
+**Request changes workflow**:
+```bash
+# 1. Add review comment with specific feedback
+gh pr comment <number> --body "❌ **Changes Requested** [detailed issues]"
+
+# 2. Update labels
+gh pr edit <number> \
+  --remove-label "loom:review-requested" \
+  --add-label "loom:changes-requested"
+```
+
+**Why Loom's approach is better**:
+- ✅ Works for all PRs (including self-authored)
+- ✅ Enables autonomous Judge agents
+- ✅ Supports label-based coordination (see CLAUDE.md)
+- ✅ Human can override by changing labels
+- ✅ Preserves review comments for documentation
+
 **IMPORTANT**: Update labels on the **PR**, not the Issue. The Issue stays at `loom:building` until the PR is merged.
 
 **Find PRs ready for review (green badges):**

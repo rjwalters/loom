@@ -55,15 +55,23 @@ info "Creating installation issue..."
 
 # Create issue and capture the URL from output
 # (Compatible with older gh CLI versions that don't support --json)
+# NOTE: Don't add label during creation - labels are synced in Step 5
 ISSUE_URL=$(gh issue create \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
-  --body "$ISSUE_BODY" \
-  --label "loom:building" 2>&1 | grep -o 'https://[^ ]*')
+  --body "$ISSUE_BODY" 2>&1 | grep -o 'https://[^ ]*')
 
 # Extract issue number from URL
 ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]*$')
 
 success "Created issue #${ISSUE_NUMBER}"
+
+# Try to add loom:building label if it exists (graceful failure if label doesn't exist yet)
+info "Adding loom:building label..."
+if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" 2>/dev/null; then
+  success "Added loom:building label"
+else
+  info "Label will be added after label sync (Step 5)"
+fi
 
 # Output the issue number (stdout, so it can be captured by caller)
 echo "$ISSUE_NUMBER"

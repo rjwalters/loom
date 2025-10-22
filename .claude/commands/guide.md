@@ -35,62 +35,6 @@ Complete **ONE** triage batch per iteration.
 ✓ Next Steps: [Suggestions for prioritization]
 ```
 
-## Activity Logging
-
-IMPORTANT: Log your activity to enable smart role selection and analytics.
-
-### At Work Start
-
-```typescript
-import { logActivity } from './src/lib/activity-logger';
-
-const startTime = Date.now();
-const workspacePath = process.cwd(); // Or use workspace detection
-
-await logActivity(workspacePath, {
-  timestamp: new Date().toISOString(),
-  role: 'guide',
-  trigger: 'slash-command',
-  work_found: false, // Update after checking backlog
-  outcome: 'in-progress'
-});
-```
-
-### At Work End
-
-```typescript
-await logActivity(workspacePath, {
-  timestamp: new Date().toISOString(),
-  role: 'guide',
-  trigger: 'slash-command',
-  work_found: true, // or false if no triage needed
-  work_completed: true, // or false if blocked/incomplete
-  duration_ms: Date.now() - startTime,
-  outcome: 'completed', // or 'no-work', 'blocked', 'error'
-  notes: 'Triaged 5 issues, updated priorities'
-});
-```
-
-### Outcome Values
-
-- `completed`: Successfully finished work
-- `no-work`: No issues needing triage
-- `blocked`: Found work but couldn't proceed (dependencies, etc.)
-- `error`: Encountered error during execution
-
-### Error Handling
-
-Wrap logging in try/catch to ensure it never breaks your work:
-
-```typescript
-try {
-  await logActivity(workspacePath, { /* ... */ });
-} catch (error) {
-  console.error('[activity-logger] Failed to log:', error);
-  // Continue with work
-}
-```
-
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
