@@ -32,6 +32,27 @@ impl DaemonManager {
         }
     }
 
+    /// Clean up stale socket if it exists but daemon isn't responding
+    ///
+    /// Returns true if stale socket was found and cleaned, false otherwise
+    async fn cleanup_stale_socket_if_needed(&self) -> bool {
+        if self.socket_path.exists() && !self.is_daemon_running().await {
+            safe_eprintln!(
+                "[DaemonManager] Detected stale socket at {}, cleaning up...",
+                self.socket_path.display()
+            );
+
+            if let Err(e) = std::fs::remove_file(&self.socket_path) {
+                safe_eprintln!("[DaemonManager] Warning: failed to remove stale socket: {e}");
+            } else {
+                safe_eprintln!("[DaemonManager] Stale socket removed");
+            }
+
+            return true;
+        }
+        false
+    }
+
     /// Start daemon in production mode (as child process)
     pub fn start_daemon_production(&mut self, daemon_path: PathBuf) -> Result<()> {
         safe_eprintln!("[DaemonManager] Starting daemon in production mode...");
@@ -90,20 +111,8 @@ impl DaemonManager {
             ));
         }
 
-        // Check if socket is stale (exists but no daemon responding)
-        if !self.is_daemon_running().await {
-            safe_eprintln!(
-                "[DaemonManager] Detected stale socket at {}, cleaning up...",
-                self.socket_path.display()
-            );
-
-            // Remove stale socket
-            if let Err(e) = std::fs::remove_file(&self.socket_path) {
-                safe_eprintln!("[DaemonManager] Warning: failed to remove stale socket: {e}");
-            } else {
-                safe_eprintln!("[DaemonManager] Stale socket removed");
-            }
-
+        // Check if socket is stale and clean it up
+        if self.cleanup_stale_socket_if_needed().await {
             return Err(anyhow!(
                 "Daemon socket was stale and has been cleaned up. \
                  Please start the daemon:\n  \
@@ -118,19 +127,7 @@ impl DaemonManager {
     /// Ensure daemon is running (start if needed in prod, connect in dev)
     pub async fn ensure_daemon_running(&mut self, is_production: bool) -> Result<()> {
         // Check if socket exists but daemon not responding (stale socket)
-        if self.socket_path.exists() && !self.is_daemon_running().await {
-            safe_eprintln!(
-                "[DaemonManager] Detected stale socket at {}, cleaning up...",
-                self.socket_path.display()
-            );
-
-            // Remove stale socket
-            if let Err(e) = std::fs::remove_file(&self.socket_path) {
-                safe_eprintln!("[DaemonManager] Warning: failed to remove stale socket: {e}");
-            } else {
-                safe_eprintln!("[DaemonManager] Stale socket removed");
-            }
-        }
+        self.cleanup_stale_socket_if_needed().await;
 
         // If daemon is already running, we're good
         if self.is_daemon_running().await {
