@@ -80,8 +80,8 @@ for i in {1..30}; do
         exit 1
     fi
 
-    # Check if daemon socket exists (assuming it creates one in ~/.loom/daemon.sock)
-    if [ -S "$HOME/.loom/daemon.sock" ]; then
+    # Check if daemon socket exists (assuming it creates one in ~/.loom/loom-daemon.sock)
+    if [ -S "$HOME/.loom/loom-daemon.sock" ]; then
         DAEMON_READY=true
         break
     fi
