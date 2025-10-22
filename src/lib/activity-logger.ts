@@ -138,7 +138,7 @@ export interface TokenUsageSummary {
  */
 export async function queryTokenUsageByRole(
   workspacePath: string,
-  since?: string,
+  since?: string
 ): Promise<TokenUsageSummary[]> {
   try {
     return await invoke("query_token_usage_by_role", {
@@ -146,6 +146,7 @@ export async function queryTokenUsageByRole(
       since,
     });
   } catch (error) {
+    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
     console.error("[activity-logger] Failed to query token usage:", error);
     return [];
   }
@@ -169,7 +170,7 @@ export interface DailyTokenUsage {
  */
 export async function queryTokenUsageTimeline(
   workspacePath: string,
-  days = 30,
+  days = 30
 ): Promise<DailyTokenUsage[]> {
   try {
     return await invoke("query_token_usage_timeline", {
@@ -177,6 +178,7 @@ export async function queryTokenUsageTimeline(
       days,
     });
   } catch (error) {
+    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
     console.error("[activity-logger] Failed to query token timeline:", error);
     return [];
   }
