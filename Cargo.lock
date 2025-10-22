@@ -127,6 +127,7 @@ dependencies = [
  "dirs 5.0.1",
  "dotenvy",
  "notify",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
