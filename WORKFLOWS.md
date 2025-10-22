@@ -14,7 +14,7 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 2. 🔍 **The Hermit** questions → identifies bloat and simplification opportunities (`loom:hermit`)
 3. 📚 **The Curator** refines → enhances and adds `loom:curated` (human then approves with `loom:issue`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
-5. 🔧 **The Fixer** heals → claims with `loom:in-progress`, addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
+5. 🔧 **The Fixer heals → claims with `loom:healing``, addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
 6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:pr`)
 
 *Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
@@ -28,8 +28,8 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
   - Issues: `loom:curated` (Curator enhanced), `loom:issue` (human approved)
   - PRs: `loom:review-requested` (PR ready for Reviewer)
 - 🟡 **Amber** = Work in progress
-  - Issues: `loom:in-progress` (Worker implementing)
-  - PRs: `loom:changes-requested` (review feedback needed), `loom:in-progress` (Fixer claiming PR)
+  - Issues: `loom:building` (Worker implementing)
+  - PRs: `loom:changes-requested` (review feedback needed), `loom:building` (Fixer claiming PR)
 - 🔴 **Red** = Blocked or urgent
   - `loom:blocked` (Blocked, needs help)
   - `loom:urgent` (High priority)
@@ -43,7 +43,7 @@ ARCHITECT creates proposal (🔵 loom:architect)
          ↓ (human removes loom:architect to approve)
 CURATOR enhances issue (🟢 loom:curated)
          ↓ (human adds loom:issue to approve for work)
-WORKER implements (🟡 loom:in-progress → 🟢 loom:review-requested PR)
+WORKER implements (🟡 loom:building → 🟢 loom:review-requested PR)
          ↓
 REVIEWER reviews (🟡 loom:changes-requested OR 🔵 loom:pr)
          ↓
@@ -100,9 +100,9 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 | **Hermit** | 15 min | Yes | N/A (scans code/issues) | `loom:hermit` (blue) |
 | **Curator** | 5 min | Yes | Approved issues (no suggestion labels) | `loom:curated` (green) |
 | **Triage** | 15 min | Yes | `loom:issue` | `loom:urgent` (red) |
-| **Worker** | Manual | No | `loom:issue` | `loom:in-progress`, `loom:review-requested` |
+| **Worker** | Manual | No | `loom:issue` | `loom:building`, `loom:review-requested` |
 | **Reviewer** | 5 min | Yes | `loom:review-requested` | `loom:changes-requested`, `loom:pr` |
-| **Fixer** | 5-10 min | Optional | `loom:changes-requested` (unclaimed) | `loom:in-progress`, `loom:review-requested` |
+| **Fixer heals → claims with `loom:healing``, `loom:review-requested` |
 | **Issues** | Manual | No | N/A | Well-formatted issues |
 | **Default** | Manual | No | N/A | Plain shell |
 
@@ -112,15 +112,15 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 **Hermit**: Identifies bloat, unused code, over-engineering. Creates removal proposals or adds simplification comments to existing issues.
 
-**Curator**: Enhances approved issues with implementation details, test plans, multiple options. Claims issues with `loom:in-progress` before starting, removes it and adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
+**Curator**: Enhances approved issues with implementation details, test plans, multiple options. Claims issues with `loom:building` before starting, removes it and adds `loom:curated` when complete. **Does not approve for work - human must add `loom:issue`.**
 
 **Triage**: Dynamically prioritizes `loom:issue` issues, maintains top 3 as `loom:urgent` based on strategic impact and time sensitivity.
 
-**Worker**: Implements `loom:issue` issues. Claims with `loom:in-progress`, creates PR with `loom:review-requested`. Manages worktrees.
+**Worker**: Implements `loom:issue` issues. Claims with `loom:building`, creates PR with `loom:review-requested`. Manages worktrees.
 
 **Reviewer**: Reviews `loom:review-requested` PRs. Requests changes with `loom:changes-requested`, approves with `loom:pr` (ready for user to merge).
 
-**Fixer**: Addresses review feedback and resolves merge conflicts. Claims PRs with `loom:in-progress` to prevent duplicate work. Transitions `loom:changes-requested` → `loom:review-requested` after fixes, removing `loom:in-progress`.
+**Fixer heals → claims with `loom:healing``.
 
 ## Essential Commands
 
@@ -129,7 +129,7 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 ```bash
 # Find and claim approved issue
 gh issue list --label="loom:issue"
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
+gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
 
 # Create worktree and implement
 ./.loom/scripts/worktree.sh 42  # or: pnpm worktree 42 (in loom repo)
@@ -168,21 +168,21 @@ gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:changes-r
 ```bash
 # Priority 1 (URGENT): Approved PRs with merge conflicts - BLOCKING
 gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 
 # Priority 2 (NORMAL): PRs with review feedback
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:in-progress")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.labels | all(.name != "loom:building")) | "#\(.number): \(.title)"'
 
 # Claim the PR before starting work
-gh pr edit 50 --add-label "loom:in-progress"
+gh pr edit 50 --add-label "loom:building"
 
 # Fix and signal ready for re-review (amber → green, remove in-progress)
 gh pr checkout 50
 # ... address feedback or resolve conflicts ...
 pnpm check:ci
 git push
-gh pr edit 50 --remove-label "loom:changes-requested" --remove-label "loom:in-progress" --add-label "loom:review-requested"
+gh pr edit 50 --remove-label "loom:changes-requested" --remove-label "loom:building" --add-label "loom:review-requested"
 ```
 
 ### Curator Workflow
@@ -190,16 +190,16 @@ gh pr edit 50 --remove-label "loom:changes-requested" --remove-label "loom:in-pr
 ```bash
 # Find approved issues (no suggestion labels, not loom:issue/in-progress)
 gh issue list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:in-progress"]) | not)) | "#\(.number) \(.title)"'
+  --jq '.[] | select(([.labels[].name] | inside(["loom:architect", "loom:hermit", "loom:curated", "loom:issue", "loom:building"]) | not)) | "#\(.number) \(.title)"'
 
 # Claim the issue before starting enhancement
-gh issue edit 42 --add-label "loom:in-progress"
+gh issue edit 42 --add-label "loom:building"
 
 # Enhance issue (add details, test plans, implementation options)
 # ...
 
 # Mark as curated and unclaim
-gh issue edit 42 --remove-label "loom:in-progress" --add-label "loom:curated"
+gh issue edit 42 --remove-label "loom:building" --add-label "loom:curated"
 ```
 
 ### User (Manual) Workflow
@@ -227,9 +227,11 @@ gh pr merge 50
 |-------|-------|--------|---------|
 | `loom:architect` | 🔵 Blue | Architect | Architect suggestion awaiting human approval |
 | `loom:hermit` | 🔵 Blue | Hermit | Removal/simplification awaiting human approval |
+| `loom:curating` | 🟡 Amber | Curator | Curator actively enhancing issue |
 | `loom:curated` | 🟢 Green | Curator | Curator enhanced, awaiting human approval for work |
 | `loom:issue` | 🟢 Green | Human | Human approved, ready for Worker to implement |
-| `loom:in-progress` | 🟡 Amber | Worker | Worker actively implementing |
+| `loom:building` | 🟡 Amber | Worker | Worker actively implementing |
+| `loom:healing` | 🟡 Amber | Healer | Healer actively fixing bug or addressing feedback |
 | `loom:blocked` | 🔴 Red | Any agent | Implementation blocked, needs help |
 | `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
 
@@ -239,7 +241,7 @@ gh pr merge 50
 |-------|-------|-----------|---------|
 | `loom:review-requested` | 🟢 Green | Worker/Fixer | PR ready for Reviewer |
 | `loom:changes-requested` | 🟡 Amber | Reviewer | PR needs fixes from Fixer |
-| `loom:in-progress` | 🟡 Amber | Fixer | Fixer actively addressing review feedback |
+| `loom:healing` | 🟡 Amber | Fixer | Fixer actively addressing review feedback |
 | `loom:pr` | 🔵 Blue | Reviewer | Approved PR ready for human to merge |
 
 ## Configuration
@@ -394,7 +396,7 @@ gh issue view 42 --comments
 
 **Prevention**:
 - Remove `loom:issue` label immediately after claiming
-- If you see an issue already has `loom:in-progress`, don't claim it
+- If you see an issue already has `loom:building`, don't claim it
 - FIFO queue: claim oldest first
 
 ## Troubleshooting

@@ -59,7 +59,7 @@ This template provides **3 pre-configured terminals**:
 This template uses GitHub labels to coordinate work:
 
 - `loom:ready` (green) - Issue is ready for implementation
-- `loom:in-progress` (yellow) - Worker is currently working on it
+- `loom:building` (yellow) - Worker is currently working on it
 - `loom:review-requested` (green) - PR is ready for review
 - `loom:reviewing` (amber) - Reviewer is currently reviewing
 - `loom:pr` (blue) - PR is approved and ready to merge

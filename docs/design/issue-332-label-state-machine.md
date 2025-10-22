@@ -27,7 +27,7 @@ The current label workflow has several issues:
 | `loom:hermit` | 🟣 #9333EA | Critic | Removal/simplification awaiting review |
 | `loom:curated` | 🟢 #10B981 | Curator | Enhanced with implementation details |
 | `loom:issue` | 🔵 #3B82F6 | **Human** | **Approved for work** (replaces `loom:ready`) |
-| `loom:in-progress` | 🟡 #F59E0B | Worker | Being implemented |
+| `loom:building` | 🟡 #F59E0B | Worker | Being implemented |
 | `loom:blocked` | 🔴 #EF4444 | Anyone | Implementation blocked |
 | `loom:urgent` | 🔴 #DC2626 | Triage/Human | High priority (max 3) |
 
@@ -86,7 +86,7 @@ The current label workflow has several issues:
                          ↓
 ┌─────────────────────────────────────────────────────────────┐
 │ WORKER: Claim and implement                                  │
-│   Action: Remove loom:issue, add loom:in-progress           │
+│   Action: Remove loom:issue, add loom:building           │
 │   Result: Create PR with loom:review-requested              │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -170,12 +170,12 @@ The current label workflow has several issues:
 ### Curator
 
 **Old Behavior:**
-- Finds approved issues (no `loom:proposal`, not `loom:ready`/`loom:in-progress`)
+- Finds approved issues (no `loom:proposal`, not `loom:ready`/`loom:building`)
 - Enhances issue
 - **Automatically adds `loom:ready`** ❌
 
 **New Behavior:**
-- Finds approved issues (no suggestion labels, not `loom:issue`/`loom:in-progress`)
+- Finds approved issues (no suggestion labels, not `loom:issue`/`loom:building`)
 - Enhances issue
 - **Adds `loom:curated` only** ✅
 - **Human must explicitly add `loom:issue`** ✅
@@ -188,7 +188,7 @@ The current label workflow has several issues:
 **New Behavior:**
 - Searches for `loom:issue` issues
 - Prioritizes `loom:urgent` first
-- Claims by removing `loom:issue`, adding `loom:in-progress`
+- Claims by removing `loom:issue`, adding `loom:building`
 
 ### Triage
 

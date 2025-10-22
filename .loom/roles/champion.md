@@ -279,7 +279,7 @@ Issue Lifecycle with Champion:
               ↓
         [Builder claims]
               ↓
-      loom:in-progress
+      loom:building
               ↓
           (closed)
 ```

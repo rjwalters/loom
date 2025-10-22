@@ -58,7 +58,7 @@ info "Creating installation issue..."
 ISSUE_URL=$(gh issue create \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$ISSUE_BODY" \
-  --label "loom:in-progress" 2>&1 | grep -o 'https://[^ ]*')
+  --label "loom:building" 2>&1 | grep -o 'https://[^ ]*')
 
 # Extract issue number from URL
 ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]*$')

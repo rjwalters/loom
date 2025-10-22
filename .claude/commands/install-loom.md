@@ -49,7 +49,7 @@ echo "Created issue #$ISSUE_NUMBER"
 
 **Verification**:
 - Issue number is captured (numeric value)
-- Issue is created with `loom:in-progress` label
+- Issue is created with `loom:building` label
 - Issue body includes Loom version and commit information
 
 ### Step 3: Create Installation Worktree

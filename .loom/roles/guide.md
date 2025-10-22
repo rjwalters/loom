@@ -55,13 +55,13 @@ Sometimes issues are completed but stay open because PRs didn't use the magic ke
 
 ### Verification Tasks
 
-**1. Check for Orphaned `loom:in-progress` Issues**
+**1. Check for Orphaned `loom:building` Issues**
 
 Find issues that are marked in-progress but have no active PRs:
 
 ```bash
 # Get all in-progress issues
-gh issue list --label "loom:in-progress" --state open --json number,title
+gh issue list --label "loom:building" --state open --json number,title
 
 # For each issue, check if there's an active PR
 gh pr list --search "issue-NUMBER in:body OR issue NUMBER in:body" --state open
@@ -69,7 +69,7 @@ gh pr list --search "issue-NUMBER in:body OR issue NUMBER in:body" --state open
 
 **If no PR found and issue is old (>7 days):**
 - Comment asking for status update
-- If no response in 2 days, remove `loom:in-progress` and mark as `loom:blocked`
+- If no response in 2 days, remove `loom:building` and mark as `loom:blocked`
 
 **2. Verify Merged PRs Closed Their Issues**
 
@@ -119,7 +119,7 @@ EOF
 ```bash
 # 1. Find in-progress issues without PRs
 echo "=== In-Progress Issues ==="
-gh issue list --label "loom:in-progress" --state open
+gh issue list --label "loom:building" --state open
 
 # 2. Find recently merged PRs
 echo "=== Recently Merged PRs ==="

@@ -16,7 +16,7 @@ pub struct ActivityEntry {
     pub notes: Option<String>,
 }
 
-/// Open SQLite connection to activity database
+/// Open `SQLite` connection to activity database
 fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
     let loom_dir = Path::new(workspace_path).join(".loom");
     let db_path = loom_dir.join("activity.db");
@@ -65,9 +65,9 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
 
 /// Log activity entry to SQLite database
 #[tauri::command]
-pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), String> {
+pub fn log_activity(workspace_path: &str, entry: &ActivityEntry) -> Result<(), String> {
     let conn =
-        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
     conn.execute(
         "INSERT INTO agent_activity (
@@ -75,15 +75,15 @@ pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), 
             issue_number, duration_ms, outcome, notes
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            entry.timestamp,
-            entry.role,
-            entry.trigger,
-            entry.work_found as i32,
-            entry.work_completed.map(|b| b as i32),
+            &entry.timestamp,
+            &entry.role,
+            &entry.trigger,
+            i32::from(entry.work_found),
+            entry.work_completed.map(i32::from),
             entry.issue_number,
             entry.duration_ms,
-            entry.outcome,
-            entry.notes,
+            &entry.outcome,
+            &entry.notes,
         ],
     )
     .map_err(|e| format!("Failed to insert activity: {e}"))?;
@@ -94,11 +94,11 @@ pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), 
 /// Read recent activity entries from SQLite database
 #[tauri::command]
 pub fn read_recent_activity(
-    workspace_path: String,
+    workspace_path: &str,
     limit: Option<i32>,
 ) -> Result<Vec<ActivityEntry>, String> {
     let conn =
-        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
     let limit = limit.unwrap_or(100);
 
     let mut stmt = conn
@@ -135,12 +135,12 @@ pub fn read_recent_activity(
 /// Get activity entries filtered by role
 #[tauri::command]
 pub fn get_activity_by_role(
-    workspace_path: String,
-    role: String,
+    workspace_path: &str,
+    role: &str,
     limit: Option<i32>,
 ) -> Result<Vec<ActivityEntry>, String> {
     let conn =
-        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
     let limit = limit.unwrap_or(100);
 
     let mut stmt = conn

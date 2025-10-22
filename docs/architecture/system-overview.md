@@ -301,7 +301,7 @@ stateDiagram-v2
     Proposal --> Unlabeled: User approves<br/>(removes label)
     Proposal --> [*]: User rejects<br/>(closes issue)
     Unlabeled --> Ready: Curator enhances<br/>Add loom:ready
-    Ready --> InProgress: Worker claims<br/>Add loom:in-progress
+    Ready --> InProgress: Worker claims<br/>Add loom:building
     InProgress --> Blocked: Dependencies<br/>Add loom:blocked
     Blocked --> InProgress: Unblock<br/>Remove loom:blocked
     InProgress --> ReviewRequested: PR created<br/>Add loom:review-requested
@@ -338,7 +338,7 @@ graph TB
 
     Architect -->|loom:proposal| Repo
     Curator -->|loom:ready| Repo
-    Worker -->|loom:in-progress| Repo
+    Worker -->|loom:building| Repo
     Worker -->|PR + loom:review-requested| Repo
     Reviewer -->|loom:pr| Repo
     Issues -->|New issues| Repo

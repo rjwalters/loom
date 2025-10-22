@@ -24,7 +24,7 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 2. (No label) → Unlabeled issues ready for Curator enhancement
 3. `loom:curated` → Curator-enhanced, awaiting human approval
 4. `loom:issue` → Human-approved, ready for Worker to claim
-5. `loom:in-progress` → Worker actively implementing
+5. `loom:building` → Worker actively implementing
 6. `loom:review-requested` → PR ready for Reviewer
 7. `loom:pr` → Reviewer approved, ready to merge
 8. `loom:blocked` → Work blocked on dependency
@@ -122,7 +122,7 @@ Use **GitHub labels as a state machine** to coordinate agent workflows:
 gh issue list --label="loom:issue" --state=open --limit=10
 
 # Claim oldest issue
-gh issue edit <number> --remove-label "loom:issue" --add-label "loom:in-progress"
+gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"
 ```
 
 **Creating PRs** (Worker role):
@@ -138,8 +138,8 @@ gh pr list --label="loom:review-requested" --state=open
 **Label Cleanup** (Health Monitor):
 ```bash
 # Reset labels on workspace restart
-gh issue list --label="loom:in-progress" --state=open --json number | \
-  xargs -I {} gh issue edit {} --remove-label "loom:in-progress"
+gh issue list --label="loom:building" --state=open --json number | \
+  xargs -I {} gh issue edit {} --remove-label "loom:building"
 ```
 
 ## Race Condition Handling
@@ -147,12 +147,12 @@ gh issue list --label="loom:in-progress" --state=open --json number | \
 Label updates are **not atomic**. If two Workers try to claim the same issue simultaneously:
 
 1. Both check: Issue has `loom:issue`
-2. Both execute: `gh issue edit <N> --add-label "loom:in-progress"`
+2. Both execute: `gh issue edit <N> --add-label "loom:building"`
 3. **Result**: Both think they claimed it
 
 **Mitigation**:
 - Workers fetch issue state again after claiming
-- If multiple `loom:in-progress` labels detected, Worker backs off
+- If multiple `loom:building` labels detected, Worker backs off
 - Use `loom:blocked` label to mark conflicts
 - Future: Add optimistic locking with label timestamps
 
