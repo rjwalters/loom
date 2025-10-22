@@ -178,7 +178,7 @@ Agents coordinate autonomously through GitHub labels. No direct communication is
 loom:curated ──→ (human approves) ──→ loom:issue
                                          │
                                          ↓ Builder claims
-                                   loom:in-progress
+                                   loom:building
                                          │
                                          ↓ Implementation complete
                                       (closed)
@@ -209,7 +209,7 @@ Hermit creates ──→ loom:hermit ──→ (human approves) ──→ loom:i
 
 **Workflow States**:
 - `loom:issue` - Approved for work, ready for Builder to claim
-- `loom:in-progress` - Issue being implemented OR PR under review/revision
+- `loom:building` - Issue being implemented OR PR under review/revision
 - `loom:review-requested` - PR ready for Judge to review
 - `loom:pr` - PR approved, ready for human to merge
 
@@ -272,7 +272,7 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 2. **Builder** (you) claims the issue
    ```bash
-   gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
+   gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
    ./.loom/scripts/worktree.sh 42
    cd .loom/worktrees/issue-42
    # ... implement feature ...
@@ -387,7 +387,7 @@ If two agents claim the same issue:
 gh issue view 42 --json timeline
 
 # Yield if you claimed second
-gh issue edit 42 --remove-label "loom:in-progress"
+gh issue edit 42 --remove-label "loom:building"
 ```
 
 ### Stale Labels
@@ -395,10 +395,10 @@ gh issue edit 42 --remove-label "loom:in-progress"
 Guide role should clean these up automatically, but you can do it manually:
 ```bash
 # Find stale in-progress issues (no activity for 7 days)
-gh issue list --label "loom:in-progress" --json number,updatedAt
+gh issue list --label "loom:building" --json number,updatedAt
 
 # Remove stale label
-gh issue edit 42 --remove-label "loom:in-progress"
+gh issue edit 42 --remove-label "loom:building"
 ```
 
 ## Resources

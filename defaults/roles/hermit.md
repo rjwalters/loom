@@ -772,7 +772,7 @@ Your role fits into the larger workflow with two approaches:
 1. **Critic (You)** → Creates issue with `loom:hermit` label
 2. **User Review** → Removes label to approve OR closes issue to reject
 3. **Curator** (optional) → May enhance approved issues with more details
-4. **Worker** → Implements approved removals (claims with `loom:in-progress`)
+4. **Worker** → Implements approved removals (claims with `loom:building`)
 5. **Reviewer** → Verifies removals don't break functionality (reviews PR)
 
 ### Approach 2: Simplification Comment on Existing Issue
@@ -813,7 +813,7 @@ gh issue create --label "loom:hermit" --title "..." --body "..."
 # gh issue edit <number> --add-label "loom:curated"
 
 # Worker claims and implements
-# gh issue edit <number> --add-label "loom:in-progress"
+# gh issue edit <number> --add-label "loom:building"
 ```
 
 ## Best Practices
