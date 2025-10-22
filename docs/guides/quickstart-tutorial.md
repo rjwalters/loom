@@ -146,12 +146,12 @@ The Builder will:
 
 **1. Claim the issue:**
 ```bash
-gh issue edit 42 --remove-label "loom:issue" --add-label "loom:in-progress"
+gh issue edit 42 --remove-label "loom:issue" --add-label "loom:building"
 ```
 
 **Label transition:**
 ```
-loom:issue → loom:in-progress
+loom:issue → loom:building
 ```
 
 **2. Create worktree:**
@@ -255,7 +255,7 @@ gh pr review 43 --request-changes --body "Needs fixes:
 - [ ] Add dark mode variant
 - [ ] Fix color contrast"
 
-gh pr edit 43 --remove-label "loom:review-requested" --add-label "loom:in-progress"
+gh pr edit 43 --remove-label "loom:review-requested" --add-label "loom:building"
 ```
 
 Then the Builder would address the feedback and re-request review.
@@ -291,7 +291,7 @@ Curator enhances → loom:curated
     ↓
 Human approves → loom:issue
     ↓
-Builder claims → loom:in-progress
+Builder claims → loom:building
     ↓
 Builder creates PR → loom:review-requested (on PR)
     ↓

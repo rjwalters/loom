@@ -257,12 +257,12 @@ console.log('GitHub labels synchronized');
 
 **Labels created:**
 - `loom:ready` - Issue ready for worker
-- `loom:in-progress` - Issue being worked on
+- `loom:building` - Issue being worked on
 - `loom:blocked` - Issue blocked by dependencies
 - `loom:proposal` - Architect proposal awaiting approval
 - `loom:review-requested` - PR ready for review
 - `loom:reviewing` - PR currently under review
-- `loom:approved` - PR approved
+- `loom:pr` - PR approved
 - `loom:urgent` - High-priority issue
 
 #### `reset_github_labels`
@@ -294,7 +294,7 @@ if (result.errors.length > 0) {
 ```
 
 **Behavior:**
-- Removes `loom:in-progress` from all open issues
+- Removes `loom:building` from all open issues
 - Replaces `loom:reviewing` with `loom:review-requested` on open PRs
 - Non-critical operation - continues on error
 

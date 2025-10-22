@@ -9,7 +9,7 @@
  * Data is stored in .loom/activity.db (SQLite) within the workspace.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/tauri";
 
 /**
  * Activity log entry
@@ -59,9 +59,7 @@ export async function logActivity(workspacePath: string, entry: ActivityEntry): 
       workspacePath,
       entry,
     });
-  } catch (error) {
-    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
-    console.error("[activity-logger] Failed to log activity:", error);
+  } catch (_error) {
     // Non-blocking - don't throw
   }
 }
@@ -82,9 +80,7 @@ export async function readRecentActivity(
       workspacePath,
       limit,
     });
-  } catch (error) {
-    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
-    console.error("[activity-logger] Failed to read recent activity:", error);
+  } catch (_error) {
     return [];
   }
 }
@@ -108,9 +104,7 @@ export async function getActivityByRole(
       role,
       limit,
     });
-  } catch (error) {
-    // biome-ignore lint/suspicious/noConsole: Error logging in catch block
-    console.error(`[activity-logger] Failed to get activity for role ${role}:`, error);
+  } catch (_error) {
     return [];
   }
 }

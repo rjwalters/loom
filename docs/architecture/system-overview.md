@@ -301,13 +301,13 @@ stateDiagram-v2
     Proposal --> Unlabeled: User approves<br/>(removes label)
     Proposal --> [*]: User rejects<br/>(closes issue)
     Unlabeled --> Ready: Curator enhances<br/>Add loom:ready
-    Ready --> InProgress: Worker claims<br/>Add loom:in-progress
+    Ready --> InProgress: Worker claims<br/>Add loom:building
     InProgress --> Blocked: Dependencies<br/>Add loom:blocked
     Blocked --> InProgress: Unblock<br/>Remove loom:blocked
     InProgress --> ReviewRequested: PR created<br/>Add loom:review-requested
     ReviewRequested --> Reviewing: Reviewer claims<br/>Add loom:reviewing
     Reviewing --> ReviewRequested: Request changes<br/>Back to loom:review-requested
-    Reviewing --> Approved: Approve<br/>Add loom:approved
+    Reviewing --> Approved: Approve<br/>Add loom:pr
     Approved --> [*]: Merge PR<br/>Auto-close issue
 
     note right of Proposal: Blue badge<br/>User decision
@@ -338,9 +338,9 @@ graph TB
 
     Architect -->|loom:proposal| Repo
     Curator -->|loom:ready| Repo
-    Worker -->|loom:in-progress| Repo
+    Worker -->|loom:building| Repo
     Worker -->|PR + loom:review-requested| Repo
-    Reviewer -->|loom:approved| Repo
+    Reviewer -->|loom:pr| Repo
     Issues -->|New issues| Repo
 
     style Architect fill:#e1bee7

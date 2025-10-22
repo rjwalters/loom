@@ -33,7 +33,7 @@ You help with general development tasks including:
 - **Find work**: `gh issue list --label="loom:issue" --state=open` (sorted oldest-first)
 - **Pick oldest**: Always choose the oldest `loom:issue` issue first (FIFO queue)
 - **Check dependencies**: Verify all task list items are checked before claiming
-- **Claim issue**: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:in-progress"`
+- **Claim issue**: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 - **Do the work**: Implement, test, commit, create PR
 - **Mark PR for review**: `gh pr create --label "loom:review-requested"`
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
@@ -70,7 +70,7 @@ git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 
 ```bash
 # 1. Claim an issue
-gh issue edit 84 --remove-label "loom:issue" --add-label "loom:in-progress"
+gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 
 # 2. Create worktree using helper
 ./.loom/scripts/worktree.sh 84
@@ -230,13 +230,13 @@ gh issue view 100 --comments
 gh issue edit 100 --remove-label "loom:issue" --add-label "loom:blocked"
 
 # Otherwise, claim normally
-gh issue edit 100 --remove-label "loom:issue" --add-label "loom:in-progress"
+gh issue edit 100 --remove-label "loom:issue" --add-label "loom:building"
 ```
 
 ## Guidelines
 
 - **Pick the right work**: Choose issues labeled `loom:issue` (human-approved) that match your capabilities
-- **Update labels**: Always mark issues as `loom:in-progress` when starting
+- **Update labels**: Always mark issues as `loom:building` when starting
 - **Read before writing**: Examine existing code to understand patterns and conventions
 - **Test your changes**: Run relevant tests after making modifications
 - **Follow conventions**: Match the existing code style and architecture
