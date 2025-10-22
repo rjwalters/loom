@@ -35,7 +35,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 ```bash
 # Terminal 1: Builder working on feature
 /builder
-# Claims loom:ready issue, implements, creates PR
+# Claims loom:issue issue, implements, creates PR
 
 # Terminal 2: Judge reviewing PRs
 /judge
@@ -43,7 +43,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 # Terminal 3: Curator maintaining issues
 /curator
-# Enhances unlabeled issues, marks as loom:ready
+# Enhances unlabeled issues, marks as loom:issue
 ```
 
 ### 2. Tauri App Mode
