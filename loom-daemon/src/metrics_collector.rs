@@ -40,13 +40,14 @@ pub struct MetricsConfig {
 
 /// State tracking for incremental syncing
 #[derive(Debug, Default, Serialize, Deserialize)]
+#[allow(clippy::struct_field_names)]
 struct MetricsState {
     /// Last PR sync timestamp (ISO 8601)
-    last_pr_sync: Option<String>,
+    pr_sync: Option<String>,
     /// Last issue sync timestamp (ISO 8601)
-    last_issue_sync: Option<String>,
+    issue_sync: Option<String>,
     /// Last commit sync timestamp (ISO 8601)
-    last_commit_sync: Option<String>,
+    commit_sync: Option<String>,
 }
 
 impl MetricsState {
@@ -129,7 +130,7 @@ fn check_gh_cli_installed() -> bool {
 }
 
 /// Check environment variable to see if metrics collection is enabled
-/// Returns None if disabled, Some(interval_secs) if enabled
+/// Returns None if disabled, `Some(interval_secs)` if enabled
 pub fn check_env_enabled() -> Option<u64> {
     match std::env::var("LOOM_GITHUB_METRICS") {
         Ok(val) if val == "0" => {
@@ -234,10 +235,10 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
     let mut total_events = 0;
 
     // Collect PRs
-    match collect_pr_events(config, &conn, state.last_pr_sync.as_deref()) {
+    match collect_pr_events(config, &conn, state.pr_sync.as_deref()) {
         Ok(count) => {
             total_events += count;
-            state.last_pr_sync = Some(chrono::Utc::now().to_rfc3339());
+            state.pr_sync = Some(chrono::Utc::now().to_rfc3339());
         }
         Err(e) => {
             log::error!("Failed to collect PR events: {e}");
@@ -245,10 +246,10 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
     }
 
     // Collect issues
-    match collect_issue_events(config, &conn, state.last_issue_sync.as_deref()) {
+    match collect_issue_events(config, &conn, state.issue_sync.as_deref()) {
         Ok(count) => {
             total_events += count;
-            state.last_issue_sync = Some(chrono::Utc::now().to_rfc3339());
+            state.issue_sync = Some(chrono::Utc::now().to_rfc3339());
         }
         Err(e) => {
             log::error!("Failed to collect issue events: {e}");
@@ -269,7 +270,7 @@ fn check_rate_limit() -> bool {
                 Ok(rate_info) => {
                     let remaining = rate_info.resources.core.remaining;
                     if remaining < 100 {
-                        log::warn!("⚠️  GitHub API rate limit low: {} remaining", remaining);
+                        log::warn!("⚠️  GitHub API rate limit low: {remaining} remaining");
                         return false;
                     }
                     true
@@ -327,7 +328,7 @@ fn collect_pr_events(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("gh pr list failed: {}", stderr));
+        return Err(anyhow!("gh pr list failed: {stderr}"));
     }
 
     let prs: Vec<GitHubPR> =
@@ -393,7 +394,7 @@ fn collect_issue_events(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("gh issue list failed: {}", stderr));
+        return Err(anyhow!("gh issue list failed: {stderr}"));
     }
 
     let issues: Vec<GitHubIssue> =
@@ -441,7 +442,7 @@ fn insert_github_event(
     )?;
 
     if exists {
-        log::debug!("Event already recorded, skipping: {} at {}", event_type, event_time);
+        log::debug!("Event already recorded, skipping: {event_type} at {event_time}");
         return Ok(false);
     }
 
@@ -455,13 +456,7 @@ fn insert_github_event(
         params![activity_id, event_type, event_time, pr_number, issue_number, commit_sha, author],
     )?;
 
-    log::debug!(
-        "Inserted {} event: PR#{:?} Issue#{:?} at {}",
-        event_type,
-        pr_number,
-        issue_number,
-        event_time
-    );
+    log::debug!("Inserted {event_type} event: PR#{pr_number:?} Issue#{issue_number:?} at {event_time}");
 
     Ok(true)
 }
@@ -544,7 +539,7 @@ pub fn try_init_metrics_collector(
             Some(handle)
         }
         Err(e) => {
-            log::info!("📊 Metrics collection disabled: {}", e);
+            log::info!("📊 Metrics collection disabled: {e}");
             None
         }
     }

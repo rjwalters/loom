@@ -107,7 +107,7 @@ async fn main() -> Result<()> {
     // Start GitHub metrics collection (if workspace is set)
     // Workspace can be set via LOOM_WORKSPACE environment variable
     let workspace_from_env = std::env::var("LOOM_WORKSPACE").ok();
-    let db_path_str = db_path.to_str().map(|s| s.to_string());
+    let db_path_str = db_path.to_str().map(std::string::ToString::to_string);
 
     if let (Some(workspace), Some(db_path_string)) = (workspace_from_env.as_deref(), db_path_str) {
         let _metrics_handle =
