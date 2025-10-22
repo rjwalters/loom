@@ -59,11 +59,10 @@ impl MetricsState {
             return Ok(Self::default());
         }
 
-        let contents = fs::read_to_string(&state_path)
-            .context("Failed to read metrics state file")?;
+        let contents =
+            fs::read_to_string(&state_path).context("Failed to read metrics state file")?;
 
-        serde_json::from_str(&contents)
-            .context("Failed to parse metrics state JSON")
+        serde_json::from_str(&contents).context("Failed to parse metrics state JSON")
     }
 
     fn save_to_workspace(&self, workspace_path: &str) -> Result<()> {
@@ -71,11 +70,10 @@ impl MetricsState {
             .join(".loom")
             .join("metrics_state.json");
 
-        let contents = serde_json::to_string_pretty(self)
-            .context("Failed to serialize metrics state")?;
+        let contents =
+            serde_json::to_string_pretty(self).context("Failed to serialize metrics state")?;
 
-        fs::write(&state_path, contents)
-            .context("Failed to write metrics state file")?;
+        fs::write(&state_path, contents).context("Failed to write metrics state file")?;
 
         Ok(())
     }
@@ -161,16 +159,16 @@ fn validate_github_workspace(workspace_path: &str) -> Result<(String, String)> {
         return Err(anyhow!("Not a git repository"));
     }
 
-    let remote_url = String::from_utf8(output.stdout)
-        .context("Invalid UTF-8 in git remote URL")?;
+    let remote_url = String::from_utf8(output.stdout).context("Invalid UTF-8 in git remote URL")?;
 
     // Parse owner/repo from various URL formats:
     // - https://github.com/owner/repo.git
     // - git@github.com:owner/repo.git
-    let re = regex::Regex::new(r"github\.com[:/]([^/]+)/([^/.]+)")
-        .context("Failed to compile regex")?;
+    let re =
+        regex::Regex::new(r"github\.com[:/]([^/]+)/([^/.]+)").context("Failed to compile regex")?;
 
-    let caps = re.captures(&remote_url)
+    let caps = re
+        .captures(&remote_url)
         .ok_or_else(|| anyhow!("Not a GitHub repository (no github.com in remote URL)"))?;
 
     Ok((caps[1].to_string(), caps[2].to_string()))
@@ -206,17 +204,15 @@ pub fn start_metrics_collector(config: MetricsConfig) -> JoinHandle<()> {
         config.interval_secs
     );
 
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(config.interval_secs));
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(config.interval_secs));
 
-            match collect_and_store_events(&config) {
-                Ok(event_count) => {
-                    log::info!("📊 Collected {event_count} GitHub events");
-                }
-                Err(e) => {
-                    log::error!("❌ Metrics collection failed: {e}");
-                }
+        match collect_and_store_events(&config) {
+            Ok(event_count) => {
+                log::info!("📊 Collected {event_count} GitHub events");
+            }
+            Err(e) => {
+                log::error!("❌ Metrics collection failed: {e}");
             }
         }
     })
@@ -233,8 +229,7 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
     // Load previous sync state
     let mut state = MetricsState::load_from_workspace(&config.workspace_path)?;
 
-    let conn = Connection::open(&config.db_path)
-        .context("Failed to open activity database")?;
+    let conn = Connection::open(&config.db_path).context("Failed to open activity database")?;
 
     let mut total_events = 0;
 
@@ -268,10 +263,7 @@ fn collect_and_store_events(config: &MetricsConfig) -> Result<usize> {
 
 /// Check GitHub API rate limit
 fn check_rate_limit() -> bool {
-    match Command::new("gh")
-        .args(["api", "rate_limit"])
-        .output()
-    {
+    match Command::new("gh").args(["api", "rate_limit"]).output() {
         Ok(output) if output.status.success() => {
             match serde_json::from_slice::<RateLimitResponse>(&output.stdout) {
                 Ok(rate_info) => {
@@ -303,12 +295,11 @@ fn collect_pr_events(
 ) -> Result<usize> {
     // Create longer-lived string values
     let repo_string = format!("{}/{}", config.repo_owner, config.repo_name);
-    let search_query = since
-        .and_then(|since_time| {
-            chrono::DateTime::parse_from_rfc3339(since_time)
-                .ok()
-                .map(|dt| format!("merged:>{}", dt.format("%Y-%m-%d")))
-        });
+    let search_query = since.and_then(|since_time| {
+        chrono::DateTime::parse_from_rfc3339(since_time)
+            .ok()
+            .map(|dt| format!("merged:>{}", dt.format("%Y-%m-%d")))
+    });
 
     let mut args = vec![
         "pr",
@@ -339,8 +330,8 @@ fn collect_pr_events(
         return Err(anyhow!("gh pr list failed: {}", stderr));
     }
 
-    let prs: Vec<GitHubPR> = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse PR JSON")?;
+    let prs: Vec<GitHubPR> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse PR JSON")?;
 
     let mut count = 0;
     for pr in prs {
@@ -370,12 +361,11 @@ fn collect_issue_events(
 ) -> Result<usize> {
     // Create longer-lived string values
     let repo_string = format!("{}/{}", config.repo_owner, config.repo_name);
-    let search_query = since
-        .and_then(|since_time| {
-            chrono::DateTime::parse_from_rfc3339(since_time)
-                .ok()
-                .map(|dt| format!("closed:>{}", dt.format("%Y-%m-%d")))
-        });
+    let search_query = since.and_then(|since_time| {
+        chrono::DateTime::parse_from_rfc3339(since_time)
+            .ok()
+            .map(|dt| format!("closed:>{}", dt.format("%Y-%m-%d")))
+    });
 
     let mut args = vec![
         "issue",
@@ -406,8 +396,8 @@ fn collect_issue_events(
         return Err(anyhow!("gh issue list failed: {}", stderr));
     }
 
-    let issues: Vec<GitHubIssue> = serde_json::from_slice(&output.stdout)
-        .context("Failed to parse issue JSON")?;
+    let issues: Vec<GitHubIssue> =
+        serde_json::from_slice(&output.stdout).context("Failed to parse issue JSON")?;
 
     let mut count = 0;
     for issue in issues {
@@ -465,8 +455,13 @@ fn insert_github_event(
         params![activity_id, event_type, event_time, pr_number, issue_number, commit_sha, author],
     )?;
 
-    log::debug!("Inserted {} event: PR#{:?} Issue#{:?} at {}",
-               event_type, pr_number, issue_number, event_time);
+    log::debug!(
+        "Inserted {} event: PR#{:?} Issue#{:?} at {}",
+        event_type,
+        pr_number,
+        issue_number,
+        event_time
+    );
 
     Ok(true)
 }

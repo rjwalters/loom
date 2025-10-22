@@ -110,10 +110,8 @@ async fn main() -> Result<()> {
     let db_path_str = db_path.to_str().map(|s| s.to_string());
 
     if let (Some(workspace), Some(db_path_string)) = (workspace_from_env.as_deref(), db_path_str) {
-        let _metrics_handle = metrics_collector::try_init_metrics_collector(
-            Some(workspace),
-            &db_path_string,
-        );
+        let _metrics_handle =
+            metrics_collector::try_init_metrics_collector(Some(workspace), &db_path_string);
         // Note: metrics_handle is dropped here, but the thread keeps running if enabled
     }
 
