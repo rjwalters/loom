@@ -102,7 +102,7 @@ Both templates use GitHub labels to coordinate work between agents:
 - `loom:in-progress` (yellow) - Currently being worked on
 - `loom:review-requested` (green) - PR ready for review
 - `loom:reviewing` (amber) - Under active review
-- `loom:approved` (blue) - PR approved, ready to merge
+- `loom:pr` (blue) - PR approved, ready to merge
 
 See [../WORKFLOWS.md](../WORKFLOWS.md) for complete workflow documentation.
 

@@ -62,7 +62,7 @@ This template uses GitHub labels to coordinate work:
 - `loom:in-progress` (yellow) - Worker is currently working on it
 - `loom:review-requested` (green) - PR is ready for review
 - `loom:reviewing` (amber) - Reviewer is currently reviewing
-- `loom:approved` (blue) - PR is approved and ready to merge
+- `loom:pr` (blue) - PR is approved and ready to merge
 
 ## Configuration
 
