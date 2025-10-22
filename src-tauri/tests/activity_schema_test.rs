@@ -1,6 +1,11 @@
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::panic)]
+#![allow(clippy::manual_assert)]
+
 use rusqlite::{Connection, Result as SqliteResult};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Helper to create a temporary workspace directory
@@ -11,7 +16,7 @@ fn create_temp_workspace() -> (TempDir, PathBuf) {
 }
 
 /// Helper to open a connection to the activity database
-fn open_test_db(workspace_path: &PathBuf) -> SqliteResult<Connection> {
+fn open_test_db(workspace_path: &Path) -> SqliteResult<Connection> {
     let loom_dir = workspace_path.join(".loom");
     fs::create_dir_all(&loom_dir).unwrap();
     let db_path = loom_dir.join("activity.db");

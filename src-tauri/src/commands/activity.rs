@@ -200,9 +200,9 @@ fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
 
 /// Log activity entry to SQLite database
 #[tauri::command]
-pub fn log_activity(workspace_path: &str, entry: &ActivityEntry) -> Result<(), String> {
+pub fn log_activity(workspace_path: String, entry: ActivityEntry) -> Result<(), String> {
     let conn =
-        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
     conn.execute(
         "INSERT INTO agent_activity (
