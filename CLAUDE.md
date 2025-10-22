@@ -412,6 +412,61 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+### Error Recovery Workflows
+
+**Terminal Missing Session Recovery**
+
+When a terminal loses its tmux session:
+
+1. **Detection**: Health monitor detects missing session
+2. **State Update**: Terminal marked with `missingSession: true`
+3. **User Prompt**: UI shows "Restart" button
+4. **Recovery**: User clicks restart → daemon creates new session
+5. **State Sync**: Terminal reconnected, `missingSession` cleared
+
+**Implementation**: See `src/lib/health-monitor.ts:218-296`
+
+**Daemon Reconnection**
+
+When daemon connection is lost:
+
+1. **Detection**: IPC socket write fails
+2. **Retry**: Exponential backoff (2s, 4s, 8s, max 30s)
+3. **Fallback**: If daemon unresponsive, prompt user to restart app
+4. **State Preservation**: Terminal configs saved to `.loom/config.json`
+
+**Implementation**: See `src/lib/daemon-client.ts`
+
+**State Cleanup After Crash**
+
+After app crash:
+
+1. **Orphaned tmux sessions**: Run `tmux -L loom kill-server`
+2. **Stale worktrees**: Run `git worktree prune`
+3. **Corrupted config**: Factory reset loads `defaults/config.json`
+4. **Terminal logs**: Inspect `~/.loom/console.log`, `~/.loom/daemon.log`
+
+**Tools**: Use MCP servers to inspect state:
+- `mcp__loom-ui__read_state_file`
+- `mcp__loom-logs__tail_daemon_log`
+
+**Worktree Orphan Cleanup**
+
+When worktrees remain after terminal deletion:
+
+```bash
+# List all worktrees
+git worktree list
+
+# Remove specific worktree
+git worktree remove .loom/worktrees/issue-42 --force
+
+# Prune all orphaned worktrees
+git worktree prune
+```
+
+**Prevention**: Daemon auto-cleanup in `loom-daemon/src/terminal.rs:87-102`
+
 ## Resources
 
 ### Loom Documentation
