@@ -246,6 +246,25 @@ export function setupMainEventListeners(deps: {
         return;
       }
 
+      // Export button
+      const exportBtn = target.closest("#terminal-export-btn");
+      if (exportBtn) {
+        e.stopPropagation();
+        const id = exportBtn.getAttribute("data-terminal-id");
+        if (id) {
+          logger.info("Exporting terminal", { terminalId: id });
+          terminalManager
+            .exportAndDownload(id)
+            .then(() => {
+              logger.info("Terminal exported successfully", { terminalId: id });
+            })
+            .catch((error) => {
+              logger.error("Failed to export terminal", error, { terminalId: id });
+            });
+        }
+        return;
+      }
+
       // Search panel - Close button
       const searchCloseBtn = target.closest("#terminal-search-close");
       if (searchCloseBtn) {

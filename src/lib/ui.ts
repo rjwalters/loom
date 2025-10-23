@@ -324,6 +324,19 @@ export function renderPrimaryTerminal(
           </svg>
         </button>
         <button
+          id="terminal-export-btn"
+          data-terminal-id="${terminal.id}"
+          data-tooltip="Export terminal output as text file"
+          data-tooltip-position="bottom"
+          class="p-1.5 hover:bg-gray-200 dark:hover:bg-gray-600 rounded transition-colors"
+          title="Export"
+          aria-label="Export ${escapeHtml(terminal.name)} terminal output"
+        >
+          <svg class="w-4 h-4 text-gray-600 dark:text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path>
+          </svg>
+        </button>
+        <button
           id="terminal-clear-btn"
           data-terminal-id="${terminal.id}"
           data-tooltip="Clear terminal history"
