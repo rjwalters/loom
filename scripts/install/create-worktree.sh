@@ -106,6 +106,6 @@ fi
 success "Worktree created: $WORKTREE_PATH"
 success "Branch name: $BRANCH_NAME"
 
-# Output the worktree path and branch name (stdout, so it can be captured by caller)
-# Format: WORKTREE_PATH|BRANCH_NAME
-echo "${WORKTREE_PATH}|${BRANCH_NAME}"
+# Output the worktree path, branch name, and base branch (stdout, so it can be captured by caller)
+# Format: WORKTREE_PATH|BRANCH_NAME|BASE_BRANCH
+echo "${WORKTREE_PATH}|${BRANCH_NAME}|${BASE_BRANCH}"

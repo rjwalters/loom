@@ -5,6 +5,7 @@ set -euo pipefail
 
 WORKTREE_PATH="${1:-.}"
 ISSUE_NUMBER="${2:-}"
+BASE_BRANCH="${3:-}"
 LOOM_VERSION="${LOOM_VERSION:-unknown}"
 LOOM_COMMIT="${LOOM_COMMIT:-unknown}"
 
@@ -29,6 +30,10 @@ success() {
 
 if [[ -z "$ISSUE_NUMBER" ]]; then
   error "Issue number required as second argument"
+fi
+
+if [[ -z "$BASE_BRANCH" ]]; then
+  error "Base branch required as third argument"
 fi
 
 cd "$WORKTREE_PATH"
@@ -115,6 +120,7 @@ EOF
 # Create pull request
 # Output goes to stderr so it doesn't interfere with URL capture
 PR_OUTPUT=$(gh pr create \
+  --base "$BASE_BRANCH" \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$PR_BODY" \
   --label "loom:review-requested" 2>&1)
