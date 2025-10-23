@@ -58,10 +58,10 @@ info "Creating installation issue..."
 # NOTE: Don't add label during creation - labels are synced in Step 5
 ISSUE_URL=$(gh issue create \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
-  --body "$ISSUE_BODY" 2>&1 | grep -o 'https://[^ ]*')
+  --body "$ISSUE_BODY" 2>&1 | grep -o 'https://[^ ]*' | head -1)
 
 # Extract issue number from URL
-ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]*$')
+ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]\+$')
 
 success "Created issue #${ISSUE_NUMBER}"
 
