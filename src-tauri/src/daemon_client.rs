@@ -79,6 +79,7 @@ pub struct TerminalInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivityEntry {
     pub input_id: i64,
     pub timestamp: String,

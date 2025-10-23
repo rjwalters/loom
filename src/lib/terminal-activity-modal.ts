@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
+import { Command } from "@tauri-apps/plugin-shell";
 import type { ActivityEntry } from "./state";
 import { showToast } from "./toast";
 
@@ -52,6 +53,9 @@ function createActivityModal(terminalId: string, terminalName: string): HTMLElem
           📊 Terminal Activity: ${escapeHtml(terminalName)}
         </h2>
         <div class="flex gap-2">
+          <button id="copy-clipboard-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
+            Copy to Clipboard
+          </button>
           <button id="export-csv-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
             Export CSV
           </button>
@@ -163,7 +167,7 @@ function createActivityEntryHTML(entry: ActivityEntry, index: number): string {
   return `
     <div class="mb-4 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
       <!-- Summary -->
-      <div class="p-3 bg-gray-50 dark:bg-gray-700/50 flex items-start gap-3 cursor-pointer activity-entry-toggle hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors" data-entry-id="${index}">
+      <div class="p-3 bg-gray-100 dark:bg-gray-700/50 flex items-start gap-3 cursor-pointer activity-entry-toggle hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors" data-entry-id="${index}">
         <span class="toggle-icon text-gray-500 dark:text-gray-400 text-sm">▶</span>
         <div class="flex-1 min-w-0">
           <div class="flex items-center gap-2 mb-1 flex-wrap">
@@ -248,6 +252,11 @@ function setupCloseHandlers(modal: HTMLElement, terminalId: string): void {
   };
   document.addEventListener("keydown", escapeHandler);
 
+  // Copy to clipboard handler
+  modal.querySelector("#copy-clipboard-btn")?.addEventListener("click", async () => {
+    await copyActivityToClipboard(terminalId);
+  });
+
   // Export handlers
   modal.querySelector("#export-csv-btn")?.addEventListener("click", async () => {
     await exportActivity(terminalId, "csv");
@@ -295,6 +304,68 @@ async function exportActivity(terminalId: string, format: "csv" | "json"): Promi
     }
   } catch (error) {
     showToast(`Export failed: ${error}`, "error");
+  }
+}
+
+/**
+ * Copy activity data to clipboard as formatted text
+ */
+async function copyActivityToClipboard(terminalId: string): Promise<void> {
+  try {
+    const entries = await invoke<ActivityEntry[]>("get_terminal_activity", {
+      terminalId,
+      limit: 1000, // Copy more entries
+    });
+
+    if (entries.length === 0) {
+      showToast("No activity to copy", "info");
+      return;
+    }
+
+    // Format as plain text with sections
+    const lines: string[] = [];
+    lines.push("=".repeat(80));
+    lines.push(`TERMINAL ACTIVITY - ${terminalId}`);
+    lines.push(`Total Entries: ${entries.length}`);
+    lines.push("=".repeat(80));
+    lines.push("");
+
+    for (const entry of entries) {
+      lines.push("-".repeat(80));
+      lines.push(`Timestamp: ${entry.timestamp}`);
+      lines.push(`Input Type: ${entry.inputType}`);
+      lines.push(`Prompt: ${entry.prompt}`);
+      if (entry.agentRole) {
+        lines.push(`Agent Role: ${entry.agentRole}`);
+      }
+      if (entry.gitBranch) {
+        lines.push(`Git Branch: ${entry.gitBranch}`);
+      }
+      if (entry.exitCode !== undefined && entry.exitCode !== null) {
+        lines.push(`Exit Code: ${entry.exitCode}`);
+      }
+      if (entry.outputPreview) {
+        lines.push(`Output Preview: ${entry.outputPreview}`);
+      }
+      lines.push("");
+    }
+
+    const text = lines.join("\n");
+
+    // Write to temp file, then use pbcopy to read it
+    // This is more reliable than stdin with the shell plugin
+    const tempFile = `/tmp/loom-activity-${Date.now()}.txt`;
+    await writeTextFile(tempFile, text);
+
+    const command = Command.create("bash", [
+      "-c",
+      `cat "${tempFile}" | pbcopy && rm "${tempFile}"`,
+    ]);
+    await command.execute();
+
+    showToast("Activity copied to clipboard", "success");
+  } catch (error) {
+    showToast(`Copy failed: ${error}`, "error");
   }
 }
 

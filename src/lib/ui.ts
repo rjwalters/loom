@@ -79,7 +79,7 @@ export function renderLoadingState(message: string = "Resetting workspace..."): 
   if (!container) return;
 
   container.innerHTML = `
-    <div class="h-full flex items-center justify-center bg-gray-50 dark:bg-gray-900">
+    <div class="h-full flex items-center justify-center bg-gray-200 dark:bg-gray-900">
       <div class="flex flex-col items-center gap-6">
         <!-- Loom weaving animation -->
         <div class="relative w-32 h-32">
@@ -223,21 +223,21 @@ export function renderPrimaryTerminal(
   if (!existingWrapper) {
     // First render - create persistent structure
     container.innerHTML = `
-      <div class="h-full flex flex-col bg-white dark:bg-gray-800 rounded-lg border-l-4 border-r border-t border-b border-gray-200 dark:border-gray-700 overflow-hidden" style="border-left-color: ${styles.borderColor}" id="terminal-wrapper">
-        <div class="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700" style="background-color: ${styles.backgroundColor}" id="terminal-header">
+      <div class="h-full flex flex-col bg-gray-100 dark:bg-gray-800 rounded-lg border-l-4 border-r border-t border-b border-gray-200 dark:border-gray-700 overflow-hidden" style="border-left-color: ${styles.borderColor}" id="terminal-wrapper">
+        <div class="flex items-center justify-between px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-700" style="background-color: ${styles.backgroundColor}" id="terminal-header">
           <!-- Header content will be updated below -->
         </div>
         <div id="persistent-xterm-containers" class="flex-1 overflow-auto relative">
           <!-- Persistent xterm containers created by terminal-manager, shown/hidden via display style -->
 
           <!-- Search panel (hidden by default) -->
-          <div id="terminal-search-panel" class="hidden absolute top-4 right-4 z-50 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg p-3" style="backdrop-filter: blur(10px); background-color: rgba(255, 255, 255, 0.95); dark:background-color: rgba(31, 41, 55, 0.95);">
+          <div id="terminal-search-panel" class="hidden absolute top-4 right-4 z-50 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg shadow-lg p-3" style="backdrop-filter: blur(10px);">
             <div class="flex items-center gap-2 mb-2">
               <input
                 id="terminal-search-input"
                 type="text"
                 placeholder="Search terminal output..."
-                class="flex-1 px-2 py-1 text-sm bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-500 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+                class="flex-1 px-2 py-1 text-sm bg-gray-50 dark:bg-gray-700 border border-gray-300 dark:border-gray-500 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
                 aria-label="Search terminal output"
               />
               <button
@@ -489,6 +489,10 @@ export function renderMiniTerminals(
   const container = document.getElementById("mini-terminal-row");
   if (!container) return;
 
+  // Save the current scroll position before re-rendering
+  const scrollContainer = container.querySelector(".overflow-x-auto");
+  const savedScrollLeft = scrollContainer?.scrollLeft ?? 0;
+
   const terminalCards = terminals
     .map((t, index) => {
       const health = terminalHealthMap?.get(t.id);
@@ -498,7 +502,7 @@ export function renderMiniTerminals(
 
   const addButtonClasses = hasWorkspace
     ? "bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 cursor-pointer"
-    : "bg-gray-50 dark:bg-gray-800 cursor-not-allowed opacity-50";
+    : "bg-gray-100 dark:bg-gray-800 cursor-not-allowed opacity-50";
 
   const addButtonDisabled = hasWorkspace ? "" : "disabled";
   const addButtonTitle = hasWorkspace ? "Add terminal" : "Select a workspace first";
@@ -523,6 +527,16 @@ export function renderMiniTerminals(
       </button>
     </div>
   `;
+
+  // Restore the scroll position after re-rendering (without animation)
+  const newScrollContainer = container.querySelector(".overflow-x-auto") as HTMLElement;
+  if (newScrollContainer && savedScrollLeft > 0) {
+    // Use scrollTo with behavior: 'instant' to skip animation
+    newScrollContainer.scrollTo({
+      left: savedScrollLeft,
+      behavior: "instant" as ScrollBehavior,
+    });
+  }
 }
 
 /**
@@ -702,7 +716,7 @@ function createMiniTerminalHTML(
       <div class="relative">
         ${needsInputBadge}
         <div
-          class="terminal-card group w-40 h-40 bg-white dark:bg-gray-800 hover:bg-gray-900/5 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all relative overflow-hidden"
+          class="terminal-card group w-40 h-40 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-white/5 rounded-lg cursor-grab transition-all relative overflow-hidden"
           style="border: ${borderWidth}px solid ${borderColor}"
           data-terminal-id="${terminal.id}"
           draggable="true"
@@ -713,33 +727,23 @@ function createMiniTerminalHTML(
         >
           <!-- Regular terminal card content -->
           <div class="terminal-card-content">
-            <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700 group-hover:bg-gray-100 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
+            <div class="p-2 border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-700 group-hover:bg-gray-200 dark:group-hover:bg-gray-600 flex items-center justify-between transition-colors rounded-t-lg" style="background-color: ${styles.backgroundColor}">
               <div class="flex items-center gap-2 flex-1 min-w-0">
                 <div class="w-2 h-2 rounded-full flex-shrink-0 ${getStatusColor(terminal.status)}"></div>
                 <span class="terminal-name text-xs font-medium truncate" data-tooltip="Double-click to rename, drag to reorder" data-tooltip-position="top">${escapeHtml(terminal.name)}</span>
               </div>
               <div class="flex items-center gap-0.5 flex-shrink-0">
-                ${createRestartButtonHTML(terminal, "mini")}
-                ${createRunNowButtonHTML(terminal, "mini")}
                 <button
-                  class="show-activity-btn text-gray-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors text-base"
+                  class="show-activity-btn p-0.5 text-gray-400 hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
                   data-terminal-id="${terminal.id}"
                   data-tooltip="View activity"
                   data-tooltip-position="top"
                   title="View activity"
                   aria-label="View activity for ${escapeHtml(terminal.name)}"
                 >
-                  <span aria-hidden="true">📊</span>
-                </button>
-                <button
-                  class="close-terminal-btn text-gray-400 hover:text-red-500 dark:hover:text-red-400 font-bold transition-colors"
-                  data-terminal-id="${terminal.id}"
-                  data-tooltip="Close terminal"
-                  data-tooltip-position="top"
-                  title="Close terminal"
-                  aria-label="Close ${escapeHtml(terminal.name)} terminal"
-                >
-                  <span aria-hidden="true">×</span>
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
+                  </svg>
                 </button>
               </div>
             </div>

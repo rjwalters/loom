@@ -40,6 +40,10 @@ export function setupDragAndDrop(
       if (e.dataTransfer) {
         e.dataTransfer.effectAllowed = "move";
         e.dataTransfer.setData("text/html", card.innerHTML);
+
+        // Use the card itself as the drag image (browser will show it semi-transparent)
+        // The tarot card will be visible in the original position due to the .dragging class
+        e.dataTransfer.setDragImage(card, 80, 80); // Center on cursor
       }
     }
   });

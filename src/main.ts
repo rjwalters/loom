@@ -184,17 +184,6 @@ healthMonitor.onHealthUpdate(() => {
 });
 // logger?.info("Subscribed to health monitor updates"); // Moved to async IIFE
 
-// Update timer displays every second
-window.setInterval(() => {
-  // Re-render to update timer displays without full state change
-  // This ensures busy/idle timers update in real-time
-  const terminals = state.getTerminals();
-  if (terminals.length > 0) {
-    render();
-  }
-}, 1000);
-// logger?.info("Timer update interval started"); // Moved to async IIFE
-
 // =================================================================
 // EVENT LISTENER DEDUPLICATION
 // =================================================================

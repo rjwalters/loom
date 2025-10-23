@@ -70,6 +70,10 @@ export class TerminalManager {
     // Get saved font size or use default
     const fontSize = this.getSavedFontSize();
 
+    // Determine current theme
+    const isDark = document.documentElement.classList.contains("dark");
+    const theme = isDark ? this.getDarkTheme() : this.getLightTheme();
+
     // Create xterm.js Terminal instance with fixed size matching tmux
     const terminal = new Terminal({
       cols: 80, // Standard width to match tmux
@@ -77,28 +81,7 @@ export class TerminalManager {
       cursorBlink: true,
       fontSize,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
-      theme: {
-        background: "#1e1e1e",
-        foreground: "#d4d4d4",
-        cursor: "#ffffff",
-        selectionBackground: "rgba(255, 255, 255, 0.3)",
-        black: "#000000",
-        red: "#cd3131",
-        green: "#0dbc79",
-        yellow: "#e5e510",
-        blue: "#2472c8",
-        magenta: "#bc3fbc",
-        cyan: "#11a8cd",
-        white: "#e5e5e5",
-        brightBlack: "#666666",
-        brightRed: "#f14c4c",
-        brightGreen: "#23d18b",
-        brightYellow: "#f5f543",
-        brightBlue: "#3b8eea",
-        brightMagenta: "#d670d6",
-        brightCyan: "#29b8db",
-        brightWhite: "#e5e5e5",
-      },
+      theme,
       allowProposedApi: true,
       scrollback: 10000, // Keep plenty of scrollback
     });
@@ -326,6 +309,47 @@ export class TerminalManager {
   }
 
   /**
+   * Get dark theme colors
+   */
+  private getDarkTheme() {
+    return {
+      background: "#1e1e1e",
+      foreground: "#d4d4d4",
+      cursor: "#ffffff",
+      selectionBackground: "rgba(255, 255, 255, 0.3)",
+    };
+  }
+
+  /**
+   * Get light theme colors
+   */
+  private getLightTheme() {
+    return {
+      background: "#f5f5f5",
+      foreground: "#1e1e1e",
+      cursor: "#000000",
+      selectionBackground: "rgba(0, 0, 0, 0.2)",
+      // ANSI colors - adjusted for light background with darker blues
+      black: "#000000",
+      red: "#cd3131",
+      green: "#00bc00",
+      yellow: "#949800",
+      blue: "#0033cc",
+      magenta: "#bc05bc",
+      cyan: "#0598bc",
+      white: "#555555",
+      brightBlack: "#666666",
+      brightRed: "#cd3131",
+      brightGreen: "#14ce14",
+      brightYellow: "#b5ba00",
+      brightBlue: "#0044dd",
+      brightMagenta: "#bc05bc",
+      brightCyan: "#0598bc",
+      brightWhite: "#a5a5a5",
+    };
+  }
+
+  /**
    * Update terminal theme based on dark/light mode
    */
   updateTheme(terminalId: string, isDark: boolean): void {
@@ -334,20 +358,7 @@ export class TerminalManager {
       return;
     }
 
-    const theme = isDark
-      ? {
-          background: "#1e1e1e",
-          foreground: "#d4d4d4",
-          cursor: "#ffffff",
-          selectionBackground: "rgba(255, 255, 255, 0.3)",
-        }
-      : {
-          background: "#ffffff",
-          foreground: "#333333",
-          cursor: "#000000",
-          selectionBackground: "rgba(0, 0, 0, 0.3)",
-        };
-
+    const theme = isDark ? this.getDarkTheme() : this.getLightTheme();
     managed.terminal.options.theme = theme;
   }
 
@@ -355,9 +366,13 @@ export class TerminalManager {
    * Update all terminals' themes
    */
   updateAllThemes(isDark: boolean): void {
-    for (const [id] of this.terminals) {
-      this.updateTheme(id, isDark);
+    const theme = isDark ? this.getDarkTheme() : this.getLightTheme();
+
+    for (const [_, managed] of this.terminals) {
+      managed.terminal.options.theme = theme;
     }
+
+    logger.info(`Updated ${this.terminals.size} terminals to ${isDark ? "dark" : "light"} theme`);
   }
 
   /**

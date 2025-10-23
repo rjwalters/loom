@@ -79,7 +79,7 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
                 .map(
                   ([id, theme]) => `
                 <button
-                  class="theme-card flex flex-col items-center gap-1 p-2 bg-white dark:bg-gray-700 hover:bg-gray-50 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
+                  class="theme-card flex flex-col items-center gap-1 p-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
                   data-theme-id="${id}"
                 >
                   <div class="w-8 h-8 rounded" style="background-color: ${theme.primary}"></div>

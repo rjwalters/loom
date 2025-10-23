@@ -7,7 +7,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
-import type { AppLevelState } from "./app-state";
+import { type AppLevelState, appLevelState } from "./app-state";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
@@ -220,9 +220,14 @@ export function startRename(
   setTimeout(() => {
     input.focus();
     input.select();
+    // Set editing flag to prevent timer-based re-renders from discarding edits
+    appLevelState.isUserEditing = true;
   }, 0);
 
   const commit = () => {
+    // Clear editing flag before committing
+    appLevelState.isUserEditing = false;
+
     const newName = input.value.trim();
     if (newName && newName !== currentName) {
       state.renameTerminal(terminalId, newName);
@@ -234,6 +239,8 @@ export function startRename(
   };
 
   const cancel = () => {
+    // Clear editing flag before cancelling
+    appLevelState.isUserEditing = false;
     render();
   };
 
