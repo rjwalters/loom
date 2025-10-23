@@ -16,17 +16,36 @@
     "core:window:allow-set-icon",
     "core:window:allow-close",
     "dialog:allow-open",
+    "dialog:allow-save",
     "dialog:allow-message",
     "dialog:allow-ask",
     "fs:allow-read-dir",
     "fs:allow-read-file",
     "fs:allow-write-file",
+    "fs:allow-write-text-file",
     "fs:allow-mkdir",
     "fs:allow-exists",
     "fs:scope-home",
     "fs:scope-appconfig",
     "fs:scope-appdata",
     "fs:scope-applog",
-    "core:path:default"
+    "core:path:default",
+    "shell:allow-execute",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "pbcopy",
+          "cmd": "pbcopy",
+          "sidecar": false
+        },
+        {
+          "name": "bash",
+          "cmd": "bash",
+          "args": ["-c"],
+          "sidecar": false
+        }
+      ]
+    }
   ]
 }

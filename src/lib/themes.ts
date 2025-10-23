@@ -76,7 +76,12 @@ export interface ThemeStyles {
  */
 export function getThemeStyles(theme: ColorTheme, isDark: boolean): ThemeStyles {
   const borderColor = theme.border;
-  const backgroundColor = theme.background || (isDark ? "transparent" : "transparent");
+
+  // In light mode, use a very light tint with low opacity
+  // In dark mode, keep existing behavior (transparent or theme background)
+  const backgroundColor = isDark
+    ? theme.background || "transparent"
+    : colorToRgba(theme.primary, 0.1); // 10% opacity for subtle tint in light mode
 
   // For hover, brighten the primary color slightly
   const hoverColor = adjustColorBrightness(theme.primary, isDark ? 20 : -10);
@@ -90,6 +95,17 @@ export function getThemeStyles(theme: ColorTheme, isDark: boolean): ThemeStyles 
     hoverColor,
     activeColor,
   };
+}
+
+/**
+ * Convert hex color to rgba with specified opacity
+ */
+function colorToRgba(color: string, opacity: number): string {
+  const hex = color.replace("#", "");
+  const r = Number.parseInt(hex.substring(0, 2), 16);
+  const g = Number.parseInt(hex.substring(2, 4), 16);
+  const b = Number.parseInt(hex.substring(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`;
 }
 
 /**

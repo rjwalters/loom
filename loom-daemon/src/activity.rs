@@ -127,6 +127,7 @@ pub struct TokenUsage {
 /// Combined activity entry (input + output)
 /// Used for displaying terminal activity history in UI
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivityEntry {
     pub input_id: i64,
     pub timestamp: DateTime<Utc>,

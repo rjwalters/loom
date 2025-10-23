@@ -4,18 +4,6 @@
   "terminals": [
     {
       "id": "terminal-1",
-      "name": "Architect",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "architect.md",
-        "targetInterval": 900000,
-        "intervalPrompt": "First triage any unlabeled issues. If none exist, scan codebase and create new improvement suggestions across features, docs, quality, CI, and security"
-      },
-      "theme": "lavender"
-    },
-    {
-      "id": "terminal-2",
       "name": "Curator",
       "role": "claude-code-worker",
       "roleConfig": {
@@ -25,90 +13,6 @@
         "intervalPrompt": "Find unlabeled issues and enhance with implementation details"
       },
       "theme": "ocean"
-    },
-    {
-      "id": "terminal-3",
-      "name": "Guide",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "guide.md",
-        "targetInterval": 900000,
-        "intervalPrompt": "Review all loom:ready issues and update loom:urgent labels to reflect current top 3 priorities"
-      },
-      "theme": "indigo"
-    },
-    {
-      "id": "terminal-4",
-      "name": "Judge",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "codex",
-        "roleFile": "judge.md",
-        "targetInterval": 300000,
-        "intervalPrompt": "Find and review PRs with loom:review-requested label"
-      },
-      "theme": "rose"
-    },
-    {
-      "id": "terminal-5",
-      "name": "Builder 1",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "builder.md",
-        "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
-      },
-      "theme": "forest"
-    },
-    {
-      "id": "terminal-6",
-      "name": "Builder 2",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "builder.md",
-        "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
-      },
-      "theme": "forest"
-    },
-    {
-      "id": "terminal-7",
-      "name": "Healer",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "healer.md",
-        "targetInterval": 300000,
-        "intervalPrompt": "Check for PRs with changes requested: gh pr list --label=\"loom:changes-requested\" --state=open. Address feedback, run pnpm check:ci, and update labels to loom:review-requested"
-      },
-      "theme": "amber"
-    },
-    {
-      "id": "terminal-8",
-      "name": "Hermit",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "hermit.md",
-        "targetInterval": 900000,
-        "intervalPrompt": "Analyze the codebase for opportunities to simplify, remove bloat, or eliminate unnecessary complexity. Create a GitHub issue with loom:hermit label if you find something concrete"
-      },
-      "theme": "gray"
-    },
-    {
-      "id": "terminal-9",
-      "name": "Builder 3",
-      "role": "claude-code-worker",
-      "roleConfig": {
-        "workerType": "claude",
-        "roleFile": "builder.md",
-        "targetInterval": 60000,
-        "intervalPrompt": "Find and implement loom:ready issues"
-      },
-      "theme": "crimson"
     }
   ]
 }

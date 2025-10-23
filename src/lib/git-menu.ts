@@ -203,7 +203,7 @@ export async function openBranchListDialog(workspacePath: string): Promise<void>
           ${branches
             .map(
               (branch) => `
-            <div class="border border-gray-200 dark:border-gray-700 rounded-md p-3 ${branch.is_current ? "bg-blue-50 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800" : "hover:bg-gray-50 dark:hover:bg-gray-700/50"}">
+            <div class="border border-gray-200 dark:border-gray-700 rounded-md p-3 ${branch.is_current ? "bg-blue-100 dark:bg-blue-900/20 border-blue-200 dark:border-blue-800" : "hover:bg-gray-100 dark:hover:bg-gray-700/50"}">
               <div class="flex items-start justify-between">
                 <div class="flex-1">
                   <div class="flex items-center space-x-2">

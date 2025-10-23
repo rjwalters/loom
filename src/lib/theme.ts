@@ -7,6 +7,24 @@ export function initTheme(): void {
 }
 
 export function toggleTheme(): void {
+  const wasDark = document.documentElement.classList.contains("dark");
   const isDark = document.documentElement.classList.toggle("dark");
-  localStorage.setItem("theme", isDark ? "dark" : "light");
+  const newTheme = isDark ? "dark" : "light";
+  localStorage.setItem("theme", newTheme);
+
+  // Update theme icon
+  const icon = document.getElementById("theme-icon");
+  if (icon) {
+    icon.textContent = isDark ? "☀️" : "🌙";
+  }
+
+  // Update xterm terminal themes
+  import("./terminal-manager")
+    .then(({ getTerminalManager }) => {
+      const manager = getTerminalManager();
+      manager.updateAllThemes(isDark);
+    })
+    .catch(() => {
+      // Silently fail - terminal themes are not critical
+    });
 }

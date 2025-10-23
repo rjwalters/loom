@@ -31,6 +31,8 @@ export interface AppLevelState {
   currentAttachedTerminalId: string | null;
   /** Drag and drop state */
   dragState: DragState;
+  /** Whether user is actively editing (skip re-renders during edits) */
+  isUserEditing: boolean;
 }
 
 /**
@@ -47,6 +49,7 @@ export const appLevelState: AppLevelState = {
     dropInsertBefore: false,
     isDragging: false,
   },
+  isUserEditing: false,
 };
 
 /**
