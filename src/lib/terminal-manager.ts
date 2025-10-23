@@ -622,6 +622,57 @@ export class TerminalManager {
       logger.error("Failed to resize tmux session", error, { terminalId, cols, rows });
     });
   }
+
+  /**
+   * Export terminal output as plain text
+   * @param terminalId - Terminal ID to export
+   * @returns Blob containing plain text output
+   */
+  async exportAsText(terminalId: string): Promise<Blob> {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      throw new Error(`Terminal ${terminalId} not found`);
+    }
+
+    // Get all lines from terminal buffer
+    const terminal = managed.terminal;
+    const buffer = terminal.buffer.active;
+    const lines: string[] = [];
+
+    for (let i = 0; i < buffer.length; i++) {
+      const line = buffer.getLine(i);
+      if (line) {
+        lines.push(line.translateToString(true));
+      }
+    }
+
+    const content = lines.join("\n");
+    return new Blob([content], { type: "text/plain" });
+  }
+
+  /**
+   * Helper to trigger file download from blob
+   * @param blob - Blob to download
+   * @param filename - Suggested filename
+   */
+  private downloadBlob(blob: Blob, filename: string): void {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  /**
+   * Export terminal and trigger download
+   * @param terminalId - Terminal ID to export
+   */
+  async exportAndDownload(terminalId: string): Promise<void> {
+    const blob = await this.exportAsText(terminalId);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    this.downloadBlob(blob, `terminal-${terminalId}-${timestamp}.txt`);
+  }
 }
 
 // Singleton instance
