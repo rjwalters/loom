@@ -53,24 +53,22 @@ EOF
 
 info "Creating installation issue..."
 
-# Create issue and capture the output
+# Create issue and capture the URL
 # NOTE: Don't add label during creation - labels are synced in Step 5
-GH_OUTPUT=$(gh issue create \
+ISSUE_URL=$(gh issue create \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
-  --body "$ISSUE_BODY" 2>&1)
+  --body "$ISSUE_BODY" 2>&1 | grep -oE 'https://github\.com/[^[:space:]]+/issues/[0-9]+' | head -1 | tr -d '\n\r')
 
-# Extract URL from output (gh CLI outputs the issue URL)
-ISSUE_URL=$(echo "$GH_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/issues/[0-9]+' | head -1 | tr -d '\n\r')
-
+# Validate URL was created
 if [[ -z "$ISSUE_URL" ]]; then
-  echo "Error: Failed to extract issue URL from gh output:" >&2
-  echo "$GH_OUTPUT" >&2
+  echo "Error: Failed to create issue or extract issue URL" >&2
   exit 1
 fi
 
-# Extract issue number from URL (last sequence of digits)
+# Extract issue number from URL
 ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$' | head -1 | tr -d '\n\r')
 
+# Validate issue number
 if [[ -z "$ISSUE_NUMBER" ]] || [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "Error: Failed to extract valid issue number from URL: $ISSUE_URL" >&2
   exit 1
@@ -80,7 +78,7 @@ success "Created issue #${ISSUE_NUMBER}"
 
 # Try to add loom:building label if it exists (graceful failure if label doesn't exist yet)
 info "Adding loom:building label..."
-if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" 2>/dev/null; then
+if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" >/dev/null 2>&1; then
   success "Added loom:building label"
 else
   info "Label will be added after label sync (Step 5)"
