@@ -42,16 +42,82 @@ gh pr list --label="loom:changes-requested" --state=open --json number,title,lab
   | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
 ```
 
-### Other PRs Needing Attention
+### Priority 3: Unlabeled PRs (Fallback Queue)
 
-**Find PRs with merge conflicts (any label):**
+If no Priority 1 or 2 work exists, proactively maintain unlabeled PRs to maximize utilization.
+
+**Find unlabeled PRs:**
 ```bash
-gh pr list --state=open --search "is:open conflicts:>0"
+gh pr list --state=open --json number,title,labels \
+  --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number): \(.title)"'
 ```
 
-**Find all open PRs:**
+**Fallback mode behavior**:
+- ✅ DO review the PR for issues (merge conflicts, failing CI, outdated branches)
+- ✅ DO fix problems found
+- ❌ DO NOT add workflow labels (`loom:changes-requested`, `loom:review-requested`)
+- ✅ DO add a comment explaining what was fixed
+
+**Why lowest priority?**
+- These are likely external contributor PRs outside the Loom workflow
+- Respect their workflow by not adding labels
+- Still provide value by catching conflicts and CI failures early
+
+**Example fallback workflow:**
 ```bash
-gh pr list --state=open
+# Check primary queues first
+PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number | jq 'length')
+PRIORITY_2=$(gh pr list --label="loom:changes-requested" --state=open --json number | jq 'length')
+
+if [ "$PRIORITY_1" -eq 0 ] && [ "$PRIORITY_2" -eq 0 ]; then
+  echo "No labeled work, checking fallback queue..."
+
+  UNLABELED_PR=$(gh pr list --state=open --json number,labels \
+    --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
+    | head -n 1)
+
+  if [ -n "$UNLABELED_PR" ]; then
+    echo "Checking health of unlabeled PR #$UNLABELED_PR"
+    gh pr checkout $UNLABELED_PR
+
+    # Check for merge conflicts
+    if git merge-tree origin/main | grep -q "^+<<<<<<<"; then
+      # Resolve conflicts
+      git fetch origin main
+      git rebase origin/main
+      # ... resolve conflicts ...
+      git push --force-with-lease
+
+      # Comment but don't add labels
+      gh pr comment $UNLABELED_PR --body "🔧 Fixed merge conflicts with main branch."
+    fi
+  else
+    echo "No work available - all queues empty"
+  fi
+fi
+```
+
+**Decision tree:**
+```
+Healer iteration starts
+    ↓
+Search Priority 1 (loom:pr + conflicts)
+    ↓
+    ├─→ Found? → Fix conflicts, update labels
+    │
+    └─→ None found
+            ↓
+        Search Priority 2 (loom:changes-requested)
+            ↓
+            ├─→ Found? → Address feedback, update labels
+            │
+            └─→ None found
+                    ↓
+                Search Priority 3 (unlabeled PRs)
+                    ↓
+                    ├─→ Found? → Fix issues, comment only (no labels)
+                    │
+                    └─→ None found → No work available, exit iteration
 ```
 
 ## Exception: Explicit User Instructions
