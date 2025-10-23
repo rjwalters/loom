@@ -101,7 +101,7 @@ import {
 // NOTE: handleWorkspacePathInput is a local wrapper that calls handleWorkspacePathInputCore from src/lib/workspace-lifecycle.ts
 
 // Logger will be initialized in async IIFE after Tauri IPC is ready
-let logger: ReturnType<typeof Logger.forComponent> | undefined;
+let logger = undefined as ReturnType<typeof Logger.forComponent> | undefined;
 
 // Initialize theme
 initTheme();
@@ -428,8 +428,8 @@ state.onChange(render);
 if (!eventListenersRegistered) {
   logger?.info("Registering event listeners (first time only)");
 
-  // Render immediately so users see the loading screen before async init
-  render();
+  // NOTE: Initial render is now done in the async IIFE after logger is initialized
+  // render(); // Commented out - causes "Cannot access uninitialized variable" error
   eventListenersRegistered = true;
 
   // Listen for CLI workspace argument from Rust backend
