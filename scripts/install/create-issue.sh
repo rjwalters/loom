@@ -53,15 +53,28 @@ EOF
 
 info "Creating installation issue..."
 
-# Create issue and capture the URL from output
-# (Compatible with older gh CLI versions that don't support --json)
+# Create issue and capture the output
 # NOTE: Don't add label during creation - labels are synced in Step 5
-ISSUE_URL=$(gh issue create \
+GH_OUTPUT=$(gh issue create \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
-  --body "$ISSUE_BODY" 2>&1 | grep -o 'https://[^ ]*' | head -1)
+  --body "$ISSUE_BODY" 2>&1)
 
-# Extract issue number from URL
-ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -o '[0-9]\+$')
+# Extract URL from output (gh CLI outputs the issue URL)
+ISSUE_URL=$(echo "$GH_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/issues/[0-9]+' | head -1 | tr -d '\n\r')
+
+if [[ -z "$ISSUE_URL" ]]; then
+  echo "Error: Failed to extract issue URL from gh output:" >&2
+  echo "$GH_OUTPUT" >&2
+  exit 1
+fi
+
+# Extract issue number from URL (last sequence of digits)
+ISSUE_NUMBER=$(echo "$ISSUE_URL" | grep -oE '[0-9]+$' | head -1 | tr -d '\n\r')
+
+if [[ -z "$ISSUE_NUMBER" ]] || [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
+  echo "Error: Failed to extract valid issue number from URL: $ISSUE_URL" >&2
+  exit 1
+fi
 
 success "Created issue #${ISSUE_NUMBER}"
 
@@ -74,4 +87,4 @@ else
 fi
 
 # Output the issue number (stdout, so it can be captured by caller)
-echo "$ISSUE_NUMBER"
+printf "%s" "$ISSUE_NUMBER"

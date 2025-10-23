@@ -108,4 +108,4 @@ success "Branch name: $BRANCH_NAME"
 
 # Output the worktree path, branch name, and base branch (stdout, so it can be captured by caller)
 # Format: WORKTREE_PATH|BRANCH_NAME|BASE_BRANCH
-echo "${WORKTREE_PATH}|${BRANCH_NAME}|${BASE_BRANCH}"
+printf "%s|%s|%s" "${WORKTREE_PATH}" "${BRANCH_NAME}" "${BASE_BRANCH}"

@@ -125,14 +125,16 @@ PR_OUTPUT=$(gh pr create \
   --body "$PR_BODY" \
   --label "loom:review-requested" 2>&1)
 
-# Extract URL from output (last line that contains https://)
-PR_URL=$(echo "$PR_OUTPUT" | grep -o 'https://[^ ]*' | tail -1)
+# Extract URL from output (gh CLI outputs the PR URL)
+PR_URL=$(echo "$PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '\n\r')
 
-if [[ -z "$PR_URL" ]]; then
-  error "Failed to extract PR URL from gh output"
+if [[ -z "$PR_URL" ]] || [[ ! "$PR_URL" =~ ^https:// ]]; then
+  echo "Error: Failed to extract valid PR URL from gh output:" >&2
+  echo "$PR_OUTPUT" >&2
+  exit 1
 fi
 
 success "Pull request created: $PR_URL"
 
 # Output the PR URL (stdout, so it can be captured by caller)
-echo "$PR_URL"
+printf "%s" "$PR_URL"
