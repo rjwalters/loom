@@ -36,7 +36,5 @@ Complete **ONE** PR review per iteration.
 ## Label Workflow
 
 Follow label-based coordination (ADR-0006):
-- PRs: `loom:review-requested` → `loom:pr` (if approved) or `loom:changes-requested` (if changes needed)
+- PRs: `loom:review-requested` → `loom:pr` (if approved) or keep label (if changes requested)
 - After approval, ready for maintainer merge
-
-**IMPORTANT**: Never use `gh pr review --approve/--request-changes`. These commands fail for self-authored PRs. Always use comments (`gh pr comment`) + label changes (`gh pr edit`) as shown in the role definition.
