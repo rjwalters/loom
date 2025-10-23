@@ -313,7 +313,7 @@ echo ""
 # Now that labels are synced, ensure the tracking issue has the loom:building label
 info "Ensuring tracking issue has loom:building label..."
 cd "$TARGET_PATH"
-if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" 2>/dev/null; then
+if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" >/dev/null 2>&1; then
   success "Added loom:building label to issue #${ISSUE_NUMBER}"
 else
   warning "Could not add loom:building label to issue #${ISSUE_NUMBER}"
@@ -332,11 +332,15 @@ if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
   error "Installation script not found: create-pr.sh"
 fi
 
-PR_URL=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER" "$BASE_BRANCH") || \
+PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER" "$BASE_BRANCH") || \
   error "Failed to create pull request"
 
+# Extract just the URL from the output in case there's any extra content
+# This handles cases where gh or other commands leak output to stdout
+PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+
 # Check if installation was already complete (no changes needed)
-if [[ "$PR_URL" == "NO_CHANGES_NEEDED" ]]; then
+if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   info "Loom is already installed - cleaning up..."
 
   # Close the tracking issue

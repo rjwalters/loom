@@ -117,24 +117,28 @@ See \`.loom/CLAUDE.md\` for complete usage details.
 EOF
 )
 
-# Create pull request
-# Output goes to stderr so it doesn't interfere with URL capture
-PR_OUTPUT=$(gh pr create \
+# Create pull request and capture the URL
+# Redirect stderr to stdout to capture the full output, then extract the URL
+GH_PR_OUTPUT=$(gh pr create \
   --base "$BASE_BRANCH" \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$PR_BODY" \
   --label "loom:review-requested" 2>&1)
 
-# Extract URL from output (gh CLI outputs the PR URL)
-PR_URL=$(echo "$PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '\n\r')
+# Extract URL from output (gh CLI outputs the PR URL as the last line)
+PR_URL=$(echo "$GH_PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
 
-if [[ -z "$PR_URL" ]] || [[ ! "$PR_URL" =~ ^https:// ]]; then
-  echo "Error: Failed to extract valid PR URL from gh output:" >&2
-  echo "$PR_OUTPUT" >&2
+# Validate the URL
+if [[ -z "$PR_URL" ]] || [[ ! "$PR_URL" =~ ^https://github\.com/[^[:space:]]+/pull/[0-9]+$ ]]; then
+  echo "Error: Failed to create PR or invalid URL returned" >&2
+  echo "gh output was:" >&2
+  echo "$GH_PR_OUTPUT" >&2
   exit 1
 fi
 
 success "Pull request created: $PR_URL"
 
 # Output the PR URL (stdout, so it can be captured by caller)
+# Use exec to ensure we're writing directly to FD 1 without any buffering issues
+exec 1>&1  # Ensure FD 1 is stdout
 printf "%s" "$PR_URL"
