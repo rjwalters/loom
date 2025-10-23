@@ -1,5 +1,5 @@
-import { ask } from "@tauri-apps/api/dialog";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
@@ -114,7 +114,7 @@ async function initializeNewWorkspace(
       `Continue?`,
     {
       title: "Initialize Loom in this workspace?",
-      type: "info",
+      kind: "info",
     }
   );
 

@@ -246,7 +246,7 @@ export async function showTerminalSettingsModal(
   const workspacePath = state.getWorkspace();
   if (workspacePath) {
     try {
-      const { invoke } = await import("@tauri-apps/api/tauri");
+      const { invoke } = await import("@tauri-apps/api/core");
       const roleFiles = await invoke<string[]>("list_role_files", { workspacePath });
 
       const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
@@ -359,7 +359,7 @@ export async function showTerminalSettingsModal(
     });
 
     try {
-      const { invoke } = await import("@tauri-apps/api/tauri");
+      const { invoke } = await import("@tauri-apps/api/core");
       const metadataJson = await invoke<string | null>("read_role_metadata", {
         workspacePath,
         filename: selectedFile,
@@ -512,7 +512,7 @@ async function applySettings(
             const { launchAgentInTerminal } = await import("./agent-launcher");
 
             // Load role metadata to get git identity
-            const { invoke } = await import("@tauri-apps/api/tauri");
+            const { invoke } = await import("@tauri-apps/api/core");
             let gitIdentity: { name: string; email: string } | undefined;
 
             try {

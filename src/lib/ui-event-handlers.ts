@@ -5,7 +5,7 @@
  * These are called dynamically when UI is rendered.
  */
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import type { AppLevelState } from "./app-state";
 import type { setupDragAndDrop } from "./drag-drop-manager";
 import type { HealthMonitor } from "./health-monitor";

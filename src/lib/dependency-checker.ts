@@ -1,5 +1,5 @@
-import { ask } from "@tauri-apps/api/dialog";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 
 interface DependencyStatus {
   tmux_available: boolean;
@@ -85,7 +85,7 @@ export async function checkAndReportDependencies(): Promise<boolean> {
 
   const retry = await ask(message, {
     title: "Missing Dependencies",
-    type: "warning",
+    kind: "warning",
   });
 
   if (retry) {

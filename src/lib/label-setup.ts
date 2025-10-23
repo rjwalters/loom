@@ -114,7 +114,7 @@ export async function setupLoomLabels(force = false): Promise<LabelSetupResult> 
 
   // Check if we're in a git repository with a GitHub remote
   try {
-    const { invoke } = await import("@tauri-apps/api/tauri");
+    const { invoke } = await import("@tauri-apps/api/core");
     const hasGitHub = await invoke<boolean>("check_github_remote");
     if (!hasGitHub) {
       throw new Error(
@@ -162,7 +162,7 @@ async function createOrUpdateLabel(
   label: LabelDefinition,
   force: boolean
 ): Promise<"created" | "updated" | "skipped"> {
-  const { invoke } = await import("@tauri-apps/api/tauri");
+  const { invoke } = await import("@tauri-apps/api/core");
 
   // Check if label exists
   const exists = await invoke<boolean>("check_label_exists", {

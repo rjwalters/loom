@@ -7,7 +7,7 @@ import {
 } from "./label-setup";
 
 // Mock Tauri invoke
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -15,7 +15,7 @@ describe("label-setup", () => {
   let invokeMock: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
-    const { invoke } = await import("@tauri-apps/api/tauri");
+    const { invoke } = await import("@tauri-apps/api/core");
     invokeMock = vi.mocked(invoke);
     invokeMock.mockClear();
   });

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getOutputPoller, OutputPoller } from "./output-poller";
 
 // Mock Tauri API
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -11,7 +11,7 @@ vi.mock("./terminal-manager", () => ({
   getTerminalManager: vi.fn(),
 }));
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { getTerminalManager } from "./terminal-manager";
 
 // Helper to assert JSON structured log messages

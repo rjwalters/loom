@@ -1,7 +1,56 @@
 import "./style.css";
-import { ask } from "@tauri-apps/api/dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/tauri";
+import { ask } from "@tauri-apps/plugin-dialog";
+
+// Wait for Tauri to be ready before initializing the app
+// Tries to actually invoke a Tauri command to verify IPC works
+async function waitForTauri(): Promise<void> {
+  const maxAttempts = 30;
+  const delayMs = 200;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      // Try to invoke a simple Tauri command
+      // This will throw if Tauri IPC isn't ready
+      await invoke("get_stored_workspace");
+      console.log(`[Loom] Tauri IPC ready after ${attempt} attempt(s)`);
+
+      // Also test the console logging command specifically
+      try {
+        await invoke("append_to_console_log", { message: "[TEST] Tauri IPC verified\n" });
+        console.log("[Loom] append_to_console_log command verified working");
+      } catch (testError) {
+        console.error("[Loom] append_to_console_log command failed:", testError);
+      }
+
+      return;
+    } catch (error: any) {
+      // Log every attempt to help debug
+      console.log(`[Loom] Tauri wait attempt ${attempt}/${maxAttempts}:`, error);
+
+      // Check if it's a "command not found" error (IPC works but command doesn't exist)
+      // vs an IPC error (Tauri not ready)
+      const errorStr = String(error);
+      if (errorStr.includes("command") || errorStr.includes("not found")) {
+        // IPC is working, just the command might not exist (shouldn't happen but let's be safe)
+        console.log(`[Loom] Tauri IPC ready after ${attempt} attempt(s) (command exists)`);
+        return;
+      }
+
+      // If this is the last attempt, throw error
+      if (attempt === maxAttempts) {
+        const errorMsg = `Tauri IPC not available after ${maxAttempts} attempts (${(maxAttempts * delayMs) / 1000}s)`;
+        console.error(`[Loom] ${errorMsg}`, error);
+        throw new Error(errorMsg);
+      }
+
+      // Wait before next attempt
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 import { initializeApp } from "./lib/app-initializer";
 import { appLevelState } from "./lib/app-state";
 import { saveCurrentConfiguration, setConfigWorkspace } from "./lib/config";
@@ -51,11 +100,8 @@ import {
 
 // NOTE: handleWorkspacePathInput is a local wrapper that calls handleWorkspacePathInputCore from src/lib/workspace-lifecycle.ts
 
-// Initialize console logging to file for MCP access
-initConsoleLogger();
-
-// Create logger for main component
-const logger = Logger.forComponent("main");
+// Logger will be initialized in async IIFE after Tauri IPC is ready
+let logger: ReturnType<typeof Logger.forComponent> | undefined;
 
 // Initialize theme
 initTheme();
@@ -74,41 +120,31 @@ initializeKeyboardNavigation(state);
 // Set up auto-save (saves state 2 seconds after last change)
 state.setAutoSave(async () => {
   if (state.hasWorkspace()) {
-    logger.info("Auto-saving state");
+    // Logger will be initialized in async IIFE
+    if (logger) logger?.info("Auto-saving state");
     await saveCurrentConfiguration(state);
   }
 });
-logger.info("Auto-save enabled (2-second debounce)");
+// logger?.info("Auto-save enabled (2-second debounce)"); // Moved to async IIFE
 
 // Save state immediately on window close (before app quits)
 // Handle both browser beforeunload and Tauri window close events
 window.addEventListener("beforeunload", async () => {
   if (state.hasWorkspace()) {
-    logger.info("Window closing (beforeunload) - saving state immediately");
+    logger?.info("Window closing (beforeunload) - saving state immediately");
     try {
       // Save state synchronously if possible
       await state.saveNow();
-      logger.info("State saved successfully on beforeunload");
+      logger?.info("State saved successfully on beforeunload");
     } catch (error) {
-      logger.error("Failed to save state on beforeunload", error as Error);
+      logger?.error("Failed to save state on beforeunload", error as Error);
     }
   }
 });
 
 // Listen for Tauri window close event (more reliable in Tauri apps)
-listen("tauri://close-requested", async () => {
-  logger.info("Window close requested (Tauri event) - saving state");
-  if (state.hasWorkspace()) {
-    try {
-      await state.saveNow();
-      logger.info("State saved successfully on close-requested");
-    } catch (error) {
-      logger.error("Failed to save state on close-requested", error as Error);
-    }
-  }
-}).catch((error) => {
-  logger.error("Failed to register close-requested listener", error as Error);
-});
+// NOTE: The close-requested listener is registered in the async IIFE below
+// after logger is initialized, since it uses logger
 
 // Get terminal manager, output poller, and health monitor
 const terminalManager = getTerminalManager();
@@ -122,7 +158,7 @@ outputPoller.onActivity((terminalId) => {
 
 // Register error callback for polling failures
 outputPoller.onError((terminalId, errorMessage) => {
-  logger.warn("Terminal encountered fatal errors, marking as error state", {
+  logger?.warn("Terminal encountered fatal errors, marking as error state", {
     terminalId,
     errorMessage,
   });
@@ -139,14 +175,14 @@ outputPoller.onError((terminalId, errorMessage) => {
 
 // Start health monitoring
 healthMonitor.start();
-logger.info("Health monitoring started");
+// logger?.info("Health monitoring started"); // Moved to async IIFE
 
 // Subscribe to health updates to trigger re-renders
 healthMonitor.onHealthUpdate(() => {
   // Trigger a re-render when health status changes
   render();
 });
-logger.info("Subscribed to health monitor updates");
+// logger?.info("Subscribed to health monitor updates"); // Moved to async IIFE
 
 // Update timer displays every second
 window.setInterval(() => {
@@ -157,7 +193,7 @@ window.setInterval(() => {
     render();
   }
 }, 1000);
-logger.info("Timer update interval started");
+// logger?.info("Timer update interval started"); // Moved to async IIFE
 
 // =================================================================
 // EVENT LISTENER DEDUPLICATION
@@ -172,7 +208,7 @@ let eventListenersRegistered = false;
 // =================================================================
 // File watching is now handled by the Rust backend (mcp_watcher.rs) using the notify crate
 // This provides event-driven file watching with 0 CPU usage when idle (vs 120 fs reads/min with polling)
-logger.info("MCP command watcher started in backend (using notify crate)");
+// logger?.info("MCP command watcher started in backend (using notify crate)"); // Moved to async IIFE
 
 // Track which terminals have had their health checked (Phase 3: Debouncing)
 // This prevents redundant health checks during the 1-second render loop
@@ -183,7 +219,7 @@ function render() {
   const hasWorkspace = state.hasWorkspace();
   const isResetting = state.isWorkspaceResetting();
   const isInitializing = state.isAppInitializing();
-  logger.info("Rendering", {
+  logger?.info("Rendering", {
     hasWorkspace,
     displayedWorkspace: state.getDisplayedWorkspace(),
     isResetting,
@@ -255,13 +291,13 @@ async function initializeTerminalDisplay(terminalId: string) {
 
   // Skip placeholder IDs - they're already broken and will show error UI
   if (terminalId === "__unassigned__") {
-    logger.warn("Skipping placeholder terminal ID", { terminalId });
+    logger?.warn("Skipping placeholder terminal ID", { terminalId });
     return;
   }
 
   // Phase 3: Skip health check if already checked (debouncing)
   if (healthCheckedTerminals.has(terminalId)) {
-    logger.info("Terminal already health-checked, skipping redundant check", {
+    logger?.info("Terminal already health-checked, skipping redundant check", {
       terminalId,
       setSize: healthCheckedTerminals.size,
     });
@@ -269,27 +305,27 @@ async function initializeTerminalDisplay(terminalId: string) {
   } else {
     // Check session health before initializing
     try {
-      logger.info("Performing new health check for terminal", {
+      logger?.info("Performing new health check for terminal", {
         terminalId,
         setSizeBefore: healthCheckedTerminals.size,
       });
       const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
-      logger.info("Session health check result", {
+      logger?.info("Session health check result", {
         terminalId,
         hasSession,
       });
 
       if (!hasSession) {
-        logger.warn("Terminal has no tmux session", { terminalId });
+        logger?.warn("Terminal has no tmux session", { terminalId });
 
         // Mark terminal as having missing session (only if not already marked)
         const terminal = state.getTerminal(terminalId);
-        logger.info("Terminal state before update", {
+        logger?.info("Terminal state before update", {
           terminalId,
           missingSession: terminal?.missingSession,
         });
         if (terminal && !terminal.missingSession) {
-          logger.info("Setting missingSession=true for terminal", { terminalId });
+          logger?.info("Setting missingSession=true for terminal", { terminalId });
           state.updateTerminal(terminal.id, {
             status: TerminalStatus.Error,
             missingSession: true,
@@ -298,28 +334,28 @@ async function initializeTerminalDisplay(terminalId: string) {
 
         // Add to checked set even for failures to prevent repeated checks
         healthCheckedTerminals.add(terminalId);
-        logger.info("Added terminal to health-checked set (failed check)", {
+        logger?.info("Added terminal to health-checked set (failed check)", {
           terminalId,
           setSize: healthCheckedTerminals.size,
         });
         return; // Don't create xterm instance - error UI will show instead
       }
 
-      logger.info("Session health check passed, proceeding with xterm initialization", {
+      logger?.info("Session health check passed, proceeding with xterm initialization", {
         terminalId,
       });
 
       // Add to checked set after successful health check (Phase 3: Debouncing)
       healthCheckedTerminals.add(terminalId);
-      logger.info("Added terminal to health-checked set (passed check)", {
+      logger?.info("Added terminal to health-checked set (passed check)", {
         terminalId,
         setSize: healthCheckedTerminals.size,
       });
     } catch (error) {
-      logger.error("Failed to check session health", error, { terminalId });
+      logger?.error("Failed to check session health", error, { terminalId });
       // Add to checked set even on error to prevent retry spam
       healthCheckedTerminals.add(terminalId);
-      logger.info("Added terminal to health-checked set (error during check)", {
+      logger?.info("Added terminal to health-checked set (error during check)", {
         terminalId,
         setSize: healthCheckedTerminals.size,
       });
@@ -331,12 +367,12 @@ async function initializeTerminalDisplay(terminalId: string) {
   const existingManaged = terminalManager.getTerminal(terminalId);
   if (existingManaged) {
     // Terminal exists - just show/hide as needed
-    logger.info("Terminal already exists, using show/hide", { terminalId });
+    logger?.info("Terminal already exists, using show/hide", { terminalId });
 
     // Hide previous terminal (if different)
     const currentAttachedTerminalId = appLevelState.currentAttachedTerminalId;
     if (currentAttachedTerminalId && currentAttachedTerminalId !== terminalId) {
-      logger.info("Hiding previous terminal", {
+      logger?.info("Hiding previous terminal", {
         terminalId: currentAttachedTerminalId,
       });
       terminalManager.hideTerminal(currentAttachedTerminalId);
@@ -344,11 +380,11 @@ async function initializeTerminalDisplay(terminalId: string) {
     }
 
     // Show current terminal
-    logger.info("Showing terminal", { terminalId });
+    logger?.info("Showing terminal", { terminalId });
     terminalManager.showTerminal(terminalId);
 
     // Resume polling for current terminal
-    logger.info("Resuming polling for terminal", { terminalId });
+    logger?.info("Resuming polling for terminal", { terminalId });
     outputPoller.resumePolling(terminalId);
 
     appLevelState.currentAttachedTerminalId = terminalId;
@@ -356,7 +392,7 @@ async function initializeTerminalDisplay(terminalId: string) {
   }
 
   // Terminal doesn't exist yet - create it
-  logger.info("Creating new terminal", { terminalId });
+  logger?.info("Creating new terminal", { terminalId });
 
   // Wait for DOM to be ready
   setTimeout(() => {
@@ -377,7 +413,7 @@ async function initializeTerminalDisplay(terminalId: string) {
       outputPoller.startPolling(terminalId);
       appLevelState.currentAttachedTerminalId = terminalId;
 
-      logger.info("Created and showing terminal", { terminalId });
+      logger?.info("Created and showing terminal", { terminalId });
     }
   }, 0);
 }
@@ -390,7 +426,7 @@ state.onChange(render);
 
 // Register all event listeners (with deduplication guard)
 if (!eventListenersRegistered) {
-  logger.info("Registering event listeners (first time only)");
+  logger?.info("Registering event listeners (first time only)");
 
   // Render immediately so users see the loading screen before async init
   render();
@@ -399,7 +435,7 @@ if (!eventListenersRegistered) {
   // Listen for CLI workspace argument from Rust backend
   listen("cli-workspace", (event) => {
     const workspacePath = event.payload as string;
-    logger.info("Loading workspace from CLI argument", { workspacePath });
+    logger?.info("Loading workspace from CLI argument", { workspacePath });
     handleWorkspacePathInput(workspacePath);
   });
 
@@ -429,19 +465,19 @@ if (!eventListenersRegistered) {
   });
 
   listen("close-workspace", async () => {
-    logger.info("Closing workspace");
+    logger?.info("Closing workspace");
 
     // Clear stored workspace
     try {
       await invoke("clear_stored_workspace");
-      logger.info("Cleared stored workspace");
+      logger?.info("Cleared stored workspace");
     } catch (error) {
-      logger.error("Failed to clear stored workspace", error);
+      logger?.error("Failed to clear stored workspace", error);
     }
 
     // Clear localStorage workspace (for HMR survival)
     localStorage.removeItem("loom:workspace");
-    logger.info("Cleared localStorage workspace");
+    logger?.info("Cleared localStorage workspace");
 
     // Stop all autonomous intervals and wait for active executions
     const { getAutonomousManager } = await import("./lib/autonomous-manager");
@@ -462,13 +498,13 @@ if (!eventListenersRegistered) {
     // Phase 3: Clear health check tracking when workspace closes
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger.info("Cleared health-checked terminals set", {
+    logger?.info("Cleared health-checked terminals set", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
     });
 
     // Re-render to show workspace picker
-    logger.info("Rendering workspace picker");
+    logger?.info("Rendering workspace picker");
     render();
   });
 
@@ -486,7 +522,7 @@ if (!eventListenersRegistered) {
         "Continue?",
       {
         title: "Start Loom Engine",
-        type: "info",
+        kind: "info",
       }
     );
 
@@ -495,7 +531,7 @@ if (!eventListenersRegistered) {
     // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger.info("Cleared health-checked terminals set (starting workspace)", {
+    logger?.info("Cleared health-checked terminals set (starting workspace)", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
     });
@@ -516,7 +552,7 @@ if (!eventListenersRegistered) {
         render,
         markTerminalsHealthChecked: (terminalIds) => {
           terminalIds.forEach((id) => healthCheckedTerminals.add(id));
-          logger.info("Marked terminals as health-checked", {
+          logger?.info("Marked terminals as health-checked", {
             terminalCount: terminalIds.length,
             setSize: healthCheckedTerminals.size,
           });
@@ -531,12 +567,12 @@ if (!eventListenersRegistered) {
     if (!state.hasWorkspace()) return;
     const workspace = state.getWorkspaceOrThrow();
 
-    logger.info("Starting engine (no confirmation)");
+    logger?.info("Starting engine (no confirmation)");
 
     // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger.info("Cleared health-checked terminals set (force-starting workspace)", {
+    logger?.info("Cleared health-checked terminals set (force-starting workspace)", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
     });
@@ -557,7 +593,7 @@ if (!eventListenersRegistered) {
         render,
         markTerminalsHealthChecked: (terminalIds) => {
           terminalIds.forEach((id) => healthCheckedTerminals.add(id));
-          logger.info("Marked terminals as health-checked", {
+          logger?.info("Marked terminals as health-checked", {
             terminalCount: terminalIds.length,
             setSize: healthCheckedTerminals.size,
           });
@@ -584,7 +620,7 @@ if (!eventListenersRegistered) {
         "Continue with Factory Reset?",
       {
         title: "⚠️ Factory Reset Warning",
-        type: "warning",
+        kind: "warning",
       }
     );
 
@@ -593,7 +629,7 @@ if (!eventListenersRegistered) {
     // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger.info("Cleared health-checked terminals set (factory reset)", {
+    logger?.info("Cleared health-checked terminals set (factory reset)", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
     });
@@ -630,12 +666,12 @@ if (!eventListenersRegistered) {
     if (!state.hasWorkspace()) return;
     const workspace = state.getWorkspaceOrThrow();
 
-    logger.info("Resetting workspace (no confirmation)");
+    logger?.info("Resetting workspace (no confirmation)");
 
     // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger.info("Cleared health-checked terminals set (force factory reset)", {
+    logger?.info("Cleared health-checked terminals set (force factory reset)", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
     });
@@ -671,14 +707,14 @@ if (!eventListenersRegistered) {
   listen("restart-terminal", async (event) => {
     const terminalId = event.payload as string;
     if (!terminalId) {
-      logger.error(
+      logger?.error(
         "Restart terminal event received without terminal ID",
         new Error("Missing terminal ID")
       );
       return;
     }
 
-    logger.info("Restarting terminal via MCP command", { terminalId });
+    logger?.info("Restarting terminal via MCP command", { terminalId });
     await handleRestartTerminal(terminalId, { state, saveCurrentConfig });
   });
 
@@ -707,9 +743,9 @@ if (!eventListenersRegistered) {
     showDaemonStatusDialog();
   });
 
-  logger.info("Event listeners registered successfully");
+  logger?.info("Event listeners registered successfully");
 } else {
-  logger.info("Event listeners already registered, skipping duplicate registration");
+  logger?.info("Event listeners already registered, skipping duplicate registration");
 }
 
 // Show daemon status dialog with reconnect option
@@ -737,12 +773,12 @@ async function showDaemonStatusDialog() {
           `This is useful if you hot-reloaded the frontend and lost connection to terminals.`,
         {
           title: "Daemon Status",
-          type: "info",
+          kind: "info",
         }
       );
 
       if (shouldReconnect) {
-        logger.info("User requested terminal reconnection");
+        logger?.info("User requested terminal reconnection");
         await reconnectTerminalsCore({
           state,
           initializeTerminalDisplay,
@@ -758,14 +794,6 @@ async function showDaemonStatusDialog() {
     showToast(`Failed to get daemon status: ${error}`, "error");
   }
 }
-
-// Initialize app
-initializeApp({
-  state,
-  validateWorkspacePath,
-  handleWorkspacePathInput,
-  render,
-});
 
 // Drag and drop state moved to src/lib/drag-drop-manager.ts
 
@@ -800,16 +828,75 @@ const browseWorkspaceWithCallback = () => browseWorkspace(handleWorkspacePathInp
 // Terminal action handlers are now in src/lib/terminal-actions.ts
 // Recovery handlers are now in src/lib/recovery-handlers.ts
 
-// Set up all event listeners (consolidated in ui-event-handlers.ts)
-setupMainEventListeners({
-  state,
-  render,
-  saveCurrentConfig,
-  terminalManager,
-  outputPoller,
-  healthMonitor,
-  appLevelState,
-  createPlainTerminal,
-  generateNextConfigId,
-  setupDragAndDrop,
-});
+// Wrap initialization in async function that waits for Tauri
+(async () => {
+  try {
+    await waitForTauri();
+    console.log("[Loom] Tauri IPC ready, initializing app...");
+
+    // Now that Tauri IPC is ready, initialize console logging
+    initConsoleLogger();
+
+    // Test console logging immediately
+    console.log("[Loom] Console logger initialized - this should appear in ~/.loom/console.log");
+
+    // Create logger for main component
+    logger = Logger.forComponent("main");
+
+    // Log initialization complete
+    logger?.info("Auto-save enabled (2-second debounce)");
+    logger?.info("Health monitoring started");
+    logger?.info("Subscribed to health monitor updates");
+    logger?.info("Timer update interval started");
+    logger?.info("MCP command watcher started in backend (using notify crate)");
+
+    // Register close-requested listener (needs logger to be initialized)
+    listen("tauri://close-requested", async () => {
+      logger?.info("Window close requested (Tauri event) - saving state");
+      if (state.hasWorkspace()) {
+        try {
+          await state.saveNow();
+          logger?.info("State saved successfully on close-requested");
+        } catch (error) {
+          logger?.error("Failed to save state on close-requested", error as Error);
+        }
+      }
+    }).catch((error) => {
+      logger?.error("Failed to register close-requested listener", error as Error);
+    });
+
+    // Initialize app
+    initializeApp({
+      state,
+      validateWorkspacePath,
+      handleWorkspacePathInput,
+      render,
+    });
+
+    // Set up all event listeners (consolidated in ui-event-handlers.ts)
+    setupMainEventListeners({
+      state,
+      render,
+      saveCurrentConfig,
+      terminalManager,
+      outputPoller,
+      healthMonitor,
+      appLevelState,
+      createPlainTerminal,
+      generateNextConfigId,
+      setupDragAndDrop,
+    });
+  } catch (error) {
+    console.error("[Loom] Failed to initialize:", error);
+    // Show error to user
+    document.body.innerHTML = `
+      <div style="display: flex; align-items: center; justify-content: center; height: 100vh; font-family: system-ui;">
+        <div style="text-align: center;">
+          <h1 style="color: #ef4444;">Failed to Initialize</h1>
+          <p style="color: #6b7280;">${error}</p>
+          <p style="color: #6b7280; font-size: 0.875rem;">Check the console for more details</p>
+        </div>
+      </div>
+    `;
+  }
+})();

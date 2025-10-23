@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { WorkspaceCleanupOptions } from "./workspace-cleanup";
 
 // Mock Tauri API
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -16,7 +16,7 @@ vi.mock("./logger", () => ({
   },
 }));
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
 import { cleanupWorkspace } from "./workspace-cleanup";
 

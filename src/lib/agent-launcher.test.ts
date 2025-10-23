@@ -12,7 +12,7 @@ import {
 } from "./agent-launcher";
 
 // Mock Tauri API
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -34,7 +34,7 @@ vi.mock("./terminal-state-parser", () => ({
   })),
 }));
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { detectTerminalState } from "./terminal-state-parser";
 
 describe("agent-launcher", () => {

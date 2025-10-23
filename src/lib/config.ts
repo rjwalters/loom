@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
 import type { AgentStatus, AppState, ColorTheme, Terminal } from "./state";
 import { TerminalStatus } from "./state";

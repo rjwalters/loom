@@ -5,9 +5,9 @@
  * Shows chronological list of inputs (prompts) and outputs with full details.
  */
 
-import { save } from "@tauri-apps/api/dialog";
-import { writeTextFile } from "@tauri-apps/api/fs";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
+import { save } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 import type { ActivityEntry } from "./state";
 import { showToast } from "./toast";
 
