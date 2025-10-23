@@ -212,9 +212,10 @@ fi
 WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH" "$ISSUE_NUMBER") || \
   error "Failed to create worktree"
 
-# Parse output: WORKTREE_PATH|BRANCH_NAME
+# Parse output: WORKTREE_PATH|BRANCH_NAME|BASE_BRANCH
 WORKTREE_PATH=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f1)
 BRANCH_NAME=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f2)
+BASE_BRANCH=$(echo "$WORKTREE_OUTPUT" | cut -d'|' -f3)
 
 # Validate worktree path format (should be relative path starting with .loom/worktrees/)
 if [[ ! "$WORKTREE_PATH" =~ ^\.loom/worktrees/ ]]; then
@@ -227,6 +228,7 @@ fi
 
 info "Worktree: $WORKTREE_PATH"
 info "Branch: $BRANCH_NAME"
+info "Base branch: $BASE_BRANCH"
 echo ""
 
 # ============================================================================
@@ -330,7 +332,7 @@ if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
   error "Installation script not found: create-pr.sh"
 fi
 
-PR_URL=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER") || \
+PR_URL=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER" "$BASE_BRANCH") || \
   error "Failed to create pull request"
 
 # Check if installation was already complete (no changes needed)
