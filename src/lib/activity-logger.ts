@@ -9,7 +9,7 @@
  * Data is stored in .loom/activity.db (SQLite) within the workspace.
  */
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 
 /**
  * Activity log entry

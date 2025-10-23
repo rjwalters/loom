@@ -8,7 +8,7 @@
  * 3. Tauri storage (persistent)
  */
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
 import type { AppState } from "./state";
 
@@ -29,7 +29,7 @@ export async function checkDependenciesOnStartup(): Promise<boolean> {
   if (!hasAllDependencies) {
     // User chose not to retry, close the app gracefully
     logger.error("Missing dependencies, exiting", new Error("Missing dependencies"));
-    const { exit } = await import("@tauri-apps/api/process");
+    const { exit } = await import("@tauri-apps/plugin-process");
     await exit(1);
     return false;
   }

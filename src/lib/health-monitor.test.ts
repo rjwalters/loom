@@ -4,7 +4,7 @@ import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
 
 // Mock Tauri API
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -22,7 +22,7 @@ vi.mock("./output-poller", () => ({
   getOutputPoller: vi.fn(),
 }));
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { getOutputPoller } from "./output-poller";
 import { getAppState } from "./state";
 

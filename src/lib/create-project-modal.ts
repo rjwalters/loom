@@ -1,6 +1,6 @@
-import { open } from "@tauri-apps/api/dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { homeDir } from "@tauri-apps/api/path";
-import { invoke } from "@tauri-apps/api/tauri";
+import { open } from "@tauri-apps/plugin-dialog";
 import { Logger } from "./logger";
 
 const logger = Logger.forComponent("create-project-modal");

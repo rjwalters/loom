@@ -88,7 +88,7 @@ vi.mock("@xterm/addon-webgl", () => ({
 }));
 
 // Mock Tauri API
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -104,7 +104,7 @@ vi.mock("./state", () => ({
   },
 }));
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "@xterm/xterm";
 import { getAppState, TerminalStatus } from "./state";
 

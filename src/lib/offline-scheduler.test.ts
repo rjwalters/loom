@@ -4,7 +4,7 @@ import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
 
 // Mock Tauri invoke
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
@@ -42,7 +42,7 @@ describe("offline-scheduler", () => {
 
   beforeEach(async () => {
     vi.useFakeTimers();
-    const { invoke } = await import("@tauri-apps/api/tauri");
+    const { invoke } = await import("@tauri-apps/api/core");
     invokeMock = vi.mocked(invoke);
     invokeMock.mockClear();
     invokeMock.mockResolvedValue(undefined);

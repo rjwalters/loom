@@ -1,9 +1,9 @@
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type GitIdentity, setupWorktreeForAgent } from "./worktree-manager";
 
 // Mock Tauri invoke
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 

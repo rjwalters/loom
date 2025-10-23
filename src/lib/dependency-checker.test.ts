@@ -2,16 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { checkAndReportDependencies, getAvailableWorkerTypes } from "./dependency-checker";
 
 // Mock Tauri APIs
-vi.mock("@tauri-apps/api/tauri", () => ({
+vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/dialog", () => ({
+vi.mock("@tauri-apps/plugin-dialog", () => ({
   ask: vi.fn(),
 }));
 
-import { ask } from "@tauri-apps/api/dialog";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 
 describe("dependency-checker", () => {
   beforeEach(() => {

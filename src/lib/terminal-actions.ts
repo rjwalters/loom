@@ -5,8 +5,8 @@
  * restarting terminals, and inline renaming. These are called from event handlers in main.ts.
  */
 
-import { ask } from "@tauri-apps/api/dialog";
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import type { AppLevelState } from "./app-state";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
@@ -284,7 +284,7 @@ export async function closeTerminalWithConfirmation(
   // Ask for confirmation
   const confirmed = await ask(`Are you sure you want to close "${terminal.name}"?`, {
     title: "Close Terminal",
-    type: "warning",
+    kind: "warning",
   });
 
   if (!confirmed) {

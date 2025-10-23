@@ -5,7 +5,7 @@
  * This allows MCP tools to read console output for debugging purposes.
  */
 
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 
 // Store original console methods before overriding
 // biome-ignore lint/suspicious/noConsole: This file intentionally intercepts console methods
@@ -29,7 +29,7 @@ async function writeToConsoleLog(level: string, ...args: unknown[]) {
   const logLine = `[${timestamp}] [${level}] ${message}\n`;
 
   try {
-    await invoke("append_to_console_log", { content: logLine });
+    await invoke("append_to_console_log", { message: logLine });
   } catch (error) {
     // Silent fail - don't want logging errors to break the app
     // Only log to original console if something goes wrong

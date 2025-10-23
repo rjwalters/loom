@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/tauri";
+import { invoke } from "@tauri-apps/api/core";
 import { loadConfig } from "./config";
 import { Logger } from "./logger";
 import { startOfflineScheduler } from "./offline-scheduler";

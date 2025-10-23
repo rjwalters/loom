@@ -241,7 +241,7 @@ export async function readTerminalOutput(
   terminalId: string,
   startByte: number | null = null
 ): Promise<string> {
-  const { invoke } = await import("@tauri-apps/api/tauri");
+  const { invoke } = await import("@tauri-apps/api/core");
 
   interface TerminalOutput {
     output: string; // Base64-encoded
