@@ -6,6 +6,82 @@ import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-settings-modal");
 
+// Role display metadata (maps role file to display info)
+const ROLE_INFO: Record<
+  string,
+  {
+    archetype: string;
+    description: string;
+    workflow: string;
+    cardFile: string;
+  }
+> = {
+  "builder.md": {
+    archetype: "The Magician",
+    description:
+      "Transforms ideas into reality through implementation and testing. Claims loom:issue and creates PRs.",
+    workflow: "Claims loom:issue → implements → tests → creates PR",
+    cardFile: "worker.svg",
+  },
+  "curator.md": {
+    archetype: "The High Priestess",
+    description:
+      "Refines chaos into clarity by enhancing issues with context and acceptance criteria.",
+    workflow: "Finds unlabeled issues → enhances → marks as loom:curated",
+    cardFile: "curator.svg",
+  },
+  "architect.md": {
+    archetype: "The Emperor",
+    description:
+      "Envisions system architecture and creates technical proposals for improvements.",
+    workflow: "Analyzes codebase → creates proposals → marks loom:architect",
+    cardFile: "architect.svg",
+  },
+  "judge.md": {
+    archetype: "Justice",
+    description:
+      "Maintains quality through thorough code review and constructive feedback.",
+    workflow:
+      "Finds loom:review-requested → reviews → approves or requests changes",
+    cardFile: "reviewer.svg",
+  },
+  "hermit.md": {
+    archetype: "The Hermit",
+    description:
+      "Questions assumptions and identifies code simplification opportunities.",
+    workflow: "Analyzes complexity → creates removal proposals → marks loom:hermit",
+    cardFile: "critic.svg",
+  },
+  "doctor.md": {
+    archetype: "The Hanged Man",
+    description:
+      "Heals bugs and addresses PR feedback with patience and alternative perspectives.",
+    workflow: "Finds loom:changes-requested → addresses feedback → updates PR",
+    cardFile: "fixer.svg",
+  },
+  "guide.md": {
+    archetype: "The Star",
+    description:
+      "Illuminates priorities by focusing team energy on critical issues.",
+    workflow: "Reviews backlog → updates priorities → manages loom:urgent label",
+    cardFile: "guide.svg",
+  },
+  "driver.md": {
+    archetype: "The Chariot",
+    description:
+      "Represents human agency and direct control through manual command execution.",
+    workflow: "Plain shell environment for custom tasks and ad-hoc work",
+    cardFile: "driver.svg",
+  },
+  "champion.md": {
+    archetype: "The Sun",
+    description:
+      "Auto-merges safe PRs that pass all safety criteria and quality checks.",
+    workflow: "Finds loom:pr → verifies safety → auto-merges if safe",
+    cardFile: "champion.svg",
+  },
+};
+
 export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
   const modal = document.createElement("div");
   modal.id = "terminal-settings-modal";
@@ -123,6 +199,28 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
               Only installed AI coding agents are shown
             </p>
           </div>
+
+          <!-- Role Preview Panel -->
+          <div id="role-preview" class="mt-6 p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 hidden">
+            <div class="flex gap-4">
+              <!-- Tarot Card -->
+              <div class="flex-shrink-0">
+                <img
+                  id="role-preview-card"
+                  src=""
+                  alt=""
+                  class="w-20 h-32 object-contain"
+                />
+              </div>
+
+              <!-- Role Info -->
+              <div class="flex-1">
+                <h3 id="role-preview-title" class="text-lg font-bold text-gray-900 dark:text-gray-100 mb-1"></h3>
+                <p id="role-preview-description" class="text-sm text-gray-700 dark:text-gray-300 mb-2"></p>
+                <p id="role-preview-workflow" class="text-xs text-gray-600 dark:text-gray-400 font-mono"></p>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Interval Mode Tab -->
@@ -205,6 +303,48 @@ function escapeHtml(text: string): string {
   const div = document.createElement("div");
   div.textContent = text;
   return div.innerHTML;
+}
+
+function updateRolePreview(modal: HTMLElement, roleFile: string): void {
+  const previewPanel = modal.querySelector("#role-preview") as HTMLElement;
+  const cardImg = modal.querySelector(
+    "#role-preview-card"
+  ) as HTMLImageElement;
+  const titleEl = modal.querySelector(
+    "#role-preview-title"
+  ) as HTMLElement;
+  const descEl = modal.querySelector(
+    "#role-preview-description"
+  ) as HTMLElement;
+  const workflowEl = modal.querySelector(
+    "#role-preview-workflow"
+  ) as HTMLElement;
+
+  if (!previewPanel || !roleFile || roleFile === "") {
+    previewPanel?.classList.add("hidden");
+    return;
+  }
+
+  const roleInfo = ROLE_INFO[roleFile];
+  if (!roleInfo) {
+    previewPanel.classList.add("hidden");
+    return;
+  }
+
+  // Show panel
+  previewPanel.classList.remove("hidden");
+
+  // Extract role name from filename (e.g., "builder.md" → "Builder")
+  const roleName =
+    roleFile.replace(".md", "").charAt(0).toUpperCase() +
+    roleFile.replace(".md", "").slice(1);
+
+  // Update content
+  cardImg.src = `/assets/tarot-cards/${roleInfo.cardFile}`;
+  cardImg.alt = `${roleName} - ${roleInfo.archetype}`;
+  titleEl.textContent = `${roleName} - ${roleInfo.archetype}`;
+  descEl.textContent = roleInfo.description;
+  workflowEl.textContent = `Workflow: ${roleInfo.workflow}`;
 }
 
 export async function showTerminalSettingsModal(
@@ -335,6 +475,10 @@ export async function showTerminalSettingsModal(
 
   roleFileSelect?.addEventListener("change", async () => {
     const selectedFile = roleFileSelect.value;
+
+    // Update role preview panel
+    updateRolePreview(modal, selectedFile);
+
     if (!selectedFile || !workspacePath) return;
 
     // Auto-assign theme based on role file
@@ -392,6 +536,11 @@ export async function showTerminalSettingsModal(
       });
     }
   });
+
+  // Initial preview load
+  if (roleFileSelect?.value) {
+    updateRolePreview(modal, roleFileSelect.value);
+  }
 
   // Wire up autonomous checkbox to enable/disable config
   autonomousCheckbox?.addEventListener("change", () => {
