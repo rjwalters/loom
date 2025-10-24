@@ -6,35 +6,35 @@
 
 ## The Touch Typing Transition
 
-When you first learn touch typing, you're slower than hunt-and-peck. Your fingers don't know where the keys are. You make mistakes. You watch your speed drop from 40 WPM to 15 WPM and wonder if you're going backwards.
+When you first learn touch typing, you're slower than hunt-and-peck. Your fingers don't know where the keys are. You watch your speed drop from 40 WPM to 15 WPM and wonder if you're going backwards.
 
-But you're not going backwards—you're building muscle memory that will eventually let you type 80+ WPM without looking.
+But you're not—you're building muscle memory that will eventually let you type 80+ WPM without looking.
 
-**Working with AI through cut-and-paste context control is like learning touch typing.**
-
-Yes, it's slower than hammering commands into Claude Code's terminal. You have to:
+**Cut-and-paste context control is hunt-and-peck typing.** It's slow and manual:
 - Carefully select which context to include
 - Explicitly paste file contents
 - Think about what the model needs to see
 - Manually manage the conversation flow
 
-But this friction is *teaching you something*. You're learning:
+But this friction is *teaching you*:
 - What context actually matters
 - How to state problems clearly
 - How to architect prompts that work
 - The difference between vague and precise
 
-Claude Code is fast, but cut-and-paste gives you **control**. Once you internalize the patterns, you can move back to faster tools with much better instincts about what to ask for and how.
+**Writing effective prompts at the right level of abstraction is touch typing.**
 
-The slowness is temporary. The control is permanent.
+Once you internalize what the model needs and how to communicate intent clearly, you work much faster—automatically, like touch typing. You'll know instinctively what to ask for and how.
+
+The slowness is temporary. The skill is permanent.
 
 ---
 
 ## The Spectrum of Precision
 
-**Claude is actually a very good programmer** and can handle almost anything if you state the problem clearly.
+**Claude is a very good programmer** and can handle almost anything if you state the problem clearly.
 
-Here's a thought experiment: We could instruct an LLM to write code character-by-character:
+Here's a thought experiment: You could instruct an LLM to write code character-by-character:
 ```
 "Write the letter 'f'"
 "Now write 'u'"
@@ -60,15 +60,51 @@ The programmer's new job is to **find the right middle ground**:
 - Leave the *how* flexible (implementation details)
 - Be precise about requirements, vague about syntax
 
-**CSS and visual design is still hard** because feedback loops are slow. You need to *see* it to know if it's right. This isn't an LLM limitation—it's a communication limitation. We're probably explaining visual intent poorly because natural language is imprecise for spatial relationships and aesthetics.
+*Note: CSS and visual design remain hard because you need to see it to judge it. This isn't an LLM limitation—natural language is simply imprecise for spatial relationships and aesthetics.*
+
+---
+
+## Documentation as Memory
+
+When working with AI, **documentation stops being an afterthought and becomes the primary artifact.**
+
+Here's what actually happens when building with Claude Code:
+- 30-50% of the lines you write are documentation
+- You update docs constantly, not at the end
+- The README becomes the AI's working memory
+- CLAUDE.md becomes instructions to your future self
+
+**Because the AI doesn't remember your last session.**
+
+Every new conversation is a blank slate. The only way to preserve context, decisions, and intent across sessions is to write it down:
+
+```markdown
+# API Design Decisions
+
+We use POST for all mutations (not PATCH) because GraphQL conventions...
+Auth tokens go in headers, not query params, because security scanners...
+Error codes follow RFC 7807 because clients need machine-readable errors...
+```
+
+This isn't documentation for documentation's sake. It's **externalizing your working memory** so the next AI session (tomorrow's conversation, next week's bug fix) can pick up exactly where you left off.
+
+**The documents become you.**
+
+When Claude reads `CLAUDE.md`, it's reading your voice, your decisions, your architectural intent. The AI doesn't remember you, but it remembers what you wrote. The documentation literally becomes the continuity of identity across sessions.
+
+**The shift:**
+- Old world: Code is primary, docs are secondary
+- New world: **Docs ARE executable instructions**—they tell the AI what to build and why
+
+You're not writing comments for humans anymore. You're writing memory for machines.
+
+And weirdly, this makes codebases *more* maintainable for humans too. Because clear intent expressed in natural language beats clever code every time.
 
 ---
 
 ## Let Claude Write All the Code
 
-This is a controversial take, but there's logic to it:
-
-**Code written by the same model has semantic consistency with its own latent space.**
+Controversial take: **Code written by the same model has semantic consistency.**
 
 When Claude writes function A and function B:
 - They use similar patterns
@@ -156,9 +192,9 @@ mcp__loom-terminals__list_terminals()
 mcp__loom-logs__read_daemon_log()
 ```
 
-**When Claude writes the code AND can read its own instrumentation:**
+**When Claude writes the code and can read its own instrumentation:**
 - The feedback loop closes
-- Agents can autonomously verify their work  
+- Agents autonomously verify their work
 - Test failures are unambiguous
 - Humans move from "tester/describer" to "architect/goal-setter"
 
@@ -188,8 +224,6 @@ To:
 
 **"Can I specify what I actually want clearly enough?"**
 
-The craft isn't disappearing. It's evolving.
+The craft isn't disappearing. It's evolving. We're becoming **architects of intent** rather than **typists of syntax**.
 
-We're becoming **architects of intent** rather than **typists of syntax**.
-
-And that's exactly where human creativity should be focused.
+And that's exactly where human creativity belongs.
