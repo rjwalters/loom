@@ -111,7 +111,7 @@ The `agents/` directory contains Claude Code subagents that are automatically in
 | **curator** | Enhances issues and marks them as `loom:curated` | Read-only | Sonnet |
 | **architect** | Creates architectural proposals with `loom:architect` | Full (can write docs) | Opus |
 | **hermit** | Identifies bloat and creates simplification issues | Read-only | Sonnet |
-| **healer** | Addresses PR feedback and resolves conflicts | Full (fixes PRs) | Sonnet |
+| **doctor** | Addresses PR feedback and resolves conflicts | Full (fixes PRs) | Sonnet |
 | **guide** | Triages issues and applies `loom:urgent` to top 3 | Read-only | Sonnet |
 | **driver** | General shell environment for ad-hoc tasks | Full | Sonnet |
 
@@ -130,7 +130,7 @@ The `agents/` directory contains Claude Code subagents that are automatically in
 
 **Tool Restrictions**:
 - **Read-only agents** (judge, curator, hermit, guide): Can read code and create issues/comments but cannot modify files
-- **Write-enabled agents** (builder, healer, architect, driver): Can modify files, create commits, and push changes
+- **Write-enabled agents** (builder, doctor, architect, driver): Can modify files, create commits, and push changes
 
 ### Agent Roles in Workflow
 
@@ -143,7 +143,7 @@ The subagents work together following the label-based workflow:
 5. **guide** prioritizes → adds `loom:urgent` to top 3
 6. **builder** implements → creates PR with `loom:review-requested`
 7. **judge** reviews → approves or requests changes
-8. **healer** fixes feedback → transitions back to `loom:review-requested`
+8. **doctor** fixes feedback → transitions back to `loom:review-requested`
 9. **User merges** → issue auto-closes
 
 ### Creating Custom Subagents

@@ -147,9 +147,9 @@ describe("themes", () => {
       expect(getThemeForRole("hermit.md")).toBe("forest");
     });
 
-    // Fixing/healing role → rose (pink)
-    it("should map healer role to rose theme", () => {
-      expect(getThemeForRole("healer.md")).toBe("rose");
+    // Fixing/treating role → rose (pink)
+    it("should map doctor role to rose theme", () => {
+      expect(getThemeForRole("doctor.md")).toBe("rose");
     });
 
     // Leadership/visibility role → sunset (orange)

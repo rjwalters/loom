@@ -148,7 +148,7 @@ export function isDarkMode(): boolean {
  * - Analysis/strategic roles → Purple (lavender) - thoughtful, analytical
  * - Organization/curation → Cyan (ocean) - calm, organizing
  * - Building/implementation → Green (forest) - growth, construction
- * - Fixing/healing → Pink (rose) - gentle care
+ * - Fixing/treating → Pink (rose) - gentle care
  * - Leadership/visibility → Orange (sunset) - energy, prominence
  * - General-purpose → Gray (slate) - neutral, flexible
  */
@@ -165,7 +165,7 @@ export function getThemeForRole(roleFile?: string): string {
     "curator.md": "ocean", // Organization
     "driver.md": "slate", // General-purpose
     "guide.md": "ocean", // Prioritization/organization
-    "healer.md": "rose", // Fixing/healing
+    "doctor.md": "rose", // Fixing/treating
     "hermit.md": "forest", // Simplification
     "judge.md": "lavender", // Code review/analysis
   };

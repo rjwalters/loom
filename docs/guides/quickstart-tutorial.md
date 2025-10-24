@@ -320,7 +320,7 @@ Try these other roles:
 
 - **`/architect`** - Create architectural proposals and design documents
 - **`/hermit`** - Identify code bloat and suggest simplifications
-- **`/healer`** - Fix bugs and maintain existing PRs
+- **`/doctor`** - Fix bugs and maintain existing PRs
 - **`/guide`** - Prioritize and organize the issue backlog
 
 ### Customize Roles

@@ -100,7 +100,7 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Workflow**: Analyzes complexity → creates removal proposals with `loom:hermit`
 - **When to use**: Code simplification, reducing technical debt
 
-**Healer** (Manual, `healer.md`)
+**Doctor** (Manual, `doctor.md`)
 - **Purpose**: Fix bugs and address PR feedback
 - **Workflow**: Claims bug reports or addresses PR comments → fixes → pushes changes
 - **When to use**: Bug fixes, PR maintenance
@@ -137,8 +137,8 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 (created) → loom:curating → loom:curated → loom:issue
            ↑ Curator        ↑ Curator      ↑ Human approves
 
-(bug) → loom:healing → (fixed)
-       ↑ Healer
+(bug) → loom:treating → (fixed)
+       ↑ Doctor
 ```
 
 **PR Lifecycle**:
@@ -162,7 +162,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 - **`loom:issue`**: Issue approved for work, ready for Builder to claim
 - **`loom:building`**: Builder is actively implementing this issue
 - **`loom:curating`**: Curator is actively enhancing this issue
-- **`loom:healing`**: Healer is actively fixing this bug or addressing PR feedback
+- **`loom:treating`**: Doctor is actively fixing this bug or addressing PR feedback
 - **`loom:review-requested`**: PR ready for Judge to review
 - **`loom:pr`**: PR approved by Judge, ready for human to merge
 
@@ -286,7 +286,7 @@ gh pr create --label "loom:review-requested"
 
 1. **Find unlabeled issues**:
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:curating,!loom:healing,!loom:architect,!loom:hermit"
+   gh issue list --label="!loom:issue,!loom:building,!loom:curating,!loom:treating,!loom:architect,!loom:hermit"
    ```
 
 2. **Enhance issue**:

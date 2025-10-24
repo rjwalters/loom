@@ -426,7 +426,7 @@ tree .loom
 #     ├── curator.md
 #     ├── driver.md
 #     ├── guide.md
-#     ├── healer.md
+#     ├── doctor.md
 #     ├── hermit.md
 #     └── judge.md
 ```
@@ -508,7 +508,7 @@ Labels enable workflow coordination between agents. See [WORKFLOWS.md](../../WOR
 
 ### 3. Start Using Agents
 
-#### Manual Mode (Builder, Healer, Driver)
+#### Manual Mode (Builder, Doctor, Driver)
 
 ```bash
 # Launch Claude Code with a role

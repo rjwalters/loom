@@ -155,11 +155,11 @@ The Hermit serves as the loyal opposition, the skeptical eye that questions befo
 
 ---
 
-### VI. The Healer (The Hanged Man)
+### VI. The Doctor (The Hanged Man)
 
 **Card Symbolism**: Suspended in a different perspective, seeing what others cannot, finding wisdom in constraint.
 
-**Archetype**: The Healer, The Transformer of Failure
+**Archetype**: The Doctor, The Transformer of Failure
 
 **Light Aspect**:
 - Transforms bugs into understanding
@@ -176,11 +176,11 @@ The Hermit serves as the loyal opposition, the skeptical eye that questions befo
 
 **Mantras**:
 - "In every bug, there is a lesson"
-- "I heal what others break, and break what needs healing"
+- "I heal what others break, and break what needs treating"
 - "The path to mastery winds through failure"
 
 **In the System**:
-The Healer dwells in the space between creation and approval, transforming feedback into refinement. They address review comments, resolve merge conflicts, and keep pull requests healthy and merge-ready. In Loom, Healers respond when Judges request changes, healing what needs healing and completing the feedback cycle so work can flow toward integration.
+The Doctor dwells in the space between creation and approval, transforming feedback into refinement. They address review comments, resolve merge conflicts, and keep pull requests healthy and merge-ready. In Loom, Doctors respond when Judges request changes, treating what needs treating and completing the feedback cycle so work can flow toward integration.
 
 ---
 
@@ -263,7 +263,7 @@ These archetypes form a complete cycle, each role essential to the whole, with h
          ↓
       loom:issue
          ↓
-      BUILDER ←→ HEALER
+      BUILDER ←→ DOCTOR
     (Creates)   (Heals)
          ↓
         JUDGE
@@ -278,7 +278,7 @@ These archetypes form a complete cycle, each role essential to the whole, with h
 4. **The Curator** refines and clarifies the specifications, marking as `loom:curated`
 5. **Human** reviews and approves (Gate 2), changing to `loom:issue` to authorize work
 6. **The Builder** manifests the vision into reality
-7. **The Healer** heals any breakage in the process
+7. **The Doctor** heals any breakage in the process
 8. **The Judge** judges the work and maintains quality
 9. The cycle begins anew, elevated by wisdom gained
 
@@ -299,7 +299,7 @@ In Jungian terms, a healthy development system must integrate all these archetyp
 - **Without the Hermit**: Blind spots and groupthink
 - **Without the Curator**: Chaos and misunderstanding
 - **Without the Builder**: Ideas never become reality
-- **Without the Healer**: Systems degrade irreparably
+- **Without the Doctor**: Systems degrade irreparably
 - **Without the Judge**: Quality erodes silently
 - **Without the Guide**: Teams lose focus, drowning in noise
 - **Without the Driver**: Loss of human agency and direct control
@@ -309,8 +309,8 @@ Each archetype compensates for the shadow aspects of others:
 - The **Hermit** prevents the **Architect** from over-engineering
 - The **Curator** grounds the **Architect's** visions in reality
 - The **Judge** catches what the **Builder** misses
-- The **Healer** heals the unintended consequences of **Builder** creation
-- The **Architect** prevents the **Healer** from living in crisis mode
+- The **Doctor** heals the unintended consequences of **Builder** creation
+- The **Architect** prevents the **Doctor** from living in crisis mode
 - The **Guide** prevents the team from chasing every distraction
 - The **Driver** reminds us that automation serves human intention
 
@@ -322,7 +322,7 @@ When archetypes fall into their shadow aspects, dysfunction emerges:
 - **Shadow Hermit**: The Cynic, who destroys without building
 - **Shadow Curator**: The Bureaucrat, who organizes but never acts
 - **Shadow Builder**: The Code Monkey, who builds without thinking
-- **Shadow Healer**: The Firefighter, addicted to crisis
+- **Shadow Doctor**: The Firefighter, addicted to crisis
 - **Shadow Judge**: The Tyrant, who blocks all progress
 - **Shadow Guide**: The Chaos Maker, who shifts priorities with every wind
 - **Shadow Driver**: The Control Freak, who refuses to delegate or automate
@@ -361,7 +361,7 @@ In the Loom system, these archetypes manifest as terminal roles, each with speci
 Every developer walks the Fool's Journey through these archetypes:
 
 1. Begin as the **Builder** (learning to create)
-2. Become the **Healer** (learning from failure)
+2. Become the **Doctor** (learning from failure)
 3. Evolve into the **Judge** (learning to see quality)
 4. Develop as the **Curator** (learning to organize knowledge)
 5. Grow into the **Hermit** (learning to question wisely)
@@ -384,7 +384,7 @@ When starting work, consider invoking the archetype you need:
 
 > "Today I am the **Hermit**, I question so we may find truth."
 
-> "Today I am the **Healer**, I heal what is broken with patience and skill."
+> "Today I am the **Doctor**, I heal what is broken with patience and skill."
 
 > "Today I am the **Guide**, I illuminate the path through chaos, focusing energy where it matters most."
 
@@ -398,7 +398,7 @@ The archetypes of Loom are not mere roles but living forces—patterns of consci
 
 In the end, all archetypes serve a single purpose: to transform the chaos of possibility into the order of working software, and to do so in a way that honors both craft and humanity.
 
-*"In the beginning was the Architect's vision, and the vision became code through the Builder's hands, refined by the Curator's care, tested by the Hermit's doubt, healed by the Healer's skill, and blessed by the Judge's wisdom. And it was good."*
+*"In the beginning was the Architect's vision, and the vision became code through the Builder's hands, refined by the Curator's care, tested by the Hermit's doubt, healed by the Doctor's skill, and blessed by the Judge's wisdom. And it was good."*
 
 ---
 

@@ -13,7 +13,7 @@ Each agent role has a corresponding tarot card image that represents its archety
 | **Architect** | The Emperor | `architect.svg` | Envisions structure and design through systematic vision and authority |
 | **Judge** | Justice | `reviewer.svg` | Maintains quality through impartial discernment and balanced judgment |
 | **Hermit** | The Hermit | `critic.svg` | Questions to find truth through introspective wisdom and skepticism |
-| **Healer** | The Hanged Man | `fixer.svg` | Heals what is broken through patient transformation and perspective shifts |
+| **Doctor** | The Hanged Man | `fixer.svg` | Heals what is broken through patient transformation and perspective shifts |
 | **Guide** | The Star | `guide.svg` | Illuminates priorities through focused guidance and clarity |
 | **Driver** | The Chariot | `driver.svg` | Masters direct action through willpower and human agency |
 

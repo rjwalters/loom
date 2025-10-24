@@ -105,12 +105,12 @@ analyze → identify bloat → create removal proposal → loom:hermit → (appr
 - Create simplification proposals
 - Label proposals with `loom:hermit`
 
-#### 6. Healer (The Star)
+#### 6. Doctor (The Star)
 **Mode**: Manual
-**File**: `healer.md`
+**File**: `doctor.md`
 **Purpose**: Fix bugs and maintain health
 
-The Healer brings hope through fixing what's broken. They address bugs, PR feedback, and maintenance tasks.
+The Doctor brings hope through fixing what's broken. They address bugs, PR feedback, and maintenance tasks.
 
 **Workflow**:
 ```
@@ -257,9 +257,9 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 ### Manual Agents
 
-**Builder**, **Healer**, **Driver** require human direction:
+**Builder**, **Doctor**, **Driver** require human direction:
 - Builder: Claim specific issues when ready to implement
-- Healer: Respond to bug reports or PR feedback
+- Doctor: Respond to bug reports or PR feedback
 - Driver: Execute user commands as requested
 
 ## Coordination Examples
