@@ -375,11 +375,8 @@ fi
 PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER" "$BASE_BRANCH") || \
   error "Failed to create pull request"
 
-# Extract just the URL from the output in case there's any extra content
-# This handles cases where gh or other commands leak output to stdout
-PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
-
 # Check if installation was already complete (no changes needed)
+# IMPORTANT: Check this BEFORE trying to parse as URL
 if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   info "Loom is already installed - cleaning up..."
 
@@ -401,6 +398,10 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   echo ""
   exit 0
 fi
+
+# Extract just the URL from the output in case there's any extra content
+# This handles cases where gh or other commands leak output to stdout
+PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
 
 if [[ ! "$PR_URL" =~ ^https:// ]]; then
   error "Invalid PR URL returned: $PR_URL"
