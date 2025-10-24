@@ -38,6 +38,41 @@ export async function checkDependenciesOnStartup(): Promise<boolean> {
 }
 
 /**
+ * Attempt to load workspace if valid
+ *
+ * Validates the workspace path and loads it if valid.
+ * Logs appropriate messages with source context for debugging.
+ *
+ * @param path - Workspace path to validate and load
+ * @param source - Source context for logging (e.g., "CLI", "Tauri storage", "localStorage")
+ * @param deps - Dependencies (validateWorkspacePath, handleWorkspacePathInput, state)
+ * @returns true if workspace was loaded successfully, false if invalid
+ */
+async function tryLoadWorkspace(
+  path: string,
+  source: string,
+  deps: {
+    validateWorkspacePath: (path: string) => Promise<boolean>;
+    handleWorkspacePathInput: (path: string) => Promise<void>;
+    state: AppState;
+  }
+): Promise<boolean> {
+  const { validateWorkspacePath, handleWorkspacePathInput, state } = deps;
+
+  const isValid = await validateWorkspacePath(path);
+
+  if (isValid) {
+    logger.info(`${source} workspace is valid, loading`, { path });
+    await handleWorkspacePathInput(path);
+    state.setInitializing(false);
+    return true;
+  }
+
+  logger.info(`${source} workspace is invalid`, { path });
+  return false;
+}
+
+/**
  * Initialize application
  *
  * Handles app startup sequence:
@@ -58,7 +93,7 @@ export async function initializeApp(deps: {
   handleWorkspacePathInput: (path: string) => Promise<void>;
   render: () => void;
 }): Promise<void> {
-  const { state, validateWorkspacePath, handleWorkspacePathInput, render } = deps;
+  const { state, validateWorkspacePath, handleWorkspacePathInput, render} = deps;
 
   // Set initializing state to show loading UI
   state.setInitializing(true);
@@ -81,12 +116,8 @@ export async function initializeApp(deps: {
       });
       logger.info("Using CLI workspace (takes precedence over stored workspace)");
 
-      // Validate CLI workspace
-      const isValid = await validateWorkspacePath(cliWorkspace);
-      if (isValid) {
-        logger.info("CLI workspace is valid, loading", { cliWorkspace });
-        await handleWorkspacePathInput(cliWorkspace);
-        state.setInitializing(false);
+      // Validate and load CLI workspace
+      if (await tryLoadWorkspace(cliWorkspace, "CLI", { validateWorkspacePath, handleWorkspacePathInput, state })) {
         return; // CLI workspace loaded successfully - skip stored workspace
       }
 
@@ -117,14 +148,8 @@ export async function initializeApp(deps: {
     if (storedPath) {
       logger.info("Found stored workspace", { storedPath, priority: "lowest" });
 
-      // Validate stored workspace is still valid
-      const isValid = await validateWorkspacePath(storedPath);
-
-      if (isValid) {
-        // Load workspace automatically
-        logger.info("Loading stored workspace", { storedPath });
-        await handleWorkspacePathInput(storedPath);
-        state.setInitializing(false);
+      // Validate and load stored workspace
+      if (await tryLoadWorkspace(storedPath, "Tauri storage", { validateWorkspacePath, handleWorkspacePathInput, state })) {
         return;
       }
 
@@ -137,14 +162,8 @@ export async function initializeApp(deps: {
       logger.info("Using localStorage workspace after HMR", {
         localStorageWorkspace,
       });
-      const isValid = await validateWorkspacePath(localStorageWorkspace);
 
-      if (isValid) {
-        logger.info("localStorage workspace is valid, loading", {
-          localStorageWorkspace,
-        });
-        await handleWorkspacePathInput(localStorageWorkspace);
-        state.setInitializing(false);
+      if (await tryLoadWorkspace(localStorageWorkspace, "localStorage", { validateWorkspacePath, handleWorkspacePathInput, state })) {
         return;
       }
 
@@ -162,13 +181,8 @@ export async function initializeApp(deps: {
       logger.info("Tauri storage failed, trying localStorage workspace", {
         localStorageWorkspace,
       });
-      const isValid = await validateWorkspacePath(localStorageWorkspace);
-      if (isValid) {
-        logger.info("localStorage workspace is valid, loading", {
-          localStorageWorkspace,
-        });
-        await handleWorkspacePathInput(localStorageWorkspace);
-        state.setInitializing(false);
+
+      if (await tryLoadWorkspace(localStorageWorkspace, "localStorage (fallback)", { validateWorkspacePath, handleWorkspacePathInput, state })) {
         return;
       }
 
