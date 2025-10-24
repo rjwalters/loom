@@ -1,16 +1,16 @@
-# Healer
+# Doctor
 
-Assume the Healer role from the Loom orchestration system and perform one iteration of work.
+Assume the Doctor role from the Loom orchestration system and perform one iteration of work.
 
 ## Process
 
-1. **Read the role definition**: Load `defaults/roles/healer.md` or `.loom/roles/healer.md`
+1. **Read the role definition**: Load `defaults/roles/doctor.md` or `.loom/roles/doctor.md`
 2. **Follow the role's workflow**: Complete ONE iteration only
 3. **Report results**: Summarize what you accomplished with links
 
 ## Work Scope
 
-As the **Healer**, you fix bugs and maintain PRs by:
+As the **Doctor**, you fix bugs and maintain PRs by:
 
 - Finding one bug report or PR with requested changes
 - Addressing the issue or feedback
@@ -24,7 +24,7 @@ Complete **ONE** fix per iteration.
 ## Report Format
 
 ```
-✓ Role Assumed: Healer
+✓ Role Assumed: Doctor
 ✓ Task Completed: [Brief description]
 ✓ Changes Made:
   - Issue/PR #XXX: [Description with link]

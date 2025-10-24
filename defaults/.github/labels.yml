@@ -25,8 +25,8 @@
   description: Curator is enhancing this issue
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
-- name: loom:healing
-  description: Healer is fixing this bug or addressing PR feedback
+- name: loom:treating
+  description: Doctor is fixing this bug or addressing PR feedback
   color: "F59E0B"  # amber-500 - matches other in-progress states
 
 - name: loom:reviewing

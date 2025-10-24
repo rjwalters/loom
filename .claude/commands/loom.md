@@ -18,7 +18,7 @@ Randomly select and assume an archetypal role from the Loom orchestration system
 - **champion.md** - Evaluate `loom:curated` issues, promote to `loom:issue` or provide feedback
 - **architect.md** - Create architectural proposal issue with `loom:architect` label
 - **hermit.md** - Analyze codebase complexity, create bloat removal issue with `loom:hermit`
-- **healer.md** - Fix bug or address PR feedback, maintain existing PRs
+- **doctor.md** - Fix bug or address PR feedback, maintain existing PRs
 - **guide.md** - Triage batch of issues, update priorities and labels for workflow
 - **driver.md** - Execute direct task or command (plain shell, no specific workflow)
 
@@ -34,7 +34,7 @@ Complete **ONE** meaningful task following the selected role's guidelines, then 
 **Champion**: Evaluate `loom:curated` issues (max 2) → promote to `loom:issue` or provide feedback
 **Architect**: Identify one architectural need → create detailed proposal issue
 **Hermit**: Analyze codebase section → identify bloat → create removal issue
-**Healer**: Fix one bug or address one PR comment → update PR → push changes
+**Doctor**: Fix one bug or address one PR comment → update PR → push changes
 **Guide**: Review issue backlog → update priorities → add/remove labels for batch
 **Driver**: Execute one direct command or task per user instruction
 

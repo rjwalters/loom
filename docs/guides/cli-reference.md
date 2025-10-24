@@ -161,7 +161,7 @@ defaults/
 │   ├── curator.md
 │   ├── driver.md
 │   ├── guide.md
-│   ├── healer.md
+│   ├── doctor.md
 │   ├── hermit.md
 │   └── judge.md
 ├── .claude/              # Claude Code config

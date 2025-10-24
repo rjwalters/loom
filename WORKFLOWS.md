@@ -14,7 +14,7 @@ In Loom, development follows an ancient pattern of archetypal forces working in 
 2. 🔍 **The Hermit** questions → identifies bloat and simplification opportunities (`loom:hermit`)
 3. 📚 **The Curator** refines → enhances and adds `loom:curated` (human then approves with `loom:issue`)
 4. 🔮 **The Worker** manifests → implements and creates PRs (`loom:review-requested`)
-5. 🔧 **The Fixer heals → claims with `loom:healing``, addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
+5. 🔧 **The Fixer heals → claims with `loom:treating``, addresses review feedback (`loom:changes-requested` → `loom:review-requested`)
 6. ⚖️ **The Reviewer** judges → maintains quality through discernment (`loom:pr`)
 
 *Like the Tarot's Major Arcana, each role is essential to the whole. See [Agent Archetypes](docs/philosophy/agent-archetypes.md) for the mystical framework.*
@@ -102,7 +102,7 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 | **Triage** | 15 min | Yes | `loom:issue` | `loom:urgent` (red) |
 | **Worker** | Manual | No | `loom:issue` | `loom:building`, `loom:review-requested` |
 | **Reviewer** | 5 min | Yes | `loom:review-requested` | `loom:changes-requested`, `loom:pr` |
-| **Fixer heals → claims with `loom:healing``, `loom:review-requested` |
+| **Fixer heals → claims with `loom:treating``, `loom:review-requested` |
 | **Issues** | Manual | No | N/A | Well-formatted issues |
 | **Default** | Manual | No | N/A | Plain shell |
 
@@ -120,7 +120,7 @@ See full dependency workflow in [scripts/LABEL_WORKFLOW.md](scripts/LABEL_WORKFL
 
 **Reviewer**: Reviews `loom:review-requested` PRs. Requests changes with `loom:changes-requested`, approves with `loom:pr` (ready for user to merge).
 
-**Fixer heals → claims with `loom:healing``.
+**Fixer heals → claims with `loom:treating``.
 
 ## Essential Commands
 
@@ -163,12 +163,12 @@ gh pr edit 50 --remove-label "loom:review-requested" --add-label "loom:changes-r
 
 ### Fixer Workflow
 
-**Healers prioritize work in the following order:**
+**Doctors prioritize work in the following order:**
 
 ```bash
 # Priority 1 (URGENT): Approved PRs with merge conflicts - BLOCKING
 gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number,title,labels \
-  | jq -r '.[] | select(.labels | all(.name != "loom:healing")) | "#\(.number): \(.title)"'
+  | jq -r '.[] | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
 
 # Priority 2 (NORMAL): PRs with review feedback
 gh pr list --label="loom:changes-requested" --state=open --json number,title,labels \
@@ -231,7 +231,7 @@ gh pr merge 50
 | `loom:curated` | 🟢 Green | Curator | Curator enhanced, awaiting human approval for work |
 | `loom:issue` | 🟢 Green | Human | Human approved, ready for Worker to implement |
 | `loom:building` | 🟡 Amber | Worker | Worker actively implementing |
-| `loom:healing` | 🟡 Amber | Healer | Healer actively fixing bug or addressing feedback |
+| `loom:treating` | 🟡 Amber | Doctor | Doctor actively fixing bug or addressing feedback |
 | `loom:blocked` | 🔴 Red | Any agent | Implementation blocked, needs help |
 | `loom:urgent` | 🔴 Dark Red | Triage | High priority (max 3) |
 
@@ -241,7 +241,7 @@ gh pr merge 50
 |-------|-------|-----------|---------|
 | `loom:review-requested` | 🟢 Green | Worker/Fixer | PR ready for Reviewer |
 | `loom:changes-requested` | 🟡 Amber | Reviewer | PR needs fixes from Fixer |
-| `loom:healing` | 🟡 Amber | Fixer | Fixer actively addressing review feedback |
+| `loom:treating` | 🟡 Amber | Fixer | Fixer actively addressing review feedback |
 | `loom:pr` | 🔵 Blue | Reviewer | Approved PR ready for human to merge |
 
 ## Configuration

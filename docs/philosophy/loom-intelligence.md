@@ -222,13 +222,13 @@ Timeline: 2024-10-18 to 2024-10-20 (2.3 days)
 │  ⚡ 4.2 min | ✅ Success | 47 lines changed
 ├─ [Builder-1] 2:23 PM - Run tests
 │  ⚡ 23 seconds | ❌ Failed (3 tests)
-├─ [Healer-1] 2:25 PM - Fix failing tests
+├─ [Doctor-1] 2:25 PM - Fix failing tests
 │  ⚡ 3.1 min | ✅ Success | 12 lines changed
 ├─ [Builder-1] 2:31 PM - Create PR
 │  ⚡ 18 seconds | ✅ Success
 ├─ [Judge-2] 4:42 PM - Review PR
 │  ⚡ 2.1 min | 🔄 Request changes (CSS issues)
-├─ [Healer-1] 10:05 AM - Address review feedback
+├─ [Doctor-1] 10:05 AM - Address review feedback
 │  ⚡ 5.3 min | ✅ Success | 8 lines changed
 └─ [Judge-2] 10:47 AM - Approve PR
    ⚡ 1.2 min | ✅ Approved

@@ -100,7 +100,7 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Workflow**: Analyzes complexity → creates removal proposals with `loom:hermit`
 - **When to use**: Code simplification, reducing technical debt
 
-**Healer** (Manual, `healer.md`)
+**Doctor** (Manual, `doctor.md`)
 - **Purpose**: Fix bugs and address PR feedback
 - **Workflow**: Claims bug reports or addresses PR comments → fixes → pushes changes
 - **When to use**: Bug fixes, PR maintenance
