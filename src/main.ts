@@ -592,35 +592,20 @@ if (!eventListenersRegistered) {
     );
   });
 
-  // Factory Reset - overwrite config with defaults (with confirmation)
-  listen("factory-reset-workspace", async () => {
+  // Helper function to handle factory reset logic (shared between confirmed and force variants)
+  async function handleFactoryReset(logPrefix: string): Promise<void> {
     if (!state.hasWorkspace()) return;
     const workspace = state.getWorkspaceOrThrow();
 
-    const confirmed = await ask(
-      "⚠️ WARNING: Factory Reset ⚠️\n\n" +
-        "This will:\n" +
-        "• DELETE all terminal configurations\n" +
-        "• OVERWRITE .loom/ with default config\n" +
-        "• Reset all roles to defaults\n" +
-        "• Close all current terminals\n" +
-        "• Recreate 6 default terminals\n\n" +
-        "This action CANNOT be undone!\n\n" +
-        "Continue with Factory Reset?",
-      {
-        title: "⚠️ Factory Reset Warning",
-        kind: "warning",
-      }
-    );
-
-    if (!confirmed) return;
+    logger?.info("Starting factory reset", { source: logPrefix });
 
     // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set (factory reset)", {
+    logger?.info("Cleared health-checked terminals set", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
+      source: logPrefix,
     });
 
     // Set loading state before reset
@@ -642,54 +627,46 @@ if (!eventListenersRegistered) {
             launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
           render,
         },
-        "factory-reset-workspace"
+        logPrefix
       );
     } finally {
       // Clear loading state when done (even if error)
       state.setResettingWorkspace(false);
     }
+  }
+
+  // Factory Reset - overwrite config with defaults (with confirmation)
+  listen("factory-reset-workspace", async () => {
+    if (!state.hasWorkspace()) return;
+
+    const confirmed = await ask(
+      "⚠️ WARNING: Factory Reset ⚠️\n\n" +
+        "This will:\n" +
+        "• DELETE all terminal configurations\n" +
+        "• OVERWRITE .loom/ with default config\n" +
+        "• Reset all roles to defaults\n" +
+        "• Close all current terminals\n" +
+        "• Recreate 6 default terminals\n\n" +
+        "This action CANNOT be undone!\n\n" +
+        "Continue with Factory Reset?",
+      {
+        title: "⚠️ Factory Reset Warning",
+        kind: "warning",
+      }
+    );
+
+    if (!confirmed) return;
+
+    await handleFactoryReset("factory-reset-workspace");
   });
 
   // Force Factory Reset - NO confirmation dialog (for MCP automation)
   listen("force-factory-reset-workspace", async () => {
     if (!state.hasWorkspace()) return;
-    const workspace = state.getWorkspaceOrThrow();
 
     logger?.info("Resetting workspace (no confirmation)");
 
-    // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
-    const previousSize = healthCheckedTerminals.size;
-    healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set (force factory reset)", {
-      previousSize,
-      currentSize: healthCheckedTerminals.size,
-    });
-
-    // Set loading state before reset
-    state.setResettingWorkspace(true);
-
-    try {
-      // Use the workspace reset module (no confirmation)
-      const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
-      await resetWorkspaceToDefaults(
-        workspace,
-        {
-          state,
-          outputPoller,
-          terminalManager,
-          setCurrentAttachedTerminalId: (id) => {
-            appLevelState.currentAttachedTerminalId = id;
-          },
-          launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
-            launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
-          render,
-        },
-        "force-factory-reset-workspace"
-      );
-    } finally {
-      // Clear loading state when done (even if error)
-      state.setResettingWorkspace(false);
-    }
+    await handleFactoryReset("force-factory-reset-workspace");
   });
 
   // Restart Terminal - triggered by MCP command
