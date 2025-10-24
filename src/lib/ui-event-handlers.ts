@@ -510,13 +510,18 @@ export function setupMainEventListeners(deps: {
           return;
         }
 
-        // Create plain terminal
-        createPlainTerminal({
+        // Create plain terminal and open settings modal
+        const newTerminal = await createPlainTerminal({
           state,
           workspacePath: state.getWorkspaceOrThrow(),
           generateNextConfigId,
           saveCurrentConfig,
         });
+
+        // Automatically open settings modal for the newly created terminal
+        if (newTerminal) {
+          showTerminalSettingsModal(newTerminal, state, render);
+        }
         return;
       }
 
