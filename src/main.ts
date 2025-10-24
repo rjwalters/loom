@@ -497,32 +497,21 @@ if (!eventListenersRegistered) {
     render();
   });
 
-  // Start engine - create sessions for existing config (with confirmation)
-  listen("start-workspace", async () => {
+  /**
+   * Helper function to handle workspace start logic
+   * Extracted from duplicate code in start-workspace and force-start-workspace event listeners
+   */
+  async function handleWorkspaceStart(logPrefix: string): Promise<void> {
     if (!state.hasWorkspace()) return;
     const workspace = state.getWorkspaceOrThrow();
 
-    const confirmed = await ask(
-      "This will:\n" +
-        "• Close all current terminal sessions\n" +
-        "• Create new sessions for configured terminals\n" +
-        "• Launch agents as configured\n\n" +
-        "Your configuration will NOT be changed.\n\n" +
-        "Continue?",
-      {
-        title: "Start Loom Engine",
-        kind: "info",
-      }
-    );
-
-    if (!confirmed) return;
-
-    // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
+    // Clear health check tracking when starting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
     healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set (starting workspace)", {
+    logger?.info("Cleared health-checked terminals set", {
       previousSize,
       currentSize: healthCheckedTerminals.size,
+      source: logPrefix,
     });
 
     // Use the workspace start module (reads existing config)
@@ -547,49 +536,39 @@ if (!eventListenersRegistered) {
           });
         },
       },
-      "start-workspace"
+      logPrefix
     );
+  }
+
+  // Start engine - create sessions for existing config (with confirmation)
+  listen("start-workspace", async () => {
+    if (!state.hasWorkspace()) return;
+
+    const confirmed = await ask(
+      "This will:\n" +
+        "• Close all current terminal sessions\n" +
+        "• Create new sessions for configured terminals\n" +
+        "• Launch agents as configured\n\n" +
+        "Your configuration will NOT be changed.\n\n" +
+        "Continue?",
+      {
+        title: "Start Loom Engine",
+        kind: "info",
+      }
+    );
+
+    if (!confirmed) return;
+
+    await handleWorkspaceStart("start-workspace");
   });
 
   // Force Start engine - NO confirmation dialog (for MCP automation)
   listen("force-start-workspace", async () => {
     if (!state.hasWorkspace()) return;
-    const workspace = state.getWorkspaceOrThrow();
 
     logger?.info("Starting engine (no confirmation)");
 
-    // Phase 3: Clear health check tracking when starting workspace (terminals will be recreated)
-    const previousSize = healthCheckedTerminals.size;
-    healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set (force-starting workspace)", {
-      previousSize,
-      currentSize: healthCheckedTerminals.size,
-    });
-
-    // Use the workspace start module (no confirmation)
-    const { startWorkspaceEngine } = await import("./lib/workspace-start");
-    await startWorkspaceEngine(
-      workspace,
-      {
-        state,
-        outputPoller,
-        terminalManager,
-        setCurrentAttachedTerminalId: (id) => {
-          appLevelState.currentAttachedTerminalId = id;
-        },
-        launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
-          launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
-        render,
-        markTerminalsHealthChecked: (terminalIds) => {
-          terminalIds.forEach((id) => healthCheckedTerminals.add(id));
-          logger?.info("Marked terminals as health-checked", {
-            terminalCount: terminalIds.length,
-            setSize: healthCheckedTerminals.size,
-          });
-        },
-      },
-      "force-start-workspace"
-    );
+    await handleWorkspaceStart("force-start-workspace");
   });
 
   // Factory Reset - overwrite config with defaults (with confirmation)
