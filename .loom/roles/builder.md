@@ -822,6 +822,7 @@ EOF
 - Use the TodoWrite tool to plan and track multi-step tasks
 - Run lint, format, and type checks before considering complete
 - **Create PR**: **Use "Closes #123" syntax** (see section above), add `loom:review-requested` label
+- **After PR creation**: Move on to the next `loom:issue` - the Healer agent handles PR review feedback
 - When blocked: Add comment explaining blocker, mark `loom:blocked`
 - Stay focused on assigned issue - create separate issues for other work
 
