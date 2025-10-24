@@ -4,10 +4,12 @@
 # Safely creates and manages git worktrees for agent development
 #
 # Usage:
-#   pnpm worktree <issue-number>           # Create worktree for issue
-#   pnpm worktree <issue-number> <branch>  # Create worktree with custom branch name
-#   pnpm worktree --check                  # Check if currently in a worktree
-#   pnpm worktree --help                   # Show help
+#   pnpm worktree <issue-number>                    # Create worktree for issue
+#   pnpm worktree <issue-number> <branch>           # Create worktree with custom branch name
+#   pnpm worktree --check                           # Check if currently in a worktree
+#   pnpm worktree --json <issue-number>             # Machine-readable output
+#   pnpm worktree --return-to <dir> <issue-number>  # Store return directory
+#   pnpm worktree --help                            # Show help
 
 set -e
 
@@ -72,10 +74,12 @@ Loom Worktree Helper
 This script helps AI agents safely create and manage git worktrees.
 
 Usage:
-  pnpm worktree <issue-number>           Create worktree for issue
-  pnpm worktree <issue-number> <branch>  Create worktree with custom branch
-  pnpm worktree --check                  Check if in a worktree
-  pnpm worktree --help                   Show this help
+  pnpm worktree <issue-number>                    Create worktree for issue
+  pnpm worktree <issue-number> <branch>           Create worktree with custom branch
+  pnpm worktree --check                           Check if in a worktree
+  pnpm worktree --json <issue-number>             Machine-readable JSON output
+  pnpm worktree --return-to <dir> <issue-number>  Store return directory
+  pnpm worktree --help                            Show this help
 
 Examples:
   pnpm worktree 42
@@ -88,6 +92,12 @@ Examples:
 
   pnpm worktree --check
     Shows current worktree status
+
+  pnpm worktree --json 42
+    Output: {"success": true, "worktreePath": "/path/to/.loom/worktrees/issue-42", ...}
+
+  pnpm worktree --return-to $(pwd) 42
+    Creates worktree and stores current directory for later return
 
 Safety Features:
   ✓ Detects if already in a worktree
@@ -125,6 +135,30 @@ if [[ "$1" == "--check" ]]; then
     exit $?
 fi
 
+# Check for --json flag
+JSON_OUTPUT=false
+RETURN_TO_DIR=""
+
+if [[ "$1" == "--json" ]]; then
+    JSON_OUTPUT=true
+    shift
+fi
+
+# Check for --return-to flag
+if [[ "$1" == "--return-to" ]]; then
+    RETURN_TO_DIR="$2"
+    shift 2
+    # Validate return directory exists
+    if [[ ! -d "$RETURN_TO_DIR" ]]; then
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"error": "Return directory does not exist", "returnTo": "'"$RETURN_TO_DIR"'"}'
+        else
+            print_error "Return directory does not exist: $RETURN_TO_DIR"
+        fi
+        exit 1
+    fi
+fi
+
 # Main worktree creation logic
 ISSUE_NUMBER="$1"
 CUSTOM_BRANCH="$2"
@@ -139,44 +173,68 @@ fi
 
 # Check if already in a worktree and automatically handle it
 if check_if_in_worktree; then
-    print_warning "Currently in a worktree, auto-navigating to main workspace..."
-    echo ""
-    get_worktree_info
-    echo ""
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_warning "Currently in a worktree, auto-navigating to main workspace..."
+        echo ""
+        get_worktree_info
+        echo ""
+    fi
 
     # Find the git root (common directory for all worktrees)
     GIT_COMMON_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
     if [[ -z "$GIT_COMMON_DIR" ]]; then
-        print_error "Failed to find git common directory"
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"error": "Failed to find git common directory"}'
+        else
+            print_error "Failed to find git common directory"
+        fi
         exit 1
     fi
 
     # The main workspace is the parent of .git (or the directory containing .git)
     MAIN_WORKSPACE=$(dirname "$GIT_COMMON_DIR")
-    print_info "Found main workspace: $MAIN_WORKSPACE"
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_info "Found main workspace: $MAIN_WORKSPACE"
+    fi
 
     # Change to main workspace
     if cd "$MAIN_WORKSPACE" 2>/dev/null; then
-        print_success "Switched to main workspace"
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_success "Switched to main workspace"
+        fi
 
         # Check if we're on main branch, if not switch to it
         CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
         if [[ "$CURRENT_BRANCH" != "main" ]]; then
-            print_info "Switching from $CURRENT_BRANCH to main branch..."
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_info "Switching from $CURRENT_BRANCH to main branch..."
+            fi
             if git checkout main 2>/dev/null; then
-                print_success "Switched to main branch"
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_success "Switched to main branch"
+                fi
             else
-                print_error "Failed to switch to main branch"
-                print_info "Please manually run: git checkout main"
+                if [[ "$JSON_OUTPUT" == "true" ]]; then
+                    echo '{"error": "Failed to switch to main branch"}'
+                else
+                    print_error "Failed to switch to main branch"
+                    print_info "Please manually run: git checkout main"
+                fi
                 exit 1
             fi
         fi
     else
-        print_error "Failed to change to main workspace: $MAIN_WORKSPACE"
-        print_info "Please manually run: cd $MAIN_WORKSPACE"
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"error": "Failed to change to main workspace", "mainWorkspace": "'"$MAIN_WORKSPACE"'"}'
+        else
+            print_error "Failed to change to main workspace: $MAIN_WORKSPACE"
+            print_info "Please manually run: cd $MAIN_WORKSPACE"
+        fi
         exit 1
     fi
-    echo ""
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        echo ""
+    fi
 fi
 
 # Determine branch name
@@ -211,35 +269,64 @@ fi
 
 # Check if branch already exists
 if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-    print_warning "Branch '$BRANCH_NAME' already exists - reusing it"
-    print_info "To create a new branch instead, use a custom branch name:"
-    echo "  ./.loom/scripts/worktree.sh $ISSUE_NUMBER <custom-branch-name>"
-    echo ""
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_warning "Branch '$BRANCH_NAME' already exists - reusing it"
+        print_info "To create a new branch instead, use a custom branch name:"
+        echo "  ./.loom/scripts/worktree.sh $ISSUE_NUMBER <custom-branch-name>"
+        echo ""
+    fi
 
     CREATE_ARGS=("$WORKTREE_PATH" "$BRANCH_NAME")
 else
     # Create new branch from main
-    print_info "Creating new branch from main"
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_info "Creating new branch from main"
+    fi
     CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "main")
 fi
 
 # Create the worktree
-print_info "Creating worktree..."
-echo "  Path: $WORKTREE_PATH"
-echo "  Branch: $BRANCH_NAME"
-echo ""
+if [[ "$JSON_OUTPUT" != "true" ]]; then
+    print_info "Creating worktree..."
+    echo "  Path: $WORKTREE_PATH"
+    echo "  Branch: $BRANCH_NAME"
+    echo ""
+fi
 
 if git worktree add "${CREATE_ARGS[@]}"; then
-    print_success "Worktree created successfully!"
-    echo ""
-    print_info "Next steps:"
-    echo "  cd $WORKTREE_PATH"
-    echo "  # Do your work..."
-    echo "  git add -A"
-    echo "  git commit -m 'Your message'"
-    echo "  git push -u origin $BRANCH_NAME"
-    echo "  gh pr create"
+    # Get absolute path to worktree
+    ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
+
+    # Store return-to directory if provided
+    if [[ -n "$RETURN_TO_DIR" ]]; then
+        ABS_RETURN_TO=$(cd "$RETURN_TO_DIR" && pwd)
+        echo "$ABS_RETURN_TO" > "$ABS_WORKTREE_PATH/.loom-return-to"
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Stored return directory: $ABS_RETURN_TO"
+        fi
+    fi
+
+    # Output results
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        # Machine-readable JSON output
+        echo '{"success": true, "worktreePath": "'"$ABS_WORKTREE_PATH"'", "branchName": "'"$BRANCH_NAME"'", "issueNumber": '"$ISSUE_NUMBER"', "returnTo": "'"${ABS_RETURN_TO:-}"'"}'
+    else
+        # Human-readable output
+        print_success "Worktree created successfully!"
+        echo ""
+        print_info "Next steps:"
+        echo "  cd $WORKTREE_PATH"
+        echo "  # Do your work..."
+        echo "  git add -A"
+        echo "  git commit -m 'Your message'"
+        echo "  git push -u origin $BRANCH_NAME"
+        echo "  gh pr create"
+    fi
 else
-    print_error "Failed to create worktree"
+    if [[ "$JSON_OUTPUT" == "true" ]]; then
+        echo '{"success": false, "error": "Failed to create worktree"}'
+    else
+        print_error "Failed to create worktree"
+    fi
     exit 1
 fi

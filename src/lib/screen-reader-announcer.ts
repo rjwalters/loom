@@ -47,24 +47,6 @@ export function announce(message: string, priority: "polite" | "assertive" = "po
 }
 
 /**
- * Announce terminal status changes
- */
-export function announceTerminalStatusChange(terminalName: string, status: string): void {
-  announce(`Terminal ${terminalName} is now ${status}`);
-}
-
-/**
- * Announce workspace changes
- */
-export function announceWorkspaceChange(workspacePath: string, loaded: boolean): void {
-  if (loaded) {
-    announce(`Workspace loaded: ${workspacePath}`);
-  } else {
-    announce(`Workspace unloaded`);
-  }
-}
-
-/**
  * Announce terminal selection
  */
 export function announceTerminalSelection(terminalName: string): void {
