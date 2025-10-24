@@ -160,6 +160,127 @@ The worktree helper script prevents common errors:
 
 This on-demand approach prevents worktree clutter and reduces resource usage.
 
+## Working in Tauri App Mode with Terminal Worktrees
+
+When running as an autonomous agent in the Tauri App, you start in a **terminal worktree** (e.g., `.loom/worktrees/terminal-1`), not the main workspace. This provides isolation between multiple autonomous agents.
+
+### Understanding the Two-Level Worktree System
+
+1. **Terminal Worktree** (`.loom/worktrees/terminal-N`): Your "home base" as an autonomous agent
+   - Created automatically when the Tauri App starts your terminal
+   - Persistent across multiple issues
+   - Where you return after completing work
+
+2. **Issue Worktree** (`.loom/worktrees/issue-N`): Temporary workspace for specific issue
+   - Created when you claim an issue
+   - Isolated from other agents' work
+   - Cleaned up after PR is merged
+
+### Tauri App Worktree Workflow
+
+```bash
+# You start in terminal worktree
+pwd
+# → /path/to/repo/.loom/worktrees/terminal-1
+
+# 1. Find and claim issue
+gh issue list --label="loom:issue"
+gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
+
+# 2. Create issue worktree WITH return path
+./.loom/scripts/worktree.sh --return-to $(pwd) 84
+# → Creates: .loom/worktrees/issue-84
+# → Stores return path to terminal-1
+
+# 3. Change to issue worktree
+cd .loom/worktrees/issue-84
+
+# 4. Do your work (implement, test, commit)
+# ... implement feature ...
+git add -A
+git commit -m "Implement feature for issue #84"
+
+# 5. Push and create PR
+git push -u origin feature/issue-84
+gh pr create --label "loom:review-requested" --body "Closes #84"
+
+# 6. Return to terminal worktree
+pnpm worktree:return
+# → Changes back to .loom/worktrees/terminal-1
+# → Ready for next issue!
+
+# 7. Clean up happens automatically when PR is merged
+```
+
+### Machine-Readable Output
+
+For scripting and automation, use the `--json` flag:
+
+```bash
+# Create worktree with JSON output
+RESULT=$(./.loom/scripts/worktree.sh --json --return-to $(pwd) 84)
+echo "$RESULT"
+# → {"success": true, "worktreePath": "/path/to/.loom/worktrees/issue-84", ...}
+
+# Check return path
+pnpm worktree:return --json --check
+# → {"hasReturnPath": true, "returnPath": "/path/to/.loom/worktrees/terminal-1"}
+```
+
+### Best Practices for Tauri App Mode
+
+1. **Always use `--return-to $(pwd)`** when creating issue worktrees
+   - Ensures you can return to your terminal worktree
+   - Maintains your agent's "home base"
+
+2. **Use `pnpm worktree:return`** when done with issue
+   - Cleaner than manual `cd` commands
+   - Validates return path exists
+   - Provides clear success/error messages
+
+3. **Don't worry about cleanup**
+   - Issue worktrees are cleaned up automatically after PRs merge
+   - Terminal worktrees persist for your entire session
+   - Focus on the work, not the infrastructure
+
+4. **Check your location**
+   - Use `pnpm worktree --check` to see current worktree
+   - Terminal worktrees: `terminal-N`
+   - Issue worktrees: `issue-N`
+
+### Example Autonomous Loop
+
+```bash
+while true; do
+  # Find ready issue
+  ISSUE=$(gh issue list --label="loom:issue" --limit 1 --json number --jq '.[0].number')
+
+  if [[ -n "$ISSUE" ]]; then
+    # Claim issue
+    gh issue edit "$ISSUE" --remove-label "loom:issue" --add-label "loom:building"
+
+    # Create issue worktree from terminal worktree
+    ./.loom/scripts/worktree.sh --return-to $(pwd) "$ISSUE"
+    cd .loom/worktrees/issue-"$ISSUE"
+
+    # Do the work...
+    # ... implementation ...
+
+    # Push and create PR
+    git push -u origin feature/issue-"$ISSUE"
+    gh pr create --label "loom:review-requested" --body "Closes #$ISSUE"
+
+    # Return to terminal worktree
+    pnpm worktree:return
+  else
+    # No issues ready, wait
+    sleep 300
+  fi
+done
+```
+
+This workflow ensures clean isolation between agents and issues while maintaining a consistent "home base" for each autonomous agent.
+
 ## Reading Issues: ALWAYS Read Comments First
 
 **CRITICAL:** Curator adds implementation guidance in comments (and sometimes amends descriptions). You MUST read both the issue body AND all comments before starting work.
@@ -701,6 +822,7 @@ EOF
 - Use the TodoWrite tool to plan and track multi-step tasks
 - Run lint, format, and type checks before considering complete
 - **Create PR**: **Use "Closes #123" syntax** (see section above), add `loom:review-requested` label
+- **After PR creation**: Move on to the next `loom:issue` - the Healer agent handles PR review feedback
 - When blocked: Add comment explaining blocker, mark `loom:blocked`
 - Stay focused on assigned issue - create separate issues for other work
 
