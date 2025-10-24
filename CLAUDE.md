@@ -369,6 +369,71 @@ cat > .loom/roles/my-role.json <<EOF
 EOF
 ```
 
+### Branch Protection
+
+Loom works best with branch protection enabled on your default branch. Branch protection ensures all changes go through the PR workflow and prevents accidental direct commits.
+
+#### During Installation
+
+The installation script optionally configures branch protection:
+
+**Interactive mode**: Prompts you to enable protection
+```bash
+./scripts/install-loom.sh /path/to/repo
+# Will prompt: Configure branch protection rules for 'main' branch? (y/N)
+```
+
+**Non-interactive mode**: Skips branch protection (configure manually)
+```bash
+./scripts/install-loom.sh --yes /path/to/repo
+# Skips protection setup for automation safety
+```
+
+#### Manual Configuration
+
+Configure branch protection after installation:
+
+```bash
+./scripts/install/setup-branch-protection.sh /path/to/repo main
+```
+
+Or configure via GitHub Settings:
+1. Go to: `Settings > Branches` in your repository
+2. Add rule for your default branch (usually `main`)
+3. Enable:
+   - Require pull request reviews (1 approval)
+   - Dismiss stale reviews on new commits
+   - Prevent force pushes
+   - Prevent branch deletion
+
+#### Protection Rules Applied
+
+The setup script configures these rules:
+- ✅ Require pull request before merging
+- ✅ Require 1 approval (can be bypassed by admins)
+- ✅ Dismiss stale reviews when new commits pushed
+- ✅ Prevent force pushes
+- ✅ Prevent branch deletion
+
+#### Why Branch Protection?
+
+**Enforces Loom workflow**:
+- All changes require pull requests
+- PRs require Judge review before merge
+- Prevents bypassing label-based coordination
+- Maintains audit trail of all changes
+
+**Requirements**:
+- Admin permissions on target repository
+- GitHub CLI authenticated
+- Default branch must exist
+
+**Troubleshooting**:
+If setup fails, it's usually due to:
+- Lacking admin permissions (ask repo owner)
+- Branch doesn't exist yet (push at least one commit)
+- GitHub API unreachable (check network/auth)
+
 ## Troubleshooting
 
 ### Common Issues

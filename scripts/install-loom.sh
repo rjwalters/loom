@@ -17,7 +17,8 @@
 #     3. Creates installation worktree (.loom/worktrees/issue-XXX)
 #     4. Initializes Loom configuration (copies defaults to .loom/)
 #     5. Syncs GitHub labels for Loom workflow
-#     6. Creates pull request with loom:review-requested label
+#     6. Configures branch protection rules (interactive mode only)
+#     7. Creates pull request with loom:review-requested label
 #
 #   Requirements:
 #     - Target must be a Git repository
@@ -322,10 +323,49 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 6: Create Pull Request
+# STEP 6: Configure Branch Protection
+# ============================================================================
+CURRENT_STEP="Configure Branch Protection"
+header "Step 6: Configure Branch Protection"
+echo ""
+
+# Detect default branch
+cd "$TARGET_PATH"
+DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+info "Detected default branch: ${DEFAULT_BRANCH}"
+
+# Prompt user
+if [[ "$NON_INTERACTIVE" == "true" ]]; then
+  info "Non-interactive mode: Skipping branch protection setup"
+  info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
+else
+  echo ""
+  read -p "Configure branch protection rules for '${DEFAULT_BRANCH}' branch? (y/N) " -n 1 -r
+  echo ""
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    info "Applying branch protection rules..."
+
+    # Apply protection rules
+    if "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
+      echo ""
+    else
+      echo ""
+      warning "Failed to configure branch protection (may require admin permissions)"
+      info "You can configure manually via GitHub Settings > Branches"
+    fi
+  else
+    info "Skipping branch protection setup"
+    info "To configure later, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
+  fi
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 7: Create Pull Request
 # ============================================================================
 CURRENT_STEP="Create PR"
-header "Step 6: Creating Pull Request"
+header "Step 7: Creating Pull Request"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
