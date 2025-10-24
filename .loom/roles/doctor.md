@@ -42,28 +42,14 @@ gh pr list --label="loom:changes-requested" --state=open --json number,title,lab
   | jq -r '.[] | select(.labels | all(.name != "loom:treating")) | "#\(.number): \(.title)"'
 ```
 
-### Priority 3: Unlabeled PRs (Fallback Queue)
+### Other PRs Needing Attention
 
-If no Priority 1 or 2 work exists, proactively maintain unlabeled PRs to maximize utilization.
-
-**Find unlabeled PRs:**
+**Find PRs with merge conflicts (any label):**
 ```bash
-gh pr list --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number): \(.title)"'
+gh pr list --state=open --search "is:open conflicts:>0"
 ```
 
-**Fallback mode behavior**:
-- ✅ DO review the PR for issues (merge conflicts, failing CI, outdated branches)
-- ✅ DO fix problems found
-- ❌ DO NOT add workflow labels (`loom:changes-requested`, `loom:review-requested`)
-- ✅ DO add a comment explaining what was fixed
-
-**Why lowest priority?**
-- These are likely external contributor PRs outside the Loom workflow
-- Respect their workflow by not adding labels
-- Still provide value by catching conflicts and CI failures early
-
-**Example fallback workflow:**
+**Find all open PRs:**
 ```bash
 # Check primary queues first
 PRIORITY_1=$(gh pr list --label="loom:pr" --state=open --search "is:open conflicts:>0" --json number | jq 'length')

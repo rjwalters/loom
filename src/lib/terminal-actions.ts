@@ -343,7 +343,7 @@ export async function createPlainTerminal(deps: {
   workspacePath: string;
   generateNextConfigId: (terminals: import("./state").Terminal[]) => string;
   saveCurrentConfig: () => Promise<void>;
-}): Promise<void> {
+}): Promise<Terminal | undefined> {
   const { state, workspacePath, generateNextConfigId, saveCurrentConfig } = deps;
 
   // Generate terminal name
@@ -357,25 +357,25 @@ export async function createPlainTerminal(deps: {
     // Get instance number for this terminal
     const instanceNumber = state.getNextTerminalNumber();
 
-    // Create terminal in workspace directory
-    const terminalId = await invoke<string>("create_terminal", {
-      configId: id,
-      name,
-      workingDir: workspacePath,
-      role: "default",
-      instanceNumber,
-    });
-
-    logger.info("Created terminal", { name, id, tmuxId: terminalId });
-
-    // Create worktree for this terminal
+    // Create worktree for this terminal FIRST (before creating terminal)
     logger.info("Creating worktree for terminal", { name, id });
     const { setupWorktreeForAgent } = await import("./worktree-manager");
     const worktreePath = await setupWorktreeForAgent(id, workspacePath);
     logger.info("Created worktree", { name, id, worktreePath });
 
+    // Create terminal in worktree directory (not workspace)
+    const terminalId = await invoke<string>("create_terminal", {
+      configId: id,
+      name,
+      workingDir: worktreePath,
+      role: "default",
+      instanceNumber,
+    });
+
+    logger.info("Created terminal", { name, id, tmuxId: terminalId, workingDir: worktreePath });
+
     // Add to state with default role (plain shell / driver)
-    state.addTerminal({
+    const newTerminal: Terminal = {
       id,
       name,
       worktreePath,
@@ -383,7 +383,8 @@ export async function createPlainTerminal(deps: {
       isPrimary: false,
       role: "default",
       theme: "default",
-    });
+    };
+    state.addTerminal(newTerminal);
 
     // Announce terminal creation to screen readers
     announceTerminalCreated(name);
@@ -393,8 +394,12 @@ export async function createPlainTerminal(deps: {
 
     // Switch to new terminal
     state.setPrimary(id);
+
+    // Return the created terminal
+    return newTerminal;
   } catch (error) {
     logger.error("Failed to create terminal", error, { workspacePath });
     showToast(`Failed to create terminal: ${error}`, "error");
+    return undefined;
   }
 }
