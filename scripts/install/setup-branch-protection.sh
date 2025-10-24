@@ -5,7 +5,7 @@
 #   ./scripts/install/setup-branch-protection.sh /path/to/target-repo [branch-name]
 #
 # Applies recommended branch protection rules:
-#   - Require PRs with 1 approval
+#   - Require PRs (0 approvals for solo dev/Loom workflows)
 #   - Dismiss stale reviews
 #   - Prevent force pushes and deletions
 
@@ -54,6 +54,8 @@ fi
 
 # Apply branch protection rules using JSON payload
 # Note: Using --input with JSON is more reliable than --field with bracket notation
+# Note: required_approving_review_count is 0 to support solo development and Loom workflows
+#       (GitHub's review API doesn't work for self-authored PRs, and Loom uses label-based reviews)
 if gh api --method PUT "repos/${OWNER}/${REPO}/branches/${BRANCH_NAME}/protection" --input - > /dev/null 2>&1 <<'EOF'
 {
   "required_status_checks": null,
@@ -61,7 +63,7 @@ if gh api --method PUT "repos/${OWNER}/${REPO}/branches/${BRANCH_NAME}/protectio
   "required_pull_request_reviews": {
     "dismiss_stale_reviews": true,
     "require_code_owner_reviews": false,
-    "required_approving_review_count": 1
+    "required_approving_review_count": 0
   },
   "restrictions": null,
   "allow_force_pushes": false,
@@ -74,11 +76,13 @@ then
   success "Branch protection configured successfully"
   echo ""
   echo "Applied rules:"
-  echo "  - Require pull request reviews (1 approval)"
+  echo "  - Require pull requests before merging (0 approvals required)"
   echo "  - Dismiss stale reviews on new commits"
   echo "  - Prevent force pushes"
   echo "  - Prevent branch deletion"
   echo "  - Admins can bypass (enforce_admins=false)"
+  echo ""
+  echo "Note: 0 approvals required supports solo development and Loom's label-based review system."
   echo ""
   info "To modify: GitHub Settings > Branches > ${BRANCH_NAME}"
   exit 0
@@ -93,7 +97,7 @@ else
   info "To configure manually:"
   echo "  1. Go to: https://github.com/${OWNER}/${REPO}/settings/branches"
   echo "  2. Add rule for '${BRANCH_NAME}' branch"
-  echo "  3. Enable: Require pull request reviews (1 approval)"
+  echo "  3. Enable: Require pull request reviews (0 approvals)"
   echo "  4. Enable: Dismiss stale reviews"
   echo "  5. Enable: Prevent force pushes"
   exit 1
