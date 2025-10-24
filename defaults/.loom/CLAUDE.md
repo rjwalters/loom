@@ -164,7 +164,36 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 ## Git Worktree Workflow
 
-Loom uses git worktrees to isolate agent work. Each issue gets its own worktree.
+Loom uses git worktrees to isolate agent work. Loom supports two types of worktrees depending on the usage mode:
+
+### Worktree Strategy Overview
+
+**Terminal Worktrees** (`.loom/worktrees/terminal-N`):
+- **Purpose**: Agent isolation in Tauri App Mode
+- **When**: Created automatically for each terminal in the Loom desktop application
+- **Why**: Allows multiple autonomous agents to work on different branches simultaneously without conflicts
+- **Scope**: Per terminal/agent (persistent across app restarts)
+- **Used in**: Tauri App Mode only
+
+**Issue Worktrees** (`.loom/worktrees/issue-N`):
+- **Purpose**: Issue-specific work isolation for Builder agents
+- **When**: Created manually by Builder when claiming an issue (both MOM and Tauri App)
+- **Why**: Isolates work on specific issues with dedicated feature branches
+- **Scope**: Per issue (temporary, cleaned up when PR is merged)
+- **Used in**: Both Manual Orchestration Mode and Tauri App Mode
+
+### When to Use Which Worktree Type
+
+**Manual Orchestration Mode (Claude Code CLI)**:
+- No terminal worktrees (agents work in main workspace initially)
+- Builder creates issue worktrees via `./.loom/scripts/worktree.sh <issue-number>`
+- Single agent per terminal, human-controlled
+
+**Tauri App Mode (Autonomous Agents)**:
+- Automatic terminal worktrees for agent isolation (`.loom/worktrees/terminal-N`)
+- Builder ALSO creates issue worktrees when claiming work (`.loom/worktrees/issue-N`)
+- Multiple autonomous agents can run simultaneously
+- Builder works in issue worktree, not terminal worktree
 
 ### Creating Worktrees (for Agents)
 
@@ -339,6 +368,71 @@ cat > .loom/roles/my-role.json <<EOF
 }
 EOF
 ```
+
+### Branch Protection
+
+Loom works best with branch protection enabled on your default branch. Branch protection ensures all changes go through the PR workflow and prevents accidental direct commits.
+
+#### During Installation
+
+The installation script optionally configures branch protection:
+
+**Interactive mode**: Prompts you to enable protection
+```bash
+./scripts/install-loom.sh /path/to/repo
+# Will prompt: Configure branch protection rules for 'main' branch? (y/N)
+```
+
+**Non-interactive mode**: Skips branch protection (configure manually)
+```bash
+./scripts/install-loom.sh --yes /path/to/repo
+# Skips protection setup for automation safety
+```
+
+#### Manual Configuration
+
+Configure branch protection after installation:
+
+```bash
+./scripts/install/setup-branch-protection.sh /path/to/repo main
+```
+
+Or configure via GitHub Settings:
+1. Go to: `Settings > Branches` in your repository
+2. Add rule for your default branch (usually `main`)
+3. Enable:
+   - Require pull request reviews (1 approval)
+   - Dismiss stale reviews on new commits
+   - Prevent force pushes
+   - Prevent branch deletion
+
+#### Protection Rules Applied
+
+The setup script configures these rules:
+- ✅ Require pull request before merging
+- ✅ Require 1 approval (can be bypassed by admins)
+- ✅ Dismiss stale reviews when new commits pushed
+- ✅ Prevent force pushes
+- ✅ Prevent branch deletion
+
+#### Why Branch Protection?
+
+**Enforces Loom workflow**:
+- All changes require pull requests
+- PRs require Judge review before merge
+- Prevents bypassing label-based coordination
+- Maintains audit trail of all changes
+
+**Requirements**:
+- Admin permissions on target repository
+- GitHub CLI authenticated
+- Default branch must exist
+
+**Troubleshooting**:
+If setup fails, it's usually due to:
+- Lacking admin permissions (ask repo owner)
+- Branch doesn't exist yet (push at least one commit)
+- GitHub API unreachable (check network/auth)
 
 ## Troubleshooting
 
