@@ -24,8 +24,6 @@ vi.mock("./terminal-state-parser", () => ({
     lastPrompt: "⏺ Ready",
     raw: "⏺ Ready",
   })),
-  getLastLines: vi.fn(async () => "⏺ Ready"),
-  readTerminalOutput: vi.fn(async () => "⏺ Ready"),
   parseTerminalState: vi.fn(() => ({
     type: "claude-code" as const,
     status: "waiting-input" as const,

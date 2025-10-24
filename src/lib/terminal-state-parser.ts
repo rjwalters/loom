@@ -228,19 +228,16 @@ function extractLastNonEmptyLine(text: string): string {
 }
 
 /**
- * Read terminal output from daemon
+ * Read terminal output and get last N lines
  *
- * This is a helper function that wraps the Tauri IPC command to read
- * terminal output. It handles base64 decoding and returns the text.
+ * Internal helper for detectTerminalState(). Reads terminal output from daemon
+ * and returns the last N lines for state detection.
  *
  * @param terminalId - Terminal session ID
- * @param startByte - Optional byte offset to start reading from (null = all output)
- * @returns Decoded terminal output text
+ * @param lineCount - Number of lines to return
+ * @returns The last N lines of terminal output
  */
-export async function readTerminalOutput(
-  terminalId: string,
-  startByte: number | null = null
-): Promise<string> {
+async function getLastLines(terminalId: string, lineCount: number): Promise<string> {
   const { invoke } = await import("@tauri-apps/api/core");
 
   interface TerminalOutput {
@@ -251,7 +248,7 @@ export async function readTerminalOutput(
   try {
     const result = await invoke<TerminalOutput>("get_terminal_output", {
       id: terminalId,
-      startByte,
+      startByte: null,
     });
 
     // Decode base64 output
@@ -261,62 +258,30 @@ export async function readTerminalOutput(
     }
 
     // Base64 decode
-    const decodedBytes = base64ToBytes(result.output);
-    const text = new TextDecoder("utf-8").decode(decodedBytes);
+    const binaryString = atob(result.output);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const text = new TextDecoder("utf-8").decode(bytes);
 
-    logger.info("Read terminal output", {
+    // Extract last N lines
+    const lines = text.split("\n");
+    const lastLines = lines.slice(-lineCount).join("\n");
+
+    logger.info("Read and extracted last lines", {
       terminalId,
       byteCount: result.byte_count,
-      textLength: text.length,
-      preview: text.substring(0, 100).replace(/\n/g, "\\n"),
+      totalLines: lines.length,
+      requestedLines: lineCount,
+      returnedLines: lastLines.split("\n").length,
     });
 
-    return text;
+    return lastLines;
   } catch (error) {
-    logger.error("Failed to read terminal output", error, { terminalId, startByte });
+    logger.error("Failed to read terminal output", error, { terminalId });
     return "";
   }
-}
-
-/**
- * Decode base64 string to Uint8Array
- *
- * @param base64 - Base64-encoded string
- * @returns Decoded bytes
- */
-function base64ToBytes(base64: string): Uint8Array {
-  const binaryString = atob(base64);
-  const bytes = new Uint8Array(binaryString.length);
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
-
-/**
- * Get the last N lines of terminal output
- *
- * This is a convenience function that reads all terminal output and
- * returns only the last N lines. Useful for state detection where
- * we only care about recent output.
- *
- * @param terminalId - Terminal session ID
- * @param lineCount - Number of lines to return (default: 20)
- * @returns The last N lines of terminal output
- */
-export async function getLastLines(terminalId: string, lineCount: number = 20): Promise<string> {
-  const fullOutput = await readTerminalOutput(terminalId);
-  const lines = fullOutput.split("\n");
-  const lastLines = lines.slice(-lineCount).join("\n");
-
-  logger.info("Extracted last lines", {
-    terminalId,
-    requestedLines: lineCount,
-    totalLines: lines.length,
-    returnedLines: lastLines.split("\n").length,
-  });
-
-  return lastLines;
 }
 
 /**
