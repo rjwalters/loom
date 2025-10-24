@@ -357,22 +357,22 @@ export async function createPlainTerminal(deps: {
     // Get instance number for this terminal
     const instanceNumber = state.getNextTerminalNumber();
 
-    // Create terminal in workspace directory
-    const terminalId = await invoke<string>("create_terminal", {
-      configId: id,
-      name,
-      workingDir: workspacePath,
-      role: "default",
-      instanceNumber,
-    });
-
-    logger.info("Created terminal", { name, id, tmuxId: terminalId });
-
-    // Create worktree for this terminal
+    // Create worktree for this terminal FIRST (before creating terminal)
     logger.info("Creating worktree for terminal", { name, id });
     const { setupWorktreeForAgent } = await import("./worktree-manager");
     const worktreePath = await setupWorktreeForAgent(id, workspacePath);
     logger.info("Created worktree", { name, id, worktreePath });
+
+    // Create terminal in worktree directory (not workspace)
+    const terminalId = await invoke<string>("create_terminal", {
+      configId: id,
+      name,
+      workingDir: worktreePath,
+      role: "default",
+      instanceNumber,
+    });
+
+    logger.info("Created terminal", { name, id, tmuxId: terminalId, workingDir: worktreePath });
 
     // Add to state with default role (plain shell / driver)
     state.addTerminal({
