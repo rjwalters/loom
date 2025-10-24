@@ -52,17 +52,24 @@ if [[ "$HAS_ADMIN" != "true" ]]; then
   warning "Attempting anyway (may fail with permission error)..."
 fi
 
-# Apply branch protection rules
-if gh api --method PUT "repos/${OWNER}/${REPO}/branches/${BRANCH_NAME}/protection" \
-  --field required_pull_request_reviews[dismiss_stale_reviews]=true \
-  --field required_pull_request_reviews[require_code_owner_reviews]=false \
-  --field required_pull_request_reviews[required_approving_review_count]=1 \
-  --field enforce_admins=false \
-  --field restrictions=null \
-  -F allow_force_pushes=false \
-  -F allow_deletions=false \
-  -F required_linear_history=false \
-  > /dev/null 2>&1; then
+# Apply branch protection rules using JSON payload
+# Note: Using --input with JSON is more reliable than --field with bracket notation
+if gh api --method PUT "repos/${OWNER}/${REPO}/branches/${BRANCH_NAME}/protection" --input - > /dev/null 2>&1 <<'EOF'
+{
+  "required_status_checks": null,
+  "enforce_admins": false,
+  "required_pull_request_reviews": {
+    "dismiss_stale_reviews": true,
+    "require_code_owner_reviews": false,
+    "required_approving_review_count": 1
+  },
+  "restrictions": null,
+  "allow_force_pushes": false,
+  "allow_deletions": false,
+  "required_linear_history": false
+}
+EOF
+then
 
   success "Branch protection configured successfully"
   echo ""
