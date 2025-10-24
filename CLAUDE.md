@@ -164,7 +164,36 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 ## Git Worktree Workflow
 
-Loom uses git worktrees to isolate agent work. Each issue gets its own worktree.
+Loom uses git worktrees to isolate agent work. Loom supports two types of worktrees depending on the usage mode:
+
+### Worktree Strategy Overview
+
+**Terminal Worktrees** (`.loom/worktrees/terminal-N`):
+- **Purpose**: Agent isolation in Tauri App Mode
+- **When**: Created automatically for each terminal in the Loom desktop application
+- **Why**: Allows multiple autonomous agents to work on different branches simultaneously without conflicts
+- **Scope**: Per terminal/agent (persistent across app restarts)
+- **Used in**: Tauri App Mode only
+
+**Issue Worktrees** (`.loom/worktrees/issue-N`):
+- **Purpose**: Issue-specific work isolation for Builder agents
+- **When**: Created manually by Builder when claiming an issue (both MOM and Tauri App)
+- **Why**: Isolates work on specific issues with dedicated feature branches
+- **Scope**: Per issue (temporary, cleaned up when PR is merged)
+- **Used in**: Both Manual Orchestration Mode and Tauri App Mode
+
+### When to Use Which Worktree Type
+
+**Manual Orchestration Mode (Claude Code CLI)**:
+- No terminal worktrees (agents work in main workspace initially)
+- Builder creates issue worktrees via `./.loom/scripts/worktree.sh <issue-number>`
+- Single agent per terminal, human-controlled
+
+**Tauri App Mode (Autonomous Agents)**:
+- Automatic terminal worktrees for agent isolation (`.loom/worktrees/terminal-N`)
+- Builder ALSO creates issue worktrees when claiming work (`.loom/worktrees/issue-N`)
+- Multiple autonomous agents can run simultaneously
+- Builder works in issue worktree, not terminal worktree
 
 ### Creating Worktrees (for Agents)
 
