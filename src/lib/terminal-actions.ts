@@ -63,12 +63,12 @@ export async function handleRunNowClick(
       return;
     }
 
-    // Import autonomous manager
-    const { getAutonomousManager } = await import("./autonomous-manager");
-    const autonomousManager = getAutonomousManager();
+    // Import interval prompt manager
+    const { getIntervalPromptManager } = await import("./interval-prompt-manager");
+    const intervalManager = getIntervalPromptManager();
 
-    // Execute the interval prompt and reset timer
-    await autonomousManager.runNow(terminal);
+    // Execute the interval prompt
+    await intervalManager.runNow(terminal);
     logger.info("Successfully executed interval prompt", { terminalId });
   } catch (error) {
     logger.error("Failed to execute interval prompt", error as Error, {
@@ -300,10 +300,10 @@ export async function closeTerminalWithConfirmation(
 
   logger.info("Closing terminal", { terminalId });
 
-  // Stop autonomous mode if running
-  const { getAutonomousManager } = await import("./autonomous-manager");
-  const autonomousManager = getAutonomousManager();
-  await autonomousManager.stopAutonomous(terminalId);
+  // Stop interval prompts if running
+  const { getIntervalPromptManager } = await import("./interval-prompt-manager");
+  const intervalManager = getIntervalPromptManager();
+  intervalManager.stop(terminalId);
 
   // Stop polling and destroy terminal
   outputPoller.stopPolling(terminalId);

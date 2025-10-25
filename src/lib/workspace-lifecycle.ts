@@ -418,10 +418,10 @@ async function loadExistingWorkspace(
  * @param state - App state
  */
 async function startAutonomousMode(state: AppState): Promise<void> {
-  const { getAutonomousManager } = await import("./autonomous-manager");
-  const autonomousManager = getAutonomousManager();
-  autonomousManager.startAllAutonomous(state);
-  logger.info("Started autonomous agents");
+  const { getIntervalPromptManager } = await import("./interval-prompt-manager");
+  const intervalManager = getIntervalPromptManager();
+  intervalManager.startAll(state);
+  logger.info("Started interval prompt managers");
 }
 
 /**

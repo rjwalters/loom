@@ -468,10 +468,10 @@ if (!eventListenersRegistered) {
     localStorage.removeItem("loom:workspace");
     logger?.info("Cleared localStorage workspace");
 
-    // Stop all autonomous intervals and wait for active executions
-    const { getAutonomousManager } = await import("./lib/autonomous-manager");
-    const autonomousManager = getAutonomousManager();
-    await autonomousManager.stopAll();
+    // Stop all interval prompts
+    const { getIntervalPromptManager } = await import("./lib/interval-prompt-manager");
+    const intervalManager = getIntervalPromptManager();
+    intervalManager.stopAll();
 
     // Stop all polling
     outputPoller.stopAll();
