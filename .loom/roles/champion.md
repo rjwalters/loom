@@ -211,15 +211,46 @@ For each `loom:pr` PR, verify ALL 7 safety criteria. If ANY criterion fails, do 
 - [ ] PR has `loom:pr` label (Judge approval)
 - [ ] PR does NOT have `loom:manual-merge` label (human override)
 
+**Verification command**:
 ```bash
-gh pr view <number> --json labels --jq '.labels[].name'
+# Get all labels for the PR
+LABELS=$(gh pr view <number> --json labels --jq '.labels[].name' | tr '\n' ' ')
+
+# Check for loom:pr label
+if ! echo "$LABELS" | grep -q "loom:pr"; then
+  echo "FAIL: Missing loom:pr label"
+  exit 1
+fi
+
+# Check for manual-merge override
+if echo "$LABELS" | grep -q "loom:manual-merge"; then
+  echo "SKIP: Has loom:manual-merge label (human override)"
+  exit 1
+fi
+
+echo "PASS: Label check"
 ```
+
+**Rationale**: Only merge PRs explicitly approved by Judge, respect human override
 
 ### 2. Size Check
 - [ ] Total lines changed ≤ 200 (additions + deletions)
 
+**Verification command**:
 ```bash
-gh pr view <number> --json additions,deletions --jq '{additions, deletions, total: (.additions + .deletions)}'
+# Get additions and deletions
+PR_DATA=$(gh pr view <number> --json additions,deletions --jq '{additions, deletions, total: (.additions + .deletions)}')
+ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
+DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
+TOTAL=$((ADDITIONS + DELETIONS))
+
+# Check size limit
+if [ "$TOTAL" -gt 200 ]; then
+  echo "FAIL: Too large ($TOTAL lines, limit is 200)"
+  exit 1
+fi
+
+echo "PASS: Size check ($TOTAL lines)"
 ```
 
 **Rationale**: Small PRs are easier to revert if problems arise.
@@ -238,8 +269,35 @@ gh pr view <number> --json additions,deletions --jq '{additions, deletions, tota
 - `*.sql` - database schema changes
 - `*migration*` - database migration files
 
+**Verification command**:
 ```bash
-gh pr view <number> --json files --jq '.files[].path'
+# Get all changed files
+FILES=$(gh pr view <number> --json files --jq -r '.files[].path')
+
+# Define critical patterns (extend as needed)
+CRITICAL_PATTERNS=(
+  "src-tauri/tauri.conf.json"
+  "Cargo.toml"
+  "loom-daemon/Cargo.toml"
+  "src-tauri/Cargo.toml"
+  "package.json"
+  "pnpm-lock.yaml"
+  ".github/workflows/"
+  ".sql"
+  "migration"
+)
+
+# Check each file against patterns
+for file in $FILES; do
+  for pattern in "${CRITICAL_PATTERNS[@]}"; do
+    if [[ "$file" == *"$pattern"* ]]; then
+      echo "FAIL: Critical file modified: $file"
+      exit 1
+    fi
+  done
+done
+
+echo "PASS: No critical files modified"
 ```
 
 **Rationale**: Changes to these files require careful human review due to high impact.
@@ -247,17 +305,52 @@ gh pr view <number> --json files --jq '.files[].path'
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
 
+**Verification command**:
 ```bash
-gh pr view <number> --json mergeable --jq '.mergeable'
+# Check merge status
+MERGEABLE=$(gh pr view <number> --json mergeable --jq -r '.mergeable')
+
+# Verify mergeable state
+if [ "$MERGEABLE" != "MERGEABLE" ]; then
+  echo "FAIL: Not mergeable (state: $MERGEABLE)"
+  exit 1
+fi
+
+echo "PASS: No merge conflicts"
 ```
 
-Expected output: `"MERGEABLE"` (not `"CONFLICTING"` or `"UNKNOWN"`)
+**Expected states**:
+- `MERGEABLE` - Safe to merge (PASS)
+- `CONFLICTING` - Has merge conflicts (FAIL)
+- `UNKNOWN` - GitHub still calculating, try again later (FAIL)
+
+**Rationale**: Conflicting PRs require human resolution before merging
 
 ### 5. Recency Check
 - [ ] PR updated within last 24 hours
 
+**Verification command**:
 ```bash
-gh pr view <number> --json updatedAt --jq '.updatedAt'
+# Get PR last update time
+UPDATED_AT=$(gh pr view <number> --json updatedAt --jq -r '.updatedAt')
+
+# Convert to Unix timestamp
+UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
+             date -d "$UPDATED_AT" +%s 2>/dev/null)
+
+# Get current time
+NOW_TS=$(date +%s)
+
+# Calculate hours since update
+HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
+
+# Check if within 24 hours
+if [ "$HOURS_AGO" -gt 24 ]; then
+  echo "FAIL: Stale PR (updated $HOURS_AGO hours ago)"
+  exit 1
+fi
+
+echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 ```
 
 **Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale.
@@ -266,14 +359,62 @@ gh pr view <number> --json updatedAt --jq '.updatedAt'
 - [ ] If CI checks exist, all checks must be passing
 - [ ] If no CI checks exist, this criterion passes automatically
 
+**Verification command**:
 ```bash
-gh pr checks <number> --json name,conclusion
+# Get all CI checks
+CHECKS=$(gh pr checks <number> --json name,conclusion,status 2>&1)
+
+# Handle case where no checks exist
+if echo "$CHECKS" | grep -q "no checks reported"; then
+  echo "PASS: No CI checks required"
+  exit 0
+fi
+
+# Parse checks
+FAILING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.conclusion != "SUCCESS" and .conclusion != null) | .name')
+PENDING_CHECKS=$(echo "$CHECKS" | jq -r '.[] | select(.status == "IN_PROGRESS" or .status == "QUEUED") | .name')
+
+# Check for failing checks
+if [ -n "$FAILING_CHECKS" ]; then
+  echo "FAIL: CI checks failing:"
+  echo "$FAILING_CHECKS"
+  exit 1
+fi
+
+# Check for pending checks
+if [ -n "$PENDING_CHECKS" ]; then
+  echo "SKIP: CI checks still running:"
+  echo "$PENDING_CHECKS"
+  exit 1
+fi
+
+echo "PASS: All CI checks passing"
 ```
 
-Expected: All checks have `"conclusion": "SUCCESS"` (or no checks exist)
+**Edge cases handled**:
+- **No CI checks**: Passes (allows merge)
+- **Pending checks**: Skips (waits for completion)
+- **Failed checks**: Fails (blocks merge)
+- **Mixed state**: Fails if any check is not SUCCESS
+
+**Rationale**: Only merge when all automated checks pass or no checks are configured
 
 ### 7. Human Override Check
 - [ ] PR does NOT have `loom:manual-merge` label
+
+**Verification command**:
+```bash
+# This check is already covered in criterion #1 (Label Check)
+# Included here for completeness - see Label Check for implementation
+
+# Quick standalone check if needed:
+if gh pr view <number> --json labels --jq -e '.labels[] | select(.name == "loom:manual-merge")' > /dev/null 2>&1; then
+  echo "SKIP: Has loom:manual-merge label (human override)"
+  exit 1
+fi
+
+echo "PASS: No manual-merge override"
+```
 
 **Rationale**: Allows humans to prevent auto-merge by adding this label.
 
@@ -282,6 +423,126 @@ Expected: All checks have `"conclusion": "SUCCESS"` (or no checks exist)
 ### Step 1: Verify Safety Criteria
 
 For each candidate PR, check ALL 7 criteria in order. If any criterion fails, skip to rejection workflow.
+
+**Complete verification script** (run all checks):
+
+```bash
+#!/bin/bash
+# Complete safety verification for PR auto-merge
+# Usage: ./verify-pr-safety.sh <pr-number>
+
+PR_NUMBER=$1
+if [ -z "$PR_NUMBER" ]; then
+  echo "Usage: $0 <pr-number>"
+  exit 1
+fi
+
+echo "Verifying safety criteria for PR #$PR_NUMBER..."
+echo ""
+
+# Criterion 1: Label Check
+echo "1/7 Checking labels..."
+LABELS=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' | tr '\n' ' ')
+if ! echo "$LABELS" | grep -q "loom:pr"; then
+  echo "❌ FAIL: Missing loom:pr label"
+  exit 1
+fi
+if echo "$LABELS" | grep -q "loom:manual-merge"; then
+  echo "⏭️  SKIP: Has loom:manual-merge label (human override)"
+  exit 1
+fi
+echo "✅ PASS: Label check"
+
+# Criterion 2: Size Check
+echo "2/7 Checking PR size..."
+PR_DATA=$(gh pr view "$PR_NUMBER" --json additions,deletions)
+ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
+DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
+TOTAL=$((ADDITIONS + DELETIONS))
+if [ "$TOTAL" -gt 200 ]; then
+  echo "❌ FAIL: Too large ($TOTAL lines, limit is 200)"
+  exit 1
+fi
+echo "✅ PASS: Size check ($TOTAL lines)"
+
+# Criterion 3: Critical File Exclusion
+echo "3/7 Checking for critical files..."
+FILES=$(gh pr view "$PR_NUMBER" --json files --jq -r '.files[].path')
+CRITICAL_PATTERNS=(
+  "src-tauri/tauri.conf.json"
+  "Cargo.toml"
+  "loom-daemon/Cargo.toml"
+  "src-tauri/Cargo.toml"
+  "package.json"
+  "pnpm-lock.yaml"
+  ".github/workflows/"
+  ".sql"
+  "migration"
+)
+for file in $FILES; do
+  for pattern in "${CRITICAL_PATTERNS[@]}"; do
+    if [[ "$file" == *"$pattern"* ]]; then
+      echo "❌ FAIL: Critical file modified: $file"
+      exit 1
+    fi
+  done
+done
+echo "✅ PASS: No critical files modified"
+
+# Criterion 4: Merge Conflict Check
+echo "4/7 Checking for merge conflicts..."
+MERGEABLE=$(gh pr view "$PR_NUMBER" --json mergeable --jq -r '.mergeable')
+if [ "$MERGEABLE" != "MERGEABLE" ]; then
+  echo "❌ FAIL: Not mergeable (state: $MERGEABLE)"
+  exit 1
+fi
+echo "✅ PASS: No merge conflicts"
+
+# Criterion 5: Recency Check
+echo "5/7 Checking PR recency..."
+UPDATED_AT=$(gh pr view "$PR_NUMBER" --json updatedAt --jq -r '.updatedAt')
+UPDATED_TS=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
+             date -d "$UPDATED_AT" +%s 2>/dev/null)
+NOW_TS=$(date +%s)
+HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
+if [ "$HOURS_AGO" -gt 24 ]; then
+  echo "❌ FAIL: Stale PR (updated $HOURS_AGO hours ago)"
+  exit 1
+fi
+echo "✅ PASS: Recently updated ($HOURS_AGO hours ago)"
+
+# Criterion 6: CI Status Check
+echo "6/7 Checking CI status..."
+CHECKS=$(gh pr checks "$PR_NUMBER" --json name,conclusion,status 2>&1)
+if echo "$CHECKS" | grep -q "no checks reported"; then
+  echo "✅ PASS: No CI checks required"
+else
+  FAILING=$(echo "$CHECKS" | jq -r '.[] | select(.conclusion != "SUCCESS" and .conclusion != null) | .name')
+  PENDING=$(echo "$CHECKS" | jq -r '.[] | select(.status == "IN_PROGRESS" or .status == "QUEUED") | .name')
+  if [ -n "$FAILING" ]; then
+    echo "❌ FAIL: CI checks failing:"
+    echo "$FAILING"
+    exit 1
+  fi
+  if [ -n "$PENDING" ]; then
+    echo "⏭️  SKIP: CI checks still running:"
+    echo "$PENDING"
+    exit 1
+  fi
+  echo "✅ PASS: All CI checks passing"
+fi
+
+# Criterion 7: Human Override (redundant with #1, but explicit)
+echo "7/7 Checking for manual-merge override..."
+echo "✅ PASS: No manual-merge override (already verified in criterion 1)"
+
+echo ""
+echo "🏆 All safety criteria passed for PR #$PR_NUMBER"
+echo "Safe to auto-merge!"
+exit 0
+```
+
+**Usage**: Save this script for testing or reference. In practice, Champion should implement these checks directly in the workflow.
 
 ### Step 2: Add Pre-Merge Comment
 
@@ -393,6 +654,250 @@ This PR met all safety criteria but the merge operation failed. A human will nee
 ---
 *Automated by Champion role*"
 ```
+
+---
+
+## Edge Cases and Special Scenarios
+
+This section documents how Champion handles non-standard situations during PR auto-merge.
+
+### Edge Case 1: PR with No CI Checks
+
+**Scenario**: Repository has no CI/CD configured, or PR doesn't trigger any checks.
+
+**Handling**:
+```bash
+# gh pr checks returns "no checks reported"
+if echo "$CHECKS" | grep -q "no checks reported"; then
+  echo "PASS: No CI checks required"
+  # Continue to merge
+fi
+```
+
+**Decision**: **Allow merge** - absence of CI is not a blocker.
+
+**Rationale**: Many repositories don't use CI, or use branch protection without status checks.
+
+---
+
+### Edge Case 2: PR with Pending CI Checks
+
+**Scenario**: CI checks are queued or in progress when Champion evaluates the PR.
+
+**Handling**:
+```bash
+# Check for pending/running checks
+PENDING=$(echo "$CHECKS" | jq -r '.[] | select(.status == "IN_PROGRESS" or .status == "QUEUED") | .name')
+if [ -n "$PENDING" ]; then
+  echo "SKIP: CI checks still running - will retry next iteration"
+  # Skip this PR, try again later
+fi
+```
+
+**Decision**: **Skip and defer** - do not merge, check again in next iteration.
+
+**Rationale**: Wait for CI to complete to ensure quality. Champion will naturally retry on next cycle (10 minutes).
+
+---
+
+### Edge Case 3: Force-Push After Judge Approval
+
+**Scenario**: Builder force-pushes new commits after Judge added `loom:pr` label.
+
+**Handling**:
+- **Recency check** catches this (PR updated recently)
+- **CI check** re-runs after force push
+- **Judge approval remains valid** if PR still has `loom:pr` label
+
+**Decision**: **Allow merge if all criteria pass** - recency and CI checks provide sufficient safety.
+
+**Recommended improvement**: Judge should remove `loom:pr` on force-push (not Champion's responsibility).
+
+---
+
+### Edge Case 4: Merge Conflicts Develop After Approval
+
+**Scenario**: PR was mergeable when Judge approved, but another PR merged first causing conflicts.
+
+**Handling**:
+```bash
+MERGEABLE=$(gh pr view "$PR_NUMBER" --json mergeable --jq -r '.mergeable')
+if [ "$MERGEABLE" != "MERGEABLE" ]; then
+  echo "FAIL: Merge conflicts detected"
+  # Add comment explaining conflict
+  gh pr comment "$PR_NUMBER" --body "Cannot auto-merge: merge conflicts with base branch"
+fi
+```
+
+**Decision**: **Skip and comment** - do not merge, notify via comment.
+
+**Rationale**: Conflicts require human/Builder resolution. Champion should not attempt to resolve conflicts.
+
+**Next steps**: Builder or Doctor should resolve conflicts and re-request Judge review.
+
+---
+
+### Edge Case 5: Stale PR (Updated > 24 Hours Ago)
+
+**Scenario**: PR has `loom:pr` label but hasn't been updated in over 24 hours.
+
+**Handling**:
+```bash
+HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
+if [ "$HOURS_AGO" -gt 24 ]; then
+  echo "FAIL: Stale PR (updated $HOURS_AGO hours ago)"
+  # Skip merge, add comment
+fi
+```
+
+**Decision**: **Skip and comment** - do not merge stale PRs.
+
+**Rationale**: Main branch may have evolved significantly. Stale PRs should be rebased or re-reviewed.
+
+**Recommended action**: Remove `loom:pr` label on stale PRs, request rebase from Builder.
+
+---
+
+### Edge Case 6: PR Modifying Only Test Files
+
+**Scenario**: PR changes only test files (e.g., `*.test.ts`, `*.spec.rs`).
+
+**Handling**: No special handling needed - standard safety criteria apply.
+
+**Decision**: **Allow merge if criteria pass** - test-only changes are safe.
+
+**Rationale**: Size limit (200 lines) and CI checks provide sufficient protection.
+
+---
+
+### Edge Case 7: PR with `loom:manual-merge` Added Mid-Evaluation
+
+**Scenario**: Human adds `loom:manual-merge` label while Champion is evaluating the PR.
+
+**Handling**: Label check (#1) runs first, catches override immediately.
+
+**Decision**: **Skip immediately** - respect human override.
+
+**Rationale**: Champion re-fetches labels at start of each evaluation, race condition window is minimal.
+
+---
+
+### Edge Case 8: PR Linked to Multiple Issues
+
+**Scenario**: PR body contains "Closes #123, Closes #456, Fixes #789".
+
+**Handling**:
+```bash
+# Extract all linked issues
+LINKED_ISSUES=$(gh pr view "$PR_NUMBER" --json body --jq '.body' | grep -Eo "(Closes|Fixes|Resolves) #[0-9]+" | grep -Eo "[0-9]+")
+
+# Verify each issue closed after merge
+for issue in $LINKED_ISSUES; do
+  STATE=$(gh issue view "$issue" --json state --jq -r '.state')
+  if [ "$STATE" != "CLOSED" ]; then
+    echo "Warning: Issue #$issue not auto-closed, closing manually"
+    gh issue close "$issue" --comment "Closed by PR #$PR_NUMBER (auto-merged by Champion)"
+  fi
+done
+```
+
+**Decision**: **Allow merge, verify all linked issues** - standard practice.
+
+**Rationale**: GitHub auto-closes multiple issues, but verify and manually close if needed.
+
+---
+
+### Edge Case 9: PR with Mixed-State CI Checks
+
+**Scenario**: Some checks pass, some pending, some skipped.
+
+**Handling**:
+```bash
+# Any non-SUCCESS conclusion fails the check
+FAILING=$(echo "$CHECKS" | jq -r '.[] | select(.conclusion != "SUCCESS" and .conclusion != null) | .name')
+if [ -n "$FAILING" ]; then
+  echo "FAIL: Some checks did not pass"
+fi
+```
+
+**Decision**: **Fail if any check is not SUCCESS** - conservative approach.
+
+**Rationale**: "Skipped" or "Neutral" conclusions indicate incomplete validation.
+
+---
+
+### Edge Case 10: Critical File Pattern Extensions
+
+**Scenario**: Repository adds new critical files not in pattern list (e.g., `auth.config.ts`).
+
+**Handling**: Champion uses hardcoded patterns - will **not** catch new critical files.
+
+**Decision**: **Requires pattern update** - human must extend `CRITICAL_PATTERNS` array.
+
+**Maintenance**: Review and update critical file patterns periodically as codebase evolves.
+
+**Recommended**: Add repository-specific `.loom/champion-critical-files.txt` for custom patterns (future enhancement).
+
+---
+
+### Edge Case 11: PR Size Exactly at Limit (200 Lines)
+
+**Scenario**: PR has exactly 200 lines changed (e.g., 100 additions + 100 deletions).
+
+**Handling**:
+```bash
+if [ "$TOTAL" -gt 200 ]; then  # Strictly greater than
+  echo "FAIL: Too large"
+fi
+```
+
+**Decision**: **Allow merge** - limit is inclusive (≤ 200 allowed).
+
+**Rationale**: 200-line PRs are still considered "small" for auto-merge purposes.
+
+---
+
+### Edge Case 12: GitHub API Rate Limiting
+
+**Scenario**: Champion makes too many API calls and hits rate limit.
+
+**Handling**: `gh` commands will fail with rate limit error.
+
+**Current behavior**: Error handling workflow catches this, adds comment to PR, continues.
+
+**Recommendation**: Add exponential backoff or skip iteration if rate-limited (future enhancement).
+
+---
+
+### Edge Case 13: PR Approved by Multiple Judges
+
+**Scenario**: Multiple agents or humans add comments/approvals to the same PR.
+
+**Handling**: No special handling - `loom:pr` label is single source of truth.
+
+**Decision**: **Allow merge** - redundant approvals are harmless.
+
+**Rationale**: Label-based coordination prevents duplicate merges.
+
+---
+
+### Summary: Edge Case Decision Matrix
+
+| Edge Case | Decision | Action |
+|-----------|----------|--------|
+| No CI checks | ✅ Allow | Continue to merge |
+| Pending CI checks | ⏭️ Skip | Defer to next iteration |
+| Force-push after approval | ✅ Allow | If criteria still pass |
+| Merge conflicts | ❌ Fail | Comment and skip |
+| Stale PR (>24h) | ❌ Fail | Comment and skip |
+| Test-only changes | ✅ Allow | Standard criteria apply |
+| Manual-merge override | ⏭️ Skip | Respect human decision |
+| Multiple linked issues | ✅ Allow | Verify all closed |
+| Mixed-state CI | ❌ Fail | Require all SUCCESS |
+| Unknown critical file | ⚠️ Miss | Needs pattern update |
+| Exactly 200 lines | ✅ Allow | Limit is inclusive |
+| API rate limit | ❌ Error | Comment and continue |
+| Multiple approvals | ✅ Allow | Label is source of truth |
 
 ---
 
