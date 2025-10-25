@@ -169,55 +169,62 @@ export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
         </div>
 
         <!-- Agent Configuration Tab -->
-        <div data-tab-content="agent" class="space-y-4 hidden">
-          <div>
-            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              Role
-            </label>
-            <select
-              id="role-file"
-              class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
-            >
-              <option value="">Loading roles...</option>
-            </select>
-            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              Role files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/roles/</code>
+        <div data-tab-content="agent" class="hidden">
+          <!-- Two-column grid layout: 40% tarot card, 60% controls -->
+          <div id="role-preview" class="grid grid-cols-5 gap-4 hidden">
+            <!-- Left column: Tarot Card (2/5 = 40%) -->
+            <div class="col-span-2 flex items-start justify-center">
+              <img
+                id="role-preview-card"
+                src=""
+                alt=""
+                class="w-full h-auto object-contain"
+                style="max-height: 400px"
+              />
             </div>
-          </div>
 
-          <div>
-            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              Worker Type
-            </label>
-            <select
-              id="worker-type-select"
-              class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
-            >
-              <option value="">Loading available agents...</option>
-            </select>
-            <p class="text-xs text-gray-500 dark:text-gray-400 mt-2">
-              Only installed AI coding agents are shown
-            </p>
-          </div>
-
-          <!-- Role Preview Panel -->
-          <div id="role-preview" class="mt-6 p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 hidden">
-            <div class="flex gap-4">
-              <!-- Tarot Card -->
-              <div class="flex-shrink-0">
-                <img
-                  id="role-preview-card"
-                  src=""
-                  alt=""
-                  class="w-20 h-32 object-contain"
-                />
+            <!-- Right column: Configuration (3/5 = 60%) -->
+            <div class="col-span-3 space-y-4">
+              <!-- Worker Type -->
+              <div>
+                <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                  Worker Type
+                </label>
+                <select
+                  id="worker-type-select"
+                  class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="">Loading available agents...</option>
+                </select>
+                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  Only installed AI coding agents are shown
+                </p>
               </div>
 
-              <!-- Role Info -->
-              <div class="flex-1">
-                <h3 id="role-preview-title" class="text-lg font-bold text-gray-900 dark:text-gray-100 mb-1"></h3>
-                <p id="role-preview-description" class="text-sm text-gray-700 dark:text-gray-300 mb-2"></p>
-                <p id="role-preview-workflow" class="text-xs text-gray-600 dark:text-gray-400 font-mono"></p>
+              <!-- Role -->
+              <div>
+                <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                  Role
+                </label>
+                <select
+                  id="role-file"
+                  class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="">Loading roles...</option>
+                </select>
+                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                  Role files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/roles/</code>
+                </div>
+              </div>
+
+              <!-- Role Description -->
+              <div class="p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700">
+                <h3 id="role-preview-title" class="text-lg font-bold text-gray-900 dark:text-gray-100 mb-2"></h3>
+                <p id="role-preview-description" class="text-sm text-gray-700 dark:text-gray-300 mb-3"></p>
+                <div class="text-xs text-gray-600 dark:text-gray-400">
+                  <span class="font-semibold">Workflow:</span>
+                  <p id="role-preview-workflow" class="mt-1 font-mono"></p>
+                </div>
               </div>
             </div>
           </div>
@@ -478,6 +485,15 @@ export async function showTerminalSettingsModal(
 
     // Update role preview panel
     updateRolePreview(modal, selectedFile);
+
+    // Auto-update terminal name to match role
+    const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
+    if (selectedFile && nameInput) {
+      // Extract role name from filename (e.g., "builder.md" -> "Builder")
+      const roleName = selectedFile.replace('.md', '');
+      const defaultName = roleName.charAt(0).toUpperCase() + roleName.slice(1);
+      nameInput.value = defaultName;
+    }
 
     if (!selectedFile || !workspacePath) return;
 
