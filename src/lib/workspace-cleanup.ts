@@ -3,6 +3,7 @@ import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
 import type { AppState } from "./state";
 import type { TerminalManager } from "./terminal-manager";
+import { cleanupAllTerminalWorktrees } from "./terminal-worktree-manager";
 
 /**
  * Options for workspace cleanup operations
@@ -32,6 +33,11 @@ export interface WorkspaceCleanupOptions {
    * Callback to clear the currently attached terminal ID
    */
   setCurrentAttachedTerminalId: (id: string | null) => void;
+
+  /**
+   * Workspace path (optional) - if provided, will clean up terminal worktrees
+   */
+  workspacePath?: string;
 }
 
 /**
@@ -42,7 +48,8 @@ export interface WorkspaceCleanupOptions {
  * 2. Destroys all xterm instances
  * 3. Destroys all terminal sessions in the daemon
  * 4. Kills all loom tmux sessions to ensure clean slate
- * 5. Clears terminal state
+ * 5. Cleans up terminal worktrees (if workspacePath provided)
+ * 6. Clears terminal state
  *
  * This cleanup sequence is used by both workspace-start and workspace-reset
  * to ensure a clean state before creating new terminals.
@@ -61,7 +68,14 @@ export interface WorkspaceCleanupOptions {
  * ```
  */
 export async function cleanupWorkspace(options: WorkspaceCleanupOptions): Promise<void> {
-  const { component, state, outputPoller, terminalManager, setCurrentAttachedTerminalId } = options;
+  const {
+    component,
+    state,
+    outputPoller,
+    terminalManager,
+    setCurrentAttachedTerminalId,
+    workspacePath,
+  } = options;
 
   const logger = Logger.forComponent(component);
 
@@ -105,6 +119,22 @@ export async function cleanupWorkspace(options: WorkspaceCleanupOptions): Promis
   } catch (error) {
     logger.error("Failed to kill loom sessions", error);
     // Continue anyway - we'll try to create fresh terminals
+  }
+
+  // Clean up terminal worktrees if workspace path provided
+  if (workspacePath) {
+    logger.info("Cleaning up terminal worktrees", {
+      workspacePath,
+    });
+    try {
+      await cleanupAllTerminalWorktrees(workspacePath);
+      logger.info("Terminal worktrees cleaned up");
+    } catch (error) {
+      logger.error("Failed to clean up terminal worktrees", error, {
+        workspacePath,
+      });
+      // Continue anyway - cleanup failures are non-critical
+    }
   }
 
   // Clear state (but don't clear config files)

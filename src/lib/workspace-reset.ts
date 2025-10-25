@@ -7,6 +7,10 @@ import type { AppState, Terminal } from "./state";
 import type { TerminalManager } from "./terminal-manager";
 import { showToast } from "./toast";
 import { cleanupWorkspace } from "./workspace-cleanup";
+import {
+  createTerminalWorktreesInParallel,
+  type TerminalWorktreeConfig,
+} from "./terminal-worktree-manager";
 
 const logger = Logger.forComponent("workspace-reset");
 
@@ -65,6 +69,7 @@ export async function resetWorkspaceToDefaults(
     outputPoller,
     terminalManager,
     setCurrentAttachedTerminalId,
+    workspacePath,
   });
 
   // Call backend reset
@@ -130,18 +135,70 @@ export async function resetWorkspaceToDefaults(
 
     // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
-      logger.info("Creating terminals in parallel", {
+      logger.info("Creating terminal worktrees and sessions in parallel", {
         workspacePath,
         terminalCount: config.agents.length,
         source: logPrefix,
       });
 
-      // Build array of terminal configurations for parallel creation
+      // Step 1: Create terminal worktrees with role-specific CLAUDE.md files
+      const worktreeConfigs: TerminalWorktreeConfig[] = config.agents.map((agent) => ({
+        terminalId: agent.id,
+        terminalName: agent.name,
+        roleFile: (agent.roleConfig?.roleFile as string | undefined) || "driver.md", // Default to driver if no role file
+        workspacePath,
+      }));
+
+      const { succeeded: worktreeSuccess, failed: worktreeFailed } =
+        await createTerminalWorktreesInParallel(worktreeConfigs);
+
+      // Log worktree creation results
+      logger.info("Terminal worktree creation complete", {
+        workspacePath,
+        succeeded: worktreeSuccess.length,
+        failed: worktreeFailed.length,
+        source: logPrefix,
+      });
+
+      // Report worktree failures to user
+      if (worktreeFailed.length > 0) {
+        const failedNames = worktreeFailed
+          .map((f) => {
+            const agent = config.agents.find((a) => a.id === f.terminalId);
+            return agent?.name || f.terminalId;
+          })
+          .join(", ");
+
+        logger.error(
+          "Some terminal worktrees failed to create",
+          new Error("Worktree creation failures"),
+          {
+            workspacePath,
+            failedCount: worktreeFailed.length,
+            failedNames,
+            failures: worktreeFailed,
+            source: logPrefix,
+          }
+        );
+
+        showToast(
+          `Failed to create worktrees for ${worktreeFailed.length} terminal(s): ${failedNames}. These terminals will start in the main workspace.`,
+          "info",
+          7000
+        );
+      }
+
+      // Step 2: Build array of terminal configurations for parallel creation
+      // Use worktree paths for terminals with successful worktree creation
+      const worktreePathMap = new Map(
+        worktreeSuccess.map((w) => [w.terminalId, w.worktreePath])
+      );
+
       const terminalConfigs: TerminalConfig[] = config.agents.map((agent) => ({
         id: agent.id,
         name: agent.name,
         role: agent.role || "default",
-        workingDir: workspacePath,
+        workingDir: worktreePathMap.get(agent.id) || workspacePath, // Use worktree path if available
         instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
       }));
 
@@ -152,20 +209,31 @@ export async function resetWorkspaceToDefaults(
         state
       );
 
-      // Update agent IDs for succeeded terminals
+      // Update agent IDs and worktree paths for succeeded terminals
       for (const success of succeeded) {
         const agent = config.agents.find((a) => a.id === success.configId);
         if (agent) {
           agent.id = success.terminalId;
-          // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
-          // Agents start in the main workspace directory
-          agent.worktreePath = "";
-          logger.info("Agent will start in main workspace", {
-            workspacePath,
-            terminalName: agent.name,
-            terminalId: success.terminalId,
-            source: logPrefix,
-          });
+          // Set worktree path if worktree was created successfully
+          const worktreePath = worktreePathMap.get(success.configId);
+          agent.worktreePath = worktreePath || "";
+
+          if (worktreePath) {
+            logger.info("Agent will start in terminal worktree", {
+              workspacePath,
+              terminalName: agent.name,
+              terminalId: success.terminalId,
+              worktreePath,
+              source: logPrefix,
+            });
+          } else {
+            logger.info("Agent will start in main workspace (no worktree)", {
+              workspacePath,
+              terminalName: agent.name,
+              terminalId: success.terminalId,
+              source: logPrefix,
+            });
+          }
         }
       }
 
