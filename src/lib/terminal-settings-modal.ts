@@ -732,19 +732,19 @@ async function applySettings(
       }
     }
 
-    // Handle autonomous mode based on configuration
-    const { getAutonomousManager } = await import("./autonomous-manager");
-    const autonomousManager = getAutonomousManager();
+    // Handle interval prompts based on configuration
+    const { getIntervalPromptManager } = await import("./interval-prompt-manager");
+    const intervalManager = getIntervalPromptManager();
 
-    if (hasNewRole && roleConfig.targetInterval && (roleConfig.targetInterval as number) > 0) {
-      // Start or restart autonomous mode
+    if (hasNewRole && roleConfig.targetInterval !== undefined && (roleConfig.targetInterval as number) >= 0) {
+      // Start or restart interval prompts (includes interval: 0 for continuous)
       const updatedTerminal = state.getTerminal(terminal.id);
       if (updatedTerminal) {
-        await autonomousManager.restartAutonomous(updatedTerminal);
+        intervalManager.restart(updatedTerminal);
       }
     } else {
-      // Stop autonomous mode if disabled
-      await autonomousManager.stopAutonomous(terminal.id);
+      // Stop interval prompts if disabled
+      intervalManager.stop(terminal.id);
     }
 
     // Close modal and re-render
