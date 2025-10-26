@@ -6,18 +6,20 @@
  */
 
 export type TarotRole =
-  | "worker"
+  | "builder"
   | "curator"
   | "champion"
   | "architect"
-  | "reviewer"
-  | "critic"
-  | "fixer"
+  | "judge"
+  | "hermit"
+  | "doctor"
+  | "guide"
+  | "driver"
   | "default";
 
 /**
  * Maps a role string to the corresponding tarot card SVG path
- * @param role - The terminal role (e.g., "claude-code-worker", "curator", etc.)
+ * @param role - The terminal role (e.g., "builder", "curator", "judge", etc.)
  * @returns Path to the tarot card SVG file, or default card if role not recognized
  */
 export function getTarotCardPath(role: string | undefined): string {
@@ -25,14 +27,16 @@ export function getTarotCardPath(role: string | undefined): string {
   const normalizedRole = normalizeRole(role);
 
   const roleToCard: Record<TarotRole, string> = {
-    worker: "assets/tarot-cards/worker.svg",
+    builder: "assets/tarot-cards/builder.svg",
     curator: "assets/tarot-cards/curator.svg",
     champion: "assets/tarot-cards/champion.svg",
     architect: "assets/tarot-cards/architect.svg",
-    reviewer: "assets/tarot-cards/reviewer.svg",
-    critic: "assets/tarot-cards/critic.svg",
-    fixer: "assets/tarot-cards/fixer.svg",
-    default: "assets/tarot-cards/worker.svg", // Fallback to worker card
+    judge: "assets/tarot-cards/judge.svg",
+    hermit: "assets/tarot-cards/hermit.svg",
+    doctor: "assets/tarot-cards/doctor.svg",
+    guide: "assets/tarot-cards/guide.svg",
+    driver: "assets/tarot-cards/driver.svg",
+    default: "assets/tarot-cards/builder.svg", // Fallback to builder card
   };
 
   return roleToCard[normalizedRole] || roleToCard.default;
@@ -40,7 +44,7 @@ export function getTarotCardPath(role: string | undefined): string {
 
 /**
  * Normalizes a role identifier to the base tarot role
- * @param role - Role identifier (e.g., "claude-code-worker", "worker", "curator")
+ * @param role - Role identifier (e.g., "builder", "curator", "judge")
  * @returns Normalized tarot role
  */
 function normalizeRole(role: string | undefined): TarotRole {
@@ -51,8 +55,8 @@ function normalizeRole(role: string | undefined): TarotRole {
   const lowerRole = role.toLowerCase();
 
   // Map various role formats to tarot roles
-  if (lowerRole.includes("worker")) {
-    return "worker";
+  if (lowerRole.includes("builder")) {
+    return "builder";
   }
   if (lowerRole.includes("curator")) {
     return "curator";
@@ -63,14 +67,20 @@ function normalizeRole(role: string | undefined): TarotRole {
   if (lowerRole.includes("architect")) {
     return "architect";
   }
-  if (lowerRole.includes("reviewer")) {
-    return "reviewer";
+  if (lowerRole.includes("judge")) {
+    return "judge";
   }
-  if (lowerRole.includes("critic")) {
-    return "critic";
+  if (lowerRole.includes("hermit")) {
+    return "hermit";
   }
-  if (lowerRole.includes("fixer")) {
-    return "fixer";
+  if (lowerRole.includes("doctor")) {
+    return "doctor";
+  }
+  if (lowerRole.includes("guide")) {
+    return "guide";
+  }
+  if (lowerRole.includes("driver")) {
+    return "driver";
   }
 
   return "default";
@@ -85,13 +95,15 @@ export function getTarotArchetype(role: string | undefined): string {
   const normalizedRole = normalizeRole(role);
 
   const roleToArchetype: Record<TarotRole, string> = {
-    worker: "The Magician",
+    builder: "The Magician",
     curator: "The High Priestess",
     champion: "Strength",
     architect: "The Emperor",
-    reviewer: "Justice",
-    critic: "The Hermit",
-    fixer: "The Hanged Man",
+    judge: "Justice",
+    hermit: "The Hermit",
+    doctor: "The Hanged Man",
+    guide: "The Hierophant",
+    driver: "The Chariot",
     default: "The Fool",
   };
 
