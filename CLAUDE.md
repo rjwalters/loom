@@ -35,7 +35,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 ```bash
 # Terminal 1: Builder working on feature
 /builder
-# Claims loom:ready issue, implements, creates PR
+# Claims loom:issue issue, implements, creates PR
 
 # Terminal 2: Judge reviewing PRs
 /judge
@@ -43,7 +43,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 # Terminal 3: Curator maintaining issues
 /curator
-# Enhances unlabeled issues, marks as loom:ready
+# Enhances unlabeled issues, marks as loom:curated
 ```
 
 ### 2. Tauri App Mode
@@ -84,6 +84,11 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Purpose**: Review pull requests
 - **Workflow**: Finds `loom:review-requested` PRs → reviews → approves or requests changes
 - **When to use**: Code quality assurance, automated reviews
+
+**Champion** (Autonomous 10min, `champion.md`)
+- **Purpose**: Auto-merge approved PRs
+- **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
+- **When to use**: Reducing manual merge overhead for approved PRs
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
@@ -133,12 +138,18 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 ```
 (created) → loom:issue → loom:building → (closed)
            ↑ Curator      ↑ Builder
+
+(created) → loom:curating → loom:curated → loom:issue
+           ↑ Curator        ↑ Curator      ↑ Human approves
+
+(bug) → loom:treating → (fixed)
+       ↑ Doctor
 ```
 
 **PR Lifecycle**:
 ```
-(created) → loom:review-requested → loom:pr → (merged)
-           ↑ Builder                ↑ Judge    ↑ Human
+(created) → loom:review-requested → loom:pr → (auto-merged)
+           ↑ Builder                ↑ Judge    ↑ Champion
 ```
 
 **Proposal Lifecycle**:
@@ -152,14 +163,21 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 ### Label Definitions
 
+**Workflow Labels**:
 - **`loom:issue`**: Issue approved for work, ready for Builder to claim
-- **`loom:building`**: Issue being implemented OR PR under review
+- **`loom:building`**: Builder is actively implementing this issue
+- **`loom:curating`**: Curator is actively enhancing this issue
+- **`loom:treating`**: Doctor is actively fixing this bug or addressing PR feedback
 - **`loom:review-requested`**: PR ready for Judge to review
-- **`loom:pr`**: PR approved by Judge, ready for human to merge
+- **`loom:pr`**: PR approved by Judge, ready for Champion to auto-merge
+
+**Proposal Labels**:
 - **`loom:architect`**: Architectural proposal awaiting user approval
 - **`loom:hermit`**: Simplification proposal awaiting user approval
-- **`loom:curated`**: Issue enhanced by Curator, awaiting approval
-- **`loom:blocked`**: Implementation blocked, needs help
+- **`loom:curated`**: Issue enhanced by Curator, awaiting human approval
+
+**Status Labels**:
+- **`loom:blocked`**: Implementation blocked, needs help or clarification
 - **`loom:urgent`**: Critical issue requiring immediate attention
 
 ## Git Worktree Workflow
