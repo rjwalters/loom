@@ -4,11 +4,27 @@ Randomly select and assume an archetypal role from the Loom orchestration system
 
 ## Process
 
-1. **List available roles**: Check `defaults/roles/*.md` or `.loom/roles/*.md`
-2. **Select one at random**: Use current timestamp or random selection
-3. **Read the role definition**: Load the markdown file for the selected role
-4. **Follow the role's workflow**: Complete ONE iteration only (one task, one PR review, one issue triage, etc.)
-5. **Report results**: Summarize what you accomplished with links to issues/PRs modified
+1. **List available roles**: 9 roles available (builder, judge, curator, doctor, champion, architect, hermit, guide, driver)
+2. **Select role using time-based selection**: Use `Date.now() % 13` for weighted random selection
+3. **Role mapping** (core operational roles are double-weighted):
+   ```
+   0: builder    (2x weight)
+   1: builder    (2x weight)
+   2: judge      (2x weight)
+   3: judge      (2x weight)
+   4: curator    (2x weight)
+   5: curator    (2x weight)
+   6: doctor     (2x weight)
+   7: doctor     (2x weight)
+   8: champion   (1x weight)
+   9: architect  (1x weight)
+   10: hermit    (1x weight)
+   11: guide     (1x weight)
+   12: driver    (1x weight)
+   ```
+4. **Read the role definition**: Load `.loom/roles/<role>.md` or `defaults/roles/<role>.md`
+5. **Follow the role's workflow**: Complete ONE iteration only (one task, one PR review, one issue triage, etc.)
+6. **Report results**: Summarize what you accomplished with links to issues/PRs modified
 
 ## Available Roles
 
@@ -63,6 +79,9 @@ Follow the label-based coordination system (ADR-0006):
 
 ## Notes
 
+- **Time-based selection**: Uses `Date.now() % 13` for deterministic but unpredictable role selection (no bash permissions needed!)
+- **Weighted distribution**: Core operational roles (builder, judge, curator, doctor) are 2x more likely to be selected than supporting roles
+- **Zero permissions**: No bash/python execution required - pure time-based mathematics
 - This command simulates one terminal's work in the Loom multi-terminal orchestration system
 - Multiple Claude Code sessions can run `/loom` in parallel for distributed work
 - Each iteration should be atomic and complete (don't leave partial work)
@@ -76,7 +95,9 @@ Follow the label-based coordination system (ADR-0006):
 /loom
 
 # Claude responds:
-"🎭 Rolling random role... Assuming the Judge role for this iteration.
+"🎭 Selecting role using time-based weighted selection...
+   Time index: Date.now() % 13 = 2
+   Selected: Judge (2x weighted - core operational role)
 
 Looking for PRs with loom:review-requested...
 Found PR #401 - 'Add terminal restart functionality'
