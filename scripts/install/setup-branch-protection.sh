@@ -32,15 +32,25 @@ fi
 
 cd "$TARGET_PATH"
 
-# Get repo owner/name
-REPO_INFO=$(gh repo view --json owner,name 2>/dev/null || true)
-if [[ -z "$REPO_INFO" ]]; then
+# Detect the repository from origin remote (not upstream)
+ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+if [[ -z "$ORIGIN_URL" ]]; then
   error "Failed to get repository information. Is this a GitHub repository?"
   exit 1
 fi
 
-OWNER=$(echo "$REPO_INFO" | jq -r .owner.login)
-REPO=$(echo "$REPO_INFO" | jq -r .name)
+# Extract owner/repo from URL (handles both HTTPS and SSH)
+# HTTPS: https://github.com/owner/repo.git -> owner/repo
+# SSH: git@github.com:owner/repo.git -> owner/repo
+REPO_NAME=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
+
+if [[ ! "$REPO_NAME" =~ ^[^/]+/[^/]+$ ]]; then
+  error "Could not extract valid repository from URL: $ORIGIN_URL"
+  exit 1
+fi
+
+OWNER=$(echo "$REPO_NAME" | cut -d'/' -f1)
+REPO=$(echo "$REPO_NAME" | cut -d'/' -f2)
 
 echo ""
 info "Configuring branch protection for: ${OWNER}/${REPO} (${BRANCH_NAME})"

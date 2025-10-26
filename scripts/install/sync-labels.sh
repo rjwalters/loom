@@ -31,6 +31,24 @@ warning() {
 
 cd "$WORKTREE_PATH"
 
+# Detect the target repository from git remote
+# This ensures we use the fork instead of upstream when both exist
+ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+if [[ -z "$ORIGIN_URL" ]]; then
+  error "Could not determine repository from git remote"
+fi
+
+# Extract owner/repo from URL (handles both HTTPS and SSH)
+# HTTPS: https://github.com/owner/repo.git -> owner/repo
+# SSH: git@github.com:owner/repo.git -> owner/repo
+REPO=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
+
+if [[ ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
+  error "Could not extract valid repository from URL: $ORIGIN_URL"
+fi
+
+info "Target repository: $REPO"
+
 LABELS_FILE=".github/labels.yml"
 
 if [[ ! -f "$LABELS_FILE" ]]; then
@@ -56,7 +74,7 @@ DEFAULT_LABELS=(
 
 info "Removing default GitHub labels..."
 for label in "${DEFAULT_LABELS[@]}"; do
-  if output=$(gh label delete "$label" --yes 2>&1); then
+  if output=$(gh label delete "$label" -R "$REPO" --yes 2>&1); then
     info "Deleted default label: $label"
   elif ! echo "$output" | grep -qi "not found\|404"; then
     # Only warn if it failed for a reason other than "not found" or 404
@@ -94,9 +112,9 @@ while IFS= read -r line; do
 
     # Try to create or update the label
     # Use gh label list to check existence, suppressing grep's stderr only
-    if gh label list --json name --jq '.[].name' 2>&1 | grep -q "^${name}$" 2>/dev/null; then
+    if gh label list -R "$REPO" --json name --jq '.[].name' 2>&1 | grep -q "^${name}$" 2>/dev/null; then
       # Label exists, update it
-      if output=$(gh label edit "$name" --description "$description" --color "$color" 2>&1); then
+      if output=$(gh label edit "$name" -R "$REPO" --description "$description" --color "$color" 2>&1); then
         info "Updated label: $name"
       else
         warning "Failed to update label: $name"
@@ -104,13 +122,13 @@ while IFS= read -r line; do
       fi
     else
       # Label doesn't exist, create it
-      if output=$(gh label create "$name" --description "$description" --color "$color" 2>&1); then
+      if output=$(gh label create "$name" -R "$REPO" --description "$description" --color "$color" 2>&1); then
         info "Created label: $name"
       else
         # Check if it failed because the label already exists
         if echo "$output" | grep -q "already exists"; then
           info "Label '$name' already exists, attempting update instead..."
-          if update_output=$(gh label edit "$name" --description "$description" --color "$color" 2>&1); then
+          if update_output=$(gh label edit "$name" -R "$REPO" --description "$description" --color "$color" 2>&1); then
             info "Updated label: $name"
           else
             warning "Failed to update label: $name"

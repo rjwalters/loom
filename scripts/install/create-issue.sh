@@ -22,6 +22,26 @@ success() {
 
 cd "$TARGET_PATH"
 
+# Detect the target repository from git remote
+# This ensures we use the fork instead of upstream when both exist
+ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+if [[ -z "$ORIGIN_URL" ]]; then
+  echo "Error: Could not determine repository from git remote" >&2
+  exit 1
+fi
+
+# Extract owner/repo from URL (handles both HTTPS and SSH)
+# HTTPS: https://github.com/owner/repo.git -> owner/repo
+# SSH: git@github.com:owner/repo.git -> owner/repo
+REPO=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
+
+if [[ ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
+  echo "Error: Could not extract valid repository from URL: $ORIGIN_URL" >&2
+  exit 1
+fi
+
+info "Target repository: $REPO"
+
 # Get current date
 INSTALL_DATE=$(date +%Y-%m-%d)
 
@@ -56,6 +76,7 @@ info "Creating installation issue..."
 # Create issue and capture the URL
 # NOTE: Don't add label during creation - labels are synced in Step 5
 ISSUE_URL=$(gh issue create \
+  -R "$REPO" \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$ISSUE_BODY" 2>&1 | grep -oE 'https://github\.com/[^[:space:]]+/issues/[0-9]+' | head -1 | tr -d '\n\r')
 
@@ -78,7 +99,7 @@ success "Created issue #${ISSUE_NUMBER}"
 
 # Try to add loom:building label if it exists (graceful failure if label doesn't exist yet)
 info "Adding loom:building label..."
-if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" >/dev/null 2>&1; then
+if gh issue edit "$ISSUE_NUMBER" -R "$REPO" --add-label "loom:building" >/dev/null 2>&1; then
   success "Added loom:building label"
 else
   info "Label will be added after label sync (Step 5)"

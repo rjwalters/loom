@@ -90,7 +90,13 @@ cleanup_on_error() {
     if [[ -n "${ISSUE_NUMBER:-}" ]]; then
       info "Cleaning up tracking issue #${ISSUE_NUMBER}..."
       cd "$TARGET_PATH" 2>/dev/null || true
-      gh issue close "${ISSUE_NUMBER}" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
+      # Detect repo for gh commands (best effort, ignore errors in cleanup)
+      CLEANUP_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
+      if [[ -n "$CLEANUP_REPO" ]] && [[ "$CLEANUP_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+        gh issue close "${ISSUE_NUMBER}" -R "$CLEANUP_REPO" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
+      else
+        gh issue close "${ISSUE_NUMBER}" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
+      fi
     fi
 
     if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -d "${TARGET_PATH}/${WORKTREE_PATH}" ]]; then
@@ -314,10 +320,16 @@ echo ""
 # Now that labels are synced, ensure the tracking issue has the loom:building label
 info "Ensuring tracking issue has loom:building label..."
 cd "$TARGET_PATH"
-if gh issue edit "$ISSUE_NUMBER" --add-label "loom:building" >/dev/null 2>&1; then
-  success "Added loom:building label to issue #${ISSUE_NUMBER}"
+# Detect the target repository from git remote
+TARGET_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
+if [[ -n "$TARGET_REPO" ]] && [[ "$TARGET_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+  if gh issue edit "$ISSUE_NUMBER" -R "$TARGET_REPO" --add-label "loom:building" >/dev/null 2>&1; then
+    success "Added loom:building label to issue #${ISSUE_NUMBER}"
+  else
+    warning "Could not add loom:building label to issue #${ISSUE_NUMBER}"
+  fi
 else
-  warning "Could not add loom:building label to issue #${ISSUE_NUMBER}"
+  warning "Could not detect repository for label update"
 fi
 
 echo ""
@@ -382,7 +394,13 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
 
   # Close the tracking issue
   cd "$TARGET_PATH"
-  gh issue close "${ISSUE_NUMBER}" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
+  # Detect the target repository from git remote
+  TARGET_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
+  if [[ -n "$TARGET_REPO" ]] && [[ "$TARGET_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+    gh issue close "${ISSUE_NUMBER}" -R "$TARGET_REPO" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
+  else
+    gh issue close "${ISSUE_NUMBER}" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
+  fi
 
   # Remove the worktree
   git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
