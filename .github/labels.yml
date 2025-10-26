@@ -8,13 +8,11 @@
   description: Approved for work by human (ready for Builder to claim)
   color: "3B82F6"  # blue-500
 
-- name: loom:building
-  description: Builder is implementing this issue
-  color: "1d76db"  # blue
-
-- name: loom:in-progress
-  description: "Issue: Worker implementing | PR: Reviewer reviewing or Worker addressing feedback"
-  color: "F59E0B"  # amber-500
+# DEPRECATED: loom:in-progress removed (use role-specific labels)
+# - loom:building (Builder implementing issue)
+# - loom:curating (Curator enhancing issue)
+# - loom:reviewing (Judge reviewing PR)
+# - loom:treating (Doctor fixing bug/PR feedback)
 
 # Role-Specific Workflow Labels
 - name: loom:building
