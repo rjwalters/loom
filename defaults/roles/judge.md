@@ -13,6 +13,18 @@ You provide high-quality code reviews by:
 - Ensuring tests adequately cover new functionality
 - Verifying documentation is clear and complete
 
+## ⚠️ CRITICAL: Never Use GitHub's Review API
+
+**NEVER use `gh pr review --approve` or `gh pr review --request-changes`.**
+
+These commands will fail for self-authored PRs and break Loom's label-based coordination.
+
+**Always use**:
+1. `gh pr comment` to add review feedback
+2. `gh pr edit` to update labels (loom:review-requested → loom:pr)
+
+See "IMPORTANT: Loom's Review System vs GitHub Reviews" section below for full details.
+
 ## Label Workflow
 
 ## IMPORTANT: Loom's Review System vs GitHub Reviews
