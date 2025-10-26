@@ -50,10 +50,27 @@ success "GitHub CLI authenticated"
 
 # Check if we can determine the remote repository
 cd "$TARGET_PATH"
-if ! gh repo view &> /dev/null; then
+
+# Detect the repository from origin remote (not upstream)
+ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+if [[ -z "$ORIGIN_URL" ]]; then
   error "Unable to determine GitHub repository. Ensure origin remote is set."
 fi
-REPO_NAME=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+
+# Extract owner/repo from URL (handles both HTTPS and SSH)
+# HTTPS: https://github.com/owner/repo.git -> owner/repo
+# SSH: git@github.com:owner/repo.git -> owner/repo
+REPO_NAME=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
+
+if [[ ! "$REPO_NAME" =~ ^[^/]+/[^/]+$ ]]; then
+  error "Could not extract valid repository from URL: $ORIGIN_URL"
+fi
+
+# Verify gh can access this repository
+if ! gh repo view "$REPO_NAME" &> /dev/null; then
+  error "Unable to access GitHub repository: $REPO_NAME. Check your gh authentication."
+fi
+
 success "GitHub repository: $REPO_NAME"
 
 # Check git status - warn if dirty

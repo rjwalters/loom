@@ -38,6 +38,24 @@ fi
 
 cd "$WORKTREE_PATH"
 
+# Detect the target repository from git remote
+# This ensures we use the fork instead of upstream when both exist
+ORIGIN_URL=$(git config --get remote.origin.url 2>/dev/null || echo "")
+if [[ -z "$ORIGIN_URL" ]]; then
+  error "Could not determine repository from git remote"
+fi
+
+# Extract owner/repo from URL (handles both HTTPS and SSH)
+# HTTPS: https://github.com/owner/repo.git -> owner/repo
+# SSH: git@github.com:owner/repo.git -> owner/repo
+REPO=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
+
+if [[ ! "$REPO" =~ ^[^/]+/[^/]+$ ]]; then
+  error "Could not extract valid repository from URL: $ORIGIN_URL"
+fi
+
+info "Target repository: $REPO"
+
 # Get current branch
 BRANCH_NAME=$(git rev-parse --abbrev-ref HEAD)
 
@@ -120,6 +138,7 @@ EOF
 # Create pull request and capture the URL
 # Redirect stderr to stdout to capture the full output, then extract the URL
 GH_PR_OUTPUT=$(gh pr create \
+  -R "$REPO" \
   --base "$BASE_BRANCH" \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$PR_BODY" \
