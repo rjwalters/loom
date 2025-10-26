@@ -1,0 +1,43 @@
+# Configuration for cargo-deny
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Security vulnerabilities from RustSec advisory database
+vulnerability = "deny"
+unmaintained = "warn"
+unsound = "warn"
+yanked = "warn"
+notice = "warn"
+
+[licenses]
+# Ensure all dependencies have acceptable licenses
+unlicensed = "deny"
+# Allow common open source licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-DFS-2016",  # For unicode-ident
+    "0BSD",              # For adler
+]
+copyleft = "warn"
+# Allow licenses that are not in the allowed list to pass for now
+# This can be tightened later
+default = "warn"
+
+[bans]
+# Warn about multiple versions of the same crate
+multiple-versions = "warn"
+# Wildcards in dependencies are not allowed
+wildcards = "deny"
+# Prevent known bad crates
+deny = []
+
+[sources]
+# Ensure dependencies come from trusted sources
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

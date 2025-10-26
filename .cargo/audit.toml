@@ -1,0 +1,31 @@
+# Cargo audit configuration
+# Ignored advisories for known transitive dependencies that are not security risks
+
+[advisories]
+# All GTK3-related unmaintained warnings from gtk-rs
+# These are transitive dependencies from Tauri v2's GTK bindings on Linux.
+# All advisories below are for "unmaintained" status, not security vulnerabilities.
+# Tauri v2 uses GTK3 bindings which will be resolved when Tauri migrates to GTK4.
+ignore = [
+    # GTK3 ecosystem (gtk-rs) - deprecated in favor of GTK4
+    "RUSTSEC-2024-0411",  # gio - unmaintained
+    "RUSTSEC-2024-0412",  # gdk - unmaintained
+    "RUSTSEC-2024-0413",  # atk - unmaintained
+    "RUSTSEC-2024-0414",  # gdkx11 - unmaintained
+    "RUSTSEC-2024-0415",  # gio-sys - unmaintained
+    "RUSTSEC-2024-0416",  # atk-sys - unmaintained
+    "RUSTSEC-2024-0417",  # gdk-pixbuf - unmaintained
+    "RUSTSEC-2024-0418",  # gdk-sys - unmaintained
+    "RUSTSEC-2024-0419",  # gdkwayland-sys - unmaintained
+    "RUSTSEC-2024-0420",  # gdkx11-sys - unmaintained
+    "RUSTSEC-2024-0429",  # gtk-sys - unmaintained
+    "RUSTSEC-2024-0370",  # gdk-pixbuf-sys - unmaintained
+
+    # Other unmaintained transitive dependencies
+    "RUSTSEC-2025-0057",  # fxhash - unmaintained
+    "RUSTSEC-2025-0075",  # unmaintained
+    "RUSTSEC-2025-0080",  # unmaintained
+    "RUSTSEC-2025-0081",  # unmaintained
+    "RUSTSEC-2025-0098",  # unmaintained
+    "RUSTSEC-2025-0100",  # unmaintained
+]
