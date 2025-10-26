@@ -85,6 +85,11 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Workflow**: Finds `loom:review-requested` PRs → reviews → approves or requests changes
 - **When to use**: Code quality assurance, automated reviews
 
+**Champion** (Autonomous 10min, `champion.md`)
+- **Purpose**: Auto-merge approved PRs
+- **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
+- **When to use**: Reducing manual merge overhead for approved PRs
+
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
 - **Workflow**: Finds unlabeled issues → adds context → marks as `loom:issue`
