@@ -45,7 +45,7 @@
   },
   "app": {
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: tauri:; font-src 'self'; connect-src 'self' tauri:"
     },
     "windows": [
       {
