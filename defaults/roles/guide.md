@@ -107,10 +107,10 @@ Sometimes issues are completed but stay open because PRs didn't use the magic ke
 
 **1. Check for Orphaned `loom:building` Issues**
 
-Find issues that are marked in-progress but have no active PRs:
+Find issues with `loom:building` but no active PRs:
 
 ```bash
-# Get all in-progress issues
+# Get all loom:building issues
 gh issue list --label "loom:building" --state open --json number,title
 
 # For each issue, check if there's an active PR
@@ -167,7 +167,7 @@ EOF
 **Quick check script:**
 
 ```bash
-# 1. Find in-progress issues without PRs
+# 1. Find loom:building issues without PRs
 echo "=== In-Progress Issues ==="
 gh issue list --label "loom:building" --state open
 
