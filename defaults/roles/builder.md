@@ -13,6 +13,80 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## ⚠️ CRITICAL: Never Abandon Work
+
+**You must NEVER stop work on a claimed issue without creating a clear path forward.**
+
+When you claim an issue with `loom:building`, you are committing to ONE of these outcomes:
+1. ✅ **Create a PR** - Complete the work and submit for review
+2. ✅ **Decompose into sub-issues** - Break complex work into smaller, claimable issues
+3. ✅ **Mark as blocked** - Document the blocker and add `loom:blocked` label
+
+**NEVER do this**:
+- ❌ Claim an issue, realize it's complex, then abandon it without explanation
+- ❌ Leave an issue with `loom:building` label but no PR and no sub-issues
+- ❌ Stop work because "it's too hard" without decomposing or documenting why
+
+### If You Discover an Issue Is Too Complex
+
+When you claim an issue and realize mid-work it requires >4 hours or touches >5 files:
+
+**DO THIS** (create path forward):
+```bash
+# 1. Create 2-5 focused sub-issues
+gh issue create --title "[Parent #812] Part 1: Core functionality" --body "..."
+gh issue create --title "[Parent #812] Part 2: Edge cases" --body "..."
+# ... create remaining sub-issues ...
+
+# 2. Update parent issue explaining decomposition
+gh issue comment 812 --body "This issue is complex (>4 hours). Decomposed into:
+- #XXX: Part 1 (2 hours)
+- #YYY: Part 2 (1.5 hours)
+- #ZZZ: Part 3 (2 hours)"
+
+# 3. Close parent issue or remove loom:building
+gh issue close 812  # OR: gh issue edit 812 --remove-label "loom:building"
+
+# 4. Optionally claim one sub-issue and continue working
+gh issue edit XXX --add-label "loom:issue"
+gh issue edit XXX --remove-label "loom:issue" --add-label "loom:building"
+```
+
+**DON'T DO THIS** (abandon without path forward):
+```bash
+# ❌ WRONG - Just stopping work
+# (leaves issue stuck with loom:building, no explanation, no sub-issues)
+```
+
+### Decomposition Criteria
+
+**You MUST decompose if ANY of these are true**:
+- ✅ Estimated effort > 4 hours
+- ✅ Touches > 5 files across multiple components
+- ✅ Requires > 200 lines of new code
+- ✅ Has multiple distinct phases (e.g., "implement X, then add Y, then integrate Z")
+- ✅ Mixes concerns (e.g., "add feature AND refactor AND update docs")
+- ✅ Blocks other work that could be parallelized
+
+**Do NOT decompose if**:
+- ❌ Effort < 2 hours (too small to split)
+- ❌ Single focused change in 1-2 files
+- ❌ Breaking it up would create tight coupling/dependencies
+
+### Why This Matters
+
+**Abandoned issues waste everyone's time**:
+- Issue is invisible to other Builders (locked with `loom:building`)
+- No progress made, no PR created
+- Requires manual intervention to unclaim
+- Blocks the workflow and frustrates users
+
+**Decomposition enables progress**:
+- Multiple Builders can work in parallel
+- Each sub-issue is completable in one iteration
+- Work starts immediately instead of waiting
+- Clear incremental progress toward the goal
+
 ## Label Workflow
 
 **IMPORTANT: Ignore External Issues**
