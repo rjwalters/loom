@@ -72,20 +72,20 @@
     "@xterm/xterm": "^5.5.0"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.3.0",
-    "@tailwindcss/postcss": "^4.1.16",
-    "@tauri-apps/cli": "^2.9.1",
-    "@vitest/coverage-v8": "^4.0.3",
-    "@vitest/ui": "^4.0.3",
+    "@biomejs/biome": "^2.3.4",
+    "@tailwindcss/postcss": "^4.1.17",
+    "@tauri-apps/cli": "^2.9.4",
+    "@vitest/coverage-v8": "^4.0.8",
+    "@vitest/ui": "^4.0.8",
     "autoprefixer": "^10.4.21",
-    "happy-dom": "^20.0.8",
+    "happy-dom": "^20.0.10",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.6",
     "postcss": "^8.5.6",
-    "tailwindcss": "^4.1.16",
+    "tailwindcss": "^4.1.17",
     "typescript": "^5.9.3",
-    "vite": "^7.1.11",
-    "vitest": "^4.0.3"
+    "vite": "^7.2.2",
+    "vitest": "^4.0.8"
   },
   "lint-staged": {
     "*.{ts,tsx,js,jsx,json}": [
