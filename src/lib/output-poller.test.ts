@@ -29,9 +29,9 @@ function assertLogContains(spy: { mock: { calls: unknown[][] } }, expectedSubstr
 }
 describe("OutputPoller", () => {
   let poller: OutputPoller;
-  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
-  let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
-  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let consoleLogSpy: any;
+  let consoleWarnSpy: any;
+  let consoleErrorSpy: any;
 
   // Mock terminal manager
   const mockTerminalManager = {
@@ -373,8 +373,8 @@ describe("OutputPoller", () => {
       // First error - should log
       await vi.runOnlyPendingTimersAsync();
 
-      const errorLogCount = consoleErrorSpy.mock.calls.filter((call) =>
-        call.some((arg) => typeof arg === "string" && arg.includes("Error polling terminal"))
+      const errorLogCount = consoleErrorSpy.mock.calls.filter((call: any) =>
+        call.some((arg: any) => typeof arg === "string" && arg.includes("Error polling terminal"))
       ).length;
 
       // Should have logged first error (1 consecutive errors)
@@ -473,8 +473,8 @@ describe("OutputPoller", () => {
       await vi.runOnlyPendingTimersAsync();
 
       // Should not log frequency change (already idle)
-      const frequencyChangeLogs = consoleLogSpy.mock.calls.filter((call) =>
-        call.some((arg) => typeof arg === "string" && arg.includes("poll frequency"))
+      const frequencyChangeLogs = consoleLogSpy.mock.calls.filter((call: any) =>
+        call.some((arg: any) => typeof arg === "string" && arg.includes("poll frequency"))
       );
       expect(frequencyChangeLogs.length).toBe(0);
     });

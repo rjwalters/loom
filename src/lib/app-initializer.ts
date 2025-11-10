@@ -93,7 +93,7 @@ export async function initializeApp(deps: {
   handleWorkspacePathInput: (path: string) => Promise<void>;
   render: () => void;
 }): Promise<void> {
-  const { state, validateWorkspacePath, handleWorkspacePathInput, render} = deps;
+  const { state, validateWorkspacePath, handleWorkspacePathInput, render } = deps;
 
   // Set initializing state to show loading UI
   state.setInitializing(true);
@@ -117,7 +117,13 @@ export async function initializeApp(deps: {
       logger.info("Using CLI workspace (takes precedence over stored workspace)");
 
       // Validate and load CLI workspace
-      if (await tryLoadWorkspace(cliWorkspace, "CLI", { validateWorkspacePath, handleWorkspacePathInput, state })) {
+      if (
+        await tryLoadWorkspace(cliWorkspace, "CLI", {
+          validateWorkspacePath,
+          handleWorkspacePathInput,
+          state,
+        })
+      ) {
         return; // CLI workspace loaded successfully - skip stored workspace
       }
 
@@ -149,7 +155,13 @@ export async function initializeApp(deps: {
       logger.info("Found stored workspace", { storedPath, priority: "lowest" });
 
       // Validate and load stored workspace
-      if (await tryLoadWorkspace(storedPath, "Tauri storage", { validateWorkspacePath, handleWorkspacePathInput, state })) {
+      if (
+        await tryLoadWorkspace(storedPath, "Tauri storage", {
+          validateWorkspacePath,
+          handleWorkspacePathInput,
+          state,
+        })
+      ) {
         return;
       }
 
@@ -163,7 +175,13 @@ export async function initializeApp(deps: {
         localStorageWorkspace,
       });
 
-      if (await tryLoadWorkspace(localStorageWorkspace, "localStorage", { validateWorkspacePath, handleWorkspacePathInput, state })) {
+      if (
+        await tryLoadWorkspace(localStorageWorkspace, "localStorage", {
+          validateWorkspacePath,
+          handleWorkspacePathInput,
+          state,
+        })
+      ) {
         return;
       }
 
@@ -182,7 +200,13 @@ export async function initializeApp(deps: {
         localStorageWorkspace,
       });
 
-      if (await tryLoadWorkspace(localStorageWorkspace, "localStorage (fallback)", { validateWorkspacePath, handleWorkspacePathInput, state })) {
+      if (
+        await tryLoadWorkspace(localStorageWorkspace, "localStorage (fallback)", {
+          validateWorkspacePath,
+          handleWorkspacePathInput,
+          state,
+        })
+      ) {
         return;
       }
 

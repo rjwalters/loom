@@ -41,9 +41,9 @@ function assertLogMessage(spy: { mock: { calls: unknown[][] } }, expectedMessage
 }
 describe("HealthMonitor", () => {
   let monitor: HealthMonitor;
-  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
-  let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
-  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let consoleLogSpy: any;
+  let consoleWarnSpy: any;
+  let consoleErrorSpy: any;
   let mockTerminals: Terminal[];
   let mockState: any;
   let mockPoller: any;
@@ -265,7 +265,7 @@ describe("HealthMonitor", () => {
 
       // Check for error log with message containing "Health check failed"
       const errorCalls = consoleErrorSpy.mock.calls;
-      const errorCall = errorCalls.find((call) => {
+      const errorCall = errorCalls.find((call: any) => {
         try {
           const log = JSON.parse(call[0] as string);
           return log.message?.includes("Health check failed");
@@ -548,7 +548,7 @@ describe("HealthMonitor", () => {
 
       // Check for error log with message "Error in health callback"
       const errorCalls = consoleErrorSpy.mock.calls;
-      const errorCall = errorCalls.find((call) => {
+      const errorCall = errorCalls.find((call: any) => {
         try {
           const log = JSON.parse(call[0] as string);
           return log.message === "Error in health callback";

@@ -7,7 +7,6 @@ export function initTheme(): void {
 }
 
 export function toggleTheme(): void {
-  const wasDark = document.documentElement.classList.contains("dark");
   const isDark = document.documentElement.classList.toggle("dark");
   const newTheme = isDark ? "dark" : "light";
   localStorage.setItem("theme", newTheme);

@@ -32,51 +32,43 @@ const ROLE_INFO: Record<
   },
   "architect.md": {
     archetype: "The Emperor",
-    description:
-      "Envisions system architecture and creates technical proposals for improvements.",
+    description: "Envisions system architecture and creates technical proposals for improvements.",
     workflow: "Analyzes codebase → creates proposals → marks loom:architect",
     cardFile: "architect.svg",
   },
   "judge.md": {
     archetype: "Justice",
-    description:
-      "Maintains quality through thorough code review and constructive feedback.",
-    workflow:
-      "Finds loom:review-requested → reviews → approves or requests changes",
+    description: "Maintains quality through thorough code review and constructive feedback.",
+    workflow: "Finds loom:review-requested → reviews → approves or requests changes",
     cardFile: "reviewer.svg",
   },
   "hermit.md": {
     archetype: "The Hermit",
-    description:
-      "Questions assumptions and identifies code simplification opportunities.",
+    description: "Questions assumptions and identifies code simplification opportunities.",
     workflow: "Analyzes complexity → creates removal proposals → marks loom:hermit",
     cardFile: "critic.svg",
   },
   "doctor.md": {
     archetype: "The Hanged Man",
-    description:
-      "Heals bugs and addresses PR feedback with patience and alternative perspectives.",
+    description: "Heals bugs and addresses PR feedback with patience and alternative perspectives.",
     workflow: "Finds loom:changes-requested → addresses feedback → updates PR",
     cardFile: "fixer.svg",
   },
   "guide.md": {
     archetype: "The Star",
-    description:
-      "Illuminates priorities by focusing team energy on critical issues.",
+    description: "Illuminates priorities by focusing team energy on critical issues.",
     workflow: "Reviews backlog → updates priorities → manages loom:urgent label",
     cardFile: "guide.svg",
   },
   "driver.md": {
     archetype: "The Chariot",
-    description:
-      "Represents human agency and direct control through manual command execution.",
+    description: "Represents human agency and direct control through manual command execution.",
     workflow: "Plain shell environment for custom tasks and ad-hoc work",
     cardFile: "driver.svg",
   },
   "champion.md": {
     archetype: "The Sun",
-    description:
-      "Auto-merges safe PRs that pass all safety criteria and quality checks.",
+    description: "Auto-merges safe PRs that pass all safety criteria and quality checks.",
     workflow: "Finds loom:pr → verifies safety → auto-merges if safe",
     cardFile: "champion.svg",
   },
@@ -314,18 +306,10 @@ function escapeHtml(text: string): string {
 
 function updateRolePreview(modal: HTMLElement, roleFile: string): void {
   const previewPanel = modal.querySelector("#role-preview") as HTMLElement;
-  const cardImg = modal.querySelector(
-    "#role-preview-card"
-  ) as HTMLImageElement;
-  const titleEl = modal.querySelector(
-    "#role-preview-title"
-  ) as HTMLElement;
-  const descEl = modal.querySelector(
-    "#role-preview-description"
-  ) as HTMLElement;
-  const workflowEl = modal.querySelector(
-    "#role-preview-workflow"
-  ) as HTMLElement;
+  const cardImg = modal.querySelector("#role-preview-card") as HTMLImageElement;
+  const titleEl = modal.querySelector("#role-preview-title") as HTMLElement;
+  const descEl = modal.querySelector("#role-preview-description") as HTMLElement;
+  const workflowEl = modal.querySelector("#role-preview-workflow") as HTMLElement;
 
   if (!previewPanel || !roleFile || roleFile === "") {
     previewPanel?.classList.add("hidden");
@@ -343,8 +327,7 @@ function updateRolePreview(modal: HTMLElement, roleFile: string): void {
 
   // Extract role name from filename (e.g., "builder.md" → "Builder")
   const roleName =
-    roleFile.replace(".md", "").charAt(0).toUpperCase() +
-    roleFile.replace(".md", "").slice(1);
+    roleFile.replace(".md", "").charAt(0).toUpperCase() + roleFile.replace(".md", "").slice(1);
 
   // Update content
   cardImg.src = `/assets/tarot-cards/${roleInfo.cardFile}`;
@@ -490,7 +473,7 @@ export async function showTerminalSettingsModal(
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
     if (selectedFile && nameInput) {
       // Extract role name from filename (e.g., "builder.md" -> "Builder")
-      const roleName = selectedFile.replace('.md', '');
+      const roleName = selectedFile.replace(".md", "");
       const defaultName = roleName.charAt(0).toUpperCase() + roleName.slice(1);
       nameInput.value = defaultName;
     }
@@ -736,7 +719,11 @@ async function applySettings(
     const { getIntervalPromptManager } = await import("./interval-prompt-manager");
     const intervalManager = getIntervalPromptManager();
 
-    if (hasNewRole && roleConfig.targetInterval !== undefined && (roleConfig.targetInterval as number) >= 0) {
+    if (
+      hasNewRole &&
+      roleConfig.targetInterval !== undefined &&
+      (roleConfig.targetInterval as number) >= 0
+    ) {
       // Start or restart interval prompts (includes interval: 0 for continuous)
       const updatedTerminal = state.getTerminal(terminal.id);
       if (updatedTerminal) {

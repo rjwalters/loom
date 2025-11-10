@@ -11,7 +11,7 @@ import { type AppLevelState, appLevelState } from "./app-state";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
-import type { AppState } from "./state";
+import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import type { TerminalManager } from "./terminal-manager";
 import { showToast } from "./toast";
@@ -341,7 +341,7 @@ export async function closeTerminalWithConfirmation(
 export async function createPlainTerminal(deps: {
   state: AppState;
   workspacePath: string;
-  generateNextConfigId: (terminals: import("./state").Terminal[]) => string;
+  generateNextConfigId: (terminals: Terminal[]) => string;
   saveCurrentConfig: () => Promise<void>;
 }): Promise<Terminal | undefined> {
   const { state, workspacePath, generateNextConfigId, saveCurrentConfig } = deps;
