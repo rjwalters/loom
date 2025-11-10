@@ -147,7 +147,7 @@ export function setupMainEventListeners(deps: {
     workspacePath: string;
     generateNextConfigId: (terminals: Terminal[]) => string;
     saveCurrentConfig: () => Promise<void>;
-  }) => Promise<void>;
+  }) => Promise<Terminal | undefined>;
   generateNextConfigId: (terminals: Terminal[]) => string;
   setupDragAndDrop: typeof setupDragAndDrop;
 }): void {

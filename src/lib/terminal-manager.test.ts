@@ -136,13 +136,13 @@ function assertLogContains(spy: { mock: { calls: unknown[][] } }, expectedSubstr
 }
 describe("TerminalManager", () => {
   let manager: TerminalManager;
-  let consoleLogSpy: ReturnType<typeof vi.spyOn>;
-  let consoleWarnSpy: ReturnType<typeof vi.spyOn>;
-  let consoleErrorSpy: ReturnType<typeof vi.spyOn>;
+  let consoleLogSpy: any;
+  let consoleWarnSpy: any;
+  let consoleErrorSpy: any;
   let persistentContainer: HTMLElement;
   let originalRequestAnimationFrame: typeof window.requestAnimationFrame;
   let originalCancelAnimationFrame: typeof window.cancelAnimationFrame;
-  let boundingRectSpy: ReturnType<typeof vi.spyOn>;
+  let boundingRectSpy: any;
 
   // Mock state
   const mockTerminal = {
@@ -312,7 +312,7 @@ describe("TerminalManager", () => {
 
       // Check for warn log with message containing "WebGL addon failed"
       const warnCalls = consoleWarnSpy.mock.calls;
-      const warnCall = warnCalls.find((call) => {
+      const warnCall = warnCalls.find((call: any) => {
         try {
           const log = JSON.parse(call[0] as string);
           return log.message?.includes("WebGL addon failed");
