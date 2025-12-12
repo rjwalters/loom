@@ -79,7 +79,8 @@ Install Loom ${LOOM_VERSION} orchestration framework
 
 Adds Loom configuration and GitHub workflow integration:
 - .loom/ directory with configuration and scripts
-- .claude/ MCP servers and prompts
+- .claude/commands/ slash commands for roles (/builder, /judge, etc.)
+- .claude/settings.json tool permissions
 - .github/ labels and workflows
 - Documentation (CLAUDE.md, AGENTS.md)
 
@@ -115,7 +116,8 @@ Closes #${ISSUE_NUMBER}
 ## What's included:
 
 - ✅ \`.loom/\` - Configuration, roles, and scripts
-- ✅ \`.claude/\` - MCP servers and prompts (target-specific only)
+- ✅ \`.claude/commands/\` - Slash commands for roles (/builder, /judge, /curator, etc.)
+- ✅ \`.claude/settings.json\` - Claude Code tool permissions
 - ✅ \`.github/\` - Labels and workflows
 - ✅ \`CLAUDE.md\`/\`AGENTS.md\` - Documentation with Loom reference
 
