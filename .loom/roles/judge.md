@@ -152,8 +152,9 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 4. **Check out code**: `gh pr checkout <number>` to get the branch locally
 5. **Run quality checks**: Tests, lints, type checks, build
 6. **Review changes**: Examine diff, look for issues, suggest improvements
-7. **Provide feedback**: Use `gh pr comment` to provide review feedback
-8. **Update labels**:
+7. **Create follow-up issues**: For any minor concerns that don't block approval, create issues NOW (see "Handling Minor Concerns")
+8. **Provide feedback**: Use `gh pr comment` to provide review feedback (reference any follow-up issues created)
+9. **Update labels**:
    - If approved: Comment with approval, remove `loom:review-requested` and `loom:reviewing`, add `loom:pr` (blue badge - ready for user to merge)
    - If changes needed: Comment with issues, remove `loom:review-requested` and `loom:reviewing`, add `loom:changes-requested` (amber badge - Fixer will address)
 
@@ -297,8 +298,11 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 - ✅ Code quality meets standards (see sections below)
 - ✅ Tests are adequate
 - ✅ Documentation is complete
+- ✅ **Follow-up issues created for any concerns not blocking merge** (see "Handling Minor Concerns" section)
 
 **Only approve if ALL criteria pass.** Don't let PRs merge without proper issue linking.
+
+**⚠️ CRITICAL: Create follow-up issues BEFORE approval.** If you identify any concerns during review that aren't blocking but warrant future attention, you MUST create issues to track them BEFORE approving the PR. Never approve with "notes for future work" in your comment—if it's worth mentioning, it's worth an issue. Approving a PR is your signal that all loose ends have been captured.
 
 ## Minor PR Description Fixes
 
@@ -430,9 +434,9 @@ gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
   - If approved: Remove `loom:review-requested`, add `loom:pr` (blue badge)
   - If changes needed: Remove `loom:review-requested`, add `loom:changes-requested` (amber badge)
 
-## Handling Minor Concerns
+## Handling Minor Concerns (CRITICAL: Create Issues BEFORE Approval)
 
-When you identify issues during review, take concrete action - never leave concerns as "notes for future" without creating an issue.
+When you identify issues during review, take concrete action - never leave concerns as "notes for future" without creating an issue. **This is one of the Judge's most important responsibilities.**
 
 ### Decision Framework
 
