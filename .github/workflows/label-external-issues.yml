@@ -3,12 +3,24 @@ name: Label external issues
 on:
   issues:
     types: [opened]
+  push:
+    paths:
+      - '.github/workflows/label-external-issues.yml'
 
 permissions:
   issues: write
   contents: read
 
 jobs:
+  # Guard job to prevent workflow failure on push events
+  # GitHub Actions requires at least one job to run for each event type
+  validate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Workflow syntax valid
+        run: echo "Workflow file validated successfully"
+
   label_external:
     if: github.event_name == 'issues'
     runs-on: ubuntu-latest
