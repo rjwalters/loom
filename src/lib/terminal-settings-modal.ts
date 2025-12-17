@@ -1,9 +1,11 @@
 import { saveCurrentConfiguration } from "./config";
 import { Logger } from "./logger";
 import { ModalBuilder } from "./modal-builder";
+import { RoleMetadataSchema } from "./schemas";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
 import { showToast } from "./toast";
+import { parseJSONWithDefault } from "./validation";
 
 const logger = Logger.forComponent("terminal-settings-modal");
 
@@ -259,11 +261,12 @@ export async function showTerminalSettingsModal(
       });
 
       if (metadataJson) {
-        const metadata = JSON.parse(metadataJson) as {
-          defaultInterval?: number;
-          defaultIntervalPrompt?: string;
-          autonomousRecommended?: boolean;
-        };
+        const metadata = parseJSONWithDefault(
+          metadataJson,
+          RoleMetadataSchema,
+          {},
+          { context: `role metadata for ${selectedFile}` }
+        );
 
         if (metadata.defaultInterval !== undefined) {
           targetIntervalInput.value = Math.floor(metadata.defaultInterval / 1000).toString();
@@ -594,9 +597,12 @@ async function applySettings(
               });
 
               if (metadataJson) {
-                const metadata = JSON.parse(metadataJson) as {
-                  gitIdentity?: { name: string; email: string };
-                };
+                const metadata = parseJSONWithDefault(
+                  metadataJson,
+                  RoleMetadataSchema,
+                  {},
+                  { context: `role metadata for ${roleConfig.roleFile}` }
+                );
                 gitIdentity = metadata.gitIdentity;
               }
             } catch (error) {
