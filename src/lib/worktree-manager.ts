@@ -24,6 +24,84 @@ export interface GitIdentity {
 }
 
 /**
+ * Context for worktree error enrichment
+ */
+interface WorktreeErrorContext {
+  terminalId: string;
+  workspacePath: string;
+  worktreePath: string;
+  branchName: string;
+}
+
+/**
+ * Enriches generic worktree errors with actionable, user-friendly messages
+ *
+ * @param error - The original error that occurred
+ * @param context - Context about the worktree operation
+ * @returns A new Error with an enriched, actionable message
+ */
+export function enrichWorktreeError(error: unknown, context: WorktreeErrorContext): Error {
+  const errorMessage = error instanceof Error ? error.message : String(error);
+
+  // Terminal not found (catch-22 bug - terminal creation order issue)
+  if (errorMessage.includes("Terminal not found")) {
+    return new Error(
+      `Cannot create worktree: terminal '${context.terminalId}' not ready. ` +
+        `This is a bug in terminal creation order (see issue #734).`
+    );
+  }
+
+  // Not a git repository
+  if (errorMessage.includes("not a git repository")) {
+    return new Error(
+      `Cannot create worktree: '${context.workspacePath}' is not a git repository. ` +
+        `Please initialize git (git init) or select a different workspace.`
+    );
+  }
+
+  // Worktree directory already exists
+  if (errorMessage.includes("already exists") && errorMessage.includes(context.worktreePath)) {
+    return new Error(
+      `Cannot create worktree: directory '${context.worktreePath}' already exists. ` +
+        `This may be from a previous session. Try removing it or restart Loom.`
+    );
+  }
+
+  // Branch name collision
+  if (errorMessage.includes("already exists") && errorMessage.includes(context.branchName)) {
+    return new Error(
+      `Cannot create worktree: branch '${context.branchName}' already exists. ` +
+        `This may be left over from a crash. Try: git branch -D ${context.branchName}`
+    );
+  }
+
+  // Permission denied
+  if (
+    errorMessage.includes("Permission denied") ||
+    errorMessage.includes("cannot create directory")
+  ) {
+    return new Error(
+      `Cannot create worktree: insufficient permissions to create '${context.worktreePath}'. ` +
+        `Check file system permissions.`
+    );
+  }
+
+  // HEAD is detached or invalid
+  if (errorMessage.includes("invalid reference") || errorMessage.includes("not a valid ref")) {
+    return new Error(
+      `Cannot create worktree: HEAD is invalid or detached. ` +
+        `Please ensure you have at least one commit in the repository.`
+    );
+  }
+
+  // Generic fallback with context
+  return new Error(
+    `Failed to setup worktree for terminal '${context.terminalId}': ${errorMessage}. ` +
+      `Worktree path: ${context.worktreePath}`
+  );
+}
+
+/**
  * worktree-manager.ts - Functions for setting up git worktrees for agent isolation
  *
  * IMPORTANT: All functions in this module operate on sessionIds (ephemeral tmux session IDs).
@@ -122,13 +200,22 @@ export async function setupTerminalWorktree(
 
     return worktreePath;
   } catch (error) {
-    logger.error("Failed to create terminal worktree", error, {
+    const enrichedError = enrichWorktreeError(error, {
+      terminalId,
+      workspacePath,
+      worktreePath,
+      branchName,
+    });
+
+    logger.error("Failed to create terminal worktree", enrichedError, {
       terminalId,
       workspacePath,
       roleFile,
       worktreePath,
+      originalError: error instanceof Error ? error.message : String(error),
     });
-    throw error;
+
+    throw enrichedError;
   }
 }
 
@@ -155,6 +242,8 @@ export async function setupWorktreeForAgent(
 
   // Worktree path: .loom/worktrees/{terminalId}
   const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
+  // Branch name for worktree isolation (defined here so it's accessible in catch block)
+  const branchName = `worktree/${terminalId}`;
 
   try {
     // Create worktrees directory if it doesn't exist
@@ -163,7 +252,6 @@ export async function setupWorktreeForAgent(
     // Create git worktree with a unique branch name
     // This ensures proper isolation - git prevents checking out a branch
     // that's already checked out in another worktree (including main repo)
-    const branchName = `worktree/${terminalId}`;
     await sendCommand(terminalId, `git worktree add -b "${branchName}" "${worktreePath}" HEAD`);
 
     // Change to worktree directory
@@ -205,12 +293,21 @@ export async function setupWorktreeForAgent(
     logger.info("Worktree setup complete", { terminalId, worktreePath });
     return worktreePath;
   } catch (error) {
-    logger.error("Failed to setup worktree", error, {
+    const enrichedError = enrichWorktreeError(error, {
       terminalId,
       workspacePath,
       worktreePath,
+      branchName,
     });
-    throw error;
+
+    logger.error("Failed to setup worktree", enrichedError, {
+      terminalId,
+      workspacePath,
+      worktreePath,
+      originalError: error instanceof Error ? error.message : String(error),
+    });
+
+    throw enrichedError;
   }
 }
 

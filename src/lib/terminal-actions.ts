@@ -400,8 +400,9 @@ export async function createPlainTerminal(deps: {
     // Return the created terminal
     return newTerminal;
   } catch (error) {
-    logger.error("Failed to create terminal", error, { workspacePath });
-    showToast(`Failed to create terminal: ${error}`, "error");
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error("Failed to create terminal", error, { workspacePath, errorMessage });
+    showToast(`Failed to create terminal: ${errorMessage}`, "error");
     return undefined;
   }
 }
