@@ -92,7 +92,7 @@ Loom provides specialized roles for different development tasks. Each role follo
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
-- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:issue`
+- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated` (human approves → `loom:issue`)
 - **When to use**: Issue backlog maintenance, quality improvement
 
 **Architect** (Autonomous 15min, `architect.md`)
@@ -321,7 +321,7 @@ gh pr create --label "loom:review-requested"
 
 1. **Find unlabeled issues**:
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit"
+   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"
    ```
 
 2. **Enhance issue**:
@@ -330,9 +330,9 @@ gh pr create --label "loom:review-requested"
    gh issue edit 42 --body "Enhanced description..."
    ```
 
-3. **Mark as ready**:
+3. **Mark as curated** (human will approve to add `loom:issue`):
    ```bash
-   gh issue edit 42 --add-label "loom:issue"
+   gh issue edit 42 --add-label "loom:curated"
    ```
 
 ## Configuration
