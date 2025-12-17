@@ -17,6 +17,19 @@ const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(homedir(), ".loom", "lo
 const LOOM_DIR = join(homedir(), ".loom");
 const STATE_FILE = join(LOOM_DIR, "state.json");
 
+/**
+ * Configuration for creating a terminal
+ */
+interface CreateTerminalConfig {
+  name?: string;
+  role?: string;
+  roleFile?: string;
+  targetInterval?: number;
+  intervalPrompt?: string;
+  theme?: string;
+  workingDir?: string;
+}
+
 interface Terminal {
   id: string;
   name: string;
@@ -275,6 +288,192 @@ async function toggleTmuxVerboseLogging(): Promise<{
   }
 }
 
+/**
+ * Generate a unique terminal ID
+ */
+async function generateTerminalId(): Promise<string> {
+  const terminals = await listTerminals();
+  const existingIds = terminals.map((t) => t.id);
+
+  // Find the highest existing terminal number
+  let maxNum = 0;
+  for (const id of existingIds) {
+    const match = id.match(/^terminal-(\d+)$/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num > maxNum) {
+        maxNum = num;
+      }
+    }
+  }
+
+  return `terminal-${maxNum + 1}`;
+}
+
+/**
+ * Create a new terminal via the daemon
+ */
+async function createTerminal(config: CreateTerminalConfig): Promise<{
+  success: boolean;
+  terminal_id?: string;
+  error?: string;
+}> {
+  try {
+    const terminalId = await generateTerminalId();
+    const name = config.name || `${config.role || "default"}-${Date.now()}`;
+
+    const response = (await sendDaemonRequest({
+      type: "CreateTerminal",
+      payload: {
+        config_id: terminalId,
+        name,
+        working_dir: config.workingDir || null,
+        role: config.role || null,
+        instance_number: 0,
+      },
+    })) as { type: string; payload?: { id: string }; message?: string };
+
+    if (response.type === "TerminalCreated" && response.payload?.id) {
+      return {
+        success: true,
+        terminal_id: response.payload.id,
+      };
+    }
+
+    if (response.type === "Error") {
+      return {
+        success: false,
+        error: response.message || "Unknown error creating terminal",
+      };
+    }
+
+    return {
+      success: false,
+      error: `Unexpected response: ${response.type}`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Error creating terminal: ${error}`,
+    };
+  }
+}
+
+/**
+ * Delete (destroy) a terminal via the daemon
+ */
+async function deleteTerminal(terminalId: string): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  try {
+    const response = (await sendDaemonRequest({
+      type: "DestroyTerminal",
+      payload: {
+        id: terminalId,
+      },
+    })) as { type: string; message?: string };
+
+    if (response.type === "Success") {
+      return { success: true };
+    }
+
+    if (response.type === "Error") {
+      return {
+        success: false,
+        error: response.message || "Unknown error deleting terminal",
+      };
+    }
+
+    return {
+      success: false,
+      error: `Unexpected response: ${response.type}`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Error deleting terminal: ${error}`,
+    };
+  }
+}
+
+/**
+ * Restart a terminal by destroying and recreating it with the same config
+ */
+async function restartTerminal(terminalId: string): Promise<{
+  success: boolean;
+  terminal_id?: string;
+  error?: string;
+}> {
+  try {
+    // First, get the current terminal info
+    const terminals = await listTerminals();
+    const terminal = terminals.find((t) => t.id === terminalId);
+
+    if (!terminal) {
+      return {
+        success: false,
+        error: `Terminal ${terminalId} not found`,
+      };
+    }
+
+    // Store the config before destroying
+    const savedConfig = {
+      name: terminal.name,
+      role: terminal.role,
+      working_dir: terminal.working_dir,
+    };
+
+    // Destroy the terminal
+    const destroyResult = await deleteTerminal(terminalId);
+    if (!destroyResult.success) {
+      return {
+        success: false,
+        error: `Failed to destroy terminal: ${destroyResult.error}`,
+      };
+    }
+
+    // Wait a brief moment for cleanup to complete
+    await new Promise((resolve) => setTimeout(resolve, 500));
+
+    // Recreate the terminal with the same ID
+    const response = (await sendDaemonRequest({
+      type: "CreateTerminal",
+      payload: {
+        config_id: terminalId,
+        name: savedConfig.name,
+        working_dir: savedConfig.working_dir || null,
+        role: savedConfig.role || null,
+        instance_number: 0,
+      },
+    })) as { type: string; payload?: { id: string }; message?: string };
+
+    if (response.type === "TerminalCreated" && response.payload?.id) {
+      return {
+        success: true,
+        terminal_id: response.payload.id,
+      };
+    }
+
+    if (response.type === "Error") {
+      return {
+        success: false,
+        error: response.message || "Unknown error recreating terminal",
+      };
+    }
+
+    return {
+      success: false,
+      error: `Unexpected response: ${response.type}`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Error restarting terminal: ${error}`,
+    };
+  }
+}
+
 const server = new Server(
   {
     name: "loom-terminals",
@@ -378,6 +577,77 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {},
+        },
+      },
+      {
+        name: "create_terminal",
+        description:
+          "Create a new Loom terminal session. Returns the new terminal's ID which can be used for other operations. The terminal will be created with its own tmux session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Human-readable name for the terminal (e.g., 'Builder', 'Judge')",
+            },
+            role: {
+              type: "string",
+              description: "Role for the terminal (e.g., 'builder', 'judge', 'curator')",
+            },
+            role_file: {
+              type: "string",
+              description: "Role definition file (e.g., 'builder.md', 'judge.md')",
+            },
+            target_interval: {
+              type: "number",
+              description: "Interval in milliseconds for autonomous operation (0 for manual)",
+              default: 0,
+            },
+            interval_prompt: {
+              type: "string",
+              description: "Prompt to send at each interval for autonomous terminals",
+              default: "",
+            },
+            theme: {
+              type: "string",
+              description: "Terminal theme (optional)",
+            },
+            working_dir: {
+              type: "string",
+              description:
+                "Working directory for the terminal (optional, defaults to workspace root)",
+            },
+          },
+        },
+      },
+      {
+        name: "delete_terminal",
+        description:
+          "Delete (destroy) a Loom terminal session. This will kill the tmux session, clean up the output log file, and remove any associated worktree if it's not used by other terminals.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminal_id: {
+              type: "string",
+              description: "Terminal ID to delete (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminal_id"],
+        },
+      },
+      {
+        name: "restart_terminal",
+        description:
+          "Restart a Loom terminal session. This preserves the terminal's configuration (ID, name, role, working directory) but creates a fresh tmux session. Useful for recovering from stuck states or clearing terminal history.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminal_id: {
+              type: "string",
+              description: "Terminal ID to restart (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminal_id"],
         },
       },
     ],
@@ -601,6 +871,129 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: `=== Toggle tmux Verbose Logging ===\n\n✅ Success\n\n${result.message}\n\nNote: Verbose logging writes to tmux-server-${result.pid}.log in the current directory where the tmux server was started.`,
+            },
+          ],
+        };
+      }
+
+      case "create_terminal": {
+        const config: CreateTerminalConfig = {
+          name: args?.name as string | undefined,
+          role: args?.role as string | undefined,
+          roleFile: args?.role_file as string | undefined,
+          targetInterval: args?.target_interval as number | undefined,
+          intervalPrompt: args?.interval_prompt as string | undefined,
+          theme: args?.theme as string | undefined,
+          workingDir: args?.working_dir as string | undefined,
+        };
+
+        const result = await createTerminal(config);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Create Terminal ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const details = [
+          `Terminal ID: ${result.terminal_id}`,
+          config.name ? `Name: ${config.name}` : null,
+          config.role ? `Role: ${config.role}` : null,
+          config.roleFile ? `Role File: ${config.roleFile}` : null,
+          config.workingDir ? `Working Dir: ${config.workingDir}` : null,
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Create Terminal ===\n\n✅ Success\n\n${details}\n\nThe terminal has been created with its own tmux session. You can now send commands to it using send_terminal_input.`,
+            },
+          ],
+        };
+      }
+
+      case "delete_terminal": {
+        const terminalId = args?.terminal_id as string;
+
+        if (!terminalId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: terminal_id is required",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = await deleteTerminal(terminalId);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Delete Terminal ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Delete Terminal ===\n\n✅ Success\n\nTerminal ${terminalId} has been deleted.\n\nCleanup performed:\n- tmux session killed\n- Output log file removed\n- Worktree cleaned up (if not used by other terminals)`,
+            },
+          ],
+        };
+      }
+
+      case "restart_terminal": {
+        const terminalId = args?.terminal_id as string;
+
+        if (!terminalId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: terminal_id is required",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = await restartTerminal(terminalId);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Restart Terminal ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Restart Terminal ===\n\n✅ Success\n\nTerminal ${result.terminal_id} has been restarted.\n\nThe terminal's configuration (ID, name, role, working directory) was preserved, but a fresh tmux session was created.\n\nNote: Any running processes in the terminal were terminated and terminal history was cleared.`,
             },
           ],
         };

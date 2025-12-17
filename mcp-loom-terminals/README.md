@@ -4,7 +4,9 @@ MCP server for interacting with Loom terminal sessions. Provides tools to list t
 
 ## Features
 
-Provides 4 tools for interacting with Loom's terminal sessions:
+Provides 10 tools for interacting with Loom's terminal sessions:
+
+### Terminal Discovery
 
 1. **`list_terminals`** - List all active terminal sessions
    - Shows terminal IDs, names, roles, working directories
@@ -18,9 +20,38 @@ Provides 4 tools for interacting with Loom's terminal sessions:
    - Shows terminal details + recent output
    - Reads from state file (`~/.loom/state.json`)
 
+### Terminal Control
+
 4. **`send_terminal_input`** - Send commands to a terminal
    - Execute commands in any Loom terminal
    - Use `\n` for Enter, `\u0003` for Ctrl+C
+
+5. **`create_terminal`** - Create a new terminal session
+   - Parameters: `name`, `role`, `role_file`, `target_interval`, `interval_prompt`, `theme`, `working_dir`
+   - Returns the new terminal ID
+   - Creates a tmux session for the terminal
+
+6. **`delete_terminal`** - Delete (destroy) a terminal session
+   - Parameters: `terminal_id` (required)
+   - Kills the tmux session
+   - Cleans up output log files and worktrees
+
+7. **`restart_terminal`** - Restart a terminal session
+   - Parameters: `terminal_id` (required)
+   - Preserves terminal configuration (ID, name, role, working directory)
+   - Creates a fresh tmux session
+   - Useful for recovering from stuck states
+
+### Debugging Tools
+
+8. **`check_tmux_server_health`** - Check if tmux server is running
+   - Shows server status and active session count
+
+9. **`get_tmux_server_info`** - Get detailed tmux server information
+   - PID, socket path, version
+
+10. **`toggle_tmux_verbose_logging`** - Toggle tmux verbose logging
+    - Useful for deep debugging of tmux issues
 
 ## Installation
 
@@ -90,6 +121,17 @@ Once configured in Claude Desktop, you can ask:
 - "Run 'git status' in terminal-2"
 - "Send 'npm test' to the worker terminal"
 - "Execute 'ls -la' in terminal-1"
+
+### Creating Terminals
+- "Create a new terminal named 'Builder' with the builder role"
+- "Create a worker terminal for the architect role"
+- "Add a new terminal called 'Test Runner'"
+
+### Managing Terminals
+- "Delete terminal-3"
+- "Restart terminal-1"
+- "Remove the judge terminal"
+- "Restart the builder terminal to clear its history"
 
 The MCP tools will be automatically invoked to interact with the terminals.
 
@@ -161,26 +203,60 @@ The daemon uses internally-tagged JSON over Unix socket:
     "data": "ls -la\n"
   }
 }
+
+{
+  "type": "CreateTerminal",
+  "payload": {
+    "config_id": "terminal-1",
+    "name": "Builder",
+    "working_dir": "/path/to/workspace",
+    "role": "builder",
+    "instance_number": 0
+  }
+}
+
+{
+  "type": "DestroyTerminal",
+  "payload": {
+    "id": "terminal-1"
+  }
+}
 ```
 
 ### Response Format
 ```json
 {
   "type": "TerminalList",
-  "payload": [
-    {
-      "id": "terminal-1",
-      "name": "Shell",
-      "role": "default",
-      "working_dir": "/Users/user/project",
-      "tmux_session": "loom-terminal-1-default-1",
-      "created_at": 1234567890
-    }
-  ]
+  "payload": {
+    "terminals": [
+      {
+        "id": "terminal-1",
+        "name": "Shell",
+        "role": "default",
+        "working_dir": "/Users/user/project",
+        "tmux_session": "loom-terminal-1-default-1",
+        "created_at": 1234567890
+      }
+    ]
+  }
+}
+
+{
+  "type": "TerminalCreated",
+  "payload": {
+    "id": "terminal-1"
+  }
 }
 
 {
   "type": "Success"
+}
+
+{
+  "type": "Error",
+  "payload": {
+    "message": "Terminal not found"
+  }
 }
 ```
 
@@ -228,12 +304,11 @@ The daemon uses internally-tagged JSON over Unix socket:
 ## Future Enhancements
 
 - **Streaming output**: Watch terminal output in real-time
-- **Terminal creation**: Create new terminals via MCP
-- **Terminal destruction**: Close terminals via MCP
 - **Role assignment**: Change terminal roles via MCP
 - **Workspace switching**: Select different workspaces
 - **Terminal resizing**: Resize terminal dimensions
 - **Command history**: Access terminal command history
+- **Agent launching**: Launch Claude agents in terminals via MCP
 
 ## Notes
 
