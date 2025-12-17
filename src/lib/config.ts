@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
+import { LoomConfigSchema, RawLoomConfigSchema, TerminalConfigSchema } from "./schemas";
 import type { AgentStatus, AppState, ColorTheme, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+import { safeParseJSON, safeValidateData } from "./validation";
 
 const logger = Logger.forComponent("config");
 
@@ -96,20 +98,6 @@ export interface LoomState {
   terminals: TerminalState[];
 }
 
-/**
- * Legacy config format (pre-split into config/state).
- * Contained both config and state in one file.
- * Automatically migrated to new format on first load.
- *
- * @deprecated This format is no longer used but supported for migration
- */
-interface LegacyConfig {
-  /** Terminal number counter */
-  nextAgentNumber: number;
-  /** Array of terminals with mixed config and state data */
-  agents: Array<Terminal & { configId?: string }>;
-}
-
 let cachedWorkspacePath: string | null = null;
 
 /**
@@ -125,31 +113,54 @@ export function setConfigWorkspace(workspacePath: string): void {
 /**
  * Migrates config from v1 (no version field or version:"1") to v2 format.
  * v1 configs are identified by missing version field or explicit "1" value.
+ * Validates terminal configs during migration to catch invalid data early.
  *
  * @param raw - The raw v1 config object
  * @returns Migrated v2 config with version field
  */
 function migrateFromV1(raw: unknown): LoomConfig {
-  const v1 = raw as { terminals?: TerminalConfig[]; offlineMode?: boolean };
+  // Safely extract v1 fields with type checking
+  const rawConfig = raw as { terminals?: unknown[]; offlineMode?: unknown };
+
+  // Validate and filter terminals - only keep valid ones
+  const validTerminals: TerminalConfig[] = [];
+  if (Array.isArray(rawConfig.terminals)) {
+    for (const terminal of rawConfig.terminals) {
+      const result = safeValidateData(terminal, TerminalConfigSchema, {
+        context: "v1 terminal config",
+        logErrors: false,
+      });
+      if (result.success) {
+        validTerminals.push(result.data);
+      } else {
+        logger.warn("Skipping invalid terminal during v1 migration", {
+          terminal: JSON.stringify(terminal).slice(0, 200),
+          issues: result.issues,
+        });
+      }
+    }
+  }
 
   logger.info("Migrating config from v1 to v2", {
-    terminalCount: v1.terminals?.length ?? 0,
+    originalCount: rawConfig.terminals?.length ?? 0,
+    validCount: validTerminals.length,
   });
 
   return {
     version: "2",
-    terminals: v1.terminals ?? [],
-    offlineMode: v1.offlineMode,
+    terminals: validTerminals,
+    offlineMode: typeof rawConfig.offlineMode === "boolean" ? rawConfig.offlineMode : undefined,
   };
 }
 
 /**
  * Migrates config to the latest version based on explicit version field.
  * Handles version detection and delegates to specific migration functions.
+ * Validates the final config against the v2 schema.
  *
  * @param raw - The raw config object (may be any version)
  * @returns Migrated config at latest version (v2)
- * @throws Error if config version is unsupported (future versions)
+ * @throws Error if config version is unsupported (future versions) or validation fails
  */
 function migrateToLatest(raw: unknown): LoomConfig {
   // Safely extract version field
@@ -157,19 +168,37 @@ function migrateToLatest(raw: unknown): LoomConfig {
 
   logger.info("Checking config version for migration", { version });
 
+  let config: LoomConfig;
   switch (version) {
     case "1":
       // Treat missing version or explicit "1" as v1
-      return migrateFromV1(raw);
-    case "2":
-      // Already latest version
-      return raw as LoomConfig;
+      config = migrateFromV1(raw);
+      break;
+    case "2": {
+      // Validate v2 config against schema
+      const result = safeValidateData(raw, LoomConfigSchema, {
+        context: "config.json",
+        logErrors: true,
+      });
+      if (result.success) {
+        config = result.data;
+      } else {
+        // If validation fails, attempt recovery by re-validating terminals
+        logger.warn("Config validation failed, attempting recovery", {
+          issues: result.issues,
+        });
+        config = migrateFromV1(raw);
+      }
+      break;
+    }
     default:
       // Unknown version from the future - fail fast with clear error
       throw new Error(
         `Unsupported config version "${version}". This version of Loom only supports versions 1-2. Please upgrade Loom to work with this config.`
       );
   }
+
+  return config;
 }
 
 /**
@@ -194,13 +223,27 @@ export async function loadConfig(): Promise<LoomConfig> {
       workspacePath,
     });
 
-    const parsed = JSON.parse(contents);
+    // Use safe JSON parsing with basic structure validation
+    const parseResult = safeParseJSON(contents, RawLoomConfigSchema, {
+      context: "config.json",
+      logErrors: true,
+    });
+
+    if (!parseResult.success) {
+      logger.error("Config file is malformed", parseResult.error, {
+        workspacePath,
+        issues: parseResult.issues,
+      });
+      return { version: "2", terminals: [] };
+    }
+
+    const parsed = parseResult.data;
 
     // Check if legacy format (has "agents" array with mixed data)
     // Phase 1 of deprecation: Refuse legacy configs with clear error message
     // The migration code is preserved for future removal in Phase 2
     if (parsed.agents && !parsed.terminals) {
-      const legacyAgentCount = (parsed as LegacyConfig).agents?.length || 0;
+      const legacyAgentCount = parsed.agents?.length || 0;
 
       throw new Error(
         `Legacy config format detected (${legacyAgentCount} terminals).\n\n` +
@@ -214,7 +257,7 @@ export async function loadConfig(): Promise<LoomConfig> {
       );
     }
 
-    // Migrate to latest version if needed
+    // Migrate to latest version if needed (with full validation)
     const migratedConfig = migrateToLatest(parsed);
 
     // Save migrated config if version changed
@@ -272,12 +315,14 @@ export async function saveConfig(config: LoomConfig): Promise<void> {
  * @throws Never throws - returns default state on error and logs the error
  */
 export async function loadState(): Promise<LoomState> {
+  const defaultState: LoomState = {
+    nextAgentNumber: 1,
+    terminals: [],
+  };
+
   // Return default state if no workspace is set
   if (!cachedWorkspacePath) {
-    return {
-      nextAgentNumber: 1,
-      terminals: [],
-    };
+    return defaultState;
   }
 
   try {
@@ -287,15 +332,141 @@ export async function loadState(): Promise<LoomState> {
       workspacePath,
     });
 
-    return JSON.parse(contents) as LoomState;
+    // Parse JSON first
+    let raw: unknown;
+    try {
+      raw = JSON.parse(contents);
+    } catch (parseError) {
+      logger.warn("State file has invalid JSON, using defaults", {
+        workspacePath,
+        error: parseError instanceof Error ? parseError.message : String(parseError),
+      });
+      return defaultState;
+    }
+
+    // Basic structure validation
+    if (typeof raw !== "object" || raw === null) {
+      logger.warn("State file is not an object, using defaults", { workspacePath });
+      return defaultState;
+    }
+
+    const rawState = raw as {
+      daemonPid?: unknown;
+      nextAgentNumber?: unknown;
+      terminals?: unknown[];
+    };
+
+    // Validate and build state with proper types
+    const nextAgentNumber =
+      typeof rawState.nextAgentNumber === "number" && rawState.nextAgentNumber >= 1
+        ? rawState.nextAgentNumber
+        : 1;
+
+    const terminals: TerminalState[] = [];
+    if (Array.isArray(rawState.terminals)) {
+      for (const t of rawState.terminals) {
+        if (typeof t === "object" && t !== null) {
+          const terminal = t as Record<string, unknown>;
+          if (typeof terminal.id === "string" && terminal.id.length > 0) {
+            terminals.push({
+              id: terminal.id,
+              status: parseTerminalStatus(terminal.status),
+              isPrimary: typeof terminal.isPrimary === "boolean" ? terminal.isPrimary : false,
+              worktreePath:
+                typeof terminal.worktreePath === "string" ? terminal.worktreePath : undefined,
+              agentPid: typeof terminal.agentPid === "number" ? terminal.agentPid : undefined,
+              agentStatus: parseAgentStatus(terminal.agentStatus),
+              lastIntervalRun:
+                typeof terminal.lastIntervalRun === "number" ? terminal.lastIntervalRun : undefined,
+              pendingInputRequests: parsePendingInputRequests(terminal.pendingInputRequests),
+              busyTime: typeof terminal.busyTime === "number" ? terminal.busyTime : undefined,
+              idleTime: typeof terminal.idleTime === "number" ? terminal.idleTime : undefined,
+              lastStateChange:
+                typeof terminal.lastStateChange === "number" ? terminal.lastStateChange : undefined,
+            });
+          }
+        }
+      }
+    }
+
+    return {
+      daemonPid: typeof rawState.daemonPid === "number" ? rawState.daemonPid : undefined,
+      nextAgentNumber,
+      terminals,
+    };
   } catch (error) {
     logger.error("Failed to load state", error as Error, { workspacePath: cachedWorkspacePath });
     // Return empty state on error
-    return {
-      nextAgentNumber: 1,
-      terminals: [],
-    };
+    return defaultState;
   }
+}
+
+/**
+ * Parses a terminal status value, returning Idle for invalid values.
+ */
+function parseTerminalStatus(value: unknown): TerminalStatus {
+  if (typeof value === "string") {
+    switch (value) {
+      case "idle":
+        return TerminalStatus.Idle;
+      case "busy":
+        return TerminalStatus.Busy;
+      case "needs_input":
+        return TerminalStatus.NeedsInput;
+      case "error":
+        return TerminalStatus.Error;
+      case "stopped":
+        return TerminalStatus.Stopped;
+    }
+  }
+  return TerminalStatus.Idle;
+}
+
+/**
+ * Parses an agent status value, returning undefined for invalid values.
+ */
+function parseAgentStatus(value: unknown): AgentStatus | undefined {
+  if (typeof value !== "string") return undefined;
+  // Import AgentStatus dynamically to avoid circular dependency issues
+  const validStatuses = [
+    "not_started",
+    "initializing",
+    "ready",
+    "busy",
+    "waiting_for_input",
+    "error",
+    "stopped",
+  ];
+  if (validStatuses.includes(value)) {
+    return value as AgentStatus;
+  }
+  return undefined;
+}
+
+/**
+ * Parses pending input requests array.
+ */
+function parsePendingInputRequests(
+  value: unknown
+): Array<{ id: string; prompt: string; timestamp: number }> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const requests: Array<{ id: string; prompt: string; timestamp: number }> = [];
+  for (const item of value) {
+    if (
+      typeof item === "object" &&
+      item !== null &&
+      typeof (item as Record<string, unknown>).id === "string" &&
+      typeof (item as Record<string, unknown>).prompt === "string" &&
+      typeof (item as Record<string, unknown>).timestamp === "number"
+    ) {
+      requests.push({
+        id: (item as Record<string, unknown>).id as string,
+        prompt: (item as Record<string, unknown>).prompt as string,
+        timestamp: (item as Record<string, unknown>).timestamp as number,
+      });
+    }
+  }
+  return requests.length > 0 ? requests : undefined;
 }
 
 /**
