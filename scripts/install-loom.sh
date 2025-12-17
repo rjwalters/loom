@@ -314,6 +314,8 @@ EXPECTED_FILES=(
   ".loom/scripts/worktree.sh"
   "CLAUDE.md"
   ".github/labels.yml"
+  ".claude/commands"
+  ".claude/settings.json"
 )
 
 info "Verifying installation files..."
