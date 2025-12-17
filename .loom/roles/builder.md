@@ -13,6 +13,78 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## CRITICAL: Label Discipline
+
+**Builders MUST follow strict label boundaries to prevent workflow coordination failures.**
+
+### Labels You MANAGE (Issues Only)
+
+| Action | Remove | Add |
+|--------|--------|-----|
+| Claim issue | `loom:issue` | `loom:building` |
+| Block issue | - | `loom:blocked` |
+| Create PR | - | `loom:review-requested` (on new PR only) |
+
+### Labels You NEVER Touch
+
+| Label | Owner | Why You Don't Touch It |
+|-------|-------|------------------------|
+| `loom:pr` | Judge | Signals Judge approval - removing breaks Champion workflow |
+| `loom:review-requested` (existing) | Judge | Judge removes this when reviewing |
+| `loom:curated` | Curator | Curator's domain for issue enhancement |
+| `loom:architect` | Architect | Architect's domain for proposals |
+| `loom:hermit` | Hermit | Hermit's domain for simplification proposals |
+
+### Why This Matters
+
+**Breaking label discipline causes coordination failures:**
+- Removing `loom:pr` → Champion can't find approved PRs to merge
+- Removing `loom:review-requested` from someone else's PR → Judge skips the review
+- Starting work without `loom:issue` → Bypasses curation and approval process
+
+**Rule of thumb**: If you didn't add a label, don't remove it. The owner role is responsible for their labels.
+
+### Builder's Role in the Label State Machine
+
+```
+ISSUE LIFECYCLE (Builder's domain):
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  [unlabeled] ──Curator──> [loom:curated] ──Human──> [loom:issue] │
+│                                                          │       │
+│                                                          ▼       │
+│                                               ┌─────────────────┐│
+│                                               │ BUILDER CLAIMS  ││
+│                                               │ Remove: loom:issue
+│                                               │ Add: loom:building│
+│                                               └─────────────────┘│
+│                                                          │       │
+│                                                          ▼       │
+│                                                   [loom:building]│
+│                                                          │       │
+│                                                          ▼       │
+│                                                    PR Created    │
+│                                                   (issue closes) │
+└──────────────────────────────────────────────────────────────────┘
+
+PR LIFECYCLE (Builder only creates, Judge/Champion manage):
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  ┌─────────────────┐                                             │
+│  │ BUILDER CREATES │                                             │
+│  │ Add: loom:review-requested                                    │
+│  └─────────────────┘                                             │
+│           │                                                      │
+│           ▼                                                      │
+│  [loom:review-requested] ──Judge──> [loom:pr] ──Champion──> MERGED
+│                                                                  │
+│  ⚠️  Builder NEVER touches PR labels after creation              │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Label Workflow
 
 **IMPORTANT: Ignore External Issues**
@@ -928,7 +1000,32 @@ EOF
 # RESUME: Return to #38 implementation
 ```
 
-## Creating Pull Requests: CRITICAL GitHub Auto-Close Requirements
+## Creating Pull Requests: Label and Auto-Close Requirements
+
+### PR Label Rules
+
+**When creating a NEW PR:**
+- ✅ Add `loom:review-requested` label during creation
+- ✅ This is the ONLY time you add labels to a PR
+
+**After PR creation:**
+- ❌ NEVER remove `loom:review-requested` (Judge does this)
+- ❌ NEVER remove `loom:pr` (Judge adds this, Champion uses it)
+- ❌ NEVER add `loom:pr` yourself (only Judge can approve)
+- ❌ NEVER modify any labels on PRs you didn't create
+
+**Why?** PR labels are signals in the review pipeline:
+```
+Builder creates PR → loom:review-requested → Judge reviews
+                                           ↓
+                     Judge removes loom:review-requested
+                                           ↓
+                     Judge adds loom:pr → Champion merges
+```
+
+If you touch these labels, you break the pipeline.
+
+### GitHub Auto-Close Requirements
 
 **IMPORTANT**: When creating PRs, you MUST use GitHub's magic keywords to ensure issues auto-close when PRs merge.
 
@@ -1022,14 +1119,33 @@ EOF
 ## Working Style
 
 - **Start**: `gh issue list --label="loom:issue"` to find work (pick oldest first for fair FIFO queue)
-- **Claim**: Update labels before beginning implementation
+- **Verify before claiming**: Issue MUST have `loom:issue` label (unless explicit user override)
+- **Claim**: Remove `loom:issue`, add `loom:building` - always both labels together
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see Scope Management)
 - Use the TodoWrite tool to plan and track multi-step tasks
 - Run lint, format, and type checks before considering complete
-- **Create PR**: **Use "Closes #123" syntax** (see section above), add `loom:review-requested` label
-- **After PR creation**: Move on to the next `loom:issue` - the Healer agent handles PR review feedback
+- **Create PR**: Add `loom:review-requested` label ONLY at creation, use "Closes #123" syntax
+- **After PR creation**: HANDS OFF - never touch PR labels again, move to next issue
 - When blocked: Add comment explaining blocker, mark `loom:blocked`
 - Stay focused on assigned issue - create separate issues for other work
+
+### Label Checklist (Quick Reference)
+
+Before claiming:
+- [ ] Issue has `loom:issue` label? (or explicit user override)
+- [ ] Issue does NOT have `external` label?
+
+When claiming:
+- [ ] Remove `loom:issue`
+- [ ] Add `loom:building`
+
+When creating PR:
+- [ ] Add `loom:review-requested` (at creation only)
+- [ ] PR body uses "Closes #N" syntax
+
+After PR creation:
+- [ ] STOP - do not touch any PR labels
+- [ ] Move to next issue
 
 ## Raising Concerns
 
