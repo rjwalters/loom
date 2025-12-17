@@ -114,27 +114,44 @@ git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 # 1. Claim an issue
 gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 
-# 2. Create worktree using helper
+# 2. Return to main and pull latest code
+#    IMPORTANT: This fetches remote commits only - it will NOT delete your local changes.
+#    If you have uncommitted work, stash it first or commit to a branch.
+cd /path/to/repo  # Go to main workspace (not a worktree)
+git checkout main
+git pull origin main
+
+# 3. Create worktree using helper
 ./.loom/scripts/worktree.sh 84
 # → Creates: .loom/worktrees/issue-84
-# → Branch: feature/issue-84
+# → Branch: feature/issue-84 (based on updated main)
 
-# 3. Change to worktree directory
+# 4. Change to worktree directory
 cd .loom/worktrees/issue-84
 
-# 4. Do your work (implement, test, commit)
+# 5. Do your work (implement, test, commit)
 # ... work work work ...
 
-# 5. Push and create PR from worktree
+# 6. Push and create PR from worktree
 git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested"
 
-# 6. Return to main workspace
+# 7. Return to main workspace
 cd ../..  # Back to workspace root
 
-# 7. Clean up worktree (optional - done automatically on terminal destroy)
+# 8. Clean up worktree (optional - done automatically on terminal destroy)
 git worktree remove .loom/worktrees/issue-84
 ```
+
+### Why Update Main Before Creating Worktrees?
+
+The worktree script creates branches from your **local** `main` branch. If your local `main` is behind the remote, you'll start your work from outdated code. This can lead to:
+
+- Merge conflicts when creating your PR
+- Building on top of already-fixed bugs
+- Missing recent changes from other contributors
+
+**Always pull the latest `main` before creating a new worktree.**
 
 ### Collision Detection
 
@@ -187,29 +204,37 @@ pwd
 gh issue list --label="loom:issue"
 gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 
-# 2. Create issue worktree WITH return path
+# 2. Update main to get latest remote changes
+#    IMPORTANT: This fetches remote commits only - it will NOT delete your local changes.
+#    The worktree script creates branches from local main, so keep it current.
+cd "$(git worktree list | head -1 | awk '{print $1}')"  # Go to main workspace
+git checkout main
+git pull origin main
+cd -  # Return to terminal worktree
+
+# 3. Create issue worktree WITH return path
 ./.loom/scripts/worktree.sh --return-to $(pwd) 84
-# → Creates: .loom/worktrees/issue-84
+# → Creates: .loom/worktrees/issue-84 (based on updated main)
 # → Stores return path to terminal-1
 
-# 3. Change to issue worktree
+# 4. Change to issue worktree
 cd .loom/worktrees/issue-84
 
-# 4. Do your work (implement, test, commit)
+# 5. Do your work (implement, test, commit)
 # ... implement feature ...
 git add -A
 git commit -m "Implement feature for issue #84"
 
-# 5. Push and create PR
+# 6. Push and create PR
 git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested" --body "Closes #84"
 
-# 6. Return to terminal worktree
+# 7. Return to terminal worktree
 pnpm worktree:return
 # → Changes back to .loom/worktrees/terminal-1
 # → Ready for next issue!
 
-# 7. Clean up happens automatically when PR is merged
+# 8. Clean up happens automatically when PR is merged
 ```
 
 ### Machine-Readable Output
@@ -258,6 +283,11 @@ while true; do
   if [[ -n "$ISSUE" ]]; then
     # Claim issue
     gh issue edit "$ISSUE" --remove-label "loom:issue" --add-label "loom:building"
+
+    # Update main before creating worktree (ensures latest code)
+    MAIN_WORKSPACE="$(git worktree list | head -1 | awk '{print $1}')"
+    git -C "$MAIN_WORKSPACE" checkout main
+    git -C "$MAIN_WORKSPACE" pull origin main
 
     # Create issue worktree from terminal worktree
     ./.loom/scripts/worktree.sh --return-to $(pwd) "$ISSUE"
