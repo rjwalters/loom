@@ -9,6 +9,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { save } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { Command } from "@tauri-apps/plugin-shell";
+import { ModalBuilder } from "./modal-builder";
 import type { ActivityEntry } from "./state";
 import { showToast } from "./toast";
 
@@ -19,79 +20,108 @@ export async function showTerminalActivityModal(
   terminalId: string,
   terminalName: string
 ): Promise<void> {
-  const modal = createActivityModal(terminalId, terminalName);
-  document.body.appendChild(modal);
-  modal.classList.remove("hidden");
+  const modal = new ModalBuilder({
+    title: `Terminal Activity: ${terminalName}`,
+    width: "800px",
+    id: "terminal-activity-modal",
+    showHeader: false,
+    customHeader: createCustomHeader(terminalName, terminalId),
+  });
 
-  // Setup event handlers
-  setupCloseHandlers(modal, terminalId);
+  modal.setContent(createInitialContent());
+  modal.show();
+
+  // Store modal reference and terminalId for export handlers
+  const backdrop = modal.getBackdrop();
+  backdrop.dataset.terminalId = terminalId;
+
+  // Setup export handlers
+  setupExportHandlers(modal, terminalId);
 
   // Load activity data
   await loadActivityData(modal, terminalId);
 }
 
 /**
- * Create the modal DOM structure
+ * Create custom header with export buttons
  */
-function createActivityModal(terminalId: string, terminalName: string): HTMLElement {
-  const modal = document.createElement("div");
-  modal.id = "terminal-activity-modal";
-  modal.className =
-    "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden";
-  modal.dataset.terminalId = terminalId;
+function createCustomHeader(terminalName: string, _terminalId: string): HTMLElement {
+  const header = document.createElement("div");
+  header.className =
+    "flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700";
 
-  modal.innerHTML = `
-    <div
-      class="bg-white dark:bg-gray-800 rounded-lg w-[800px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="terminal-activity-title"
-    >
-      <!-- Header -->
-      <div class="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
-        <h2 id="terminal-activity-title" class="text-xl font-bold text-gray-900 dark:text-gray-100">
-          📊 Terminal Activity: ${escapeHtml(terminalName)}
-        </h2>
-        <div class="flex gap-2">
-          <button id="copy-clipboard-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
-            Copy to Clipboard
-          </button>
-          <button id="export-csv-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
-            Export CSV
-          </button>
-          <button id="export-json-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
-            Export JSON
-          </button>
-          <button id="close-activity-btn" class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 font-bold text-2xl transition-colors">
-            ×
-          </button>
-        </div>
-      </div>
-
-      <!-- Loading state -->
-      <div id="activity-loading" class="p-8 text-center text-gray-500 dark:text-gray-400">
-        Loading activity...
-      </div>
-
-      <!-- Content (will be populated) -->
-      <div id="activity-content" class="flex-1 overflow-y-auto p-4 hidden">
-        <!-- Timeline entries will go here -->
-      </div>
-
-      <!-- Empty state -->
-      <div id="activity-empty" class="p-8 text-center text-gray-500 dark:text-gray-400 hidden">
-        No activity recorded for this terminal yet.
-      </div>
+  header.innerHTML = `
+    <h2 id="modal-title" class="text-xl font-bold text-gray-900 dark:text-gray-100">
+      Terminal Activity: ${escapeHtml(terminalName)}
+    </h2>
+    <div class="flex gap-2">
+      <button id="copy-clipboard-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
+        Copy to Clipboard
+      </button>
+      <button id="export-csv-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
+        Export CSV
+      </button>
+      <button id="export-json-btn" class="px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded transition-colors">
+        Export JSON
+      </button>
+      <button class="modal-close-btn text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 font-bold text-2xl transition-colors" aria-label="Close modal">
+        &times;
+      </button>
     </div>
   `;
 
-  return modal;
+  return header;
+}
+
+/**
+ * Create initial loading content
+ */
+function createInitialContent(): string {
+  return `
+    <!-- Loading state -->
+    <div id="activity-loading" class="p-8 text-center text-gray-500 dark:text-gray-400">
+      Loading activity...
+    </div>
+
+    <!-- Content (will be populated) -->
+    <div id="activity-content" class="hidden">
+      <!-- Timeline entries will go here -->
+    </div>
+
+    <!-- Empty state -->
+    <div id="activity-empty" class="p-8 text-center text-gray-500 dark:text-gray-400 hidden">
+      No activity recorded for this terminal yet.
+    </div>
+  `;
+}
+
+/**
+ * Setup export handlers on the modal
+ */
+function setupExportHandlers(modal: ModalBuilder, terminalId: string): void {
+  // Close button in custom header
+  const closeBtn = modal.querySelector(".modal-close-btn");
+  closeBtn?.addEventListener("click", () => modal.close());
+
+  // Copy to clipboard handler
+  modal.querySelector("#copy-clipboard-btn")?.addEventListener("click", async () => {
+    await copyActivityToClipboard(terminalId);
+  });
+
+  // Export handlers
+  modal.querySelector("#export-csv-btn")?.addEventListener("click", async () => {
+    await exportActivity(terminalId, "csv");
+  });
+
+  modal.querySelector("#export-json-btn")?.addEventListener("click", async () => {
+    await exportActivity(terminalId, "json");
+  });
 }
 
 /**
  * Load activity data from backend and render it
  */
-async function loadActivityData(modal: HTMLElement, terminalId: string): Promise<void> {
+async function loadActivityData(modal: ModalBuilder, terminalId: string): Promise<void> {
   const loadingEl = modal.querySelector("#activity-loading");
   const contentEl = modal.querySelector("#activity-content");
   const emptyEl = modal.querySelector("#activity-empty");
@@ -229,42 +259,6 @@ function getInputTypeBadge(type: string): string {
   const color = colors[type] || "bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300";
 
   return `<span class="text-xs px-2 py-0.5 rounded ${color}">${getInputTypeLabel(type)}</span>`;
-}
-
-/**
- * Setup close handlers and export handlers
- */
-function setupCloseHandlers(modal: HTMLElement, terminalId: string): void {
-  const closeBtn = modal.querySelector("#close-activity-btn");
-  closeBtn?.addEventListener("click", () => modal.remove());
-
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) {
-      modal.remove();
-    }
-  });
-
-  const escapeHandler = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      modal.remove();
-      document.removeEventListener("keydown", escapeHandler);
-    }
-  };
-  document.addEventListener("keydown", escapeHandler);
-
-  // Copy to clipboard handler
-  modal.querySelector("#copy-clipboard-btn")?.addEventListener("click", async () => {
-    await copyActivityToClipboard(terminalId);
-  });
-
-  // Export handlers
-  modal.querySelector("#export-csv-btn")?.addEventListener("click", async () => {
-    await exportActivity(terminalId, "csv");
-  });
-
-  modal.querySelector("#export-json-btn")?.addEventListener("click", async () => {
-    await exportActivity(terminalId, "json");
-  });
 }
 
 /**
