@@ -1,88 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { saveCurrentConfiguration } from "./config";
 import { Logger } from "./logger";
+import { ModalBuilder } from "./modal-builder";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
 
 const logger = Logger.forComponent("worker-modal");
-
-export function createWorkerModal(_workspacePath: string): HTMLElement {
-  const modal = document.createElement("div");
-  modal.id = "worker-modal";
-  modal.className =
-    "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden";
-
-  modal.innerHTML = `
-    <div
-      class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[700px] max-h-[85vh] flex flex-col border border-gray-200 dark:border-gray-700"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="worker-modal-title"
-    >
-      <h2 id="worker-modal-title" class="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">Add Worker</h2>
-
-      <div class="flex-1 overflow-y-auto space-y-4">
-        <!-- Worker Name -->
-        <div>
-          <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-            Worker Name
-          </label>
-          <input
-            type="text"
-            id="worker-name"
-            class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
-            placeholder="Worker 1"
-          />
-        </div>
-
-        <!-- AI Provider -->
-        <div>
-          <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-            AI Provider
-          </label>
-          <div class="text-sm text-gray-500 dark:text-gray-400">
-            Claude Code (default)
-          </div>
-        </div>
-
-        <!-- System Prompt -->
-        <div>
-          <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-            System Prompt
-          </label>
-          <textarea
-            id="worker-prompt"
-            rows="16"
-            class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs text-gray-900 dark:text-gray-100"
-            placeholder="System prompt..."
-          ></textarea>
-          <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-            This prompt will be sent to Claude Code on startup
-          </div>
-        </div>
-      </div>
-
-      <!-- Buttons -->
-      <div class="flex justify-end gap-2 mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-        <button
-          id="cancel-worker-btn"
-          class="px-4 py-2 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 rounded text-gray-900 dark:text-gray-100"
-        >
-          Cancel
-        </button>
-        <button
-          id="launch-worker-btn"
-          class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-white font-medium"
-        >
-          Launch Worker
-        </button>
-      </div>
-    </div>
-  `;
-
-  return modal;
-}
 
 export async function showWorkerModal(state: AppState, renderFn: () => void): Promise<void> {
   // Get workspace path from state
@@ -121,64 +45,105 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
       );
     }
 
-    // Create modal
-    const modal = createWorkerModal(workspacePath);
-    document.body.appendChild(modal);
-
-    // Pre-fill
-    const nameInput = modal.querySelector("#worker-name") as HTMLInputElement;
-    const promptTextarea = modal.querySelector("#worker-prompt") as HTMLTextAreaElement;
-
-    const workerCount = state.getTerminals().length + 1;
-    nameInput.value = `Worker ${workerCount}`;
-
     // Load worker.md role file content
+    let roleContent = "Error loading worker role file";
     try {
-      const roleContent = await invoke<string>("read_role_file", {
+      roleContent = await invoke<string>("read_role_file", {
         workspacePath,
         filename: "worker.md",
       });
-      promptTextarea.value = roleContent;
     } catch (error) {
       logger.error("Failed to load worker.md role file", error as Error, {
         workspacePath,
       });
-      promptTextarea.value = "Error loading worker role file";
     }
 
-    // Show modal
-    modal.classList.remove("hidden");
-    nameInput.focus();
-    nameInput.select();
+    const workerCount = state.getTerminals().length + 1;
+    const defaultName = `Worker ${workerCount}`;
 
-    // Wire up events
-    const cancelBtn = modal.querySelector("#cancel-worker-btn");
-    const launchBtn = modal.querySelector("#launch-worker-btn");
-
-    cancelBtn?.addEventListener("click", () => modal.remove());
-
-    launchBtn?.addEventListener("click", async () => {
-      await launchWorker(modal, state, workspacePath, renderFn);
+    // Create modal using ModalBuilder
+    const modal = new ModalBuilder({
+      title: "Add Worker",
+      width: "700px",
+      id: "worker-modal",
     });
 
-    // Close on background click
-    modal.addEventListener("click", (e) => {
-      if (e.target === modal) {
-        modal.remove();
-      }
-    });
+    modal.setContent(createWorkerFormContent(defaultName, roleContent));
 
-    // Close on Escape
-    const escapeHandler = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        modal.remove();
-        document.removeEventListener("keydown", escapeHandler);
-      }
-    };
-    document.addEventListener("keydown", escapeHandler);
+    modal.addFooterButton("Cancel", () => modal.close());
+    modal.addFooterButton(
+      "Launch Worker",
+      () => launchWorker(modal, state, workspacePath, renderFn),
+      "primary"
+    );
+
+    modal.show();
+
+    // Focus and select name input
+    const nameInput = modal.querySelector("#worker-name") as HTMLInputElement;
+    nameInput?.focus();
+    nameInput?.select();
   } catch (error) {
     showToast(`Failed to open worker modal: ${error}`, "error");
   }
+}
+
+/**
+ * Create the form content for the worker modal
+ */
+function createWorkerFormContent(defaultName: string, roleContent: string): string {
+  return `
+    <div class="space-y-4">
+      <!-- Worker Name -->
+      <div>
+        <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+          Worker Name
+        </label>
+        <input
+          type="text"
+          id="worker-name"
+          value="${escapeHtml(defaultName)}"
+          class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+          placeholder="Worker 1"
+        />
+      </div>
+
+      <!-- AI Provider -->
+      <div>
+        <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+          AI Provider
+        </label>
+        <div class="text-sm text-gray-500 dark:text-gray-400">
+          Claude Code (default)
+        </div>
+      </div>
+
+      <!-- System Prompt -->
+      <div>
+        <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+          System Prompt
+        </label>
+        <textarea
+          id="worker-prompt"
+          rows="16"
+          class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs text-gray-900 dark:text-gray-100"
+          placeholder="System prompt..."
+        >${escapeHtml(roleContent)}</textarea>
+        <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+          This prompt will be sent to Claude Code on startup
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+/**
+ * Escape HTML to prevent XSS
+ */
+function escapeHtml(text: string): string {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
 }
 
 // Helper to generate next config ID
@@ -196,7 +161,7 @@ function generateNextConfigId(state: AppState): string {
 }
 
 async function launchWorker(
-  modal: HTMLElement,
+  modal: ModalBuilder,
   state: AppState,
   workspacePath: string,
   renderFn: () => void
@@ -266,7 +231,7 @@ async function launchWorker(
     });
 
     // Close modal
-    modal.remove();
+    modal.close();
 
     // Switch to new terminal
     state.setPrimary(id);

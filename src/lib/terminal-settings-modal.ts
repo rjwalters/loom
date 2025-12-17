@@ -1,5 +1,6 @@
 import { saveCurrentConfiguration } from "./config";
 import { Logger } from "./logger";
+import { ModalBuilder } from "./modal-builder";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
 import { showToast } from "./toast";
@@ -74,283 +75,42 @@ const ROLE_INFO: Record<
   },
 };
 
-export function createTerminalSettingsModal(terminal: Terminal): HTMLElement {
-  const modal = document.createElement("div");
-  modal.id = "terminal-settings-modal";
-  modal.className =
-    "fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 hidden";
-
-  // Determine current role config
-  const roleConfig = terminal.roleConfig || {};
-  const targetIntervalMs = (roleConfig.targetInterval as number) || 300000; // 5 minutes default
-  const targetIntervalSeconds = Math.floor(targetIntervalMs / 1000); // Convert to seconds for display
-  const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
-  const autonomousEnabled = targetIntervalMs > 0;
-
-  modal.innerHTML = `
-    <div
-      class="bg-white dark:bg-gray-800 rounded-lg p-6 w-[800px] min-w-[600px] max-h-[90vh] flex flex-col border border-gray-200 dark:border-gray-700"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="terminal-settings-title"
-    >
-      <h2 id="terminal-settings-title" class="text-xl font-bold mb-4 text-gray-900 dark:text-gray-100">Terminal Settings: ${escapeHtml(terminal.name)}</h2>
-
-      <!-- Tabs -->
-      <div class="flex border-b border-gray-200 dark:border-gray-700 mb-4">
-        <button
-          data-tab="appearance"
-          class="tab-btn px-4 py-2 font-medium text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 dark:border-blue-400"
-        >
-          Appearance
-        </button>
-        <button
-          data-tab="agent"
-          class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-        >
-          Agent
-        </button>
-        <button
-          data-tab="interval"
-          class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
-        >
-          Interval Mode
-        </button>
-      </div>
-
-      <!-- Tab Content Container -->
-      <div class="overflow-y-auto h-[420px]">
-        <!-- Appearance Tab -->
-        <div data-tab-content="appearance" class="space-y-4">
-          <div>
-            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              Terminal Name
-            </label>
-            <input
-              type="text"
-              id="terminal-name"
-              value="${escapeHtml(terminal.name)}"
-              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
-              placeholder="Terminal 1"
-            />
-          </div>
-
-          <div>
-            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-              Color Theme
-            </label>
-            <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">
-              Choose a color theme to visually distinguish this terminal
-            </p>
-            <div class="grid grid-cols-4 gap-2">
-              ${Object.entries(TERMINAL_THEMES)
-                .map(
-                  ([id, theme]) => `
-                <button
-                  class="theme-card flex flex-col items-center gap-1 p-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
-                  data-theme-id="${id}"
-                >
-                  <div class="w-8 h-8 rounded" style="background-color: ${theme.primary}"></div>
-                  <span class="text-xs font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
-                </button>
-              `
-                )
-                .join("")}
-            </div>
-          </div>
-        </div>
-
-        <!-- Agent Configuration Tab -->
-        <div data-tab-content="agent" class="hidden">
-          <!-- Two-column grid layout: 40% tarot card, 60% controls -->
-          <div id="role-preview" class="grid grid-cols-5 gap-4 hidden">
-            <!-- Left column: Tarot Card (2/5 = 40%) -->
-            <div class="col-span-2 flex items-start justify-center">
-              <img
-                id="role-preview-card"
-                src=""
-                alt=""
-                class="w-full h-auto object-contain"
-                style="max-height: 400px"
-              />
-            </div>
-
-            <!-- Right column: Configuration (3/5 = 60%) -->
-            <div class="col-span-3 space-y-4">
-              <!-- Worker Type -->
-              <div>
-                <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-                  Worker Type
-                </label>
-                <select
-                  id="worker-type-select"
-                  class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
-                >
-                  <option value="">Loading available agents...</option>
-                </select>
-                <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  Only installed AI coding agents are shown
-                </p>
-              </div>
-
-              <!-- Role -->
-              <div>
-                <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-                  Role
-                </label>
-                <select
-                  id="role-file"
-                  class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
-                >
-                  <option value="">Loading roles...</option>
-                </select>
-                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                  Role files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/roles/</code>
-                </div>
-              </div>
-
-              <!-- Role Description -->
-              <div class="p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700">
-                <h3 id="role-preview-title" class="text-lg font-bold text-gray-900 dark:text-gray-100 mb-2"></h3>
-                <p id="role-preview-description" class="text-sm text-gray-700 dark:text-gray-300 mb-3"></p>
-                <div class="text-xs text-gray-600 dark:text-gray-400">
-                  <span class="font-semibold">Workflow:</span>
-                  <p id="role-preview-workflow" class="mt-1 font-mono"></p>
-                </div>
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- Interval Mode Tab -->
-        <div data-tab-content="interval" class="space-y-4 hidden">
-          <div>
-            <label class="flex items-center">
-              <input
-                type="checkbox"
-                id="autonomous-enabled"
-                ${autonomousEnabled ? "checked" : ""}
-                class="mr-2"
-              />
-              <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
-                Enable Autonomous Operation
-              </span>
-            </label>
-            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-              Worker will automatically continue working at specified intervals
-            </div>
-          </div>
-
-          <div id="autonomous-config" ${autonomousEnabled ? "" : 'class="opacity-50 pointer-events-none"'}>
-            <div class="mb-4">
-              <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-                Target Interval (seconds)
-              </label>
-              <input
-                type="number"
-                id="target-interval"
-                value="${targetIntervalSeconds}"
-                min="0"
-                step="1"
-                class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
-              />
-              <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                Default: 300 (5 minutes)
-              </div>
-            </div>
-
-            <div>
-              <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
-                Interval Prompt
-              </label>
-              <textarea
-                id="interval-prompt"
-                rows="4"
-                class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs text-gray-900 dark:text-gray-100"
-                placeholder="Enter prompt to send at each interval..."
-              >${escapeHtml(intervalPrompt)}</textarea>
-              <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                This message will be sent to the worker at each interval
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- Buttons -->
-      <div class="flex justify-end items-center gap-2 mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
-        <button
-          id="cancel-settings-btn"
-          class="px-4 py-2 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 rounded text-gray-900 dark:text-gray-100"
-        >
-          Cancel
-        </button>
-        <button
-          id="apply-settings-btn"
-          class="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded text-white font-medium"
-        >
-          Apply
-        </button>
-      </div>
-    </div>
-  `;
-
-  return modal;
-}
-
-function escapeHtml(text: string): string {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-function updateRolePreview(modal: HTMLElement, roleFile: string): void {
-  const previewPanel = modal.querySelector("#role-preview") as HTMLElement;
-  const cardImg = modal.querySelector("#role-preview-card") as HTMLImageElement;
-  const titleEl = modal.querySelector("#role-preview-title") as HTMLElement;
-  const descEl = modal.querySelector("#role-preview-description") as HTMLElement;
-  const workflowEl = modal.querySelector("#role-preview-workflow") as HTMLElement;
-
-  if (!previewPanel || !roleFile || roleFile === "") {
-    previewPanel?.classList.add("hidden");
-    return;
-  }
-
-  const roleInfo = ROLE_INFO[roleFile];
-  if (!roleInfo) {
-    previewPanel.classList.add("hidden");
-    return;
-  }
-
-  // Show panel
-  previewPanel.classList.remove("hidden");
-
-  // Extract role name from filename (e.g., "builder.md" → "Builder")
-  const roleName =
-    roleFile.replace(".md", "").charAt(0).toUpperCase() + roleFile.replace(".md", "").slice(1);
-
-  // Update content
-  cardImg.src = `/assets/tarot-cards/${roleInfo.cardFile}`;
-  cardImg.alt = `${roleName} - ${roleInfo.archetype}`;
-  titleEl.textContent = `${roleName} - ${roleInfo.archetype}`;
-  descEl.textContent = roleInfo.description;
-  workflowEl.textContent = `Workflow: ${roleInfo.workflow}`;
-}
-
 export async function showTerminalSettingsModal(
   terminal: Terminal,
   state: AppState,
   renderFn: () => void
 ): Promise<void> {
-  const modal = createTerminalSettingsModal(terminal);
-  document.body.appendChild(modal);
+  const roleConfig = terminal.roleConfig || {};
+  const targetIntervalMs = (roleConfig.targetInterval as number) || 300000;
+  const targetIntervalSeconds = Math.floor(targetIntervalMs / 1000);
+  const intervalPrompt = (roleConfig.intervalPrompt as string) || "Continue working on open tasks";
+  const autonomousEnabled = targetIntervalMs > 0;
 
-  // Show modal
-  modal.classList.remove("hidden");
+  const modal = new ModalBuilder({
+    title: `Terminal Settings: ${terminal.name}`,
+    width: "800px",
+    id: "terminal-settings-modal",
+  });
+
+  modal.setContent(
+    createSettingsContent(terminal, targetIntervalSeconds, intervalPrompt, autonomousEnabled)
+  );
+
+  modal.addFooterButton("Cancel", () => modal.close());
+
+  // Track selected theme
+  let selectedTheme = terminal.theme || "default";
+
+  modal.addFooterButton(
+    "Apply",
+    () => applySettings(modal, terminal, state, renderFn, selectedTheme),
+    "primary"
+  );
+
+  modal.show();
 
   // Load available worker types
   const workerTypeSelect = modal.querySelector("#worker-type-select") as HTMLSelectElement;
-  const roleConfig = terminal.roleConfig || {};
   const currentWorkerType = (roleConfig.workerType as string) || "claude";
 
   try {
@@ -381,7 +141,6 @@ export async function showTerminalSettingsModal(
 
       const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
       if (roleFileSelect && roleFiles.length > 0) {
-        const roleConfig = terminal.roleConfig || {};
         const currentRoleFile = (roleConfig.roleFile as string) || "worker.md";
 
         roleFileSelect.innerHTML = roleFiles
@@ -412,7 +171,6 @@ export async function showTerminalSettingsModal(
     btn.addEventListener("click", () => {
       const tabName = btn.getAttribute("data-tab");
 
-      // Update button styles
       tabBtns.forEach((b) => {
         if (b.getAttribute("data-tab") === tabName) {
           b.className =
@@ -423,7 +181,6 @@ export async function showTerminalSettingsModal(
         }
       });
 
-      // Show/hide content
       tabContents.forEach((content) => {
         if (content.getAttribute("data-tab-content") === tabName) {
           content.classList.remove("hidden");
@@ -435,13 +192,11 @@ export async function showTerminalSettingsModal(
   });
 
   // Wire up theme cards
-  let selectedTheme = terminal.theme || "default";
   modal.querySelectorAll(".theme-card").forEach((card) => {
     card.addEventListener("click", () => {
       const themeId = card.getAttribute("data-theme-id");
       if (themeId) {
         selectedTheme = themeId;
-        // Update visual selection
         modal.querySelectorAll(".theme-card").forEach((c) => {
           c.className = c.className.replace(
             "border-blue-500",
@@ -466,13 +221,10 @@ export async function showTerminalSettingsModal(
   roleFileSelect?.addEventListener("change", async () => {
     const selectedFile = roleFileSelect.value;
 
-    // Update role preview panel
     updateRolePreview(modal, selectedFile);
 
-    // Auto-update terminal name to match role
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
     if (selectedFile && nameInput) {
-      // Extract role name from filename (e.g., "builder.md" -> "Builder")
       const roleName = selectedFile.replace(".md", "");
       const defaultName = roleName.charAt(0).toUpperCase() + roleName.slice(1);
       nameInput.value = defaultName;
@@ -480,12 +232,10 @@ export async function showTerminalSettingsModal(
 
     if (!selectedFile || !workspacePath) return;
 
-    // Auto-assign theme based on role file
     const { getThemeForRole } = await import("./themes");
     const autoTheme = getThemeForRole(selectedFile);
     selectedTheme = autoTheme;
 
-    // Update theme card selection in UI
     modal.querySelectorAll(".theme-card").forEach((c) => {
       const themeId = c.getAttribute("data-theme-id");
       if (themeId === autoTheme) {
@@ -515,7 +265,6 @@ export async function showTerminalSettingsModal(
           autonomousRecommended?: boolean;
         };
 
-        // Populate interval settings from metadata (convert ms to seconds)
         if (metadata.defaultInterval !== undefined) {
           targetIntervalInput.value = Math.floor(metadata.defaultInterval / 1000).toString();
         }
@@ -524,7 +273,6 @@ export async function showTerminalSettingsModal(
         }
         if (metadata.autonomousRecommended !== undefined) {
           autonomousCheckbox.checked = metadata.autonomousRecommended;
-          // Trigger change event to update UI
           autonomousCheckbox.dispatchEvent(new Event("change"));
         }
       }
@@ -541,7 +289,7 @@ export async function showTerminalSettingsModal(
     updateRolePreview(modal, roleFileSelect.value);
   }
 
-  // Wire up autonomous checkbox to enable/disable config
+  // Wire up autonomous checkbox
   autonomousCheckbox?.addEventListener("change", () => {
     if (autonomousCheckbox.checked) {
       autonomousConfig?.classList.remove("opacity-50", "pointer-events-none");
@@ -549,45 +297,236 @@ export async function showTerminalSettingsModal(
       autonomousConfig?.classList.add("opacity-50", "pointer-events-none");
     }
   });
+}
 
-  // Worker type dropdown is now handled in applySettings
+function createSettingsContent(
+  terminal: Terminal,
+  targetIntervalSeconds: number,
+  intervalPrompt: string,
+  autonomousEnabled: boolean
+): string {
+  return `
+    <!-- Tabs -->
+    <div class="flex border-b border-gray-200 dark:border-gray-700 mb-4 -mt-2">
+      <button
+        data-tab="appearance"
+        class="tab-btn px-4 py-2 font-medium text-blue-600 dark:text-blue-400 border-b-2 border-blue-600 dark:border-blue-400"
+      >
+        Appearance
+      </button>
+      <button
+        data-tab="agent"
+        class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+      >
+        Agent
+      </button>
+      <button
+        data-tab="interval"
+        class="tab-btn px-4 py-2 font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+      >
+        Interval Mode
+      </button>
+    </div>
 
-  // Wire up buttons
-  const cancelBtn = modal.querySelector("#cancel-settings-btn");
-  const applyBtn = modal.querySelector("#apply-settings-btn");
+    <!-- Tab Content Container -->
+    <div class="h-[380px] overflow-y-auto">
+      <!-- Appearance Tab -->
+      <div data-tab-content="appearance" class="space-y-4">
+        <div>
+          <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+            Terminal Name
+          </label>
+          <input
+            type="text"
+            id="terminal-name"
+            value="${escapeHtml(terminal.name)}"
+            class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+            placeholder="Terminal 1"
+          />
+        </div>
 
-  cancelBtn?.addEventListener("click", () => modal.remove());
+        <div>
+          <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+            Color Theme
+          </label>
+          <p class="text-sm text-gray-600 dark:text-gray-400 mb-3">
+            Choose a color theme to visually distinguish this terminal
+          </p>
+          <div class="grid grid-cols-4 gap-2">
+            ${Object.entries(TERMINAL_THEMES)
+              .map(
+                ([id, theme]) => `
+              <button
+                class="theme-card flex flex-col items-center gap-1 p-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 rounded-lg border-2 ${terminal.theme === id ? "border-blue-500" : "border-gray-300 dark:border-gray-600"} transition-all cursor-pointer"
+                data-theme-id="${id}"
+              >
+                <div class="w-8 h-8 rounded" style="background-color: ${theme.primary}"></div>
+                <span class="text-xs font-medium text-gray-700 dark:text-gray-300">${theme.name}</span>
+              </button>
+            `
+              )
+              .join("")}
+          </div>
+        </div>
+      </div>
 
-  applyBtn?.addEventListener("click", async () => {
-    await applySettings(modal, terminal, state, renderFn, selectedTheme);
-  });
+      <!-- Agent Configuration Tab -->
+      <div data-tab-content="agent" class="hidden">
+        <div id="role-preview" class="grid grid-cols-5 gap-4 hidden">
+          <div class="col-span-2 flex items-start justify-center">
+            <img
+              id="role-preview-card"
+              src=""
+              alt=""
+              class="w-full h-auto object-contain"
+              style="max-height: 400px"
+            />
+          </div>
 
-  // Close on background click
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) {
-      modal.remove();
-    }
-  });
+          <div class="col-span-3 space-y-4">
+            <div>
+              <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                Worker Type
+              </label>
+              <select
+                id="worker-type-select"
+                class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
+              >
+                <option value="">Loading available agents...</option>
+              </select>
+              <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                Only installed AI coding agents are shown
+              </p>
+            </div>
 
-  // Close on Escape
-  const escapeHandler = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      modal.remove();
-      document.removeEventListener("keydown", escapeHandler);
-    }
-  };
-  document.addEventListener("keydown", escapeHandler);
+            <div>
+              <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                Role
+              </label>
+              <select
+                id="role-file"
+                class="w-full px-3 py-2 bg-transparent border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:border-blue-500 dark:focus:border-blue-400 text-gray-900 dark:text-gray-100"
+              >
+                <option value="">Loading roles...</option>
+              </select>
+              <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                Role files are stored in <code class="px-1 py-0.5 bg-gray-100 dark:bg-gray-800 rounded font-mono text-xs">.loom/roles/</code>
+              </div>
+            </div>
+
+            <div class="p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700">
+              <h3 id="role-preview-title" class="text-lg font-bold text-gray-900 dark:text-gray-100 mb-2"></h3>
+              <p id="role-preview-description" class="text-sm text-gray-700 dark:text-gray-300 mb-3"></p>
+              <div class="text-xs text-gray-600 dark:text-gray-400">
+                <span class="font-semibold">Workflow:</span>
+                <p id="role-preview-workflow" class="mt-1 font-mono"></p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Interval Mode Tab -->
+      <div data-tab-content="interval" class="space-y-4 hidden">
+        <div>
+          <label class="flex items-center">
+            <input
+              type="checkbox"
+              id="autonomous-enabled"
+              ${autonomousEnabled ? "checked" : ""}
+              class="mr-2"
+            />
+            <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
+              Enable Autonomous Operation
+            </span>
+          </label>
+          <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+            Worker will automatically continue working at specified intervals
+          </div>
+        </div>
+
+        <div id="autonomous-config" ${autonomousEnabled ? "" : 'class="opacity-50 pointer-events-none"'}>
+          <div class="mb-4">
+            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+              Target Interval (seconds)
+            </label>
+            <input
+              type="number"
+              id="target-interval"
+              value="${targetIntervalSeconds}"
+              min="0"
+              step="1"
+              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-900 dark:text-gray-100"
+            />
+            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              Default: 300 (5 minutes)
+            </div>
+          </div>
+
+          <div>
+            <label class="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+              Interval Prompt
+            </label>
+            <textarea
+              id="interval-prompt"
+              rows="4"
+              class="w-full px-3 py-2 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono text-xs text-gray-900 dark:text-gray-100"
+              placeholder="Enter prompt to send at each interval..."
+            >${escapeHtml(intervalPrompt)}</textarea>
+            <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+              This message will be sent to the worker at each interval
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function escapeHtml(text: string): string {
+  const div = document.createElement("div");
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+function updateRolePreview(modal: ModalBuilder, roleFile: string): void {
+  const previewPanel = modal.querySelector("#role-preview") as HTMLElement;
+  const cardImg = modal.querySelector("#role-preview-card") as HTMLImageElement;
+  const titleEl = modal.querySelector("#role-preview-title") as HTMLElement;
+  const descEl = modal.querySelector("#role-preview-description") as HTMLElement;
+  const workflowEl = modal.querySelector("#role-preview-workflow") as HTMLElement;
+
+  if (!previewPanel || !roleFile || roleFile === "") {
+    previewPanel?.classList.add("hidden");
+    return;
+  }
+
+  const roleInfo = ROLE_INFO[roleFile];
+  if (!roleInfo) {
+    previewPanel.classList.add("hidden");
+    return;
+  }
+
+  previewPanel.classList.remove("hidden");
+
+  const roleName =
+    roleFile.replace(".md", "").charAt(0).toUpperCase() + roleFile.replace(".md", "").slice(1);
+
+  cardImg.src = `/assets/tarot-cards/${roleInfo.cardFile}`;
+  cardImg.alt = `${roleName} - ${roleInfo.archetype}`;
+  titleEl.textContent = `${roleName} - ${roleInfo.archetype}`;
+  descEl.textContent = roleInfo.description;
+  workflowEl.textContent = `Workflow: ${roleInfo.workflow}`;
 }
 
 async function applySettings(
-  modal: HTMLElement,
+  modal: ModalBuilder,
   terminal: Terminal,
   state: AppState,
   renderFn: () => void,
   selectedTheme: string
 ): Promise<void> {
   try {
-    // Get values from form
     const nameInput = modal.querySelector("#terminal-name") as HTMLInputElement;
     const roleFileSelect = modal.querySelector("#role-file") as HTMLSelectElement;
     const workerTypeSelect = modal.querySelector("#worker-type-select") as HTMLSelectElement;
@@ -603,13 +542,9 @@ async function applySettings(
       return;
     }
 
-    // Get current worker type from dropdown
     const workerType = workerTypeSelect?.value || "claude";
-
-    // Determine role based on role file selection
     const role = roleFile ? "claude-code-worker" : undefined;
 
-    // Build role config (convert seconds to milliseconds for storage)
     const roleConfig = roleFile
       ? {
           workerType,
@@ -621,45 +556,34 @@ async function applySettings(
         }
       : undefined;
 
-    // Check if role changed and we need to launch agent
     const previousRole = terminal.role;
     const roleChanged = previousRole !== role;
     const hasNewRole = role !== undefined && roleConfig !== undefined;
 
-    // Update terminal in state (use configId for state operations)
     state.updateTerminal(terminal.id, { name });
     state.setTerminalRole(terminal.id, role, roleConfig);
     state.setTerminalTheme(terminal.id, selectedTheme);
 
-    // Save config and state files
     await saveCurrentConfiguration(state);
 
-    // Launch agent if role was set/changed
     if (roleChanged && hasNewRole) {
       const workspacePath = state.getWorkspace();
       if (workspacePath && roleConfig.roleFile) {
         try {
           if (workerType === "github-copilot") {
-            // Launch GitHub Copilot (no worktree support for now)
             const { launchGitHubCopilotAgent } = await import("./agent-launcher");
             await launchGitHubCopilotAgent(terminal.id);
           } else if (workerType === "gemini") {
-            // Launch Google Gemini CLI (no worktree support for now)
             const { launchGeminiCLIAgent } = await import("./agent-launcher");
             await launchGeminiCLIAgent(terminal.id);
           } else if (workerType === "deepseek") {
-            // Launch DeepSeek CLI (no worktree support for now)
             const { launchDeepSeekAgent } = await import("./agent-launcher");
             await launchDeepSeekAgent(terminal.id);
           } else if (workerType === "grok") {
-            // Launch xAI Grok CLI (no worktree support for now)
             const { launchGrokAgent } = await import("./agent-launcher");
             await launchGrokAgent(terminal.id);
           } else {
-            // Launch Claude or Codex with full worktree support
             const { launchAgentInTerminal } = await import("./agent-launcher");
-
-            // Load role metadata to get git identity
             const { invoke } = await import("@tauri-apps/api/core");
             let gitIdentity: { name: string; email: string } | undefined;
 
@@ -683,7 +607,6 @@ async function applySettings(
               });
             }
 
-            // Verify terminal has worktree, create if it doesn't exist yet
             let worktreePath = terminal.worktreePath;
             if (!worktreePath) {
               logger.info("Terminal missing worktree, creating now", {
@@ -692,11 +615,9 @@ async function applySettings(
               });
               const { setupWorktreeForAgent } = await import("./worktree-manager");
               worktreePath = await setupWorktreeForAgent(terminal.id, workspacePath, gitIdentity);
-              // Store worktree path in terminal state
               state.updateTerminal(terminal.id, { worktreePath });
             }
 
-            // Launch agent using existing/new worktree
             await launchAgentInTerminal(
               terminal.id,
               roleConfig.roleFile as string,
@@ -715,7 +636,6 @@ async function applySettings(
       }
     }
 
-    // Handle interval prompts based on configuration
     const { getIntervalPromptManager } = await import("./interval-prompt-manager");
     const intervalManager = getIntervalPromptManager();
 
@@ -724,18 +644,15 @@ async function applySettings(
       roleConfig.targetInterval !== undefined &&
       (roleConfig.targetInterval as number) >= 0
     ) {
-      // Start or restart interval prompts (includes interval: 0 for continuous)
       const updatedTerminal = state.getTerminal(terminal.id);
       if (updatedTerminal) {
         intervalManager.restart(updatedTerminal);
       }
     } else {
-      // Stop interval prompts if disabled
       intervalManager.stop(terminal.id);
     }
 
-    // Close modal and re-render
-    modal.remove();
+    modal.close();
     renderFn();
   } catch (error) {
     showToast(`Failed to apply settings: ${error}`, "error");
