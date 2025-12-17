@@ -531,6 +531,125 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
 - Respect the priority system - urgent issues need immediate attention
 - Always prefer curated issues when available for better context and guidance
 
+## Auditing Before Decomposition
+
+**CRITICAL**: Before decomposing a large issue into sub-issues, audit the codebase to verify what's actually missing.
+
+### Why Audit First?
+
+**The Problem**:
+- Issue descriptions may be outdated
+- Features may have been implemented without closing the issue
+- Mature codebases often have more functionality than issues suggest
+
+**Without audit**: Create duplicate issues for complete features
+**With audit**: Create focused issues for genuine gaps only
+
+### Audit Checklist
+
+Before decomposing an issue into sub-issues:
+
+1. **Search for related code**:
+   ```bash
+   # Search for feature keywords
+   grep -r "TRANSACTION\|BEGIN\|COMMIT" src/
+
+   # Find relevant files
+   find . -name "*constraint*.rs" -o -name "*transaction*.rs"
+   ```
+
+2. **Check for implementations**:
+   - Look for executor/handler files related to the feature
+   - Check storage layer and data models
+   - Review parser or API definitions
+
+3. **Verify with tests**:
+   ```bash
+   # Find related tests
+   find . -name "*_test*" | xargs grep -l "constraint\|transaction"
+
+   # Count test coverage for a feature
+   grep -c "fn test" tests/constraint_tests.rs
+   ```
+
+4. **Compare findings to issue requirements**:
+   - **Fully implemented** → Close issue as already complete with evidence
+   - **Partially implemented** → Create sub-issues only for missing parts
+   - **Not implemented** → Proceed with decomposition as planned
+
+### Decision Tree
+
+```
+Large issue requiring decomposition
+↓
+1. AUDIT: Search codebase for existing implementations
+↓
+2. ASSESS:
+   ├─ Fully implemented? → Close issue with evidence
+   ├─ Partially implemented? → Create sub-issues for gaps only
+   └─ Not implemented? → Proceed with decomposition
+↓
+3. DECOMPOSE: Create focused sub-issues for genuine gaps
+```
+
+### Example: Good Audit Process
+
+```bash
+# Issue #341: "Implement E141 Constraints"
+
+# Step 1: Search for constraint enforcement
+$ grep -rn "NOT NULL.*constraint\|primary_key\|unique_constraint" src/
+
+# Findings:
+# - insert.rs:119-127: NOT NULL enforcement exists
+# - insert.rs:129-171: PRIMARY KEY enforcement exists
+# - update.rs:173-213: UNIQUE constraint enforcement exists
+# - update.rs:215-232: CHECK constraint enforcement exists
+
+# Step 2: Check test coverage
+$ find . -name "*_test*" | xargs grep -l constraint
+# - tests/constraint_tests.rs (exists)
+# - tests/insert_tests.rs (NOT NULL tests)
+
+# Step 3: Compare to issue requirements
+# Issue claims: "NOT NULL not enforced, PRIMARY KEY missing, UNIQUE missing"
+# Audit shows: All features fully implemented with tests
+
+# Step 4: Decision
+# → Close issue #341 as already implemented
+# → Do NOT create sub-issues (would be duplicates)
+# → Create separate issue for actual gaps: "Add SQLSTATE codes to constraint errors"
+```
+
+### Example: Bad Process (Without Audit)
+
+```bash
+# Issue #341: "Implement E141 Constraints"
+
+# ❌ WRONG: Skip straight to decomposition without checking
+gh issue create --title "[Parent #341] Part 1: Implement NOT NULL"
+gh issue create --title "[Parent #341] Part 2: Implement PRIMARY KEY"
+gh issue create --title "[Parent #341] Part 3: Implement UNIQUE"
+# ... creates 6 duplicate issues for already-complete features
+
+# Result: 6 issues created, all later closed as duplicates
+# Wasted effort for Builder, Curator, and Guide roles
+```
+
+### Why This Matters
+
+**Real-world impact without audit**:
+- 10 duplicate issues created in a single decomposition session
+- 59% of open issues were duplicates
+- Curator time wasted enhancing issues for complete features
+- Guide time wasted triaging and closing duplicates
+- Risk of "reimplementing" existing features
+
+**With audit**:
+- Create only issues that need real work
+- Clean backlog with legitimate work items
+- Focus on genuine gaps, not phantom requirements
+
 ## Assessing Complexity Before Claiming
 
 **IMPORTANT**: Always assess complexity BEFORE claiming an issue. Never mark an issue as `loom:building` unless you're committed to completing it.
