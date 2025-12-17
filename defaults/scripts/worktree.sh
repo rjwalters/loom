@@ -306,6 +306,53 @@ if git worktree add "${CREATE_ARGS[@]}"; then
         fi
     fi
 
+    # Initialize submodules with reference to main workspace (for object sharing)
+    # This is much faster than downloading from network and saves disk space
+    MAIN_GIT_DIR=$(git rev-parse --git-common-dir 2>/dev/null)
+    UNINIT_SUBMODULES=$(cd "$ABS_WORKTREE_PATH" && git submodule status 2>/dev/null | grep '^-' | wc -l | tr -d ' ')
+
+    if [[ "$UNINIT_SUBMODULES" -gt 0 ]]; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Initializing $UNINIT_SUBMODULES submodule(s) with shared objects..."
+        fi
+
+        SUBMODULE_FAILED=false
+        cd "$ABS_WORKTREE_PATH"
+
+        # Process each uninitialized submodule
+        git submodule status | grep '^-' | awk '{print $2}' | while read -r submod_path; do
+            ref_path="$MAIN_GIT_DIR/modules/$submod_path"
+
+            if [[ -d "$ref_path" ]]; then
+                # Use reference to share objects with main workspace (fast, no network)
+                if ! timeout 30 git submodule update --init --reference "$ref_path" -- "$submod_path" 2>/dev/null; then
+                    echo "SUBMODULE_FAILED" > /tmp/loom-submodule-status-$$
+                fi
+            else
+                # No reference available, initialize normally (may need network)
+                if ! timeout 30 git submodule update --init -- "$submod_path" 2>/dev/null; then
+                    echo "SUBMODULE_FAILED" > /tmp/loom-submodule-status-$$
+                fi
+            fi
+        done
+
+        # Check if any submodule failed
+        if [[ -f "/tmp/loom-submodule-status-$$" ]]; then
+            rm -f "/tmp/loom-submodule-status-$$"
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Some submodules failed to initialize (worktree still created)"
+                print_info "You may need to run: git submodule update --init --recursive"
+            fi
+        else
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_success "Submodules initialized with shared objects"
+            fi
+        fi
+
+        # Return to original directory
+        cd - > /dev/null
+    fi
+
     # Output results
     if [[ "$JSON_OUTPUT" == "true" ]]; then
         # Machine-readable JSON output
