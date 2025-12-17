@@ -4,7 +4,7 @@ import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } fro
 import type { AgentLauncherDependencies, CoreDependencies } from "./dependencies";
 import { Logger } from "./logger";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
-import type { Terminal } from "./state";
+import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
 import { expandTildePath } from "./workspace-utils";

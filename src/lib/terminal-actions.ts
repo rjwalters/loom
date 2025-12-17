@@ -16,7 +16,7 @@ import type {
 } from "./dependencies";
 import { Logger } from "./logger";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
-import type { Terminal } from "./state";
+import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
 

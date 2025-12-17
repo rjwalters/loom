@@ -23,14 +23,14 @@ vi.mock("./toast", () => ({
 
 describe("terminal-actions", () => {
   let state: AppState;
-  let mockSaveCurrentConfig: ReturnType<typeof vi.fn>;
-  let mockRender: ReturnType<typeof vi.fn>;
+  let mockSaveCurrentConfig: () => Promise<void>;
+  let mockRender: () => void;
   let deps: TerminalActionDependencies;
 
   beforeEach(() => {
     state = new AppState();
-    mockSaveCurrentConfig = vi.fn().mockResolvedValue(undefined);
-    mockRender = vi.fn();
+    mockSaveCurrentConfig = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+    mockRender = vi.fn<() => void>();
 
     deps = {
       state,
