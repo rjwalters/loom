@@ -37,3 +37,13 @@ Complete **ONE** issue enhancement per iteration.
 Follow label-based coordination (ADR-0006):
 - Issues: Find unlabeled or incomplete issues → enhance → mark as `loom:ready`
 - Ready issues can then be claimed by Builder role
+
+## Context Clearing (Autonomous Mode)
+
+When running autonomously, clear your context at the end of each iteration to save costs:
+
+```
+/clear
+```
+
+This resets the conversation, reducing API costs for future iterations while keeping each run fresh and independent.

@@ -564,3 +564,25 @@ Keep it brief (3-6 words) and descriptive:
 - **Be consistent**: Always use the same format
 - **Be honest**: If you're idle, say so
 - **Be brief**: Task description should be 3-6 words max
+
+## Context Clearing (Cost Optimization)
+
+**When running autonomously, clear your context at the end of each iteration to save API costs.**
+
+After completing your iteration (enhancing an issue and marking it curated), execute:
+
+```
+/clear
+```
+
+### Why This Matters
+
+- **Reduces API costs**: Fresh context for each iteration means smaller request sizes
+- **Prevents context pollution**: Each iteration starts clean without stale information
+- **Improves reliability**: No risk of acting on outdated context from previous iterations
+
+### When to Clear
+
+- ✅ **After completing curation** (issue enhanced and labeled)
+- ✅ **When no work is available** (no issues to curate)
+- ❌ **NOT during active work** (only after iteration is complete)
