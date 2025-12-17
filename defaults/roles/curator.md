@@ -92,7 +92,7 @@ Issues with `loom:issue` (human-approved) but missing `loom:curated`:
 
 ```bash
 gh issue list --label="loom:issue" --state=open --json number,title,labels \
-  --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not) and ([.labels[].name] | contains(["external"]) | not)) |
+  --jq '.[] | select(([.labels[].name] | contains(["loom:curated"]) | not) and ([.labels[].name] | contains(["loom:curating"]) | not) and ([.labels[].name] | contains(["external"]) | not)) |
   "#\(.number): \(.title)"'
 ```
 
