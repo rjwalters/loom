@@ -71,7 +71,8 @@ gh pr edit <number> \
 
 **Find PRs ready for review (green badges):**
 ```bash
-gh pr list --label="loom:review-requested" --state=open
+# Sort by oldest first - review PRs in order they were submitted
+gh pr list --label="loom:review-requested" --state=open --sort created --order asc
 ```
 
 **After approval (green → blue):**
@@ -146,7 +147,9 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 
 ### Primary Queue (Priority)
 
-1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
+**Always review oldest PRs first** - this ensures fair treatment for all contributors and prevents PRs from becoming stale. Reviewing in submission order provides predictable turnaround times and respects the effort put into earlier submissions.
+
+1. **Find work**: `gh pr list --label="loom:review-requested" --state=open --sort created --order asc` (oldest first)
 2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Understand context**: Read PR description and linked issues
 4. **Check out code**: `gh pr checkout <number>` to get the branch locally
@@ -165,8 +168,8 @@ If no PRs have the `loom:review-requested` label, the Judge can proactively revi
 
 **Fallback search**:
 ```bash
-# Find PRs without any loom: labels
-gh pr list --state=open --json number,title,labels \
+# Find PRs without any loom: labels (oldest first)
+gh pr list --state=open --sort created --order asc --json number,title,labels \
   --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | "#\(.number) \(.title)"'
 ```
 
@@ -205,8 +208,8 @@ if [ "$LABELED_PRS" -gt 0 ]; then
 else
   echo "No loom:review-requested PRs found, checking unlabeled PRs..."
 
-  # 2. Check fallback queue
-  UNLABELED_PR=$(gh pr list --state=open --json number,labels \
+  # 2. Check fallback queue (oldest first)
+  UNLABELED_PR=$(gh pr list --state=open --sort created --order asc --json number,labels \
     --jq '.[] | select(([.labels[].name | select(startswith("loom:"))] | length) == 0) | .number' \
     | head -n 1)
 
@@ -613,8 +616,8 @@ EOF
 ## Example Commands
 
 ```bash
-# Find PRs ready for review (green badges)
-gh pr list --label="loom:review-requested" --state=open
+# Find PRs ready for review (green badges) - oldest first
+gh pr list --label="loom:review-requested" --state=open --sort created --order asc
 
 # Check out the PR
 gh pr checkout 42
