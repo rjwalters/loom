@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { type GitIdentity, setupWorktreeForAgent } from "./worktree-manager";
+import { enrichWorktreeError, type GitIdentity, setupWorktreeForAgent } from "./worktree-manager";
 
 // Mock Tauri invoke
 vi.mock("@tauri-apps/api/core", () => ({
@@ -245,11 +245,11 @@ describe("worktree-manager", () => {
       expect(result2).toBe("/different/workspace/.loom/worktrees/terminal-b");
     });
 
-    it("should handle invoke errors gracefully", async () => {
+    it("should handle invoke errors gracefully and enrich them", async () => {
       vi.mocked(invoke).mockRejectedValue(new Error("Terminal not found"));
 
       await expect(setupWorktreeForAgent("test-terminal-12", "/path/to/workspace")).rejects.toThrow(
-        "Terminal not found"
+        "Cannot create worktree: terminal 'test-terminal-12' not ready"
       );
     });
 
@@ -267,6 +267,134 @@ describe("worktree-manager", () => {
       expect(invoke).toHaveBeenCalled();
 
       vi.useRealTimers();
+    });
+  });
+
+  describe("enrichWorktreeError", () => {
+    const defaultContext = {
+      terminalId: "terminal-1",
+      workspacePath: "/path/to/workspace",
+      worktreePath: "/path/to/workspace/.loom/worktrees/terminal-1",
+      branchName: "worktree/terminal-1",
+    };
+
+    it("should enrich 'Terminal not found' error with actionable message", () => {
+      const error = new Error("Terminal not found");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("Cannot create worktree: terminal 'terminal-1' not ready");
+      expect(enriched.message).toContain("bug in terminal creation order");
+      expect(enriched.message).toContain("issue #734");
+    });
+
+    it("should enrich 'not a git repository' error with actionable message", () => {
+      const error = new Error("fatal: not a git repository");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain(
+        "Cannot create worktree: '/path/to/workspace' is not a git repository"
+      );
+      expect(enriched.message).toContain("Please initialize git");
+    });
+
+    it("should enrich worktree directory exists error with actionable message", () => {
+      const error = new Error(
+        "fatal: '/path/to/workspace/.loom/worktrees/terminal-1' already exists"
+      );
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("Cannot create worktree: directory");
+      expect(enriched.message).toContain("already exists");
+      expect(enriched.message).toContain("previous session");
+    });
+
+    it("should enrich branch name collision error with actionable message", () => {
+      const error = new Error("fatal: a branch named 'worktree/terminal-1' already exists");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("Cannot create worktree: branch 'worktree/terminal-1'");
+      expect(enriched.message).toContain("already exists");
+      expect(enriched.message).toContain("git branch -D worktree/terminal-1");
+    });
+
+    it("should enrich permission denied error with actionable message", () => {
+      const error = new Error("Permission denied: mkdir failed");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("insufficient permissions");
+      expect(enriched.message).toContain("Check file system permissions");
+    });
+
+    it("should enrich 'cannot create directory' error with actionable message", () => {
+      const error = new Error("mkdir: cannot create directory '/path/to/workspace/.loom'");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("insufficient permissions");
+      expect(enriched.message).toContain(defaultContext.worktreePath);
+    });
+
+    it("should enrich invalid reference error with actionable message", () => {
+      const error = new Error("fatal: invalid reference: HEAD");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("HEAD is invalid or detached");
+      expect(enriched.message).toContain("at least one commit");
+    });
+
+    it("should enrich 'not a valid ref' error with actionable message", () => {
+      const error = new Error("fatal: not a valid ref: HEAD");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("HEAD is invalid or detached");
+    });
+
+    it("should provide generic fallback with context for unknown errors", () => {
+      const error = new Error("Some unknown git error");
+      const enriched = enrichWorktreeError(error, defaultContext);
+
+      expect(enriched.message).toContain("Failed to setup worktree for terminal 'terminal-1'");
+      expect(enriched.message).toContain("Some unknown git error");
+      expect(enriched.message).toContain(defaultContext.worktreePath);
+    });
+
+    it("should handle non-Error objects", () => {
+      const enriched = enrichWorktreeError("string error message", defaultContext);
+
+      expect(enriched.message).toContain("string error message");
+      expect(enriched).toBeInstanceOf(Error);
+    });
+
+    it("should handle null/undefined errors", () => {
+      const enrichedNull = enrichWorktreeError(null, defaultContext);
+      const enrichedUndefined = enrichWorktreeError(undefined, defaultContext);
+
+      expect(enrichedNull.message).toContain("null");
+      expect(enrichedUndefined.message).toContain("undefined");
+    });
+
+    it("should preserve terminal ID in all error messages", () => {
+      const contexts = [
+        { ...defaultContext, terminalId: "custom-terminal-42" },
+        { ...defaultContext, terminalId: "terminal-with-special_chars" },
+      ];
+
+      for (const context of contexts) {
+        const error = new Error("Some error");
+        const enriched = enrichWorktreeError(error, context);
+        expect(enriched.message).toContain(context.terminalId);
+      }
+    });
+
+    it("should preserve workspace path in relevant error messages", () => {
+      const context = {
+        ...defaultContext,
+        workspacePath: "/custom/workspace/path",
+      };
+
+      const error = new Error("fatal: not a git repository");
+      const enriched = enrichWorktreeError(error, context);
+
+      expect(enriched.message).toContain("/custom/workspace/path");
     });
   });
 });
