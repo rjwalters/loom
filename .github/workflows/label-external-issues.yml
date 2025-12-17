@@ -13,9 +13,9 @@ permissions:
 
 jobs:
   # Guard job to prevent workflow failure on push events
-  # GitHub Actions requires at least one job to run for each event type
+  # GitHub Actions marks runs as failed when no jobs execute, so this ensures
+  # at least one job runs. The push trigger is scoped to this file's path only.
   validate:
-    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Workflow syntax valid
