@@ -150,11 +150,12 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Understand context**: Read PR description and linked issues
 4. **Check out code**: `gh pr checkout <number>` to get the branch locally
-5. **Run quality checks**: Tests, lints, type checks, build
-6. **Review changes**: Examine diff, look for issues, suggest improvements
-7. **Create follow-up issues**: For any minor concerns that don't block approval, create issues NOW (see "Handling Minor Concerns")
-8. **Provide feedback**: Use `gh pr comment` to provide review feedback (reference any follow-up issues created)
-9. **Update labels**:
+5. **Merge main into branch**: Ensure the branch has the latest code from main and resolve any merge conflicts before reviewing (see "Merging Main Before Review")
+6. **Run quality checks**: Tests, lints, type checks, build
+7. **Review changes**: Examine diff, look for issues, suggest improvements
+8. **Create follow-up issues**: For any minor concerns that don't block approval, create issues NOW (see "Handling Minor Concerns")
+9. **Provide feedback**: Use `gh pr comment` to provide review feedback (reference any follow-up issues created)
+10. **Update labels**:
    - If approved: Comment with approval, remove `loom:review-requested` and `loom:reviewing`, add `loom:pr` (blue badge - ready for user to merge)
    - If changes needed: Comment with issues, remove `loom:review-requested` and `loom:reviewing`, add `loom:changes-requested` (amber badge - Fixer will address)
 
@@ -236,6 +237,82 @@ fi
 - Provides proactive code review on external contributor PRs
 - Catches issues before they accumulate
 - Respects external PRs by not adding workflow labels
+
+## Merging Main Before Review
+
+**Before reviewing any code, ensure the PR branch has the latest changes from main.** This is critical because:
+
+- **Avoid reviewing stale code**: The PR may have conflicts with changes already merged to main
+- **Catch integration issues early**: Tests may pass on the branch but fail when combined with main
+- **Ensure accurate review**: You should review the code as it will exist after merge, not as it was when the PR was created
+- **Save time for everyone**: Finding merge conflicts during review is better than after approval
+
+### Merge Process
+
+```bash
+# After checking out the PR
+gh pr checkout <number>
+
+# Fetch latest main
+git fetch origin main
+
+# Check if branch is behind main
+BEHIND=$(git rev-list --count HEAD..origin/main)
+if [ "$BEHIND" -gt 0 ]; then
+  echo "Branch is $BEHIND commits behind main, merging..."
+
+  # Merge main into the PR branch
+  git merge origin/main --no-edit
+
+  # If merge conflicts occur, resolve them
+  # Then commit the resolution
+
+  # Push the updated branch
+  git push
+fi
+```
+
+### Handling Merge Conflicts
+
+If merge conflicts occur:
+
+1. **Assess the conflicts**: Are they trivial (formatting, imports) or substantive (logic changes)?
+
+2. **For trivial conflicts** - Resolve them yourself:
+   ```bash
+   # After git merge origin/main shows conflicts
+   # Edit conflicted files to resolve
+   git add <resolved-files>
+   git commit -m "Merge main into branch, resolve conflicts"
+   git push
+   ```
+
+3. **For substantive conflicts** - Request changes:
+   ```bash
+   # Abort the merge
+   git merge --abort
+
+   # Comment and update labels
+   gh pr comment <number> --body "$(cat <<'EOF'
+   ❌ **Changes Requested**
+
+   This PR has merge conflicts with main that require attention from the author:
+
+   - `path/to/conflicted/file.ts` - Logic changes conflict with recent main updates
+   - `path/to/another/file.ts` - Function signature changed in main
+
+   Please merge main into your branch and resolve these conflicts, then re-request review.
+   EOF
+   )"
+   gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"
+   ```
+
+4. **Document what you did**: If you resolved conflicts, mention it in your review comment so the PR author knows what changed.
+
+### When to Skip Merging
+
+- **Fallback queue PRs**: For unlabeled PRs not in the Loom workflow, don't modify the branch - just review as-is
+- **Draft PRs**: If explicitly marked as draft/WIP, don't merge main (author may not want it yet)
 
 ## Review Focus Areas
 
