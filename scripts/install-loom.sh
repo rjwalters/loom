@@ -123,9 +123,23 @@ fi
 # Export for sub-scripts
 export NON_INTERACTIVE
 
-# Resolve target to absolute path
-TARGET_PATH="$(cd "$TARGET_PATH" && pwd 2>/dev/null)" || \
+# Resolve target to absolute path (git repository root, not worktree)
+TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
   error "Target path does not exist: $TARGET_PATH"
+
+# Check if target is a git repository
+if ! git -C "$TARGET_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+  error "Target path is not a git repository: $TARGET_PATH"
+fi
+
+# If target is inside a worktree, resolve to the main repository root
+# git worktree list --porcelain returns the main worktree first
+MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | grep -m1 '^worktree ' | cut -d' ' -f2-)
+if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
+  warning "Target path is inside a worktree: $TARGET_PATH"
+  info "Resolving to main repository root: $MAIN_WORKTREE"
+  TARGET_PATH="$MAIN_WORKTREE"
+fi
 
 echo ""
 header "╔═══════════════════════════════════════════════════════════╗"
@@ -181,6 +195,28 @@ fi
 
 "$LOOM_ROOT/scripts/install/validate-target.sh" "$TARGET_PATH" || \
   error "Target validation failed"
+
+# Check for workflow scope (non-blocking warning)
+if ! "$LOOM_ROOT/scripts/install/check-workflow-scope.sh" 2>/dev/null; then
+  echo ""
+  warning "GitHub CLI token is missing 'workflow' scope"
+  info "Workflow files (.github/workflows/) may be skipped during installation."
+  echo ""
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    info "Continuing in non-interactive mode - workflows will be skipped if needed."
+  else
+    echo "  To add the workflow scope now, run:"
+    echo "    gh auth refresh -s workflow"
+    echo ""
+    read -p "Continue without workflow scope? (Y/n) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+      echo ""
+      info "Run 'gh auth refresh -s workflow' and retry installation."
+      exit 0
+    fi
+  fi
+fi
 
 echo ""
 
