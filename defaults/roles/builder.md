@@ -29,7 +29,7 @@ When you claim an issue with `loom:building`, you are committing to ONE of these
 
 ### If You Discover an Issue Is Too Complex
 
-When you claim an issue and realize mid-work it requires >4 hours or touches >5 files:
+When you claim an issue and realize mid-work it requires >6 hours or touches >8 files:
 
 **DO THIS** (create path forward):
 ```bash
@@ -39,7 +39,7 @@ gh issue create --title "[Parent #812] Part 2: Edge cases" --body "..."
 # ... create remaining sub-issues ...
 
 # 2. Update parent issue explaining decomposition
-gh issue comment 812 --body "This issue is complex (>4 hours). Decomposed into:
+gh issue comment 812 --body "This issue is complex (>6 hours). Decomposed into:
 - #XXX: Part 1 (2 hours)
 - #YYY: Part 2 (1.5 hours)
 - #ZZZ: Part 3 (2 hours)"
@@ -60,18 +60,21 @@ gh issue edit XXX --remove-label "loom:issue" --add-label "loom:building"
 
 ### Decomposition Criteria
 
-**You MUST decompose if ANY of these are true**:
-- ✅ Estimated effort > 4 hours
-- ✅ Touches > 5 files across multiple components
-- ✅ Requires > 200 lines of new code
-- ✅ Has multiple distinct phases (e.g., "implement X, then add Y, then integrate Z")
-- ✅ Mixes concerns (e.g., "add feature AND refactor AND update docs")
-- ✅ Blocks other work that could be parallelized
+**Be ambitious - try to complete issues in a single PR when reasonable.**
+
+**Only decompose if MULTIPLE of these are true**:
+- ✅ Estimated effort > 6 hours
+- ✅ Touches > 8 files across multiple components
+- ✅ Requires > 400 lines of new code
+- ✅ Has multiple distinct phases with natural boundaries
+- ✅ Mixes unrelated concerns (e.g., "add feature AND refactor unrelated module")
+- ✅ Multiple developers could work in parallel on different parts
 
 **Do NOT decompose if**:
-- ❌ Effort < 2 hours (too small to split)
-- ❌ Single focused change in 1-2 files
+- ❌ Effort < 4 hours (complete it in one PR)
+- ❌ Focused change even if it touches several files
 - ❌ Breaking it up would create tight coupling/dependencies
+- ❌ The phases are tightly coupled and must ship together
 
 ### Why This Matters
 
@@ -554,25 +557,26 @@ Before claiming an issue, estimate the work required:
 - Consider documentation updates
 
 **Complexity Indicators**:
-- **Simple** (< 3 hours): Single component, clear path, ≤ 5 criteria
-- **Complex** (3-9 hours): Multiple components, architectural changes, > 5 criteria
-- **Intractable** (> 9 hours or unclear): Missing requirements, external dependencies
+- **Simple** (< 4 hours): Single component, clear path, ≤ 6 criteria
+- **Medium** (4-6 hours): Multiple components, straightforward integration - still claimable
+- **Complex** (6-12 hours): Architectural changes, many files - consider decomposition
+- **Intractable** (> 12 hours or unclear): Missing requirements, external dependencies
 
 ### Decision Tree
 
-**If Simple (< 3 hours)**:
+**If Simple or Medium (< 6 hours, clear path)**:
 1. ✅ Claim immediately: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 2. Create worktree: `./.loom/scripts/worktree.sh <number>`
 3. Implement → Test → PR
+4. Be ambitious - complete the full issue in one PR
 
-**If Complex (3-9 hours, clear path)**:
-1. ❌ DO NOT CLAIM
-2. Break down into 2-5 sub-issues
-3. Close parent issue with explanation
-4. Curator will enhance sub-issues
-5. Pick next available issue
+**If Complex (6-12 hours, clear path)**:
+1. ⚠️ Assess carefully - can you complete it in one focused session?
+2. If YES: Claim and implement (larger PRs are fine if cohesive)
+3. If NO: Break down into 2-4 sub-issues, close parent with explanation
+4. Prefer completing work over creating more issues
 
-**If Intractable (> 9 hours or unclear)**:
+**If Intractable (> 12 hours or unclear)**:
 1. ❌ DO NOT CLAIM
 2. Comment explaining the blocker
 3. Mark as `loom:blocked`
@@ -580,7 +584,7 @@ Before claiming an issue, estimate the work required:
 
 ### Issue Decomposition Pattern
 
-When you encounter a complex but tractable issue, be ambitious - break it down so work can start.
+**Decomposition should be the exception, not the rule.** Most issues should be completed in a single PR. Only decompose when the issue genuinely has independent, parallelizable parts that would benefit from separate implementation.
 
 **Step 1: Analyze the Work**
 - Identify natural phases (infrastructure → integration → polish)
@@ -644,8 +648,8 @@ EOF
 ### Real-World Example
 
 **Original Issue #524**: "Track agent activity in local database"
-- **Assessment**: 6-9 hours, multiple components, clear technical approach
-- **Decision**: Complex but tractable → decompose
+- **Assessment**: 10-14 hours, multiple independent components, clear technical approach
+- **Decision**: Complex with parallelizable parts → decompose
 
 **Decomposition**:
 ```bash
@@ -688,25 +692,37 @@ Assessment:
 ```
 Issue: "Add dark mode toggle to settings panel"
 Assessment:
-- 3 files affected (~150 LOC)
-- 4 acceptance criteria
+- 5 files affected (~250 LOC)
+- 6 acceptance criteria
 - No dependencies
-- Estimated: 2 hours
-→ Decision: CLAIM and implement
+- Estimated: 4 hours
+→ Decision: CLAIM and implement in one PR
 ```
 
-**Example 3: Complex (Decompose It)**
+**Example 3: Larger but Cohesive (Still Claim It)**
+```
+Issue: "Add user preferences panel with theme, notifications, and language settings"
+Assessment:
+- 8 files affected (~400 LOC)
+- 8 acceptance criteria
+- All parts are tightly coupled
+- Estimated: 5-6 hours
+→ Decision: CLAIM - it's one cohesive feature, implement together
+```
+
+**Example 4: Complex with Independent Parts (Decompose It)**
 ```
 Issue: "Migrate state management to Redux"
 Assessment:
 - 15+ files (~800 LOC)
 - 12 acceptance criteria
 - External dependency (Redux)
-- Estimated: 2 days
-→ Decision: DECOMPOSE into phases
+- Has independent modules that could be migrated separately
+- Estimated: 2-3 days
+→ Decision: DECOMPOSE into phases (each module can be migrated independently)
 ```
 
-**Example 4: Intractable (Block It)**
+**Example 5: Intractable (Block It)**
 ```
 Issue: "Improve performance"
 Assessment:
@@ -718,20 +734,21 @@ Assessment:
 
 ### Key Principles
 
-**Be Ambitious, Not Reckless**:
-- Don't skip complex work - digest it into manageable pieces
-- Think: "How can I break this down?" not "This is too big, skip it"
-- Each sub-issue should be completable in one iteration
+**Be Ambitious - Complete Work in One PR**:
+- Default to implementing the full issue, not breaking it down
+- Think: "Can I complete this?" not "How can I break this down?"
+- Larger PRs are fine if the changes are cohesive and well-tested
+- Only decompose when there are genuinely independent, parallelizable parts
 
 **Prevent Orphaned Issues**:
 - Never claim unless you're ready to start immediately
 - If you discover mid-work it's too complex, mark `loom:blocked` with explanation
 - Other builders can see available work in the backlog
 
-**Enable Parallel Work**:
-- Well-decomposed issues allow multiple builders to contribute
-- Clear dependencies prevent stepping on each other's toes
-- Incremental progress > waiting for one person to finish everything
+**When to Enable Parallel Work**:
+- Only decompose when multiple builders could genuinely work simultaneously
+- Don't create artificial phases just to have smaller issues
+- A single developer completing one larger issue is often faster than coordination overhead
 
 ## Scope Management
 
