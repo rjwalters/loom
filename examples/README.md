@@ -98,8 +98,10 @@ See [../.loom/README.md](../.loom/README.md) for detailed customization guide.
 
 Both templates use GitHub labels to coordinate work between agents:
 
-- `loom:ready` (green) - Issue ready for implementation
-- `loom:in-progress` (yellow) - Currently being worked on
+- `loom:issue` (blue) - Issue approved for work, ready for Builder
+- `loom:building` (blue) - Builder is actively implementing
+- `loom:curating` (amber) - Curator is enhancing issue
+- `loom:treating` (amber) - Doctor is fixing bug/PR feedback
 - `loom:review-requested` (green) - PR ready for review
 - `loom:reviewing` (amber) - Under active review
 - `loom:pr` (blue) - PR approved, ready to merge
