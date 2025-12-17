@@ -169,6 +169,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 - **`loom:curating`**: Curator is actively enhancing this issue
 - **`loom:treating`**: Doctor is actively fixing this bug or addressing PR feedback
 - **`loom:review-requested`**: PR ready for Judge to review
+- **`loom:changes-requested`**: PR requires changes (Judge requested modifications)
 - **`loom:pr`**: PR approved by Judge, ready for Champion to auto-merge
 
 **Proposal Labels**:
