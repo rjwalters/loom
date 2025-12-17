@@ -166,7 +166,7 @@ class AutonomousManager {
    * @param state - The application state
    */
   startAllAutonomous(state: AppState): void {
-    const terminals = state.getTerminals();
+    const terminals = state.terminals.getTerminals();
 
     for (const terminal of terminals) {
       // Check if terminal has role with autonomous enabled

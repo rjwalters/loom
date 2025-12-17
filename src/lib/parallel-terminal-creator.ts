@@ -245,7 +245,7 @@ export async function createTerminalsWithRetry(
   // Assign instance numbers to each config
   const configsWithNumbers = configs.map((config) => ({
     ...config,
-    instanceNumber: state.getNextTerminalNumber(),
+    instanceNumber: state.terminals.getNextTerminalNumber(),
   }));
 
   // First attempt: create all terminals in parallel

@@ -66,7 +66,7 @@ export async function cleanupWorkspace(options: WorkspaceCleanupOptions): Promis
   const logger = Logger.forComponent(component);
 
   // Get terminals before cleanup
-  const terminals = state.getTerminals();
+  const terminals = state.terminals.getTerminals();
 
   // Stop all polling
   logger.info("Stopping output polling for all terminals", {

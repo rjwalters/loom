@@ -171,7 +171,7 @@ export function setupMainEventListeners(deps: {
 
   // Close workspace button
   document.getElementById("close-workspace-btn")?.addEventListener("click", async () => {
-    if (state.hasWorkspace()) {
+    if (state.workspace.hasWorkspace()) {
       await invoke("emit_event", { event: "close-workspace" });
     }
   });
@@ -190,7 +190,7 @@ export function setupMainEventListeners(deps: {
         const id = settingsBtn.getAttribute("data-terminal-id");
         if (id) {
           logger.info("Opening terminal settings", { terminalId: id });
-          const terminal = state.getTerminals().find((t) => t.id === id);
+          const terminal = state.terminals.getTerminals().find((t) => t.id === id);
           if (terminal) {
             showTerminalSettingsModal(terminal, state, render);
           }
@@ -272,7 +272,7 @@ export function setupMainEventListeners(deps: {
         const searchPanel = document.getElementById("terminal-search-panel");
         if (searchPanel) {
           searchPanel.classList.add("hidden");
-          const terminal = state.getPrimary();
+          const terminal = state.terminals.getPrimary();
           if (terminal) {
             terminalManager.clearSearch(terminal.id);
           }
@@ -284,7 +284,7 @@ export function setupMainEventListeners(deps: {
       const searchNextBtn = target.closest("#terminal-search-next");
       if (searchNextBtn) {
         e.stopPropagation();
-        const terminal = state.getPrimary();
+        const terminal = state.terminals.getPrimary();
         if (terminal) {
           terminalManager.findNext(terminal.id);
         }
@@ -295,7 +295,7 @@ export function setupMainEventListeners(deps: {
       const searchPrevBtn = target.closest("#terminal-search-prev");
       if (searchPrevBtn) {
         e.stopPropagation();
-        const terminal = state.getPrimary();
+        const terminal = state.terminals.getPrimary();
         if (terminal) {
           terminalManager.findPrevious(terminal.id);
         }
@@ -363,7 +363,7 @@ export function setupMainEventListeners(deps: {
             ?.checked || false;
         const regex =
           (document.getElementById("terminal-search-regex") as HTMLInputElement)?.checked || false;
-        const terminal = state.getPrimary();
+        const terminal = state.terminals.getPrimary();
 
         if (terminal && input.value) {
           terminalManager.searchTerminal(terminal.id, input.value, {
@@ -387,7 +387,7 @@ export function setupMainEventListeners(deps: {
             ?.checked || false;
         const regex =
           (document.getElementById("terminal-search-regex") as HTMLInputElement)?.checked || false;
-        const terminal = state.getPrimary();
+        const terminal = state.terminals.getPrimary();
 
         if (terminal && input && input.value) {
           terminalManager.searchTerminal(terminal.id, input.value, {
@@ -404,7 +404,7 @@ export function setupMainEventListeners(deps: {
 
       // Search input shortcuts
       if (target.id === "terminal-search-input") {
-        const terminal = state.getPrimary();
+        const terminal = state.terminals.getPrimary();
 
         if (e.key === "Enter" && terminal) {
           e.preventDefault();
@@ -478,7 +478,7 @@ export function setupMainEventListeners(deps: {
         e.stopPropagation();
         const id = activityBtn.getAttribute("data-terminal-id");
         if (id) {
-          const terminal = state.getTerminal(id);
+          const terminal = state.terminals.getTerminal(id);
           if (terminal) {
             showTerminalActivityModal(id, terminal.name);
           }
@@ -506,14 +506,14 @@ export function setupMainEventListeners(deps: {
       // Handle add terminal button
       if (target.id === "add-terminal-btn" || target.closest("#add-terminal-btn")) {
         // Don't add if no workspace selected
-        if (!state.hasWorkspace()) {
+        if (!state.workspace.hasWorkspace()) {
           return;
         }
 
         // Create plain terminal and open settings modal
         const newTerminal = await createPlainTerminal({
           state,
-          workspacePath: state.getWorkspaceOrThrow(),
+          workspacePath: state.workspace.getWorkspaceOrThrow(),
           generateNextConfigId,
           saveCurrentConfig,
         });
@@ -530,8 +530,8 @@ export function setupMainEventListeners(deps: {
       if (card) {
         const id = card.getAttribute("data-terminal-id");
         if (id) {
-          const terminal = state.getTerminals().find((t) => t.id === id);
-          state.setPrimary(id);
+          const terminal = state.terminals.getTerminals().find((t) => t.id === id);
+          state.terminals.setPrimary(id);
           if (terminal) {
             announceTerminalSelection(terminal.name);
           }

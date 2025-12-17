@@ -119,7 +119,7 @@ initializeKeyboardNavigation(state);
 
 // Set up auto-save (saves state 2 seconds after last change)
 state.setAutoSave(async () => {
-  if (state.hasWorkspace()) {
+  if (state.workspace.hasWorkspace()) {
     // Logger will be initialized in async IIFE
     if (logger) logger?.info("Auto-saving state");
     await saveCurrentConfiguration(state);
@@ -130,7 +130,7 @@ state.setAutoSave(async () => {
 // Save state immediately on window close (before app quits)
 // Handle both browser beforeunload and Tauri window close events
 window.addEventListener("beforeunload", async () => {
-  if (state.hasWorkspace()) {
+  if (state.workspace.hasWorkspace()) {
     logger?.info("Window closing (beforeunload) - saving state immediately");
     try {
       // Save state synchronously if possible
@@ -164,9 +164,9 @@ outputPoller.onError((terminalId, errorMessage) => {
   });
 
   // Update terminal state
-  const terminal = state.getTerminal(terminalId);
+  const terminal = state.terminals.getTerminal(terminalId);
   if (terminal) {
-    state.updateTerminal(terminal.id, {
+    state.terminals.updateTerminal(terminal.id, {
       status: TerminalStatus.Error,
       missingSession: true,
     });
@@ -205,12 +205,12 @@ const healthCheckedTerminals = new Set<string>();
 
 // Render function
 function render() {
-  const hasWorkspace = state.hasWorkspace();
+  const hasWorkspace = state.workspace.hasWorkspace();
   const isResetting = state.isWorkspaceResetting();
   const isInitializing = state.isAppInitializing();
   logger?.info("Rendering", {
     hasWorkspace,
-    displayedWorkspace: state.getDisplayedWorkspace(),
+    displayedWorkspace: state.workspace.getDisplayedWorkspace(),
     isResetting,
     isInitializing,
   });
@@ -220,7 +220,7 @@ function render() {
 
   // Render header with daemon health and offline mode indicator
   renderHeader(
-    state.getDisplayedWorkspace(),
+    state.workspace.getDisplayedWorkspace(),
     hasWorkspace,
     systemHealth.daemon.connected,
     systemHealth.daemon.lastPing,
@@ -241,7 +241,7 @@ function render() {
     return;
   }
 
-  renderPrimaryTerminal(state.getPrimary(), hasWorkspace, state.getDisplayedWorkspace());
+  renderPrimaryTerminal(state.terminals.getPrimary(), hasWorkspace, state.workspace.getDisplayedWorkspace());
 
   // Render mini terminals with health data
   const terminalHealthMap = new Map(
@@ -253,14 +253,14 @@ function render() {
       },
     ])
   );
-  renderMiniTerminals(state.getTerminals(), hasWorkspace, terminalHealthMap);
+  renderMiniTerminals(state.terminals.getTerminals(), hasWorkspace, terminalHealthMap);
 
   // Re-attach workspace event listeners if they were just rendered
   if (!hasWorkspace) {
     attachWorkspaceEventListeners(
       handleWorkspacePathInput,
       browseWorkspaceWithCallback,
-      () => state.getWorkspace() || ""
+      () => state.workspace.getWorkspace() || ""
     );
   }
 
@@ -268,7 +268,7 @@ function render() {
   setupTooltips();
 
   // Initialize xterm.js terminal for primary terminal
-  const primary = state.getPrimary();
+  const primary = state.terminals.getPrimary();
   if (primary && hasWorkspace) {
     initializeTerminalDisplay(primary.id);
   }
@@ -308,14 +308,14 @@ async function initializeTerminalDisplay(terminalId: string) {
         logger?.warn("Terminal has no tmux session", { terminalId });
 
         // Mark terminal as having missing session (only if not already marked)
-        const terminal = state.getTerminal(terminalId);
+        const terminal = state.terminals.getTerminal(terminalId);
         logger?.info("Terminal state before update", {
           terminalId,
           missingSession: terminal?.missingSession,
         });
         if (terminal && !terminal.missingSession) {
           logger?.info("Setting missingSession=true for terminal", { terminalId });
-          state.updateTerminal(terminal.id, {
+          state.terminals.updateTerminal(terminal.id, {
             status: TerminalStatus.Error,
             missingSession: true,
           });
@@ -430,10 +430,10 @@ if (!eventListenersRegistered) {
 
   // Listen for menu events
   listen("new-terminal", () => {
-    if (state.hasWorkspace()) {
+    if (state.workspace.hasWorkspace()) {
       createPlainTerminal({
         state,
-        workspacePath: state.getWorkspaceOrThrow(),
+        workspacePath: state.workspace.getWorkspaceOrThrow(),
         generateNextConfigId,
         saveCurrentConfig,
       });
@@ -441,7 +441,7 @@ if (!eventListenersRegistered) {
   });
 
   listen("close-terminal", async () => {
-    const primary = state.getPrimary();
+    const primary = state.terminals.getPrimary();
     if (primary) {
       await closeTerminalWithConfirmation(primary.id, {
         state,
@@ -502,8 +502,8 @@ if (!eventListenersRegistered) {
    * Extracted from duplicate code in start-workspace and force-start-workspace event listeners
    */
   async function handleWorkspaceStart(logPrefix: string): Promise<void> {
-    if (!state.hasWorkspace()) return;
-    const workspace = state.getWorkspaceOrThrow();
+    if (!state.workspace.hasWorkspace()) return;
+    const workspace = state.workspace.getWorkspaceOrThrow();
 
     // Clear health check tracking when starting workspace (terminals will be recreated)
     const previousSize = healthCheckedTerminals.size;
@@ -542,7 +542,7 @@ if (!eventListenersRegistered) {
 
   // Start engine - create sessions for existing config (with confirmation)
   listen("start-workspace", async () => {
-    if (!state.hasWorkspace()) return;
+    if (!state.workspace.hasWorkspace()) return;
 
     const confirmed = await ask(
       "This will:\n" +
@@ -564,7 +564,7 @@ if (!eventListenersRegistered) {
 
   // Force Start engine - NO confirmation dialog (for MCP automation)
   listen("force-start-workspace", async () => {
-    if (!state.hasWorkspace()) return;
+    if (!state.workspace.hasWorkspace()) return;
 
     logger?.info("Starting engine (no confirmation)");
 
@@ -573,8 +573,8 @@ if (!eventListenersRegistered) {
 
   // Helper function to handle factory reset logic (shared between confirmed and force variants)
   async function handleFactoryReset(logPrefix: string): Promise<void> {
-    if (!state.hasWorkspace()) return;
-    const workspace = state.getWorkspaceOrThrow();
+    if (!state.workspace.hasWorkspace()) return;
+    const workspace = state.workspace.getWorkspaceOrThrow();
 
     logger?.info("Starting factory reset", { source: logPrefix });
 
@@ -616,7 +616,7 @@ if (!eventListenersRegistered) {
 
   // Factory Reset - overwrite config with defaults (with confirmation)
   listen("factory-reset-workspace", async () => {
-    if (!state.hasWorkspace()) return;
+    if (!state.workspace.hasWorkspace()) return;
 
     const confirmed = await ask(
       "⚠️ WARNING: Factory Reset ⚠️\n\n" +
@@ -641,7 +641,7 @@ if (!eventListenersRegistered) {
 
   // Force Factory Reset - NO confirmation dialog (for MCP automation)
   listen("force-factory-reset-workspace", async () => {
-    if (!state.hasWorkspace()) return;
+    if (!state.workspace.hasWorkspace()) return;
 
     logger?.info("Resetting workspace (no confirmation)");
 
@@ -708,7 +708,7 @@ async function showDaemonStatusDialog() {
       ? "✅ Running"
       : `❌ Not Running${status.error ? `\n\nError: ${status.error}` : ""}`;
 
-    const hasWorkspace = state.hasWorkspace();
+    const hasWorkspace = state.workspace.hasWorkspace();
 
     // Show different dialog based on whether daemon is running and workspace is loaded
     if (status.running && hasWorkspace) {
@@ -744,7 +744,7 @@ async function showDaemonStatusDialog() {
 
 // Save current state to config and state files
 async function saveCurrentConfig() {
-  if (!state.hasWorkspace()) {
+  if (!state.workspace.hasWorkspace()) {
     return;
   }
 
@@ -798,7 +798,7 @@ const browseWorkspaceWithCallback = () => browseWorkspace(handleWorkspacePathInp
     // Register close-requested listener (needs logger to be initialized)
     listen("tauri://close-requested", async () => {
       logger?.info("Window close requested (Tauri event) - saving state");
-      if (state.hasWorkspace()) {
+      if (state.workspace.hasWorkspace()) {
         try {
           await state.saveNow();
           logger?.info("State saved successfully on close-requested");

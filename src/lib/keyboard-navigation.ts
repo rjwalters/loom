@@ -21,7 +21,7 @@ export function initializeKeyboardNavigation(state: AppState): void {
     const terminalId = activeElement.getAttribute("data-terminal-id");
     if (!terminalId) return;
 
-    const terminals = state.getTerminals();
+    const terminals = state.terminals.getTerminals();
     const currentIndex = terminals.findIndex((t) => t.id === terminalId);
 
     if (currentIndex === -1) return;
@@ -50,7 +50,7 @@ export function initializeKeyboardNavigation(state: AppState): void {
       case " ":
         // Activate terminal on Enter or Space
         e.preventDefault();
-        state.setPrimary(terminalId);
+        state.terminals.setPrimary(terminalId);
         return;
       default:
         return;

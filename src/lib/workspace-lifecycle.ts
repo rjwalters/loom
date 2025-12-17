@@ -51,7 +51,7 @@ async function expandAndValidatePath(
   logger.info("Expanded path", { expandedPath });
 
   // Always update displayed workspace so bad paths are visible with error message
-  deps.state.setDisplayedWorkspace(expandedPath);
+  deps.state.workspace.setDisplayedWorkspace(expandedPath);
   logger.info("Set displayedWorkspace, triggering render");
 
   const isValid = await deps.validateWorkspacePath(expandedPath);
@@ -143,7 +143,7 @@ async function initializeNewWorkspace(
   // After initialization, create terminals for the default config
   setConfigWorkspace(workspacePath);
   const config = await loadWorkspaceConfig();
-  state.setNextTerminalNumber(config.nextAgentNumber);
+  state.terminals.setNextTerminalNumber(config.nextAgentNumber);
 
   if (config.agents && config.agents.length > 0) {
     logger.info("Creating terminals for fresh workspace", {
@@ -191,7 +191,7 @@ async function initializeNewWorkspace(
     }
 
     // Load agents into state with their new IDs
-    state.loadAgents(config.agents);
+    state.terminals.loadTerminals(config.agents);
 
     // Launch agents for terminals with role configs
     await launchAgentsForTerminals(workspacePath, config.agents);
@@ -293,7 +293,7 @@ async function autoCreateSessionsIfAllMissing(
   deps: WorkspaceLifecycleDependencies
 ): Promise<number> {
   const { state, launchAgentsForTerminals } = deps;
-  const terminals = state.getTerminals();
+  const terminals = state.terminals.getTerminals();
   const allMissing = terminals.every((t) => t.missingSession === true);
 
   if (!allMissing || terminals.length === 0) {
@@ -325,7 +325,7 @@ async function autoCreateSessionsIfAllMissing(
   for (const result of succeeded) {
     const terminal = terminals.find((t) => t.id === result.configId);
     if (terminal) {
-      state.updateTerminal(terminal.id, {
+      state.terminals.updateTerminal(terminal.id, {
         id: result.terminalId,
         status: TerminalStatus.Idle,
         missingSession: undefined,
@@ -363,7 +363,7 @@ async function autoCreateSessionsIfAllMissing(
     logger.info("Launching agents for auto-created terminals", {
       workspacePath,
     });
-    await launchAgentsForTerminals(workspacePath, state.getTerminals());
+    await launchAgentsForTerminals(workspacePath, state.terminals.getTerminals());
   }
 
   return succeeded.length;
@@ -386,7 +386,7 @@ async function loadExistingWorkspace(
   // Workspace already initialized - load existing config
   setConfigWorkspace(workspacePath);
   const config = await loadWorkspaceConfig();
-  state.setNextTerminalNumber(config.nextAgentNumber);
+  state.terminals.setNextTerminalNumber(config.nextAgentNumber);
 
   // Load agents from config
   if (config.agents && config.agents.length > 0) {
@@ -407,10 +407,10 @@ async function loadExistingWorkspace(
       workspacePath,
       agents: config.agents.map((a) => `${a.name}=${a.id}`),
     });
-    state.loadAgents(config.agents);
+    state.terminals.loadTerminals(config.agents);
     logger.info("State after loadAgents", {
       workspacePath,
-      terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+      terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
     });
 
     // If we created sessions, save the updated config with real IDs
@@ -510,7 +510,7 @@ export async function handleWorkspacePathInput(
     await startAutonomousMode(deps.state);
 
     // Step 10: Set workspace as active
-    deps.state.setWorkspace(expandedPath);
+    deps.state.workspace.setWorkspace(expandedPath);
     logger.info("Workspace fully loaded", { workspacePath: expandedPath });
 
     // Step 11: Persist workspace path

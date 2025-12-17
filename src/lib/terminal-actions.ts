@@ -57,7 +57,7 @@ export async function handleRunNowClick(
   logger.info("Running interval prompt manually", { terminalId });
 
   try {
-    const terminal = state.getTerminal(terminalId);
+    const terminal = state.terminals.getTerminal(terminalId);
     if (!terminal) {
       logger.error("Terminal not found", new Error("Terminal not found"), {
         terminalId,
@@ -97,7 +97,7 @@ export async function handleRestartTerminal(
   logger.info("Restarting terminal", { terminalId });
 
   try {
-    const terminal = state.getTerminal(terminalId);
+    const terminal = state.terminals.getTerminal(terminalId);
     if (!terminal) {
       logger.error("Terminal not found", new Error("Terminal not found"), {
         terminalId,
@@ -119,7 +119,7 @@ export async function handleRestartTerminal(
     });
 
     // Set terminal to busy status during restart
-    state.updateTerminal(terminalId, { status: TerminalStatus.Busy });
+    state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Busy });
 
     // Destroy the terminal via Tauri IPC
     await invoke("destroy_terminal", { id: terminalId });
@@ -130,7 +130,7 @@ export async function handleRestartTerminal(
     await new Promise((resolve) => setTimeout(resolve, 500));
 
     // Create a new terminal with the same configuration
-    const workspacePath = state.getWorkspace();
+    const workspacePath = state.workspace.getWorkspace();
     if (!workspacePath) {
       throw new Error("No workspace path available");
     }
@@ -157,7 +157,7 @@ export async function handleRestartTerminal(
     }
 
     // Update terminal status to idle
-    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+    state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Idle });
 
     // Save the configuration
     await saveCurrentConfig();
@@ -179,7 +179,7 @@ export async function handleRestartTerminal(
       terminalId,
     });
     // Reset status to idle on error
-    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+    state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Idle });
     showToast(`Failed to restart terminal: ${error}`, "error");
   }
 }
@@ -200,7 +200,7 @@ export function startRename(
   deps: TerminalActionDependencies
 ): void {
   const { state, saveCurrentConfig, render } = deps;
-  const terminal = state.getTerminals().find((t) => t.id === terminalId);
+  const terminal = state.terminals.getTerminals().find((t) => t.id === terminalId);
   if (!terminal) return;
 
   const currentName = terminal.name;
@@ -232,7 +232,7 @@ export function startRename(
 
     const newName = input.value.trim();
     if (newName && newName !== currentName) {
-      state.renameTerminal(terminalId, newName);
+      state.terminals.renameTerminal(terminalId, newName);
       saveCurrentConfig();
     } else {
       // Just re-render to restore the original name element
@@ -282,7 +282,7 @@ export async function closeTerminalWithConfirmation(
 ): Promise<void> {
   const { state, outputPoller, terminalManager, appLevelState, saveCurrentConfig } = deps;
 
-  const terminal = state.getTerminal(terminalId);
+  const terminal = state.terminals.getTerminal(terminalId);
   if (!terminal) {
     logger.error("Terminal not found", new Error("Terminal not found"), {
       terminalId,
@@ -312,7 +312,7 @@ export async function closeTerminalWithConfirmation(
   terminalManager.destroyTerminal(terminalId);
 
   // Get terminal name before removing
-  const terminalToRemove = state.getTerminals().find((t) => t.id === terminalId);
+  const terminalToRemove = state.terminals.getTerminals().find((t) => t.id === terminalId);
   const terminalName = terminalToRemove?.name || "Unknown";
 
   // Clear attached terminal ID if it matches
@@ -321,7 +321,7 @@ export async function closeTerminalWithConfirmation(
   }
 
   // Remove from state
-  state.removeTerminal(terminalId);
+  state.terminals.removeTerminal(terminalId);
 
   // Announce terminal removal to screen readers
   announceTerminalRemoved(terminalName);
@@ -349,15 +349,15 @@ export async function createPlainTerminal(deps: {
   const { state, workspacePath, generateNextConfigId, saveCurrentConfig } = deps;
 
   // Generate terminal name
-  const terminalCount = state.getTerminals().length + 1;
+  const terminalCount = state.terminals.getTerminals().length + 1;
   const name = `Terminal ${terminalCount}`;
 
   try {
     // Generate stable ID first
-    const id = generateNextConfigId(state.getTerminals());
+    const id = generateNextConfigId(state.terminals.getTerminals());
 
     // Get instance number for this terminal
-    const instanceNumber = state.getNextTerminalNumber();
+    const instanceNumber = state.terminals.getNextTerminalNumber();
 
     // Create worktree for this terminal FIRST (before creating terminal)
     logger.info("Creating worktree for terminal", { name, id });
@@ -386,7 +386,7 @@ export async function createPlainTerminal(deps: {
       role: "default",
       theme: "default",
     };
-    state.addTerminal(newTerminal);
+    state.terminals.addTerminal(newTerminal);
 
     // Announce terminal creation to screen readers
     announceTerminalCreated(name);
@@ -395,7 +395,7 @@ export async function createPlainTerminal(deps: {
     await saveCurrentConfig();
 
     // Switch to new terminal
-    state.setPrimary(id);
+    state.terminals.setPrimary(id);
 
     // Return the created terminal
     return newTerminal;

@@ -133,7 +133,7 @@ export async function showTerminalSettingsModal(
   }
 
   // Load available role files
-  const workspacePath = state.getWorkspace();
+  const workspacePath = state.workspace.getWorkspace();
   if (workspacePath) {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
@@ -560,14 +560,14 @@ async function applySettings(
     const roleChanged = previousRole !== role;
     const hasNewRole = role !== undefined && roleConfig !== undefined;
 
-    state.updateTerminal(terminal.id, { name });
-    state.setTerminalRole(terminal.id, role, roleConfig);
-    state.setTerminalTheme(terminal.id, selectedTheme);
+    state.terminals.updateTerminal(terminal.id, { name });
+    state.terminals.setTerminalRole(terminal.id, role, roleConfig);
+    state.terminals.setTerminalTheme(terminal.id, selectedTheme);
 
     await saveCurrentConfiguration(state);
 
     if (roleChanged && hasNewRole) {
-      const workspacePath = state.getWorkspace();
+      const workspacePath = state.workspace.getWorkspace();
       if (workspacePath && roleConfig.roleFile) {
         try {
           if (workerType === "github-copilot") {
@@ -615,7 +615,7 @@ async function applySettings(
               });
               const { setupWorktreeForAgent } = await import("./worktree-manager");
               worktreePath = await setupWorktreeForAgent(terminal.id, workspacePath, gitIdentity);
-              state.updateTerminal(terminal.id, { worktreePath });
+              state.terminals.updateTerminal(terminal.id, { worktreePath });
             }
 
             await launchAgentInTerminal(
@@ -644,7 +644,7 @@ async function applySettings(
       roleConfig.targetInterval !== undefined &&
       (roleConfig.targetInterval as number) >= 0
     ) {
-      const updatedTerminal = state.getTerminal(terminal.id);
+      const updatedTerminal = state.terminals.getTerminal(terminal.id);
       if (updatedTerminal) {
         intervalManager.restart(updatedTerminal);
       }

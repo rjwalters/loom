@@ -75,8 +75,10 @@ describe("HealthMonitor", () => {
     mockTerminals = createMockTerminals();
 
     mockState = {
-      getTerminals: vi.fn(() => mockTerminals),
-      updateTerminal: vi.fn(),
+      terminals: {
+        getTerminals: vi.fn(() => mockTerminals),
+        updateTerminal: vi.fn(),
+      },
     };
 
     mockPoller = {
@@ -235,7 +237,7 @@ describe("HealthMonitor", () => {
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+      expect(mockState.terminals.updateTerminal).toHaveBeenCalledWith("terminal-1", {
         status: TerminalStatus.Error,
         missingSession: true,
       });
@@ -251,7 +253,7 @@ describe("HealthMonitor", () => {
       monitor.start();
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+      expect(mockState.terminals.updateTerminal).toHaveBeenCalledWith("terminal-1", {
         status: TerminalStatus.Idle,
         missingSession: undefined,
       });
@@ -280,7 +282,7 @@ describe("HealthMonitor", () => {
       expect(log.context.errorStack).toBeDefined();
 
       // Should not set missingSession on IPC failure
-      expect(mockState.updateTerminal).not.toHaveBeenCalled();
+      expect(mockState.terminals.updateTerminal).not.toHaveBeenCalled();
     });
 
     it("detects stale terminals based on activity threshold", async () => {
@@ -699,7 +701,7 @@ describe("HealthMonitor", () => {
       vi.advanceTimersByTime(30000);
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+      expect(mockState.terminals.updateTerminal).toHaveBeenCalledWith("terminal-1", {
         status: TerminalStatus.Error,
         missingSession: true,
       });
@@ -716,7 +718,7 @@ describe("HealthMonitor", () => {
       vi.advanceTimersByTime(30000);
       await vi.advanceTimersByTimeAsync(0);
 
-      expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+      expect(mockState.terminals.updateTerminal).toHaveBeenCalledWith("terminal-1", {
         status: TerminalStatus.Idle,
         missingSession: undefined,
       });

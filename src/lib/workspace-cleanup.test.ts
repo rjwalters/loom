@@ -40,7 +40,9 @@ describe("cleanupWorkspace", () => {
 
     // Mock state
     mockState = {
-      getTerminals: vi.fn(() => mockTerminals),
+      terminals: {
+        getTerminals: vi.fn(() => mockTerminals),
+      },
       clearAll: vi.fn(),
     };
 
@@ -84,7 +86,7 @@ describe("cleanupWorkspace", () => {
       await cleanupWorkspace(options);
 
       // Verify cleanup sequence
-      expect(mockState.getTerminals).toHaveBeenCalled();
+      expect(mockState.terminals.getTerminals).toHaveBeenCalled();
       expect(mockOutputPoller.stopPolling).toHaveBeenCalledTimes(3);
       expect(mockTerminalManager.destroyAll).toHaveBeenCalled();
       expect(invoke).toHaveBeenCalledWith("destroy_terminal", { id: "terminal-1" });
@@ -356,7 +358,7 @@ describe("cleanupWorkspace", () => {
 
   describe("Edge Cases", () => {
     it("handles empty terminal list", async () => {
-      mockState.getTerminals.mockReturnValue([]);
+      mockState.terminals.getTerminals.mockReturnValue([]);
 
       const options: WorkspaceCleanupOptions = {
         component: "test-component",
@@ -379,7 +381,7 @@ describe("cleanupWorkspace", () => {
     });
 
     it("handles single terminal", async () => {
-      mockState.getTerminals.mockReturnValue([{ id: "terminal-1", name: "Solo" }]);
+      mockState.terminals.getTerminals.mockReturnValue([{ id: "terminal-1", name: "Solo" }]);
 
       const options: WorkspaceCleanupOptions = {
         component: "test-component",

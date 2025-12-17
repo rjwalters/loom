@@ -313,7 +313,7 @@ class IntervalPromptManager {
    * @param state - Application state
    */
   startAll(state: AppState): void {
-    const terminals = state.getTerminals();
+    const terminals = state.terminals.getTerminals();
 
     for (const terminal of terminals) {
       const hasInterval =

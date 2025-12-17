@@ -379,7 +379,7 @@ describe("autonomous-manager", () => {
 
   describe("startAllAutonomous", () => {
     it("should start autonomous mode for all eligible terminals", () => {
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "terminal-1",
         name: "Autonomous 1",
         status: TerminalStatus.Idle,
@@ -391,7 +391,7 @@ describe("autonomous-manager", () => {
         },
       });
 
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "terminal-2",
         name: "Manual",
         status: TerminalStatus.Idle,
@@ -403,7 +403,7 @@ describe("autonomous-manager", () => {
         },
       });
 
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "terminal-3",
         name: "Autonomous 2",
         status: TerminalStatus.Idle,
@@ -423,7 +423,7 @@ describe("autonomous-manager", () => {
     });
 
     it("should skip terminals without role", () => {
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "terminal-1",
         name: "No Role",
         status: TerminalStatus.Idle,

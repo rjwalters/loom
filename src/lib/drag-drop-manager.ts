@@ -55,13 +55,13 @@ export function setupDragAndDrop(
 
     // Perform reorder if valid (uses configId for state operation)
     if (draggedConfigId && dropTargetConfigId && dropTargetConfigId !== draggedConfigId) {
-      state.reorderTerminal(draggedConfigId, dropTargetConfigId, dropInsertBefore);
+      state.terminals.reorderTerminal(draggedConfigId, dropTargetConfigId, dropInsertBefore);
       saveConfig();
     }
 
     // Select the terminal that was dragged (uses configId for state operation)
     if (draggedConfigId) {
-      state.setPrimary(draggedConfigId);
+      state.terminals.setPrimary(draggedConfigId);
     }
 
     // Cleanup
