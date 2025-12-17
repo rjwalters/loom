@@ -1,8 +1,12 @@
+import type {
+  AgentLauncherDependencies,
+  CoreDependencies,
+  RenderableDependencies,
+  TerminalAttachmentDependencies,
+  TerminalInfrastructureDependencies,
+} from "./dependencies";
 import { Logger } from "./logger";
-import type { OutputPoller } from "./output-poller";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
-import type { AppState, Terminal } from "./state";
-import type { TerminalManager } from "./terminal-manager";
 import { showToast } from "./toast";
 import { cleanupWorkspace } from "./workspace-cleanup";
 
@@ -11,13 +15,12 @@ const logger = Logger.forComponent("workspace-start");
 /**
  * Dependencies needed by the workspace start logic
  */
-export interface WorkspaceStartDependencies {
-  state: AppState;
-  outputPoller: OutputPoller;
-  terminalManager: TerminalManager;
-  setCurrentAttachedTerminalId: (id: string | null) => void;
-  launchAgentsForTerminals: (workspacePath: string, terminals: Terminal[]) => Promise<void>;
-  render: () => void;
+export interface WorkspaceStartDependencies
+  extends CoreDependencies,
+    TerminalInfrastructureDependencies,
+    TerminalAttachmentDependencies,
+    AgentLauncherDependencies,
+    RenderableDependencies {
   markTerminalsHealthChecked: (terminalIds: string[]) => void;
 }
 

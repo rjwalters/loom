@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { loadConfig } from "./config";
+import type { ConfigurableDependencies, CoreDependencies } from "./dependencies";
 import { Logger } from "./logger";
 import { startOfflineScheduler } from "./offline-scheduler";
-import type { AppState, Terminal } from "./state";
+import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
 
@@ -20,10 +21,10 @@ const logger = Logger.forComponent("terminal-lifecycle");
 /**
  * Dependencies for terminal lifecycle operations
  */
-export interface TerminalLifecycleDependencies {
-  state: AppState;
+export interface TerminalLifecycleDependencies
+  extends CoreDependencies,
+    Partial<ConfigurableDependencies> {
   initializeTerminalDisplay?: (terminalId: string) => void;
-  saveCurrentConfig?: () => Promise<void>;
 }
 
 /**
