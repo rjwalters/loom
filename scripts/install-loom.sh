@@ -150,9 +150,55 @@ echo ""
 info "Target: $TARGET_PATH"
 echo ""
 
+# Check required dependencies
+header "Checking Dependencies"
+echo ""
+
+MISSING_DEPS=()
+
 # Check if node is available (needed for version extraction)
-if ! command -v node &> /dev/null; then
-  error "Node.js is required but not found in PATH\n       Install from: https://nodejs.org/"
+if command -v node &> /dev/null; then
+  success "node: $(node --version)"
+else
+  MISSING_DEPS+=("node")
+fi
+
+# Check for pnpm (needed to build daemon)
+if command -v pnpm &> /dev/null; then
+  success "pnpm: $(pnpm --version)"
+else
+  MISSING_DEPS+=("pnpm")
+fi
+
+# Check for cargo (needed to build daemon)
+if command -v cargo &> /dev/null; then
+  success "cargo: $(cargo --version | head -1)"
+else
+  MISSING_DEPS+=("cargo")
+fi
+
+echo ""
+
+# Report missing dependencies
+if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+  echo -e "${RED}✗ Missing required dependencies: ${MISSING_DEPS[*]}${NC}"
+  echo ""
+  info "Please install the missing dependencies:"
+  for dep in "${MISSING_DEPS[@]}"; do
+    case "$dep" in
+      node)
+        echo "  • Node.js: brew install node (or https://nodejs.org/)"
+        ;;
+      pnpm)
+        echo "  • pnpm: npm install -g pnpm (or https://pnpm.io/installation)"
+        ;;
+      cargo)
+        echo "  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        ;;
+    esac
+  done
+  echo ""
+  error "Cannot proceed without required dependencies"
 fi
 
 # Extract Loom version from package.json

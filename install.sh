@@ -76,6 +76,82 @@ if [[ ! -d "$TARGET_PATH/.git" ]]; then
 fi
 
 success "Valid git repository detected"
+echo ""
+
+# ============================================================================
+# Check Required Dependencies
+# ============================================================================
+header "Checking System Dependencies"
+echo ""
+
+MISSING_DEPS=()
+INSTALL_INSTRUCTIONS=""
+
+# Check for Git (should always be present if we got this far, but verify)
+if command -v git &> /dev/null; then
+  success "git: $(git --version | head -1)"
+else
+  MISSING_DEPS+=("git")
+  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • git: brew install git"
+fi
+
+# Check for Node.js
+if command -v node &> /dev/null; then
+  success "node: $(node --version)"
+else
+  MISSING_DEPS+=("node")
+  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • Node.js: brew install node"
+fi
+
+# Check for pnpm
+if command -v pnpm &> /dev/null; then
+  success "pnpm: $(pnpm --version)"
+else
+  MISSING_DEPS+=("pnpm")
+  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • pnpm: npm install -g pnpm"
+fi
+
+# Check for Cargo (Rust toolchain)
+if command -v cargo &> /dev/null; then
+  success "cargo: $(cargo --version | head -1)"
+else
+  MISSING_DEPS+=("cargo")
+  INSTALL_INSTRUCTIONS="${INSTALL_INSTRUCTIONS}\n  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+fi
+
+# Check for GitHub CLI (optional but needed for Full Install)
+if command -v gh &> /dev/null; then
+  success "gh: $(gh --version | head -1)"
+else
+  warning "gh (GitHub CLI) not found - Full Install will not be available"
+  info "  Install with: brew install gh"
+fi
+
+echo ""
+
+# If any required dependencies are missing, prompt the user
+if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
+  echo ""
+  error_no_exit() {
+    echo -e "${RED}✗ Missing required dependencies: ${MISSING_DEPS[*]}${NC}"
+  }
+  error_no_exit
+
+  echo ""
+  info "Please install the missing dependencies:"
+  echo -e "$INSTALL_INSTRUCTIONS"
+  echo ""
+
+  read -r -p "Exit to install dependencies? [Y/n] " -n 1 INSTALL_DEPS
+  echo ""
+  if [[ ! $INSTALL_DEPS =~ ^[Nn]$ ]]; then
+    info "Please install the missing dependencies and run this script again."
+    exit 1
+  fi
+
+  warning "Continuing without all dependencies may cause build failures"
+  echo ""
+fi
 
 # Check if Loom is already installed
 if [[ -d "$TARGET_PATH/.loom" ]]; then
