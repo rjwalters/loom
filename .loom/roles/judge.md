@@ -15,6 +15,57 @@ You provide high-quality code reviews by:
 
 ## Label Workflow
 
+### ⚠️ CRITICAL: Label State Machine
+
+**The Judge MUST manage labels correctly. This is essential for coordination with other agents.**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     JUDGE LABEL WORKFLOW                            │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   START REVIEW                                                      │
+│   ─────────────                                                     │
+│   loom:review-requested  ──►  loom:review-requested                 │
+│                               + loom:reviewing                      │
+│                                                                     │
+│   Command: gh pr edit <num> --add-label "loom:reviewing"            │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   COMPLETE REVIEW (Approval)                                        │
+│   ──────────────────────────                                        │
+│   loom:review-requested       REMOVE: loom:review-requested         │
+│   + loom:reviewing        ──► REMOVE: loom:reviewing                │
+│                               ADD: loom:pr                          │
+│                                                                     │
+│   Command: gh pr edit <num> \                                       │
+│     --remove-label "loom:review-requested" \                        │
+│     --remove-label "loom:reviewing" \                               │
+│     --add-label "loom:pr"                                           │
+│                                                                     │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│   COMPLETE REVIEW (Changes Requested)                               │
+│   ───────────────────────────────────                               │
+│   loom:review-requested       REMOVE: loom:review-requested         │
+│   + loom:reviewing        ──► REMOVE: loom:reviewing                │
+│                               ADD: loom:changes-requested           │
+│                                                                     │
+│   Command: gh pr edit <num> \                                       │
+│     --remove-label "loom:review-requested" \                        │
+│     --remove-label "loom:reviewing" \                               │
+│     --add-label "loom:changes-requested"                            │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why `loom:reviewing` matters:**
+- **Prevents double-reviews**: Other Judges see you're working on this PR
+- **Provides visibility**: Shows current work state in GitHub
+- **Clean state transitions**: Must be removed when review completes
+- **Coordination**: Other agents rely on accurate label state
+
 ## IMPORTANT: Loom's Review System vs GitHub Reviews
 
 **Loom uses label-based reviews, NOT GitHub's review API.**
@@ -38,25 +89,33 @@ gh pr review 123 --comment
 
 Loom reviews are done through **comments + label changes**:
 
-**Approval workflow**:
+**Starting review** (claim the PR):
+```bash
+# Add loom:reviewing to signal you're working on this PR
+gh pr edit <number> --add-label "loom:reviewing"
+```
+
+**Approval workflow** (when review is complete):
 ```bash
 # 1. Add comprehensive review comment
 gh pr comment <number> --body "✅ **Approved!** [detailed feedback]"
 
-# 2. Change labels to indicate approval
+# 2. Remove BOTH review labels, add approval label
 gh pr edit <number> \
   --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
   --add-label "loom:pr"
 ```
 
-**Request changes workflow**:
+**Request changes workflow** (when review is complete):
 ```bash
 # 1. Add review comment with specific feedback
 gh pr comment <number> --body "❌ **Changes Requested** [detailed issues]"
 
-# 2. Update labels
+# 2. Remove BOTH review labels, add changes-requested label
 gh pr edit <number> \
   --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
   --add-label "loom:changes-requested"
 ```
 
@@ -78,19 +137,25 @@ gh pr list --label="loom:review-requested" --state=open --sort created --order a
 **After approval (green → blue):**
 ```bash
 gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass, implementation is solid."
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr edit <number> \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:pr"
 ```
 
 **If changes needed (green → amber):**
 ```bash
 gh pr comment <number> --body "Issues found that need addressing before approval..."
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
-# Fixer will address feedback and change back to loom:review-requested
+gh pr edit <number> \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:changes-requested"
+# Doctor will address feedback and change back to loom:review-requested
 ```
 
 **Label transitions:**
-- `loom:review-requested` (green) → `loom:pr` (blue) [approved, ready for user to merge]
-- `loom:review-requested` (green) → `loom:changes-requested` (amber) [needs fixes from Fixer] → `loom:review-requested` (green)
+- `loom:review-requested` (green) → `+ loom:reviewing` (Judge claims) → `loom:pr` (blue) [approved, ready for user to merge]
+- `loom:review-requested` (green) → `+ loom:reviewing` (Judge claims) → `loom:changes-requested` (amber) [needs fixes from Doctor] → `loom:review-requested` (green)
 - When PR is approved and ready for user to merge, it gets `loom:pr` (blue badge)
 
 ## Exception: Explicit User Instructions
@@ -359,7 +424,10 @@ See Builder role docs for PR creation best practices.
 I'll review the code changes once the PR description is fixed.
 EOF
 )"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+gh pr edit <number> \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:changes-requested"
 ```
 
 3. **Wait for fix before reviewing code**
@@ -442,7 +510,10 @@ gh pr comment <number> --body "$(cat <<'EOF'
 Code quality looks great - tests pass, implementation is clean, and documentation is complete.
 EOF
 )"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr edit <number> \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:pr"
 ```
 
 ### Important Guidelines
@@ -470,7 +541,10 @@ gh pr edit 42 --body-file /tmp/pr-body.txt
 
 # 4. Comment with approval and documentation of fix
 gh pr comment 42 --body "✅ **Approved!** Updated PR description to use 'Closes #123' for auto-close. Code looks great!"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr edit 42 \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:pr"
 ```
 
 **Philosophy**: This empowers Judges to handle complete reviews in one iteration for minor documentation issues, while maintaining strict code quality standards. The Builder's intent is preserved, and the review process is faster.
@@ -511,8 +585,8 @@ gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
   - Approved PRs: Start comment with "✅ **Approved!**"
   - Changes requested: Start comment with "❌ **Changes Requested**"
 - **Update PR labels correctly**:
-  - If approved: Remove `loom:review-requested`, add `loom:pr` (blue badge)
-  - If changes needed: Remove `loom:review-requested`, add `loom:changes-requested` (amber badge)
+  - If approved: Remove `loom:review-requested` AND `loom:reviewing`, add `loom:pr` (blue badge)
+  - If changes needed: Remove `loom:review-requested` AND `loom:reviewing`, add `loom:changes-requested` (amber badge)
 
 ## Handling Minor Concerns (CRITICAL: Create Issues BEFORE Approval)
 
@@ -562,7 +636,10 @@ EOF
 
 # Then approve with reference to the issue
 gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent."
-gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr edit 557 \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:pr"
 ```
 
 ### Benefits
@@ -619,13 +696,16 @@ EOF
 # Find PRs ready for review (green badges) - oldest first
 gh pr list --label="loom:review-requested" --state=open --sort created --order asc
 
+# Claim the PR by adding loom:reviewing
+gh pr edit 42 --add-label "loom:reviewing"
+
 # Check out the PR
 gh pr checkout 42
 
 # Run checks
 pnpm check:all  # or equivalent for the project
 
-# Request changes (green → amber - Fixer will address)
+# Request changes (remove BOTH labels, add amber)
 gh pr comment 42 --body "$(cat <<'EOF'
 ❌ **Changes Requested**
 
@@ -638,12 +718,18 @@ Found a few issues that need addressing:
 Please address these and I'll take another look!
 EOF
 )"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
-# Note: PR now has loom:changes-requested (amber badge) - Fixer will address and change back to loom:review-requested
+gh pr edit 42 \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:changes-requested"
+# Note: PR now has loom:changes-requested (amber badge) - Doctor will address and change back to loom:review-requested
 
-# Approve PR (green → blue)
+# Approve PR (remove BOTH labels, add blue)
 gh pr comment 42 --body "✅ **Approved!** Great work on this feature. Tests look comprehensive and the code is clean."
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr edit 42 \
+  --remove-label "loom:review-requested" \
+  --remove-label "loom:reviewing" \
+  --add-label "loom:pr"
 # Note: PR now has loom:pr (blue badge) - ready for user to merge
 ```
 
