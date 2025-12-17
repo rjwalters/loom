@@ -139,7 +139,7 @@ export async function initializeApp(deps: {
   }
 
   // PRIORITY 2: Try to restore workspace from localStorage (for HMR survival)
-  const localStorageWorkspace = state.restoreWorkspaceFromLocalStorage();
+  const localStorageWorkspace = state.workspace.restoreWorkspaceFromLocalStorage();
   if (localStorageWorkspace) {
     logger.info("Restored workspace from localStorage (HMR survival)", {
       localStorageWorkspace,

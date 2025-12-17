@@ -128,7 +128,7 @@ export async function resetWorkspaceToDefaults(
   try {
     setConfigWorkspace(workspacePath);
     const config = await loadWorkspaceConfig();
-    state.setNextTerminalNumber(config.nextAgentNumber);
+    state.terminals.setNextTerminalNumber(config.nextAgentNumber);
 
     // Load agents from fresh config and create terminal sessions for each
     if (config.agents && config.agents.length > 0) {
@@ -208,7 +208,7 @@ export async function resetWorkspaceToDefaults(
       });
 
       // Set workspace as active BEFORE loading agents (needed for proper initialization)
-      state.setWorkspace(workspacePath);
+      state.workspace.setWorkspace(workspacePath);
 
       // Now load the agents into state with their new IDs
       logger.info("Loading agents into state", {
@@ -216,10 +216,10 @@ export async function resetWorkspaceToDefaults(
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
-      state.loadAgents(config.agents);
+      state.terminals.loadTerminals(config.agents);
       logger.info("State after loadAgents", {
         workspacePath,
-        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
 
@@ -243,7 +243,7 @@ export async function resetWorkspaceToDefaults(
       await launchAgentsForTerminals(workspacePath, config.agents);
       logger.info("State after launchAgentsForTerminals", {
         workspacePath,
-        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
 
@@ -260,7 +260,7 @@ export async function resetWorkspaceToDefaults(
       });
     } else {
       // No agents in config - still set workspace as active
-      state.setWorkspace(workspacePath);
+      state.workspace.setWorkspace(workspacePath);
     }
   } catch (error) {
     logger.error("Failed to reload config after reset", error as Error, {

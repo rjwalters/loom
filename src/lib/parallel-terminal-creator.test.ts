@@ -19,7 +19,7 @@ describe("parallel-terminal-creator", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     state = new AppState();
-    state.setNextTerminalNumber(1);
+    state.terminals.setNextTerminalNumber(1);
   });
 
   describe("createTerminalsInParallel", () => {
@@ -337,7 +337,7 @@ describe("parallel-terminal-creator", () => {
 
       expect(result.succeeded).toHaveLength(2);
       expect(result.failed).toHaveLength(0);
-      expect(state.getCurrentTerminalNumber()).toBe(3); // Should have incremented to 3
+      expect(state.terminals.getCurrentTerminalNumber()).toBe(3); // Should have incremented to 3
     });
 
     it("should retry failed terminals automatically", async () => {
@@ -467,7 +467,7 @@ describe("parallel-terminal-creator", () => {
 
       // Should have assigned 1, 2, 3
       expect(instanceNumbers).toEqual([1, 2, 3]);
-      expect(state.getCurrentTerminalNumber()).toBe(4);
+      expect(state.terminals.getCurrentTerminalNumber()).toBe(4);
     });
 
     it("should handle empty config array", async () => {

@@ -152,8 +152,10 @@ describe("TerminalManager", () => {
   };
 
   const mockState = {
-    getTerminal: vi.fn(() => mockTerminal),
-    updateTerminal: vi.fn(),
+    terminals: {
+      getTerminal: vi.fn(() => mockTerminal),
+      updateTerminal: vi.fn(),
+    },
   };
 
   // Mock localStorage
@@ -403,7 +405,7 @@ describe("TerminalManager", () => {
 
       // Need to wait for dynamic import
       await vi.waitFor(() => {
-        expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+        expect(mockState.terminals.updateTerminal).toHaveBeenCalledWith("terminal-1", {
           status: TerminalStatus.Idle,
         });
       });
@@ -435,7 +437,7 @@ describe("TerminalManager", () => {
 
       // Need to wait for dynamic import
       await vi.waitFor(() => {
-        expect(mockState.updateTerminal).toHaveBeenCalledWith("terminal-1", {
+        expect(mockState.terminals.updateTerminal).toHaveBeenCalledWith("terminal-1", {
           status: TerminalStatus.NeedsInput,
         });
       });

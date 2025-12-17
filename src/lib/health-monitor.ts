@@ -139,7 +139,7 @@ export class HealthMonitor {
    */
   getHealth(): SystemHealth {
     const state = getAppState();
-    const terminals = state.getTerminals();
+    const terminals = state.terminals.getTerminals();
 
     let activeTerminals = 0;
     let healthyTerminals = 0;
@@ -249,7 +249,7 @@ export class HealthMonitor {
    */
   public async performHealthCheck(): Promise<void> {
     const state = getAppState();
-    const terminals = state.getTerminals();
+    const terminals = state.terminals.getTerminals();
     const now = Date.now();
 
     logger.info("Performing health check", { terminalCount: terminals.length });
@@ -311,14 +311,14 @@ export class HealthMonitor {
         if (!hasSession && !terminal.missingSession) {
           // Session missing - mark as error
           logger.warn("Terminal missing tmux session", { terminalId: terminal.id });
-          state.updateTerminal(terminal.id, {
+          state.terminals.updateTerminal(terminal.id, {
             status: TerminalStatus.Error,
             missingSession: true,
           });
         } else if (hasSession && terminal.missingSession) {
           // Session recovered - clear error state
           logger.info("Terminal session recovered", { terminalId: terminal.id });
-          state.updateTerminal(terminal.id, {
+          state.terminals.updateTerminal(terminal.id, {
             status: TerminalStatus.Idle,
             missingSession: undefined,
           });

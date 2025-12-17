@@ -76,7 +76,7 @@ export async function startWorkspaceEngine(
   try {
     setConfigWorkspace(workspacePath);
     const config = await loadWorkspaceConfig();
-    state.setNextTerminalNumber(config.nextAgentNumber);
+    state.terminals.setNextTerminalNumber(config.nextAgentNumber);
     state.setOfflineMode(config.offlineMode);
 
     logger.info("Loaded config", {
@@ -164,7 +164,7 @@ export async function startWorkspaceEngine(
       });
 
       // Set workspace as active BEFORE loading agents
-      state.setWorkspace(workspacePath);
+      state.workspace.setWorkspace(workspacePath);
 
       // Load agents into state with their new session IDs
       logger.info("Loading agents into state", {
@@ -172,10 +172,10 @@ export async function startWorkspaceEngine(
         agents: config.agents.map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
-      state.loadAgents(config.agents);
+      state.terminals.loadTerminals(config.agents);
       logger.info("State after loadAgents", {
         workspacePath,
-        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
 
@@ -198,7 +198,7 @@ export async function startWorkspaceEngine(
       await launchAgentsForTerminals(workspacePath, config.agents);
       logger.info("State after launchAgentsForTerminals", {
         workspacePath,
-        terminals: state.getTerminals().map((a) => `${a.name}=${a.id}`),
+        terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
         source: logPrefix,
       });
 
@@ -232,7 +232,7 @@ export async function startWorkspaceEngine(
       });
 
       // Mark all terminals as health-checked to prevent redundant checks in render loop
-      const terminalIds = state.getTerminals().map((t) => t.id);
+      const terminalIds = state.terminals.getTerminals().map((t) => t.id);
       dependencies.markTerminalsHealthChecked(terminalIds);
       logger.info("Marked terminals as health-checked", {
         workspacePath,
@@ -247,7 +247,7 @@ export async function startWorkspaceEngine(
       });
     } else {
       // No agents in config - still set workspace as active
-      state.setWorkspace(workspacePath);
+      state.workspace.setWorkspace(workspacePath);
       logger.info("No terminals configured, workspace active with empty state", {
         workspacePath,
         source: logPrefix,

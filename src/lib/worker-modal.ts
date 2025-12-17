@@ -10,7 +10,7 @@ const logger = Logger.forComponent("worker-modal");
 
 export async function showWorkerModal(state: AppState, renderFn: () => void): Promise<void> {
   // Get workspace path from state
-  const workspacePath = state.getWorkspace();
+  const workspacePath = state.workspace.getWorkspace();
   if (!workspacePath) {
     showToast("No workspace selected", "error");
     return;
@@ -58,7 +58,7 @@ export async function showWorkerModal(state: AppState, renderFn: () => void): Pr
       });
     }
 
-    const workerCount = state.getTerminals().length + 1;
+    const workerCount = state.terminals.getTerminals().length + 1;
     const defaultName = `Worker ${workerCount}`;
 
     // Create modal using ModalBuilder
@@ -148,7 +148,7 @@ function escapeHtml(text: string): string {
 
 // Helper to generate next config ID
 function generateNextConfigId(state: AppState): string {
-  const terminals = state.getTerminals();
+  const terminals = state.terminals.getTerminals();
   const existingIds = new Set(terminals.map((t) => t.id));
 
   // Find the next available terminal-N ID
@@ -187,7 +187,7 @@ async function launchWorker(
     const id = generateNextConfigId(state);
 
     // Get instance number
-    const instanceNumber = state.getNextTerminalNumber();
+    const instanceNumber = state.terminals.getNextTerminalNumber();
 
     // Create terminal in workspace directory
     const terminalId = await invoke<string>("create_terminal", {
@@ -199,7 +199,7 @@ async function launchWorker(
     });
 
     // Add to state
-    state.addTerminal({
+    state.terminals.addTerminal({
       id,
       name,
       status: TerminalStatus.Busy,
@@ -234,7 +234,7 @@ async function launchWorker(
     modal.close();
 
     // Switch to new terminal
-    state.setPrimary(id);
+    state.terminals.setPrimary(id);
     renderFn();
   } catch (error) {
     showToast(`Failed to launch worker: ${error}`, "error");

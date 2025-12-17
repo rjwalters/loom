@@ -43,7 +43,7 @@ describe("terminal-actions", () => {
 
   describe("handleRunNowClick", () => {
     it("executes interval prompt for terminal", async () => {
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "term-1",
         name: "Test",
         status: TerminalStatus.Idle,
@@ -67,7 +67,7 @@ describe("terminal-actions", () => {
     });
 
     it("handles execution error gracefully", async () => {
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "term-1",
         name: "Test",
         status: TerminalStatus.Idle,
@@ -95,7 +95,7 @@ describe("terminal-actions", () => {
     beforeEach(() => {
       vi.useFakeTimers();
 
-      state.addTerminal({
+      state.terminals.addTerminal({
         id: "term-1",
         name: "Original Name",
         status: TerminalStatus.Idle,
@@ -154,7 +154,7 @@ describe("terminal-actions", () => {
       const enterEvent = new KeyboardEvent("keydown", { key: "Enter" });
       input.dispatchEvent(enterEvent);
 
-      const terminal = state.getTerminal("term-1");
+      const terminal = state.terminals.getTerminal("term-1");
       expect(terminal?.name).toBe("New Name");
       expect(mockSaveCurrentConfig).toHaveBeenCalled();
     });
@@ -167,7 +167,7 @@ describe("terminal-actions", () => {
 
       input.dispatchEvent(new Event("blur"));
 
-      const terminal = state.getTerminal("term-1");
+      const terminal = state.terminals.getTerminal("term-1");
       expect(terminal?.name).toBe("New Name via Blur");
       expect(mockSaveCurrentConfig).toHaveBeenCalled();
     });
@@ -181,7 +181,7 @@ describe("terminal-actions", () => {
       const escapeEvent = new KeyboardEvent("keydown", { key: "Escape" });
       input.dispatchEvent(escapeEvent);
 
-      const terminal = state.getTerminal("term-1");
+      const terminal = state.terminals.getTerminal("term-1");
       expect(terminal?.name).toBe("Original Name");
       expect(mockRender).toHaveBeenCalled();
       expect(mockSaveCurrentConfig).not.toHaveBeenCalled();
@@ -195,7 +195,7 @@ describe("terminal-actions", () => {
 
       input.dispatchEvent(new Event("blur"));
 
-      const terminal = state.getTerminal("term-1");
+      const terminal = state.terminals.getTerminal("term-1");
       expect(terminal?.name).toBe("Original Name");
       expect(mockRender).toHaveBeenCalled();
       expect(mockSaveCurrentConfig).not.toHaveBeenCalled();
@@ -221,7 +221,7 @@ describe("terminal-actions", () => {
 
       input.dispatchEvent(new Event("blur"));
 
-      const terminal = state.getTerminal("term-1");
+      const terminal = state.terminals.getTerminal("term-1");
       expect(terminal?.name).toBe("Trimmed Name");
     });
 

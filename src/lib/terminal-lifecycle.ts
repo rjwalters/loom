@@ -59,7 +59,7 @@ export async function launchAgentsForTerminals(
 
     // Set all terminals to idle status (they're already created, just not running agents)
     for (const terminal of terminals) {
-      state.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
+      state.terminals.updateTerminal(terminal.id, { status: TerminalStatus.Idle });
     }
 
     logger.info("All terminals set to idle (offline mode)", {
@@ -104,7 +104,7 @@ export async function launchAgentsForTerminals(
 
       // Set terminal to busy status BEFORE launching agent
       // This prevents HealthMonitor from incorrectly marking it as missing during the launch process
-      state.updateTerminal(terminal.id, { status: TerminalStatus.Busy });
+      state.terminals.updateTerminal(terminal.id, { status: TerminalStatus.Busy });
       logger.info("Set terminal to busy status", {
         workspacePath,
         terminalName: terminal.name,
@@ -220,7 +220,7 @@ export async function launchAgentsForTerminals(
     terminalCount: launchedTerminalIds.length,
   });
   for (const terminalId of launchedTerminalIds) {
-    state.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+    state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Idle });
     logger.info("Reset terminal to idle status", {
       workspacePath,
       terminalId,
@@ -239,7 +239,7 @@ export async function launchAgentsForTerminals(
  */
 export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies): Promise<void> {
   const { state } = deps;
-  const terminals = state.getTerminals();
+  const terminals = state.terminals.getTerminals();
 
   if (terminals.length === 0) {
     return;
@@ -279,7 +279,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
       logger.info("Clearing stale missingSession flag", {
         terminalId: terminal.id,
       });
-      state.updateTerminal(terminal.id, {
+      state.terminals.updateTerminal(terminal.id, {
         status: TerminalStatus.Idle,
         missingSession: undefined,
       });
@@ -289,7 +289,7 @@ export async function verifyTerminalSessions(deps: TerminalLifecycleDependencies
       logger.info("Marking terminal as missing session", {
         terminalId: terminal.id,
       });
-      state.updateTerminal(terminal.id, {
+      state.terminals.updateTerminal(terminal.id, {
         status: TerminalStatus.Error,
         missingSession: true,
       });
@@ -335,7 +335,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
     const activeTerminalIds = new Set(daemonTerminals.map((t) => t.id));
 
     // Get all agents from state
-    const agents = state.getTerminals();
+    const agents = state.terminals.getTerminals();
     logger.info("Config agents loaded", {
       agentCount: agents.length,
     });
@@ -351,7 +351,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
           terminalName: agent.name,
         });
 
-        // Don't call state.updateTerminal() here - it triggers infinite render loop
+        // Don't call state.terminals.updateTerminal() here - it triggers infinite render loop
         // The terminal already shows as missing because check_session_health will fail for "__unassigned__"
         missingCount++;
         continue;
@@ -365,7 +365,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
 
         // Clear any error state from previous connection issues (use configId for state)
         if (agent.missingSession) {
-          state.updateTerminal(agent.id, {
+          state.terminals.updateTerminal(agent.id, {
             status: TerminalStatus.Idle,
             missingSession: undefined,
           });
@@ -385,7 +385,7 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
         });
 
         // Mark terminal as having missing session so user can see it needs recovery (use configId for state)
-        state.updateTerminal(agent.id, {
+        state.terminals.updateTerminal(agent.id, {
           status: TerminalStatus.Error,
           missingSession: true,
         });

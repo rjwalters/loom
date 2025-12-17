@@ -441,22 +441,22 @@ export function splitTerminals(terminals: Terminal[]): {
  * @example
  * ```ts
  * // Instead of:
- * const terminals = state.getTerminals();
+ * const terminals = state.terminals.getTerminals();
  * const { config, state: terminalStates } = splitTerminals(terminals);
  * await saveConfig({ terminals: config });
- * await saveState({ nextAgentNumber: state.getCurrentTerminalNumber(), terminals: terminalStates });
+ * await saveState({ nextAgentNumber: state.terminals.getCurrentTerminalNumber(), terminals: terminalStates });
  *
  * // Use:
  * await saveCurrentConfiguration(state);
  * ```
  */
 export async function saveCurrentConfiguration(state: AppState): Promise<void> {
-  const terminals = state.getTerminals();
+  const terminals = state.terminals.getTerminals();
   const { config: terminalConfigs, state: terminalStates } = splitTerminals(terminals);
 
   await saveConfig({ version: "2", terminals: terminalConfigs });
   await saveState({
-    nextAgentNumber: state.getCurrentTerminalNumber(),
+    nextAgentNumber: state.terminals.getCurrentTerminalNumber(),
     terminals: terminalStates,
   });
 }
@@ -472,7 +472,7 @@ export async function saveCurrentConfiguration(state: AppState): Promise<void> {
  * ```ts
  * const { nextAgentNumber, agents, offlineMode } = await loadWorkspaceConfig();
  * state.setNextAgentNumber(nextAgentNumber);
- * state.loadAgents(agents);
+ * state.terminals.loadTerminals(agents);
  * state.setOfflineMode(offlineMode);
  * ```
  */

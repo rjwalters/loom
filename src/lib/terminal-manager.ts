@@ -122,9 +122,9 @@ export class TerminalManager {
         .then(({ getAppState, TerminalStatus: Status }) => {
           const state = getAppState();
           // Find terminal by id
-          const terminal = state.getTerminal(terminalId);
+          const terminal = state.terminals.getTerminal(terminalId);
           if (terminal?.status === Status.NeedsInput) {
-            state.updateTerminal(terminal.id, { status: Status.Idle });
+            state.terminals.updateTerminal(terminal.id, { status: Status.Idle });
           }
         })
         .catch((e) => {
@@ -138,9 +138,9 @@ export class TerminalManager {
         .then(({ getAppState, TerminalStatus: Status }) => {
           const state = getAppState();
           // Find terminal by id
-          const terminal = state.getTerminal(terminalId);
+          const terminal = state.terminals.getTerminal(terminalId);
           if (terminal) {
-            state.updateTerminal(terminal.id, { status: Status.NeedsInput });
+            state.terminals.updateTerminal(terminal.id, { status: Status.NeedsInput });
           }
         })
         .catch((e) => {
