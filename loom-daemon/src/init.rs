@@ -452,6 +452,16 @@ fn setup_repository_scaffolding(
     // Note: scripts/ is now copied earlier in initialize_workspace()
     // to .loom/scripts/ along with other .loom-specific files
 
+    // Copy package.json ONLY if workspace doesn't have one
+    // (never overwrite existing package.json, even in force mode)
+    // This provides stub scripts for pnpm commands referenced in roles
+    let package_json_src = defaults_path.join("package.json");
+    let package_json_dst = workspace_path.join("package.json");
+    if package_json_src.exists() && !package_json_dst.exists() {
+        fs::copy(&package_json_src, &package_json_dst)
+            .map_err(|e| format!("Failed to copy package.json: {e}"))?;
+    }
+
     Ok(())
 }
 
@@ -730,5 +740,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(builder_content, "builder command from defaults");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_package_json_copied_when_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with package.json
+        fs::create_dir_all(&defaults).unwrap();
+        fs::write(
+            defaults.join("package.json"),
+            r#"{"name": "loom-workspace", "scripts": {"test": "echo test"}}"#,
+        )
+        .unwrap();
+
+        // Workspace has no package.json initially
+        assert!(!workspace.join("package.json").exists());
+
+        // Run setup
+        setup_repository_scaffolding(workspace, &defaults, false).unwrap();
+
+        // Verify package.json was copied
+        assert!(workspace.join("package.json").exists());
+        let content = fs::read_to_string(workspace.join("package.json")).unwrap();
+        assert!(content.contains("loom-workspace"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_package_json_preserved_when_exists() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with package.json
+        fs::create_dir_all(&defaults).unwrap();
+        fs::write(
+            defaults.join("package.json"),
+            r#"{"name": "loom-workspace", "scripts": {"test": "echo test"}}"#,
+        )
+        .unwrap();
+
+        // Create existing package.json in workspace (project-specific)
+        fs::write(
+            workspace.join("package.json"),
+            r#"{"name": "my-rust-project", "scripts": {"build": "cargo build"}}"#,
+        )
+        .unwrap();
+
+        // Run setup with force=true (should STILL preserve package.json)
+        setup_repository_scaffolding(workspace, &defaults, true).unwrap();
+
+        // Verify package.json was NOT overwritten
+        let content = fs::read_to_string(workspace.join("package.json")).unwrap();
+        assert!(content.contains("my-rust-project"));
+        assert!(!content.contains("loom-workspace"));
     }
 }
