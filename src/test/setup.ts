@@ -6,15 +6,16 @@
  * - Tauri API mocks for testing IPC calls
  */
 
-import { webcrypto } from "node:crypto";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { beforeAll } from "vitest";
 
 // Add WebCrypto to global scope (required by Tauri API)
 // happy-dom doesn't provide crypto.subtle, but Node.js does
-beforeAll(() => {
+beforeAll(async () => {
+  // @ts-expect-error - node:crypto is available at runtime but not in types
+  const { webcrypto } = await import("node:crypto");
   // Use defineProperty because global.crypto is read-only in happy-dom
-  Object.defineProperty(global, "crypto", {
+  Object.defineProperty(globalThis, "crypto", {
     value: webcrypto,
     writable: true,
     configurable: true,

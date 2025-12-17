@@ -149,16 +149,12 @@ class IntervalPromptManager {
    * @param state - Current interval state
    * @private
    */
-  private async checkTerminal(
-    terminalId: string,
-    state: TerminalIntervalState
-  ): Promise<void> {
+  private async checkTerminal(terminalId: string, state: TerminalIntervalState): Promise<void> {
     // Detect current terminal state
     const terminalState = await detectTerminalState(terminalId, 20);
 
     // Map terminal status to busy/idle
-    const isIdle =
-      terminalState.status === "idle" || terminalState.status === "waiting-input";
+    const isIdle = terminalState.status === "idle" || terminalState.status === "waiting-input";
 
     // Detect state transitions
     const wasBusy = !state.isIdle;
@@ -234,10 +230,7 @@ class IntervalPromptManager {
    * @param state - Terminal interval state
    * @private
    */
-  private async sendPrompt(
-    terminalId: string,
-    state: TerminalIntervalState
-  ): Promise<void> {
+  private async sendPrompt(terminalId: string, state: TerminalIntervalState): Promise<void> {
     // Mark as active to prevent overlapping executions
     this.activePrompts.add(terminalId);
 
