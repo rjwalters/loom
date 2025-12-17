@@ -37,6 +37,7 @@ interface Terminal {
   working_dir?: string;
   tmux_session: string;
   created_at: number;
+  isPrimary?: boolean;
 }
 
 interface StateFile {
@@ -661,14 +662,19 @@ async function setPrimaryTerminal(terminalId: string): Promise<{
           working_dir: t.working_dir,
           tmux_session: t.tmux_session,
           created_at: Date.now(),
+          isPrimary: t.id === terminalId,
         })),
-        selectedTerminalId: null,
+        selectedTerminalId: terminalId,
         lastUpdated: new Date().toISOString(),
       };
+    } else {
+      // Update isPrimary on all terminals - only the target gets true
+      for (const t of state.terminals) {
+        t.isPrimary = t.id === terminalId;
+      }
+      // Also update selectedTerminalId for backward compatibility
+      state.selectedTerminalId = terminalId;
     }
-
-    // Update the selected terminal
-    state.selectedTerminalId = terminalId;
 
     // Write the state file
     await writeStateFile(state);
