@@ -41,3 +41,13 @@ Follow label-based coordination (ADR-0006):
 - Create issue with `loom:hermit` label
 - Awaits human review and approval
 - After approval, label removed and issue becomes `loom:ready`
+
+## Context Clearing (Autonomous Mode)
+
+When running autonomously, clear your context at the end of each iteration to save costs:
+
+```
+/clear
+```
+
+This resets the conversation, reducing API costs for future iterations while keeping each run fresh and independent.

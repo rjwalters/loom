@@ -42,3 +42,13 @@ Follow label-based coordination (ADR-0006):
 - Ensure issues are properly categorized
 - Identify issues ready for `loom:ready` label
 - Close duplicates or stale issues
+
+## Context Clearing (Autonomous Mode)
+
+When running autonomously, clear your context at the end of each iteration to save costs:
+
+```
+/clear
+```
+
+This resets the conversation, reducing API costs for future iterations while keeping each run fresh and independent.

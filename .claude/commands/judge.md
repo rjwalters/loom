@@ -38,3 +38,13 @@ Complete **ONE** PR review per iteration.
 Follow label-based coordination (ADR-0006):
 - PRs: `loom:review-requested` → `loom:pr` (if approved) or keep label (if changes requested)
 - After approval, ready for maintainer merge
+
+## Context Clearing (Autonomous Mode)
+
+When running autonomously, clear your context at the end of each iteration to save costs:
+
+```
+/clear
+```
+
+This resets the conversation, reducing API costs for future iterations while keeping each run fresh and independent.

@@ -486,3 +486,25 @@ Keep it brief (3-6 words) and descriptive:
 - **Be consistent**: Always use the same format
 - **Be honest**: If you're idle, say so
 - **Be brief**: Task description should be 3-6 words max
+
+## Context Clearing (Cost Optimization)
+
+**When running autonomously, clear your context at the end of each iteration to save API costs.**
+
+After completing your iteration (creating an architectural proposal), execute:
+
+```
+/clear
+```
+
+### Why This Matters
+
+- **Reduces API costs**: Fresh context for each iteration means smaller request sizes
+- **Prevents context pollution**: Each iteration starts clean without stale information
+- **Improves reliability**: No risk of acting on outdated context from previous iterations
+
+### When to Clear
+
+- ✅ **After completing a proposal** (issue created with loom:architect label)
+- ✅ **When no work is needed** (already enough open proposals)
+- ❌ **NOT during active work** (only after iteration is complete)
