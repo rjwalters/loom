@@ -8,12 +8,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { type AppLevelState, appLevelState } from "./app-state";
+import type {
+  ConfigurableDependencies,
+  CoreDependencies,
+  RenderableDependencies,
+  TerminalInfrastructureDependencies,
+} from "./dependencies";
 import { Logger } from "./logger";
-import type { OutputPoller } from "./output-poller";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
-import type { AppState, Terminal } from "./state";
+import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
-import type { TerminalManager } from "./terminal-manager";
 import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-actions");
@@ -21,21 +25,19 @@ const logger = Logger.forComponent("terminal-actions");
 /**
  * Dependencies required by terminal action handlers
  */
-export interface TerminalActionDependencies {
-  state: AppState;
-  saveCurrentConfig: () => Promise<void>;
-  render: () => void;
-}
+export interface TerminalActionDependencies
+  extends CoreDependencies,
+    ConfigurableDependencies,
+    RenderableDependencies {}
 
 /**
  * Dependencies required for closing terminals
  */
-export interface CloseTerminalDependencies {
-  state: AppState;
-  outputPoller: OutputPoller;
-  terminalManager: TerminalManager;
+export interface CloseTerminalDependencies
+  extends CoreDependencies,
+    TerminalInfrastructureDependencies,
+    ConfigurableDependencies {
   appLevelState: AppLevelState;
-  saveCurrentConfig: () => Promise<void>;
 }
 
 /**

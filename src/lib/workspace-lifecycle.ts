@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
+import type { AgentLauncherDependencies, CoreDependencies } from "./dependencies";
 import { Logger } from "./logger";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
-import type { AppState, Terminal } from "./state";
+import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
 import { expandTildePath } from "./workspace-utils";
@@ -24,10 +25,10 @@ const logger = Logger.forComponent("workspace-lifecycle");
  * These dependencies are injected to enable testing and avoid tight coupling
  * to global state and local functions in main.ts
  */
-export interface WorkspaceLifecycleDependencies {
-  state: AppState;
+export interface WorkspaceLifecycleDependencies
+  extends CoreDependencies,
+    AgentLauncherDependencies {
   validateWorkspacePath: (path: string) => Promise<boolean>;
-  launchAgentsForTerminals: (workspacePath: string, terminals: Terminal[]) => Promise<void>;
   reconnectTerminals: () => Promise<void>;
   verifyTerminalSessions: () => Promise<void>;
 }
