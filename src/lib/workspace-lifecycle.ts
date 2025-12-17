@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
 import { Logger } from "./logger";
+import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
@@ -149,35 +150,43 @@ async function initializeNewWorkspace(
       terminalCount: config.agents.length,
     });
 
-    // Create terminal sessions for each agent in the config
-    for (const agent of config.agents) {
-      try {
-        // Get instance number
-        const instanceNumber = state.getNextTerminalNumber();
+    // Convert agents to terminal configs for parallel creation
+    const terminalConfigs: TerminalConfig[] = config.agents.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      role: agent.role || "default",
+      workingDir: workspacePath,
+      instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
+    }));
 
-        // Create terminal in daemon
-        const terminalId = await invoke<string>("create_terminal", {
-          configId: agent.id,
-          name: agent.name,
-          workingDir: workspacePath,
-          role: agent.role || "default",
-          instanceNumber,
-        });
+    // Create terminal sessions in parallel with retry logic
+    const { succeeded, failed } = await createTerminalsWithRetry(
+      terminalConfigs,
+      workspacePath,
+      state
+    );
 
-        // Update agent ID to match the newly created terminal
-        agent.id = terminalId;
+    // Update agent IDs for successfully created terminals
+    for (const result of succeeded) {
+      const agent = config.agents.find((a) => a.id === result.configId);
+      if (agent) {
+        agent.id = result.terminalId;
         logger.info("Created terminal", {
           terminalName: agent.name,
-          terminalId,
+          terminalId: result.terminalId,
           workspacePath,
         });
-      } catch (error) {
-        logger.error("Failed to create terminal", error as Error, {
-          terminalName: agent.name,
-          workspacePath,
-        });
-        showToast(`Failed to create terminal ${agent.name}: ${error}`, "error");
       }
+    }
+
+    // Log failed terminal creations
+    for (const failure of failed) {
+      const agent = config.agents.find((a) => a.id === failure.configId);
+      logger.error("Failed to create terminal", failure.error as Error, {
+        terminalName: agent?.name,
+        workspacePath,
+      });
+      showToast(`Failed to create terminal ${agent?.name}: ${failure.error}`, "error");
     }
 
     // Load agents into state with their new IDs
@@ -207,57 +216,66 @@ async function createSessionsForMigratedTerminals(
   workspacePath: string,
   state: AppState
 ): Promise<number> {
-  let createdSessionCount = 0;
+  // Filter agents that need sessions
+  const agentsNeedingSessions = config.agents.filter((agent) => agent.id === "__needs_session__");
 
-  for (const agent of config.agents) {
-    if (agent.id === "__needs_session__") {
-      try {
-        // Get instance number
-        const instanceNumber = state.getNextTerminalNumber();
+  if (agentsNeedingSessions.length === 0) {
+    return 0;
+  }
 
-        logger.info("Creating session for migrated terminal", {
-          workspacePath,
-          terminalName: agent.name,
-          currentId: agent.id,
-        });
+  logger.info("Creating sessions for migrated terminals", {
+    workspacePath,
+    count: agentsNeedingSessions.length,
+  });
 
-        // Create terminal session in daemon
-        const sessionId = await invoke<string>("create_terminal", {
-          configId: agent.id,
-          name: agent.name,
-          workingDir: workspacePath,
-          role: agent.role || "default",
-          instanceNumber,
-        });
+  // Convert to terminal configs for parallel creation
+  // Use name as the config ID since all have the same placeholder ID
+  const terminalConfigs: TerminalConfig[] = agentsNeedingSessions.map((agent) => ({
+    id: agent.name, // Use name as unique identifier for matching results
+    name: agent.name,
+    role: agent.role || "default",
+    workingDir: workspacePath,
+    instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
+  }));
 
-        // Update agent with real session ID (keep configId stable)
-        agent.id = sessionId;
-        createdSessionCount++;
+  // Create sessions in parallel with retry logic
+  const { succeeded, failed } = await createTerminalsWithRetry(
+    terminalConfigs,
+    workspacePath,
+    state
+  );
 
-        logger.info("Created session for migrated terminal", {
-          workspacePath,
-          terminalName: agent.name,
-          sessionId,
-        });
-      } catch (error) {
-        logger.error("Failed to create session for migrated terminal", error as Error, {
-          workspacePath,
-          terminalName: agent.name,
-        });
-        // Keep placeholder ID - terminal will show as missing session
-        // User can use recovery options
-      }
+  // Update agent IDs for successfully created sessions
+  // Match by name since we used name as the config ID
+  for (const result of succeeded) {
+    const agent = agentsNeedingSessions.find((a) => a.name === result.configId);
+    if (agent) {
+      agent.id = result.terminalId;
+      logger.info("Created session for migrated terminal", {
+        workspacePath,
+        terminalName: agent.name,
+        sessionId: result.terminalId,
+      });
     }
   }
 
-  if (createdSessionCount > 0) {
-    logger.info("Created sessions for migrated terminals", {
+  // Log failed session creations
+  for (const failure of failed) {
+    logger.error("Failed to create session for migrated terminal", failure.error as Error, {
       workspacePath,
-      createdCount: createdSessionCount,
+      configId: failure.configId,
     });
+    // Keep placeholder ID - terminal will show as missing session
+    // User can use recovery options
   }
 
-  return createdSessionCount;
+  logger.info("Created sessions for migrated terminals", {
+    workspacePath,
+    createdCount: succeeded.length,
+    failedCount: failed.length,
+  });
+
+  return succeeded.length;
 }
 
 /**
@@ -286,52 +304,54 @@ async function autoCreateSessionsIfAllMissing(
     terminalCount: terminals.length,
   });
 
-  let createdCount = 0;
-  for (const terminal of terminals) {
-    try {
-      const instanceNumber = state.getNextTerminalNumber();
+  // Convert terminals to configs for parallel creation
+  const terminalConfigs: TerminalConfig[] = terminals.map((terminal) => ({
+    id: terminal.id,
+    name: terminal.name,
+    role: terminal.role || "default",
+    workingDir: workspacePath,
+    instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
+  }));
 
-      logger.info("Auto-creating session for terminal", {
-        workspacePath,
-        terminalName: terminal.name,
-        terminalId: terminal.id,
-      });
+  // Create sessions in parallel with retry logic
+  const { succeeded, failed } = await createTerminalsWithRetry(
+    terminalConfigs,
+    workspacePath,
+    state
+  );
 
-      // Create terminal session in daemon
-      const sessionId = await invoke<string>("create_terminal", {
-        configId: terminal.id,
-        name: terminal.name,
-        workingDir: workspacePath,
-        role: terminal.role || "default",
-        instanceNumber,
-      });
-
-      // Update terminal with new session ID and clear error state
+  // Update terminal state for successfully created sessions
+  for (const result of succeeded) {
+    const terminal = terminals.find((t) => t.id === result.configId);
+    if (terminal) {
       state.updateTerminal(terminal.id, {
-        id: sessionId,
+        id: result.terminalId,
         status: TerminalStatus.Idle,
         missingSession: undefined,
       });
-
-      createdCount++;
       logger.info("Auto-created session for terminal", {
         workspacePath,
         terminalName: terminal.name,
-        sessionId,
+        sessionId: result.terminalId,
       });
-    } catch (error) {
-      logger.error("Failed to auto-create session for terminal", error as Error, {
-        workspacePath,
-        terminalName: terminal.name,
-      });
-      // Keep in error state - user can try manual recovery
     }
   }
 
-  if (createdCount > 0) {
+  // Log failed session creations
+  for (const failure of failed) {
+    const terminal = terminals.find((t) => t.id === failure.configId);
+    logger.error("Failed to auto-create session for terminal", failure.error as Error, {
+      workspacePath,
+      terminalName: terminal?.name,
+    });
+    // Keep in error state - user can try manual recovery
+  }
+
+  if (succeeded.length > 0) {
     logger.info("Auto-created sessions", {
       workspacePath,
-      createdCount,
+      createdCount: succeeded.length,
+      failedCount: failed.length,
       totalCount: terminals.length,
     });
 
@@ -345,7 +365,7 @@ async function autoCreateSessionsIfAllMissing(
     await launchAgentsForTerminals(workspacePath, state.getTerminals());
   }
 
-  return createdCount;
+  return succeeded.length;
 }
 
 /**
