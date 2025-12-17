@@ -100,15 +100,6 @@ export const LoomConfigSchema = z.object({
 export type LoomConfigFromSchema = z.infer<typeof LoomConfigSchema>;
 
 /**
- * V1 configuration schema (for migration detection)
- */
-export const LoomConfigV1Schema = z.object({
-  version: z.literal("1").optional(),
-  terminals: z.array(TerminalConfigSchema).optional(),
-  offlineMode: z.boolean().optional(),
-});
-
-/**
  * Raw configuration schema (accepts any version for migration)
  */
 export const RawLoomConfigSchema = z.object({

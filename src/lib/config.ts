@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
-import { LoomConfigSchema, RawLoomConfigSchema, TerminalConfigSchema } from "./schemas";
+import {
+  LoomConfigSchema,
+  LoomStateSchema,
+  RawLoomConfigSchema,
+  TerminalConfigSchema,
+} from "./schemas";
 import type { AgentStatus, AppState, ColorTheme, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { safeParseJSON, safeValidateData } from "./validation";
@@ -332,67 +337,38 @@ export async function loadState(): Promise<LoomState> {
       workspacePath,
     });
 
-    // Parse JSON first
-    let raw: unknown;
-    try {
-      raw = JSON.parse(contents);
-    } catch (parseError) {
-      logger.warn("State file has invalid JSON, using defaults", {
+    // Use Zod for schema validation (consistent with loadConfig)
+    const parseResult = safeParseJSON(contents, LoomStateSchema, {
+      context: "state.json",
+      logErrors: true,
+    });
+
+    if (!parseResult.success) {
+      logger.warn("State file validation failed, using defaults", {
         workspacePath,
-        error: parseError instanceof Error ? parseError.message : String(parseError),
+        issues: parseResult.issues,
       });
       return defaultState;
     }
 
-    // Basic structure validation
-    if (typeof raw !== "object" || raw === null) {
-      logger.warn("State file is not an object, using defaults", { workspacePath });
-      return defaultState;
-    }
-
-    const rawState = raw as {
-      daemonPid?: unknown;
-      nextAgentNumber?: unknown;
-      terminals?: unknown[];
-    };
-
-    // Validate and build state with proper types
-    const nextAgentNumber =
-      typeof rawState.nextAgentNumber === "number" && rawState.nextAgentNumber >= 1
-        ? rawState.nextAgentNumber
-        : 1;
-
-    const terminals: TerminalState[] = [];
-    if (Array.isArray(rawState.terminals)) {
-      for (const t of rawState.terminals) {
-        if (typeof t === "object" && t !== null) {
-          const terminal = t as Record<string, unknown>;
-          if (typeof terminal.id === "string" && terminal.id.length > 0) {
-            terminals.push({
-              id: terminal.id,
-              status: parseTerminalStatus(terminal.status),
-              isPrimary: typeof terminal.isPrimary === "boolean" ? terminal.isPrimary : false,
-              worktreePath:
-                typeof terminal.worktreePath === "string" ? terminal.worktreePath : undefined,
-              agentPid: typeof terminal.agentPid === "number" ? terminal.agentPid : undefined,
-              agentStatus: parseAgentStatus(terminal.agentStatus),
-              lastIntervalRun:
-                typeof terminal.lastIntervalRun === "number" ? terminal.lastIntervalRun : undefined,
-              pendingInputRequests: parsePendingInputRequests(terminal.pendingInputRequests),
-              busyTime: typeof terminal.busyTime === "number" ? terminal.busyTime : undefined,
-              idleTime: typeof terminal.idleTime === "number" ? terminal.idleTime : undefined,
-              lastStateChange:
-                typeof terminal.lastStateChange === "number" ? terminal.lastStateChange : undefined,
-            });
-          }
-        }
-      }
-    }
-
+    // Convert Zod-validated data to TypeScript types with proper enums
+    const validated = parseResult.data;
     return {
-      daemonPid: typeof rawState.daemonPid === "number" ? rawState.daemonPid : undefined,
-      nextAgentNumber,
-      terminals,
+      daemonPid: validated.daemonPid,
+      nextAgentNumber: validated.nextAgentNumber,
+      terminals: validated.terminals.map((t) => ({
+        id: t.id,
+        status: parseTerminalStatus(t.status),
+        isPrimary: t.isPrimary,
+        worktreePath: t.worktreePath,
+        agentPid: t.agentPid,
+        agentStatus: t.agentStatus as AgentStatus | undefined,
+        lastIntervalRun: t.lastIntervalRun,
+        pendingInputRequests: t.pendingInputRequests,
+        busyTime: t.busyTime,
+        idleTime: t.idleTime,
+        lastStateChange: t.lastStateChange,
+      })),
     };
   } catch (error) {
     logger.error("Failed to load state", error as Error, { workspacePath: cachedWorkspacePath });
@@ -402,71 +378,25 @@ export async function loadState(): Promise<LoomState> {
 }
 
 /**
- * Parses a terminal status value, returning Idle for invalid values.
+ * Converts Zod-validated terminal status string to TerminalStatus enum.
+ * This is needed because Zod returns literal string types while TypeScript
+ * code uses the TerminalStatus enum for type safety.
  */
-function parseTerminalStatus(value: unknown): TerminalStatus {
-  if (typeof value === "string") {
-    switch (value) {
-      case "idle":
-        return TerminalStatus.Idle;
-      case "busy":
-        return TerminalStatus.Busy;
-      case "needs_input":
-        return TerminalStatus.NeedsInput;
-      case "error":
-        return TerminalStatus.Error;
-      case "stopped":
-        return TerminalStatus.Stopped;
-    }
+function parseTerminalStatus(value: string): TerminalStatus {
+  switch (value) {
+    case "idle":
+      return TerminalStatus.Idle;
+    case "busy":
+      return TerminalStatus.Busy;
+    case "needs_input":
+      return TerminalStatus.NeedsInput;
+    case "error":
+      return TerminalStatus.Error;
+    case "stopped":
+      return TerminalStatus.Stopped;
+    default:
+      return TerminalStatus.Idle;
   }
-  return TerminalStatus.Idle;
-}
-
-/**
- * Parses an agent status value, returning undefined for invalid values.
- */
-function parseAgentStatus(value: unknown): AgentStatus | undefined {
-  if (typeof value !== "string") return undefined;
-  // Import AgentStatus dynamically to avoid circular dependency issues
-  const validStatuses = [
-    "not_started",
-    "initializing",
-    "ready",
-    "busy",
-    "waiting_for_input",
-    "error",
-    "stopped",
-  ];
-  if (validStatuses.includes(value)) {
-    return value as AgentStatus;
-  }
-  return undefined;
-}
-
-/**
- * Parses pending input requests array.
- */
-function parsePendingInputRequests(
-  value: unknown
-): Array<{ id: string; prompt: string; timestamp: number }> | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const requests: Array<{ id: string; prompt: string; timestamp: number }> = [];
-  for (const item of value) {
-    if (
-      typeof item === "object" &&
-      item !== null &&
-      typeof (item as Record<string, unknown>).id === "string" &&
-      typeof (item as Record<string, unknown>).prompt === "string" &&
-      typeof (item as Record<string, unknown>).timestamp === "number"
-    ) {
-      requests.push({
-        id: (item as Record<string, unknown>).id as string,
-        prompt: (item as Record<string, unknown>).prompt as string,
-        timestamp: (item as Record<string, unknown>).timestamp as number,
-      });
-    }
-  }
-  return requests.length > 0 ? requests : undefined;
 }
 
 /**
