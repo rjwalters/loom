@@ -1,307 +1,31 @@
+//! Database operations for activity tracking.
+//!
+//! This module contains the `ActivityDb` struct and all methods for
+//! recording and querying agent activity data.
+
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use super::models::{
+    ActivityEntry, AgentInput, AgentMetric, AgentOutput, InputContext, InputType,
+    ProductivitySummary, TokenUsage,
+};
+use super::schema::init_schema;
 
 /// Activity database for tracking agent inputs and results
 pub struct ActivityDb {
     conn: Connection,
 }
 
-/// Type of input sent to terminal
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum InputType {
-    Manual,          // User-initiated command (direct keyboard input)
-    Autonomous,      // Agent autonomous action (interval prompts)
-    System,          // System-initiated (e.g., setup commands)
-    UserInstruction, // User-initiated prompts via UI buttons
-}
-
-impl InputType {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Manual => "manual",
-            Self::Autonomous => "autonomous",
-            Self::System => "system",
-            Self::UserInstruction => "user_instruction",
-        }
-    }
-
-    #[allow(dead_code)]
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "manual" => Some(Self::Manual),
-            "autonomous" => Some(Self::Autonomous),
-            "system" => Some(Self::System),
-            "user_instruction" => Some(Self::UserInstruction),
-            _ => None,
-        }
-    }
-}
-
-/// Context information for an agent input
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct InputContext {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub issue_number: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pr_number: Option<i32>,
-}
-
-/// Agent input record
-#[derive(Debug, Clone)]
-pub struct AgentInput {
-    #[allow(dead_code)]
-    pub id: Option<i64>,
-    pub terminal_id: String,
-    pub timestamp: DateTime<Utc>,
-    pub input_type: InputType,
-    pub content: String,
-    pub agent_role: Option<String>,
-    pub context: InputContext,
-}
-
-/// Agent output record (terminal output sample)
-#[derive(Debug, Clone)]
-pub struct AgentOutput {
-    #[allow(dead_code)]
-    pub id: Option<i64>,
-    pub input_id: Option<i64>,
-    pub terminal_id: String,
-    pub timestamp: DateTime<Utc>,
-    pub content: Option<String>,
-    pub content_preview: Option<String>,
-    pub exit_code: Option<i32>,
-    pub metadata: Option<String>,
-}
-
-/// Agent productivity metrics for a task
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct AgentMetric {
-    pub id: Option<i64>,
-    pub terminal_id: String,
-    pub agent_role: String,
-    pub agent_system: String,
-    pub task_type: Option<String>,
-    pub github_issue: Option<i32>,
-    pub github_pr: Option<i32>,
-    pub started_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
-    pub wall_time_seconds: Option<i64>,
-    pub active_time_seconds: Option<i64>,
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub total_tokens: i64,
-    pub estimated_cost_usd: f64,
-    pub status: String,
-    pub outcome_type: Option<String>,
-    pub test_failures: i32,
-    pub ci_failures: i32,
-    pub commits_count: i32,
-    pub lines_changed: i32,
-    pub context: Option<String>,
-}
-
-/// Token usage record for a single API request
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct TokenUsage {
-    pub id: Option<i64>,
-    pub input_id: Option<i64>,
-    pub metric_id: Option<i64>,
-    pub timestamp: DateTime<Utc>,
-    pub prompt_tokens: i64,
-    pub completion_tokens: i64,
-    pub total_tokens: i64,
-    pub model: Option<String>,
-    pub estimated_cost_usd: f64,
-}
-
-/// Combined activity entry (input + output)
-/// Used for displaying terminal activity history in UI
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ActivityEntry {
-    pub input_id: i64,
-    pub timestamp: DateTime<Utc>,
-    pub input_type: InputType,
-    pub prompt: String,
-    pub agent_role: Option<String>,
-    pub git_branch: Option<String>,
-
-    // Output data (optional, joined from agent_outputs)
-    pub output_preview: Option<String>,
-    pub exit_code: Option<i32>,
-    pub output_timestamp: Option<DateTime<Utc>>,
-}
-
-/// Type alias for productivity summary: (`agent_system`, `tasks_completed`, `avg_minutes`, `avg_tokens`, `total_cost`)
-pub type ProductivitySummary = Vec<(String, i64, f64, f64, f64)>;
-
 impl ActivityDb {
     /// Create or open activity database at the given path
     pub fn new(db_path: PathBuf) -> Result<Self> {
         let conn = Connection::open(db_path)?;
         let db = Self { conn };
-        db.init_schema()?;
+        init_schema(&db.conn)?;
         Ok(db)
-    }
-
-    /// Initialize database schema
-    #[allow(clippy::too_many_lines)]
-    fn init_schema(&self) -> Result<()> {
-        self.conn.execute_batch(
-            r"
-            CREATE TABLE IF NOT EXISTS agent_inputs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                terminal_id TEXT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                input_type TEXT NOT NULL,
-                content TEXT NOT NULL,
-                agent_role TEXT,
-                context TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_inputs_terminal_id ON agent_inputs(terminal_id);
-            CREATE INDEX IF NOT EXISTS idx_inputs_timestamp ON agent_inputs(timestamp);
-            CREATE INDEX IF NOT EXISTS idx_inputs_type ON agent_inputs(input_type);
-
-            CREATE TABLE IF NOT EXISTS agent_outputs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input_id INTEGER REFERENCES agent_inputs(id),
-                terminal_id TEXT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                content TEXT,
-                content_preview TEXT,
-                exit_code INTEGER,
-                metadata TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_outputs_input_id ON agent_outputs(input_id);
-            CREATE INDEX IF NOT EXISTS idx_outputs_terminal_id ON agent_outputs(terminal_id);
-            CREATE INDEX IF NOT EXISTS idx_outputs_timestamp ON agent_outputs(timestamp);
-
-            CREATE TABLE IF NOT EXISTS agent_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input_id INTEGER NOT NULL,
-                result_type TEXT NOT NULL,
-                timestamp DATETIME NOT NULL,
-                status TEXT,
-                data TEXT,
-                FOREIGN KEY(input_id) REFERENCES agent_inputs(id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_results_input_id ON agent_results(input_id);
-            CREATE INDEX IF NOT EXISTS idx_results_timestamp ON agent_results(timestamp);
-
-            CREATE TABLE IF NOT EXISTS agent_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                description TEXT,
-                started_at DATETIME,
-                completed_at DATETIME,
-                github_issue INTEGER,
-                github_pr INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS task_inputs (
-                task_id INTEGER NOT NULL,
-                input_id INTEGER NOT NULL,
-                FOREIGN KEY(task_id) REFERENCES agent_tasks(id),
-                FOREIGN KEY(input_id) REFERENCES agent_inputs(id),
-                PRIMARY KEY(task_id, input_id)
-            );
-
-            -- Agent productivity metrics per task
-            CREATE TABLE IF NOT EXISTS agent_metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                terminal_id TEXT NOT NULL,
-                agent_role TEXT NOT NULL,
-                agent_system TEXT NOT NULL,
-
-                -- Task identification
-                task_type TEXT,
-                github_issue INTEGER,
-                github_pr INTEGER,
-
-                -- Time tracking
-                started_at DATETIME NOT NULL,
-                completed_at DATETIME,
-                wall_time_seconds INTEGER,
-                active_time_seconds INTEGER,
-
-                -- Token usage
-                input_tokens INTEGER DEFAULT 0,
-                output_tokens INTEGER DEFAULT 0,
-                total_tokens INTEGER DEFAULT 0,
-                estimated_cost_usd REAL DEFAULT 0.0,
-
-                -- Outcome tracking
-                status TEXT NOT NULL DEFAULT 'in_progress',
-                outcome_type TEXT,
-
-                -- Quality indicators
-                test_failures INTEGER DEFAULT 0,
-                ci_failures INTEGER DEFAULT 0,
-                commits_count INTEGER DEFAULT 0,
-                lines_changed INTEGER DEFAULT 0,
-
-                -- Metadata
-                context TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_metrics_agent_system ON agent_metrics(agent_system);
-            CREATE INDEX IF NOT EXISTS idx_metrics_task_type ON agent_metrics(task_type);
-            CREATE INDEX IF NOT EXISTS idx_metrics_completed ON agent_metrics(completed_at);
-            CREATE INDEX IF NOT EXISTS idx_metrics_github_issue ON agent_metrics(github_issue);
-            CREATE INDEX IF NOT EXISTS idx_metrics_status ON agent_metrics(status);
-
-            -- Token usage per API request
-            CREATE TABLE IF NOT EXISTS token_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                input_id INTEGER REFERENCES agent_inputs(id),
-                metric_id INTEGER REFERENCES agent_metrics(id),
-                timestamp DATETIME NOT NULL,
-                prompt_tokens INTEGER NOT NULL,
-                completion_tokens INTEGER NOT NULL,
-                total_tokens INTEGER NOT NULL,
-                model TEXT,
-                estimated_cost_usd REAL DEFAULT 0.0
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_token_usage_input_id ON token_usage(input_id);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_metric_id ON token_usage(metric_id);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
-
-            -- GitHub events for correlating agent activity with GitHub actions
-            CREATE TABLE IF NOT EXISTS github_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                activity_id INTEGER,
-                event_type TEXT NOT NULL,
-                event_time TEXT NOT NULL,
-                pr_number INTEGER,
-                issue_number INTEGER,
-                commit_sha TEXT,
-                author TEXT,
-                FOREIGN KEY (activity_id) REFERENCES agent_metrics(id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_github_events_activity_id ON github_events(activity_id);
-            CREATE INDEX IF NOT EXISTS idx_github_events_event_type ON github_events(event_type);
-            CREATE INDEX IF NOT EXISTS idx_github_events_event_time ON github_events(event_time);
-            CREATE INDEX IF NOT EXISTS idx_github_events_pr_number ON github_events(pr_number);
-            CREATE INDEX IF NOT EXISTS idx_github_events_issue_number ON github_events(issue_number);
-            ",
-        )?;
-
-        Ok(())
     }
 
     /// Record a new agent input
