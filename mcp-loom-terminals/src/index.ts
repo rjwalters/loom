@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { exec } from "node:child_process";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -46,6 +46,36 @@ interface StateFile {
 }
 
 /**
+ * Role configuration for a terminal
+ */
+interface RoleConfig {
+  workerType?: string;
+  roleFile?: string;
+  targetInterval?: number;
+  intervalPrompt?: string;
+}
+
+/**
+ * Terminal configuration in config.json
+ */
+interface TerminalConfig {
+  id: string;
+  name: string;
+  role?: string;
+  roleConfig?: RoleConfig;
+  theme?: string;
+}
+
+/**
+ * Workspace config file structure
+ */
+interface ConfigFile {
+  version: string;
+  offlineMode?: boolean;
+  terminals: TerminalConfig[];
+}
+
+/**
  * Send a request to the Loom daemon and get the response
  */
 async function sendDaemonRequest(request: unknown): Promise<unknown> {
@@ -78,6 +108,13 @@ async function sendDaemonRequest(request: unknown): Promise<unknown> {
 }
 
 /**
+ * Get the workspace path from environment or state file
+ */
+function getWorkspacePath(): string {
+  return process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+}
+
+/**
  * Read the state file to get terminal information
  */
 async function readStateFile(): Promise<StateFile | null> {
@@ -95,6 +132,46 @@ async function readStateFile(): Promise<StateFile | null> {
     }
     throw error;
   }
+}
+
+/**
+ * Write the state file
+ */
+async function writeStateFile(state: StateFile): Promise<void> {
+  state.lastUpdated = new Date().toISOString();
+  await writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
+}
+
+/**
+ * Read the config file from the workspace
+ */
+async function readConfigFile(): Promise<ConfigFile | null> {
+  try {
+    const workspacePath = getWorkspacePath();
+    const configPath = join(workspacePath, ".loom", "config.json");
+
+    const fileStats = await stat(configPath);
+    if (!fileStats.isFile()) {
+      return null;
+    }
+
+    const content = await readFile(configPath, "utf-8");
+    return JSON.parse(content) as ConfigFile;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
+ * Write the config file to the workspace
+ */
+async function writeConfigFile(config: ConfigFile): Promise<void> {
+  const workspacePath = getWorkspacePath();
+  const configPath = join(workspacePath, ".loom", "config.json");
+  await writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
 }
 
 /**
@@ -474,6 +551,190 @@ async function restartTerminal(terminalId: string): Promise<{
   }
 }
 
+/**
+ * Configuration options for updating a terminal
+ */
+interface ConfigureTerminalOptions {
+  name?: string;
+  role?: string;
+  roleConfig?: Partial<RoleConfig>;
+  theme?: string;
+}
+
+/**
+ * Configure a terminal by updating its settings in the config file
+ */
+async function configureTerminal(
+  terminalId: string,
+  options: ConfigureTerminalOptions
+): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  try {
+    // Validate that at least one option is provided
+    if (!options.name && !options.role && !options.roleConfig && !options.theme) {
+      return {
+        success: false,
+        error: "At least one configuration option must be provided",
+      };
+    }
+
+    // Read the current config
+    const config = await readConfigFile();
+    if (!config) {
+      return {
+        success: false,
+        error: "Config file not found. Workspace may not be initialized.",
+      };
+    }
+
+    // Find the terminal in the config
+    const terminalIndex = config.terminals.findIndex((t) => t.id === terminalId);
+    if (terminalIndex === -1) {
+      return {
+        success: false,
+        error: `Terminal ${terminalId} not found in config`,
+      };
+    }
+
+    const terminal = config.terminals[terminalIndex];
+
+    // Update the terminal configuration
+    if (options.name !== undefined) {
+      terminal.name = options.name;
+    }
+    if (options.role !== undefined) {
+      terminal.role = options.role;
+    }
+    if (options.theme !== undefined) {
+      terminal.theme = options.theme;
+    }
+    if (options.roleConfig !== undefined) {
+      terminal.roleConfig = {
+        ...terminal.roleConfig,
+        ...options.roleConfig,
+      };
+    }
+
+    // Write the updated config back
+    config.terminals[terminalIndex] = terminal;
+    await writeConfigFile(config);
+
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Error configuring terminal: ${error}`,
+    };
+  }
+}
+
+/**
+ * Set the primary (selected) terminal
+ */
+async function setPrimaryTerminal(terminalId: string): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  try {
+    // Verify the terminal exists in the daemon
+    const terminals = await listTerminals();
+    const terminal = terminals.find((t) => t.id === terminalId);
+
+    if (!terminal) {
+      return {
+        success: false,
+        error: `Terminal ${terminalId} not found`,
+      };
+    }
+
+    // Read current state or create new one
+    let state = await readStateFile();
+    if (!state) {
+      // Create a new state file with the current terminals
+      state = {
+        terminals: terminals.map((t) => ({
+          id: t.id,
+          name: t.name,
+          role: t.role,
+          working_dir: t.working_dir,
+          tmux_session: t.tmux_session,
+          created_at: Date.now(),
+        })),
+        selectedTerminalId: null,
+        lastUpdated: new Date().toISOString(),
+      };
+    }
+
+    // Update the selected terminal
+    state.selectedTerminalId = terminalId;
+
+    // Write the state file
+    await writeStateFile(state);
+
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Error setting primary terminal: ${error}`,
+    };
+  }
+}
+
+/**
+ * Clear terminal history (scrollback buffer and output log)
+ */
+async function clearTerminalHistory(terminalId: string): Promise<{
+  success: boolean;
+  error?: string;
+}> {
+  try {
+    // Get the terminal info to find the tmux session name
+    const terminals = await listTerminals();
+    const terminal = terminals.find((t) => t.id === terminalId);
+
+    if (!terminal) {
+      return {
+        success: false,
+        error: `Terminal ${terminalId} not found`,
+      };
+    }
+
+    // Clear tmux scrollback history
+    try {
+      await execAsync(`tmux -L loom clear-history -t "${terminal.tmux_session}"`);
+    } catch (error) {
+      // Session might not exist, but we can still try to clear the log file
+      const stderr = (error as { stderr?: string }).stderr || "";
+      if (!stderr.includes("no server running") && !stderr.includes("session not found")) {
+        // Log warning but continue to clear the output file
+      }
+    }
+
+    // Truncate the output log file
+    const outputFile = `/tmp/loom-${terminalId}.out`;
+    try {
+      await writeFile(outputFile, "", "utf-8");
+    } catch (error) {
+      // File might not exist, which is fine
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        return {
+          success: false,
+          error: `Failed to clear output log file: ${error}`,
+        };
+      }
+    }
+
+    return { success: true };
+  } catch (error) {
+    return {
+      success: false,
+      error: `Error clearing terminal history: ${error}`,
+    };
+  }
+}
+
 const server = new Server(
   {
     name: "loom-terminals",
@@ -645,6 +906,85 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             terminal_id: {
               type: "string",
               description: "Terminal ID to restart (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminal_id"],
+        },
+      },
+      {
+        name: "configure_terminal",
+        description:
+          "Update a terminal's configuration settings. Changes are saved to the config file and take effect on next terminal restart or when the UI hot-reloads the configuration. Use this to change terminal name, role, theme, or autonomous interval settings.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminal_id: {
+              type: "string",
+              description: "Terminal ID to configure (e.g., 'terminal-1')",
+            },
+            name: {
+              type: "string",
+              description: "New human-readable name for the terminal",
+            },
+            role: {
+              type: "string",
+              description: "New role for the terminal (e.g., 'claude-code-worker')",
+            },
+            role_config: {
+              type: "object",
+              description: "Role configuration settings",
+              properties: {
+                worker_type: {
+                  type: "string",
+                  description: "Worker type (e.g., 'claude')",
+                },
+                role_file: {
+                  type: "string",
+                  description: "Role definition file (e.g., 'builder.md', 'judge.md')",
+                },
+                target_interval: {
+                  type: "number",
+                  description: "Interval in milliseconds for autonomous operation (0 for manual)",
+                },
+                interval_prompt: {
+                  type: "string",
+                  description: "Prompt to send at each interval for autonomous terminals",
+                },
+              },
+            },
+            theme: {
+              type: "string",
+              description: "Terminal theme (e.g., 'ocean', 'forest', 'sunset')",
+            },
+          },
+          required: ["terminal_id"],
+        },
+      },
+      {
+        name: "set_primary_terminal",
+        description:
+          "Set the primary (selected) terminal in the Loom UI. This updates the UI state to focus on the specified terminal. The terminal must exist.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminal_id: {
+              type: "string",
+              description: "Terminal ID to set as primary (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminal_id"],
+        },
+      },
+      {
+        name: "clear_terminal_history",
+        description:
+          "Clear a terminal's scrollback history and output log. This clears the tmux scrollback buffer and truncates the output log file. Useful for clearing sensitive data or resetting terminal state without restarting.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminal_id: {
+              type: "string",
+              description: "Terminal ID to clear history for (e.g., 'terminal-1')",
             },
           },
           required: ["terminal_id"],
@@ -994,6 +1334,171 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: `=== Restart Terminal ===\n\n✅ Success\n\nTerminal ${result.terminal_id} has been restarted.\n\nThe terminal's configuration (ID, name, role, working directory) was preserved, but a fresh tmux session was created.\n\nNote: Any running processes in the terminal were terminated and terminal history was cleared.`,
+            },
+          ],
+        };
+      }
+
+      case "configure_terminal": {
+        const terminalId = args?.terminal_id as string;
+
+        if (!terminalId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: terminal_id is required",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Build the options object from the provided arguments
+        const roleConfigArgs = args?.role_config as
+          | {
+              worker_type?: string;
+              role_file?: string;
+              target_interval?: number;
+              interval_prompt?: string;
+            }
+          | undefined;
+
+        const options: ConfigureTerminalOptions = {};
+
+        if (args?.name !== undefined) {
+          options.name = args.name as string;
+        }
+        if (args?.role !== undefined) {
+          options.role = args.role as string;
+        }
+        if (args?.theme !== undefined) {
+          options.theme = args.theme as string;
+        }
+        if (roleConfigArgs !== undefined) {
+          options.roleConfig = {};
+          if (roleConfigArgs.worker_type !== undefined) {
+            options.roleConfig.workerType = roleConfigArgs.worker_type;
+          }
+          if (roleConfigArgs.role_file !== undefined) {
+            options.roleConfig.roleFile = roleConfigArgs.role_file;
+          }
+          if (roleConfigArgs.target_interval !== undefined) {
+            options.roleConfig.targetInterval = roleConfigArgs.target_interval;
+          }
+          if (roleConfigArgs.interval_prompt !== undefined) {
+            options.roleConfig.intervalPrompt = roleConfigArgs.interval_prompt;
+          }
+        }
+
+        const result = await configureTerminal(terminalId, options);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Configure Terminal ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const changedFields = Object.keys(options)
+          .map((key) => {
+            if (key === "roleConfig" && options.roleConfig) {
+              return Object.keys(options.roleConfig)
+                .map((k) => `roleConfig.${k}`)
+                .join(", ");
+            }
+            return key;
+          })
+          .join(", ");
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Configure Terminal ===\n\n✅ Success\n\nTerminal ${terminalId} configuration updated.\n\nUpdated fields: ${changedFields}\n\nNote: Changes are saved to the config file. The terminal may need to be restarted for some changes to take effect, or the UI will hot-reload the configuration.`,
+            },
+          ],
+        };
+      }
+
+      case "set_primary_terminal": {
+        const terminalId = args?.terminal_id as string;
+
+        if (!terminalId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: terminal_id is required",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = await setPrimaryTerminal(terminalId);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Set Primary Terminal ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Set Primary Terminal ===\n\n✅ Success\n\nTerminal ${terminalId} is now the primary (selected) terminal.\n\nThe UI will focus on this terminal.`,
+            },
+          ],
+        };
+      }
+
+      case "clear_terminal_history": {
+        const terminalId = args?.terminal_id as string;
+
+        if (!terminalId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: terminal_id is required",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = await clearTerminalHistory(terminalId);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Clear Terminal History ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Clear Terminal History ===\n\n✅ Success\n\nTerminal ${terminalId} history has been cleared.\n\nCleared:\n- tmux scrollback buffer\n- Output log file (/tmp/loom-${terminalId}.out)`,
             },
           ],
         };

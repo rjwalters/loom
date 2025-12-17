@@ -4,7 +4,7 @@ MCP server for interacting with Loom terminal sessions. Provides tools to list t
 
 ## Features
 
-Provides 10 tools for interacting with Loom's terminal sessions:
+Provides 13 tools for interacting with Loom's terminal sessions:
 
 ### Terminal Discovery
 
@@ -42,15 +42,34 @@ Provides 10 tools for interacting with Loom's terminal sessions:
    - Creates a fresh tmux session
    - Useful for recovering from stuck states
 
+### Terminal Configuration
+
+8. **`configure_terminal`** - Update terminal configuration
+   - Parameters: `terminal_id` (required), `name?`, `role?`, `role_config?`, `theme?`
+   - Role config options: `worker_type`, `role_file`, `target_interval`, `interval_prompt`
+   - Updates saved to `.loom/config.json`
+   - Changes take effect on restart or UI hot-reload
+
+9. **`set_primary_terminal`** - Set the primary (selected) terminal
+   - Parameters: `terminal_id` (required)
+   - Updates UI state to focus on specified terminal
+   - Writes to `~/.loom/state.json`
+
+10. **`clear_terminal_history`** - Clear terminal scrollback and output log
+    - Parameters: `terminal_id` (required)
+    - Clears tmux scrollback buffer
+    - Truncates output log file (`/tmp/loom-{id}.out`)
+    - Useful for clearing sensitive data without restart
+
 ### Debugging Tools
 
-8. **`check_tmux_server_health`** - Check if tmux server is running
-   - Shows server status and active session count
+11. **`check_tmux_server_health`** - Check if tmux server is running
+    - Shows server status and active session count
 
-9. **`get_tmux_server_info`** - Get detailed tmux server information
-   - PID, socket path, version
+12. **`get_tmux_server_info`** - Get detailed tmux server information
+    - PID, socket path, version
 
-10. **`toggle_tmux_verbose_logging`** - Toggle tmux verbose logging
+13. **`toggle_tmux_verbose_logging`** - Toggle tmux verbose logging
     - Useful for deep debugging of tmux issues
 
 ## Installation
@@ -132,6 +151,18 @@ Once configured in Claude Desktop, you can ask:
 - "Restart terminal-1"
 - "Remove the judge terminal"
 - "Restart the builder terminal to clear its history"
+
+### Configuring Terminals
+- "Change terminal-1's name to 'Main Builder'"
+- "Set terminal-2 to use the curator role"
+- "Update the autonomous interval for terminal-3 to 5 minutes"
+- "Change terminal-1's theme to 'forest'"
+
+### UI Control
+- "Select terminal-2 as the primary terminal"
+- "Focus on the builder terminal"
+- "Clear the history of terminal-1"
+- "Clear terminal-3's output log"
 
 The MCP tools will be automatically invoked to interact with the terminals.
 
@@ -304,7 +335,6 @@ The daemon uses internally-tagged JSON over Unix socket:
 ## Future Enhancements
 
 - **Streaming output**: Watch terminal output in real-time
-- **Role assignment**: Change terminal roles via MCP
 - **Workspace switching**: Select different workspaces
 - **Terminal resizing**: Resize terminal dimensions
 - **Command history**: Access terminal command history
