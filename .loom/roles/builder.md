@@ -655,6 +655,16 @@ Before claiming an issue, estimate the work required:
 
 ### Issue Decomposition Pattern
 
+> **⚠️ CRITICAL: You MUST close the parent issue after decomposition.**
+>
+> Leaving parent issues open after decomposition is a workflow violation that causes:
+> - Duplicate work (other Builders may claim the parent)
+> - Backlog confusion (parent appears as available work)
+> - Curator wasted effort (enhancing already-decomposed issues)
+> - Inaccurate project metrics (inflated open issue count)
+>
+> **The decomposition is NOT complete until the parent issue is CLOSED.**
+
 When you encounter a complex but tractable issue, be ambitious - break it down so work can start.
 
 **Step 1: Analyze the Work**
@@ -716,6 +726,19 @@ EOF
 )"
 ```
 
+### Decomposition Checklist
+
+Before moving on after decomposition, verify ALL items are complete:
+
+- [ ] **Created sub-issues** with clear scope and acceptance criteria
+- [ ] **Added dependencies** linking sub-issues to each other
+- [ ] **Referenced parent** in each sub-issue ("Parent Issue: #XXX")
+- [ ] **CLOSED parent issue** with comment listing all sub-issues ← **REQUIRED**
+- [ ] **Verified parent state** is CLOSED (not just commented)
+
+> **🛑 STOP**: If you haven't closed the parent issue, go back and close it NOW.
+> The decomposition workflow is incomplete until the parent is closed.
+
 ### Real-World Example
 
 **Original Issue #524**: "Track agent activity in local database"
@@ -736,8 +759,12 @@ gh issue create --title "Integrate activity logging into /builder and /judge"
 gh issue create --title "Add activity querying to /loom heuristic"
 # → Issue #536 (1-2 hours, depends on #535)
 
-# Close parent
+# ⚠️ CRITICAL: Close parent issue (DO NOT SKIP THIS STEP)
 gh issue close 524 --comment "Decomposed into #534, #535, #536"
+
+# ✅ Verify parent is closed
+gh issue view 524 --json state --jq '.state'
+# Must output: CLOSED
 ```
 
 **Benefits**:
@@ -745,6 +772,35 @@ gh issue close 524 --comment "Decomposed into #534, #535, #536"
 - ✅ Can implement MVP first, enhance later
 - ✅ Multiple builders can work in parallel
 - ✅ Incremental value delivery
+
+### Post-Decomposition Validation
+
+**After every decomposition, run this validation to ensure nothing was missed:**
+
+```bash
+# Validation script - run after decomposing issue #XXX
+PARENT=XXX
+
+# 1. Verify parent is CLOSED (not open)
+STATE=$(gh issue view $PARENT --json state --jq '.state')
+if [ "$STATE" != "CLOSED" ]; then
+  echo "❌ ERROR: Parent issue #$PARENT is still $STATE - close it now!"
+  gh issue close $PARENT --comment "Decomposed into sub-issues (see comments)"
+else
+  echo "✅ Parent issue #$PARENT is closed"
+fi
+
+# 2. Verify closing comment exists
+gh issue view $PARENT --comments | grep -q "Decomposed" && \
+  echo "✅ Closing comment exists" || \
+  echo "⚠️  WARNING: No decomposition comment found"
+```
+
+**Why validate?**
+- Catches forgotten close operations immediately
+- Prevents orphaned parent issues from polluting backlog
+- Confirms workflow was completed correctly
+- Takes 5 seconds, saves hours of confusion
 
 ### Complexity Assessment Examples
 
