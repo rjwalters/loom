@@ -182,6 +182,28 @@ fi
 "$LOOM_ROOT/scripts/install/validate-target.sh" "$TARGET_PATH" || \
   error "Target validation failed"
 
+# Check for workflow scope (non-blocking warning)
+if ! "$LOOM_ROOT/scripts/install/check-workflow-scope.sh" 2>/dev/null; then
+  echo ""
+  warning "GitHub CLI token is missing 'workflow' scope"
+  info "Workflow files (.github/workflows/) may be skipped during installation."
+  echo ""
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    info "Continuing in non-interactive mode - workflows will be skipped if needed."
+  else
+    echo "  To add the workflow scope now, run:"
+    echo "    gh auth refresh -s workflow"
+    echo ""
+    read -p "Continue without workflow scope? (Y/n) " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Nn]$ ]]; then
+      echo ""
+      info "Run 'gh auth refresh -s workflow' and retry installation."
+      exit 0
+    fi
+  fi
+fi
+
 echo ""
 
 # ============================================================================

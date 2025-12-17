@@ -13,11 +13,16 @@ LOOM_COMMIT="${LOOM_COMMIT:-unknown}"
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 error() {
   echo -e "${RED}✗ Error: $*${NC}" >&2
   exit 1
+}
+
+warning() {
+  echo -e "${YELLOW}⚠ $*${NC}" >&2
 }
 
 info() {
@@ -98,8 +103,95 @@ info "Pushing branch: $BRANCH_NAME"
 
 # Push branch (use --force in case branch exists remotely from previous failed installation)
 # Redirect output to stderr so it doesn't interfere with PR URL capture
-git push -u origin "$BRANCH_NAME" --force >&2
-success "Branch pushed"
+PUSH_OUTPUT=""
+PUSH_EXIT_CODE=0
+PUSH_OUTPUT=$(git push -u origin "$BRANCH_NAME" --force 2>&1) || PUSH_EXIT_CODE=$?
+
+if [[ $PUSH_EXIT_CODE -ne 0 ]]; then
+  # Check if the error is due to missing workflow scope
+  if echo "$PUSH_OUTPUT" | grep -q "refusing to allow.*workflow"; then
+    echo "" >&2
+    echo -e "${YELLOW}⚠ GitHub rejected push: missing 'workflow' scope${NC}" >&2
+    echo "" >&2
+    info "The GitHub CLI token doesn't have permission to create workflow files."
+    info "Retrying without workflow files..."
+    echo "" >&2
+
+    # Remove workflow files from the commit and retry
+    WORKFLOW_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep "^\.github/workflows/" || true)
+
+    if [[ -n "$WORKFLOW_FILES" ]]; then
+      # Unstage workflow files and amend the commit
+      git reset HEAD~1 --soft >&2
+
+      # Re-add everything except workflows
+      git add -A >&2
+      for wf in $WORKFLOW_FILES; do
+        if [[ -f "$wf" ]]; then
+          git reset HEAD -- "$wf" >&2 2>/dev/null || true
+          rm -f "$wf"
+        fi
+      done
+
+      # Amend commit message to note skipped workflows
+      COMMIT_MSG_NO_WORKFLOW=$(cat <<EOF
+Install Loom ${LOOM_VERSION} orchestration framework
+
+Adds Loom configuration and GitHub workflow integration:
+- .loom/ directory with configuration and scripts
+- .claude/ MCP servers and prompts
+- .github/ labels (workflows skipped - requires 'workflow' scope)
+- Documentation (CLAUDE.md, AGENTS.md)
+
+Note: GitHub workflow files were skipped due to missing 'workflow' scope.
+To add workflows later, run: gh auth refresh -s workflow
+
+Loom Version: ${LOOM_VERSION}
+Loom Commit: ${LOOM_COMMIT}
+
+Closes #${ISSUE_NUMBER}
+EOF
+)
+      git commit -m "$COMMIT_MSG_NO_WORKFLOW" >&2
+
+      # Retry push
+      git push -u origin "$BRANCH_NAME" --force >&2 || {
+        error "Failed to push even without workflow files"
+      }
+
+      echo "" >&2
+      echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}" >&2
+      echo -e "${YELLOW}  WORKFLOW FILES SKIPPED${NC}" >&2
+      echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}" >&2
+      echo "" >&2
+      echo "  The following workflow files were NOT included:" >&2
+      for wf in $WORKFLOW_FILES; do
+        echo "    - $wf" >&2
+      done
+      echo "" >&2
+      echo "  To add workflows later:" >&2
+      echo "    1. Run: gh auth refresh -s workflow" >&2
+      echo "    2. Manually copy workflows from Loom defaults:" >&2
+      echo "       $LOOM_ROOT/defaults/.github/workflows/" >&2
+      echo "" >&2
+      echo -e "${YELLOW}════════════════════════════════════════════════════════════${NC}" >&2
+      echo "" >&2
+
+      success "Branch pushed (without workflows)"
+    else
+      # No workflow files found, but still failed - re-raise the error
+      echo "$PUSH_OUTPUT" >&2
+      error "Failed to push branch: $BRANCH_NAME"
+    fi
+  else
+    # Different error - show output and fail
+    echo "$PUSH_OUTPUT" >&2
+    error "Failed to push branch: $BRANCH_NAME"
+  fi
+else
+  echo "$PUSH_OUTPUT" >&2
+  success "Branch pushed"
+fi
 
 info "Creating pull request..."
 
