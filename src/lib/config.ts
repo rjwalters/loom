@@ -123,89 +123,6 @@ export function setConfigWorkspace(workspacePath: string): void {
 }
 
 /**
- * Migrates legacy config format to new split format.
- * Handles three cases of legacy IDs:
- * 1. Dual-ID system (configId field) - uses existing configId
- * 2. UUID or placeholder IDs - generates stable "terminal-N" ID
- * 3. Already stable IDs - uses as-is
- *
- * @param legacy - The legacy config object containing mixed config/state data
- * @returns Object with separated config and state structures
- */
-function migrateLegacyConfig(legacy: LegacyConfig): {
-  config: LoomConfig;
-  state: LoomState;
-} {
-  logger.info("Migrating from legacy config format", {
-    agentCount: legacy.agents.length,
-  });
-
-  const terminals: TerminalConfig[] = [];
-  const terminalStates: TerminalState[] = [];
-
-  legacy.agents.forEach((agent, index) => {
-    // Determine stable ID
-    let id: string;
-
-    // Case 1: Has configId (dual-ID system) - use it
-    if ("configId" in agent && agent.configId) {
-      id = agent.configId;
-      logger.info("Using existing configId", {
-        id,
-        terminalName: agent.name,
-      });
-    }
-    // Case 2: Has UUID or placeholder - generate stable ID
-    else if (
-      agent.id &&
-      (agent.id.includes("-") || agent.id === "__needs_session__" || agent.id === "__unassigned__")
-    ) {
-      id = `terminal-${index + 1}`;
-      logger.info("Generated stable ID", {
-        id,
-        terminalName: agent.name,
-      });
-    }
-    // Case 3: Already has stable ID
-    else {
-      id = agent.id;
-    }
-
-    // Split into config (persistent) and state (ephemeral)
-    terminals.push({
-      id,
-      name: agent.name,
-      role: agent.role,
-      roleConfig: agent.roleConfig,
-      theme: agent.theme,
-      customTheme: agent.customTheme,
-    });
-
-    terminalStates.push({
-      id,
-      status: agent.status,
-      isPrimary: agent.isPrimary,
-      worktreePath: agent.worktreePath,
-      agentPid: agent.agentPid,
-      agentStatus: agent.agentStatus,
-      lastIntervalRun: agent.lastIntervalRun,
-      pendingInputRequests: agent.pendingInputRequests,
-      busyTime: agent.busyTime,
-      idleTime: agent.idleTime,
-      lastStateChange: agent.lastStateChange,
-    });
-  });
-
-  return {
-    config: { version: "2", terminals },
-    state: {
-      nextAgentNumber: legacy.nextAgentNumber,
-      terminals: terminalStates,
-    },
-  };
-}
-
-/**
  * Migrates config from v1 (no version field or version:"1") to v2 format.
  * v1 configs are identified by missing version field or explicit "1" value.
  *
@@ -280,21 +197,21 @@ export async function loadConfig(): Promise<LoomConfig> {
     const parsed = JSON.parse(contents);
 
     // Check if legacy format (has "agents" array with mixed data)
+    // Phase 1 of deprecation: Refuse legacy configs with clear error message
+    // The migration code is preserved for future removal in Phase 2
     if (parsed.agents && !parsed.terminals) {
-      logger.info("Detected legacy format, migrating");
-      const { config, state } = migrateLegacyConfig(parsed as LegacyConfig);
+      const legacyAgentCount = (parsed as LegacyConfig).agents?.length || 0;
 
-      // Ensure version field is set after legacy migration
-      const configWithVersion: LoomConfig = {
-        ...config,
-        version: "2",
-      };
-
-      // Save migrated versions
-      await saveConfig(configWithVersion);
-      await saveState(state);
-
-      return configWithVersion;
+      throw new Error(
+        `Legacy config format detected (${legacyAgentCount} terminals).\n\n` +
+          `This version of Loom requires config version 2 or higher.\n` +
+          `Your config is using the legacy pre-v2 format.\n\n` +
+          `To migrate:\n` +
+          `1. Downgrade to a Loom version before this change\n` +
+          `2. Open your workspace (this will auto-migrate to v2)\n` +
+          `3. Upgrade to this version\n\n` +
+          `Or use factory reset: ./.loom/scripts/clean.sh --deep`
+      );
     }
 
     // Migrate to latest version if needed

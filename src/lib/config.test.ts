@@ -601,21 +601,21 @@ describe("config", () => {
     });
   });
 
-  describe("legacy config migration", () => {
-    it("should migrate dual-ID config (configId + UUID sessionId)", async () => {
+  describe("legacy config rejection", () => {
+    it("should reject legacy config with agents array and return empty config", async () => {
       const legacyConfig = {
         nextAgentNumber: 3,
         agents: [
           {
             configId: "terminal-1",
-            id: "abc-123-def-456", // old UUID session ID
+            id: "abc-123-def-456",
             name: "Agent 1",
             status: "idle",
             isPrimary: true,
           },
           {
             configId: "terminal-2",
-            id: "xyz-789-uvw-012", // old UUID session ID
+            id: "xyz-789-uvw-012",
             name: "Agent 2",
             status: "idle",
             isPrimary: false,
@@ -628,7 +628,6 @@ describe("config", () => {
           return JSON.stringify(legacyConfig);
         }
         if (cmd === "read_state") {
-          // After migration, state.json won't exist yet
           throw new Error("File not found");
         }
         return "";
@@ -636,29 +635,19 @@ describe("config", () => {
 
       setConfigWorkspace("/path/to/workspace");
 
-      const result = await loadWorkspaceConfig();
+      // Legacy config now throws error, which loadConfig catches and returns empty config
+      const config = await loadConfig();
 
-      // Should use configId as the new single ID
-      expect(result.agents[0].id).toBe("terminal-1");
-      expect(result.agents[1].id).toBe("terminal-2");
+      expect(config).toEqual({ version: "2", terminals: [] });
     });
 
-    it("should migrate UUID-only config to terminal-N IDs", async () => {
+    it("should include terminal count in error message", async () => {
       const legacyConfig = {
         nextAgentNumber: 3,
         agents: [
-          {
-            id: "abc-123-def-456", // old UUID
-            name: "Agent 1",
-            status: "idle",
-            isPrimary: true,
-          },
-          {
-            id: "xyz-789-uvw-012", // old UUID
-            name: "Agent 2",
-            status: "idle",
-            isPrimary: false,
-          },
+          { id: "1", name: "Agent 1", status: "idle", isPrimary: true },
+          { id: "2", name: "Agent 2", status: "idle", isPrimary: false },
+          { id: "3", name: "Agent 3", status: "idle", isPrimary: false },
         ],
       };
 
@@ -666,60 +655,17 @@ describe("config", () => {
         if (cmd === "read_config") {
           return JSON.stringify(legacyConfig);
         }
-        if (cmd === "read_state") {
-          throw new Error("File not found");
-        }
         return "";
       });
 
       setConfigWorkspace("/path/to/workspace");
 
-      const result = await loadWorkspaceConfig();
-
-      // Should generate stable terminal-N IDs based on index
-      expect(result.agents[0].id).toBe("terminal-1");
-      expect(result.agents[1].id).toBe("terminal-2");
+      // Legacy config returns empty config due to error
+      const config = await loadConfig();
+      expect(config).toEqual({ version: "2", terminals: [] });
     });
 
-    it("should migrate placeholder IDs to terminal-N IDs", async () => {
-      const legacyConfig = {
-        nextAgentNumber: 3,
-        agents: [
-          {
-            id: "__needs_session__",
-            name: "Agent 1",
-            status: "idle",
-            isPrimary: true,
-          },
-          {
-            id: "__unassigned__",
-            name: "Agent 2",
-            status: "idle",
-            isPrimary: false,
-          },
-        ],
-      };
-
-      vi.mocked(invoke).mockImplementation(async (cmd) => {
-        if (cmd === "read_config") {
-          return JSON.stringify(legacyConfig);
-        }
-        if (cmd === "read_state") {
-          throw new Error("File not found");
-        }
-        return "";
-      });
-
-      setConfigWorkspace("/path/to/workspace");
-
-      const result = await loadWorkspaceConfig();
-
-      // Should generate stable terminal-N IDs
-      expect(result.agents[0].id).toBe("terminal-1");
-      expect(result.agents[1].id).toBe("terminal-2");
-    });
-
-    it("should not migrate already-migrated config", async () => {
+    it("should not reject current v2 format", async () => {
       const currentConfig: LoomConfig = {
         version: "2",
         terminals: [
