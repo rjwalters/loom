@@ -104,12 +104,12 @@ You should see the Curator's enhancement comment with implementation details.
 Once you review the Curator's enhancement, approve it for implementation:
 
 ```bash
-gh issue edit 42 --remove-label "loom:curated" --add-label "loom:issue"
+gh issue edit 42 --add-label "loom:issue"
 ```
 
 **Label transition:**
 ```
-loom:curated → loom:issue (ready for Builder to claim)
+loom:curated + loom:issue (ready for Builder to claim, curated label preserved)
 ```
 
 ---

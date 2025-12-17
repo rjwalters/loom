@@ -138,9 +138,8 @@ Check each of the 8 criteria above. If ANY criterion fails, skip to Step 4 (reje
 If all 8 criteria pass, promote the issue:
 
 ```bash
-# Remove loom:curated, add loom:issue
+# Add loom:issue (keep loom:curated as historical context)
 gh issue edit <number> \
-  --remove-label "loom:curated" \
   --add-label "loom:issue"
 
 # Add promotion comment
