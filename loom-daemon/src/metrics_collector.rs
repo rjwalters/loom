@@ -80,22 +80,31 @@ impl MetricsState {
     }
 }
 
-/// GitHub PR data from gh CLI
+/// Unified GitHub event item for deserialization
+/// Uses serde aliases to handle both mergedAt and closedAt fields
 #[derive(Debug, Deserialize)]
-struct GitHubPR {
+struct GitHubEventItem {
     number: i64,
-    #[serde(rename = "mergedAt")]
-    merged_at: Option<String>,
+    /// Event timestamp - handles both mergedAt (PRs) and closedAt (issues)
+    #[serde(alias = "mergedAt", alias = "closedAt")]
+    event_time: Option<String>,
     author: Author,
 }
 
-/// GitHub Issue data from gh CLI
-#[derive(Debug, Deserialize)]
-struct GitHubIssue {
-    number: i64,
-    #[serde(rename = "closedAt")]
-    closed_at: Option<String>,
-    author: Author,
+/// Configuration for collecting different types of GitHub events
+struct EventCollectionConfig {
+    /// Resource type for gh CLI subcommand ("pr" or "issue")
+    resource_type: &'static str,
+    /// State filter for gh CLI ("merged" or "closed")
+    state: &'static str,
+    /// Query prefix for date filtering ("merged:>" or "closed:>")
+    query_prefix: &'static str,
+    /// JSON fields to request from gh CLI
+    json_fields: &'static str,
+    /// Event type string for database storage
+    event_type: &'static str,
+    /// Whether this is a PR event (true) or issue event (false)
+    is_pr: bool,
 }
 
 /// GitHub author data
@@ -294,64 +303,15 @@ fn collect_pr_events(
     conn: &Connection,
     since: Option<&str>,
 ) -> Result<usize> {
-    // Create longer-lived string values
-    let repo_string = format!("{}/{}", config.repo_owner, config.repo_name);
-    let search_query = since.and_then(|since_time| {
-        chrono::DateTime::parse_from_rfc3339(since_time)
-            .ok()
-            .map(|dt| format!("merged:>{}", dt.format("%Y-%m-%d")))
-    });
-
-    let mut args = vec![
-        "pr",
-        "list",
-        "--repo",
-        &repo_string,
-        "--state",
-        "merged",
-        "--limit",
-        "100",
-        "--json",
-        "number,mergedAt,author",
-    ];
-
-    // Add date filter if we have a search query
-    if let Some(ref query) = search_query {
-        args.push("--search");
-        args.push(query);
-    }
-
-    let output = Command::new("gh")
-        .args(&args)
-        .output()
-        .context("Failed to execute gh pr list")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("gh pr list failed: {stderr}"));
-    }
-
-    let prs: Vec<GitHubPR> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse PR JSON")?;
-
-    let mut count = 0;
-    for pr in prs {
-        if let Some(merged_at) = pr.merged_at {
-            if insert_github_event(
-                conn,
-                "pr_merged",
-                &merged_at,
-                Some(pr.number),
-                None,
-                None,
-                &pr.author.login,
-            )? {
-                count += 1;
-            }
-        }
-    }
-
-    Ok(count)
+    static PR_CONFIG: EventCollectionConfig = EventCollectionConfig {
+        resource_type: "pr",
+        state: "merged",
+        query_prefix: "merged:>",
+        json_fields: "number,mergedAt,author",
+        event_type: "pr_merged",
+        is_pr: true,
+    };
+    collect_github_events(config, conn, since, &PR_CONFIG)
 }
 
 /// Collect issue close events
@@ -360,28 +320,44 @@ fn collect_issue_events(
     conn: &Connection,
     since: Option<&str>,
 ) -> Result<usize> {
-    // Create longer-lived string values
-    let repo_string = format!("{}/{}", config.repo_owner, config.repo_name);
+    static ISSUE_CONFIG: EventCollectionConfig = EventCollectionConfig {
+        resource_type: "issue",
+        state: "closed",
+        query_prefix: "closed:>",
+        json_fields: "number,closedAt,author",
+        event_type: "issue_closed",
+        is_pr: false,
+    };
+    collect_github_events(config, conn, since, &ISSUE_CONFIG)
+}
+
+/// Generic GitHub event collection function
+fn collect_github_events(
+    metrics_config: &MetricsConfig,
+    conn: &Connection,
+    since: Option<&str>,
+    event_config: &EventCollectionConfig,
+) -> Result<usize> {
+    let repo_string = format!("{}/{}", metrics_config.repo_owner, metrics_config.repo_name);
     let search_query = since.and_then(|since_time| {
         chrono::DateTime::parse_from_rfc3339(since_time)
             .ok()
-            .map(|dt| format!("closed:>{}", dt.format("%Y-%m-%d")))
+            .map(|dt| format!("{}{}", event_config.query_prefix, dt.format("%Y-%m-%d")))
     });
 
     let mut args = vec![
-        "issue",
+        event_config.resource_type,
         "list",
         "--repo",
         &repo_string,
         "--state",
-        "closed",
+        event_config.state,
         "--limit",
         "100",
         "--json",
-        "number,closedAt,author",
+        event_config.json_fields,
     ];
 
-    // Add date filter if we have a search query
     if let Some(ref query) = search_query {
         args.push("--search");
         args.push(query);
@@ -390,27 +366,36 @@ fn collect_issue_events(
     let output = Command::new("gh")
         .args(&args)
         .output()
-        .context("Failed to execute gh issue list")?;
+        .with_context(|| format!("Failed to execute gh {} list", event_config.resource_type))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("gh issue list failed: {stderr}"));
+        return Err(anyhow!(
+            "gh {} list failed: {stderr}",
+            event_config.resource_type
+        ));
     }
 
-    let issues: Vec<GitHubIssue> =
-        serde_json::from_slice(&output.stdout).context("Failed to parse issue JSON")?;
+    let items: Vec<GitHubEventItem> = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("Failed to parse {} JSON", event_config.resource_type))?;
 
     let mut count = 0;
-    for issue in issues {
-        if let Some(closed_at) = issue.closed_at {
+    for item in items {
+        if let Some(event_time) = item.event_time {
+            let (pr_number, issue_number) = if event_config.is_pr {
+                (Some(item.number), None)
+            } else {
+                (None, Some(item.number))
+            };
+
             if insert_github_event(
                 conn,
-                "issue_closed",
-                &closed_at,
+                event_config.event_type,
+                &event_time,
+                pr_number,
+                issue_number,
                 None,
-                Some(issue.number),
-                None,
-                &issue.author.login,
+                &item.author.login,
             )? {
                 count += 1;
             }
