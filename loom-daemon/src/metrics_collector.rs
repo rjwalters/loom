@@ -370,10 +370,7 @@ fn collect_github_events(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!(
-            "gh {} list failed: {stderr}",
-            event_config.resource_type
-        ));
+        return Err(anyhow!("gh {} list failed: {stderr}", event_config.resource_type));
     }
 
     let items: Vec<GitHubEventItem> = serde_json::from_slice(&output.stdout)
