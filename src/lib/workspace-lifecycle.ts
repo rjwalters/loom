@@ -7,6 +7,7 @@ import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-termin
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
 import { showToast } from "./toast";
+import { initializeTerminals } from "./workspace-common";
 import { expandTildePath } from "./workspace-utils";
 
 const logger = Logger.forComponent("workspace-lifecycle");
@@ -151,54 +152,15 @@ async function initializeNewWorkspace(
       terminalCount: config.agents.length,
     });
 
-    // Convert agents to terminal configs for parallel creation
-    const terminalConfigs: TerminalConfig[] = config.agents.map((agent) => ({
-      id: agent.id,
-      name: agent.name,
-      role: agent.role || "default",
-      workingDir: workspacePath,
-      instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
-    }));
-
-    // Create terminal sessions in parallel with retry logic
-    const { succeeded, failed } = await createTerminalsWithRetry(
-      terminalConfigs,
+    // Use shared terminal initialization logic
+    await initializeTerminals({
       workspacePath,
-      state
-    );
-
-    // Update agent IDs for successfully created terminals
-    for (const result of succeeded) {
-      const agent = config.agents.find((a) => a.id === result.configId);
-      if (agent) {
-        agent.id = result.terminalId;
-        logger.info("Created terminal", {
-          terminalName: agent.name,
-          terminalId: result.terminalId,
-          workspacePath,
-        });
-      }
-    }
-
-    // Log failed terminal creations
-    for (const failure of failed) {
-      const agent = config.agents.find((a) => a.id === failure.configId);
-      logger.error("Failed to create terminal", failure.error as Error, {
-        terminalName: agent?.name,
-        workspacePath,
-      });
-      showToast(`Failed to create terminal ${agent?.name}: ${failure.error}`, "error");
-    }
-
-    // Load agents into state with their new IDs
-    state.terminals.loadTerminals(config.agents);
-
-    // Launch agents for terminals with role configs
-    await launchAgentsForTerminals(workspacePath, config.agents);
-
-    // Save the updated config with real terminal IDs (including worktree paths)
-    await saveCurrentConfiguration(state);
-    logger.info("Saved config with real terminal IDs", { workspacePath });
+      agents: config.agents,
+      state,
+      launchAgentsForTerminals,
+      // workspace-lifecycle defaults: toastPerFailure=true, others=false
+      logPrefix: "workspace-lifecycle",
+    });
   }
 }
 
