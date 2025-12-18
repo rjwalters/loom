@@ -4,6 +4,7 @@ import { Logger } from "./logger";
 import { ModalBuilder } from "./modal-builder";
 import type { AppState } from "./state";
 import { TerminalStatus } from "./state";
+import { MODAL_RENDER_DELAY_MS } from "./timing-constants";
 import { showToast } from "./toast";
 
 const logger = Logger.forComponent("worker-modal");
@@ -217,7 +218,7 @@ async function launchWorker(
     });
 
     // Wait for Claude Code to start
-    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await new Promise((resolve) => setTimeout(resolve, MODAL_RENDER_DELAY_MS));
 
     // Send the prompt
     await invoke("send_terminal_input", {

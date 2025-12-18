@@ -5,6 +5,8 @@
  * Supports success, error, and info message types with automatic dismiss.
  */
 
+import { TOAST_FADEOUT_DELAY_MS } from "./timing-constants";
+
 export type ToastType = "success" | "error" | "info";
 
 /**
@@ -36,6 +38,6 @@ export function showToast(
   setTimeout(() => {
     toast.classList.remove("show");
     // Remove from DOM after fade-out animation completes
-    setTimeout(() => toast.remove(), 300);
+    setTimeout(() => toast.remove(), TOAST_FADEOUT_DELAY_MS);
   }, duration);
 }

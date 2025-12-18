@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Command } from "@tauri-apps/plugin-shell";
 import { Logger } from "./logger";
+import { TERMINAL_COMMAND_DELAY_MS } from "./timing-constants";
 
 const logger = Logger.forComponent("worktree-manager");
 
@@ -434,5 +435,5 @@ async function sendCommand(terminalId: string, command: string): Promise<void> {
 
   // Delay to allow command to fully execute before sending next command
   // This prevents command concatenation in the terminal
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  await new Promise((resolve) => setTimeout(resolve, TERMINAL_COMMAND_DELAY_MS));
 }

@@ -1,6 +1,7 @@
 import { sendPromptToAgent } from "./agent-launcher";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
+import { TERMINAL_POLL_INTERVAL_MS } from "./timing-constants";
 
 const logger = Logger.forComponent("autonomous-manager");
 
@@ -130,7 +131,7 @@ class AutonomousManager {
       // Wait for active execution to finish
       while (this.activePrompts.has(terminalId)) {
         logger.info("Waiting for active execution to complete", { terminalId });
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, TERMINAL_POLL_INTERVAL_MS));
       }
 
       logger.info("Autonomous mode stopped", { terminalId });
