@@ -150,6 +150,18 @@ fn process_command_file(window: &WebviewWindow, command_file: &PathBuf) {
             );
             window.emit("restart-terminal", terminal_id)
         }
+        "stop_engine" => {
+            safe_eprintln!("[MCP Watcher] Emitting stop-engine event");
+            window.emit("stop-engine", ())
+        }
+        cmd if cmd.starts_with("run_now:") => {
+            // Parse terminal ID from command string
+            let terminal_id = cmd.strip_prefix("run_now:").unwrap_or("");
+            safe_eprintln!(
+                "[MCP Watcher] Emitting run-now-terminal event for terminal: {terminal_id}"
+            );
+            window.emit("run-now-terminal", terminal_id)
+        }
         _ => {
             safe_eprintln!("[MCP Watcher] Unknown command: {}", mcp_cmd.command);
             Ok(())
