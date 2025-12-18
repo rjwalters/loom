@@ -1,0 +1,45 @@
+# Loom workflow labels
+- name: "loom:issue"
+  color: "0E8A16"
+  description: "Issue approved for work, ready for Builder"
+
+- name: "loom:building"
+  color: "1D76DB"
+  description: "Builder is actively implementing this"
+
+- name: "loom:review-requested"
+  color: "FBCA04"
+  description: "PR ready for Judge review"
+
+- name: "loom:pr"
+  color: "0E8A16"
+  description: "PR approved, ready to merge"
+
+- name: "loom:changes-requested"
+  color: "E99695"
+  description: "PR requires changes"
+
+- name: "loom:curated"
+  color: "D4C5F9"
+  description: "Issue enhanced by Curator, awaiting approval"
+
+- name: "loom:blocked"
+  color: "B60205"
+  description: "Implementation blocked"
+
+# Standard labels
+- name: "bug"
+  color: "D73A4A"
+  description: "Something isn't working"
+
+- name: "enhancement"
+  color: "A2EEEF"
+  description: "New feature or request"
+
+- name: "documentation"
+  color: "0075CA"
+  description: "Improvements or additions to documentation"
+
+- name: "good first issue"
+  color: "7057FF"
+  description: "Good for newcomers"
