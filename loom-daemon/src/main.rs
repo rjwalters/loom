@@ -275,11 +275,13 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  📁 .github/        - GitHub workflow templates");
                     println!("  📄 .gitignore      - Updated with Loom patterns");
                     println!("\nNext steps:");
-                    println!("  1. Review .loom/config.json for terminal configuration");
-                    println!("  2. Customize agent roles in .loom/roles/ (optional)");
-                    println!("  3. Start the Loom app or use manual orchestration:");
-                    println!("     - Launch Loom.app and select this workspace");
-                    println!("     - Or run agents manually: claude --role builder");
+                    println!("  1. Commit the changes: git add -A && git commit -m 'Add Loom configuration'");
+                    println!("  2. Choose your workflow:");
+                    println!("     Manual Mode (recommended to start):");
+                    println!("       cd {} && claude", workspace_str);
+                    println!("       Then use /builder, /judge, or other role commands");
+                    println!("     Tauri App Mode (requires Loom.app - see README):");
+                    println!("       Download Loom.app from releases, open workspace");
                     Ok(())
                 }
                 Err(e) => {

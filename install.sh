@@ -260,8 +260,6 @@ case "$METHOD" in
 
     echo ""
     success "Quick installation complete!"
-    echo ""
-    info "Don't forget to commit: git add -A && git commit -m 'Add Loom configuration'"
     ;;
 
   2)
