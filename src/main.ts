@@ -3,59 +3,17 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { ask } from "@tauri-apps/plugin-dialog";
 
-// Wait for Tauri to be ready before initializing the app
-// Tries to actually invoke a Tauri command to verify IPC works
-async function waitForTauri(): Promise<void> {
-  const maxAttempts = 30;
-  const delayMs = 200;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      // Try to invoke a simple Tauri command
-      // This will throw if Tauri IPC isn't ready
-      await invoke("get_stored_workspace");
-      console.log(`[Loom] Tauri IPC ready after ${attempt} attempt(s)`);
-
-      // Also test the console logging command specifically
-      try {
-        await invoke("append_to_console_log", { message: "[TEST] Tauri IPC verified\n" });
-        console.log("[Loom] append_to_console_log command verified working");
-      } catch (testError) {
-        console.error("[Loom] append_to_console_log command failed:", testError);
-      }
-
-      return;
-    } catch (error: any) {
-      // Log every attempt to help debug
-      console.log(`[Loom] Tauri wait attempt ${attempt}/${maxAttempts}:`, error);
-
-      // Check if it's a "command not found" error (IPC works but command doesn't exist)
-      // vs an IPC error (Tauri not ready)
-      const errorStr = String(error);
-      if (errorStr.includes("command") || errorStr.includes("not found")) {
-        // IPC is working, just the command might not exist (shouldn't happen but let's be safe)
-        console.log(`[Loom] Tauri IPC ready after ${attempt} attempt(s) (command exists)`);
-        return;
-      }
-
-      // If this is the last attempt, throw error
-      if (attempt === maxAttempts) {
-        const errorMsg = `Tauri IPC not available after ${maxAttempts} attempts (${(maxAttempts * delayMs) / 1000}s)`;
-        console.error(`[Loom] ${errorMsg}`, error);
-        throw new Error(errorMsg);
-      }
-
-      // Wait before next attempt
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-}
-
 import { initializeApp } from "./lib/app-initializer";
 import { appLevelState } from "./lib/app-state";
 import { saveCurrentConfiguration, setConfigWorkspace } from "./lib/config";
 import { initConsoleLogger } from "./lib/console-logger";
 import { setupDragAndDrop } from "./lib/drag-drop-manager";
+import {
+  confirmAndFactoryReset,
+  confirmAndStartEngine,
+  handleFactoryReset,
+  handleWorkspaceStart,
+} from "./lib/engine-handlers";
 import { getHealthMonitor } from "./lib/health-monitor";
 import {
   initializeKeyboardNavigation,
@@ -66,12 +24,18 @@ import { getOutputPoller } from "./lib/output-poller";
 import { initializeScreenReaderAnnouncer } from "./lib/screen-reader-announcer";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+import { waitForTauri } from "./lib/tauri-bootstrap";
 import { initializeErrorTracking, trackEvent } from "./lib/telemetry";
 import {
   closeTerminalWithConfirmation,
   createPlainTerminal,
   handleRestartTerminal,
 } from "./lib/terminal-actions";
+import {
+  clearHealthCheckedTerminals,
+  healthCheckedTerminals,
+  initializeTerminalDisplay,
+} from "./lib/terminal-display";
 import {
   launchAgentsForTerminals as launchAgentsForTerminalsCore,
   reconnectTerminals as reconnectTerminalsCore,
@@ -200,9 +164,7 @@ let eventListenersRegistered = false;
 // This provides event-driven file watching with 0 CPU usage when idle (vs 120 fs reads/min with polling)
 // logger?.info("MCP command watcher started in backend (using notify crate)"); // Moved to async IIFE
 
-// Track which terminals have had their health checked (Phase 3: Debouncing)
-// This prevents redundant health checks during the 1-second render loop
-const healthCheckedTerminals = new Set<string>();
+// Phase 3: Debouncing - healthCheckedTerminals moved to ./lib/terminal-display.ts
 
 // Render function
 function render() {
@@ -275,142 +237,11 @@ function render() {
   // Initialize xterm.js terminal for primary terminal
   const primary = state.terminals.getPrimary();
   if (primary && hasWorkspace) {
-    initializeTerminalDisplay(primary.id);
+    initializeTerminalDisplay(primary.id, state);
   }
 }
 
-// Initialize xterm.js terminal display
-async function initializeTerminalDisplay(terminalId: string) {
-  const containerId = `xterm-container-${terminalId}`;
-
-  // Skip placeholder IDs - they're already broken and will show error UI
-  if (terminalId === "__unassigned__") {
-    logger?.warn("Skipping placeholder terminal ID", { terminalId });
-    return;
-  }
-
-  // Phase 3: Skip health check if already checked (debouncing)
-  if (healthCheckedTerminals.has(terminalId)) {
-    logger?.info("Terminal already health-checked, skipping redundant check", {
-      terminalId,
-      setSize: healthCheckedTerminals.size,
-    });
-    // Continue with xterm initialization without re-checking
-  } else {
-    // Check session health before initializing
-    try {
-      logger?.info("Performing new health check for terminal", {
-        terminalId,
-        setSizeBefore: healthCheckedTerminals.size,
-      });
-      const hasSession = await invoke<boolean>("check_session_health", { id: terminalId });
-      logger?.info("Session health check result", {
-        terminalId,
-        hasSession,
-      });
-
-      if (!hasSession) {
-        logger?.warn("Terminal has no tmux session", { terminalId });
-
-        // Mark terminal as having missing session (only if not already marked)
-        const terminal = state.terminals.getTerminal(terminalId);
-        logger?.info("Terminal state before update", {
-          terminalId,
-          missingSession: terminal?.missingSession,
-        });
-        if (terminal && !terminal.missingSession) {
-          logger?.info("Setting missingSession=true for terminal", { terminalId });
-          state.terminals.updateTerminal(terminal.id, {
-            status: TerminalStatus.Error,
-            missingSession: true,
-          });
-        }
-
-        // Add to checked set even for failures to prevent repeated checks
-        healthCheckedTerminals.add(terminalId);
-        logger?.info("Added terminal to health-checked set (failed check)", {
-          terminalId,
-          setSize: healthCheckedTerminals.size,
-        });
-        return; // Don't create xterm instance - error UI will show instead
-      }
-
-      logger?.info("Session health check passed, proceeding with xterm initialization", {
-        terminalId,
-      });
-
-      // Add to checked set after successful health check (Phase 3: Debouncing)
-      healthCheckedTerminals.add(terminalId);
-      logger?.info("Added terminal to health-checked set (passed check)", {
-        terminalId,
-        setSize: healthCheckedTerminals.size,
-      });
-    } catch (error) {
-      logger?.error("Failed to check session health", error, { terminalId });
-      // Add to checked set even on error to prevent retry spam
-      healthCheckedTerminals.add(terminalId);
-      logger?.info("Added terminal to health-checked set (error during check)", {
-        terminalId,
-        setSize: healthCheckedTerminals.size,
-      });
-      // Continue anyway - better to try than not
-    }
-  }
-
-  // Check if terminal already exists
-  const existingManaged = terminalManager.getTerminal(terminalId);
-  if (existingManaged) {
-    // Terminal exists - just show/hide as needed
-    logger?.info("Terminal already exists, using show/hide", { terminalId });
-
-    // Hide previous terminal (if different)
-    const currentAttachedTerminalId = appLevelState.currentAttachedTerminalId;
-    if (currentAttachedTerminalId && currentAttachedTerminalId !== terminalId) {
-      logger?.info("Hiding previous terminal", {
-        terminalId: currentAttachedTerminalId,
-      });
-      terminalManager.hideTerminal(currentAttachedTerminalId);
-      outputPoller.pausePolling(currentAttachedTerminalId);
-    }
-
-    // Show current terminal
-    logger?.info("Showing terminal", { terminalId });
-    terminalManager.showTerminal(terminalId);
-
-    // Resume polling for current terminal
-    logger?.info("Resuming polling for terminal", { terminalId });
-    outputPoller.resumePolling(terminalId);
-
-    appLevelState.currentAttachedTerminalId = terminalId;
-    return;
-  }
-
-  // Terminal doesn't exist yet - create it
-  logger?.info("Creating new terminal", { terminalId });
-
-  // Wait for DOM to be ready
-  setTimeout(() => {
-    // Hide all other terminals first
-    const currentAttachedTerminalId = appLevelState.currentAttachedTerminalId;
-    if (currentAttachedTerminalId) {
-      terminalManager.hideTerminal(currentAttachedTerminalId);
-      outputPoller.pausePolling(currentAttachedTerminalId);
-    }
-
-    // Create new terminal (will be shown by default in createTerminal)
-    const managed = terminalManager.createTerminal(terminalId, containerId);
-    if (managed) {
-      // Show this terminal
-      terminalManager.showTerminal(terminalId);
-
-      // Start polling for output
-      outputPoller.startPolling(terminalId);
-      appLevelState.currentAttachedTerminalId = terminalId;
-
-      logger?.info("Created and showing terminal", { terminalId });
-    }
-  }, 0);
-}
+// initializeTerminalDisplay moved to ./lib/terminal-display.ts
 
 // Check dependencies on startup
 // App initialization moved to src/lib/app-initializer.ts
@@ -490,167 +321,42 @@ if (!eventListenersRegistered) {
     appLevelState.currentAttachedTerminalId = null;
 
     // Phase 3: Clear health check tracking when workspace closes
-    const previousSize = healthCheckedTerminals.size;
-    healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set", {
-      previousSize,
-      currentSize: healthCheckedTerminals.size,
-    });
+    clearHealthCheckedTerminals();
 
     // Re-render to show workspace picker
     logger?.info("Rendering workspace picker");
     render();
   });
 
-  /**
-   * Helper function to handle workspace start logic
-   * Extracted from duplicate code in start-workspace and force-start-workspace event listeners
-   */
-  async function handleWorkspaceStart(logPrefix: string): Promise<void> {
-    if (!state.workspace.hasWorkspace()) return;
-    const workspace = state.workspace.getWorkspaceOrThrow();
-
-    // Clear health check tracking when starting workspace (terminals will be recreated)
-    const previousSize = healthCheckedTerminals.size;
-    healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set", {
-      previousSize,
-      currentSize: healthCheckedTerminals.size,
-      source: logPrefix,
-    });
-
-    // Use the workspace start module (reads existing config)
-    const { startWorkspaceEngine } = await import("./lib/workspace-start");
-    await startWorkspaceEngine(
-      workspace,
-      {
-        state,
-        outputPoller,
-        terminalManager,
-        setCurrentAttachedTerminalId: (id) => {
-          appLevelState.currentAttachedTerminalId = id;
-        },
-        launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
-          launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
-        render,
-        markTerminalsHealthChecked: (terminalIds) => {
-          terminalIds.forEach((id) => healthCheckedTerminals.add(id));
-          logger?.info("Marked terminals as health-checked", {
-            terminalCount: terminalIds.length,
-            setSize: healthCheckedTerminals.size,
-          });
-        },
-      },
-      logPrefix
-    );
-  }
+  // handleWorkspaceStart moved to ./lib/engine-handlers.ts
 
   // Start engine - create sessions for existing config (with confirmation)
   listen("start-workspace", async () => {
-    if (!state.workspace.hasWorkspace()) return;
-
-    const confirmed = await ask(
-      "This will:\n" +
-        "• Close all current terminal sessions\n" +
-        "• Create new sessions for configured terminals\n" +
-        "• Launch agents as configured\n\n" +
-        "Your configuration will NOT be changed.\n\n" +
-        "Continue?",
-      {
-        title: "Start Loom Engine",
-        kind: "info",
-      }
-    );
-
-    if (!confirmed) return;
-
-    await handleWorkspaceStart("start-workspace");
+    await confirmAndStartEngine({ state, healthCheckedTerminals, render });
   });
 
   // Force Start engine - NO confirmation dialog (for MCP automation)
   listen("force-start-workspace", async () => {
     if (!state.workspace.hasWorkspace()) return;
-
     logger?.info("Starting engine (no confirmation)");
-
-    await handleWorkspaceStart("force-start-workspace");
+    await handleWorkspaceStart({ state, healthCheckedTerminals, render }, "force-start-workspace");
   });
 
-  // Helper function to handle factory reset logic (shared between confirmed and force variants)
-  async function handleFactoryReset(logPrefix: string): Promise<void> {
-    if (!state.workspace.hasWorkspace()) return;
-    const workspace = state.workspace.getWorkspaceOrThrow();
-
-    logger?.info("Starting factory reset", { source: logPrefix });
-
-    // Phase 3: Clear health check tracking when resetting workspace (terminals will be recreated)
-    const previousSize = healthCheckedTerminals.size;
-    healthCheckedTerminals.clear();
-    logger?.info("Cleared health-checked terminals set", {
-      previousSize,
-      currentSize: healthCheckedTerminals.size,
-      source: logPrefix,
-    });
-
-    // Set loading state before reset
-    state.setResettingWorkspace(true);
-
-    try {
-      // Use the workspace reset module (overwrites config with defaults)
-      const { resetWorkspaceToDefaults } = await import("./lib/workspace-reset");
-      await resetWorkspaceToDefaults(
-        workspace,
-        {
-          state,
-          outputPoller,
-          terminalManager,
-          setCurrentAttachedTerminalId: (id) => {
-            appLevelState.currentAttachedTerminalId = id;
-          },
-          launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
-            launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
-          render,
-        },
-        logPrefix
-      );
-    } finally {
-      // Clear loading state when done (even if error)
-      state.setResettingWorkspace(false);
-    }
-  }
+  // handleFactoryReset moved to ./lib/engine-handlers.ts
 
   // Factory Reset - overwrite config with defaults (with confirmation)
   listen("factory-reset-workspace", async () => {
-    if (!state.workspace.hasWorkspace()) return;
-
-    const confirmed = await ask(
-      "⚠️ WARNING: Factory Reset ⚠️\n\n" +
-        "This will:\n" +
-        "• DELETE all terminal configurations\n" +
-        "• OVERWRITE .loom/ with default config\n" +
-        "• Reset all roles to defaults\n" +
-        "• Close all current terminals\n" +
-        "• Recreate 6 default terminals\n\n" +
-        "This action CANNOT be undone!\n\n" +
-        "Continue with Factory Reset?",
-      {
-        title: "⚠️ Factory Reset Warning",
-        kind: "warning",
-      }
-    );
-
-    if (!confirmed) return;
-
-    await handleFactoryReset("factory-reset-workspace");
+    await confirmAndFactoryReset({ state, healthCheckedTerminals, render });
   });
 
   // Force Factory Reset - NO confirmation dialog (for MCP automation)
   listen("force-factory-reset-workspace", async () => {
     if (!state.workspace.hasWorkspace()) return;
-
     logger?.info("Resetting workspace (no confirmation)");
-
-    await handleFactoryReset("force-factory-reset-workspace");
+    await handleFactoryReset(
+      { state, healthCheckedTerminals, render },
+      "force-factory-reset-workspace"
+    );
   });
 
   // Restart Terminal - triggered by MCP command
@@ -808,7 +514,7 @@ async function showDaemonStatusDialog() {
         logger?.info("User requested terminal reconnection");
         await reconnectTerminalsCore({
           state,
-          initializeTerminalDisplay,
+          initializeTerminalDisplay: (terminalId) => initializeTerminalDisplay(terminalId, state),
           saveCurrentConfig,
         });
         showToast("Terminal reconnection complete! Check the console for details.", "success");
@@ -844,7 +550,11 @@ async function handleWorkspacePathInput(path: string) {
     launchAgentsForTerminals: async (workspacePath: string, terminals: Terminal[]) =>
       launchAgentsForTerminalsCore(workspacePath, terminals, { state }),
     reconnectTerminals: async () =>
-      reconnectTerminalsCore({ state, initializeTerminalDisplay, saveCurrentConfig }),
+      reconnectTerminalsCore({
+        state,
+        initializeTerminalDisplay: (terminalId) => initializeTerminalDisplay(terminalId, state),
+        saveCurrentConfig,
+      }),
     verifyTerminalSessions: async () => verifyTerminalSessionsCore({ state }),
   });
 }
