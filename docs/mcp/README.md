@@ -54,19 +54,24 @@ MCP (Model Context Protocol) is a standard protocol for connecting AI agents to 
 
 ### 3. [mcp-loom-terminals](./loom-terminals.md)
 
-**Purpose**: Interact with terminal sessions via daemon IPC
+**Purpose**: Interact with terminal sessions via daemon IPC and control autonomous mode
 
 **Key Tools**:
 - `list_terminals` - List active terminals with metadata
 - `get_terminal_output` - Read terminal output
 - `get_selected_terminal` - Get currently selected terminal
 - `send_terminal_input` - Send commands to terminals
+- `start_autonomous_mode` - Start interval prompts for all terminals
+- `stop_autonomous_mode` - Stop all interval prompts
+- `launch_interval` - Manually trigger interval prompt for a terminal
 
 **When to Use**:
 - Sending commands to agent terminals
 - Monitoring agent activity in real-time
 - Interactive terminal sessions
 - Automating terminal workflows
+- Controlling autonomous agent execution
+- Testing autonomous mode behavior
 
 ---
 
@@ -459,7 +464,7 @@ For detailed tool documentation, see individual server references:
 
 - **[mcp-loom-ui API Reference](./loom-ui.md)** - 7 tools for UI interaction
 - **[mcp-loom-logs API Reference](./loom-logs.md)** - 4 tools for log access
-- **[mcp-loom-terminals API Reference](./loom-terminals.md)** - 4 tools for terminal control
+- **[mcp-loom-terminals API Reference](./loom-terminals.md)** - 7 tools for terminal and autonomous mode control
 
 ---
 

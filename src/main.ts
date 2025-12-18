@@ -703,6 +703,42 @@ if (!eventListenersRegistered) {
     await handleRunNowClick(terminalId, { state });
   });
 
+  // Start Autonomous Mode - triggered by MCP command
+  listen("start-autonomous-mode", async () => {
+    logger?.info("Starting autonomous mode via MCP command");
+    const { getIntervalPromptManager } = await import("./lib/interval-prompt-manager");
+    const intervalManager = getIntervalPromptManager();
+    intervalManager.startAll(state);
+    logger?.info("Autonomous mode started for all configured terminals");
+    showToast("Autonomous mode started for all terminals.", "success");
+  });
+
+  // Stop Autonomous Mode - triggered by MCP command
+  listen("stop-autonomous-mode", async () => {
+    logger?.info("Stopping autonomous mode via MCP command");
+    const { getIntervalPromptManager } = await import("./lib/interval-prompt-manager");
+    const intervalManager = getIntervalPromptManager();
+    intervalManager.stopAll();
+    logger?.info("Autonomous mode stopped for all terminals");
+    showToast("Autonomous mode stopped for all terminals.", "info");
+  });
+
+  // Launch Interval - triggered by MCP command (same as run-now but with different event name)
+  listen("launch-interval-terminal", async (event) => {
+    const terminalId = event.payload as string;
+    if (!terminalId) {
+      logger?.error(
+        "Launch interval event received without terminal ID",
+        new Error("Missing terminal ID")
+      );
+      return;
+    }
+
+    logger?.info("Launching interval prompt via MCP command", { terminalId });
+    const { handleRunNowClick } = await import("./lib/terminal-actions");
+    await handleRunNowClick(terminalId, { state });
+  });
+
   listen("toggle-theme", () => {
     toggleTheme();
   });
