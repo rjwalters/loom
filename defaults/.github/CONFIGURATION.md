@@ -42,10 +42,10 @@ This directory contains GitHub configuration templates that Loom installs into n
 1. Collaborator creates an issue (no auto-labeling)
 2. Issue starts with `loom:triage` label (from template)
 3. Enters the label-based workflow:
-   - Curator enhances → adds `loom:ready`
-   - Worker implements → adds `loom:in-progress`
+   - Curator enhances → adds `loom:curated` (human approves → `loom:issue`)
+   - Builder implements → adds `loom:building`
    - Creates PR → adds `loom:review-requested`
-   - Reviewer approves → adds `loom:pr`
+   - Judge approves → adds `loom:pr`
    - Merge completes workflow
 
 ## Installation
@@ -83,12 +83,14 @@ The issue template integrates with Loom's label-based workflow coordination:
 | Label | Meaning | Who Sets It |
 |-------|---------|-------------|
 | `external` | External contribution | Workflow (automatic) |
-| `loom:triage` | Needs review/enhancement | Template (default) |
-| `loom:ready` | Ready for implementation | Curator agent |
-| `loom:in-progress` | Being worked on | Worker agent |
-| `loom:review-requested` | PR needs review | Worker agent |
-| `loom:reviewing` | Under review | Reviewer agent |
-| `loom:pr` | Approved for merge | Reviewer agent |
+| `loom:curated` | Enhanced by Curator, awaiting human approval | Curator agent |
+| `loom:issue` | Approved for work, ready for Builder | Human (from curated) |
+| `loom:building` | Builder is implementing | Builder agent |
+| `loom:curating` | Curator is enhancing | Curator agent |
+| `loom:treating` | Doctor is fixing bug/PR feedback | Doctor agent |
+| `loom:review-requested` | PR needs review | Builder agent |
+| `loom:reviewing` | Judge is actively reviewing | Judge agent |
+| `loom:pr` | Approved for merge | Judge agent |
 
 See [WORKFLOWS.md](../../WORKFLOWS.md) for complete workflow documentation.
 
