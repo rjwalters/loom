@@ -160,6 +160,20 @@ async function triggerRestartTerminal(terminalId: string): Promise<string> {
 }
 
 /**
+ * Trigger engine stop - stops all terminals and cleans up sessions
+ */
+async function triggerStopEngine(): Promise<string> {
+  return await writeMCPCommand("stop_engine");
+}
+
+/**
+ * Trigger run now - executes the interval prompt immediately for a terminal
+ */
+async function triggerRunNow(terminalId: string): Promise<string> {
+  return await writeMCPCommand(`run_now:${terminalId}`);
+}
+
+/**
  * Read the Loom state file
  */
 async function readStateFile(): Promise<string> {
@@ -275,6 +289,95 @@ async function getHeartbeat(): Promise<string> {
       );
     }
     throw error;
+  }
+}
+
+/**
+ * Get comprehensive UI state including workspace, terminals, and engine status
+ */
+async function getUIState(): Promise<string> {
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+
+    // Read config file
+    const configPath = join(workspacePath, ".loom", "config.json");
+    let config: { version: string; terminals: unknown[]; offlineMode?: boolean } | null = null;
+    try {
+      await access(configPath);
+      const configContent = await readFile(configPath, "utf-8");
+      config = JSON.parse(configContent);
+    } catch {
+      // Config doesn't exist or can't be read
+    }
+
+    // Read state file
+    const statePath = join(workspacePath, ".loom", "state.json");
+    let state: {
+      daemonPid?: number;
+      nextAgentNumber: number;
+      terminals: Array<{
+        id: string;
+        status: string;
+        isPrimary: boolean;
+        worktreePath?: string;
+        agentPid?: number;
+        agentStatus?: string;
+        lastIntervalRun?: number;
+      }>;
+    } | null = null;
+    try {
+      await access(statePath);
+      const stateContent = await readFile(statePath, "utf-8");
+      state = JSON.parse(stateContent);
+    } catch {
+      // State doesn't exist or can't be read
+    }
+
+    // Build comprehensive UI state response
+    const uiState = {
+      workspace: {
+        path: workspacePath,
+        hasConfig: config !== null,
+        hasState: state !== null,
+      },
+      engine: {
+        isRunning: state !== null && (state.terminals?.length ?? 0) > 0,
+        daemonPid: state?.daemonPid ?? null,
+        terminalCount: state?.terminals?.length ?? 0,
+      },
+      config: config
+        ? {
+            version: config.version,
+            terminalCount: config.terminals?.length ?? 0,
+            offlineMode: config.offlineMode ?? false,
+            terminals: config.terminals,
+          }
+        : null,
+      state: state
+        ? {
+            nextAgentNumber: state.nextAgentNumber,
+            terminals: state.terminals?.map((t) => ({
+              id: t.id,
+              status: t.status,
+              isPrimary: t.isPrimary,
+              worktreePath: t.worktreePath,
+              agentPid: t.agentPid,
+              agentStatus: t.agentStatus,
+              lastIntervalRun: t.lastIntervalRun ? new Date(t.lastIntervalRun).toISOString() : null,
+            })),
+          }
+        : null,
+    };
+
+    return JSON.stringify(uiState, null, 2);
+  } catch (error) {
+    return JSON.stringify(
+      {
+        error: `Failed to get UI state: ${error}`,
+      },
+      null,
+      2
+    );
   }
 }
 
@@ -455,6 +558,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "stop_engine",
+        description:
+          "Stop the Loom engine by destroying all terminal sessions and cleaning up resources. This will close all terminals and stop all running agents. Use trigger_start or trigger_force_start to restart the engine afterwards.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "trigger_run_now",
+        description:
+          "Trigger immediate execution of the interval prompt for a specific terminal. Only works for terminals configured with autonomous mode (non-zero target_interval). Useful for testing autonomous behavior without waiting for the next interval.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminalId: {
+              type: "string",
+              description:
+                "The ID of the terminal to run the interval prompt for (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminalId"],
+        },
+      },
+      {
+        name: "get_ui_state",
+        description:
+          "Get comprehensive UI state including workspace info, engine status, terminal configurations, and runtime state. Returns a JSON object with workspace path, engine running status, terminal count, and detailed terminal states. Useful for understanding the current state of the Loom application.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
         name: "get_random_file",
         description:
           "Get a random file path from the workspace. Respects .gitignore and excludes common build artifacts. Useful for the Critic agent to pick files to review.",
@@ -594,6 +731,46 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: result,
+            },
+          ],
+        };
+      }
+
+      case "stop_engine": {
+        const result = await triggerStopEngine();
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "trigger_run_now": {
+        const terminalId = args?.terminalId as string;
+        if (!terminalId) {
+          throw new Error("terminalId parameter is required");
+        }
+        const result = await triggerRunNow(terminalId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
+            },
+          ],
+        };
+      }
+
+      case "get_ui_state": {
+        const uiState = await getUIState();
+        return {
+          content: [
+            {
+              type: "text",
+              text: uiState,
             },
           ],
         };

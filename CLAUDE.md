@@ -525,6 +525,89 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+## MCP Hooks for Programmatic Control
+
+Loom provides MCP (Model Context Protocol) servers that allow Claude Code to programmatically control the Loom application. This enables automation, testing, and advanced workflows.
+
+### Available MCP Servers
+
+**loom-terminals** - Terminal management via daemon socket:
+- `list_terminals` - List all active terminal sessions
+- `get_terminal_output` - Get recent output from a terminal
+- `get_selected_terminal` - Get info about the currently selected terminal
+- `send_terminal_input` - Send input to a terminal
+- `create_terminal` - Create a new terminal session
+- `delete_terminal` - Delete a terminal session
+- `restart_terminal` - Restart a terminal preserving its config
+- `configure_terminal` - Update terminal settings (name, role, interval)
+- `set_primary_terminal` - Set which terminal is selected in the UI
+- `clear_terminal_history` - Clear terminal scrollback and log file
+- `check_tmux_server_health` - Check tmux server status
+- `get_tmux_server_info` - Get tmux server details
+- `toggle_tmux_verbose_logging` - Enable tmux debug logging
+
+**loom-ui** - UI control via file-based IPC:
+- `read_console_log` - Read browser console logs
+- `read_state_file` - Read workspace state
+- `read_config_file` - Read workspace config
+- `get_heartbeat` - Check if Loom app is running
+- `get_ui_state` - Get comprehensive UI state (terminals, workspace, engine)
+- `trigger_start` - Start engine with confirmation dialog
+- `trigger_force_start` - Start engine without confirmation
+- `trigger_factory_reset` - Reset workspace with confirmation
+- `trigger_force_factory_reset` - Reset workspace without confirmation
+- `trigger_restart_terminal` - Restart a specific terminal
+- `stop_engine` - Stop all terminals and clean up
+- `trigger_run_now` - Execute interval prompt immediately
+- `get_random_file` - Get random file from workspace
+
+### Example Usage
+
+```bash
+# Create a terminal with specific role
+mcp__loom-terminals__create_terminal --name "Builder" --role "builder"
+
+# Configure autonomous operation
+mcp__loom-terminals__configure_terminal \
+  --terminal_id terminal-1 \
+  --target_interval 300000 \
+  --interval_prompt "Check for new issues"
+
+# Trigger immediate autonomous run
+mcp__loom-ui__trigger_run_now --terminalId terminal-1
+
+# Stop all terminals
+mcp__loom-ui__stop_engine
+
+# Get comprehensive state
+mcp__loom-ui__get_ui_state
+```
+
+### MCP Server Configuration
+
+Add these MCP servers to your Claude Code configuration:
+
+```json
+{
+  "mcpServers": {
+    "loom-terminals": {
+      "command": "node",
+      "args": ["/path/to/loom/mcp-loom-terminals/dist/index.js"],
+      "env": {
+        "LOOM_WORKSPACE": "/path/to/your/workspace"
+      }
+    },
+    "loom-ui": {
+      "command": "node",
+      "args": ["/path/to/loom/mcp-loom-ui/dist/index.js"],
+      "env": {
+        "LOOM_WORKSPACE": "/path/to/your/workspace"
+      }
+    }
+  }
+}
+```
+
 ## Resources
 
 ### Loom Documentation

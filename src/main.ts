@@ -241,7 +241,11 @@ function render() {
     return;
   }
 
-  renderPrimaryTerminal(state.terminals.getPrimary(), hasWorkspace, state.workspace.getDisplayedWorkspace());
+  renderPrimaryTerminal(
+    state.terminals.getPrimary(),
+    hasWorkspace,
+    state.workspace.getDisplayedWorkspace()
+  );
 
   // Render mini terminals with health data
   const terminalHealthMap = new Map(
@@ -661,6 +665,42 @@ if (!eventListenersRegistered) {
 
     logger?.info("Restarting terminal via MCP command", { terminalId });
     await handleRestartTerminal(terminalId, { state, saveCurrentConfig });
+  });
+
+  // Stop Engine - triggered by MCP command
+  listen("stop-engine", async () => {
+    logger?.info("Stopping engine via MCP command");
+
+    const { cleanupWorkspace } = await import("./lib/workspace-cleanup");
+    await cleanupWorkspace({
+      component: "mcp-stop-engine",
+      state,
+      outputPoller,
+      terminalManager,
+      setCurrentAttachedTerminalId: (id) => {
+        appLevelState.currentAttachedTerminalId = id;
+      },
+    });
+
+    // Save the empty state
+    await saveCurrentConfig();
+
+    logger?.info("Engine stopped via MCP command");
+    showToast("Engine stopped. All terminals have been closed.", "info");
+    render();
+  });
+
+  // Run Now - triggered by MCP command
+  listen("run-now-terminal", async (event) => {
+    const terminalId = event.payload as string;
+    if (!terminalId) {
+      logger?.error("Run now event received without terminal ID", new Error("Missing terminal ID"));
+      return;
+    }
+
+    logger?.info("Running interval prompt via MCP command", { terminalId });
+    const { handleRunNowClick } = await import("./lib/terminal-actions");
+    await handleRunNowClick(terminalId, { state });
   });
 
   listen("toggle-theme", () => {
