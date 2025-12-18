@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { exec } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,8 @@ const execAsync = promisify(exec);
 const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(homedir(), ".loom", "loom-daemon.sock");
 const LOOM_DIR = join(homedir(), ".loom");
 const STATE_FILE = join(LOOM_DIR, "state.json");
+const MCP_COMMAND_FILE = join(LOOM_DIR, "mcp-command.json");
+const MCP_ACK_FILE = join(LOOM_DIR, "mcp-ack.json");
 
 /**
  * Configuration for creating a terminal
@@ -741,6 +743,142 @@ async function clearTerminalHistory(terminalId: string): Promise<{
   }
 }
 
+/**
+ * Write MCP command to control file for Loom to pick up with retry and exponential backoff
+ * This is a file-based IPC mechanism with acknowledgment
+ */
+async function writeMCPCommand(command: string): Promise<string> {
+  // Ensure .loom directory exists
+  try {
+    await mkdir(LOOM_DIR, { recursive: true });
+  } catch (_error) {
+    // Directory might already exist, that's fine
+  }
+
+  // Clean up old acknowledgment file before writing new command
+  try {
+    await rm(MCP_ACK_FILE);
+  } catch (_error) {
+    // Ack file might not exist, that's fine
+  }
+
+  // Write command with timestamp
+  const commandData = {
+    command,
+    timestamp: new Date().toISOString(),
+  };
+
+  await writeFile(MCP_COMMAND_FILE, JSON.stringify(commandData, null, 2));
+
+  // Retry with exponential backoff to wait for acknowledgment
+  const maxRetries = 8; // Max 8 retries
+  const baseDelay = 100; // Start with 100ms
+  const maxDelay = 5000; // Cap at 5 seconds
+  let totalWaitTime = 0;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    // Calculate exponential backoff delay: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms, 5000ms
+    const delay = Math.min(baseDelay * 2 ** attempt, maxDelay);
+    totalWaitTime += delay;
+
+    // Wait before checking for acknowledgment
+    await new Promise((resolve) => setTimeout(resolve, delay));
+
+    // Check if acknowledgment file exists
+    try {
+      await stat(MCP_ACK_FILE);
+
+      // Read acknowledgment data
+      const ackContent = await readFile(MCP_ACK_FILE, "utf-8");
+      const ackData = JSON.parse(ackContent);
+
+      // Verify the ack is for our command
+      if (ackData.command === command && ackData.timestamp === commandData.timestamp) {
+        // Clean up acknowledgment file
+        try {
+          await rm(MCP_ACK_FILE);
+        } catch (_error) {
+          // Ignore cleanup errors
+        }
+
+        if (ackData.success) {
+          return `MCP command '${command}' processed successfully (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        } else {
+          return `MCP command '${command}' acknowledged but execution failed (waited ${totalWaitTime}ms, attempt ${attempt + 1}/${maxRetries})`;
+        }
+      }
+    } catch (_error) {
+      // Ack file doesn't exist yet or couldn't be read, continue retrying
+    }
+  }
+
+  // Max retries exceeded - give up but don't error
+  return `MCP command '${command}' written but no acknowledgment received after ${maxRetries} retries (${totalWaitTime}ms total). The command may still be processing.`;
+}
+
+/**
+ * Start autonomous mode for all configured terminals
+ */
+async function startAutonomousMode(): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  try {
+    const result = await writeMCPCommand("start_autonomous_mode");
+    return {
+      success: result.includes("successfully"),
+      message: result,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Error starting autonomous mode: ${error}`,
+    };
+  }
+}
+
+/**
+ * Stop autonomous mode for all terminals
+ */
+async function stopAutonomousMode(): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  try {
+    const result = await writeMCPCommand("stop_autonomous_mode");
+    return {
+      success: result.includes("successfully"),
+      message: result,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Error stopping autonomous mode: ${error}`,
+    };
+  }
+}
+
+/**
+ * Manually trigger the interval prompt for a specific terminal
+ */
+async function launchInterval(terminalId: string): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  try {
+    const result = await writeMCPCommand(`launch_interval:${terminalId}`);
+    return {
+      success: result.includes("successfully"),
+      message: result,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      message: `Error launching interval: ${error}`,
+    };
+  }
+}
+
 const server = new Server(
   {
     name: "loom-terminals",
@@ -991,6 +1129,39 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             terminal_id: {
               type: "string",
               description: "Terminal ID to clear history for (e.g., 'terminal-1')",
+            },
+          },
+          required: ["terminal_id"],
+        },
+      },
+      {
+        name: "start_autonomous_mode",
+        description:
+          "Start autonomous mode for all configured terminals. This starts the interval prompt timers for all terminals that have a targetInterval configured. Terminals will receive their intervalPrompt at their configured intervals when idle.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "stop_autonomous_mode",
+        description:
+          "Stop autonomous mode for all terminals. This pauses all interval prompt timers, preventing automatic prompts from being sent. Terminals remain running but won't receive autonomous prompts until autonomous mode is started again.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "launch_interval",
+        description:
+          "Manually trigger the interval prompt for a specific terminal immediately. This sends the terminal's configured intervalPrompt without waiting for the next scheduled interval. Works regardless of whether autonomous mode is enabled. Useful for testing autonomous behavior or manually triggering work.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            terminal_id: {
+              type: "string",
+              description: "Terminal ID to trigger the interval prompt for (e.g., 'terminal-1')",
             },
           },
           required: ["terminal_id"],
@@ -1505,6 +1676,95 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: `=== Clear Terminal History ===\n\n✅ Success\n\nTerminal ${terminalId} history has been cleared.\n\nCleared:\n- tmux scrollback buffer\n- Output log file (/tmp/loom-${terminalId}.out)`,
+            },
+          ],
+        };
+      }
+
+      case "start_autonomous_mode": {
+        const result = await startAutonomousMode();
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Start Autonomous Mode ===\n\n❌ Failed\n\n${result.message}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Start Autonomous Mode ===\n\n✅ Success\n\nAutonomous mode has been started for all configured terminals.\n\nTerminals with targetInterval > 0 will now receive their intervalPrompt when idle.\n\n${result.message}`,
+            },
+          ],
+        };
+      }
+
+      case "stop_autonomous_mode": {
+        const result = await stopAutonomousMode();
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Stop Autonomous Mode ===\n\n❌ Failed\n\n${result.message}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Stop Autonomous Mode ===\n\n✅ Success\n\nAutonomous mode has been stopped for all terminals.\n\nTerminals will no longer receive automatic interval prompts until autonomous mode is started again.\n\n${result.message}`,
+            },
+          ],
+        };
+      }
+
+      case "launch_interval": {
+        const terminalId = args?.terminal_id as string;
+
+        if (!terminalId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: terminal_id is required",
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        const result = await launchInterval(terminalId);
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Launch Interval ===\n\n❌ Failed\n\n${result.message}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `=== Launch Interval ===\n\n✅ Success\n\nInterval prompt triggered for terminal ${terminalId}.\n\nThe terminal's configured intervalPrompt has been sent.\n\n${result.message}`,
             },
           ],
         };

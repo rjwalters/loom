@@ -162,6 +162,22 @@ fn process_command_file(window: &WebviewWindow, command_file: &PathBuf) {
             );
             window.emit("run-now-terminal", terminal_id)
         }
+        "start_autonomous_mode" => {
+            safe_eprintln!("[MCP Watcher] Emitting start-autonomous-mode event");
+            window.emit("start-autonomous-mode", ())
+        }
+        "stop_autonomous_mode" => {
+            safe_eprintln!("[MCP Watcher] Emitting stop-autonomous-mode event");
+            window.emit("stop-autonomous-mode", ())
+        }
+        cmd if cmd.starts_with("launch_interval:") => {
+            // Parse terminal ID from command string
+            let terminal_id = cmd.strip_prefix("launch_interval:").unwrap_or("");
+            safe_eprintln!(
+                "[MCP Watcher] Emitting launch-interval-terminal event for terminal: {terminal_id}"
+            );
+            window.emit("launch-interval-terminal", terminal_id)
+        }
         _ => {
             safe_eprintln!("[MCP Watcher] Unknown command: {}", mcp_cmd.command);
             Ok(())

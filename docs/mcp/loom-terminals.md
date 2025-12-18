@@ -287,6 +287,172 @@ mcp__loom-terminals__send_terminal_input({
 
 ---
 
+### `start_autonomous_mode`
+
+Start autonomous mode for all configured terminals. This starts the interval prompt timers for all terminals that have a `targetInterval` configured.
+
+**Parameters:**
+
+None
+
+**Returns:**
+
+Status message indicating success or failure with timing information.
+
+**Success Response:**
+```
+=== Start Autonomous Mode ===
+
+✅ Success
+
+Autonomous mode has been started for all configured terminals.
+
+Terminals with targetInterval > 0 will now receive their intervalPrompt when idle.
+
+MCP command 'start_autonomous_mode' processed successfully (waited 200ms, attempt 2/8)
+```
+
+**Error Response:**
+```
+=== Start Autonomous Mode ===
+
+❌ Failed
+
+MCP command 'start_autonomous_mode' written but no acknowledgment received after 8 retries...
+```
+
+**How It Works:**
+- Sends `start_autonomous_mode` command via file-based IPC to `~/.loom/mcp-command.json`
+- Loom application watches for this file and starts interval prompt timers
+- Uses exponential backoff to wait for acknowledgment
+
+**Example:**
+```typescript
+// Start autonomous mode for all terminals
+mcp__loom-terminals__start_autonomous_mode()
+```
+
+**Use Cases:**
+- Starting automated agent workflows
+- Enabling interval prompts after workspace setup
+- Resuming autonomous operation after manual intervention
+- Integration testing of autonomous behavior
+
+---
+
+### `stop_autonomous_mode`
+
+Stop autonomous mode for all terminals. This pauses all interval prompt timers, preventing automatic prompts from being sent.
+
+**Parameters:**
+
+None
+
+**Returns:**
+
+Status message indicating success or failure with timing information.
+
+**Success Response:**
+```
+=== Stop Autonomous Mode ===
+
+✅ Success
+
+Autonomous mode has been stopped for all terminals.
+
+Terminals will no longer receive automatic interval prompts until autonomous mode is started again.
+
+MCP command 'stop_autonomous_mode' processed successfully (waited 150ms, attempt 1/8)
+```
+
+**Error Response:**
+```
+=== Stop Autonomous Mode ===
+
+❌ Failed
+
+MCP command 'stop_autonomous_mode' written but no acknowledgment received after 8 retries...
+```
+
+**How It Works:**
+- Sends `stop_autonomous_mode` command via file-based IPC
+- Loom application stops all interval prompt timers
+- Terminals remain running but won't receive autonomous prompts
+
+**Example:**
+```typescript
+// Stop autonomous mode
+mcp__loom-terminals__stop_autonomous_mode()
+```
+
+**Use Cases:**
+- Pausing automated workflows for manual intervention
+- Debugging autonomous behavior
+- Temporarily disabling prompts while making changes
+- Graceful shutdown of autonomous operations
+
+---
+
+### `launch_interval`
+
+Manually trigger the interval prompt for a specific terminal immediately. This sends the terminal's configured `intervalPrompt` without waiting for the next scheduled interval.
+
+**Parameters:**
+
+| Name | Type | Required | Default | Description |
+|------|------|----------|---------|-------------|
+| `terminal_id` | string | **Yes** | - | Terminal ID to trigger (e.g., `terminal-1`) |
+
+**Returns:**
+
+Status message indicating success or failure with timing information.
+
+**Success Response:**
+```
+=== Launch Interval ===
+
+✅ Success
+
+Interval prompt triggered for terminal terminal-2.
+
+The terminal's configured intervalPrompt has been sent.
+
+MCP command 'launch_interval:terminal-2' processed successfully (waited 180ms, attempt 2/8)
+```
+
+**Error Response:**
+```
+=== Launch Interval ===
+
+❌ Failed
+
+MCP command 'launch_interval:terminal-2' acknowledged but execution failed...
+```
+
+**How It Works:**
+- Sends `launch_interval:{terminal_id}` command via file-based IPC
+- Loom application triggers the interval prompt for the specified terminal
+- Works regardless of whether autonomous mode is currently enabled
+
+**Example:**
+```typescript
+// Trigger interval prompt for terminal-2
+mcp__loom-terminals__launch_interval({
+  terminal_id: "terminal-2"
+})
+```
+
+**Use Cases:**
+- Testing interval prompts without waiting
+- Manually triggering agent work cycles
+- Debugging autonomous prompt behavior
+- On-demand agent activation
+- Integration testing
+
+**Note:** This is similar to `trigger_run_now` in `mcp-loom-ui` but available in the terminals server for convenience.
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
