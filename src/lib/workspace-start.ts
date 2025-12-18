@@ -6,10 +6,10 @@ import type {
   TerminalInfrastructureDependencies,
 } from "./dependencies";
 import { Logger } from "./logger";
-import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
 import { TERMINAL_OUTPUT_STABILIZATION_MS } from "./timing-constants";
 import { showToast } from "./toast";
 import { cleanupWorkspace } from "./workspace-cleanup";
+import { initializeTerminals } from "./workspace-common";
 
 const logger = Logger.forComponent("workspace-start");
 
@@ -70,9 +70,7 @@ export async function startWorkspaceEngine(
   });
 
   // Load existing config (do NOT reset to defaults)
-  const { loadWorkspaceConfig, setConfigWorkspace, saveCurrentConfiguration } = await import(
-    "./config"
-  );
+  const { loadWorkspaceConfig, setConfigWorkspace } = await import("./config");
 
   try {
     setConfigWorkspace(workspacePath);
@@ -95,120 +93,18 @@ export async function startWorkspaceEngine(
         source: logPrefix,
       });
 
-      // Build array of terminal configurations for parallel creation
-      const terminalConfigs: TerminalConfig[] = config.agents.map((agent) => ({
-        id: agent.id,
-        name: agent.name,
-        role: agent.role || "default",
-        workingDir: workspacePath,
-        instanceNumber: 0, // Will be assigned by createTerminalsWithRetry
-      }));
-
-      // Create all terminals in parallel with automatic retry
-      const { succeeded, failed } = await createTerminalsWithRetry(
-        terminalConfigs,
+      // Use shared terminal initialization logic with workspace-start specific options
+      await initializeTerminals({
         workspacePath,
-        state
-      );
-
-      // Update agent IDs for succeeded terminals
-      for (const success of succeeded) {
-        const agent = config.agents.find((a) => a.id === success.configId);
-        if (agent) {
-          agent.id = success.terminalId;
-          // NOTE: Worktrees are now created on-demand when claiming issues, not automatically
-          // Agents start in the main workspace directory
-          agent.worktreePath = "";
-          logger.info("Agent will start in main workspace", {
-            workspacePath,
-            terminalName: agent.name,
-            terminalId: success.terminalId,
-            source: logPrefix,
-          });
-        }
-      }
-
-      // Report failures to user
-      if (failed.length > 0) {
-        const failedNames = failed
-          .map((f) => {
-            const agent = config.agents.find((a) => a.id === f.configId);
-            return agent?.name || f.configId;
-          })
-          .join(", ");
-
-        logger.error(
-          "Some terminals failed to create after retries",
-          new Error("Terminal creation failures"),
-          {
-            workspacePath,
-            failedCount: failed.length,
-            failedNames,
-            source: logPrefix,
-          }
-        );
-
-        showToast(
-          `Failed to create ${failed.length} terminal(s) after retries: ${failedNames}. Successfully created ${succeeded.length} of ${config.agents.length} terminals.`,
-          "error",
-          7000
-        );
-      }
-
-      logger.info("Parallel terminal creation complete", {
-        workspacePath,
-        totalTerminals: config.agents.length,
-        succeeded: succeeded.length,
-        failed: failed.length,
-        agents: config.agents.map((a) => `${a.name}=${a.id}`),
-        source: logPrefix,
+        agents: config.agents,
+        state,
+        launchAgentsForTerminals,
+        clearWorktreePaths: true, // Agents start in main workspace, worktrees created on-demand
+        setWorkspaceActive: true, // Set workspace before loading agents
+        saveBeforeLaunch: true, // Save config before launching agents
+        toastPerFailure: false, // Show combined failure toast
+        logPrefix,
       });
-
-      // Set workspace as active BEFORE loading agents
-      state.workspace.setWorkspace(workspacePath);
-
-      // Load agents into state with their new session IDs
-      logger.info("Loading agents into state", {
-        workspacePath,
-        agents: config.agents.map((a) => `${a.name}=${a.id}`),
-        source: logPrefix,
-      });
-      state.terminals.loadTerminals(config.agents);
-      logger.info("State after loadAgents", {
-        workspacePath,
-        terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
-        source: logPrefix,
-      });
-
-      // Save config with real terminal IDs BEFORE launching agents
-      logger.info("Saving config with real terminal IDs", {
-        workspacePath,
-        source: logPrefix,
-      });
-      await saveCurrentConfiguration(state);
-      logger.info("Config saved", {
-        workspacePath,
-        source: logPrefix,
-      });
-
-      // Launch agents for terminals with role configs
-      logger.info("Launching agents", {
-        workspacePath,
-        source: logPrefix,
-      });
-      await launchAgentsForTerminals(workspacePath, config.agents);
-      logger.info("State after launchAgentsForTerminals", {
-        workspacePath,
-        terminals: state.terminals.getTerminals().map((a) => `${a.name}=${a.id}`),
-        source: logPrefix,
-      });
-
-      // Save final state after agent launch
-      logger.info("Saving final config", {
-        workspacePath,
-        source: logPrefix,
-      });
-      await saveCurrentConfiguration(state);
 
       // Brief delay to allow tmux sessions to stabilize after agent launch
       // Without this delay, health checks may run before tmux sessions are fully query-able
