@@ -18,6 +18,7 @@ import { Logger } from "./logger";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+import { TERMINAL_OUTPUT_STABILIZATION_MS } from "./timing-constants";
 import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-actions");
@@ -127,7 +128,7 @@ export async function handleRestartTerminal(
     logger.info("Destroyed terminal", { terminalId });
 
     // Small delay to ensure tmux session is fully cleaned up
-    await new Promise((resolve) => setTimeout(resolve, 500));
+    await new Promise((resolve) => setTimeout(resolve, TERMINAL_OUTPUT_STABILIZATION_MS));
 
     // Create a new terminal with the same configuration
     const workspacePath = state.workspace.getWorkspace();

@@ -7,6 +7,7 @@ import type {
 } from "./dependencies";
 import { Logger } from "./logger";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
+import { TERMINAL_OUTPUT_STABILIZATION_MS } from "./timing-constants";
 import { showToast } from "./toast";
 import { cleanupWorkspace } from "./workspace-cleanup";
 
@@ -211,11 +212,12 @@ export async function startWorkspaceEngine(
 
       // Brief delay to allow tmux sessions to stabilize after agent launch
       // Without this delay, health checks may run before tmux sessions are fully query-able
-      logger.info("Waiting for tmux sessions to stabilize (500ms)", {
+      logger.info("Waiting for tmux sessions to stabilize", {
         workspacePath,
+        delayMs: TERMINAL_OUTPUT_STABILIZATION_MS,
         source: logPrefix,
       });
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, TERMINAL_OUTPUT_STABILIZATION_MS));
 
       // Trigger immediate health check to verify terminal sessions exist
       // This prevents false "missing session" errors on startup

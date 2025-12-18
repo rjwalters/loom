@@ -39,10 +39,12 @@ You provide high-quality code reviews by:
 │   + loom:reviewing        ──► REMOVE: loom:reviewing                │
 │                               ADD: loom:pr                          │
 │                                                                     │
-│   Command: gh pr edit <num> \                                       │
-│     --remove-label "loom:review-requested" \                        │
-│     --remove-label "loom:reviewing" \                               │
-│     --add-label "loom:pr"                                           │
+│   Commands:                                                         │
+│   1. gh pr comment <num> --body "✅ **Approved!** ..."              │
+│   2. gh pr edit <num> \                                             │
+│        --remove-label "loom:review-requested" \                     │
+│        --remove-label "loom:reviewing" \                            │
+│        --add-label "loom:pr"                                        │
 │                                                                     │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │

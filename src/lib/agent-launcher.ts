@@ -1,6 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
 import { detectTerminalState, type TerminalState } from "./terminal-state-parser";
+import {
+  TERMINAL_OUTPUT_STABILIZATION_MS,
+  TERMINAL_POLL_INTERVAL_MS,
+  WORKER_INITIALIZATION_DELAY_MS,
+} from "./timing-constants";
 
 const logger = Logger.forComponent("agent-launcher");
 
@@ -111,8 +116,11 @@ export async function launchAgentInTerminal(
 
   // Wait for any previous commands to fully complete
   // This prevents command concatenation with worktree setup commands
-  logger.info("Waiting for previous commands to complete", { terminalId, delayMs: 500 });
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  logger.info("Waiting for previous commands to complete", {
+    terminalId,
+    delayMs: TERMINAL_OUTPUT_STABILIZATION_MS,
+  });
+  await new Promise((resolve) => setTimeout(resolve, TERMINAL_OUTPUT_STABILIZATION_MS));
 
   // Send command to terminal
   await invoke("send_terminal_input", {
@@ -159,7 +167,7 @@ export async function launchAgentInTerminal(
       });
 
       // Small delay before Enter
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, TERMINAL_POLL_INTERVAL_MS));
 
       await invoke("send_terminal_input", {
         id: terminalId,
@@ -190,8 +198,11 @@ export async function launchAgentInTerminal(
   // Wait for Claude Code to be ready to receive input and send role prompt
   // Wrapped in try-catch to capture any silent failures
   try {
-    logger.info("Waiting for Claude Code to initialize", { terminalId, delayMs: 2000 });
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    logger.info("Waiting for Claude Code to initialize", {
+      terminalId,
+      delayMs: WORKER_INITIALIZATION_DELAY_MS,
+    });
+    await new Promise((resolve) => setTimeout(resolve, WORKER_INITIALIZATION_DELAY_MS));
     logger.info("Wait complete, proceeding to send role prompt", { terminalId });
 
     // Send the role prompt as the first message
@@ -221,8 +232,11 @@ export async function launchAgentInTerminal(
   }
 
   // Wait for the agent to process the role prompt
-  logger.info("Waiting for agent to process role prompt", { terminalId, delayMs: 2000 });
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  logger.info("Waiting for agent to process role prompt", {
+    terminalId,
+    delayMs: WORKER_INITIALIZATION_DELAY_MS,
+  });
+  await new Promise((resolve) => setTimeout(resolve, WORKER_INITIALIZATION_DELAY_MS));
 
   // Verify agent launched successfully using passive detection
   logger.info("Verifying agent launch with passive detection", { terminalId });
@@ -461,8 +475,11 @@ export async function launchCodexAgent(
   });
 
   // Wait for any previous commands to fully complete
-  logger.info("Waiting for previous commands to complete", { terminalId, delayMs: 500 });
-  await new Promise((resolve) => setTimeout(resolve, 500));
+  logger.info("Waiting for previous commands to complete", {
+    terminalId,
+    delayMs: TERMINAL_OUTPUT_STABILIZATION_MS,
+  });
+  await new Promise((resolve) => setTimeout(resolve, TERMINAL_OUTPUT_STABILIZATION_MS));
 
   // Send command to terminal
   await invoke("send_terminal_input", {
@@ -479,8 +496,11 @@ export async function launchCodexAgent(
   });
 
   // Wait for the agent to initialize and process the role prompt
-  logger.info("Waiting for Codex agent to initialize", { terminalId, delayMs: 2000 });
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+  logger.info("Waiting for Codex agent to initialize", {
+    terminalId,
+    delayMs: WORKER_INITIALIZATION_DELAY_MS,
+  });
+  await new Promise((resolve) => setTimeout(resolve, WORKER_INITIALIZATION_DELAY_MS));
 
   // Verify agent launched successfully using passive detection
   logger.info("Verifying Codex agent launch with passive detection", { terminalId });
