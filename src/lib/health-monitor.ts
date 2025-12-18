@@ -1,3 +1,27 @@
+/**
+ * health-monitor.ts - Coordinates periodic health monitoring
+ *
+ * Architecture:
+ * - This class is the SCHEDULER: decides WHEN to perform health checks
+ * - For session health, uses IPC `check_session_health` command to verify tmux sessions exist
+ * - For daemon health, uses IPC `check_daemon_health` command (ping every 10s)
+ * - For activity tracking, receives callbacks from output-poller (recordActivity method)
+ *
+ * Separation of Concerns:
+ * - health-monitor.ts (this file): SCHEDULER - periodic checks, activity timestamps, daemon connectivity
+ * - terminal-probe.ts: CHECKER - terminal TYPE detection (agent vs shell) via probe commands
+ *
+ * These modules are intentionally separate:
+ * - Health monitoring checks if terminals are ALIVE (session exists, responding)
+ * - Terminal probing checks what TYPE a terminal is (AI agent vs plain shell)
+ *
+ * DO NOT add terminal command sending logic here - health checks use IPC only.
+ * For terminal type detection, see terminal-probe.ts instead.
+ *
+ * @see terminal-probe.ts for terminal type detection
+ * @see output-poller.ts for activity tracking integration
+ */
+
 import { invoke } from "@tauri-apps/api/core";
 import { Logger } from "./logger";
 import { getAppState, TerminalStatus } from "./state";
@@ -120,6 +144,14 @@ export class HealthMonitor {
 
   /**
    * Record activity for a terminal (called when output is received)
+   *
+   * Integration point: This method is called by output-poller when a terminal
+   * produces output. It updates the activity timestamp used to detect stale
+   * terminals (no output for > staleThreshold).
+   *
+   * This is a passive observer pattern - we don't send commands to detect activity,
+   * we just record when output is observed. For active probing (sending commands
+   * to detect terminal type), see terminal-probe.ts instead.
    */
   recordActivity(terminalId: string): void {
     const now = Date.now();
@@ -274,7 +306,9 @@ export class HealthMonitor {
       }
 
       try {
-        // Check if tmux session exists
+        // Check if tmux session exists via IPC (daemon verifies session)
+        // NOTE: This checks if terminal is ALIVE, not what TYPE it is.
+        // For terminal type detection (agent vs shell), see terminal-probe.ts
         logger.info("Checking session health", { terminalId: terminal.id });
         const hasSession = await invoke<boolean>("check_session_health", {
           id: terminal.id,
@@ -284,7 +318,8 @@ export class HealthMonitor {
           hasSession,
         });
 
-        // Get last activity time
+        // Get last activity time (populated by recordActivity callback from output-poller)
+        // Integration point: output-poller calls recordActivity() when terminal produces output
         const lastActivity = this.terminalActivity.get(terminal.id) || null;
         const timeSinceActivity = lastActivity ? now - lastActivity : null;
         const isStale = timeSinceActivity !== null && timeSinceActivity > this.staleThreshold;
