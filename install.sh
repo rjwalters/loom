@@ -261,12 +261,7 @@ case "$METHOD" in
     echo ""
     success "Quick installation complete!"
     echo ""
-    info "Next steps:"
-    echo "  1. Review installed files in $TARGET_PATH"
-    echo "  2. Commit the changes: git add -A && git commit -m 'Add Loom configuration'"
-    echo "  3. Start using Loom:"
-    echo "     - Open Loom.app and select this workspace, OR"
-    echo "     - Use Claude Code: cd $TARGET_PATH && /builder"
+    info "Don't forget to commit: git add -A && git commit -m 'Add Loom configuration'"
     ;;
 
   2)
