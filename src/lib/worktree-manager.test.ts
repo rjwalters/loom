@@ -285,9 +285,10 @@ describe("worktree-manager", () => {
 
   describe("createWorktreeDirect", () => {
     // Helper to create a mock Command.execute result
-    const mockExecuteResult = (code: number, stdout = "", stderr = "") => ({
-      execute: vi.fn().mockResolvedValue({ code, stdout, stderr }),
-    });
+    const mockExecuteResult = (code: number, stdout = "", stderr = "") =>
+      ({
+        execute: vi.fn().mockResolvedValue({ code, stdout, stderr }),
+      }) as unknown as ReturnType<typeof Command.create>;
 
     beforeEach(() => {
       vi.mocked(Command.create).mockReturnValue(mockExecuteResult(0));
