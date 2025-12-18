@@ -83,9 +83,10 @@ pub struct TerminalInfo {
     pub last_interval_run: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
+    #[default]
     NotStarted,
     Initializing,
     Ready,
@@ -93,10 +94,4 @@ pub enum AgentStatus {
     WaitingForInput,
     Error,
     Stopped,
-}
-
-impl Default for AgentStatus {
-    fn default() -> Self {
-        Self::NotStarted
-    }
 }
