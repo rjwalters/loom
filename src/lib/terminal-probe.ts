@@ -1,17 +1,34 @@
 /**
- * terminal-probe.ts - Smart terminal type detection
+ * terminal-probe.ts - Terminal type detection utility
  *
- * This module provides a bash-compatible probe command that can identify
- * whether a terminal is running an AI agent (Claude Code, Codex, etc.) or
- * a plain shell environment. The probe uses bash comments that agents interpret
- * as prompts, while shells simply ignore them.
+ * Architecture:
+ * - This module is the CHECKER: implements HOW to detect terminal type
+ * - Generates probe commands and parses responses to identify agent vs shell
+ * - Is STATELESS - does not schedule periodic checks or track state
+ *
+ * Separation of Concerns:
+ * - terminal-probe.ts (this file): CHECKER - terminal TYPE detection via probe commands
+ * - health-monitor.ts: SCHEDULER - periodic checks, activity timestamps, daemon connectivity
+ *
+ * These modules are intentionally separate:
+ * - Terminal probing checks what TYPE a terminal is (AI agent vs plain shell)
+ * - Health monitoring checks if terminals are ALIVE (session exists, responding)
  *
  * Design:
  * - Bash shells: Comments are ignored, `true` command succeeds silently
  * - AI agents: See comments as questions and respond with structured data
  *
- * This replaces the fragile "2" hack that caused "command not found" errors
- * and only worked for Claude Code's bypass permissions prompt.
+ * Usage:
+ *   const probeCmd = generateProbeCommand();
+ *   const output = await sendToTerminal(terminalId, probeCmd);
+ *   const response = parseProbeResponse(output);
+ *   // response.type === "agent" | "shell" | "unknown"
+ *
+ * DO NOT add scheduling logic here - that's health-monitor's job.
+ * This module should remain stateless and focused on detection.
+ *
+ * @see health-monitor.ts for periodic health checks
+ * @see terminal-state-parser.ts for passive state detection (alternative approach)
  */
 
 export interface ProbeResponse {

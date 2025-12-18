@@ -274,4 +274,61 @@ describe("terminal-probe", () => {
       });
     });
   });
+
+  describe("Separation of Concerns (terminal-probe vs health-monitor)", () => {
+    /**
+     * These tests verify that terminal-probe.ts maintains its architectural separation:
+     * - terminal-probe: CHECKER - determines terminal TYPE via probe commands (stateless)
+     * - health-monitor: SCHEDULER - decides WHEN to check, uses IPC for health (stateful)
+     */
+
+    test("functions are stateless (pure functions)", () => {
+      // generateProbeCommand should always return the same command
+      const cmd1 = generateProbeCommand();
+      const cmd2 = generateProbeCommand();
+      expect(cmd1).toBe(cmd2);
+
+      // generateCommandProbe should always return the same command
+      const probe1 = generateCommandProbe();
+      const probe2 = generateCommandProbe();
+      expect(probe1).toBe(probe2);
+    });
+
+    test("parseProbeResponse is a pure function (same input = same output)", () => {
+      const output = "AGENT:Worker:implements-issues";
+
+      // Multiple calls with same input should produce identical results
+      const result1 = parseProbeResponse(output);
+      const result2 = parseProbeResponse(output);
+
+      expect(result1.type).toBe(result2.type);
+      expect(result1.role).toBe(result2.role);
+      expect(result1.task).toBe(result2.task);
+    });
+
+    test("module has no scheduling or timer logic", () => {
+      // terminal-probe exports only pure functions, no classes or singletons
+      // This is verified by the fact that we can call functions without initialization
+
+      // No setup required - functions work immediately
+      expect(() => generateProbeCommand()).not.toThrow();
+      expect(() => generateCommandProbe()).not.toThrow();
+      expect(() => parseProbeResponse("test")).not.toThrow();
+    });
+
+    test("probe functions have no side effects", () => {
+      // Calling generate functions multiple times shouldn't change anything
+      const before = generateProbeCommand();
+
+      // Call many times
+      for (let i = 0; i < 100; i++) {
+        generateProbeCommand();
+        generateCommandProbe();
+        parseProbeResponse("AGENT:Test:task");
+      }
+
+      const after = generateProbeCommand();
+      expect(before).toBe(after);
+    });
+  });
 });

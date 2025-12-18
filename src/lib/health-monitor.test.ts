@@ -758,4 +758,69 @@ describe("HealthMonitor", () => {
       expect(health.daemon.consecutiveFailures).toBe(3);
     });
   });
+
+  describe("Separation of Concerns (health-monitor vs terminal-probe)", () => {
+    /**
+     * These tests verify that health-monitor.ts and terminal-probe.ts
+     * maintain their architectural separation:
+     * - health-monitor: SCHEDULER - decides WHEN to check, uses IPC for health
+     * - terminal-probe: CHECKER - determines terminal TYPE via probe commands
+     */
+
+    it("uses IPC invoke for health checks, not terminal commands", async () => {
+      monitor.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Verify invoke was called with IPC commands (check_session_health, check_daemon_health)
+      const invokeCalls = vi.mocked(invoke).mock.calls;
+      const commandNames = invokeCalls.map((call) => call[0]);
+
+      // Health monitor should use IPC commands, not send terminal commands
+      expect(commandNames).toContain("check_session_health");
+      expect(commandNames).toContain("check_daemon_health");
+
+      // These would indicate terminal-probe usage (should NOT be present)
+      expect(commandNames).not.toContain("send_input");
+      expect(commandNames).not.toContain("write_to_terminal");
+    });
+
+    it("tracks activity via passive observation (recordActivity), not probing", () => {
+      // HealthMonitor should receive activity updates passively from output-poller
+      // It should NOT send probe commands to detect activity
+
+      expect(monitor.getLastActivity("terminal-1")).toBeNull();
+
+      // Record activity (called by output-poller when terminal produces output)
+      monitor.recordActivity("terminal-1");
+
+      // Activity should be recorded passively
+      expect(monitor.getLastActivity("terminal-1")).not.toBeNull();
+      expect(monitor.getLastActivity("terminal-1")).toBeGreaterThan(0);
+    });
+
+    it("is stateful (tracks health state over time)", () => {
+      // HealthMonitor maintains state: activity timestamps, health records, daemon status
+      // This is different from terminal-probe which is stateless
+
+      // Record activity at different times
+      vi.setSystemTime(new Date("2024-01-01T10:00:00Z"));
+      monitor.recordActivity("terminal-1");
+      const activity1 = monitor.getLastActivity("terminal-1");
+
+      vi.setSystemTime(new Date("2024-01-01T10:01:00Z"));
+      monitor.recordActivity("terminal-1");
+      const activity2 = monitor.getLastActivity("terminal-1");
+
+      // State should be updated over time
+      expect(activity2).toBeGreaterThan(activity1!);
+    });
+
+    it("integrates with output-poller for activity tracking", async () => {
+      monitor.start();
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Verify getOutputPoller is called during health checks
+      expect(vi.mocked(getOutputPoller)).toHaveBeenCalled();
+    });
+  });
 });
