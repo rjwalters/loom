@@ -361,9 +361,12 @@ export async function createPlainTerminal(deps: {
     const instanceNumber = state.terminals.getNextTerminalNumber();
 
     // Create worktree for this terminal FIRST (before creating terminal)
+    // Use createWorktreeDirect which runs git commands directly via shell,
+    // avoiding the catch-22 of setupWorktreeForAgent which tries to send
+    // commands to a terminal that doesn't exist yet (see issue #734)
     logger.info("Creating worktree for terminal", { name, id });
-    const { setupWorktreeForAgent } = await import("./worktree-manager");
-    const worktreePath = await setupWorktreeForAgent(id, workspacePath);
+    const { createWorktreeDirect } = await import("./worktree-manager");
+    const worktreePath = await createWorktreeDirect(id, workspacePath);
     logger.info("Created worktree", { name, id, worktreePath });
 
     // Create terminal in worktree directory (not workspace)

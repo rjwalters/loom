@@ -415,6 +415,95 @@ export async function cleanupTerminalWorktrees(workspacePath: string): Promise<v
  */
 
 /**
+ * Create a worktree directly using shell commands (no terminal required)
+ *
+ * This function creates a git worktree for a terminal BEFORE the terminal exists.
+ * It uses Command.create() to run git commands directly, avoiding the catch-22
+ * of needing to send commands to a terminal that doesn't exist yet.
+ *
+ * Unlike setupWorktreeForAgent (which sends commands to an existing terminal),
+ * this function runs git commands directly via the Tauri shell plugin.
+ *
+ * @param terminalId - The terminal ID (e.g., "terminal-1")
+ * @param workspacePath - The main workspace path (git repository root)
+ * @returns Promise that resolves with the worktree path
+ */
+export async function createWorktreeDirect(
+  terminalId: string,
+  workspacePath: string
+): Promise<string> {
+  logger.info("Creating worktree directly (no terminal)", { terminalId, workspacePath });
+
+  // Worktree path: .loom/worktrees/{terminalId}
+  const worktreePath = `${workspacePath}/.loom/worktrees/${terminalId}`;
+  const branchName = `worktree/${terminalId}`;
+
+  try {
+    // Create worktrees base directory if it doesn't exist
+    const worktreesBaseDir = `${workspacePath}/.loom/worktrees`;
+    const mkdirCmd = Command.create("mkdir", ["-p", worktreesBaseDir], { cwd: workspacePath });
+    const mkdirResult = await mkdirCmd.execute();
+    if (mkdirResult.code !== 0) {
+      logger.warn("mkdir failed but continuing", { stderr: mkdirResult.stderr });
+    }
+
+    // Check if worktree already exists - if so, remove it first
+    const checkCmd = Command.create("test", ["-d", worktreePath], { cwd: workspacePath });
+    const checkResult = await checkCmd.execute();
+
+    if (checkResult.code === 0) {
+      logger.warn("Worktree already exists, removing it", { worktreePath });
+      const removeCmd = Command.create("git", ["worktree", "remove", worktreePath, "--force"], {
+        cwd: workspacePath,
+      });
+      await removeCmd.execute();
+
+      // Also try to delete the branch if it exists
+      const branchDeleteCmd = Command.create("git", ["branch", "-D", branchName], {
+        cwd: workspacePath,
+      });
+      await branchDeleteCmd.execute();
+    }
+
+    // Create git worktree with a unique branch
+    logger.info("Creating git worktree", { worktreePath, branchName });
+    const addCmd = Command.create(
+      "git",
+      ["worktree", "add", "-b", branchName, worktreePath, "HEAD"],
+      { cwd: workspacePath }
+    );
+    const result = await addCmd.execute();
+
+    if (result.code !== 0) {
+      throw new Error(`Failed to create worktree: ${result.stderr}`);
+    }
+
+    logger.info("Worktree created successfully", {
+      terminalId,
+      worktreePath,
+    });
+
+    return worktreePath;
+  } catch (error) {
+    const enrichedError = enrichWorktreeError(error, {
+      terminalId,
+      workspacePath,
+      worktreePath,
+      branchName,
+    });
+
+    logger.error("Failed to create worktree directly", enrichedError, {
+      terminalId,
+      workspacePath,
+      worktreePath,
+      originalError: error instanceof Error ? error.message : String(error),
+    });
+
+    throw enrichedError;
+  }
+}
+
+/**
  * Send a command to a terminal and wait for it to execute
  *
  * @param terminalId - The terminal ID to send the command to

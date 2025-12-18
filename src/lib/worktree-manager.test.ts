@@ -1,10 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
+import { Command } from "@tauri-apps/plugin-shell";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { enrichWorktreeError, type GitIdentity, setupWorktreeForAgent } from "./worktree-manager";
+import {
+  createWorktreeDirect,
+  enrichWorktreeError,
+  type GitIdentity,
+  setupWorktreeForAgent,
+} from "./worktree-manager";
 
 // Mock Tauri invoke
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
+}));
+
+// Mock Tauri shell plugin Command
+vi.mock("@tauri-apps/plugin-shell", () => ({
+  Command: {
+    create: vi.fn(),
+  },
 }));
 
 describe("worktree-manager", () => {
@@ -267,6 +280,145 @@ describe("worktree-manager", () => {
       expect(invoke).toHaveBeenCalled();
 
       vi.useRealTimers();
+    });
+  });
+
+  describe("createWorktreeDirect", () => {
+    // Helper to create a mock Command.execute result
+    const mockExecuteResult = (code: number, stdout = "", stderr = "") =>
+      ({
+        execute: vi.fn().mockResolvedValue({ code, stdout, stderr }),
+      }) as unknown as ReturnType<typeof Command.create>;
+
+    beforeEach(() => {
+      vi.mocked(Command.create).mockReturnValue(mockExecuteResult(0));
+    });
+
+    it("should create worktree directory using Command.create", async () => {
+      const worktreePath = await createWorktreeDirect("terminal-1", "/path/to/workspace");
+
+      // Check mkdir was called
+      expect(Command.create).toHaveBeenCalledWith(
+        "mkdir",
+        ["-p", "/path/to/workspace/.loom/worktrees"],
+        { cwd: "/path/to/workspace" }
+      );
+
+      expect(worktreePath).toBe("/path/to/workspace/.loom/worktrees/terminal-1");
+    });
+
+    it("should create git worktree with correct branch name", async () => {
+      await createWorktreeDirect("terminal-2", "/path/to/workspace");
+
+      // Check git worktree add was called
+      expect(Command.create).toHaveBeenCalledWith(
+        "git",
+        [
+          "worktree",
+          "add",
+          "-b",
+          "worktree/terminal-2",
+          "/path/to/workspace/.loom/worktrees/terminal-2",
+          "HEAD",
+        ],
+        { cwd: "/path/to/workspace" }
+      );
+    });
+
+    it("should check if worktree exists before creating", async () => {
+      await createWorktreeDirect("terminal-3", "/path/to/workspace");
+
+      // Check test -d was called to check if directory exists
+      expect(Command.create).toHaveBeenCalledWith(
+        "test",
+        ["-d", "/path/to/workspace/.loom/worktrees/terminal-3"],
+        { cwd: "/path/to/workspace" }
+      );
+    });
+
+    it("should remove existing worktree if it exists", async () => {
+      // Mock test -d to return success (directory exists)
+      vi.mocked(Command.create)
+        .mockReturnValueOnce(mockExecuteResult(0)) // mkdir
+        .mockReturnValueOnce(mockExecuteResult(0)) // test -d returns 0 (exists)
+        .mockReturnValueOnce(mockExecuteResult(0)) // git worktree remove
+        .mockReturnValueOnce(mockExecuteResult(0)) // git branch -D
+        .mockReturnValueOnce(mockExecuteResult(0)); // git worktree add
+
+      await createWorktreeDirect("terminal-4", "/path/to/workspace");
+
+      // Check git worktree remove was called
+      expect(Command.create).toHaveBeenCalledWith(
+        "git",
+        ["worktree", "remove", "/path/to/workspace/.loom/worktrees/terminal-4", "--force"],
+        { cwd: "/path/to/workspace" }
+      );
+
+      // Check git branch -D was called
+      expect(Command.create).toHaveBeenCalledWith("git", ["branch", "-D", "worktree/terminal-4"], {
+        cwd: "/path/to/workspace",
+      });
+    });
+
+    it("should not remove worktree if it does not exist", async () => {
+      // Mock test -d to return failure (directory does not exist)
+      vi.mocked(Command.create)
+        .mockReturnValueOnce(mockExecuteResult(0)) // mkdir
+        .mockReturnValueOnce(mockExecuteResult(1)) // test -d returns 1 (doesn't exist)
+        .mockReturnValueOnce(mockExecuteResult(0)); // git worktree add
+
+      await createWorktreeDirect("terminal-5", "/path/to/workspace");
+
+      // Should not have called git worktree remove
+      const removeCall = vi
+        .mocked(Command.create)
+        .mock.calls.find(
+          (call) => call[0] === "git" && call[1]?.[0] === "worktree" && call[1]?.[1] === "remove"
+        );
+      expect(removeCall).toBeUndefined();
+    });
+
+    it("should return the correct worktree path", async () => {
+      const result1 = await createWorktreeDirect("terminal-a", "/workspace/path");
+      expect(result1).toBe("/workspace/path/.loom/worktrees/terminal-a");
+
+      const result2 = await createWorktreeDirect("terminal-b", "/different/workspace");
+      expect(result2).toBe("/different/workspace/.loom/worktrees/terminal-b");
+    });
+
+    it("should throw enriched error on git worktree add failure", async () => {
+      vi.mocked(Command.create)
+        .mockReturnValueOnce(mockExecuteResult(0)) // mkdir
+        .mockReturnValueOnce(mockExecuteResult(1)) // test -d (doesn't exist)
+        .mockReturnValueOnce(mockExecuteResult(1, "", "fatal: not a git repository")); // git worktree add fails
+
+      await expect(createWorktreeDirect("terminal-6", "/path/to/workspace")).rejects.toThrow(
+        "is not a git repository"
+      );
+    });
+
+    it("should handle workspace paths with spaces", async () => {
+      await createWorktreeDirect("terminal-7", "/path/with spaces/workspace");
+
+      expect(Command.create).toHaveBeenCalledWith(
+        "git",
+        [
+          "worktree",
+          "add",
+          "-b",
+          "worktree/terminal-7",
+          "/path/with spaces/workspace/.loom/worktrees/terminal-7",
+          "HEAD",
+        ],
+        { cwd: "/path/with spaces/workspace" }
+      );
+    });
+
+    it("should not require terminal to exist (no invoke calls)", async () => {
+      await createWorktreeDirect("terminal-8", "/path/to/workspace");
+
+      // Should NOT have called send_terminal_input since terminal doesn't exist
+      expect(invoke).not.toHaveBeenCalledWith("send_terminal_input", expect.anything());
     });
   });
 
