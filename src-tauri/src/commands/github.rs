@@ -105,7 +105,14 @@ pub fn reset_github_labels() -> Result<LabelResetResult, String> {
         errors: Vec::new(),
     };
 
-    // Step 1: Remove loom:in-progress from all open issues
+    // Step 1: Migration cleanup - Remove deprecated loom:in-progress label
+    //
+    // MIGRATION CODE: This handles cleanup of the deprecated `loom:in-progress` label.
+    // Background: loom:in-progress was deprecated in favor of role-specific labels
+    // (loom:building, loom:curating, loom:reviewing, loom:treating) in PR #808 (Dec 2025).
+    //
+    // This code can be removed after March 2026 when all installations have migrated.
+    // See: Issue #791 (deprecation request), PR #808 (implementation), Issue #903 (this review)
     let issues_output = Command::new("gh")
         .args([
             "issue",
