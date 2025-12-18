@@ -224,6 +224,16 @@ fn main() {
             trigger_start,
             trigger_force_start,
             trigger_factory_reset,
+            // Telemetry commands
+            log_performance_metric,
+            get_performance_metrics,
+            get_performance_stats,
+            log_error_report,
+            get_error_reports,
+            log_usage_event,
+            get_usage_events,
+            get_usage_stats,
+            delete_telemetry_data,
         ])
         .run(tauri::generate_context!())
     {

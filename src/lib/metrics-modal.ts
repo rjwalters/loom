@@ -5,6 +5,7 @@
  * All data shown is locally stored - no external services are used.
  */
 
+import { ask } from "@tauri-apps/plugin-dialog";
 import { ModalBuilder } from "./modal-builder";
 import {
   deleteTelemetryData,
@@ -378,9 +379,15 @@ async function handleExportData(): Promise<void> {
  * Handle delete data button click
  */
 async function handleDeleteData(): Promise<void> {
-  if (
-    !confirm("Are you sure you want to delete all telemetry data? This action cannot be undone.")
-  ) {
+  const confirmed = await ask(
+    "Are you sure you want to delete all telemetry data? This action cannot be undone.",
+    {
+      title: "Delete Telemetry Data",
+      kind: "warning",
+    }
+  );
+
+  if (!confirmed) {
     return;
   }
 

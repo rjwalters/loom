@@ -179,56 +179,68 @@ pub fn get_performance_metrics(
         open_telemetry_db().map_err(|e| format!("Failed to open telemetry database: {e}"))?;
     let limit = limit.unwrap_or(100);
 
-    let query = match (&category, &since) {
-        (Some(_), Some(_)) => {
-            "SELECT name, duration_ms, timestamp, category, success, metadata
-             FROM performance_metrics
-             WHERE category = ?1 AND timestamp > ?2
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+    // Build query and parameters based on which filters are provided
+    let metrics = match (&category, &since) {
+        (Some(cat), Some(since_time)) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, duration_ms, timestamp, category, success, metadata
+                     FROM performance_metrics
+                     WHERE category = ?1 AND timestamp > ?2
+                     ORDER BY timestamp DESC
+                     LIMIT ?3",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![cat, since_time, limit], map_performance_row)
+                .map_err(|e| format!("Failed to query metrics: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?
         }
-        (Some(_), None) => {
-            "SELECT name, duration_ms, timestamp, category, success, metadata
-             FROM performance_metrics
-             WHERE category = ?1
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+        (Some(cat), None) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, duration_ms, timestamp, category, success, metadata
+                     FROM performance_metrics
+                     WHERE category = ?1
+                     ORDER BY timestamp DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![cat, limit], map_performance_row)
+                .map_err(|e| format!("Failed to query metrics: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?
         }
-        (None, Some(_)) => {
-            "SELECT name, duration_ms, timestamp, category, success, metadata
-             FROM performance_metrics
-             WHERE timestamp > ?2
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+        (None, Some(since_time)) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, duration_ms, timestamp, category, success, metadata
+                     FROM performance_metrics
+                     WHERE timestamp > ?1
+                     ORDER BY timestamp DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![since_time, limit], map_performance_row)
+                .map_err(|e| format!("Failed to query metrics: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?
         }
         (None, None) => {
-            "SELECT name, duration_ms, timestamp, category, success, metadata
-             FROM performance_metrics
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, duration_ms, timestamp, category, success, metadata
+                     FROM performance_metrics
+                     ORDER BY timestamp DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![limit], map_performance_row)
+                .map_err(|e| format!("Failed to query metrics: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?
         }
     };
-
-    let mut stmt = conn
-        .prepare(query)
-        .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-    let metrics = match (&category, &since) {
-        (Some(cat), Some(since_time)) => stmt
-            .query_map(params![cat, since_time, limit], map_performance_row)
-            .map_err(|e| format!("Failed to query metrics: {e}"))?,
-        (Some(cat), None) => stmt
-            .query_map(params![cat, "", limit], map_performance_row)
-            .map_err(|e| format!("Failed to query metrics: {e}"))?,
-        (None, Some(since_time)) => stmt
-            .query_map(params!["", since_time, limit], map_performance_row)
-            .map_err(|e| format!("Failed to query metrics: {e}"))?,
-        (None, None) => stmt
-            .query_map(params!["", "", limit], map_performance_row)
-            .map_err(|e| format!("Failed to query metrics: {e}"))?,
-    }
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect metrics: {e}"))?;
 
     Ok(metrics)
 }
@@ -354,32 +366,35 @@ pub fn get_error_reports(
         open_telemetry_db().map_err(|e| format!("Failed to open telemetry database: {e}"))?;
     let limit = limit.unwrap_or(50);
 
-    let query = if since.is_some() {
-        "SELECT message, stack, timestamp, component, context
-         FROM error_reports
-         WHERE timestamp > ?1
-         ORDER BY timestamp DESC
-         LIMIT ?2"
-    } else {
-        "SELECT message, stack, timestamp, component, context
-         FROM error_reports
-         ORDER BY timestamp DESC
-         LIMIT ?2"
-    };
-
-    let mut stmt = conn
-        .prepare(query)
-        .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
+    // Build query and parameters based on whether since filter is provided
     let errors = if let Some(since_time) = since {
+        let mut stmt = conn
+            .prepare(
+                "SELECT message, stack, timestamp, component, context
+                 FROM error_reports
+                 WHERE timestamp > ?1
+                 ORDER BY timestamp DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("Failed to prepare query: {e}"))?;
         stmt.query_map(params![since_time, limit], map_error_row)
             .map_err(|e| format!("Failed to query errors: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect errors: {e}"))?
     } else {
-        stmt.query_map(params!["", limit], map_error_row)
+        let mut stmt = conn
+            .prepare(
+                "SELECT message, stack, timestamp, component, context
+                 FROM error_reports
+                 ORDER BY timestamp DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+        stmt.query_map(params![limit], map_error_row)
             .map_err(|e| format!("Failed to query errors: {e}"))?
-    }
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect errors: {e}"))?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect errors: {e}"))?
+    };
 
     Ok(errors)
 }
@@ -438,56 +453,68 @@ pub fn get_usage_events(
         open_telemetry_db().map_err(|e| format!("Failed to open telemetry database: {e}"))?;
     let limit = limit.unwrap_or(100);
 
-    let query = match (&category, &since) {
-        (Some(_), Some(_)) => {
-            "SELECT event_name, category, timestamp, properties
-             FROM usage_events
-             WHERE category = ?1 AND timestamp > ?2
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+    // Build query and parameters based on which filters are provided
+    let events = match (&category, &since) {
+        (Some(cat), Some(since_time)) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_name, category, timestamp, properties
+                     FROM usage_events
+                     WHERE category = ?1 AND timestamp > ?2
+                     ORDER BY timestamp DESC
+                     LIMIT ?3",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![cat, since_time, limit], map_usage_row)
+                .map_err(|e| format!("Failed to query events: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect events: {e}"))?
         }
-        (Some(_), None) => {
-            "SELECT event_name, category, timestamp, properties
-             FROM usage_events
-             WHERE category = ?1
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+        (Some(cat), None) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_name, category, timestamp, properties
+                     FROM usage_events
+                     WHERE category = ?1
+                     ORDER BY timestamp DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![cat, limit], map_usage_row)
+                .map_err(|e| format!("Failed to query events: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect events: {e}"))?
         }
-        (None, Some(_)) => {
-            "SELECT event_name, category, timestamp, properties
-             FROM usage_events
-             WHERE timestamp > ?2
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+        (None, Some(since_time)) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_name, category, timestamp, properties
+                     FROM usage_events
+                     WHERE timestamp > ?1
+                     ORDER BY timestamp DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![since_time, limit], map_usage_row)
+                .map_err(|e| format!("Failed to query events: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect events: {e}"))?
         }
         (None, None) => {
-            "SELECT event_name, category, timestamp, properties
-             FROM usage_events
-             ORDER BY timestamp DESC
-             LIMIT ?3"
+            let mut stmt = conn
+                .prepare(
+                    "SELECT event_name, category, timestamp, properties
+                     FROM usage_events
+                     ORDER BY timestamp DESC
+                     LIMIT ?1",
+                )
+                .map_err(|e| format!("Failed to prepare query: {e}"))?;
+            stmt.query_map(params![limit], map_usage_row)
+                .map_err(|e| format!("Failed to query events: {e}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to collect events: {e}"))?
         }
     };
-
-    let mut stmt = conn
-        .prepare(query)
-        .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-    let events = match (&category, &since) {
-        (Some(cat), Some(since_time)) => stmt
-            .query_map(params![cat, since_time, limit], map_usage_row)
-            .map_err(|e| format!("Failed to query events: {e}"))?,
-        (Some(cat), None) => stmt
-            .query_map(params![cat, "", limit], map_usage_row)
-            .map_err(|e| format!("Failed to query events: {e}"))?,
-        (None, Some(since_time)) => stmt
-            .query_map(params!["", since_time, limit], map_usage_row)
-            .map_err(|e| format!("Failed to query events: {e}"))?,
-        (None, None) => stmt
-            .query_map(params!["", "", limit], map_usage_row)
-            .map_err(|e| format!("Failed to query events: {e}"))?,
-    }
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect events: {e}"))?;
 
     Ok(events)
 }
