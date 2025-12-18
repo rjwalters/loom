@@ -66,6 +66,7 @@ import { getOutputPoller } from "./lib/output-poller";
 import { initializeScreenReaderAnnouncer } from "./lib/screen-reader-announcer";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
+import { initializeErrorTracking, trackEvent } from "./lib/telemetry";
 import {
   closeTerminalWithConfirmation,
   createPlainTerminal,
@@ -760,6 +761,11 @@ if (!eventListenersRegistered) {
     showKeyboardShortcutsModal();
   });
 
+  listen("show-metrics", async () => {
+    const { showMetricsModal } = await import("./lib/metrics-modal");
+    showMetricsModal();
+  });
+
   listen("show-daemon-status", async () => {
     showDaemonStatusDialog();
   });
@@ -858,11 +864,17 @@ const browseWorkspaceWithCallback = () => browseWorkspace(handleWorkspacePathInp
     // Now that Tauri IPC is ready, initialize console logging
     initConsoleLogger();
 
+    // Initialize error tracking for uncaught errors
+    initializeErrorTracking();
+
     // Test console logging immediately
     console.log("[Loom] Console logger initialized - this should appear in ~/.loom/console.log");
 
     // Create logger for main component
     logger = Logger.forComponent("main");
+
+    // Track app startup
+    trackEvent("app_started", "workflow");
 
     // Log initialization complete
     logger?.info("Auto-save enabled (2-second debounce)");

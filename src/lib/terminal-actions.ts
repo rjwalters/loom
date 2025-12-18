@@ -18,6 +18,7 @@ import { Logger } from "./logger";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
 import type { AppState, Terminal } from "./state";
 import { TerminalStatus } from "./state";
+import { trackEvent, trackPerformance } from "./telemetry";
 import { TERMINAL_OUTPUT_STABILIZATION_MS } from "./timing-constants";
 import { showToast } from "./toast";
 
@@ -97,92 +98,100 @@ export async function handleRestartTerminal(
   const { state, saveCurrentConfig } = deps;
   logger.info("Restarting terminal", { terminalId });
 
-  try {
-    const terminal = state.terminals.getTerminal(terminalId);
-    if (!terminal) {
-      logger.error("Terminal not found", new Error("Terminal not found"), {
+  await trackPerformance(
+    "handleRestartTerminal",
+    "ipc",
+    async () => {
+      const terminal = state.terminals.getTerminal(terminalId);
+      if (!terminal) {
+        logger.error("Terminal not found", new Error("Terminal not found"), {
+          terminalId,
+        });
+        return;
+      }
+
+      // Store terminal configuration before destroying
+      const config = {
+        name: terminal.name,
+        role: terminal.role,
+        roleConfig: terminal.roleConfig,
+        worktreePath: terminal.worktreePath,
+      };
+
+      logger.info("Stored terminal configuration for restart", {
         terminalId,
+        config,
       });
-      return;
-    }
 
-    // Store terminal configuration before destroying
-    const config = {
-      name: terminal.name,
-      role: terminal.role,
-      roleConfig: terminal.roleConfig,
-      worktreePath: terminal.worktreePath,
-    };
+      // Set terminal to busy status during restart
+      state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Busy });
 
-    logger.info("Stored terminal configuration for restart", {
-      terminalId,
-      config,
-    });
+      // Destroy the terminal via Tauri IPC
+      await invoke("destroy_terminal", { id: terminalId });
 
-    // Set terminal to busy status during restart
-    state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Busy });
+      logger.info("Destroyed terminal", { terminalId });
 
-    // Destroy the terminal via Tauri IPC
-    await invoke("destroy_terminal", { id: terminalId });
+      // Small delay to ensure tmux session is fully cleaned up
+      await new Promise((resolve) => setTimeout(resolve, TERMINAL_OUTPUT_STABILIZATION_MS));
 
-    logger.info("Destroyed terminal", { terminalId });
+      // Create a new terminal with the same configuration
+      const workspacePath = state.workspace.getWorkspace();
+      if (!workspacePath) {
+        throw new Error("No workspace path available");
+      }
 
-    // Small delay to ensure tmux session is fully cleaned up
-    await new Promise((resolve) => setTimeout(resolve, TERMINAL_OUTPUT_STABILIZATION_MS));
+      // Determine working directory - use worktree path if available, otherwise workspace
+      const workingDir = config.worktreePath || workspacePath;
 
-    // Create a new terminal with the same configuration
-    const workspacePath = state.workspace.getWorkspace();
-    if (!workspacePath) {
-      throw new Error("No workspace path available");
-    }
-
-    // Determine working directory - use worktree path if available, otherwise workspace
-    const workingDir = config.worktreePath || workspacePath;
-
-    await invoke("create_terminal", {
-      configId: terminalId,
-      name: config.name,
-      workingDir,
-      role: config.role || "",
-      instanceNumber: 0,
-    });
-
-    logger.info("Created new terminal", { terminalId });
-
-    // If terminal had a worktree path, set it again
-    if (config.worktreePath) {
-      await invoke("set_worktree_path", {
-        id: terminalId,
-        worktreePath: config.worktreePath,
+      await invoke("create_terminal", {
+        configId: terminalId,
+        name: config.name,
+        workingDir,
+        role: config.role || "",
+        instanceNumber: 0,
       });
-    }
 
-    // Update terminal status to idle
-    state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Idle });
+      logger.info("Created new terminal", { terminalId });
 
-    // Save the configuration
-    await saveCurrentConfig();
+      // If terminal had a worktree path, set it again
+      if (config.worktreePath) {
+        await invoke("set_worktree_path", {
+          id: terminalId,
+          worktreePath: config.worktreePath,
+        });
+      }
 
-    // If terminal had a role config with an agent, relaunch it
-    if (config.role === "claude-code-worker" && config.roleConfig?.roleFile) {
-      logger.info("Relaunching agent for restarted terminal", { terminalId });
+      // Update terminal status to idle
+      state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Idle });
 
-      const { launchAgentsForTerminals } = await import("./terminal-lifecycle");
-      await launchAgentsForTerminals(workspacePath, [terminal], {
-        state,
-        saveCurrentConfig,
-      });
-    }
+      // Save the configuration
+      await saveCurrentConfig();
 
-    logger.info("Successfully restarted terminal", { terminalId });
-  } catch (error) {
+      // If terminal had a role config with an agent, relaunch it
+      if (config.role === "claude-code-worker" && config.roleConfig?.roleFile) {
+        logger.info("Relaunching agent for restarted terminal", { terminalId });
+
+        const { launchAgentsForTerminals } = await import("./terminal-lifecycle");
+        await launchAgentsForTerminals(workspacePath, [terminal], {
+          state,
+          saveCurrentConfig,
+        });
+      }
+
+      logger.info("Successfully restarted terminal", { terminalId });
+
+      // Track usage event
+      trackEvent("terminal_restarted", "feature", { terminalId, role: config.role });
+    },
+    { terminalId }
+  ).catch((error) => {
     logger.error("Failed to restart terminal", error as Error, {
       terminalId,
     });
     // Reset status to idle on error
     state.terminals.updateTerminal(terminalId, { status: TerminalStatus.Idle });
     showToast(`Failed to restart terminal: ${error}`, "error");
-  }
+  });
 }
 
 /**
@@ -353,60 +362,68 @@ export async function createPlainTerminal(deps: {
   const terminalCount = state.terminals.getTerminals().length + 1;
   const name = `Terminal ${terminalCount}`;
 
-  try {
-    // Generate stable ID first
-    const id = generateNextConfigId(state.terminals.getTerminals());
+  return trackPerformance(
+    "createPlainTerminal",
+    "ipc",
+    async () => {
+      // Generate stable ID first
+      const id = generateNextConfigId(state.terminals.getTerminals());
 
-    // Get instance number for this terminal
-    const instanceNumber = state.terminals.getNextTerminalNumber();
+      // Get instance number for this terminal
+      const instanceNumber = state.terminals.getNextTerminalNumber();
 
-    // Create worktree for this terminal FIRST (before creating terminal)
-    // Use createWorktreeDirect which runs git commands directly via shell,
-    // avoiding the catch-22 of setupWorktreeForAgent which tries to send
-    // commands to a terminal that doesn't exist yet (see issue #734)
-    logger.info("Creating worktree for terminal", { name, id });
-    const { createWorktreeDirect } = await import("./worktree-manager");
-    const worktreePath = await createWorktreeDirect(id, workspacePath);
-    logger.info("Created worktree", { name, id, worktreePath });
+      // Create worktree for this terminal FIRST (before creating terminal)
+      // Use createWorktreeDirect which runs git commands directly via shell,
+      // avoiding the catch-22 of setupWorktreeForAgent which tries to send
+      // commands to a terminal that doesn't exist yet (see issue #734)
+      logger.info("Creating worktree for terminal", { name, id });
+      const { createWorktreeDirect } = await import("./worktree-manager");
+      const worktreePath = await createWorktreeDirect(id, workspacePath);
+      logger.info("Created worktree", { name, id, worktreePath });
 
-    // Create terminal in worktree directory (not workspace)
-    const terminalId = await invoke<string>("create_terminal", {
-      configId: id,
-      name,
-      workingDir: worktreePath,
-      role: "default",
-      instanceNumber,
-    });
+      // Create terminal in worktree directory (not workspace)
+      const terminalId = await invoke<string>("create_terminal", {
+        configId: id,
+        name,
+        workingDir: worktreePath,
+        role: "default",
+        instanceNumber,
+      });
 
-    logger.info("Created terminal", { name, id, tmuxId: terminalId, workingDir: worktreePath });
+      logger.info("Created terminal", { name, id, tmuxId: terminalId, workingDir: worktreePath });
 
-    // Add to state with default role (plain shell / driver)
-    const newTerminal: Terminal = {
-      id,
-      name,
-      worktreePath,
-      status: TerminalStatus.Idle,
-      isPrimary: false,
-      role: "default",
-      theme: "default",
-    };
-    state.terminals.addTerminal(newTerminal);
+      // Add to state with default role (plain shell / driver)
+      const newTerminal: Terminal = {
+        id,
+        name,
+        worktreePath,
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "default",
+        theme: "default",
+      };
+      state.terminals.addTerminal(newTerminal);
 
-    // Announce terminal creation to screen readers
-    announceTerminalCreated(name);
+      // Announce terminal creation to screen readers
+      announceTerminalCreated(name);
 
-    // Save updated state to config
-    await saveCurrentConfig();
+      // Save updated state to config
+      await saveCurrentConfig();
 
-    // Switch to new terminal
-    state.terminals.setPrimary(id);
+      // Switch to new terminal
+      state.terminals.setPrimary(id);
 
-    // Return the created terminal
-    return newTerminal;
-  } catch (error) {
+      // Track usage event
+      trackEvent("terminal_created", "feature", { terminalId: id, name });
+
+      // Return the created terminal
+      return newTerminal;
+    },
+    { terminalCount }
+  ).catch((error) => {
     const errorMessage = error instanceof Error ? error.message : String(error);
     logger.error("Failed to create terminal", error, { workspacePath, errorMessage });
     showToast(`Failed to create terminal: ${errorMessage}`, "error");
     return undefined;
-  }
+  });
 }
