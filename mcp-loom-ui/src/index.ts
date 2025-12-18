@@ -24,7 +24,7 @@ const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
 /**
  * Read the browser console log file
  */
-async function readConsoleLog(lines = 100): Promise<string> {
+async function readConsoleLog(lines = 20): Promise<string> {
   try {
     await access(CONSOLE_LOG_PATH);
     const content = await readFile(CONSOLE_LOG_PATH, "utf-8");
@@ -473,8 +473,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             lines: {
               type: "number",
-              description: "Number of recent lines to return (default: 100)",
-              default: 100,
+              description: "Number of recent lines to return (default: 20)",
+              default: 20,
             },
           },
         },
@@ -624,7 +624,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "read_console_log": {
-        const lines = (args?.lines as number) || 100;
+        const lines = (args?.lines as number) || 20;
         const log = await readConsoleLog(lines);
         return {
           content: [

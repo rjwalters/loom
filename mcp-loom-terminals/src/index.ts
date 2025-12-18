@@ -201,7 +201,7 @@ async function listTerminals(): Promise<Terminal[]> {
 /**
  * Get terminal output from the log file
  */
-async function getTerminalOutput(terminalId: string, lines = 100): Promise<string> {
+async function getTerminalOutput(terminalId: string, lines = 20): Promise<string> {
   try {
     const logPath = `/tmp/loom-${terminalId}.out`;
     const content = await readFile(logPath, "utf-8");
@@ -906,7 +906,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_terminal_output",
         description:
-          "Get the recent output from a specific terminal. Returns the last N lines of output (default 100). Use this to see what a terminal is currently showing.",
+          "Get the recent output from a specific terminal. Returns the last N lines of output (default 20). Use this to see what a terminal is currently showing.",
         inputSchema: {
           type: "object",
           properties: {
@@ -916,8 +916,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             lines: {
               type: "number",
-              description: "Number of lines to show (default: 100)",
-              default: 100,
+              description: "Number of lines to show (default: 20)",
+              default: 20,
             },
           },
           required: ["terminal_id"],
@@ -932,8 +932,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             lines: {
               type: "number",
-              description: "Number of output lines to include (default: 50)",
-              default: 50,
+              description: "Number of output lines to include (default: 20)",
+              default: 20,
             },
           },
         },
@@ -1217,7 +1217,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "get_terminal_output": {
         const terminalId = args?.terminal_id as string;
-        const lines = (args?.lines as number) || 100;
+        const lines = (args?.lines as number) || 20;
 
         if (!terminalId) {
           return {
@@ -1242,7 +1242,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "get_selected_terminal": {
-        const lines = (args?.lines as number) || 50;
+        const lines = (args?.lines as number) || 20;
         const state = await readStateFile();
 
         if (!state || !state.selectedTerminalId) {
