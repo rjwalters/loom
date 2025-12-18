@@ -4,6 +4,10 @@
 # Or manually: gh label create/edit commands
 
 # Core Workflow States
+- name: loom:triage
+  description: New issue awaiting Curator enhancement
+  color: "9CA3AF"  # gray-400 - neutral initial state
+
 - name: loom:issue
   description: Approved for work by human (ready for Builder to claim)
   color: "3B82F6"  # blue-500

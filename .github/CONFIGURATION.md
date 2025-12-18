@@ -83,6 +83,7 @@ The issue template integrates with Loom's label-based workflow coordination:
 | Label | Meaning | Who Sets It |
 |-------|---------|-------------|
 | `external` | External contribution | Workflow (automatic) |
+| `loom:triage` | New issue awaiting Curator enhancement | Issue template (automatic) |
 | `loom:curated` | Enhanced by Curator, awaiting human approval | Curator agent |
 | `loom:issue` | Approved for work, ready for Builder | Human (from curated) |
 | `loom:building` | Builder is implementing | Builder agent |
