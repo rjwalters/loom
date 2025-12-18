@@ -28,7 +28,6 @@ export default defineConfig({
         "src/lib/desktop-manager.ts",
         // Logging utilities
         "src/lib/console-logger.ts",
-        "src/lib/activity-logger.ts", // TODO: Add tests in follow-up PR
         // Test utilities
         "src/lib/test-utils/**",
       ],
