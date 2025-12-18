@@ -6,6 +6,7 @@ import type { AppState, Terminal } from "./state";
 import { TERMINAL_THEMES } from "./themes";
 import { showToast } from "./toast";
 import { parseJSONWithDefault } from "./validation";
+import { getSimpleWorkerLauncher } from "./worker-type-registry";
 
 const logger = Logger.forComponent("terminal-settings-modal");
 
@@ -573,18 +574,9 @@ async function applySettings(
       const workspacePath = state.workspace.getWorkspace();
       if (workspacePath && roleConfig.roleFile) {
         try {
-          if (workerType === "github-copilot") {
-            const { launchGitHubCopilotAgent } = await import("./agent-launcher");
-            await launchGitHubCopilotAgent(terminal.id);
-          } else if (workerType === "gemini") {
-            const { launchGeminiCLIAgent } = await import("./agent-launcher");
-            await launchGeminiCLIAgent(terminal.id);
-          } else if (workerType === "deepseek") {
-            const { launchDeepSeekAgent } = await import("./agent-launcher");
-            await launchDeepSeekAgent(terminal.id);
-          } else if (workerType === "grok") {
-            const { launchGrokAgent } = await import("./agent-launcher");
-            await launchGrokAgent(terminal.id);
+          const simpleLauncher = getSimpleWorkerLauncher(workerType);
+          if (simpleLauncher) {
+            await simpleLauncher(terminal.id);
           } else {
             const { launchAgentInTerminal } = await import("./agent-launcher");
             const { invoke } = await import("@tauri-apps/api/core");
