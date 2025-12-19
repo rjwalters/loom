@@ -15,6 +15,7 @@ import {
   handleWorkspaceStart,
 } from "./lib/engine-handlers";
 import { getHealthMonitor } from "./lib/health-monitor";
+import { getHistoryCache, initializeHistoryCache } from "./lib/history-cache";
 import {
   initializeKeyboardNavigation,
   initializeModalEscapeHandler,
@@ -104,6 +105,15 @@ window.addEventListener("beforeunload", async () => {
     } catch (error) {
       logger?.error("Failed to save state on beforeunload", error as Error);
     }
+  }
+
+  // Flush history cache to disk before closing
+  try {
+    const historyCache = getHistoryCache();
+    await historyCache.flushAll();
+    logger?.info("History cache flushed on beforeunload");
+  } catch (error) {
+    logger?.error("Failed to flush history cache on beforeunload", error as Error);
   }
 });
 
@@ -576,6 +586,9 @@ const browseWorkspaceWithCallback = () => browseWorkspace(handleWorkspacePathInp
 
     // Initialize error tracking for uncaught errors
     initializeErrorTracking();
+
+    // Initialize history cache for terminal output persistence
+    await initializeHistoryCache();
 
     // Test console logging immediately
     console.log("[Loom] Console logger initialized - this should appear in ~/.loom/console.log");

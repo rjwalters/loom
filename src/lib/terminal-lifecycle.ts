@@ -1,10 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { loadConfig } from "./config";
 import type { ConfigurableDependencies, CoreDependencies } from "./dependencies";
+import { getHistoryCache } from "./history-cache";
 import { Logger } from "./logger";
 import { startOfflineScheduler } from "./offline-scheduler";
 import type { Terminal } from "./state";
 import { TerminalStatus } from "./state";
+import { getTerminalManager } from "./terminal-manager";
 import { showToast } from "./toast";
 
 const logger = Logger.forComponent("terminal-lifecycle");
@@ -375,6 +377,28 @@ export async function reconnectTerminals(deps: TerminalLifecycleDependencies): P
         // Only initialize if this is the primary terminal to avoid creating too many instances
         if (agent.isPrimary && initializeTerminalDisplay) {
           initializeTerminalDisplay(agent.id);
+        }
+
+        // Restore cached history for this terminal
+        try {
+          const historyCache = getHistoryCache();
+          if (historyCache.isReady()) {
+            const cachedHistory = await historyCache.loadHistory(agent.id);
+            if (cachedHistory && cachedHistory.length > 0) {
+              const terminalManager = getTerminalManager();
+              terminalManager.restoreHistory(agent.id, cachedHistory);
+              logger.info("Restored cached history for terminal", {
+                terminalId: agent.id,
+                lineCount: cachedHistory.split("\n").length,
+              });
+            }
+          }
+        } catch (historyError) {
+          logger.warn("Failed to restore cached history", {
+            terminalId: agent.id,
+            error: String(historyError),
+          });
+          // Continue without history - non-fatal
         }
 
         reconnectedCount++;

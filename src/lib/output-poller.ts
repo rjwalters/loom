@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getHistoryCache } from "./history-cache";
 import { Logger } from "./logger";
 import { getTerminalManager } from "./terminal-manager";
 
@@ -200,6 +201,17 @@ export class OutputPoller {
         // Notify activity callback if registered
         if (this.activityCallback) {
           this.activityCallback(state.terminalId);
+        }
+
+        // Cache output to disk for persistence across restarts (async, non-blocking)
+        const historyCache = getHistoryCache();
+        if (historyCache.isReady()) {
+          historyCache.appendOutput(state.terminalId, text).catch((err) => {
+            logger.warn("Failed to cache history", {
+              terminalId: state.terminalId,
+              error: String(err),
+            });
+          });
         }
       }
       // Silently ignore empty polls - this is normal and expected

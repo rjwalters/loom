@@ -624,6 +624,34 @@ export class TerminalManager {
   }
 
   /**
+   * Restore history to terminal scrollback
+   * Used after app restart to restore cached terminal output
+   */
+  restoreHistory(terminalId: string, history: string): void {
+    const managed = this.terminals.get(terminalId);
+    if (!managed) {
+      logger.warn("Cannot restore history, terminal not found", { terminalId });
+      return;
+    }
+
+    if (!history || history.length === 0) {
+      logger.info("No history to restore", { terminalId });
+      return;
+    }
+
+    // Write history to terminal (appears in scrollback)
+    managed.terminal.write(history);
+
+    // Scroll to bottom (show most recent output)
+    managed.terminal.scrollToBottom();
+
+    logger.info("Restored terminal history", {
+      terminalId,
+      lineCount: history.split("\n").length,
+    });
+  }
+
+  /**
    * Export terminal output as plain text
    * @param terminalId - Terminal ID to export
    * @returns Blob containing plain text output

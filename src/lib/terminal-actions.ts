@@ -14,6 +14,7 @@ import type {
   RenderableDependencies,
   TerminalInfrastructureDependencies,
 } from "./dependencies";
+import { getHistoryCache } from "./history-cache";
 import { Logger } from "./logger";
 import { announceTerminalCreated, announceTerminalRemoved } from "./screen-reader-announcer";
 import type { AppState, Terminal } from "./state";
@@ -320,6 +321,16 @@ export async function closeTerminalWithConfirmation(
   // Stop polling and destroy terminal
   outputPoller.stopPolling(terminalId);
   terminalManager.destroyTerminal(terminalId);
+
+  // Clear cached history for this terminal
+  try {
+    const historyCache = getHistoryCache();
+    await historyCache.clearHistory(terminalId);
+    logger.info("Cleared history cache for terminal", { terminalId });
+  } catch (error) {
+    logger.warn("Failed to clear history cache", { terminalId, error: String(error) });
+    // Non-fatal - continue with terminal removal
+  }
 
   // Get terminal name before removing
   const terminalToRemove = state.terminals.getTerminals().find((t) => t.id === terminalId);
