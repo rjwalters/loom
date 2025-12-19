@@ -17,7 +17,7 @@ interface LogTailOptions {
 }
 
 async function tailLogFile(filePath: string, options: LogTailOptions = {}): Promise<string> {
-  const { lines = 100 } = options;
+  const { lines = 20 } = options;
 
   try {
     const fileStats = await stat(filePath);
@@ -55,7 +55,7 @@ async function listTerminalLogs(): Promise<string[]> {
   }
 }
 
-async function getTerminalLog(terminalId: string, lines: number = 100): Promise<string> {
+async function getTerminalLog(terminalId: string, lines: number = 20): Promise<string> {
   const logPath = `/tmp/loom-${terminalId}.out`;
   return tailLogFile(logPath, { lines });
 }
@@ -84,8 +84,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             lines: {
               type: "number",
-              description: "Number of lines to show (default: 100)",
-              default: 100,
+              description: "Number of lines to show (default: 20)",
+              default: 20,
             },
           },
         },
@@ -99,8 +99,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             lines: {
               type: "number",
-              description: "Number of lines to show (default: 100)",
-              default: 100,
+              description: "Number of lines to show (default: 20)",
+              default: 20,
             },
           },
         },
@@ -127,8 +127,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             lines: {
               type: "number",
-              description: "Number of lines to show (default: 100)",
-              default: 100,
+              description: "Number of lines to show (default: 20)",
+              default: 20,
             },
           },
           required: ["terminal_id"],
@@ -144,7 +144,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   try {
     switch (name) {
       case "tail_daemon_log": {
-        const lines = (args?.lines as number) || 100;
+        const lines = (args?.lines as number) || 20;
         const content = await tailLogFile(DAEMON_LOG, { lines });
         return {
           content: [
@@ -157,7 +157,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "tail_tauri_log": {
-        const lines = (args?.lines as number) || 100;
+        const lines = (args?.lines as number) || 20;
         const content = await tailLogFile(TAURI_LOG, { lines });
         return {
           content: [
@@ -193,7 +193,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "tail_terminal_log": {
         const terminalId = args?.terminal_id as string;
-        const lines = (args?.lines as number) || 100;
+        const lines = (args?.lines as number) || 20;
 
         if (!terminalId) {
           return {
