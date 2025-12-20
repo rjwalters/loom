@@ -85,27 +85,3 @@ function normalizeRole(role: string | undefined): TarotRole {
 
   return "default";
 }
-
-/**
- * Gets the tarot archetype name for a role
- * @param role - The terminal role
- * @returns The tarot archetype name (e.g., "The Magician")
- */
-export function getTarotArchetype(role: string | undefined): string {
-  const normalizedRole = normalizeRole(role);
-
-  const roleToArchetype: Record<TarotRole, string> = {
-    builder: "The Magician",
-    curator: "The High Priestess",
-    champion: "Strength",
-    architect: "The Emperor",
-    judge: "Justice",
-    hermit: "The Hermit",
-    doctor: "The Hanged Man",
-    guide: "The Hierophant",
-    driver: "The Chariot",
-    default: "The Fool",
-  };
-
-  return roleToArchetype[normalizedRole] || roleToArchetype.default;
-}
