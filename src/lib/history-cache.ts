@@ -75,7 +75,7 @@ export class HistoryCache {
 
     try {
       const home = await homeDir();
-      this.historyDir = `${home}.loom/terminal-history`;
+      this.historyDir = `${home}/.loom/terminal-history`;
       logger.info("History cache initialized", { historyDir: this.historyDir });
       this.initialized = true;
     } catch (error) {
