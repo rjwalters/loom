@@ -35,7 +35,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 ```bash
 # Terminal 1: Builder working on feature
 /builder
-# Claims loom:issue issue, implements, creates PR
+# Claims loom:ready issue, implements, creates PR
 
 # Terminal 2: Judge reviewing PRs
 /judge
@@ -43,7 +43,7 @@ Use Claude Code terminals with specialized roles for hands-on development coordi
 
 # Terminal 3: Curator maintaining issues
 /curator
-# Enhances unlabeled issues, marks as loom:curated
+# Enhances unlabeled issues, marks as loom:ready
 ```
 
 ### 2. Tauri App Mode
@@ -85,14 +85,9 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Workflow**: Finds `loom:review-requested` PRs → reviews → approves or requests changes
 - **When to use**: Code quality assurance, automated reviews
 
-**Champion** (Autonomous 10min, `champion.md`)
-- **Purpose**: Auto-merge approved PRs
-- **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
-- **When to use**: Reducing manual merge overhead for approved PRs
-
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
-- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated` (human approves → `loom:issue`)
+- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:issue`
 - **When to use**: Issue backlog maintenance, quality improvement
 
 **Architect** (Autonomous 15min, `architect.md`)
@@ -138,18 +133,12 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 ```
 (created) → loom:issue → loom:building → (closed)
            ↑ Curator      ↑ Builder
-
-(created) → loom:curating → loom:curated → loom:issue
-           ↑ Curator        ↑ Curator      ↑ Human approves
-
-(bug) → loom:treating → (fixed)
-       ↑ Doctor
 ```
 
 **PR Lifecycle**:
 ```
-(created) → loom:review-requested → loom:pr → (auto-merged)
-           ↑ Builder                ↑ Judge    ↑ Champion
+(created) → loom:review-requested → loom:pr → (merged)
+           ↑ Builder                ↑ Judge    ↑ Human
 ```
 
 **Proposal Lifecycle**:
@@ -163,22 +152,14 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 ### Label Definitions
 
-**Workflow Labels**:
 - **`loom:issue`**: Issue approved for work, ready for Builder to claim
-- **`loom:building`**: Builder is actively implementing this issue
-- **`loom:curating`**: Curator is actively enhancing this issue
-- **`loom:treating`**: Doctor is actively fixing this bug or addressing PR feedback
+- **`loom:building`**: Issue being implemented OR PR under review
 - **`loom:review-requested`**: PR ready for Judge to review
-- **`loom:changes-requested`**: PR requires changes (Judge requested modifications)
-- **`loom:pr`**: PR approved by Judge, ready for Champion to auto-merge
-
-**Proposal Labels**:
+- **`loom:pr`**: PR approved by Judge, ready for human to merge
 - **`loom:architect`**: Architectural proposal awaiting user approval
 - **`loom:hermit`**: Simplification proposal awaiting user approval
-- **`loom:curated`**: Issue enhanced by Curator, awaiting human approval
-
-**Status Labels**:
-- **`loom:blocked`**: Implementation blocked, needs help or clarification
+- **`loom:curated`**: Issue enhanced by Curator, awaiting approval
+- **`loom:blocked`**: Implementation blocked, needs help
 - **`loom:urgent`**: Critical issue requiring immediate attention
 
 ## Git Worktree Workflow
@@ -321,7 +302,7 @@ gh pr create --label "loom:review-requested"
 
 1. **Find unlabeled issues**:
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"
+   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit"
    ```
 
 2. **Enhance issue**:
@@ -330,9 +311,9 @@ gh pr create --label "loom:review-requested"
    gh issue edit 42 --body "Enhanced description..."
    ```
 
-3. **Mark as curated** (human will approve to add `loom:issue`):
+3. **Mark as ready**:
    ```bash
-   gh issue edit 42 --add-label "loom:curated"
+   gh issue edit 42 --add-label "loom:issue"
    ```
 
 ## Configuration
@@ -523,89 +504,6 @@ tail -f /tmp/loom-terminal-1.out
 which claude
 
 # Install if missing (see Claude Code documentation)
-```
-
-## MCP Hooks for Programmatic Control
-
-Loom provides MCP (Model Context Protocol) servers that allow Claude Code to programmatically control the Loom application. This enables automation, testing, and advanced workflows.
-
-### Available MCP Servers
-
-**loom-terminals** - Terminal management via daemon socket:
-- `list_terminals` - List all active terminal sessions
-- `get_terminal_output` - Get recent output from a terminal
-- `get_selected_terminal` - Get info about the currently selected terminal
-- `send_terminal_input` - Send input to a terminal
-- `create_terminal` - Create a new terminal session
-- `delete_terminal` - Delete a terminal session
-- `restart_terminal` - Restart a terminal preserving its config
-- `configure_terminal` - Update terminal settings (name, role, interval)
-- `set_primary_terminal` - Set which terminal is selected in the UI
-- `clear_terminal_history` - Clear terminal scrollback and log file
-- `check_tmux_server_health` - Check tmux server status
-- `get_tmux_server_info` - Get tmux server details
-- `toggle_tmux_verbose_logging` - Enable tmux debug logging
-
-**loom-ui** - UI control via file-based IPC:
-- `read_console_log` - Read browser console logs
-- `read_state_file` - Read workspace state
-- `read_config_file` - Read workspace config
-- `get_heartbeat` - Check if Loom app is running
-- `get_ui_state` - Get comprehensive UI state (terminals, workspace, engine)
-- `trigger_start` - Start engine with confirmation dialog
-- `trigger_force_start` - Start engine without confirmation
-- `trigger_factory_reset` - Reset workspace with confirmation
-- `trigger_force_factory_reset` - Reset workspace without confirmation
-- `trigger_restart_terminal` - Restart a specific terminal
-- `stop_engine` - Stop all terminals and clean up
-- `trigger_run_now` - Execute interval prompt immediately
-- `get_random_file` - Get random file from workspace
-
-### Example Usage
-
-```bash
-# Create a terminal with specific role
-mcp__loom-terminals__create_terminal --name "Builder" --role "builder"
-
-# Configure autonomous operation
-mcp__loom-terminals__configure_terminal \
-  --terminal_id terminal-1 \
-  --target_interval 300000 \
-  --interval_prompt "Check for new issues"
-
-# Trigger immediate autonomous run
-mcp__loom-ui__trigger_run_now --terminalId terminal-1
-
-# Stop all terminals
-mcp__loom-ui__stop_engine
-
-# Get comprehensive state
-mcp__loom-ui__get_ui_state
-```
-
-### MCP Server Configuration
-
-Add these MCP servers to your Claude Code configuration:
-
-```json
-{
-  "mcpServers": {
-    "loom-terminals": {
-      "command": "node",
-      "args": ["/path/to/loom/mcp-loom-terminals/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "/path/to/your/workspace"
-      }
-    },
-    "loom-ui": {
-      "command": "node",
-      "args": ["/path/to/loom/mcp-loom-ui/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "/path/to/your/workspace"
-      }
-    }
-  }
-}
 ```
 
 ## Resources

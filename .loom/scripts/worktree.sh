@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 
 # Loom Worktree Helper Script
 # Safely creates and manages git worktrees for agent development
@@ -106,7 +106,6 @@ Safety Features:
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
-  ✓ Automatically initializes git submodules
 
 Resuming Abandoned Work:
   If an agent abandoned work on issue #42, a new agent can resume:
@@ -297,23 +296,6 @@ fi
 if git worktree add "${CREATE_ARGS[@]}"; then
     # Get absolute path to worktree
     ABS_WORKTREE_PATH=$(cd "$WORKTREE_PATH" && pwd)
-
-    # Initialize git submodules if .gitmodules exists
-    if [[ -f .gitmodules ]]; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Initializing git submodules..."
-        fi
-
-        if git -C "$ABS_WORKTREE_PATH" submodule update --init --recursive 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_success "Submodules initialized"
-            fi
-        else
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Failed to initialize submodules (this may cause test failures)"
-            fi
-        fi
-    fi
 
     # Store return-to directory if provided
     if [[ -n "$RETURN_TO_DIR" ]]; then
