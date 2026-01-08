@@ -16,6 +16,30 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use chrono::Local;
+
+/// Loom installation metadata for template variable substitution
+#[derive(Default)]
+struct LoomMetadata {
+    /// Loom version from LOOM_VERSION env var (e.g., "0.1.0")
+    version: Option<String>,
+    /// Loom commit hash from LOOM_COMMIT env var (e.g., "d6cf9ac")
+    commit: Option<String>,
+    /// Installation date (generated at runtime)
+    install_date: String,
+}
+
+impl LoomMetadata {
+    /// Create metadata by reading from environment variables
+    fn from_env() -> Self {
+        Self {
+            version: std::env::var("LOOM_VERSION").ok(),
+            commit: std::env::var("LOOM_COMMIT").ok(),
+            install_date: Local::now().format("%Y-%m-%d").to_string(),
+        }
+    }
+}
+
 /// Extract repository owner and name from git remote URL
 ///
 /// Parses both HTTPS and SSH git remote URLs to extract owner/repo.
@@ -68,20 +92,30 @@ fn extract_repo_info(workspace_path: &Path) -> Option<(String, String)> {
 /// Replaces the following template variables:
 /// - `{{REPO_OWNER}}`: Repository owner from git remote
 /// - `{{REPO_NAME}}`: Repository name from git remote
+/// - `{{LOOM_VERSION}}`: Loom version from environment
+/// - `{{LOOM_COMMIT}}`: Loom commit hash from environment
+/// - `{{INSTALL_DATE}}`: Current date (YYYY-MM-DD format)
 ///
 /// If repo info is not available (non-GitHub remote or no remote),
-/// falls back to generic placeholders.
+/// falls back to generic placeholders. If Loom metadata is not available,
+/// falls back to "unknown" placeholders.
 fn substitute_template_variables(
     content: &str,
     repo_owner: Option<&str>,
     repo_name: Option<&str>,
+    loom_metadata: &LoomMetadata,
 ) -> String {
     let owner = repo_owner.unwrap_or("OWNER");
     let name = repo_name.unwrap_or("REPO");
+    let version = loom_metadata.version.as_deref().unwrap_or("unknown");
+    let commit = loom_metadata.commit.as_deref().unwrap_or("unknown");
 
     content
         .replace("{{REPO_OWNER}}", owner)
         .replace("{{REPO_NAME}}", name)
+        .replace("{{LOOM_VERSION}}", version)
+        .replace("{{LOOM_COMMIT}}", commit)
+        .replace("{{INSTALL_DATE}}", &loom_metadata.install_date)
 }
 
 /// Initialize a Loom workspace in the target directory
@@ -353,7 +387,9 @@ fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 /// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
 /// - Force mode: Overwrites existing files/directories
 /// - Non-force mode: Merges directories (copies missing files, keeps existing ones)
-/// - Template variables: Substitutes `{{REPO_OWNER}}` and `{{REPO_NAME}}` in workflow files
+/// - Template variables: Substitutes variables in CLAUDE.md, AGENTS.md, and workflow files
+///   - `{{REPO_OWNER}}`, `{{REPO_NAME}}`: Repository info from git remote
+///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
 fn setup_repository_scaffolding(
     workspace_path: &Path,
     defaults_path: &Path,
@@ -365,19 +401,33 @@ fn setup_repository_scaffolding(
         Some((owner, name)) => (Some(owner), Some(name)),
         None => (None, None),
     };
-    // Helper to copy file with force logic
-    let copy_file = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
-        if src.exists() {
-            if force && dst.exists() {
-                fs::remove_file(dst)
-                    .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+
+    // Get Loom installation metadata from environment variables
+    let loom_metadata = LoomMetadata::from_env();
+
+    // Helper to copy file with template variable substitution
+    let copy_file_with_substitution =
+        |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
+            if src.exists() {
+                if force && dst.exists() {
+                    fs::remove_file(dst)
+                        .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+                }
+                if force || !dst.exists() {
+                    let content = fs::read_to_string(src)
+                        .map_err(|e| format!("Failed to read {name}: {e}"))?;
+                    let substituted = substitute_template_variables(
+                        &content,
+                        repo_owner.as_deref(),
+                        repo_name.as_deref(),
+                        &loom_metadata,
+                    );
+                    fs::write(dst, substituted)
+                        .map_err(|e| format!("Failed to write {name}: {e}"))?;
+                }
             }
-            if force || !dst.exists() {
-                fs::copy(src, dst).map_err(|e| format!("Failed to copy {name}: {e}"))?;
-            }
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
     // Helper to copy directory with force logic
     let copy_directory = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
@@ -399,13 +449,14 @@ fn setup_repository_scaffolding(
 
     // Copy target-repo-specific CLAUDE.md and AGENTS.md from defaults/.loom/
     // (NOT defaults/CLAUDE.md which is for Loom repo itself)
-    copy_file(
+    // These files contain template variables that need to be substituted
+    copy_file_with_substitution(
         &defaults_path.join(".loom").join("CLAUDE.md"),
         &workspace_path.join("CLAUDE.md"),
         "CLAUDE.md",
     )?;
 
-    copy_file(
+    copy_file_with_substitution(
         &defaults_path.join(".loom").join("AGENTS.md"),
         &workspace_path.join("AGENTS.md"),
         "AGENTS.md",
@@ -442,8 +493,12 @@ fn setup_repository_scaffolding(
         let content = fs::read_to_string(&workflow_file)
             .map_err(|e| format!("Failed to read workflow file: {e}"))?;
 
-        let substituted =
-            substitute_template_variables(&content, repo_owner.as_deref(), repo_name.as_deref());
+        let substituted = substitute_template_variables(
+            &content,
+            repo_owner.as_deref(),
+            repo_name.as_deref(),
+            &loom_metadata,
+        );
 
         fs::write(&workflow_file, substituted)
             .map_err(|e| format!("Failed to write workflow file: {e}"))?;
@@ -541,6 +596,72 @@ mod tests {
         // Should now be valid
         let result = validate_git_repository(workspace.to_str().unwrap());
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_substitute_template_variables() {
+        let content = r#"
+**Loom Version**: {{LOOM_VERSION}}
+**Loom Commit**: {{LOOM_COMMIT}}
+**Installation Date**: {{INSTALL_DATE}}
+**Repository**: {{REPO_OWNER}}/{{REPO_NAME}}
+"#;
+
+        // Test with all values provided
+        let metadata = LoomMetadata {
+            version: Some("1.2.3".to_string()),
+            commit: Some("abc1234".to_string()),
+            install_date: "2024-01-15".to_string(),
+        };
+
+        let result = substitute_template_variables(
+            content,
+            Some("myorg"),
+            Some("myrepo"),
+            &metadata,
+        );
+
+        assert!(result.contains("**Loom Version**: 1.2.3"));
+        assert!(result.contains("**Loom Commit**: abc1234"));
+        assert!(result.contains("**Installation Date**: 2024-01-15"));
+        assert!(result.contains("**Repository**: myorg/myrepo"));
+
+        // Test with missing values (should use fallbacks)
+        let metadata_empty = LoomMetadata {
+            version: None,
+            commit: None,
+            install_date: "2024-01-15".to_string(),
+        };
+
+        let result_fallback = substitute_template_variables(
+            content,
+            None,
+            None,
+            &metadata_empty,
+        );
+
+        assert!(result_fallback.contains("**Loom Version**: unknown"));
+        assert!(result_fallback.contains("**Loom Commit**: unknown"));
+        assert!(result_fallback.contains("**Repository**: OWNER/REPO"));
+    }
+
+    #[test]
+    fn test_loom_metadata_from_env() {
+        // Test with environment variables set
+        std::env::set_var("LOOM_VERSION", "0.5.0");
+        std::env::set_var("LOOM_COMMIT", "def5678");
+
+        let metadata = LoomMetadata::from_env();
+
+        assert_eq!(metadata.version, Some("0.5.0".to_string()));
+        assert_eq!(metadata.commit, Some("def5678".to_string()));
+        // install_date should be today's date in YYYY-MM-DD format
+        assert!(metadata.install_date.len() == 10);
+        assert!(metadata.install_date.contains('-'));
+
+        // Clean up
+        std::env::remove_var("LOOM_VERSION");
+        std::env::remove_var("LOOM_COMMIT");
     }
 
     #[test]
