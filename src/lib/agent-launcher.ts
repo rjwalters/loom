@@ -394,6 +394,32 @@ export async function launchGrokAgent(terminalId: string): Promise<void> {
 }
 
 /**
+ * Launch Sourcegraph Amp CLI in a terminal
+ *
+ * This uses the Amp CLI to start an interactive coding session
+ * in the terminal. The agent runs visibly where users can see output and interact.
+ *
+ * @param terminalId - The terminal ID to launch Amp in
+ * @returns Promise that resolves when Amp is launched
+ */
+export async function launchAmpAgent(terminalId: string): Promise<void> {
+  // Build Amp CLI command for interactive mode
+  const command = "amp";
+
+  // Send command to terminal
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: command,
+  });
+
+  // Press Enter to execute
+  await invoke("send_terminal_input", {
+    id: terminalId,
+    data: "\r",
+  });
+}
+
+/**
  * Launch Codex agent in a terminal with system prompt
  *
  * This launches Codex with configuration similar to Claude Code:

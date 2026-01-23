@@ -29,6 +29,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const result = await checkAndReportDependencies();
@@ -47,6 +48,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       vi.mocked(ask).mockResolvedValue(false);
@@ -67,6 +69,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       vi.mocked(ask).mockResolvedValue(false);
@@ -87,6 +90,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       vi.mocked(ask).mockResolvedValue(false);
@@ -110,6 +114,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const result = await checkAndReportDependencies();
@@ -128,6 +133,25 @@ describe("dependency-checker", () => {
         gemini_cli_available: true,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
+      });
+
+      const result = await checkAndReportDependencies();
+
+      expect(result).toBe(true);
+    });
+
+    it("accepts Amp CLI as valid agent", async () => {
+      vi.mocked(invoke).mockResolvedValue({
+        tmux_available: true,
+        git_available: true,
+        claude_code_available: false,
+        gh_available: false,
+        gh_copilot_available: false,
+        gemini_cli_available: false,
+        deepseek_cli_available: false,
+        grok_cli_available: false,
+        amp_cli_available: true,
       });
 
       const result = await checkAndReportDependencies();
@@ -147,6 +171,7 @@ describe("dependency-checker", () => {
           gemini_cli_available: false,
           deepseek_cli_available: false,
           grok_cli_available: false,
+          amp_cli_available: false,
         })
         // Second call: Claude installed
         .mockResolvedValueOnce({
@@ -158,6 +183,7 @@ describe("dependency-checker", () => {
           gemini_cli_available: false,
           deepseek_cli_available: false,
           grok_cli_available: false,
+          amp_cli_available: false,
         });
 
       vi.mocked(ask).mockResolvedValue(true);
@@ -179,6 +205,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       vi.mocked(ask).mockResolvedValue(false);
@@ -200,6 +227,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
@@ -217,6 +245,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
@@ -234,6 +263,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
@@ -252,6 +282,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
@@ -269,6 +300,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: true,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
@@ -286,6 +318,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: true,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
@@ -303,11 +336,30 @@ describe("dependency-checker", () => {
         gemini_cli_available: false,
         deepseek_cli_available: false,
         grok_cli_available: true,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();
 
       expect(types).toContainEqual({ value: "grok", label: "xAI Grok" });
+    });
+
+    it("returns Amp when available", async () => {
+      vi.mocked(invoke).mockResolvedValue({
+        tmux_available: true,
+        git_available: true,
+        claude_code_available: false,
+        gh_available: false,
+        gh_copilot_available: false,
+        gemini_cli_available: false,
+        deepseek_cli_available: false,
+        grok_cli_available: false,
+        amp_cli_available: true,
+      });
+
+      const types = await getAvailableWorkerTypes();
+
+      expect(types).toContainEqual({ value: "amp", label: "Sourcegraph Amp" });
     });
 
     it("returns multiple worker types when multiple agents available", async () => {
@@ -320,6 +372,7 @@ describe("dependency-checker", () => {
         gemini_cli_available: true,
         deepseek_cli_available: false,
         grok_cli_available: false,
+        amp_cli_available: false,
       });
 
       const types = await getAvailableWorkerTypes();

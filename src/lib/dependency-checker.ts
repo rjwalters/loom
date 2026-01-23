@@ -10,6 +10,7 @@ interface DependencyStatus {
   gemini_cli_available: boolean;
   deepseek_cli_available: boolean;
   grok_cli_available: boolean;
+  amp_cli_available: boolean;
 }
 
 export async function checkAndReportDependencies(): Promise<boolean> {
@@ -26,7 +27,8 @@ export async function checkAndReportDependencies(): Promise<boolean> {
     (status.gh_available && status.gh_copilot_available) ||
     status.gemini_cli_available ||
     status.deepseek_cli_available ||
-    status.grok_cli_available;
+    status.grok_cli_available ||
+    status.amp_cli_available;
 
   // If we have critical deps and at least one agent, we're good
   if (criticalMissing.length === 0 && hasAtLeastOneAgent) {
@@ -79,6 +81,11 @@ export async function checkAndReportDependencies(): Promise<boolean> {
       message += "   • grok - xAI Grok CLI\n";
       message += "     Install: brew install xai/tap/grok-cli\n\n";
     }
+
+    if (!status.amp_cli_available) {
+      message += "   • amp - Sourcegraph Amp CLI\n";
+      message += "     Install: See https://github.com/sourcegraph/amp\n\n";
+    }
   }
 
   message += "Would you like to retry after installation?";
@@ -128,6 +135,10 @@ export async function getAvailableWorkerTypes(): Promise<Array<{ value: string; 
 
   if (status.grok_cli_available) {
     available.push({ value: "grok", label: "xAI Grok" });
+  }
+
+  if (status.amp_cli_available) {
+    available.push({ value: "amp", label: "Sourcegraph Amp" });
   }
 
   return available;
