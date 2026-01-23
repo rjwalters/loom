@@ -12,6 +12,7 @@ pub struct DependencyStatus {
     pub gemini_cli_available: bool,
     pub deepseek_cli_available: bool,
     pub grok_cli_available: bool,
+    pub amp_cli_available: bool,
 }
 
 pub fn check_dependencies() -> DependencyStatus {
@@ -24,6 +25,7 @@ pub fn check_dependencies() -> DependencyStatus {
         gemini_cli_available: check_command("gemini"),
         deepseek_cli_available: check_command("deepseek"),
         grok_cli_available: check_command("grok"),
+        amp_cli_available: check_command("amp"),
     }
 }
 

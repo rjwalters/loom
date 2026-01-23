@@ -129,6 +129,9 @@ export async function launchAgentsForTerminals(
       } else if (workerType === "grok") {
         const { launchGrokAgent } = await import("./agent-launcher");
         await launchGrokAgent(terminal.id);
+      } else if (workerType === "amp") {
+        const { launchAmpAgent } = await import("./agent-launcher");
+        await launchAmpAgent(terminal.id);
       } else if (workerType === "codex") {
         // Codex with worktree support (optional - starts in main workspace if empty)
         const { launchCodexAgent } = await import("./agent-launcher");
