@@ -199,29 +199,65 @@ async function listTerminals(): Promise<Terminal[]> {
 }
 
 /**
+ * Result type for terminal output
+ */
+interface TerminalOutputResult {
+  content: string;
+  linesReturned: number;
+  totalLines: number;
+  error?: string;
+}
+
+/**
+ * Format terminal output with line count metadata header
+ */
+function formatTerminalOutput(result: TerminalOutputResult, terminalId: string): string {
+  if (result.error) {
+    return `--- Terminal ${terminalId} Output (0 lines, file empty or does not exist) ---\n${result.error}`;
+  }
+  if (result.linesReturned === 0) {
+    return `--- Terminal ${terminalId} Output (0 lines, file empty) ---\n(empty terminal output)`;
+  }
+  return `--- Terminal ${terminalId} Output (${result.linesReturned} lines returned, ${result.totalLines} total lines available) ---\n${result.content}`;
+}
+
+/**
  * Get terminal output from the log file
  */
-async function getTerminalOutput(terminalId: string, lines = 20): Promise<string> {
+async function getTerminalOutput(terminalId: string, lines = 20): Promise<TerminalOutputResult> {
   try {
     const logPath = `/tmp/loom-${terminalId}.out`;
     const content = await readFile(logPath, "utf-8");
     const allLines = content.split("\n");
+    const totalLines = allLines.filter(Boolean).length;
 
     // Get last N lines (excluding empty trailing line)
     const relevantLines = allLines.slice(-lines - 1, -1).filter(Boolean);
-
-    if (relevantLines.length === 0) {
-      return "(empty terminal output)";
-    }
+    const linesReturned = relevantLines.length;
 
     // Strip ANSI escape sequences from output before returning
     const cleanOutput = relevantLines.map((line) => stripAnsi(line)).join("\n");
-    return cleanOutput;
+
+    return {
+      content: cleanOutput,
+      linesReturned,
+      totalLines,
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return `Terminal output file not found for ${terminalId}.\n\nThis usually means:\n- The terminal hasn't been created yet, or\n- The terminal was closed`;
+      return {
+        content: "",
+        linesReturned: 0,
+        totalLines: 0,
+        error: `Terminal output file not found for ${terminalId}.\n\nThis usually means:\n- The terminal hasn't been created yet, or\n- The terminal was closed`,
+      };
     }
-    return `Error reading terminal output: ${error}`;
+    return {
+      content: "",
+      linesReturned: 0,
+      totalLines: 0,
+      error: `Error reading terminal output: ${error}`,
+    };
   }
 }
 
@@ -1230,12 +1266,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const output = await getTerminalOutput(terminalId, lines);
+        const result = await getTerminalOutput(terminalId, lines);
         return {
           content: [
             {
               type: "text",
-              text: `=== Terminal ${terminalId} Output (last ${lines} lines) ===\n\n${output}`,
+              text: formatTerminalOutput(result, terminalId),
             },
           ],
         };
@@ -1269,7 +1305,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const output = await getTerminalOutput(terminal.id, lines);
+        const result = await getTerminalOutput(terminal.id, lines);
 
         const info = [
           `ID: ${terminal.id}`,
@@ -1285,7 +1321,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: `=== Currently Selected Terminal ===\n\n${info}\n\n=== Output (last ${lines} lines) ===\n\n${output}`,
+              text: `=== Currently Selected Terminal ===\n\n${info}\n\n${formatTerminalOutput(result, terminal.id)}`,
             },
           ],
         };

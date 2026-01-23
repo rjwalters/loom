@@ -21,24 +21,48 @@ import ignore from "ignore";
 const LOOM_DIR = join(homedir(), ".loom");
 const CONSOLE_LOG_PATH = join(LOOM_DIR, "console.log");
 
+interface LogResult {
+  content: string;
+  linesReturned: number;
+  totalLines: number;
+  error?: string;
+}
+
+function formatLogOutput(result: LogResult, logName: string): string {
+  if (result.error) {
+    return `--- ${logName} (0 lines, file empty or does not exist) ---\n${result.error}`;
+  }
+  if (result.linesReturned === 0) {
+    return `--- ${logName} (0 lines, file empty) ---\n(empty log file)`;
+  }
+  return `--- ${logName} (${result.linesReturned} lines returned, ${result.totalLines} total lines available) ---\n${result.content}`;
+}
+
 /**
  * Read the browser console log file
  */
-async function readConsoleLog(lines = 20): Promise<string> {
+async function readConsoleLog(lines = 20): Promise<LogResult> {
   try {
     await access(CONSOLE_LOG_PATH);
     const content = await readFile(CONSOLE_LOG_PATH, "utf-8");
     const allLines = content.split("\n");
+    const totalLines = allLines.filter(Boolean).length;
     const relevantLines = allLines.slice(-lines).filter(Boolean);
+    const linesReturned = relevantLines.length;
 
-    if (relevantLines.length === 0) {
-      return "(console log is empty)";
-    }
-
-    return relevantLines.join("\n");
+    return {
+      content: relevantLines.join("\n"),
+      linesReturned,
+      totalLines,
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return "Console log file not found. The Loom app may need to enable console logging.";
+      return {
+        content: "",
+        linesReturned: 0,
+        totalLines: 0,
+        error: "Console log file not found. The Loom app may need to enable console logging.",
+      };
     }
     throw error;
   }
@@ -625,12 +649,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "read_console_log": {
         const lines = (args?.lines as number) || 20;
-        const log = await readConsoleLog(lines);
+        const result = await readConsoleLog(lines);
         return {
           content: [
             {
               type: "text",
-              text: log,
+              text: formatLogOutput(result, "Console Log"),
             },
           ],
         };

@@ -16,32 +16,70 @@ interface LogTailOptions {
   follow?: boolean;
 }
 
-async function tailLogFile(filePath: string, options: LogTailOptions = {}): Promise<string> {
+interface LogTailResult {
+  content: string;
+  linesReturned: number;
+  totalLines: number;
+  error?: string;
+}
+
+async function tailLogFile(filePath: string, options: LogTailOptions = {}): Promise<LogTailResult> {
   const { lines = 20 } = options;
 
   try {
     const fileStats = await stat(filePath);
     if (!fileStats.isFile()) {
-      return `Error: ${filePath} is not a file`;
+      return {
+        content: "",
+        linesReturned: 0,
+        totalLines: 0,
+        error: `${filePath} is not a file`,
+      };
     }
 
     const content = await readFile(filePath, "utf-8");
     const allLines = content.split("\n");
+    // Filter out empty lines at the end
+    const nonEmptyLines = allLines.filter(
+      (line, index) => line !== "" || index < allLines.length - 1
+    );
+    const totalLines = nonEmptyLines.filter(Boolean).length;
 
     // Get last N lines (excluding empty trailing line)
     const relevantLines = allLines.slice(-lines - 1, -1).filter(Boolean);
+    const linesReturned = relevantLines.length;
 
-    if (relevantLines.length === 0) {
-      return `(empty log file)`;
-    }
-
-    return relevantLines.join("\n");
+    return {
+      content: relevantLines.join("\n"),
+      linesReturned,
+      totalLines,
+    };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return `Log file not found: ${filePath}\n\nThis usually means:\n- Loom hasn't been started yet, or\n- Logging to file hasn't been configured`;
+      return {
+        content: "",
+        linesReturned: 0,
+        totalLines: 0,
+        error: `Log file not found: ${filePath}\n\nThis usually means:\n- Loom hasn't been started yet, or\n- Logging to file hasn't been configured`,
+      };
     }
-    return `Error reading log: ${error}`;
+    return {
+      content: "",
+      linesReturned: 0,
+      totalLines: 0,
+      error: `Error reading log: ${error}`,
+    };
   }
+}
+
+function formatLogOutput(result: LogTailResult, logName: string): string {
+  if (result.error) {
+    return `--- ${logName} (0 lines, file empty or does not exist) ---\n${result.error}`;
+  }
+  if (result.linesReturned === 0) {
+    return `--- ${logName} (0 lines, file empty) ---\n(empty log file)`;
+  }
+  return `--- ${logName} (${result.linesReturned} lines returned, ${result.totalLines} total lines available) ---\n${result.content}`;
 }
 
 async function listTerminalLogs(): Promise<string[]> {
@@ -55,7 +93,7 @@ async function listTerminalLogs(): Promise<string[]> {
   }
 }
 
-async function getTerminalLog(terminalId: string, lines: number = 20): Promise<string> {
+async function getTerminalLog(terminalId: string, lines: number = 20): Promise<LogTailResult> {
   const logPath = `/tmp/loom-${terminalId}.out`;
   return tailLogFile(logPath, { lines });
 }
@@ -145,12 +183,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "tail_daemon_log": {
         const lines = (args?.lines as number) || 20;
-        const content = await tailLogFile(DAEMON_LOG, { lines });
+        const result = await tailLogFile(DAEMON_LOG, { lines });
         return {
           content: [
             {
               type: "text",
-              text: `=== Daemon Log (last ${lines} lines) ===\n\n${content}`,
+              text: formatLogOutput(result, "Daemon Log"),
             },
           ],
         };
@@ -158,12 +196,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "tail_tauri_log": {
         const lines = (args?.lines as number) || 20;
-        const content = await tailLogFile(TAURI_LOG, { lines });
+        const result = await tailLogFile(TAURI_LOG, { lines });
         return {
           content: [
             {
               type: "text",
-              text: `=== Tauri Log (last ${lines} lines) ===\n\n${content}`,
+              text: formatLogOutput(result, "Tauri Log"),
             },
           ],
         };
@@ -206,12 +244,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        const content = await getTerminalLog(terminalId, lines);
+        const result = await getTerminalLog(terminalId, lines);
         return {
           content: [
             {
               type: "text",
-              text: `=== Terminal ${terminalId} Log (last ${lines} lines) ===\n\n${content}`,
+              text: formatLogOutput(result, `Terminal ${terminalId} Log`),
             },
           ],
         };
