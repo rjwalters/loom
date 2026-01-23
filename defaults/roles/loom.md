@@ -31,6 +31,34 @@ You orchestrate the issue lifecycle by:
 - Each terminal can be Claude, GPT, or any other LLM
 - Coordination is through labels and MCP, not LLM-specific APIs
 
+## Command Options
+
+| Flag | Description |
+|------|-------------|
+| `--to <phase>` | Stop after specified phase (curated, pr, approved) |
+| `--resume` | Resume from last checkpoint in issue comments |
+| `--force` | Bypass approval gates - auto-approve and auto-merge |
+
+### --force Mode
+
+When `--force` is specified:
+1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
+2. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
+
+```bash
+# Force mode flow - no waiting at gates
+/loom 123 --force
+
+Curator → [auto-approve] → Builder → Judge → [auto-merge] → Complete
+```
+
+**Use cases for --force**:
+- Dogfooding/testing the orchestration system
+- Trusted issues where you've already decided to implement
+- Automated pipelines where human gates aren't needed
+
+**Warning**: Force mode merges PRs without human review of the merge decision. Judge still reviews code quality.
+
 ## Phase Flow
 
 When orchestrating issue #N, follow this progression:
@@ -40,11 +68,11 @@ When orchestrating issue #N, follow this progression:
 
 1. [Check State]  → Read issue labels, determine current phase
 2. [Curator]      → trigger_run_now(curator) → wait for loom:curated
-3. [Gate 1]       → Wait for loom:issue (Champion promotes or human approves)
+3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force)
 4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
 5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
 6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
-7. [Gate 2]       → Wait for merge (Champion or human)
+7. [Gate 2]       → Wait for merge (or auto-merge if --force)
 8. [Complete]     → Report success
 ```
 
@@ -211,6 +239,268 @@ else
 fi
 ```
 
+## Full Orchestration Workflow
+
+### Step 1: Check State
+
+```bash
+# Analyze issue state
+LABELS=$(gh issue view <number> --json labels --jq '.labels[].name')
+
+# Determine starting phase
+if echo "$LABELS" | grep -q "loom:building"; then
+  PHASE="builder"  # Already claimed, skip to monitoring
+elif echo "$LABELS" | grep -q "loom:issue"; then
+  PHASE="builder"  # Ready for building
+elif echo "$LABELS" | grep -q "loom:curated"; then
+  PHASE="gate1"    # Waiting for approval
+else
+  PHASE="curator"  # Needs curation first
+fi
+```
+
+### Step 2: Curator Phase
+
+```bash
+if [ "$PHASE" = "curator" ]; then
+  # Find curator terminal
+  CURATOR_TERMINAL="terminal-2"  # or lookup from config
+
+  # Restart and configure
+  mcp__loom-terminals__restart_terminal --terminal_id $CURATOR_TERMINAL
+  mcp__loom-terminals__configure_terminal \
+    --terminal_id $CURATOR_TERMINAL \
+    --interval_prompt "Curate issue #$ISSUE_NUMBER. Add implementation details and acceptance criteria."
+
+  # Trigger
+  mcp__loom-ui__trigger_run_now --terminalId $CURATOR_TERMINAL
+
+  # Wait for completion
+  while true; do
+    LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
+    if echo "$LABELS" | grep -q "loom:curated\|loom:issue"; then
+      break
+    fi
+    sleep 30
+  done
+
+  # Update progress
+  update_progress "curator" "complete"
+fi
+```
+
+### Step 3: Gate 1 - Approval
+
+```bash
+if [ "$PHASE" = "gate1" ]; then
+  # Check if --force mode - auto-approve
+  if [ "$FORCE_MODE" = "true" ]; then
+    echo "Force mode: auto-approving issue"
+    gh issue edit $ISSUE_NUMBER --add-label "loom:issue"
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-approved** via \`/loom --force\`"
+  else
+    # Wait for human or Champion to promote to loom:issue
+    TIMEOUT=1800  # 30 minutes
+    START=$(date +%s)
+
+    while true; do
+      LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
+      if echo "$LABELS" | grep -q "loom:issue"; then
+        echo "Issue approved for implementation"
+        break
+      fi
+
+      NOW=$(date +%s)
+      if [ $((NOW - START)) -gt $TIMEOUT ]; then
+        echo "Timeout waiting for approval"
+        gh issue comment $ISSUE_NUMBER --body "⏳ Orchestration paused: waiting for approval (loom:issue label)"
+        exit 0
+      fi
+
+      sleep 30
+    done
+  fi
+fi
+```
+
+### Step 4: Builder Phase
+
+```bash
+if [ "$PHASE" = "builder" ]; then
+  BUILDER_TERMINAL="terminal-3"
+
+  mcp__loom-terminals__restart_terminal --terminal_id $BUILDER_TERMINAL
+  mcp__loom-terminals__configure_terminal \
+    --terminal_id $BUILDER_TERMINAL \
+    --interval_prompt "Build issue #$ISSUE_NUMBER. Create worktree, implement, test, create PR."
+
+  mcp__loom-ui__trigger_run_now --terminalId $BUILDER_TERMINAL
+
+  # Wait for PR creation
+  while true; do
+    # Check if a PR exists for this issue
+    PR_NUMBER=$(gh pr list --search "Closes #$ISSUE_NUMBER" --state open --json number --jq '.[0].number')
+    if [ -n "$PR_NUMBER" ]; then
+      echo "PR #$PR_NUMBER created"
+      break
+    fi
+    sleep 30
+  done
+
+  update_progress "builder" "complete" "$PR_NUMBER"
+fi
+```
+
+### Step 5: Judge Phase
+
+```bash
+if [ "$PHASE" = "judge" ]; then
+  JUDGE_TERMINAL="terminal-1"
+
+  mcp__loom-terminals__restart_terminal --terminal_id $JUDGE_TERMINAL
+  mcp__loom-terminals__configure_terminal \
+    --terminal_id $JUDGE_TERMINAL \
+    --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
+
+  mcp__loom-ui__trigger_run_now --terminalId $JUDGE_TERMINAL
+
+  # Wait for review completion
+  while true; do
+    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+    if echo "$LABELS" | grep -q "loom:pr"; then
+      echo "PR approved"
+      PHASE="gate2"
+      break
+    elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+      echo "Changes requested"
+      PHASE="doctor"
+      break
+    fi
+    sleep 30
+  done
+fi
+```
+
+### Step 6: Doctor Loop
+
+```bash
+MAX_DOCTOR_ITERATIONS=3
+DOCTOR_ITERATION=0
+
+while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS ]; do
+  DOCTOR_TERMINAL="terminal-4"  # or lookup
+
+  mcp__loom-terminals__restart_terminal --terminal_id $DOCTOR_TERMINAL
+  mcp__loom-terminals__configure_terminal \
+    --terminal_id $DOCTOR_TERMINAL \
+    --interval_prompt "Address review feedback on PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
+
+  mcp__loom-ui__trigger_run_now --terminalId $DOCTOR_TERMINAL
+
+  # Wait for Doctor to complete and re-trigger Judge
+  while true; do
+    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+    if echo "$LABELS" | grep -q "loom:review-requested"; then
+      echo "Doctor completed, returning to Judge"
+      PHASE="judge"
+      break
+    fi
+    sleep 30
+  done
+
+  DOCTOR_ITERATION=$((DOCTOR_ITERATION + 1))
+
+  # If we've returned to judge phase, run the judge again
+  if [ "$PHASE" = "judge" ]; then
+    # ... trigger judge again (same as Step 5) ...
+
+    # Check result
+    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+    if echo "$LABELS" | grep -q "loom:pr"; then
+      PHASE="gate2"
+      break
+    elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+      PHASE="doctor"
+      # Continue loop
+    fi
+  fi
+done
+
+if [ $DOCTOR_ITERATION -ge $MAX_DOCTOR_ITERATIONS ]; then
+  gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration blocked**: Maximum Doctor iterations ($MAX_DOCTOR_ITERATIONS) reached without approval. Manual intervention required."
+  gh issue edit $ISSUE_NUMBER --add-label "loom:blocked"
+  exit 1
+fi
+```
+
+### Step 7: Gate 2 - Merge
+
+```bash
+if [ "$PHASE" = "gate2" ]; then
+  # Check if --force mode - auto-merge
+  if [ "$FORCE_MODE" = "true" ]; then
+    echo "Force mode: auto-merging PR"
+    gh pr merge $PR_NUMBER --squash --delete-branch
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force\`"
+  else
+    # Trigger Champion or wait for human merge
+    CHAMPION_TERMINAL="terminal-5"  # if exists
+
+    mcp__loom-ui__trigger_run_now --terminalId $CHAMPION_TERMINAL
+
+    # Wait for merge
+    TIMEOUT=1800  # 30 minutes
+    START=$(date +%s)
+
+    while true; do
+      PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
+      if [ "$PR_STATE" = "MERGED" ]; then
+        echo "PR merged successfully"
+        break
+      elif [ "$PR_STATE" = "CLOSED" ]; then
+        echo "PR was closed without merging"
+        exit 1
+      fi
+
+      NOW=$(date +%s)
+      if [ $((NOW - START)) -gt $TIMEOUT ]; then
+        echo "Timeout waiting for merge"
+        gh issue comment $ISSUE_NUMBER --body "⏳ Orchestration complete: PR #$PR_NUMBER is approved and ready for merge."
+        exit 0
+      fi
+
+      sleep 30
+    done
+  fi
+fi
+```
+
+### Step 8: Complete
+
+```bash
+# Final status report
+gh issue comment $ISSUE_NUMBER --body "$(cat <<EOF
+## ✅ Orchestration Complete
+
+Issue #$ISSUE_NUMBER has been successfully shepherded through the development lifecycle:
+
+| Phase | Status |
+|-------|--------|
+| Curator | ✅ Enhanced with implementation details |
+| Approval | ✅ Approved for implementation |
+| Builder | ✅ Implemented in PR #$PR_NUMBER |
+| Judge | ✅ Code review passed |
+| Merge | ✅ PR merged |
+
+**Total orchestration time**: $DURATION
+
+<!-- loom:orchestrator
+{"phase":"complete","pr":$PR_NUMBER,"completed":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+-->
+EOF
+)"
+```
+
 ## Terminal Configuration Requirements
 
 For orchestration to work, you need these terminals configured:
@@ -256,15 +546,6 @@ If MCP calls fail:
 echo "ERROR: MCP connection failed. Check Loom daemon status."
 # Fall back to manual notification
 gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration paused**: Cannot connect to Loom. Continuing manually..."
-```
-
-### Max Doctor Iterations Reached
-
-If the Judge/Doctor loop exceeds 3 iterations:
-
-```bash
-gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration blocked**: Maximum Doctor iterations (3) reached without approval. Manual intervention required."
-gh issue edit $ISSUE_NUMBER --add-label "loom:blocked"
 ```
 
 ## Report Format
