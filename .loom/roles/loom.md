@@ -31,6 +31,34 @@ You orchestrate the issue lifecycle by:
 - Each terminal can be Claude, GPT, or any other LLM
 - Coordination is through labels and MCP, not LLM-specific APIs
 
+## Command Options
+
+| Flag | Description |
+|------|-------------|
+| `--to <phase>` | Stop after specified phase (curated, pr, approved) |
+| `--resume` | Resume from last checkpoint in issue comments |
+| `--force` | Bypass approval gates - auto-approve and auto-merge |
+
+### --force Mode
+
+When `--force` is specified:
+1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
+2. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
+
+```bash
+# Force mode flow - no waiting at gates
+/loom 123 --force
+
+Curator → [auto-approve] → Builder → Judge → [auto-merge] → Complete
+```
+
+**Use cases for --force**:
+- Dogfooding/testing the orchestration system
+- Trusted issues where you've already decided to implement
+- Automated pipelines where human gates aren't needed
+
+**Warning**: Force mode merges PRs without human review of the merge decision. Judge still reviews code quality.
+
 ## Phase Flow
 
 When orchestrating issue #N, follow this progression:
@@ -40,11 +68,11 @@ When orchestrating issue #N, follow this progression:
 
 1. [Check State]  → Read issue labels, determine current phase
 2. [Curator]      → trigger_run_now(curator) → wait for loom:curated
-3. [Gate 1]       → Wait for loom:issue (Champion promotes or human approves)
+3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force)
 4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
 5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
 6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
-7. [Gate 2]       → Wait for merge (Champion or human)
+7. [Gate 2]       → Wait for merge (or auto-merge if --force)
 8. [Complete]     → Report success
 ```
 
@@ -265,26 +293,33 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate1" ]; then
-  # Wait for human or Champion to promote to loom:issue
-  TIMEOUT=1800  # 30 minutes
-  START=$(date +%s)
+  # Check if --force mode - auto-approve
+  if [ "$FORCE_MODE" = "true" ]; then
+    echo "Force mode: auto-approving issue"
+    gh issue edit $ISSUE_NUMBER --add-label "loom:issue"
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-approved** via \`/loom --force\`"
+  else
+    # Wait for human or Champion to promote to loom:issue
+    TIMEOUT=1800  # 30 minutes
+    START=$(date +%s)
 
-  while true; do
-    LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
-    if echo "$LABELS" | grep -q "loom:issue"; then
-      echo "Issue approved for implementation"
-      break
-    fi
+    while true; do
+      LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
+      if echo "$LABELS" | grep -q "loom:issue"; then
+        echo "Issue approved for implementation"
+        break
+      fi
 
-    NOW=$(date +%s)
-    if [ $((NOW - START)) -gt $TIMEOUT ]; then
-      echo "Timeout waiting for approval"
-      gh issue comment $ISSUE_NUMBER --body "⏳ Orchestration paused: waiting for approval (loom:issue label)"
-      exit 0
-    fi
+      NOW=$(date +%s)
+      if [ $((NOW - START)) -gt $TIMEOUT ]; then
+        echo "Timeout waiting for approval"
+        gh issue comment $ISSUE_NUMBER --body "⏳ Orchestration paused: waiting for approval (loom:issue label)"
+        exit 0
+      fi
 
-    sleep 30
-  done
+      sleep 30
+    done
+  fi
 fi
 ```
 
@@ -402,34 +437,41 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate2" ]; then
-  # Trigger Champion or wait for human merge
-  CHAMPION_TERMINAL="terminal-5"  # if exists
+  # Check if --force mode - auto-merge
+  if [ "$FORCE_MODE" = "true" ]; then
+    echo "Force mode: auto-merging PR"
+    gh pr merge $PR_NUMBER --squash --delete-branch
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force\`"
+  else
+    # Trigger Champion or wait for human merge
+    CHAMPION_TERMINAL="terminal-5"  # if exists
 
-  mcp__loom-ui__trigger_run_now --terminalId $CHAMPION_TERMINAL
+    mcp__loom-ui__trigger_run_now --terminalId $CHAMPION_TERMINAL
 
-  # Wait for merge
-  TIMEOUT=1800  # 30 minutes
-  START=$(date +%s)
+    # Wait for merge
+    TIMEOUT=1800  # 30 minutes
+    START=$(date +%s)
 
-  while true; do
-    PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
-    if [ "$PR_STATE" = "MERGED" ]; then
-      echo "PR merged successfully"
-      break
-    elif [ "$PR_STATE" = "CLOSED" ]; then
-      echo "PR was closed without merging"
-      exit 1
-    fi
+    while true; do
+      PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
+      if [ "$PR_STATE" = "MERGED" ]; then
+        echo "PR merged successfully"
+        break
+      elif [ "$PR_STATE" = "CLOSED" ]; then
+        echo "PR was closed without merging"
+        exit 1
+      fi
 
-    NOW=$(date +%s)
-    if [ $((NOW - START)) -gt $TIMEOUT ]; then
-      echo "Timeout waiting for merge"
-      gh issue comment $ISSUE_NUMBER --body "⏳ Orchestration complete: PR #$PR_NUMBER is approved and ready for merge."
-      exit 0
-    fi
+      NOW=$(date +%s)
+      if [ $((NOW - START)) -gt $TIMEOUT ]; then
+        echo "Timeout waiting for merge"
+        gh issue comment $ISSUE_NUMBER --body "⏳ Orchestration complete: PR #$PR_NUMBER is approved and ready for merge."
+        exit 0
+      fi
 
-    sleep 30
-  done
+      sleep 30
+    done
+  fi
 fi
 ```
 

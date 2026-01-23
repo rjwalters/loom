@@ -29,7 +29,26 @@ You don't do the work yourself - you orchestrate other terminals via MCP.
 /loom 123
 /loom 456 --to curated    # Stop after curator phase
 /loom 789 --resume        # Resume from last checkpoint
+/loom 321 --force         # Bypass approval gates, push to merge
 ```
+
+## Options
+
+| Flag | Description |
+|------|-------------|
+| `--to <phase>` | Stop after specified phase (curated, pr, approved) |
+| `--resume` | Resume from last checkpoint in issue comments |
+| `--force` | Bypass approval gates - auto-approve and auto-merge |
+
+### --force Mode
+
+When `--force` is specified, the orchestrator:
+1. **Skips Gate 1**: Auto-adds `loom:issue` label instead of waiting for human approval
+2. **Skips Gate 2**: Auto-merges the PR after Judge approval instead of waiting
+
+Use `--force` when you've already decided to implement an issue and want hands-off orchestration.
+
+**Warning**: Force mode will merge PRs without human review of the merge decision. The Judge still reviews code quality, but the final merge happens automatically.
 
 ## Phase Flow
 
