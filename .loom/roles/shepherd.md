@@ -278,6 +278,8 @@ When orchestrating issue #N, follow this progression:
 
 **Note**: In Direct Mode, "trigger_run_now" becomes "execute directly following role guidelines".
 
+**Important**: Curation is mandatory. Even if an issue already has `loom:issue` label, the shepherd will run Curator first if `loom:curated` is not present. This ensures all issues receive proper enhancement (acceptance criteria, implementation guidance, test plans) before building begins.
+
 ## Triggering Terminals (MCP Mode)
 
 ### Finding Terminal IDs
@@ -467,14 +469,20 @@ fi
 LABELS=$(gh issue view <number> --json labels --jq '.labels[].name')
 
 # Determine starting phase
+# IMPORTANT: Always ensure curation happens before building
 if echo "$LABELS" | grep -q "loom:building"; then
   PHASE="builder"  # Already claimed, skip to monitoring
-elif echo "$LABELS" | grep -q "loom:issue"; then
-  PHASE="builder"  # Ready for building
 elif echo "$LABELS" | grep -q "loom:curated"; then
-  PHASE="gate1"    # Waiting for approval
+  # Issue has been curated
+  if echo "$LABELS" | grep -q "loom:issue"; then
+    PHASE="builder"  # Curated AND approved - ready for building
+  else
+    PHASE="gate1"    # Curated but waiting for approval
+  fi
 else
-  PHASE="curator"  # Needs curation first
+  # Issue has NOT been curated - always run curator first
+  # Even if loom:issue is present, curation ensures quality
+  PHASE="curator"
 fi
 ```
 
