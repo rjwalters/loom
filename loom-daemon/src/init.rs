@@ -151,10 +151,11 @@ fn substitute_template_variables(
 /// # Behavior
 ///
 /// - **Fresh install** (no .loom directory): Copies all files from defaults
-/// - **Reinstall with force=false** (merge mode): Adds new files, preserves existing files
-/// - **Reinstall with force=true**: Overwrites all files from defaults
+/// - **Reinstall with force=false** (merge mode): Adds new files, preserves ALL existing files
+/// - **Reinstall with force=true** (force-merge mode): Updates default files, preserves custom files
 ///
-/// Merge mode is recommended for reinstalls to preserve custom project roles/commands.
+/// Both reinstall modes preserve custom project roles/commands (files not in defaults).
+/// Force mode is useful when you want to update Loom's built-in roles to the latest version.
 ///
 /// # Errors
 ///
@@ -180,11 +181,10 @@ pub fn initialize_workspace(
     // Determine if this is a fresh install or reinstall
     let is_reinstall = loom_path.exists();
 
-    if is_reinstall && force {
-        // Force mode: remove existing .loom directory completely
-        fs::remove_dir_all(&loom_path)
-            .map_err(|e| format!("Failed to remove existing .loom directory: {e}"))?;
-    }
+    // Note: We no longer delete .loom directory in force mode.
+    // Force mode now means "overwrite default files but preserve custom files"
+    // This allows reinstallation to update Loom while keeping project-specific roles.
+    let _ = (is_reinstall, force); // Silence unused warning, these affect behavior below
 
     // Create .loom directory if it doesn't exist
     fs::create_dir_all(&loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
@@ -203,32 +203,45 @@ pub fn initialize_workspace(
         }
     }
 
-    // Copy roles/ directory with merge mode (preserve custom roles)
+    // Copy roles/ directory - always preserve custom roles
+    // - Fresh install: copy all from defaults
+    // - Reinstall (merge): add new files, preserve all existing
+    // - Reinstall (force): update default files, preserve custom files
     let roles_src = defaults.join("roles");
     let roles_dst = loom_path.join("roles");
     if roles_src.exists() {
-        if is_reinstall && !force {
-            // Merge mode: preserve existing custom roles
-            merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
-                .map_err(|e| format!("Failed to merge roles directory: {e}"))?;
-        } else {
-            // Fresh install or force mode: copy all
+        if !is_reinstall {
+            // Fresh install: copy all
             copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
                 .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
+        } else if force {
+            // Force reinstall: update defaults, preserve custom
+            force_merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
+                .map_err(|e| format!("Failed to force-merge roles directory: {e}"))?;
+        } else {
+            // Merge reinstall: add new files only, preserve all existing
+            merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
+                .map_err(|e| format!("Failed to merge roles directory: {e}"))?;
         }
     }
 
-    // Copy scripts/ directory (always overwrite - these are Loom's scripts)
+    // Copy scripts/ directory - always preserve custom scripts
+    // Same logic as roles
     let scripts_src = defaults.join("scripts");
     let scripts_dst = loom_path.join("scripts");
     if scripts_src.exists() {
-        if is_reinstall && !force {
-            // Merge mode for scripts too - user might have custom scripts
-            merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
-                .map_err(|e| format!("Failed to merge scripts directory: {e}"))?;
-        } else {
+        if !is_reinstall {
+            // Fresh install: copy all
             copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
                 .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
+        } else if force {
+            // Force reinstall: update defaults, preserve custom
+            force_merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
+                .map_err(|e| format!("Failed to force-merge scripts directory: {e}"))?;
+        } else {
+            // Merge reinstall: add new files only, preserve all existing
+            merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
+                .map_err(|e| format!("Failed to merge scripts directory: {e}"))?;
         }
     }
 
@@ -517,6 +530,67 @@ fn merge_dir_with_report(
     Ok(())
 }
 
+/// Force-merge directory recursively with reporting
+///
+/// Like merge_dir_with_report but OVERWRITES files from defaults while
+/// still preserving custom files (files in dst that don't exist in src).
+/// This is used for reinstallation to update Loom files while keeping
+/// project-specific customizations.
+fn force_merge_dir_with_report(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    // Collect files in source for comparison
+    let src_files: HashSet<_> = fs::read_dir(src)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+
+    // Check for files in dst that aren't in src (custom files) - these are preserved
+    if dst.exists() {
+        for entry in fs::read_dir(dst)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if !src_files.contains(&file_name) {
+                let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+                // This is a custom file not in defaults - preserved
+                if entry.file_type()?.is_file() {
+                    report.preserved.push(rel_path);
+                }
+            }
+        }
+    }
+
+    // Process source files - overwrite existing files from defaults
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
+        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+
+        if file_type.is_dir() {
+            force_merge_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
+        } else {
+            let existed = dst_path.exists();
+            // Always copy from source (overwrite if exists)
+            fs::copy(&src_path, &dst_path)?;
+            if existed {
+                report.updated.push(rel_path);
+            } else {
+                report.added.push(rel_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Setup repository scaffolding files
 ///
 /// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
@@ -551,8 +625,8 @@ fn setup_repository_scaffolding(
                         .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
                 }
                 if force || !existed {
-                    let content =
-                        fs::read_to_string(src).map_err(|e| format!("Failed to read {name}: {e}"))?;
+                    let content = fs::read_to_string(src)
+                        .map_err(|e| format!("Failed to read {name}: {e}"))?;
                     let substituted = substitute_template_variables(
                         &content,
                         repo_owner.as_deref(),
@@ -1005,6 +1079,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(builder_content, "builder command from defaults");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_force_merge_preserves_custom_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        // Create source (defaults) with some files
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("builder.md"), "new builder content").unwrap();
+        fs::write(src.join("judge.md"), "new judge content").unwrap();
+
+        // Create destination with existing files (some default, some custom)
+        fs::create_dir(&dst).unwrap();
+        fs::write(dst.join("builder.md"), "old builder content").unwrap();
+        fs::write(dst.join("designer.md"), "custom designer content").unwrap(); // Custom file
+
+        // Force-merge directories
+        let mut report = InitReport::default();
+        force_merge_dir_with_report(&src, &dst, "roles", &mut report).unwrap();
+
+        // Verify: builder.md was UPDATED (overwritten from defaults)
+        let builder = fs::read_to_string(dst.join("builder.md")).unwrap();
+        assert_eq!(builder, "new builder content");
+
+        // Verify: judge.md was ADDED (new file from defaults)
+        let judge = fs::read_to_string(dst.join("judge.md")).unwrap();
+        assert_eq!(judge, "new judge content");
+
+        // Verify: designer.md was PRESERVED (custom file not in defaults)
+        assert!(dst.join("designer.md").exists());
+        let designer = fs::read_to_string(dst.join("designer.md")).unwrap();
+        assert_eq!(designer, "custom designer content");
+
+        // Verify report
+        assert!(report.updated.contains(&"roles/builder.md".to_string()));
+        assert!(report.added.contains(&"roles/judge.md".to_string()));
+        assert!(report.preserved.contains(&"roles/designer.md".to_string()));
     }
 
     #[test]
