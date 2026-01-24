@@ -594,11 +594,14 @@ fn force_merge_dir_with_report(
 /// Setup repository scaffolding files
 ///
 /// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
-/// - Force mode: Overwrites existing files/directories
-/// - Non-force mode: Merges directories (copies missing files, keeps existing ones)
+/// - Fresh install: Copies all files from defaults
+/// - Reinstall without force (merge mode): Adds new files, preserves ALL existing files
+/// - Reinstall with force (force-merge mode): Updates default files, preserves custom files
 /// - Template variables: Substitutes variables in CLAUDE.md, AGENTS.md, and workflow files
 ///   - `{{REPO_OWNER}}`, `{{REPO_NAME}}`: Repository info from git remote
 ///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
+///
+/// Custom files (files in workspace that don't exist in defaults) are always preserved.
 fn setup_repository_scaffolding(
     workspace_path: &Path,
     defaults_path: &Path,
@@ -648,18 +651,22 @@ fn setup_repository_scaffolding(
         };
 
     // Helper to copy directory with force logic and reporting
+    // - Fresh install (dst doesn't exist): copy all
+    // - Reinstall without force: merge (add new, preserve existing)
+    // - Reinstall with force: force-merge (update defaults, preserve custom)
     let copy_directory =
         |src: &Path, dst: &Path, name: &str, report: &mut InitReport| -> Result<(), String> {
             if src.exists() {
-                if force && dst.exists() {
-                    fs::remove_dir_all(dst)
-                        .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
-                }
-                if force || !dst.exists() {
+                if !dst.exists() {
+                    // Fresh install: copy all
                     copy_dir_with_report(src, dst, name, report)
                         .map_err(|e| format!("Failed to copy {name}: {e}"))?;
+                } else if force {
+                    // Force reinstall: update defaults, preserve custom files
+                    force_merge_dir_with_report(src, dst, name, report)
+                        .map_err(|e| format!("Failed to force-merge {name}: {e}"))?;
                 } else {
-                    // Merge mode: copy files that don't exist, preserve existing
+                    // Merge reinstall: add new files only, preserve all existing
                     merge_dir_with_report(src, dst, name, report)
                         .map_err(|e| format!("Failed to merge {name}: {e}"))?;
                 }
@@ -985,23 +992,27 @@ mod tests {
         fs::write(workspace.join(".claude").join("commands").join("loom.md"), "old loom command")
             .unwrap();
 
-        // Run setup with force=true
+        // Run setup with force=true (force-merge mode)
         let mut report = InitReport::default();
         setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
 
-        // Verify .claude was overwritten (custom commands removed)
-        assert!(!workspace
+        // Verify custom.md was PRESERVED (custom file not in defaults)
+        assert!(workspace
             .join(".claude")
             .join("commands")
             .join("custom.md")
             .exists());
+        let custom_content =
+            fs::read_to_string(workspace.join(".claude").join("commands").join("custom.md"))
+                .unwrap();
+        assert_eq!(custom_content, "my custom command");
 
-        // Verify loom.md was overwritten with new content
+        // Verify loom.md was UPDATED with new content (default file)
         let loom_content =
             fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
         assert_eq!(loom_content, "loom command from defaults");
 
-        // Verify builder.md exists
+        // Verify builder.md was ADDED (new file from defaults)
         assert!(workspace
             .join(".claude")
             .join("commands")
