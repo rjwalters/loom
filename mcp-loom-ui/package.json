@@ -1,6 +1,6 @@
 {
   "name": "@loom/mcp-ui",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for interacting with Loom UI (console logs, events, actions)",
   "type": "module",
   "bin": {
