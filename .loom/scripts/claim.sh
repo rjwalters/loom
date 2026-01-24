@@ -1,16 +1,26 @@
 #!/bin/bash
-
-# Loom Claim Helper Script
-# Atomic claiming system for parallel agent coordination
+#
+# claim.sh - Atomic file-based claiming system for parallel agent orchestration
+#
+# Uses mkdir for atomic claim creation (succeeds or fails atomically on all platforms).
+# Claims are stored in .loom/claims/issue-<N>.lock directories with metadata.
 #
 # Usage:
-#   ./.loom/scripts/claim.sh claim <issue-number> [agent-id] [ttl-seconds]
-#   ./.loom/scripts/claim.sh release <issue-number> [agent-id]
-#   ./.loom/scripts/claim.sh check <issue-number>
-#   ./.loom/scripts/claim.sh list
-#   ./.loom/scripts/claim.sh --help
+#   claim.sh claim <issue-number> [agent-id] [ttl-seconds]
+#   claim.sh release <issue-number> [agent-id]
+#   claim.sh check <issue-number>
+#   claim.sh list
+#   claim.sh cleanup
+#
+# Exit codes:
+#   0 - Success
+#   1 - Claim already exists (for claim), or general error
+#   2 - Invalid arguments
+#   3 - Claim not found (for release/check)
+#   4 - Agent ID mismatch (for release)
+#
 
-set -e
+set -euo pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -19,314 +29,360 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Configuration
-CLAIMS_DIR=".loom/claims"
-DEFAULT_TTL=3600  # 1 hour
+# Default TTL: 30 minutes
+DEFAULT_TTL=1800
 
-# Function to print colored output
-print_error() {
-    echo -e "${RED}ERROR: $1${NC}" >&2
+# Find the repository root (handles being called from anywhere)
+find_repo_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "Error: Not in a git repository" >&2
+    return 1
 }
 
-print_success() {
-    echo -e "${GREEN}✓ $1${NC}"
-}
+REPO_ROOT=$(find_repo_root)
+CLAIMS_DIR="$REPO_ROOT/.loom/claims"
 
-print_info() {
-    echo -e "${BLUE}ℹ $1${NC}"
-}
-
-print_warning() {
-    echo -e "${YELLOW}⚠ $1${NC}"
-}
-
-# Function to ensure claims directory exists
+# Ensure claims directory exists
 ensure_claims_dir() {
-    if [[ ! -d "$CLAIMS_DIR" ]]; then
-        mkdir -p "$CLAIMS_DIR"
-    fi
+    mkdir -p "$CLAIMS_DIR"
 }
 
-# Function to get current timestamp in ISO format
+# Get current timestamp
 get_timestamp() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
-# Function to get Unix timestamp
-get_unix_timestamp() {
-    date +%s
+# Get expiration timestamp (current time + TTL seconds)
+get_expiration() {
+    local ttl="${1:-$DEFAULT_TTL}"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        date -u -v+"${ttl}S" +"%Y-%m-%dT%H:%M:%SZ"
+    else
+        date -u -d "+${ttl} seconds" +"%Y-%m-%dT%H:%M:%SZ"
+    fi
 }
 
-# Function to generate default agent ID
-generate_agent_id() {
-    echo "agent-$$-$(hostname | tr '.' '-' | cut -c1-8)"
+# Check if a claim has expired
+is_expired() {
+    local expiration="$1"
+    local current
+    current=$(get_timestamp)
+
+    # Compare ISO timestamps lexicographically (works because ISO format is sortable)
+    [[ "$current" > "$expiration" ]]
 }
 
-# Function to show help
-show_help() {
-    cat << 'EOF'
-Loom Claim Helper
-
-This script provides atomic claiming for parallel agent coordination.
-Claims are stored as directories in .loom/claims/ to ensure atomic operations.
-
-Usage:
-  ./.loom/scripts/claim.sh claim <issue-number> [agent-id] [ttl-seconds]
-  ./.loom/scripts/claim.sh release <issue-number> [agent-id]
-  ./.loom/scripts/claim.sh check <issue-number>
-  ./.loom/scripts/claim.sh list
-  ./.loom/scripts/claim.sh --help
-
-Commands:
-  claim     Attempt to claim an issue atomically
-            - agent-id: Optional, auto-generated if not provided
-            - ttl-seconds: Optional, defaults to 3600 (1 hour)
-
-  release   Release a claim on an issue
-            - agent-id: Optional, validates ownership if provided
-
-  check     Check if an issue is claimed
-            - Returns claim metadata if claimed, exits 1 if not
-
-  list      List all current claims
-
-Examples:
-  ./.loom/scripts/claim.sh claim 123
-    Claim issue #123 with auto-generated agent ID
-
-  ./.loom/scripts/claim.sh claim 123 builder-1 7200
-    Claim issue #123 as builder-1 with 2-hour TTL
-
-  ./.loom/scripts/claim.sh release 123
-    Release claim on issue #123
-
-  ./.loom/scripts/claim.sh check 123
-    Check if issue #123 is claimed
-
-  ./.loom/scripts/claim.sh list
-    Show all current claims
-
-How It Works:
-  Claims use mkdir for atomicity - only one process can successfully
-  create a directory. This prevents race conditions when multiple
-  agents try to claim the same issue.
-
-Claim Metadata:
-  Each claim stores a claim.json file with:
-  - issue_number: The issue being claimed
-  - agent_id: ID of the claiming agent
-  - created_at: When the claim was made
-  - expires_at: When the claim expires
-  - ttl: Time-to-live in seconds
-
-Notes:
-  - Claims are stored in .loom/claims/issue-<N>.lock/
-  - The .lock directories are gitignored
-  - Expired claims can be cleaned with: claim.sh cleanup
-  - Use release to explicitly free a claim
-EOF
+# Generate default agent ID if not provided
+get_agent_id() {
+    local provided="${1:-}"
+    if [[ -n "$provided" ]]; then
+        echo "$provided"
+    else
+        # Use hostname-pid as default agent ID
+        echo "$(hostname)-$$"
+    fi
 }
 
-# Function to claim an issue
-do_claim() {
+# Claim an issue
+# Usage: claim_issue <issue-number> [agent-id] [ttl-seconds]
+claim_issue() {
     local issue_number="$1"
-    local agent_id="${2:-$(generate_agent_id)}"
+    local agent_id
     local ttl="${3:-$DEFAULT_TTL}"
 
-    # Validate issue number
-    if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
-        print_error "Issue number must be numeric (got: '$issue_number')"
-        exit 1
+    if [[ -z "$issue_number" ]]; then
+        echo -e "${RED}Error: Issue number required${NC}" >&2
+        return 2
     fi
 
-    # Validate TTL
-    if ! [[ "$ttl" =~ ^[0-9]+$ ]]; then
-        print_error "TTL must be numeric seconds (got: '$ttl')"
-        exit 1
-    fi
+    agent_id=$(get_agent_id "${2:-}")
 
     ensure_claims_dir
 
     local claim_dir="$CLAIMS_DIR/issue-${issue_number}.lock"
     local claim_file="$claim_dir/claim.json"
 
-    # Calculate expiration
-    local created_at=$(get_timestamp)
-    local created_unix=$(get_unix_timestamp)
-    local expires_unix=$((created_unix + ttl))
-    local expires_at=$(date -u -r "$expires_unix" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "@$expires_unix" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "unknown")
-
-    # Attempt atomic claim via mkdir
+    # Attempt atomic directory creation
+    # mkdir will fail if directory already exists (atomic operation)
     if mkdir "$claim_dir" 2>/dev/null; then
-        # Successfully claimed - write metadata
+        # Successfully created - write metadata
+        local timestamp
+        local expiration
+        timestamp=$(get_timestamp)
+        expiration=$(get_expiration "$ttl")
+
         cat > "$claim_file" << EOF
 {
-  "issue_number": $issue_number,
+  "issue": $issue_number,
   "agent_id": "$agent_id",
-  "created_at": "$created_at",
-  "expires_at": "$expires_at",
-  "expires_unix": $expires_unix,
-  "ttl": $ttl
+  "claimed_at": "$timestamp",
+  "expires_at": "$expiration",
+  "ttl_seconds": $ttl
 }
 EOF
-        print_success "Claimed issue #$issue_number"
-        print_info "Agent: $agent_id"
-        print_info "Expires: $expires_at (TTL: ${ttl}s)"
-        exit 0
+        echo -e "${GREEN}✓ Claimed issue #${issue_number}${NC}"
+        echo -e "  Agent: ${agent_id}"
+        echo -e "  Expires: ${expiration}"
+        return 0
     else
-        # Claim failed - check if already claimed
+        # Directory already exists - check if claim is expired
         if [[ -f "$claim_file" ]]; then
-            local existing_agent=$(grep -o '"agent_id": *"[^"]*"' "$claim_file" | cut -d'"' -f4)
-            print_error "Issue #$issue_number is already claimed by: $existing_agent"
-            exit 1
+            local existing_expiration
+            existing_expiration=$(grep -o '"expires_at": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+
+            if is_expired "$existing_expiration"; then
+                # Expired claim - clean up and retry
+                echo -e "${YELLOW}⚠ Found expired claim, cleaning up...${NC}"
+                rm -rf "$claim_dir"
+
+                # Retry claim
+                claim_issue "$issue_number" "$agent_id" "$ttl"
+                return $?
+            else
+                # Active claim by another agent
+                local existing_agent
+                existing_agent=$(grep -o '"agent_id": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+                echo -e "${RED}✗ Issue #${issue_number} already claimed${NC}" >&2
+                echo -e "  By: ${existing_agent}" >&2
+                echo -e "  Expires: ${existing_expiration}" >&2
+                return 1
+            fi
         else
-            print_error "Failed to claim issue #$issue_number (directory exists but no metadata)"
-            exit 1
+            # Lock dir exists but no claim file - clean up and retry
+            echo -e "${YELLOW}⚠ Found incomplete claim, cleaning up...${NC}"
+            rm -rf "$claim_dir"
+            claim_issue "$issue_number" "$agent_id" "$ttl"
+            return $?
         fi
     fi
 }
 
-# Function to release a claim
-do_release() {
+# Release a claim
+# Usage: release_claim <issue-number> [agent-id]
+release_claim() {
     local issue_number="$1"
-    local agent_id="$2"
+    local agent_id="${2:-}"
 
-    # Validate issue number
-    if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
-        print_error "Issue number must be numeric (got: '$issue_number')"
-        exit 1
+    if [[ -z "$issue_number" ]]; then
+        echo -e "${RED}Error: Issue number required${NC}" >&2
+        return 2
     fi
 
     local claim_dir="$CLAIMS_DIR/issue-${issue_number}.lock"
     local claim_file="$claim_dir/claim.json"
 
-    # Check if claim exists
     if [[ ! -d "$claim_dir" ]]; then
-        print_warning "Issue #$issue_number is not claimed"
-        exit 0
+        echo -e "${YELLOW}⚠ No claim found for issue #${issue_number}${NC}"
+        return 3
     fi
 
-    # Validate ownership if agent_id provided
+    # If agent_id provided, verify it matches
     if [[ -n "$agent_id" ]] && [[ -f "$claim_file" ]]; then
-        local existing_agent=$(grep -o '"agent_id": *"[^"]*"' "$claim_file" | cut -d'"' -f4)
+        local existing_agent
+        existing_agent=$(grep -o '"agent_id": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+
         if [[ "$existing_agent" != "$agent_id" ]]; then
-            print_error "Cannot release: issue #$issue_number is claimed by '$existing_agent', not '$agent_id'"
-            exit 1
+            echo -e "${RED}✗ Cannot release: claim owned by different agent${NC}" >&2
+            echo -e "  Owner: ${existing_agent}" >&2
+            echo -e "  Requested by: ${agent_id}" >&2
+            return 4
         fi
     fi
 
-    # Release the claim
-    if rm -rf "$claim_dir"; then
-        print_success "Released claim on issue #$issue_number"
-        exit 0
-    else
-        print_error "Failed to release claim on issue #$issue_number"
-        exit 1
-    fi
+    # Remove the claim
+    rm -rf "$claim_dir"
+    echo -e "${GREEN}✓ Released claim for issue #${issue_number}${NC}"
+    return 0
 }
 
-# Function to check if an issue is claimed
-do_check() {
+# Check if an issue is claimed
+# Usage: check_claim <issue-number>
+check_claim() {
     local issue_number="$1"
 
-    # Validate issue number
-    if ! [[ "$issue_number" =~ ^[0-9]+$ ]]; then
-        print_error "Issue number must be numeric (got: '$issue_number')"
-        exit 1
+    if [[ -z "$issue_number" ]]; then
+        echo -e "${RED}Error: Issue number required${NC}" >&2
+        return 2
     fi
 
     local claim_dir="$CLAIMS_DIR/issue-${issue_number}.lock"
     local claim_file="$claim_dir/claim.json"
 
-    if [[ -f "$claim_file" ]]; then
-        print_info "Issue #$issue_number is claimed:"
-        cat "$claim_file"
-        echo ""
-        exit 0
-    else
-        print_info "Issue #$issue_number is not claimed"
-        exit 1
+    if [[ ! -d "$claim_dir" ]]; then
+        echo -e "${BLUE}ℹ Issue #${issue_number} is not claimed${NC}"
+        return 3
     fi
+
+    if [[ ! -f "$claim_file" ]]; then
+        echo -e "${YELLOW}⚠ Incomplete claim found for issue #${issue_number}${NC}"
+        return 3
+    fi
+
+    # Check expiration
+    local expiration
+    expiration=$(grep -o '"expires_at": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+
+    if is_expired "$expiration"; then
+        echo -e "${YELLOW}⚠ Issue #${issue_number} has an expired claim${NC}"
+        cat "$claim_file"
+        return 3
+    fi
+
+    echo -e "${GREEN}✓ Issue #${issue_number} is claimed${NC}"
+    cat "$claim_file"
+    return 0
 }
 
-# Function to list all claims
-do_list() {
+# List all active claims
+list_claims() {
     ensure_claims_dir
 
-    local claims_found=0
-
-    echo "Current claims:"
+    local count=0
+    echo -e "${BLUE}Active claims:${NC}"
     echo ""
 
     for claim_dir in "$CLAIMS_DIR"/issue-*.lock; do
         if [[ -d "$claim_dir" ]]; then
             local claim_file="$claim_dir/claim.json"
             if [[ -f "$claim_file" ]]; then
-                claims_found=$((claims_found + 1))
-                local issue_num=$(grep -o '"issue_number": *[0-9]*' "$claim_file" | grep -o '[0-9]*')
-                local agent_id=$(grep -o '"agent_id": *"[^"]*"' "$claim_file" | cut -d'"' -f4)
-                local expires_at=$(grep -o '"expires_at": *"[^"]*"' "$claim_file" | cut -d'"' -f4)
-                local expires_unix=$(grep -o '"expires_unix": *[0-9]*' "$claim_file" | grep -o '[0-9]*')
-                local current_unix=$(get_unix_timestamp)
+                local issue
+                local agent
+                local expiration
+                issue=$(grep -o '"issue": [0-9]*' "$claim_file" | cut -d' ' -f2)
+                agent=$(grep -o '"agent_id": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+                expiration=$(grep -o '"expires_at": "[^"]*"' "$claim_file" | cut -d'"' -f4)
 
-                local status="active"
-                if [[ -n "$expires_unix" ]] && [[ "$current_unix" -gt "$expires_unix" ]]; then
-                    status="EXPIRED"
+                if is_expired "$expiration"; then
+                    echo -e "  ${YELLOW}Issue #${issue} (EXPIRED)${NC}"
+                else
+                    echo -e "  ${GREEN}Issue #${issue}${NC} - Agent: ${agent}, Expires: ${expiration}"
                 fi
-
-                printf "  #%-6s %-20s expires: %-25s [%s]\n" "$issue_num" "$agent_id" "$expires_at" "$status"
+                ((count++))
             fi
         fi
     done
 
-    if [[ $claims_found -eq 0 ]]; then
-        echo "  (no active claims)"
+    if [[ $count -eq 0 ]]; then
+        echo -e "  ${BLUE}(none)${NC}"
     fi
 
     echo ""
-    echo "Total: $claims_found claim(s)"
+    echo "Total: $count claim(s)"
 }
 
-# Parse arguments
-if [[ $# -eq 0 ]] || [[ "$1" == "--help" ]] || [[ "$1" == "-h" ]]; then
-    show_help
-    exit 0
-fi
+# Cleanup expired claims
+cleanup_claims() {
+    ensure_claims_dir
 
-COMMAND="$1"
-shift
+    local cleaned=0
+    echo -e "${BLUE}Cleaning up expired claims...${NC}"
 
-case "$COMMAND" in
-    claim)
-        if [[ $# -lt 1 ]]; then
-            print_error "claim requires an issue number"
-            echo "Usage: ./.loom/scripts/claim.sh claim <issue-number> [agent-id] [ttl-seconds]"
-            exit 1
+    for claim_dir in "$CLAIMS_DIR"/issue-*.lock; do
+        if [[ -d "$claim_dir" ]]; then
+            local claim_file="$claim_dir/claim.json"
+            if [[ -f "$claim_file" ]]; then
+                local expiration
+                expiration=$(grep -o '"expires_at": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+
+                if is_expired "$expiration"; then
+                    local issue
+                    issue=$(grep -o '"issue": [0-9]*' "$claim_file" | cut -d' ' -f2)
+                    rm -rf "$claim_dir"
+                    echo -e "  ${GREEN}✓ Removed expired claim for issue #${issue}${NC}"
+                    ((cleaned++))
+                fi
+            else
+                # No claim file - incomplete claim, remove it
+                rm -rf "$claim_dir"
+                ((cleaned++))
+            fi
         fi
-        do_claim "$@"
-        ;;
-    release)
-        if [[ $# -lt 1 ]]; then
-            print_error "release requires an issue number"
-            echo "Usage: ./.loom/scripts/claim.sh release <issue-number> [agent-id]"
-            exit 1
-        fi
-        do_release "$@"
-        ;;
-    check)
-        if [[ $# -lt 1 ]]; then
-            print_error "check requires an issue number"
-            echo "Usage: ./.loom/scripts/claim.sh check <issue-number>"
-            exit 1
-        fi
-        do_check "$@"
-        ;;
-    list)
-        do_list
-        ;;
-    *)
-        print_error "Unknown command: $COMMAND"
-        echo "Use --help for usage information"
-        exit 1
-        ;;
-esac
+    done
+
+    if [[ $cleaned -eq 0 ]]; then
+        echo -e "  ${BLUE}No expired claims found${NC}"
+    else
+        echo -e "\nCleaned up $cleaned expired claim(s)"
+    fi
+}
+
+# Print usage
+usage() {
+    cat << EOF
+Usage: $(basename "$0") <command> [arguments]
+
+Commands:
+  claim <issue-number> [agent-id] [ttl-seconds]
+      Atomically claim an issue. Default TTL is 30 minutes (1800 seconds).
+      Exits 0 on success, 1 if already claimed.
+
+  release <issue-number> [agent-id]
+      Release a claim. If agent-id is provided, verifies ownership.
+      Exits 0 on success, 3 if no claim exists, 4 if agent mismatch.
+
+  check <issue-number>
+      Check if an issue is claimed and print claim metadata.
+      Exits 0 if claimed, 3 if not claimed or expired.
+
+  list
+      List all active claims.
+
+  cleanup
+      Remove all expired claims.
+
+Examples:
+  $(basename "$0") claim 123                    # Claim issue with default agent ID
+  $(basename "$0") claim 123 builder-1 3600     # Claim for 1 hour
+  $(basename "$0") release 123 builder-1        # Release with ownership check
+  $(basename "$0") check 123                    # Check claim status
+  $(basename "$0") list                         # List all claims
+  $(basename "$0") cleanup                      # Clean expired claims
+EOF
+}
+
+# Main entry point
+main() {
+    local command="${1:-}"
+
+    case "$command" in
+        claim)
+            claim_issue "${2:-}" "${3:-}" "${4:-}"
+            ;;
+        release)
+            release_claim "${2:-}" "${3:-}"
+            ;;
+        check)
+            check_claim "${2:-}"
+            ;;
+        list)
+            list_claims
+            ;;
+        cleanup)
+            cleanup_claims
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        "")
+            echo -e "${RED}Error: No command specified${NC}" >&2
+            echo ""
+            usage
+            exit 2
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown command '$command'${NC}" >&2
+            echo ""
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
