@@ -915,6 +915,108 @@ async function launchInterval(terminalId: string): Promise<{
   }
 }
 
+/**
+ * Agent metrics result structure
+ */
+interface AgentMetricsResult {
+  success: boolean;
+  data?: unknown;
+  error?: string;
+  format: "json" | "text";
+  output: string;
+}
+
+/**
+ * Get agent performance metrics via CLI script
+ *
+ * Enables agents to query their own performance metrics for self-aware behavior.
+ * Part of Phase 5 (Autonomous Learning) - Issue #1073.
+ */
+async function getAgentMetrics(options: {
+  command?: string;
+  role?: string;
+  period?: string;
+  format?: string;
+  issue?: number;
+}): Promise<AgentMetricsResult> {
+  const workspacePath = getWorkspacePath();
+  const scriptPath = join(workspacePath, ".loom", "scripts", "agent-metrics.sh");
+
+  try {
+    // Check if script exists
+    await stat(scriptPath);
+  } catch {
+    return {
+      success: false,
+      error: `Agent metrics script not found at ${scriptPath}. Ensure Loom is installed.`,
+      format: "text",
+      output: "",
+    };
+  }
+
+  // Build command arguments
+  const args: string[] = [];
+
+  if (options.command && options.command !== "summary") {
+    args.push(options.command);
+  }
+
+  if (options.role) {
+    args.push("--role", options.role);
+  }
+
+  if (options.period) {
+    args.push("--period", options.period);
+  }
+
+  const format = options.format || "json";
+  args.push("--format", format);
+
+  if (options.issue) {
+    args.push("--issue", String(options.issue));
+  }
+
+  try {
+    const { stdout, stderr } = await execAsync(`bash "${scriptPath}" ${args.join(" ")}`, {
+      cwd: workspacePath,
+    });
+
+    if (stderr) {
+      console.error("agent-metrics.sh stderr:", stderr);
+    }
+
+    // Parse JSON output if format is json
+    let data: unknown;
+    if (format === "json") {
+      try {
+        data = JSON.parse(stdout.trim());
+      } catch {
+        // If JSON parse fails, return as text
+        return {
+          success: true,
+          output: stdout.trim(),
+          format: "text",
+        };
+      }
+    }
+
+    return {
+      success: true,
+      data,
+      output: stdout.trim(),
+      format: format as "json" | "text",
+    };
+  } catch (error) {
+    const err = error as { stderr?: string; message?: string };
+    return {
+      success: false,
+      error: err.stderr || err.message || String(error),
+      format: "text",
+      output: "",
+    };
+  }
+}
+
 const server = new Server(
   {
     name: "loom-terminals",
@@ -1201,6 +1303,54 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: ["terminal_id"],
+        },
+      },
+      {
+        name: "get_agent_metrics",
+        description:
+          "Get agent performance metrics for self-aware behavior. Enables agents to query their own effectiveness, costs, and velocity. Use this to check if struggling with a task type, select approaches based on historical success, or decide to escalate when below threshold. Part of Phase 5 (Autonomous Learning).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            command: {
+              type: "string",
+              enum: ["summary", "effectiveness", "costs", "velocity"],
+              description:
+                "Type of metrics to retrieve: summary (overall metrics), effectiveness (success rates by role), costs (cost breakdown by issue), velocity (development velocity trends)",
+              default: "summary",
+            },
+            role: {
+              type: "string",
+              enum: [
+                "builder",
+                "judge",
+                "curator",
+                "architect",
+                "hermit",
+                "doctor",
+                "guide",
+                "champion",
+                "shepherd",
+              ],
+              description: "Filter metrics by agent role (optional)",
+            },
+            period: {
+              type: "string",
+              enum: ["today", "week", "month", "all"],
+              description: "Time period for metrics: today, week, month, or all (default: week)",
+              default: "week",
+            },
+            format: {
+              type: "string",
+              enum: ["json", "text"],
+              description: "Output format: json for programmatic use, text for human-readable",
+              default: "json",
+            },
+            issue: {
+              type: "number",
+              description: "Filter costs by specific issue number (only for 'costs' command)",
+            },
+          },
         },
       },
     ],
@@ -1801,6 +1951,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: `=== Launch Interval ===\n\n✅ Success\n\nInterval prompt triggered for terminal ${terminalId}.\n\nThe terminal's configured intervalPrompt has been sent.\n\n${result.message}`,
+            },
+          ],
+        };
+      }
+
+      case "get_agent_metrics": {
+        const command = (args?.command as string) || "summary";
+        const role = args?.role as string | undefined;
+        const period = (args?.period as string) || "week";
+        const format = (args?.format as string) || "json";
+        const issue = args?.issue as number | undefined;
+
+        const result = await getAgentMetrics({
+          command,
+          role,
+          period,
+          format,
+          issue,
+        });
+
+        if (!result.success) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `=== Agent Metrics ===\n\n❌ Failed\n\n${result.error}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Format the output nicely
+        const header = `=== Agent Metrics (${command}) ===\n`;
+        const filterInfo = [
+          role ? `Role: ${role}` : null,
+          `Period: ${period}`,
+          issue ? `Issue: #${issue}` : null,
+        ]
+          .filter(Boolean)
+          .join(" | ");
+
+        const output =
+          format === "json" && result.data ? JSON.stringify(result.data, null, 2) : result.output;
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `${header}${filterInfo ? filterInfo + "\n\n" : "\n"}${output}`,
             },
           ],
         };
