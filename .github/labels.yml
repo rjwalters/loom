@@ -68,3 +68,7 @@
 - name: loom:urgent
   description: Critical/blocking issue requiring immediate attention
   color: "DC2626"  # red-600
+
+- name: loom:abort
+  description: Signal to abort shepherd for this issue (returns to loom:issue)
+  color: "F97316"  # orange-500 - warning/signal color

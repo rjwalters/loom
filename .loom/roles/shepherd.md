@@ -100,6 +100,92 @@ Curator → [auto-approve] → Builder → Judge → [resolve conflicts] → [au
 
 **Warning**: Force-merge mode auto-merges PRs after Judge approval without waiting for human confirmation.
 
+## Graceful Shutdown Handling
+
+Shepherds support graceful shutdown by checking for a shutdown signal at phase boundaries. This allows the Loom daemon to stop shepherds cleanly without abandoning work mid-phase.
+
+### Shutdown Signal
+
+The daemon creates `.loom/stop-shepherds` when initiating graceful shutdown. Shepherds check for this signal between phases.
+
+### Checkpoint Logic
+
+Before starting each phase, check for the shutdown signal:
+
+```bash
+# Check for graceful shutdown signal
+check_shutdown_signal() {
+    if [ -f .loom/stop-shepherds ]; then
+        echo "Shutdown signal detected - exiting gracefully at phase boundary"
+
+        # Revert issue label so it can be picked up again
+        if [ -n "$ISSUE_NUMBER" ]; then
+            LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
+            if echo "$LABELS" | grep -q "loom:building"; then
+                gh issue edit $ISSUE_NUMBER --remove-label "loom:building" --add-label "loom:issue"
+                gh issue comment $ISSUE_NUMBER --body "$(cat <<'EOF'
+⏸️ **Shepherd graceful shutdown**
+
+Orchestration paused at phase boundary due to daemon shutdown signal.
+Issue returned to `loom:issue` state for pickup when daemon restarts.
+
+Progress preserved - next shepherd will resume from current state.
+EOF
+)"
+            fi
+        fi
+
+        echo "Graceful exit complete"
+        exit 0
+    fi
+}
+```
+
+### Phase Boundary Checks
+
+Insert shutdown checks at these points in the orchestration flow:
+
+1. **After Curator phase** (before Gate 1)
+2. **After Builder phase** (before Judge)
+3. **After Judge phase** (before Merge)
+
+```bash
+# Example: After Builder phase completes
+echo "Builder phase complete - PR #$PR_NUMBER created"
+check_shutdown_signal  # ← Insert check here
+echo "Proceeding to Judge phase..."
+```
+
+### Behavior Summary
+
+| Signal Detected | Current State | Action |
+|-----------------|---------------|--------|
+| `.loom/stop-shepherds` exists | `loom:building` | Revert to `loom:issue`, exit |
+| `.loom/stop-shepherds` exists | Mid-phase (building code) | Complete current phase, then check |
+| No signal | Any | Continue normally |
+
+### Why Phase Boundaries?
+
+Checking only at phase boundaries ensures:
+- **Work integrity**: Current phase completes fully (no half-built features)
+- **Clean state**: Issue labels accurately reflect progress
+- **Resumability**: Next shepherd can pick up from a known state
+- **Responsiveness**: Shutdown happens within one phase duration (not 5+ minutes)
+
+### Per-Issue Abort
+
+For aborting a specific shepherd without stopping all shepherds, add `loom:abort` label to the issue:
+
+```bash
+# Also check for per-issue abort
+if echo "$LABELS" | grep -q "loom:abort"; then
+    echo "Abort signal detected for issue #$ISSUE_NUMBER"
+    gh issue edit $ISSUE_NUMBER --remove-label "loom:abort" --remove-label "loom:building" --add-label "loom:issue"
+    gh issue comment $ISSUE_NUMBER --body "⏹️ **Shepherd aborted** per \`loom:abort\` label. Issue returned to \`loom:issue\` state."
+    exit 0
+fi
+```
+
 ## Execution Mode Detection
 
 At orchestration start, detect which mode to use:

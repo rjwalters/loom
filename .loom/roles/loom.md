@@ -511,26 +511,61 @@ def auto_ensure_support_roles():
 
 ### Graceful Shutdown
 
+The daemon uses a signal-based approach to stop shepherds gracefully at phase boundaries.
+
 ```python
 def graceful_shutdown():
     print("\nShutdown signal received...")
 
-    # Wait for active shepherds (max 5 min)
-    timeout = 300
+    # Create shepherd stop signal
+    # Shepherds check for this at phase boundaries and exit cleanly
+    touch(".loom/stop-shepherds")
+    print("  Created .loom/stop-shepherds signal")
+
+    # Wait for active shepherds (reduced timeout since they exit at phase boundaries)
+    # Phase boundaries typically occur every 1-5 minutes, so 2 minutes is usually sufficient
+    timeout = 120  # 2 minutes instead of 5
     start = now()
 
     while count_active_shepherds() > 0 and elapsed(start) < timeout:
-        print(f"  Waiting for {count_active_shepherds()} shepherds...")
+        active = count_active_shepherds()
+        print(f"  Waiting for {active} shepherds to reach phase boundary...")
         check_all_subagent_completions()
         sleep(10)
 
-    # Cleanup
-    run("./scripts/daemon-cleanup.sh daemon-shutdown")
+    # Report any shepherds that didn't exit in time
+    remaining = count_active_shepherds()
+    if remaining > 0:
+        print(f"  Warning: {remaining} shepherds did not exit within timeout")
+        print(f"  These shepherds will continue in background and exit at next phase boundary")
+
+    # Cleanup signals and state
+    rm(".loom/stop-shepherds")
     rm(".loom/stop-daemon")
+    run("./scripts/daemon-cleanup.sh daemon-shutdown")
     state["running"] = False
     state["stopped_at"] = now()
     save_daemon_state()
     print("Daemon stopped gracefully")
+```
+
+### Shepherd Stop Signal
+
+The `.loom/stop-shepherds` file acts as a coordination signal:
+
+1. **Daemon creates** `.loom/stop-shepherds` when shutdown begins
+2. **Shepherds check** for this file at phase boundaries (after Curator, Builder, Judge)
+3. **When detected**, shepherds:
+   - Complete current phase (don't abandon mid-work)
+   - Revert issue from `loom:building` to `loom:issue`
+   - Add comment explaining graceful exit
+   - Exit cleanly
+4. **Daemon removes** `.loom/stop-shepherds` after cleanup
+
+This ensures:
+- No half-completed work left behind
+- Issues remain in valid states for next daemon start
+- Shutdown is responsive (1-5 minutes vs 15+ minutes)
 ```
 
 ## State File Format
