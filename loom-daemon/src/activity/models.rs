@@ -169,6 +169,62 @@ pub struct PromptChanges {
     pub tests_modified: i32,
 }
 
+/// GitHub event types that can be parsed from terminal output
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptGitHubEventType {
+    IssueCreated,
+    IssueClosed,
+    PrCreated,
+    PrMerged,
+    PrClosed,
+    LabelAdded,
+    LabelRemoved,
+    ReviewSubmitted,
+}
+
+impl PromptGitHubEventType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::IssueCreated => "issue_created",
+            Self::IssueClosed => "issue_closed",
+            Self::PrCreated => "pr_created",
+            Self::PrMerged => "pr_merged",
+            Self::PrClosed => "pr_closed",
+            Self::LabelAdded => "label_added",
+            Self::LabelRemoved => "label_removed",
+            Self::ReviewSubmitted => "review_submitted",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "issue_created" => Some(Self::IssueCreated),
+            "issue_closed" => Some(Self::IssueClosed),
+            "pr_created" => Some(Self::PrCreated),
+            "pr_merged" => Some(Self::PrMerged),
+            "pr_closed" => Some(Self::PrClosed),
+            "label_added" => Some(Self::LabelAdded),
+            "label_removed" => Some(Self::LabelRemoved),
+            "review_submitted" => Some(Self::ReviewSubmitted),
+            _ => None,
+        }
+    }
+}
+
+/// Prompt-GitHub correlation record for tracking which prompts triggered GitHub actions
+#[derive(Debug, Clone)]
+pub struct PromptGitHubEvent {
+    #[allow(dead_code)]
+    pub id: Option<i64>,
+    pub input_id: Option<i64>,
+    pub issue_number: Option<i32>,
+    pub pr_number: Option<i32>,
+    pub label_before: Option<Vec<String>>,
+    pub label_after: Option<Vec<String>>,
+    pub event_type: PromptGitHubEventType,
+}
+
 /// Test results parsed from terminal output
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TestResults {

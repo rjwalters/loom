@@ -406,28 +406,26 @@ fn setup_repository_scaffolding(
     let loom_metadata = LoomMetadata::from_env();
 
     // Helper to copy file with template variable substitution
-    let copy_file_with_substitution =
-        |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
-            if src.exists() {
-                if force && dst.exists() {
-                    fs::remove_file(dst)
-                        .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
-                }
-                if force || !dst.exists() {
-                    let content = fs::read_to_string(src)
-                        .map_err(|e| format!("Failed to read {name}: {e}"))?;
-                    let substituted = substitute_template_variables(
-                        &content,
-                        repo_owner.as_deref(),
-                        repo_name.as_deref(),
-                        &loom_metadata,
-                    );
-                    fs::write(dst, substituted)
-                        .map_err(|e| format!("Failed to write {name}: {e}"))?;
-                }
+    let copy_file_with_substitution = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
+        if src.exists() {
+            if force && dst.exists() {
+                fs::remove_file(dst)
+                    .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
             }
-            Ok(())
-        };
+            if force || !dst.exists() {
+                let content =
+                    fs::read_to_string(src).map_err(|e| format!("Failed to read {name}: {e}"))?;
+                let substituted = substitute_template_variables(
+                    &content,
+                    repo_owner.as_deref(),
+                    repo_name.as_deref(),
+                    &loom_metadata,
+                );
+                fs::write(dst, substituted).map_err(|e| format!("Failed to write {name}: {e}"))?;
+            }
+        }
+        Ok(())
+    };
 
     // Helper to copy directory with force logic
     let copy_directory = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
@@ -614,12 +612,8 @@ mod tests {
             install_date: "2024-01-15".to_string(),
         };
 
-        let result = substitute_template_variables(
-            content,
-            Some("myorg"),
-            Some("myrepo"),
-            &metadata,
-        );
+        let result =
+            substitute_template_variables(content, Some("myorg"), Some("myrepo"), &metadata);
 
         assert!(result.contains("**Loom Version**: 1.2.3"));
         assert!(result.contains("**Loom Commit**: abc1234"));
@@ -633,12 +627,7 @@ mod tests {
             install_date: "2024-01-15".to_string(),
         };
 
-        let result_fallback = substitute_template_variables(
-            content,
-            None,
-            None,
-            &metadata_empty,
-        );
+        let result_fallback = substitute_template_variables(content, None, None, &metadata_empty);
 
         assert!(result_fallback.contains("**Loom Version**: unknown"));
         assert!(result_fallback.contains("**Loom Commit**: unknown"));

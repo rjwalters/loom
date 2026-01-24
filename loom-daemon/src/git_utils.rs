@@ -17,10 +17,7 @@ pub fn get_current_commit(working_dir: &Path) -> Option<String> {
         .ok()?;
 
     if output.status.success() {
-        let commit = String::from_utf8(output.stdout)
-            .ok()?
-            .trim()
-            .to_string();
+        let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
         if commit.is_empty() {
             None
         } else {
@@ -115,7 +112,7 @@ fn is_test_file(filename: &str) -> bool {
         || lower.contains("/tests/")    // tests directory
         || lower.contains("/test/")     // test directory
         || lower.starts_with("tests/")  // relative tests path
-        || lower.starts_with("test/")   // relative test path
+        || lower.starts_with("test/") // relative test path
 }
 
 /// Capture git changes between two commits
@@ -189,18 +186,11 @@ pub fn capture_prompt_changes(
         capture_git_changes(working_dir, None, None)?
     } else {
         // Get diff between commits
-        capture_git_changes(
-            working_dir,
-            before_commit.as_deref(),
-            after_commit.as_deref(),
-        )?
+        capture_git_changes(working_dir, before_commit.as_deref(), after_commit.as_deref())?
     };
 
     // Only create a record if there were actual changes
-    if stats.files_changed == 0
-        && stats.lines_added == 0
-        && stats.lines_removed == 0
-    {
+    if stats.files_changed == 0 && stats.lines_added == 0 && stats.lines_removed == 0 {
         return None;
     }
 
@@ -269,7 +259,7 @@ mod tests {
         assert!(!is_test_file("src/main.rs"));
         assert!(!is_test_file("lib.rs"));
         assert!(!is_test_file("contest.rs")); // Contains "test" but not a test file pattern
-        assert!(!is_test_file("latest.js"));  // Contains "test" but not a test file
+        assert!(!is_test_file("latest.js")); // Contains "test" but not a test file
         assert!(!is_test_file("attestation.rs")); // Contains "test" but not a test file
     }
 

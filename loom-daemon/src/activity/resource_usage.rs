@@ -3,7 +3,7 @@
 //! This module provides functionality for:
 //! - Parsing token usage from Claude Code terminal output
 //! - Calculating costs based on model pricing
-//! - Creating ResourceUsage records
+//! - Creating `ResourceUsage` records
 //!
 //! # Usage
 //!
@@ -38,7 +38,7 @@ pub struct ResourceUsage {
 
 /// Model pricing configuration (cost per 1000 tokens)
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::struct_field_names)]
 pub struct ModelPricing {
     pub input_cost_per_1k: f64,
     pub output_cost_per_1k: f64,
@@ -98,7 +98,7 @@ impl ModelPricing {
             }
         } else {
             // Default to Claude Sonnet pricing as reasonable middle ground
-            log::debug!("Unknown model '{}', using default Sonnet pricing", model);
+            log::debug!("Unknown model '{model}', using default Sonnet pricing");
             Self {
                 input_cost_per_1k: 0.003,
                 output_cost_per_1k: 0.015,
@@ -109,6 +109,7 @@ impl ModelPricing {
     }
 
     /// Calculate total cost for given token counts
+    #[allow(clippy::cast_precision_loss)]
     pub fn calculate_cost(
         &self,
         input_tokens: i64,
@@ -120,12 +121,10 @@ impl ModelPricing {
         let output_cost = (output_tokens as f64 / 1000.0) * self.output_cost_per_1k;
 
         let cache_read_cost = cache_read_tokens
-            .map(|t| (t as f64 / 1000.0) * self.cache_read_cost_per_1k)
-            .unwrap_or(0.0);
+            .map_or(0.0, |t| (t as f64 / 1000.0) * self.cache_read_cost_per_1k);
 
         let cache_write_cost = cache_write_tokens
-            .map(|t| (t as f64 / 1000.0) * self.cache_write_cost_per_1k)
-            .unwrap_or(0.0);
+            .map_or(0.0, |t| (t as f64 / 1000.0) * self.cache_write_cost_per_1k);
 
         input_cost + output_cost + cache_read_cost + cache_write_cost
     }
@@ -150,31 +149,34 @@ pub fn detect_provider(model: &str) -> &'static str {
 
 // Regex patterns for parsing Claude Code output
 // These are compiled once and reused
-#[allow(dead_code)]
+// Note: expect() is appropriate here since these are compile-time constant patterns
 
 /// Pattern: "Total tokens: 1,234 in / 567 out"
+#[allow(dead_code, clippy::expect_used)]
 static TOKEN_PATTERN_SLASH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:total\s+)?tokens?:\s*([\d,]+)\s*(?:in|input)\s*/\s*([\d,]+)\s*(?:out|output)")
-        .expect("Invalid regex")
+    Regex::new(
+        r"(?i)(?:total\s+)?tokens?:\s*([\d,]+)\s*(?:in|input)\s*/\s*([\d,]+)\s*(?:out|output)",
+    )
+    .expect("Invalid regex")
 });
 
 /// Pattern: "Input: 1,234 tokens, Output: 567 tokens"
-#[allow(dead_code)]
+#[allow(dead_code, clippy::expect_used)]
 static TOKEN_PATTERN_LABELED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)input:\s*([\d,]+)\s*tokens?.*?output:\s*([\d,]+)\s*tokens?")
         .expect("Invalid regex")
 });
 
-/// Pattern: "Cache read: 1,234 tokens" or "cache_read_input_tokens: 1234"
-#[allow(dead_code)]
+/// Pattern: "Cache read: 1,234 tokens" or `cache_read_input_tokens`: 1234
+#[allow(dead_code, clippy::expect_used)]
 static CACHE_READ_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match both "cache read: 200 tokens" and "cache_read_input_tokens: 200"
     Regex::new(r"(?i)cache[_\s]*read[_\s]*(?:input[_\s]*)?(?:tokens?)?[:\s]*([\d,]+)")
         .expect("Invalid regex")
 });
 
-/// Pattern: "Cache write: 1,234 tokens" or "cache_creation_input_tokens: 1234"
-#[allow(dead_code)]
+/// Pattern: "Cache write: 1,234 tokens" or `cache_creation_input_tokens`: 1234
+#[allow(dead_code, clippy::expect_used)]
 static CACHE_WRITE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match both "cache write: 50 tokens" and "cache_creation_input_tokens: 50"
     Regex::new(r"(?i)cache[_\s]*(?:write|creation)[_\s]*(?:input[_\s]*)?(?:tokens?)?[:\s]*([\d,]+)")
@@ -182,14 +184,14 @@ static CACHE_WRITE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Pattern: Model name detection - "Model: claude-3-5-sonnet" or "using claude-sonnet-4"
-#[allow(dead_code)]
+#[allow(dead_code, clippy::expect_used)]
 static MODEL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:model[:\s]+|using\s+)(claude[a-z0-9-]+|gpt-[a-z0-9.-]+|o1[a-z0-9-]*|gemini[a-z0-9-]*)")
         .expect("Invalid regex")
 });
 
 /// Pattern for extracting duration: "Duration: 5.2s" or "took 5200ms"
-#[allow(dead_code)]
+#[allow(dead_code, clippy::expect_used)]
 static DURATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:duration|took|time)[:\s]*([\d.]+)\s*(ms|s|seconds?|milliseconds?)")
         .expect("Invalid regex")
@@ -225,8 +227,7 @@ pub fn parse_resource_usage(output: &str, duration_ms: Option<i64>) -> Option<Re
     let model = MODEL_PATTERN
         .captures(output)
         .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| "claude-sonnet-4".to_string());
+        .map_or_else(|| "claude-sonnet-4".to_string(), |m| m.as_str().to_string());
 
     // Extract or use provided duration
     let duration = duration_ms.or_else(|| extract_duration(output));
@@ -236,12 +237,8 @@ pub fn parse_resource_usage(output: &str, duration_ms: Option<i64>) -> Option<Re
 
     // Calculate cost
     let pricing = ModelPricing::for_model(&model);
-    let cost_usd = pricing.calculate_cost(
-        tokens_input,
-        tokens_output,
-        tokens_cache_read,
-        tokens_cache_write,
-    );
+    let cost_usd =
+        pricing.calculate_cost(tokens_input, tokens_output, tokens_cache_read, tokens_cache_write);
 
     Some(ResourceUsage {
         input_id: None,
@@ -278,7 +275,7 @@ fn extract_tokens(text: &str) -> Option<(i64, i64)> {
 }
 
 /// Extract duration from text
-#[allow(dead_code)]
+#[allow(dead_code, clippy::cast_possible_truncation)]
 fn extract_duration(text: &str) -> Option<i64> {
     let caps = DURATION_PATTERN.captures(text)?;
     let value: f64 = caps.get(1)?.as_str().parse().ok()?;

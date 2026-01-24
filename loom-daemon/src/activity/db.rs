@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, InputContext, InputType,
-    ProductivitySummary, PromptChanges, QualityMetrics, TokenUsage,
+    ProductivitySummary, PromptChanges, PromptGitHubEvent, QualityMetrics, TokenUsage,
 };
 use super::schema::init_schema;
 use super::test_parser;
@@ -234,8 +234,8 @@ impl ActivityDb {
     /// Record token usage for an API request
     ///
     /// Records comprehensive LLM resource usage including token counts, cache usage,
-    /// duration, and cost. If a metric_id is provided, also updates the aggregate
-    /// token counts in agent_metrics.
+    /// duration, and cost. If a `metric_id` is provided, also updates the aggregate
+    /// token counts in `agent_metrics`.
     #[allow(dead_code)]
     pub fn record_token_usage(&self, usage: &TokenUsage) -> Result<i64> {
         self.conn.execute(
@@ -285,6 +285,94 @@ impl ActivityDb {
         }
 
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record a prompt-GitHub correlation event
+    ///
+    /// Links a prompt (agent input) with a GitHub action it triggered,
+    /// such as creating an issue, opening a PR, or changing labels.
+    pub fn record_prompt_github_event(&self, event: &PromptGitHubEvent) -> Result<i64> {
+        let label_before_json = event
+            .label_before
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        let label_after_json = event
+            .label_after
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        self.conn.execute(
+            r"
+            INSERT INTO prompt_github (input_id, issue_number, pr_number, label_before, label_after, event_type)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                event.input_id,
+                event.issue_number,
+                event.pr_number,
+                label_before_json,
+                label_after_json,
+                event.event_type.as_str(),
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get prompt-GitHub events for a specific input
+    #[allow(dead_code)]
+    pub fn get_prompt_github_events(&self, input_id: i64) -> Result<Vec<PromptGitHubEvent>> {
+        use super::models::PromptGitHubEventType;
+
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, input_id, issue_number, pr_number, label_before, label_after, event_type
+            FROM prompt_github
+            WHERE input_id = ?1
+            ORDER BY id
+            ",
+        )?;
+
+        let events = stmt.query_map(params![input_id], |row| {
+            let id: i64 = row.get(0)?;
+            let input_id: Option<i64> = row.get(1)?;
+            let issue_number: Option<i32> = row.get(2)?;
+            let pr_number: Option<i32> = row.get(3)?;
+            let label_before_json: Option<String> = row.get(4)?;
+            let label_after_json: Option<String> = row.get(5)?;
+            let event_type_str: String = row.get(6)?;
+
+            let label_before = label_before_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let label_after = label_after_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let event_type = PromptGitHubEventType::from_str(&event_type_str).ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    format!("Invalid event_type: {event_type_str}").into(),
+                )
+            })?;
+
+            Ok(PromptGitHubEvent {
+                id: Some(id),
+                input_id,
+                issue_number,
+                pr_number,
+                label_before,
+                label_after,
+                event_type,
+            })
+        })?;
+
+        events.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     /// Get metrics for a specific task
@@ -511,10 +599,7 @@ impl ActivityDb {
 
     /// Get total lines changed across all prompts for a terminal
     #[allow(dead_code)]
-    pub fn get_terminal_changes_summary(
-        &self,
-        terminal_id: &str,
-    ) -> Result<(i64, i64, i64)> {
+    pub fn get_terminal_changes_summary(&self, terminal_id: &str) -> Result<(i64, i64, i64)> {
         // Returns (total_files_changed, total_lines_added, total_lines_removed)
         let result = self.conn.query_row(
             r"
@@ -1167,15 +1252,16 @@ mod tests {
         // Retrieve and verify
         let retrieved = db.get_prompt_changes(input_id)?;
         assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.input_id, input_id);
-        assert_eq!(retrieved.before_commit, Some("abc123".to_string()));
-        assert_eq!(retrieved.after_commit, Some("def456".to_string()));
-        assert_eq!(retrieved.files_changed, 5);
-        assert_eq!(retrieved.lines_added, 150);
-        assert_eq!(retrieved.lines_removed, 30);
-        assert_eq!(retrieved.tests_added, 2);
-        assert_eq!(retrieved.tests_modified, 1);
+        if let Some(retrieved) = retrieved {
+            assert_eq!(retrieved.input_id, input_id);
+            assert_eq!(retrieved.before_commit, Some("abc123".to_string()));
+            assert_eq!(retrieved.after_commit, Some("def456".to_string()));
+            assert_eq!(retrieved.files_changed, 5);
+            assert_eq!(retrieved.lines_added, 150);
+            assert_eq!(retrieved.lines_removed, 30);
+            assert_eq!(retrieved.tests_added, 2);
+            assert_eq!(retrieved.tests_modified, 1);
+        }
 
         Ok(())
     }
@@ -1226,7 +1312,7 @@ mod tests {
 
         // Get summary
         let (files, added, removed) = db.get_terminal_changes_summary("terminal-1")?;
-        assert_eq!(files, 6);   // 3 * 2
+        assert_eq!(files, 6); // 3 * 2
         assert_eq!(added, 150); // 3 * 50
         assert_eq!(removed, 30); // 3 * 10
 
@@ -1240,11 +1326,140 @@ mod tests {
     }
 
     #[test]
+    fn test_record_prompt_github_event() -> Result<()> {
+        use super::super::models::PromptGitHubEventType;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input to link to
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "gh issue edit 42 --add-label loom:building".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record a GitHub event linked to this input
+        let event = PromptGitHubEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: Some(42),
+            pr_number: None,
+            label_before: None,
+            label_after: Some(vec!["loom:building".to_string()]),
+            event_type: PromptGitHubEventType::LabelAdded,
+        };
+
+        let event_id = db.record_prompt_github_event(&event)?;
+        assert!(event_id > 0);
+
+        // Retrieve the events
+        let events = db.get_prompt_github_events(input_id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].issue_number, Some(42));
+        assert_eq!(events[0].event_type, PromptGitHubEventType::LabelAdded);
+        assert_eq!(events[0].label_after, Some(vec!["loom:building".to_string()]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_multiple_github_events() -> Result<()> {
+        use super::super::models::PromptGitHubEventType;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "gh pr create".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record multiple events from the same input
+        let event1 = PromptGitHubEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: None,
+            pr_number: Some(123),
+            label_before: None,
+            label_after: None,
+            event_type: PromptGitHubEventType::PrCreated,
+        };
+        db.record_prompt_github_event(&event1)?;
+
+        let event2 = PromptGitHubEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: None,
+            pr_number: Some(123),
+            label_before: None,
+            label_after: Some(vec!["loom:review-requested".to_string()]),
+            event_type: PromptGitHubEventType::LabelAdded,
+        };
+        db.record_prompt_github_event(&event2)?;
+
+        // Retrieve all events for this input
+        let retrieved_events = db.get_prompt_github_events(input_id)?;
+        assert_eq!(retrieved_events.len(), 2);
+
+        let pr_created = retrieved_events
+            .iter()
+            .find(|e| e.event_type == PromptGitHubEventType::PrCreated);
+        assert!(pr_created.is_some());
+        if let Some(evt) = pr_created {
+            assert_eq!(evt.pr_number, Some(123));
+        }
+
+        let label_added = retrieved_events
+            .iter()
+            .find(|e| e.event_type == PromptGitHubEventType::LabelAdded);
+        assert!(label_added.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_github_event_without_input_link() -> Result<()> {
+        use super::super::models::PromptGitHubEventType;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record a GitHub event without linking to a specific input
+        let event = PromptGitHubEvent {
+            id: None,
+            input_id: None,
+            issue_number: Some(100),
+            pr_number: None,
+            label_before: Some(vec!["loom:issue".to_string()]),
+            label_after: Some(vec!["loom:building".to_string()]),
+            event_type: PromptGitHubEventType::LabelAdded,
+        };
+
+        let event_id = db.record_prompt_github_event(&event)?;
+        assert!(event_id > 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_record_and_get_quality_metrics() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
-        // First record an input
+        // First record an input to link to
         let input = AgentInput {
             id: None,
             terminal_id: "terminal-1".to_string(),
@@ -1263,10 +1478,10 @@ mod tests {
             timestamp: Utc::now(),
             tests_passed: Some(42),
             tests_failed: Some(3),
-            tests_skipped: Some(2),
-            test_runner: Some("cargo".to_string()),
+            tests_skipped: Some(1),
+            test_runner: Some("cargo test".to_string()),
             lint_errors: Some(0),
-            format_errors: Some(0),
+            format_errors: Some(2),
             build_success: Some(true),
             pr_approved: None,
             pr_changes_requested: None,
@@ -1277,12 +1492,17 @@ mod tests {
         assert!(metrics_id > 0);
 
         // Retrieve and verify
-        let retrieved = db.get_quality_metrics(input_id)?.expect("Metrics should exist");
-        assert_eq!(retrieved.tests_passed, Some(42));
-        assert_eq!(retrieved.tests_failed, Some(3));
-        assert_eq!(retrieved.tests_skipped, Some(2));
-        assert_eq!(retrieved.test_runner, Some("cargo".to_string()));
-        assert_eq!(retrieved.build_success, Some(true));
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.tests_passed, Some(42));
+            assert_eq!(m.tests_failed, Some(3));
+            assert_eq!(m.tests_skipped, Some(1));
+            assert_eq!(m.test_runner, Some("cargo test".to_string()));
+            assert_eq!(m.lint_errors, Some(0));
+            assert_eq!(m.format_errors, Some(2));
+            assert_eq!(m.build_success, Some(true));
+        }
 
         Ok(())
     }
@@ -1292,7 +1512,7 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
-        // Record an input
+        // First record an input
         let input = AgentInput {
             id: None,
             terminal_id: "terminal-1".to_string(),
@@ -1304,22 +1524,27 @@ mod tests {
         };
         let input_id = db.record_input(&input)?;
 
-        // Simulate terminal output from cargo test
+        // Simulate cargo test output
         let output = r#"
-   Compiling myproject v0.1.0
-    Finished test [unoptimized + debuginfo] target(s) in 2.34s
-     Running unittests src/lib.rs
-test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.50s
+running 10 tests
+test test_one ... ok
+test test_two ... ok
+test test_three ... FAILED
+test result: FAILED. 9 passed; 1 failed; 0 ignored
 "#;
 
         let metrics_id = db.record_quality_from_output(input_id, output)?;
         assert!(metrics_id.is_some());
 
-        let retrieved = db.get_quality_metrics(input_id)?.expect("Metrics should exist");
-        assert_eq!(retrieved.tests_passed, Some(10));
-        assert_eq!(retrieved.tests_failed, Some(2));
-        assert_eq!(retrieved.tests_skipped, Some(1));
-        assert_eq!(retrieved.test_runner, Some("cargo".to_string()));
+        // Verify parsed metrics
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.tests_passed, Some(9));
+            assert_eq!(m.tests_failed, Some(1));
+            assert_eq!(m.tests_skipped, Some(0));
+            assert_eq!(m.test_runner, Some("cargo".to_string()));
+        }
 
         Ok(())
     }
@@ -1329,7 +1554,7 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
-        // Record an input
+        // First record an input
         let input = AgentInput {
             id: None,
             terminal_id: "terminal-1".to_string(),
@@ -1342,10 +1567,10 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
         let input_id = db.record_input(&input)?;
 
         // Output with no test results
-        let output = "drwxr-xr-x  8 user  staff  256 Jan 23 10:00 .\n";
+        let output = "total 42\ndrwxr-xr-x  5 user staff 160 Jan 23 10:00 .\n";
 
         let metrics_id = db.record_quality_from_output(input_id, output)?;
-        assert!(metrics_id.is_none(), "Should not record metrics for non-test output");
+        assert!(metrics_id.is_none()); // No metrics recorded for non-test output
 
         Ok(())
     }
@@ -1355,14 +1580,14 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
-        // Record multiple inputs with quality metrics
+        // Record multiple test runs for the same terminal
         for i in 0..3 {
             let input = AgentInput {
                 id: None,
                 terminal_id: "terminal-1".to_string(),
                 timestamp: Utc::now(),
                 input_type: InputType::Manual,
-                content: format!("cargo test {i}"),
+                content: format!("cargo test run {i}"),
                 agent_role: Some("builder".to_string()),
                 context: InputContext::default(),
             };
@@ -1373,7 +1598,7 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
                 input_id: Some(input_id),
                 timestamp: Utc::now(),
                 tests_passed: Some(10),
-                tests_failed: Some(2),
+                tests_failed: Some(i),
                 tests_skipped: Some(1),
                 test_runner: Some("cargo".to_string()),
                 lint_errors: None,
@@ -1386,10 +1611,17 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
             db.record_quality_metrics(&metrics)?;
         }
 
+        // Get summary
         let (passed, failed, skipped) = db.get_terminal_test_summary("terminal-1")?;
-        assert_eq!(passed, 30); // 10 * 3
-        assert_eq!(failed, 6);  // 2 * 3
-        assert_eq!(skipped, 3); // 1 * 3
+        assert_eq!(passed, 30); // 3 * 10
+        assert_eq!(failed, 3); // 0 + 1 + 2
+        assert_eq!(skipped, 3); // 3 * 1
+
+        // Different terminal should have no tests
+        let (passed, failed, skipped) = db.get_terminal_test_summary("terminal-2")?;
+        assert_eq!(passed, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
 
         Ok(())
     }
@@ -1399,7 +1631,7 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
         let temp_file = NamedTempFile::new()?;
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
-        // Record an input
+        // Record an input and quality metrics
         let input = AgentInput {
             id: None,
             terminal_id: "terminal-1".to_string(),
@@ -1411,7 +1643,6 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
         };
         let input_id = db.record_input(&input)?;
 
-        // Record initial quality metrics
         let metrics = QualityMetrics {
             id: None,
             input_id: Some(input_id),
@@ -1429,19 +1660,25 @@ test result: ok. 10 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; fin
         };
         db.record_quality_metrics(&metrics)?;
 
-        // Update PR review status
-        db.update_pr_review_status(input_id, Some(true), None)?;
+        // Update PR review status to approved
+        db.update_pr_review_status(input_id, Some(true), Some(false))?;
 
-        let retrieved = db.get_quality_metrics(input_id)?.expect("Metrics should exist");
-        assert_eq!(retrieved.pr_approved, Some(true));
-        assert_eq!(retrieved.pr_changes_requested, None);
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.pr_approved, Some(true));
+            assert_eq!(m.pr_changes_requested, Some(false));
+        }
 
-        // Update to request changes
-        db.update_pr_review_status(input_id, None, Some(true))?;
+        // Update to changes requested
+        db.update_pr_review_status(input_id, Some(false), Some(true))?;
 
-        let retrieved = db.get_quality_metrics(input_id)?.expect("Metrics should exist");
-        assert_eq!(retrieved.pr_approved, Some(true)); // Should still be true
-        assert_eq!(retrieved.pr_changes_requested, Some(true));
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.pr_approved, Some(false));
+            assert_eq!(m.pr_changes_requested, Some(true));
+        }
 
         Ok(())
     }

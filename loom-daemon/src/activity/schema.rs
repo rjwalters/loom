@@ -178,6 +178,22 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_input_id ON prompt_changes(input_id);
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_after_commit ON prompt_changes(after_commit);
 
+            -- Prompt-GitHub correlation table for linking prompts to GitHub actions
+            CREATE TABLE IF NOT EXISTS prompt_github (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                issue_number INTEGER,
+                pr_number INTEGER,
+                label_before TEXT,  -- JSON array of labels
+                label_after TEXT,   -- JSON array of labels
+                event_type TEXT NOT NULL  -- 'issue_created', 'pr_created', 'pr_merged', 'label_changed', etc.
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_input_id ON prompt_github(input_id);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_issue_number ON prompt_github(issue_number);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_pr_number ON prompt_github(pr_number);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_event_type ON prompt_github(event_type);
+
             -- Quality metrics for tracking test outcomes and code quality
             CREATE TABLE IF NOT EXISTS quality_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,22 +228,22 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     )?;
 
     // Run migrations for existing databases
-    migrate_token_usage_table(conn)?;
+    migrate_token_usage_table(conn);
 
     Ok(())
 }
 
-/// Migrate token_usage table to add new columns for resource tracking.
+/// Migrate `token_usage` table to add new columns for resource tracking.
 ///
 /// This function adds columns that may not exist in older databases:
-/// - tokens_cache_read
-/// - tokens_cache_write
-/// - duration_ms
+/// - `tokens_cache_read`
+/// - `tokens_cache_write`
+/// - `duration_ms`
 /// - provider
 ///
 /// Uses ALTER TABLE ADD COLUMN which is idempotent-ish (ignores errors for
 /// existing columns).
-fn migrate_token_usage_table(conn: &Connection) -> Result<()> {
+fn migrate_token_usage_table(conn: &Connection) {
     // List of new columns to add (column_name, column_type, default_value)
     let new_columns: [(&str, &str, Option<&str>); 4] = [
         ("tokens_cache_read", "INTEGER", None),
@@ -261,6 +277,4 @@ fn migrate_token_usage_table(conn: &Connection) -> Result<()> {
             }
         }
     }
-
-    Ok(())
 }
