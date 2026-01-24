@@ -12,6 +12,46 @@ Loom is a multi-terminal desktop application for macOS that orchestrates AI-powe
 
 **Loom Repository**: https://github.com/loomhq/loom
 
+## Three-Layer Architecture
+
+Loom uses a three-layer orchestration architecture:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Layer 3: Human Observer                      │
+│  - Approves proposals (loom:architect → loom:issue)             │
+│  - Handles edge cases and blocked issues                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │ observes/intervenes
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Layer 2: Loom Daemon (/loom)                 │
+│  - Spawns shepherds for ready issues                            │
+│  - Triggers Architect/Hermit when backlog is low                │
+│  - Maintains daemon-state.json for crash recovery               │
+└─────────────────────────────────────────────────────────────────┘
+                              │ spawns/manages
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Layer 1: Shepherds (/shepherd <issue>)       │
+│  - Orchestrates full issue lifecycle                            │
+│  - Coordinates: Curator → Builder → Judge → Doctor → Merge      │
+└─────────────────────────────────────────────────────────────────┘
+                              │ triggers
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Layer 0: Worker Roles                        │
+│  /builder, /judge, /curator, /doctor, etc.                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Layer | Role | Purpose |
+|-------|------|---------|
+| Layer 3 | Human | Oversight - approve proposals, handle edge cases |
+| Layer 2 | `/loom` | System orchestration - work generation, scaling |
+| Layer 1 | `/shepherd` | Issue orchestration - full lifecycle |
+| Layer 0 | `/builder` etc. | Task execution - single focused work |
+
 ## Usage Modes
 
 Loom supports two complementary workflows:
@@ -88,12 +128,14 @@ Loom provides specialized roles for different development tasks. Each role follo
 **Champion** (Autonomous 10min, `champion.md`)
 - **Purpose**: Auto-merge approved PRs
 - **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
-- **When to use**: Reducing manual merge overhead for approved PRs
+- **When to use**: Manual orchestration mode where humans review before merge
+- **Note**: Not needed when shepherds use `--force-merge` mode
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
-- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:issue`
+- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated`
 - **When to use**: Issue backlog maintenance, quality improvement
+- **Note**: Human approves curated issues (`loom:curated` → `loom:issue`)
 
 **Architect** (Autonomous 15min, `architect.md`)
 - **Purpose**: Create architectural proposals

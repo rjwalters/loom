@@ -12,18 +12,28 @@ Loom is a multi-terminal desktop application for macOS that orchestrates AI-powe
 
 **Loom Repository**: https://github.com/loomhq/loom
 
-## Two-Layer Architecture
+## Three-Layer Architecture
 
-Loom uses a two-layer orchestration architecture for scalable automation:
+Loom uses a three-layer orchestration architecture for scalable automation:
 
 ```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Layer 3: Human Observer                      │
+│  - Watches system health and intervenes when needed             │
+│  - Approves architectural proposals (loom:architect → loom:issue)│
+│  - Handles edge cases and blocked issues                        │
+│  - Provides strategic direction                                 │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ observes/intervenes
+                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Layer 2: Loom Daemon                         │
 │  /loom - Continuous system orchestrator                         │
 │  - Monitors system state (issue counts, PR status)              │
 │  - Generates work (triggers Architect/Hermit when backlog low)  │
 │  - Scales shepherd pool based on demand                         │
-│  - Ensures Guide/Champion always running                        │
+│  - Maintains daemon-state.json for crash recovery               │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ spawns/manages
@@ -32,15 +42,15 @@ Loom uses a two-layer orchestration architecture for scalable automation:
 │                    Layer 1: Shepherds                           │
 │  /shepherd <issue> - Single-issue lifecycle orchestrator        │
 │  - Coordinates: Curator → Builder → Judge → Doctor → Merge      │
+│  - Handles full lifecycle including code review (Judge phase)   │
 │  - Tracks progress in issue comments                            │
-│  - Handles one issue from creation to merged PR                 │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               │ triggers
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Worker Roles                                 │
-│  Curator, Builder, Judge, Doctor, Champion, etc.                │
+│  Curator, Builder, Judge, Doctor, etc.                          │
 │  - Execute single tasks (curate issue, build feature, review)   │
 │  - Standalone - no knowledge of orchestration                   │
 └─────────────────────────────────────────────────────────────────┘
@@ -48,11 +58,31 @@ Loom uses a two-layer orchestration architecture for scalable automation:
 
 ### Layer Summary
 
-| Layer | Command | Purpose | Mode |
-|-------|---------|---------|------|
+| Layer | Role | Purpose | Mode |
+|-------|------|---------|------|
+| Layer 3 | Human | Oversight - approve proposals, handle edge cases | Observer |
 | Layer 2 | `/loom` | System orchestration - work generation, shepherd scaling | Continuous daemon |
 | Layer 1 | `/shepherd <issue>` | Issue orchestration - lifecycle from creation to merge | Per-issue |
 | Layer 0 | `/builder`, `/judge`, etc. | Task execution - single focused work units | Per-task |
+
+### Layer Responsibilities
+
+**Layer 3 (Human Observer)**:
+- Approve Architect/Hermit proposals (convert `loom:architect` → `loom:issue`)
+- Monitor system health via daemon-state.json
+- Intervene for blocked issues or stuck agents
+- Provide strategic direction on what to build
+
+**Layer 2 (Loom Daemon)**:
+- Automatically maintained by `/loom` - no manual updates needed
+- Triggers Architect/Hermit when issue backlog is low
+- Spawns shepherds for ready issues (`loom:issue`)
+- Tracks state for crash recovery
+
+**Layer 1 (Shepherds)**:
+- Fully autonomous once spawned
+- Handles entire issue lifecycle including Judge review
+- Uses `--force-merge` for autonomous operation or waits for human merge
 
 ### When to Use Which Layer
 
@@ -199,7 +229,8 @@ Loom provides specialized roles for different development tasks. Each role follo
 **Champion** (Autonomous 10min, `champion.md`)
 - **Purpose**: Auto-merge approved PRs
 - **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
-- **When to use**: Reducing manual merge overhead for approved PRs
+- **When to use**: Manual orchestration mode where humans review before merge
+- **Note**: Not needed when shepherds use `--force-merge` (shepherds handle their own merges)
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
