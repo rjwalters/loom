@@ -1,12 +1,31 @@
 # Loom
 
 [![codecov](https://codecov.io/gh/rjwalters/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/rjwalters/loom)
+[![GitHub Release](https://img.shields.io/github/v/release/rjwalters/loom?include_prereleases)](https://github.com/rjwalters/loom/releases)
 
 > AI-powered development orchestration through multi-terminal workspace management
 
 **Multi-terminal workspace where AI agents embody distinct roles—Worker, Curator, Architect, Reviewer, Critic, Fixer—weaving chaos into creation.**
 
 Loom turns **GitHub itself** into the ultimate development interface. Each issue, label, and pull request becomes part of a living workflow orchestrated by AI workers that read, write, and review code—all through your existing GitHub repo.
+
+---
+
+## Download
+
+**[Download Loom.app from Releases](https://github.com/rjwalters/loom/releases)**
+
+| Platform | Download |
+|----------|----------|
+| macOS (Apple Silicon) | [Loom_x.x.x_aarch64.dmg](https://github.com/rjwalters/loom/releases/latest) |
+| macOS (Intel) | [Loom_x.x.x_x64.dmg](https://github.com/rjwalters/loom/releases/latest) |
+
+> **Note**: Loom is currently macOS-only. Linux support is planned.
+
+After downloading:
+1. Open the DMG file
+2. Drag `Loom.app` to your Applications folder
+3. Launch Loom and select your workspace
 
 ---
 
