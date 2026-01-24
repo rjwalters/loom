@@ -37,6 +37,18 @@
         "intervalPrompt": "Identify code simplification and removal opportunities"
       },
       "theme": "sunset"
+    },
+    {
+      "id": "terminal-4",
+      "name": "Champion",
+      "role": "claude-code-worker",
+      "roleConfig": {
+        "workerType": "claude",
+        "roleFile": "champion.md",
+        "targetInterval": 600000,
+        "intervalPrompt": "Check for PRs ready to auto-merge with loom:pr label"
+      },
+      "theme": "midnight"
     }
   ]
 }

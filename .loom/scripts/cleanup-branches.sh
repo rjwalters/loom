@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Loom Branch Cleanup Script - Remove feature branches for closed issues
 #
 # This script automatically cleans up stale feature branches by checking
