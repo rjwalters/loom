@@ -302,7 +302,8 @@ case "$METHOD" in
     echo ""
 
     # Run the full installation workflow
-    exec "$LOOM_ROOT/scripts/install-loom.sh" "$TARGET_PATH"
+    # shellcheck disable=SC2086
+    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG "$TARGET_PATH"
     ;;
 esac
 
