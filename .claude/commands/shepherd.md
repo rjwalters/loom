@@ -1,10 +1,10 @@
-# Loom
+# Shepherd
 
-Assume the Loom orchestrator role from the Loom orchestration system and shepherd an issue through the full development lifecycle.
+Assume the Shepherd role from the Loom orchestration system and shepherd an issue through the full development lifecycle.
 
 ## Process
 
-1. **Read the role definition**: Load `defaults/roles/loom.md` or `.loom/roles/loom.md`
+1. **Read the role definition**: Load `defaults/roles/shepherd.md` or `.loom/roles/shepherd.md`
 2. **Parse the issue number**: Extract from arguments or prompt user
 3. **Check dependencies**: Validate all issue dependencies are resolved (see Pre-Orchestration Dependency Check)
 4. **Orchestrate the workflow**: Trigger roles in sequence with fresh context per phase
@@ -12,7 +12,7 @@ Assume the Loom orchestrator role from the Loom orchestration system and shepher
 
 ## Work Scope
 
-As the **Loom Orchestrator**, you coordinate the full issue lifecycle:
+As the **Shepherd**, you coordinate the full issue lifecycle:
 
 - **Curator phase**: Trigger curator terminal to enhance issue with implementation details
 - **Approval gate**: Wait for `loom:issue` label (human or Champion approval)
@@ -26,12 +26,12 @@ You don't do the work yourself - you orchestrate other terminals via MCP.
 ## Usage
 
 ```
-/loom <issue-number>
-/loom 123
-/loom 456 --to curated    # Stop after curator phase
-/loom 789 --resume        # Resume from last checkpoint
-/loom 321 --force-pr      # Auto-approve, stop at reviewed PR
-/loom 321 --force-merge   # Auto-approve, resolve conflicts, auto-merge
+/shepherd <issue-number>
+/shepherd 123
+/shepherd 456 --to curated    # Stop after curator phase
+/shepherd 789 --resume        # Resume from last checkpoint
+/shepherd 321 --force-pr      # Auto-approve, stop at reviewed PR
+/shepherd 321 --force-merge   # Auto-approve, resolve conflicts, auto-merge
 ```
 
 ## Options
@@ -85,7 +85,7 @@ Orchestration requires these terminals to be configured in the Loom app:
 ## Report Format
 
 ```
-✓ Role Assumed: Loom Orchestrator
+✓ Role Assumed: Shepherd
 ✓ Issue: #XXX - [Title]
 ✓ Phases Completed:
   - Curator: ✅ (loom:curated)
@@ -99,7 +99,7 @@ Orchestration requires these terminals to be configured in the Loom app:
 
 ## Label Workflow
 
-The Loom orchestrator monitors these label transitions:
+The Shepherd monitors these label transitions:
 
 **Issue labels**:
 - `loom:curated` → Curator complete
@@ -141,7 +141,7 @@ On resume, the orchestrator reads this state and continues from the last phase.
 
 ## Pre-Orchestration Dependency Check
 
-Before starting orchestration, `/loom` validates that all issue dependencies are resolved. This prevents wasted effort on issues that will inevitably block.
+Before starting orchestration, `/shepherd` validates that all issue dependencies are resolved. This prevents wasted effort on issues that will inevitably block.
 
 ### Why Check Dependencies First?
 
@@ -185,7 +185,7 @@ done
 If unresolved dependencies are found:
 
 ```
-✓ Role Assumed: Loom Orchestrator
+✓ Role Assumed: Shepherd
 ✓ Issue: #963 - [Parent #944] Part 2: Claim TTL and expiration cleanup
 
 ⚠️ Dependency Check Failed:
@@ -196,7 +196,7 @@ Cannot proceed until dependencies are resolved.
 Options:
   1. Wait for #962 to be completed
   2. Run with --force to attempt anyway (may block later)
-  3. Run /loom 962 --force first to complete the dependency
+  3. Run /shepherd 962 --force first to complete the dependency
 ```
 
 ### Behavior With --force
@@ -204,7 +204,7 @@ Options:
 With `--force`, warn but continue:
 
 ```
-✓ Role Assumed: Loom Orchestrator
+✓ Role Assumed: Shepherd
 ✓ Issue: #963 - [Parent #944] Part 2: Claim TTL and expiration cleanup
 ✓ Mode: --force
 
@@ -228,5 +228,5 @@ pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
 
 1. **Always define dependencies explicitly** in issue body using recognized patterns
 2. **Use task lists** for complex multi-part issues: `- [ ] #123: Part 1`
-3. **Run dependencies first** with `/loom <dep-number> --force` before the dependent issue
+3. **Run dependencies first** with `/shepherd <dep-number> --force` before the dependent issue
 4. **Check closed issues** - closed doesn't always mean merged (could be declined)
