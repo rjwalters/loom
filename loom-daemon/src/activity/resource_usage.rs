@@ -119,11 +119,11 @@ impl ModelPricing {
         let input_cost = (input_tokens as f64 / 1000.0) * self.input_cost_per_1k;
         let output_cost = (output_tokens as f64 / 1000.0) * self.output_cost_per_1k;
 
-        let cache_read_cost = cache_read_tokens
-            .map_or(0.0, |t| (t as f64 / 1000.0) * self.cache_read_cost_per_1k);
+        let cache_read_cost =
+            cache_read_tokens.map_or(0.0, |t| (t as f64 / 1000.0) * self.cache_read_cost_per_1k);
 
-        let cache_write_cost = cache_write_tokens
-            .map_or(0.0, |t| (t as f64 / 1000.0) * self.cache_write_cost_per_1k);
+        let cache_write_cost =
+            cache_write_tokens.map_or(0.0, |t| (t as f64 / 1000.0) * self.cache_write_cost_per_1k);
 
         input_cost + output_cost + cache_read_cost + cache_write_cost
     }

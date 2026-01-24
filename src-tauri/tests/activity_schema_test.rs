@@ -657,11 +657,7 @@ fn test_prompt_github_pr_correlation() {
 
     // Query prompts for the PR
     let pr_count: i32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM prompt_github WHERE pr_number = 123",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM prompt_github WHERE pr_number = 123", [], |row| row.get(0))
         .unwrap();
     assert_eq!(pr_count, 2, "Should have 2 events for PR 123");
 }
@@ -687,35 +683,20 @@ fn test_prompt_github_indexes() {
     )
     .unwrap();
 
-    conn.execute(
-        "CREATE INDEX idx_prompt_github_activity_id ON prompt_github(activity_id)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE INDEX idx_prompt_github_activity_id ON prompt_github(activity_id)", [])
+        .unwrap();
 
-    conn.execute(
-        "CREATE INDEX idx_prompt_github_issue_number ON prompt_github(issue_number)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE INDEX idx_prompt_github_issue_number ON prompt_github(issue_number)", [])
+        .unwrap();
 
-    conn.execute(
-        "CREATE INDEX idx_prompt_github_pr_number ON prompt_github(pr_number)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE INDEX idx_prompt_github_pr_number ON prompt_github(pr_number)", [])
+        .unwrap();
 
-    conn.execute(
-        "CREATE INDEX idx_prompt_github_event_type ON prompt_github(event_type)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE INDEX idx_prompt_github_event_type ON prompt_github(event_type)", [])
+        .unwrap();
 
-    conn.execute(
-        "CREATE INDEX idx_prompt_github_event_time ON prompt_github(event_time)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE INDEX idx_prompt_github_event_time ON prompt_github(event_time)", [])
+        .unwrap();
 
     // Verify indexes exist
     let index_count: i32 = conn
@@ -1313,18 +1294,13 @@ fn test_recommendations_crud() {
     assert!(dismissed, "Recommendation should be dismissed");
 
     // Test mark acted on
-    conn.execute(
-        "UPDATE recommendations SET acted_on = 1 WHERE id = ?1",
-        [rec_id],
-    )
-    .unwrap();
+    conn.execute("UPDATE recommendations SET acted_on = 1 WHERE id = ?1", [rec_id])
+        .unwrap();
 
     let acted_on: bool = conn
-        .query_row(
-            "SELECT acted_on = 1 FROM recommendations WHERE id = ?1",
-            [rec_id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT acted_on = 1 FROM recommendations WHERE id = ?1", [rec_id], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(acted_on, "Recommendation should be marked as acted on");
 }
@@ -1394,18 +1370,13 @@ fn test_recommendation_rules_crud() {
     assert!((new_threshold - 0.4).abs() < 0.01);
 
     // Test disable rule
-    conn.execute(
-        "UPDATE recommendation_rules SET enabled = 0 WHERE id = ?1",
-        [rule_id],
-    )
-    .unwrap();
+    conn.execute("UPDATE recommendation_rules SET enabled = 0 WHERE id = ?1", [rule_id])
+        .unwrap();
 
     let enabled: bool = conn
-        .query_row(
-            "SELECT enabled = 1 FROM recommendation_rules WHERE id = ?1",
-            [rule_id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT enabled = 1 FROM recommendation_rules WHERE id = ?1", [rule_id], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(!enabled, "Rule should be disabled");
 }
@@ -1465,11 +1436,9 @@ fn test_recommendations_filtering() {
 
     // Query active recommendations (not dismissed)
     let active_count: i32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM recommendations WHERE dismissed_at IS NULL",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM recommendations WHERE dismissed_at IS NULL", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(active_count, 3, "Should have 3 active recommendations");
 
@@ -1559,11 +1528,9 @@ fn test_default_recommendation_rules() {
 
     // Verify all are enabled by default
     let enabled_count: i32 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM recommendation_rules WHERE enabled = 1",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT COUNT(*) FROM recommendation_rules WHERE enabled = 1", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(enabled_count, 4, "All rules should be enabled by default");
 
@@ -1613,11 +1580,7 @@ fn test_recommendation_evidence_json() {
 
     // Retrieve and verify evidence
     let stored_evidence: String = conn
-        .query_row(
-            "SELECT evidence FROM recommendations WHERE id = ?1",
-            [rec_id],
-            |row| row.get(0),
-        )
+        .query_row("SELECT evidence FROM recommendations WHERE id = ?1", [rec_id], |row| row.get(0))
         .unwrap();
 
     // Verify it's valid JSON by parsing
@@ -1646,11 +1609,8 @@ fn test_recommendations_indexes() {
     )
     .unwrap();
 
-    conn.execute(
-        "CREATE INDEX idx_recommendations_type ON recommendations(type)",
-        [],
-    )
-    .unwrap();
+    conn.execute("CREATE INDEX idx_recommendations_type ON recommendations(type)", [])
+        .unwrap();
 
     conn.execute(
         "CREATE INDEX idx_recommendations_created_at ON recommendations(created_at DESC)",

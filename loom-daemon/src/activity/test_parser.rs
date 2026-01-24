@@ -172,10 +172,7 @@ fn parse_go_test(output: &str) -> Option<TestResults> {
 
     // Also check for summary lines
     let ok_count = Regex::new(r"^ok\s+").ok()?.find_iter(output).count() as i32;
-    let fail_count = Regex::new(r"^FAIL\s+")
-        .ok()?
-        .find_iter(output)
-        .count() as i32;
+    let fail_count = Regex::new(r"^FAIL\s+").ok()?.find_iter(output).count() as i32;
 
     if ok_count > 0 || fail_count > 0 {
         // In this case, we can't get individual test counts, but we know something ran
@@ -368,8 +365,8 @@ pub fn parse_build_status(output: &str) -> Option<bool> {
         "FAILED",
         "npm ERR!",
         "error: build failed",
-        "error[E",  // Rust compiler error
-        "Error: ",  // TypeScript/Node errors
+        "error[E", // Rust compiler error
+        "Error: ", // TypeScript/Node errors
         "BUILD FAILURE",
         "BUILD FAILED",
     ];
@@ -552,27 +549,15 @@ error: could not compile `myproject` due to 1 previous error
 
     #[test]
     fn test_parse_build_status_failure() {
-        assert_eq!(
-            parse_build_status("error: could not compile `myproject`"),
-            Some(false)
-        );
+        assert_eq!(parse_build_status("error: could not compile `myproject`"), Some(false));
         assert_eq!(parse_build_status("npm ERR! Build failed"), Some(false));
-        assert_eq!(
-            parse_build_status("error[E0425]: cannot find value"),
-            Some(false)
-        );
+        assert_eq!(parse_build_status("error[E0425]: cannot find value"), Some(false));
     }
 
     #[test]
     fn test_parse_build_status_success() {
-        assert_eq!(
-            parse_build_status("   Finished release [optimized] target"),
-            Some(true)
-        );
-        assert_eq!(
-            parse_build_status("Compiled successfully in 2.3s"),
-            Some(true)
-        );
+        assert_eq!(parse_build_status("   Finished release [optimized] target"), Some(true));
+        assert_eq!(parse_build_status("Compiled successfully in 2.3s"), Some(true));
     }
 
     #[test]
