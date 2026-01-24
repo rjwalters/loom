@@ -764,6 +764,193 @@ mcp__loom-ui__get_ui_state
 
 **Note**: In Direct Mode, terminal configuration is not required. The orchestrator executes roles directly.
 
+## Auto-Configuring Missing Terminals (Force Mode)
+
+In MCP Mode, when `--force`, `--force-pr`, or `--force-merge` is specified, the orchestrator automatically configures any missing required terminals instead of prompting the user.
+
+### Why Auto-Configure?
+
+Force mode implies minimal user interaction. Stopping to ask "Add Builder terminal?" defeats the purpose. The orchestrator should:
+1. Detect missing terminals
+2. Auto-configure with sensible defaults
+3. Log what was configured
+4. Continue orchestration
+
+### Detection Logic
+
+Before each phase, check if the required terminal exists:
+
+```bash
+# Check for a terminal with specific role
+TERMINALS=$(mcp__loom-terminals__list_terminals)
+BUILDER_TERMINAL=$(echo "$TERMINALS" | jq -r '.[] | select(.roleConfig.roleFile == "builder.md") | .id' | head -1)
+
+if [ -z "$BUILDER_TERMINAL" ]; then
+  if [ "$FORCE_MODE" = "true" ]; then
+    # Auto-configure the missing terminal
+    auto_configure_terminal "builder"
+  else
+    # Prompt user (normal mode behavior)
+    echo "Missing Builder terminal. Add one?"
+  fi
+fi
+```
+
+### Auto-Configuration Process
+
+When a required terminal is missing and force mode is active:
+
+**Step 1: Read Role Defaults**
+
+```bash
+# Load defaults from role JSON file
+ROLE_JSON=$(cat .loom/roles/builder.json)
+ROLE_NAME=$(echo "$ROLE_JSON" | jq -r '.name')                    # "Development Worker"
+WORKER_TYPE=$(echo "$ROLE_JSON" | jq -r '.suggestedWorkerType')   # "claude"
+INTERVAL=$(echo "$ROLE_JSON" | jq -r '.defaultInterval')          # 0
+```
+
+**Step 2: Create Terminal via MCP**
+
+```bash
+# Create the terminal with role defaults
+mcp__loom-terminals__create_terminal \
+  --name "$ROLE_NAME" \
+  --role "builder"
+```
+
+**Step 3: Configure Role Settings**
+
+```bash
+# Get the new terminal ID (will be terminal-N based on nextAgentNumber)
+NEW_TERMINAL_ID=$(mcp__loom-terminals__list_terminals | jq -r '.[-1].id')
+
+# Configure with role-specific settings
+mcp__loom-terminals__configure_terminal \
+  --terminal_id "$NEW_TERMINAL_ID" \
+  --target_interval "$INTERVAL" \
+  --role_file "builder.md"
+```
+
+**Step 4: Log What Was Configured**
+
+```bash
+echo "📋 Auto-configured $ROLE_NAME terminal ($NEW_TERMINAL_ID)"
+```
+
+### Role Defaults Reference
+
+Each role has defaults in its JSON metadata file:
+
+| Role | Name | Worker Type | Interval | Autonomous |
+|------|------|-------------|----------|------------|
+| builder | Development Worker | claude | 0 | No |
+| curator | Issue Curator | codex | 300000 | Yes |
+| judge | Code Review Specialist | codex | 300000 | Yes |
+| doctor | PR Fixer | claude | 300000 | Yes |
+| champion | PR Champion | codex | 600000 | Yes |
+
+### Terminal Configuration Structure
+
+Auto-configured terminals follow this structure:
+
+```json
+{
+  "id": "terminal-N",
+  "name": "<role.name from JSON>",
+  "role": "<role-key>",
+  "roleConfig": {
+    "workerType": "<role.suggestedWorkerType>",
+    "roleFile": "<role>.md",
+    "targetInterval": "<role.defaultInterval>",
+    "intervalPrompt": ""
+  }
+}
+```
+
+### Complete Auto-Configuration Function
+
+```bash
+auto_configure_terminal() {
+  local ROLE_KEY=$1  # e.g., "builder", "curator", "judge"
+
+  # Read role metadata
+  local ROLE_JSON_FILE=".loom/roles/${ROLE_KEY}.json"
+  if [ ! -f "$ROLE_JSON_FILE" ]; then
+    echo "ERROR: Role file not found: $ROLE_JSON_FILE"
+    return 1
+  fi
+
+  local ROLE_JSON=$(cat "$ROLE_JSON_FILE")
+  local ROLE_NAME=$(echo "$ROLE_JSON" | jq -r '.name // "Unknown Role"')
+  local WORKER_TYPE=$(echo "$ROLE_JSON" | jq -r '.suggestedWorkerType // "claude"')
+  local INTERVAL=$(echo "$ROLE_JSON" | jq -r '.defaultInterval // 0')
+
+  # Create terminal
+  mcp__loom-terminals__create_terminal \
+    --name "$ROLE_NAME" \
+    --role "$ROLE_KEY"
+
+  # Get newly created terminal ID
+  local NEW_TERMINAL_ID=$(mcp__loom-terminals__list_terminals | jq -r '.[-1].id')
+
+  # Configure role settings
+  mcp__loom-terminals__configure_terminal \
+    --terminal_id "$NEW_TERMINAL_ID" \
+    --target_interval "$INTERVAL" \
+    --role_file "${ROLE_KEY}.md"
+
+  echo "📋 Auto-configured $ROLE_NAME terminal ($NEW_TERMINAL_ID)"
+
+  # Return the terminal ID for use
+  echo "$NEW_TERMINAL_ID"
+}
+```
+
+### Usage in Phase Execution
+
+Before triggering each phase, check and auto-configure:
+
+```bash
+# Example: Builder phase with auto-configuration
+if [ "$PHASE" = "builder" ]; then
+  # Find existing Builder terminal
+  BUILDER_TERMINAL=$(mcp__loom-terminals__list_terminals | \
+    jq -r '.[] | select(.roleConfig.roleFile == "builder.md") | .id' | head -1)
+
+  # Auto-configure if missing and in force mode
+  if [ -z "$BUILDER_TERMINAL" ]; then
+    if [ "$FORCE_MODE" = "true" ]; then
+      BUILDER_TERMINAL=$(auto_configure_terminal "builder")
+    else
+      echo "ERROR: No Builder terminal configured"
+      exit 1
+    fi
+  fi
+
+  # Now proceed with the phase using $BUILDER_TERMINAL
+  mcp__loom-terminals__restart_terminal --terminal_id "$BUILDER_TERMINAL"
+  mcp__loom-terminals__configure_terminal \
+    --terminal_id "$BUILDER_TERMINAL" \
+    --interval_prompt "Build issue #$ISSUE_NUMBER"
+  mcp__loom-ui__trigger_run_now --terminalId "$BUILDER_TERMINAL"
+fi
+```
+
+### Behavior Summary
+
+| Mode | Missing Terminal | Behavior |
+|------|------------------|----------|
+| Normal (`/loom N`) | Builder missing | Prompt user: "Add Builder terminal?" |
+| Force (`--force`) | Builder missing | Auto-configure Builder, log, continue |
+| Force PR (`--force-pr`) | Builder missing | Auto-configure Builder, log, continue |
+| Force Merge (`--force-merge`) | Builder missing | Auto-configure Builder, log, continue |
+| Direct Mode | Any missing | N/A - executes roles directly |
+
+### Persistence
+
+Auto-configured terminals are persisted to `.loom/config.json` by the MCP server. They will be available for future orchestrations.
+
 ## Error Handling
 
 ### Issue is Blocked
@@ -778,9 +965,21 @@ gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration paused**: Issue is
 
 If a required terminal isn't configured:
 
+**In Force Mode** (`--force`, `--force-pr`, `--force-merge`):
+- Auto-configure the terminal using defaults from `.loom/roles/<role>.json`
+- See "Auto-Configuring Missing Terminals" section above
+
+**In Normal Mode**:
 ```bash
+# Prompt user for action
+echo "Missing $ROLE terminal. Options:"
+echo "1. Add $ROLE terminal with default configuration"
+echo "2. Skip this phase (may cause issues)"
+echo "3. Abort orchestration"
+
+# If user chooses to abort:
 echo "ERROR: No terminal found for role '$ROLE'. Configure a terminal with roleFile: $ROLE.md"
-gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration failed**: Missing terminal for $ROLE role."
+gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration paused**: Missing terminal for $ROLE role. Run with --force to auto-configure."
 ```
 
 ### MCP Connection Failed (Triggers Direct Mode)
