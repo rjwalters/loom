@@ -258,6 +258,11 @@ fn main() {
             predict_success,
             log_success_factor,
             clear_correlation_results,
+            // Prediction model commands
+            predict_prompt_success,
+            train_prediction_model,
+            get_prediction_model_stats,
+            record_prediction_outcome,
         ])
         .run(tauri::generate_context!())
     {
