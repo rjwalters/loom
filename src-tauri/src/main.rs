@@ -287,6 +287,11 @@ fn main() {
             get_optimization_rules,
             toggle_optimization_rule,
             refine_optimization_rules,
+            // Prediction model commands
+            predict_prompt_success,
+            train_prediction_model,
+            get_prediction_model_stats,
+            record_prediction_outcome,
         ])
         .run(tauri::generate_context!())
     {
