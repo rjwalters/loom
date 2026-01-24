@@ -217,6 +217,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
                 pr_approved BOOLEAN,
                 pr_changes_requested BOOLEAN,
 
+                -- Rework tracking (Issue #1054)
+                -- Counts how many review cycles a PR goes through
+                rework_count INTEGER DEFAULT 0,
+
                 -- Human rating (optional, for future use)
                 human_rating INTEGER
             );
@@ -250,6 +254,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
     // Run migrations for existing databases
     migrate_token_usage_table(conn);
+    migrate_quality_metrics_table(conn);
 
     Ok(())
 }
@@ -264,6 +269,30 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 ///
 /// Uses ALTER TABLE ADD COLUMN which is idempotent-ish (ignores errors for
 /// existing columns).
+/// Migrate `quality_metrics` table to add new columns.
+///
+/// This function adds columns that may not exist in older databases:
+/// - `rework_count` (Issue #1054)
+///
+/// Uses ALTER TABLE ADD COLUMN which is idempotent-ish (ignores errors for
+/// existing columns).
+fn migrate_quality_metrics_table(conn: &Connection) {
+    // Add rework_count column for tracking PR review cycles
+    let sql = "ALTER TABLE quality_metrics ADD COLUMN rework_count INTEGER DEFAULT 0";
+
+    match conn.execute(sql, []) {
+        Ok(_) => log::info!("Added column rework_count to quality_metrics table"),
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("duplicate column") || err_str.contains("already exists") {
+                log::debug!("Column rework_count already exists in quality_metrics table");
+            } else {
+                log::debug!("Could not add column rework_count to quality_metrics: {e} (may be expected)");
+            }
+        }
+    }
+}
+
 fn migrate_token_usage_table(conn: &Connection) {
     // List of new columns to add (column_name, column_type, default_value)
     let new_columns: [(&str, &str, Option<&str>); 4] = [
