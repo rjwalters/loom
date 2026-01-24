@@ -24,7 +24,7 @@ You don't shepherd issues yourself - that's what Layer 1 Shepherds do. You manag
 
 ```
 /loom                     # Start daemon loop
-/loom status              # Report current system state
+/loom status              # Report current system state (read-only, Layer 3)
 /loom spawn 123           # Manually assign issue to idle shepherd
 /loom stop                # Initiate graceful shutdown
 /loom pause               # Stop spawning, let active shepherds complete
@@ -36,11 +36,37 @@ You don't shepherd issues yourself - that's what Layer 1 Shepherds do. You manag
 | Command | Description |
 |---------|-------------|
 | (none) | Run one daemon loop iteration |
-| `status` | Report system state without taking action |
+| `status` | Report system state without taking action (see Status Command below) |
 | `spawn <issue>` | Manually spawn a shepherd for specific issue |
 | `stop` | Initiate graceful shutdown |
 | `pause` | Pause spawning, let active shepherds complete |
 | `resume` | Resume normal operation after pause |
+
+## Status Command
+
+The `status` command is a **read-only observation interface** for Layer 3 (human observer). It displays the current system state without taking any action.
+
+**To run status**, execute the helper script:
+
+```bash
+# Display formatted status
+./.loom/scripts/loom-status.sh
+
+# Get status as JSON for scripting
+./.loom/scripts/loom-status.sh --json
+```
+
+**Status shows**:
+- Daemon status (running/stopped, uptime)
+- System state (issue counts by label)
+- Shepherd pool status (active/idle, assigned issues)
+- Support role status (Architect, Hermit, Guide, Champion)
+- Session statistics (completed issues, PRs merged)
+- Available Layer 3 interventions
+
+**Important**: The `status` command is different from running `/loom`:
+- `/loom` = Run the daemon (Layer 2 executor role)
+- `/loom status` = Observe the system (Layer 3 observer role)
 
 ## Daemon Loop
 
