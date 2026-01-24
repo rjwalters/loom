@@ -44,7 +44,9 @@ pub use models::{ActivityEntry, AgentInput, AgentOutput, InputContext, InputType
 
 // These types are available for future use but not currently imported elsewhere
 #[allow(unused_imports)]
-pub use models::{AgentMetric, ProductivitySummary, TokenUsage};
+pub use models::{
+    AgentMetric, ProductivitySummary, PromptGitHubEvent, PromptGitHubEventType, TokenUsage,
+};
 
 // Re-export the database struct
 pub use db::ActivityDb;

@@ -1,4 +1,5 @@
 use crate::activity::{ActivityDb, AgentInput, InputContext, InputType};
+use crate::github_parser::parse_github_events;
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
 use anyhow::Result;
@@ -226,7 +227,7 @@ fn handle_request(
                             input_id: None, // Could link to last input if tracked
                             terminal_id: id.clone(),
                             timestamp: Utc::now(),
-                            content: Some(output_str),
+                            content: Some(output_str.clone()),
                             content_preview: Some(preview),
                             exit_code: None,
                             metadata: None,
@@ -235,6 +236,22 @@ fn handle_request(
                         if let Ok(db) = activity_db.lock() {
                             if let Err(e) = db.record_output(&output_record) {
                                 log::warn!("Failed to record output to activity database: {e}");
+                            }
+
+                            // Parse terminal output for GitHub events and record them
+                            let github_events = parse_github_events(&output_str);
+                            for parsed_event in github_events {
+                                let prompt_event = parsed_event.to_prompt_github_event(None);
+                                if let Err(e) = db.record_prompt_github_event(&prompt_event) {
+                                    log::warn!("Failed to record GitHub event: {e}");
+                                } else {
+                                    log::debug!(
+                                        "Recorded GitHub event: {:?} (issue: {:?}, pr: {:?})",
+                                        prompt_event.event_type,
+                                        prompt_event.issue_number,
+                                        prompt_event.pr_number
+                                    );
+                                }
                             }
                         }
                     }

@@ -1,4 +1,5 @@
 mod activity;
+mod github_parser;
 mod health_monitor;
 mod init;
 mod ipc;
