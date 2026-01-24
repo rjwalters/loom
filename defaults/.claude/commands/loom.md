@@ -6,8 +6,9 @@ Assume the Loom orchestrator role from the Loom orchestration system and shepher
 
 1. **Read the role definition**: Load `defaults/roles/loom.md` or `.loom/roles/loom.md`
 2. **Parse the issue number**: Extract from arguments or prompt user
-3. **Orchestrate the workflow**: Trigger roles in sequence with fresh context per phase
-4. **Report results**: Summarize orchestration progress
+3. **Check dependencies**: Validate all issue dependencies are resolved (see Pre-Orchestration Dependency Check)
+4. **Orchestrate the workflow**: Trigger roles in sequence with fresh context per phase
+5. **Report results**: Summarize orchestration progress
 
 ## Work Scope
 
@@ -126,3 +127,95 @@ Progress is tracked in issue comments for crash recovery:
 ```
 
 On resume, the orchestrator reads this state and continues from the last phase.
+
+## Pre-Orchestration Dependency Check
+
+Before starting orchestration, `/loom` validates that all issue dependencies are resolved. This prevents wasted effort on issues that will inevitably block.
+
+### Why Check Dependencies First?
+
+Without pre-flight validation:
+- Curator enhances an issue that can't be built yet
+- API tokens wasted on orchestration that can't complete
+- User sees false progress before discovering the block
+
+### Dependency Patterns Recognized
+
+The orchestrator scans the issue body for these patterns:
+
+| Pattern | Example |
+|---------|---------|
+| Explicit blocker | `Blocked by #123` |
+| Depends on | `Depends on #123` |
+| Requires | `Requires #123` |
+| Task list | `- [ ] #123: Description` |
+| Dependencies section | `## Dependencies\n- #123` |
+
+### How to Check Dependencies
+
+```bash
+# Parse issue body for dependency references
+body=$(gh issue view "$issue_number" --json body --jq '.body')
+
+# Extract issue numbers from dependency patterns
+deps=$(echo "$body" | grep -oE '(Blocked by|Depends on|Requires|After|Parent.*#|\- \[.\] #)[0-9]+' | grep -oE '#[0-9]+' | tr -d '#' | sort -u)
+
+# Check each dependency's state
+for dep in $deps; do
+  state=$(gh issue view "$dep" --json state --jq '.state')
+  if [ "$state" != "CLOSED" ]; then
+    echo "BLOCKED by #$dep ($state)"
+  fi
+done
+```
+
+### Behavior Without --force
+
+If unresolved dependencies are found:
+
+```
+✓ Role Assumed: Loom Orchestrator
+✓ Issue: #963 - [Parent #944] Part 2: Claim TTL and expiration cleanup
+
+⚠️ Dependency Check Failed:
+  - #962 (OPEN): Part 1: Atomic claiming system
+
+Cannot proceed until dependencies are resolved.
+
+Options:
+  1. Wait for #962 to be completed
+  2. Run with --force to attempt anyway (may block later)
+  3. Run /loom 962 --force first to complete the dependency
+```
+
+### Behavior With --force
+
+With `--force`, warn but continue:
+
+```
+✓ Role Assumed: Loom Orchestrator
+✓ Issue: #963 - [Parent #944] Part 2: Claim TTL and expiration cleanup
+✓ Mode: --force
+
+⚠️ Unresolved Dependencies (proceeding anyway):
+  - #962 (OPEN): Part 1: Atomic claiming system
+
+Continuing with --force. Orchestration may block if dependencies are required.
+```
+
+### Checking PR Dependencies
+
+For issues that depend on PRs (not just issues):
+
+```bash
+# Check if a PR is merged
+pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
+# MERGED, OPEN, or CLOSED (without merge)
+```
+
+### Best Practices
+
+1. **Always define dependencies explicitly** in issue body using recognized patterns
+2. **Use task lists** for complex multi-part issues: `- [ ] #123: Part 1`
+3. **Run dependencies first** with `/loom <dep-number> --force` before the dependent issue
+4. **Check closed issues** - closed doesn't always mean merged (could be declined)
