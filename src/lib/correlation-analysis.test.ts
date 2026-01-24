@@ -1,13 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   formatCorrelation,
   formatPValue,
+  getCorrelationColorClass,
+  getDayName,
+  getSuccessRateColorClass,
+  getTimeBucketName,
   interpretCorrelation,
   isSignificant,
-  getDayName,
-  getTimeBucketName,
-  getCorrelationColorClass,
-  getSuccessRateColorClass,
 } from "./correlation-analysis";
 
 // Note: Full integration tests for Tauri invoke functions would require

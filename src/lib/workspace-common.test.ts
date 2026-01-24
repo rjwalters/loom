@@ -33,7 +33,7 @@ vi.mock("./logger", () => ({
 
 describe("workspace-common", () => {
   let mockState: AppState;
-  let mockLaunchAgentsForTerminals: ReturnType<typeof vi.fn>;
+  let mockLaunchAgentsForTerminals: (workspacePath: string, terminals: Terminal[]) => Promise<void>;
   let mockAgents: Terminal[];
 
   beforeEach(() => {
@@ -71,7 +71,10 @@ describe("workspace-common", () => {
     } as unknown as AppState;
 
     // Create mock launcher
-    mockLaunchAgentsForTerminals = vi.fn().mockResolvedValue(undefined);
+    mockLaunchAgentsForTerminals = vi.fn() as unknown as (
+      workspacePath: string,
+      terminals: Terminal[]
+    ) => Promise<void>;
   });
 
   afterEach(() => {
