@@ -206,8 +206,8 @@ Loom provides specialized roles for different development tasks. Each role follo
 **Champion** (Autonomous 10min, `champion.md`)
 - **Purpose**: Auto-merge approved PRs
 - **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
-- **When to use**: Manual orchestration mode where humans review before merge
-- **Note**: Not needed when shepherds use `--force-merge` mode
+- **When to use**: Default daemon mode with `--force-pr` (human reviews PR before Champion merges)
+- **Note**: Not used when shepherds run with `--force-merge` (shepherds handle their own merges)
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
