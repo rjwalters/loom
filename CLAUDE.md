@@ -717,6 +717,72 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+### Stuck Agent Detection
+
+The Loom daemon automatically detects stuck or struggling agents and can trigger interventions.
+
+**Check for stuck agents**:
+```bash
+# Run stuck detection check
+./.loom/scripts/stuck-detection.sh check
+
+# Check with JSON output
+./.loom/scripts/stuck-detection.sh check --json
+
+# Check specific agent
+./.loom/scripts/stuck-detection.sh check-agent shepherd-1
+```
+
+**View stuck detection status**:
+```bash
+# Show status summary
+./.loom/scripts/stuck-detection.sh status
+
+# View intervention history
+./.loom/scripts/stuck-detection.sh history
+./.loom/scripts/stuck-detection.sh history shepherd-1
+```
+
+**Configure stuck detection thresholds**:
+```bash
+# Adjust thresholds
+./.loom/scripts/stuck-detection.sh configure \
+  --idle-threshold 900 \
+  --working-threshold 2400 \
+  --intervention-mode escalate
+
+# Intervention modes: none, alert, suggest, pause, clarify, escalate
+```
+
+**Handle stuck agents**:
+```bash
+# Clear intervention for specific agent
+./.loom/scripts/stuck-detection.sh clear shepherd-1
+
+# Clear all interventions
+./.loom/scripts/stuck-detection.sh clear all
+
+# Resume a paused agent
+./.loom/scripts/signal.sh clear shepherd-1
+```
+
+**Stuck indicators**:
+| Indicator | Default Threshold | Description |
+|-----------|-------------------|-------------|
+| `no_progress` | 10 minutes | No output written to task output file |
+| `extended_work` | 30 minutes | Working on same issue without creating PR |
+| `looping` | 3 occurrences | Repeated similar error patterns |
+| `error_spike` | 5 errors | Multiple errors in short period |
+
+**Intervention types**:
+| Type | Trigger | Action |
+|------|---------|--------|
+| `alert` | Low severity | Write to `.loom/interventions/`, human reviews |
+| `suggest` | Medium severity | Suggest role switch (e.g., Builder -> Doctor) |
+| `pause` | High severity | Auto-pause via signal.sh, requires manual restart |
+| `clarify` | Error spike | Suggest requesting clarification from issue author |
+| `escalate` | Critical | Full escalation: pause + alert + human notification |
+
 ### Daemon Troubleshooting (Layer 2)
 
 **Check daemon state**:
