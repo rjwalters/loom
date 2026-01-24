@@ -60,7 +60,7 @@ describe("HomePage", () => {
     renderWithProviders(<HomePage />);
 
     const learnMoreLink = screen.getByRole("link", { name: /learn more/i });
-    expect(learnMoreLink).toHaveAttribute("href", "https://github.com/loomhq/loom");
+    expect(learnMoreLink).toHaveAttribute("href", "https://github.com/rjwalters/loom");
     expect(learnMoreLink).toHaveAttribute("target", "_blank");
     expect(learnMoreLink).toHaveAttribute("rel", "noopener noreferrer");
   });

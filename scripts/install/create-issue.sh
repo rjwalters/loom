@@ -67,7 +67,7 @@ Loom is a multi-terminal desktop application for macOS that orchestrates AI-powe
 
 ## Repository
 
-https://github.com/loomhq/loom
+https://github.com/rjwalters/loom
 EOF
 )
 

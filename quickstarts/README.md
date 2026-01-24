@@ -50,7 +50,7 @@ API-first backend with Cloudflare Workers and Hono.
 
 ```bash
 # Clone Loom if you haven't
-git clone https://github.com/loomhq/loom.git
+git clone https://github.com/rjwalters/loom.git
 
 # Copy template to new location
 cp -r loom/quickstarts/webapp ~/projects/my-app

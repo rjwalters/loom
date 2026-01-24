@@ -10,7 +10,7 @@ This repository uses **Loom** for AI-powered development orchestration.
 
 Loom is a multi-terminal desktop application for macOS that orchestrates AI-powered development workers using git worktrees and GitHub as the coordination layer. It enables both automated orchestration (Tauri App Mode) and manual coordination (Manual Orchestration Mode).
 
-**Loom Repository**: https://github.com/loomhq/loom
+**Loom Repository**: https://github.com/rjwalters/loom
 
 ## Usage Modes
 
@@ -510,8 +510,8 @@ which claude
 
 ### Loom Documentation
 
-- **Main Repository**: https://github.com/loomhq/loom
-- **Getting Started**: https://github.com/loomhq/loom#getting-started
+- **Main Repository**: https://github.com/rjwalters/loom
+- **Getting Started**: https://github.com/rjwalters/loom#getting-started
 - **Role Definitions**: See `.loom/roles/*.md` in this repository
 - **Workflow Details**: See `.loom/AGENTS.md` in this repository
 
@@ -525,8 +525,8 @@ which claude
 ## Support
 
 For issues with Loom itself:
-- **GitHub Issues**: https://github.com/loomhq/loom/issues
-- **Documentation**: https://github.com/loomhq/loom/blob/main/CLAUDE.md
+- **GitHub Issues**: https://github.com/rjwalters/loom/issues
+- **Documentation**: https://github.com/rjwalters/loom/blob/main/CLAUDE.md
 
 For issues specific to this repository:
 - Use the repository's normal issue tracker
