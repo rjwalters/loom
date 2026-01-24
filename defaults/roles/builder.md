@@ -596,6 +596,92 @@ Before claiming, check for these warning signs:
 
 **Reading comments is not optional** - it's where Curators put the detailed spec that makes issues truly ready for implementation.
 
+## Pre-Implementation Review: Check Recent Main Changes
+
+**CRITICAL:** Before implementing, review recent changes to main to avoid conflicts with recent architectural decisions.
+
+### Why This Matters
+
+The codebase evolves while you work. Recent PRs may have:
+- Introduced new utilities or helper functions you should use
+- Changed authentication/authorization patterns
+- Updated API conventions or response formats
+- Added shared components or abstractions
+- Modified configuration or environment handling
+
+**Without this review**: You may implement using outdated patterns, leading to merge conflicts, inconsistent code, or duplicated functionality.
+
+### Required Commands
+
+**Step 1: Review recent commits to main**
+
+```bash
+# Show last 20 commits to main
+git fetch origin main
+git log --oneline -20 origin/main
+
+# Show files changed in recent commits
+git diff HEAD~20..origin/main --stat
+```
+
+**Step 2: Check changes in your feature area**
+
+```bash
+# Check recent changes in directories related to your feature
+git log --oneline -10 origin/main -- "src/relevant/path"
+git log --oneline -10 origin/main -- "*.ts"  # or relevant file types
+```
+
+**Step 3: Look for these architectural changes**
+
+| Change Type | What to Look For | Why It Matters |
+|-------------|------------------|----------------|
+| **Authentication** | New auth middleware, session handling, token patterns | Use the new auth approach, not old patterns |
+| **API Patterns** | Response formats, error handling, validation | Match existing conventions |
+| **Utilities** | New helper functions, shared modules | Reuse instead of reimplementing |
+| **Shared Components** | Common UI elements, base classes | Extend rather than duplicate |
+| **Configuration** | New env vars, config patterns | Follow established patterns |
+
+### Example Workflow
+
+```bash
+# 1. Fetch latest main
+git fetch origin main
+
+# 2. See what changed recently
+git log --oneline -20 origin/main
+# 5b55cb7 Add dependency unblocking to Guide role (#997)
+# cc41f95 Add guidance for handling pre-existing lint/build failures (#982)
+# 6b55a3e Add rebase step before PR creation (#980)
+# ...
+
+# 3. If you see relevant changes, investigate
+git show 5b55cb7 --stat  # See what files changed
+git show 5b55cb7          # See the actual changes
+
+# 4. Check changes in your feature area
+git log --oneline -10 origin/main -- "src/lib/auth"
+# → If you see auth changes, read them before implementing!
+
+# 5. Adapt your implementation plan based on findings
+```
+
+### When to Skip This Step
+
+- **Trivial fixes**: Typos, documentation, obvious bugs
+- **Isolated changes**: Changes that don't interact with other code
+- **Fresh main**: You just pulled main and no time has passed
+
+### Integration with Worktree Workflow
+
+This review happens BEFORE creating your worktree:
+
+1. Read issue (with comments)
+2. **Review recent main changes** ← YOU ARE HERE
+3. Check dependencies
+4. Create worktree
+5. Implement (using patterns learned from review)
+
 ## Checking Dependencies Before Claiming
 
 Before claiming a `loom:issue` issue, check if it has a **Dependencies** section.
