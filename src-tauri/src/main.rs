@@ -246,6 +246,18 @@ fn main() {
             get_usage_events,
             get_usage_stats,
             delete_telemetry_data,
+            // Correlation analysis commands
+            extract_success_factors,
+            analyze_hour_success_correlation,
+            analyze_role_success_correlation,
+            analyze_time_of_day_success,
+            analyze_day_of_week_success,
+            get_correlations,
+            get_success_factors_for_role,
+            run_correlation_analysis,
+            predict_success,
+            log_success_factor,
+            clear_correlation_results,
         ])
         .run(tauri::generate_context!())
     {
