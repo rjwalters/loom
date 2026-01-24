@@ -106,6 +106,9 @@ pub struct AgentMetric {
 }
 
 /// Token usage record for a single API request
+///
+/// Enhanced to track cache tokens, duration, and provider for LLM resource usage
+/// analytics (Issue #1013).
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct TokenUsage {
@@ -118,6 +121,15 @@ pub struct TokenUsage {
     pub total_tokens: i64,
     pub model: Option<String>,
     pub estimated_cost_usd: f64,
+    // Enhanced fields for resource tracking (Issue #1013)
+    /// Cache read tokens (prompt caching - reduces input cost)
+    pub tokens_cache_read: Option<i64>,
+    /// Cache write tokens (prompt caching - initial cache creation)
+    pub tokens_cache_write: Option<i64>,
+    /// API response time in milliseconds
+    pub duration_ms: Option<i64>,
+    /// LLM provider: 'anthropic', 'openai', 'google', etc.
+    pub provider: Option<String>,
 }
 
 /// Combined activity entry (input + output)

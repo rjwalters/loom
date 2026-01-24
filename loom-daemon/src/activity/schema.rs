@@ -118,7 +118,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_metrics_github_issue ON agent_metrics(github_issue);
             CREATE INDEX IF NOT EXISTS idx_metrics_status ON agent_metrics(status);
 
-            -- Token usage per API request
+            -- Token usage per API request (enhanced for LLM resource tracking)
             CREATE TABLE IF NOT EXISTS token_usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 input_id INTEGER REFERENCES agent_inputs(id),
@@ -128,12 +128,19 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
                 completion_tokens INTEGER NOT NULL,
                 total_tokens INTEGER NOT NULL,
                 model TEXT,
-                estimated_cost_usd REAL DEFAULT 0.0
+                estimated_cost_usd REAL DEFAULT 0.0,
+                -- Enhanced fields for resource tracking (Issue #1013)
+                tokens_cache_read INTEGER,    -- Cache read tokens (prompt caching)
+                tokens_cache_write INTEGER,   -- Cache write tokens (prompt caching)
+                duration_ms INTEGER,          -- API response time in milliseconds
+                provider TEXT                 -- 'anthropic', 'openai', etc.
             );
 
             CREATE INDEX IF NOT EXISTS idx_token_usage_input_id ON token_usage(input_id);
             CREATE INDEX IF NOT EXISTS idx_token_usage_metric_id ON token_usage(metric_id);
             CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model);
+            CREATE INDEX IF NOT EXISTS idx_token_usage_provider ON token_usage(provider);
 
             -- GitHub events for correlating agent activity with GitHub actions
             CREATE TABLE IF NOT EXISTS github_events (
@@ -155,6 +162,57 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_github_events_issue_number ON github_events(issue_number);
             ",
     )?;
+
+    // Run migrations for existing databases
+    migrate_token_usage_table(conn)?;
+
+    Ok(())
+}
+
+/// Migrate token_usage table to add new columns for resource tracking.
+///
+/// This function adds columns that may not exist in older databases:
+/// - tokens_cache_read
+/// - tokens_cache_write
+/// - duration_ms
+/// - provider
+///
+/// Uses ALTER TABLE ADD COLUMN which is idempotent-ish (ignores errors for
+/// existing columns).
+fn migrate_token_usage_table(conn: &Connection) -> Result<()> {
+    // List of new columns to add (column_name, column_type, default_value)
+    let new_columns: [(&str, &str, Option<&str>); 4] = [
+        ("tokens_cache_read", "INTEGER", None),
+        ("tokens_cache_write", "INTEGER", None),
+        ("duration_ms", "INTEGER", None),
+        ("provider", "TEXT", None),
+    ];
+
+    for (column_name, column_type, default) in new_columns {
+        let sql = match default {
+            Some(def) => format!(
+                "ALTER TABLE token_usage ADD COLUMN {column_name} {column_type} DEFAULT {def}"
+            ),
+            None => format!("ALTER TABLE token_usage ADD COLUMN {column_name} {column_type}"),
+        };
+
+        // SQLite will error if column already exists, which is fine
+        match conn.execute(&sql, []) {
+            Ok(_) => log::info!("Added column {column_name} to token_usage table"),
+            Err(e) => {
+                // Check if it's a "duplicate column" error (expected for existing DBs)
+                let err_str = e.to_string();
+                if err_str.contains("duplicate column") || err_str.contains("already exists") {
+                    log::debug!("Column {column_name} already exists in token_usage table");
+                } else {
+                    // Unexpected error - log but don't fail (table might not exist yet)
+                    log::debug!(
+                        "Could not add column {column_name} to token_usage: {e} (may be expected)"
+                    );
+                }
+            }
+        }
+    }
 
     Ok(())
 }
