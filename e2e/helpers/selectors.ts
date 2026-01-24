@@ -1,70 +1,71 @@
 /**
  * Shared test selectors for Loom E2E tests.
  *
- * Using data-testid attributes for stable selectors that won't break
- * when CSS classes or text content changes.
+ * These selectors match the actual UI implementation in src/lib/ui/*.ts
+ * and src/main.ts. Update these when the UI changes.
  */
 
 export const selectors = {
-	// Workspace selection
-	workspacePicker: '[data-testid="workspace-picker"]',
-	workspaceSelectBtn: '[data-testid="select-workspace-btn"]',
-	workspaceName: '[data-testid="workspace-name"]',
-	workspaceChangeBtn: '[data-testid="change-workspace-btn"]',
+  // Workspace selection - uses IDs from main.ts
+  workspacePicker: "#workspace-path-container",
+  workspaceSelectBtn: "#select-workspace-btn",
+  workspaceInput: "#workspace-path-input",
+  workspaceName: "#workspace-name",
+  workspaceChangeBtn: "#change-workspace-btn",
 
-	// Terminal management
-	terminalContainer: '[data-testid="terminal-container"]',
-	terminalCard: '[data-testid="terminal-card"]',
-	addTerminalBtn: '[data-testid="add-terminal-btn"]',
-	terminalSettingsBtn: '[data-testid="terminal-settings-btn"]',
-	terminalDeleteBtn: '[data-testid="terminal-delete-btn"]',
-	terminalOutput: '[data-testid="terminal-output"]',
-	terminalInput: '[data-testid="terminal-input"]',
+  // Terminal management - uses IDs and classes from ui/terminal-grid.ts
+  terminalContainer: "#mini-terminal-row",
+  terminalCard: ".terminal-card",
+  addTerminalBtn: "#add-terminal-btn",
+  terminalSettingsBtn: ".terminal-settings-btn",
+  terminalDeleteBtn: ".terminal-delete-btn",
+  terminalOutput: "#terminal-output",
+  terminalInput: "#terminal-input",
 
-	// Terminal settings modal
-	settingsModal: '[data-testid="terminal-settings-modal"]',
-	roleSelect: '[data-testid="role-select"]',
-	workerTypeSelect: '[data-testid="worker-type-select"]',
-	intervalInput: '[data-testid="interval-input"]',
-	intervalPromptInput: '[data-testid="interval-prompt-input"]',
-	saveSettingsBtn: '[data-testid="save-settings-btn"]',
-	cancelSettingsBtn: '[data-testid="cancel-settings-btn"]',
+  // Terminal settings modal
+  settingsModal: "#terminal-settings-modal",
+  roleSelect: "#role-select",
+  workerTypeSelect: "#worker-type-select",
+  intervalInput: "#interval-input",
+  intervalPromptInput: "#interval-prompt-input",
+  saveSettingsBtn: "#save-settings-btn",
+  cancelSettingsBtn: "#cancel-settings-btn",
 
-	// Engine controls
-	startEngineBtn: '[data-testid="start-engine-btn"]',
-	stopEngineBtn: '[data-testid="stop-engine-btn"]',
-	engineStatus: '[data-testid="engine-status"]',
+  // Engine controls - from header.ts
+  startEngineBtn: "#start-engine-btn",
+  stopEngineBtn: "#stop-engine-btn",
+  engineStatus: "#engine-status",
 
-	// Factory reset
-	factoryResetBtn: '[data-testid="factory-reset-btn"]',
-	confirmResetBtn: '[data-testid="confirm-reset-btn"]',
-	cancelResetBtn: '[data-testid="cancel-reset-btn"]',
+  // Factory reset
+  factoryResetBtn: "#factory-reset-btn",
+  confirmResetBtn: "#confirm-reset-btn",
+  cancelResetBtn: "#cancel-reset-btn",
 
-	// Tarot cards
-	tarotCard: '[data-testid="tarot-card"]',
-	tarotName: '[data-testid="tarot-name"]',
+  // Primary terminal view
+  primaryTerminalContainer: "#primary-terminal",
+  primaryTerminalXterm: "#primary-terminal .xterm",
 
-	// Mini terminals row
-	miniTerminalRow: '[data-testid="mini-terminal-row"]',
-	miniTerminal: '[data-testid="mini-terminal"]',
+  // Dialogs and modals
+  dialog: '[role="dialog"]',
+  confirmDialog: ".confirm-dialog",
+  alertDialog: ".alert-dialog",
 
-	// Dialogs and modals
-	dialog: '[role="dialog"]',
-	confirmDialog: '[data-testid="confirm-dialog"]',
-	alertDialog: '[data-testid="alert-dialog"]',
+  // App container
+  app: "#app",
 } as const;
 
 /**
- * Text content matchers for elements without data-testid
+ * Text content matchers for elements without specific IDs
  */
 export const textMatchers = {
-	selectWorkspace: "Select Workspace",
-	addTerminal: "+",
-	save: "Save",
-	cancel: "Cancel",
-	delete: "Delete",
-	confirm: "Confirm",
-	startEngine: "Start",
-	stopEngine: "Stop",
-	factoryReset: "Factory Reset",
+  selectWorkspace: /Select.*Workspace|Choose.*Workspace|Open.*Workspace/i,
+  addTerminal: "+",
+  save: "Save",
+  cancel: "Cancel",
+  delete: "Delete",
+  confirm: "Confirm",
+  startEngine: "Start",
+  stopEngine: "Stop",
+  factoryReset: "Factory Reset",
+  noWorkspace: /No workspace selected|Select a workspace/i,
 } as const;
