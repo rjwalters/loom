@@ -36,6 +36,7 @@
 
 mod db;
 mod models;
+pub mod resource_usage;
 mod schema;
 
 // Re-export public types from models
@@ -45,8 +46,14 @@ pub use models::{ActivityEntry, AgentInput, AgentOutput, InputContext, InputType
 // These types are available for future use but not currently imported elsewhere
 #[allow(unused_imports)]
 pub use models::{
-    AgentMetric, ProductivitySummary, PromptGitHubEvent, PromptGitHubEventType, TokenUsage,
+    AgentMetric, ProductivitySummary, PromptChanges, PromptGitHubEvent, PromptGitHubEventType,
+    TokenUsage,
 };
 
 // Re-export the database struct
 pub use db::ActivityDb;
+
+// Re-export resource usage parsing and cost calculation
+// These are available for future integration with terminal output parsing
+#[allow(unused_imports)]
+pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, ResourceUsage};

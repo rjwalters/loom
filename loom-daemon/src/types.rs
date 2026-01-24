@@ -50,6 +50,17 @@ pub enum Request {
         id: TerminalId,
         limit: usize,
     },
+    /// Capture git changes for a specific input
+    /// Called after a prompt completes to record code changes
+    CaptureGitChanges {
+        input_id: i64,
+        working_dir: String,
+        before_commit: Option<String>,
+    },
+    /// Get the current git commit hash for a directory
+    GetCurrentCommit {
+        working_dir: String,
+    },
     Shutdown,
 }
 
@@ -57,14 +68,44 @@ pub enum Request {
 #[serde(tag = "type", content = "payload")]
 pub enum Response {
     Pong,
-    TerminalCreated { id: TerminalId },
-    TerminalList { terminals: Vec<TerminalInfo> },
-    TerminalOutput { output: String, byte_count: usize },
-    SessionHealth { has_session: bool },
-    AvailableSessions { sessions: Vec<String> },
-    TerminalActivity { entries: Vec<ActivityEntry> },
+    TerminalCreated {
+        id: TerminalId,
+    },
+    TerminalList {
+        terminals: Vec<TerminalInfo>,
+    },
+    TerminalOutput {
+        output: String,
+        byte_count: usize,
+    },
+    /// Response from SendInput with tracking info for git changes
+    InputSent {
+        input_id: i64,
+        before_commit: Option<String>,
+    },
+    SessionHealth {
+        has_session: bool,
+    },
+    AvailableSessions {
+        sessions: Vec<String>,
+    },
+    TerminalActivity {
+        entries: Vec<ActivityEntry>,
+    },
+    /// Response with current git commit hash
+    CurrentCommit {
+        commit: Option<String>,
+    },
+    /// Response with git changes captured
+    GitChangesCaptured {
+        files_changed: i32,
+        lines_added: i32,
+        lines_removed: i32,
+    },
     Success,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

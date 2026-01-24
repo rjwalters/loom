@@ -1,4 +1,5 @@
 use crate::activity::{ActivityDb, AgentInput, InputContext, InputType};
+use crate::git_utils;
 use crate::github_parser::parse_github_events;
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
@@ -171,6 +172,11 @@ fn handle_request(
             // Determine workspace path (prefer worktree, fallback to working_dir)
             let workspace_path = worktree_path.or(working_dir.clone());
 
+            // Capture current git commit before sending input (for change tracking)
+            let before_commit = workspace_path
+                .as_ref()
+                .and_then(|ws| git_utils::get_current_commit(std::path::Path::new(ws)));
+
             // Get git branch from workspace
             let git_branch = get_git_branch(workspace_path.as_ref());
 
@@ -189,15 +195,24 @@ fn handle_request(
                 },
             };
 
-            if let Ok(db) = activity_db.lock() {
-                if let Err(e) = db.record_input(&input) {
-                    log::warn!("Failed to record input to activity database: {e}");
+            let input_id = if let Ok(db) = activity_db.lock() {
+                match db.record_input(&input) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        log::warn!("Failed to record input to activity database: {e}");
+                        0 // Use 0 as sentinel for failed recording
+                    }
                 }
-            }
+            } else {
+                0
+            };
 
             // Send input to terminal
             match tm.send_input(&id, &data) {
-                Ok(()) => Response::Success,
+                Ok(()) => Response::InputSent {
+                    input_id,
+                    before_commit,
+                },
                 Err(e) => Response::Error {
                     message: e.to_string(),
                 },
@@ -356,6 +371,53 @@ fn handle_request(
                     message: "Database lock failed".to_string(),
                 }
             }
+        }
+
+        Request::CaptureGitChanges {
+            input_id,
+            working_dir,
+            before_commit,
+        } => {
+            let working_path = std::path::Path::new(&working_dir);
+
+            // Capture git changes
+            if let Some(changes) =
+                git_utils::capture_prompt_changes(working_path, input_id, before_commit)
+            {
+                // Record to database
+                if let Ok(db) = activity_db.lock() {
+                    match db.record_prompt_changes(&changes) {
+                        Ok(_) => Response::GitChangesCaptured {
+                            files_changed: changes.files_changed,
+                            lines_added: changes.lines_added,
+                            lines_removed: changes.lines_removed,
+                        },
+                        Err(e) => {
+                            log::error!("Failed to record prompt changes: {e}");
+                            Response::Error {
+                                message: format!("Failed to record changes: {e}"),
+                            }
+                        }
+                    }
+                } else {
+                    Response::Error {
+                        message: "Database lock failed".to_string(),
+                    }
+                }
+            } else {
+                // No changes detected or not a git repo
+                Response::GitChangesCaptured {
+                    files_changed: 0,
+                    lines_added: 0,
+                    lines_removed: 0,
+                }
+            }
+        }
+
+        Request::GetCurrentCommit { working_dir } => {
+            let working_path = std::path::Path::new(&working_dir);
+            let commit = git_utils::get_current_commit(working_path);
+            Response::CurrentCommit { commit }
         }
 
         Request::Shutdown => {
