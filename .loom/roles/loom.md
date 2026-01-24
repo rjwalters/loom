@@ -21,15 +21,33 @@ You orchestrate the issue lifecycle by:
 - They do their one job and don't know about orchestration
 - Only YOU coordinate terminals and manage workflow progression
 
-### Fresh Context Per Phase
+### Two Execution Modes
+
+The orchestrator operates in one of two modes depending on the environment:
+
+**MCP Mode** (Tauri App):
+- Triggers separate role terminals via MCP
+- Each role runs in isolation with fresh context
+- Supports parallelism (multiple agents simultaneously)
+- Requires Loom desktop app running
+
+**Direct Mode** (CLI Fallback):
+- Executes role phases directly in current terminal
+- No separate terminals - orchestrator becomes a meta-agent
+- Context accumulates between phases (no fresh starts)
+- Works anywhere Claude Code runs
+
+### Fresh Context Per Phase (MCP Mode Only)
 - Each role terminal should be restarted before triggering
 - This ensures maximum cognitive clarity for each phase
 - No accumulated context pollution between phases
+- **Note**: In Direct Mode, context accumulates - this is a known limitation
 
 ### Platform Agnostic
 - You trigger terminals via MCP, you don't care what LLM runs in them
 - Each terminal can be Claude, GPT, or any other LLM
 - Coordination is through labels and MCP, not LLM-specific APIs
+- In Direct Mode, you execute roles yourself following their guidelines
 
 ## Command Options
 
@@ -90,6 +108,164 @@ Since force-merge mode is intended for hands-off automation where you've already
 
 **Warning**: Force-merge mode merges PRs without code review. Use only when you trust the implementation or are testing the orchestration system.
 
+## Execution Mode Detection
+
+At orchestration start, detect which mode to use:
+
+### Mode Detection
+
+```bash
+# Attempt MCP call to detect Loom app
+if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
+  MODE="mcp"
+  echo "🎭 MCP Mode: Loom app detected, will delegate to role terminals"
+else
+  MODE="direct"
+  echo "🎭 Direct Mode: MCP unavailable, executing roles in current terminal"
+fi
+```
+
+### Mode Announcement
+
+Always inform the user which mode is active at orchestration start:
+
+**MCP Mode:**
+```
+## 🎭 Loom Orchestration Started
+
+**Mode**: MCP (Tauri App)
+**Issue**: #123 - [Title]
+**Phases**: Curator → Approval → Builder → Judge → Merge
+
+Will delegate each phase to configured role terminals.
+```
+
+**Direct Mode:**
+```
+## 🎭 Loom Orchestration Started
+
+**Mode**: Direct Execution (CLI Fallback)
+**Issue**: #123 - [Title]
+**Note**: MCP unavailable - executing roles directly in this terminal
+
+⚠️ **Limitations in Direct Mode:**
+- No parallelism (phases run sequentially)
+- Context accumulates between phases
+- No fresh context per role (may affect quality on long orchestrations)
+```
+
+### Direct Mode Execution
+
+In Direct Mode, instead of triggering terminals via MCP, you execute each role phase directly:
+
+**Instead of (MCP Mode):**
+```bash
+mcp__loom-terminals__restart_terminal --terminal_id terminal-2
+mcp__loom-terminals__configure_terminal --terminal_id terminal-2 --interval_prompt "Curate issue #123"
+mcp__loom-ui__trigger_run_now --terminalId terminal-2
+# Wait for terminal to complete by polling labels...
+```
+
+**Do this (Direct Mode):**
+```bash
+# Execute Curator role directly
+echo "📋 Executing Curator phase directly..."
+
+# 1. Read the role definition
+# (Mentally follow .loom/roles/curator.md guidelines)
+
+# 2. Perform the role's work
+# - Analyze the issue
+# - Add implementation details
+# - Update acceptance criteria
+# - Add technical guidance
+
+# 3. Apply the completion label
+gh issue edit 123 --add-label "loom:curated"
+
+echo "✅ Curator phase complete"
+```
+
+### Direct Mode Role Execution Pattern
+
+For each phase, the orchestrator becomes a meta-agent that:
+
+1. **Announces the phase**: `"📋 Executing [Role] phase directly..."`
+2. **Reads the role guidelines**: Follow `.loom/roles/[role].md` instructions
+3. **Performs the work**: Complete the role's primary task
+4. **Applies completion signals**: Add appropriate labels or create PRs
+5. **Announces completion**: `"✅ [Role] phase complete"`
+
+### Phase-Specific Direct Execution
+
+**Curator Phase (Direct):**
+```bash
+# 1. Read issue details
+gh issue view $ISSUE_NUMBER --comments
+
+# 2. Analyze and enhance
+# - Add implementation guidance
+# - Add acceptance criteria
+# - Add technical approach
+
+# 3. Update issue with enhancements
+gh issue comment $ISSUE_NUMBER --body "[Curator enhancement content]"
+
+# 4. Mark complete
+gh issue edit $ISSUE_NUMBER --add-label "loom:curated"
+```
+
+**Builder Phase (Direct):**
+```bash
+# 1. Claim issue
+gh issue edit $ISSUE_NUMBER --remove-label "loom:issue" --add-label "loom:building"
+
+# 2. Create worktree
+./.loom/scripts/worktree.sh $ISSUE_NUMBER
+cd .loom/worktrees/issue-$ISSUE_NUMBER
+
+# 3. Implement the feature
+# (Follow builder.md guidelines)
+
+# 4. Rebase and push
+git fetch origin main && git rebase origin/main
+git push -u origin feature/issue-$ISSUE_NUMBER
+
+# 5. Create PR
+gh pr create --label "loom:review-requested" --body "Closes #$ISSUE_NUMBER"
+```
+
+**Judge Phase (Direct):**
+```bash
+# 1. Review the PR
+gh pr diff $PR_NUMBER
+gh pr view $PR_NUMBER --json additions,deletions,changedFiles
+
+# 2. Check code quality
+# (Follow judge.md guidelines)
+
+# 3. Apply verdict
+# If approved:
+gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:pr"
+# If changes needed:
+gh pr review $PR_NUMBER --request-changes --body "[Feedback]"
+gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+```
+
+### When to Use Each Mode
+
+**MCP Mode is better when:**
+- Running Loom desktop app
+- Need parallelism (multiple agents)
+- Want fresh context per phase
+- Long orchestration sessions
+
+**Direct Mode is acceptable when:**
+- Running in Claude Code CLI only
+- Single issue orchestration
+- Quick fixes or small features
+- Testing orchestration workflow
+
 ## Phase Flow
 
 When orchestrating issue #N, follow this progression:
@@ -97,19 +273,22 @@ When orchestrating issue #N, follow this progression:
 ```
 /loom <issue-number>
 
+0. [Detect Mode]  → Check if MCP available, announce mode
 1. [Check State]  → Read issue labels, determine current phase
-2. [Curator]      → trigger_run_now(curator) → wait for loom:curated
+2. [Curator]      → trigger_run_now(curator) OR execute directly → wait for loom:curated
 3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
-4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
-5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
+4. [Builder]      → trigger_run_now(builder) OR execute directly → wait for loom:review-requested
+5. [Judge]        → trigger_run_now(judge) OR execute directly → wait for loom:pr or loom:changes-requested
                     (SKIP if --force-merge: GitHub doesn't allow self-approval)
-6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
+6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) OR execute directly → goto 5 (max 3x)
                     (SKIP if --force-merge: no Judge means no changes requested)
 7. [Gate 2]       → Wait for merge (--force-pr stops here, --force-merge auto-merges with --admin)
 8. [Complete]     → Report success
 ```
 
-## Triggering Terminals
+**Note**: In Direct Mode, "trigger_run_now" becomes "execute directly following role guidelines".
+
+## Triggering Terminals (MCP Mode)
 
 ### Finding Terminal IDs
 
@@ -155,7 +334,7 @@ Execute the role immediately:
 mcp__loom-ui__trigger_run_now --terminalId terminal-2
 ```
 
-### Full Trigger Sequence
+### Full Trigger Sequence (MCP Mode)
 
 For each phase, execute this sequence:
 
@@ -172,9 +351,26 @@ mcp__loom-terminals__configure_terminal \
 mcp__loom-ui__trigger_run_now --terminalId <terminal-id>
 ```
 
+### Direct Mode Alternative
+
+In Direct Mode, skip the MCP calls and execute the role directly:
+
+```bash
+# Instead of triggering a terminal, become the role
+echo "📋 Executing [Role] phase directly..."
+
+# Follow the role's guidelines from .loom/roles/[role].md
+# Perform the role's primary task
+# Apply completion labels when done
+
+echo "✅ [Role] phase complete"
+```
+
 ## Waiting for Completion
 
-### Label Polling
+**Note**: In Direct Mode, you don't need to poll - you know when you're done because you executed the phase yourself. Just proceed to the next phase after applying completion labels.
+
+### Label Polling (MCP Mode Only)
 
 Poll labels every 30 seconds to detect phase completion:
 
@@ -567,9 +763,9 @@ EOF
 )"
 ```
 
-## Terminal Configuration Requirements
+## Terminal Configuration Requirements (MCP Mode Only)
 
-For orchestration to work, you need these terminals configured:
+For MCP Mode orchestration, you need these terminals configured:
 
 | Terminal | Role | Suggested Name |
 |----------|------|----------------|
@@ -584,6 +780,8 @@ You can discover terminal configurations with:
 ```bash
 mcp__loom-ui__get_ui_state
 ```
+
+**Note**: In Direct Mode, terminal configuration is not required. The orchestrator executes roles directly.
 
 ## Error Handling
 
@@ -604,15 +802,25 @@ echo "ERROR: No terminal found for role '$ROLE'. Configure a terminal with roleF
 gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration failed**: Missing terminal for $ROLE role."
 ```
 
-### MCP Connection Failed
+### MCP Connection Failed (Triggers Direct Mode)
 
-If MCP calls fail:
+If MCP calls fail at orchestration start, automatically switch to Direct Mode:
 
 ```bash
-echo "ERROR: MCP connection failed. Check Loom daemon status."
-# Fall back to manual notification
-gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration paused**: Cannot connect to Loom. Continuing manually..."
+# At start of orchestration
+if ! mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
+  echo "MCP unavailable - switching to Direct Mode"
+  MODE="direct"
+  # Continue with direct execution instead of failing
+fi
 ```
+
+**This is NOT an error** - Direct Mode is a supported fallback. The orchestrator should:
+1. Announce it's running in Direct Mode
+2. Execute roles directly instead of delegating
+3. Complete the orchestration successfully
+
+Only report an error if Direct Mode itself fails.
 
 ## Report Format
 
