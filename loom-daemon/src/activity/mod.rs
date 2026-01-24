@@ -55,6 +55,13 @@ pub use models::{
     TestResults, TokenUsage,
 };
 
+// Cost analytics types (Issue #1064)
+#[allow(unused_imports)]
+pub use models::{
+    BudgetConfig, BudgetPeriod, BudgetStatus, CostByIssue, CostByPr, CostByRole, CostSummary,
+    RunwayProjection,
+};
+
 // Re-export the database struct
 pub use db::ActivityDb;
 
