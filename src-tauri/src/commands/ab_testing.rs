@@ -121,7 +121,7 @@ pub struct Experiment {
 }
 
 /// Variant within an experiment
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Variant {
     pub id: Option<i64>,
     pub experiment_id: i64,
@@ -1119,43 +1119,51 @@ pub fn get_experiments(
         .prepare(query)
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    let rows = if let Some(ref s) = status {
-        stmt.query_map([s], |row| {
-            Ok(Experiment {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                hypothesis: row.get(3)?,
-                status: row.get(4)?,
-                created_at: row.get(5)?,
-                started_at: row.get(6)?,
-                concluded_at: row.get(7)?,
-                min_sample_size: row.get(8)?,
-                target_metric: row.get(9)?,
-                target_direction: row.get(10)?,
+    let experiments: Vec<Experiment> = if let Some(ref s) = status {
+        let results: Vec<Experiment> = stmt
+            .query_map([s], |row| {
+                Ok(Experiment {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    hypothesis: row.get(3)?,
+                    status: row.get(4)?,
+                    created_at: row.get(5)?,
+                    started_at: row.get(6)?,
+                    concluded_at: row.get(7)?,
+                    min_sample_size: row.get(8)?,
+                    target_metric: row.get(9)?,
+                    target_direction: row.get(10)?,
+                })
             })
-        })
+            .map_err(|e| format!("Failed to query experiments: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect experiments: {e}"))?;
+        results
     } else {
-        stmt.query_map([], |row| {
-            Ok(Experiment {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: row.get(2)?,
-                hypothesis: row.get(3)?,
-                status: row.get(4)?,
-                created_at: row.get(5)?,
-                started_at: row.get(6)?,
-                concluded_at: row.get(7)?,
-                min_sample_size: row.get(8)?,
-                target_metric: row.get(9)?,
-                target_direction: row.get(10)?,
+        let results: Vec<Experiment> = stmt
+            .query_map([], |row| {
+                Ok(Experiment {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    hypothesis: row.get(3)?,
+                    status: row.get(4)?,
+                    created_at: row.get(5)?,
+                    started_at: row.get(6)?,
+                    concluded_at: row.get(7)?,
+                    min_sample_size: row.get(8)?,
+                    target_metric: row.get(9)?,
+                    target_direction: row.get(10)?,
+                })
             })
-        })
+            .map_err(|e| format!("Failed to query experiments: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect experiments: {e}"))?;
+        results
     };
 
-    rows.map_err(|e| format!("Failed to query experiments: {e}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to collect experiments: {e}"))
+    Ok(experiments)
 }
 
 /// Get a single experiment by ID
@@ -1250,19 +1258,22 @@ pub fn get_experiment_variants(
         )
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    stmt.query_map([experiment_id], |row| {
-        Ok(Variant {
-            id: row.get(0)?,
-            experiment_id: row.get(1)?,
-            name: row.get(2)?,
-            description: row.get(3)?,
-            config_json: row.get(4)?,
-            weight: row.get(5)?,
+    let results: Vec<Variant> = stmt
+        .query_map([experiment_id], |row| {
+            Ok(Variant {
+                id: row.get(0)?,
+                experiment_id: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                config_json: row.get(4)?,
+                weight: row.get(5)?,
+            })
         })
-    })
-    .map_err(|e| format!("Failed to query variants: {e}"))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect variants: {e}"))
+        .map_err(|e| format!("Failed to query variants: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect variants: {e}"))?;
+
+    Ok(results)
 }
 
 /// Get summary of all experiments
@@ -1321,17 +1332,20 @@ pub fn get_experiment_results(
         )
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    stmt.query_map([experiment_id], |row| {
-        Ok(ExperimentResult {
-            id: row.get(0)?,
-            assignment_id: row.get(1)?,
-            success_factor_id: row.get(2)?,
-            outcome: row.get(3)?,
-            metric_value: row.get(4)?,
-            recorded_at: row.get(5)?,
+    let results: Vec<ExperimentResult> = stmt
+        .query_map([experiment_id], |row| {
+            Ok(ExperimentResult {
+                id: row.get(0)?,
+                assignment_id: row.get(1)?,
+                success_factor_id: row.get(2)?,
+                outcome: row.get(3)?,
+                metric_value: row.get(4)?,
+                recorded_at: row.get(5)?,
+            })
         })
-    })
-    .map_err(|e| format!("Failed to query results: {e}"))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect results: {e}"))
+        .map_err(|e| format!("Failed to query results: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect results: {e}"))?;
+
+    Ok(results)
 }
