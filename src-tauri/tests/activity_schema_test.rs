@@ -730,11 +730,11 @@ fn test_prompt_github_indexes() {
 }
 
 #[test]
-fn test_v3_to_v4_migration() {
+fn test_v4_to_v5_migration() {
     let (_temp, workspace_path) = create_temp_workspace();
     let conn = open_test_db(&workspace_path).unwrap();
 
-    // Create v3 schema
+    // Create v4 schema (with velocity_snapshots from v4)
     conn.execute(
         "CREATE TABLE agent_activity (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -754,7 +754,7 @@ fn test_v3_to_v4_migration() {
 
     conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)", [])
         .unwrap();
-    conn.execute("INSERT INTO schema_version (version) VALUES (3)", [])
+    conn.execute("INSERT INTO schema_version (version) VALUES (4)", [])
         .unwrap();
 
     conn.execute(
@@ -773,7 +773,22 @@ fn test_v3_to_v4_migration() {
     )
     .unwrap();
 
-    // Insert some v3 data
+    conn.execute(
+        "CREATE TABLE velocity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date DATE NOT NULL UNIQUE,
+            issues_closed INTEGER NOT NULL DEFAULT 0,
+            prs_merged INTEGER NOT NULL DEFAULT 0,
+            avg_cycle_time_hours REAL,
+            total_prompts INTEGER NOT NULL DEFAULT 0,
+            total_cost_usd REAL NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert some v4 data
     conn.execute(
         "INSERT INTO agent_activity (timestamp, role, trigger, work_found, work_completed, outcome)
          VALUES ('2026-01-23T08:00:00Z', 'builder', 'Build issue #42', 1, 1, 'success')",
@@ -781,7 +796,7 @@ fn test_v3_to_v4_migration() {
     )
     .unwrap();
 
-    // Simulate v4 migration - create prompt_patterns and pattern_matches tables
+    // Simulate v5 migration - create prompt_patterns and pattern_matches tables
     conn.execute(
         "CREATE TABLE prompt_patterns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -817,7 +832,7 @@ fn test_v3_to_v4_migration() {
     .unwrap();
 
     // Update schema version
-    conn.execute("UPDATE schema_version SET version = 4", [])
+    conn.execute("UPDATE schema_version SET version = 5", [])
         .unwrap();
 
     // Verify prompt_patterns table exists
@@ -840,11 +855,21 @@ fn test_v3_to_v4_migration() {
         .unwrap();
     assert!(matches_exists, "pattern_matches table should exist");
 
-    // Verify schema version is 4
+    // Verify velocity_snapshots still exists (from v4)
+    let velocity_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='velocity_snapshots'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )
+        .unwrap();
+    assert!(velocity_exists, "velocity_snapshots table should still exist");
+
+    // Verify schema version is 5
     let version: i32 = conn
         .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4, "Schema version should be 4");
+    assert_eq!(version, 5, "Schema version should be 5");
 }
 
 #[test]
