@@ -37,27 +37,47 @@ You orchestrate the issue lifecycle by:
 |------|-------------|
 | `--to <phase>` | Stop after specified phase (curated, pr, approved) |
 | `--resume` | Resume from last checkpoint in issue comments |
-| `--force` | Bypass approval gates - auto-approve and auto-merge |
+| `--force-pr` | Auto-approve issue, run through Judge, stop at `loom:pr` state |
+| `--force-merge` | Auto-approve, resolve merge conflicts, auto-merge after Judge approval |
 
-### --force Mode
+### --force-pr Mode
 
-When `--force` is specified:
+When `--force-pr` is specified:
 1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
-2. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
+2. **Gate 2 (Merge)**: Stop at `loom:pr` state, wait for human to merge
 
 ```bash
-# Force mode flow - no waiting at gates
-/loom 123 --force
+# Force-pr mode flow - stops at reviewed PR
+/loom 123 --force-pr
 
-Curator → [auto-approve] → Builder → Judge → [auto-merge] → Complete
+Curator → [auto-approve] → Builder → Judge → [STOP at loom:pr]
 ```
 
-**Use cases for --force**:
+**Use cases for --force-pr**:
+- Automated development with human merge approval
+- Testing the build/review pipeline
+- When you trust automation but want final merge control
+
+### --force-merge Mode
+
+When `--force-merge` is specified:
+1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
+2. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
+3. **Conflict Resolution**: If merge conflicts exist, attempt automatic resolution
+
+```bash
+# Force-merge mode flow - fully automated
+/loom 123 --force-merge
+
+Curator → [auto-approve] → Builder → Judge → [resolve conflicts] → [auto-merge] → Complete
+```
+
+**Use cases for --force-merge**:
 - Dogfooding/testing the orchestration system
 - Trusted issues where you've already decided to implement
-- Automated pipelines where human gates aren't needed
+- Fully automated pipelines where human gates aren't needed
 
-**Warning**: Force mode merges PRs without human review of the merge decision. Judge still reviews code quality.
+**Warning**: Force-merge mode merges PRs without human review of the merge decision. Judge still reviews code quality.
 
 ## Phase Flow
 
@@ -68,11 +88,11 @@ When orchestrating issue #N, follow this progression:
 
 1. [Check State]  → Read issue labels, determine current phase
 2. [Curator]      → trigger_run_now(curator) → wait for loom:curated
-3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force)
+3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
 4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
 5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
 6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
-7. [Gate 2]       → Wait for merge (or auto-merge if --force)
+7. [Gate 2]       → Wait for merge (--force-pr stops here, --force-merge auto-merges)
 8. [Complete]     → Report success
 ```
 
@@ -293,11 +313,11 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate1" ]; then
-  # Check if --force mode - auto-approve
-  if [ "$FORCE_MODE" = "true" ]; then
+  # Check if --force-pr or --force-merge mode - auto-approve
+  if [ "$FORCE_PR" = "true" ] || [ "$FORCE_MERGE" = "true" ]; then
     echo "Force mode: auto-approving issue"
     gh issue edit $ISSUE_NUMBER --add-label "loom:issue"
-    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-approved** via \`/loom --force\`"
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-approved** via \`/loom --force-pr\` or \`--force-merge\`"
   else
     # Wait for human or Champion to promote to loom:issue
     TIMEOUT=1800  # 30 minutes
@@ -437,11 +457,33 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate2" ]; then
-  # Check if --force mode - auto-merge
-  if [ "$FORCE_MODE" = "true" ]; then
-    echo "Force mode: auto-merging PR"
-    gh pr merge $PR_NUMBER --squash --delete-branch
-    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force\`"
+  # Check if --force-pr mode - stop here, don't merge
+  if [ "$FORCE_PR" = "true" ]; then
+    echo "Force-pr mode: stopping at loom:pr state"
+    gh issue comment $ISSUE_NUMBER --body "✅ **PR approved** - stopping at \`loom:pr\` per \`--force-pr\`. Ready for human merge."
+    exit 0
+  fi
+
+  # Check if --force-merge mode - auto-merge with conflict resolution
+  if [ "$FORCE_MERGE" = "true" ]; then
+    echo "Force-merge mode: auto-merging PR"
+
+    # Check for merge conflicts and attempt resolution
+    if ! gh pr merge $PR_NUMBER --squash --delete-branch 2>/dev/null; then
+      echo "Merge failed, attempting conflict resolution..."
+      git fetch origin main
+      git checkout $BRANCH_NAME
+      git merge origin/main --no-edit || {
+        # Auto-resolve conflicts if possible
+        git checkout --theirs .
+        git add -A
+        git commit -m "Resolve merge conflicts (auto-resolved)"
+      }
+      git push origin $BRANCH_NAME
+      gh pr merge $PR_NUMBER --squash --delete-branch
+    fi
+
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force-merge\`"
   else
     # Trigger Champion or wait for human merge
     CHAMPION_TERMINAL="terminal-5"  # if exists

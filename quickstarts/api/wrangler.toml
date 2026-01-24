@@ -1,0 +1,28 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "loom-quickstart-api"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "loom-api-db"
+database_id = "YOUR_DATABASE_ID"  # Update after running: wrangler d1 create loom-api-db
+
+# KV Namespace for sessions/cache
+[[kv_namespaces]]
+binding = "KV"
+id = "YOUR_KV_ID"  # Update after running: wrangler kv:namespace create "sessions"
+
+# Environment variables (set via wrangler secret or dashboard)
+[vars]
+APP_NAME = "Loom API"
+JWT_EXPIRES_IN = "7d"
+
+# Development overrides
+[env.dev.vars]
+APP_NAME = "Loom API (Dev)"
+
+# Uncomment for production settings
+# [env.production]
+# routes = [{ pattern = "api.example.com", zone_name = "example.com" }]

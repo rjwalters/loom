@@ -1,4 +1,5 @@
 import { sendPromptToAgent } from "./agent-launcher";
+import { PromiseDeduplicator } from "./async-primitives";
 import { Logger } from "./logger";
 import type { AppState, Terminal } from "./state";
 import { TERMINAL_POLL_INTERVAL_MS } from "./timing-constants";
@@ -24,7 +25,7 @@ interface AutonomousInterval {
 
 class AutonomousManager {
   private intervals: Map<string, AutonomousInterval> = new Map();
-  private activePrompts: Set<string> = new Set();
+  private promptDeduplicator = new PromiseDeduplicator<void>();
 
   /**
    * Start autonomous mode for a terminal
@@ -67,11 +68,11 @@ class AutonomousManager {
   }
 
   /**
-   * Execute prompt with overlap prevention
+   * Execute prompt with overlap prevention using PromiseDeduplicator
    *
-   * Prevents multiple simultaneous executions of the same terminal's prompt.
-   * If a prompt is already executing for the terminal, this method logs a
-   * warning and returns immediately.
+   * Uses the PromiseDeduplicator to prevent multiple simultaneous executions
+   * of the same terminal's prompt. If a prompt is already executing for the
+   * terminal, the deduplicator skips the new request.
    *
    * @param terminalId - The terminal ID to execute the prompt for
    * @param intervalPrompt - The prompt to send to the agent
@@ -81,8 +82,8 @@ class AutonomousManager {
     terminalId: string,
     intervalPrompt: string
   ): Promise<void> {
-    // Check if already executing
-    if (this.activePrompts.has(terminalId)) {
+    // Check if already in flight before executing - this lets us log the skip
+    if (this.promptDeduplicator.isInFlight(terminalId)) {
       logger.warn("Skipping overlapping execution", {
         terminalId,
         message: "Previous execution still in progress",
@@ -90,26 +91,22 @@ class AutonomousManager {
       return;
     }
 
-    // Mark as active
-    this.activePrompts.add(terminalId);
-
     try {
-      // Send the prompt to the agent
-      await sendPromptToAgent(terminalId, intervalPrompt);
-      logger.info("Sent autonomous prompt", { terminalId });
+      await this.promptDeduplicator.execute(terminalId, async () => {
+        // Send the prompt to the agent
+        await sendPromptToAgent(terminalId, intervalPrompt);
+        logger.info("Sent autonomous prompt", { terminalId });
 
-      // Update last run timestamp
-      const interval = this.intervals.get(terminalId);
-      if (interval) {
-        interval.lastRun = Date.now();
-      }
+        // Update last run timestamp
+        const interval = this.intervals.get(terminalId);
+        if (interval) {
+          interval.lastRun = Date.now();
+        }
+      });
     } catch (error) {
       logger.error("Failed to send autonomous prompt", error, {
         terminalId,
       });
-    } finally {
-      // Always cleanup, even on error
-      this.activePrompts.delete(terminalId);
     }
   }
 
@@ -129,7 +126,7 @@ class AutonomousManager {
       this.intervals.delete(terminalId);
 
       // Wait for active execution to finish
-      while (this.activePrompts.has(terminalId)) {
+      while (this.promptDeduplicator.isInFlight(terminalId)) {
         logger.info("Waiting for active execution to complete", { terminalId });
         await new Promise((resolve) => setTimeout(resolve, TERMINAL_POLL_INTERVAL_MS));
       }

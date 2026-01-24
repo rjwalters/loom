@@ -29,7 +29,8 @@ You don't do the work yourself - you orchestrate other terminals via MCP.
 /loom 123
 /loom 456 --to curated    # Stop after curator phase
 /loom 789 --resume        # Resume from last checkpoint
-/loom 321 --force         # Bypass approval gates, push to merge
+/loom 321 --force-pr      # Auto-approve, stop at reviewed PR
+/loom 321 --force-merge   # Auto-approve, resolve conflicts, auto-merge
 ```
 
 ## Options
@@ -38,17 +39,27 @@ You don't do the work yourself - you orchestrate other terminals via MCP.
 |------|-------------|
 | `--to <phase>` | Stop after specified phase (curated, pr, approved) |
 | `--resume` | Resume from last checkpoint in issue comments |
-| `--force` | Bypass approval gates - auto-approve and auto-merge |
+| `--force-pr` | Auto-approve issue, run through Judge, stop at `loom:pr` state |
+| `--force-merge` | Auto-approve, resolve merge conflicts, auto-merge after Judge approval |
 
-### --force Mode
+### --force-pr Mode
 
-When `--force` is specified, the orchestrator:
+When `--force-pr` is specified, the orchestrator:
 1. **Skips Gate 1**: Auto-adds `loom:issue` label instead of waiting for human approval
-2. **Skips Gate 2**: Auto-merges the PR after Judge approval instead of waiting
+2. **Stops at Gate 2**: Waits at `loom:pr` state for human to merge
 
-Use `--force` when you've already decided to implement an issue and want hands-off orchestration.
+Use `--force-pr` when you want automated development but want human approval on the final merge.
 
-**Warning**: Force mode will merge PRs without human review of the merge decision. The Judge still reviews code quality, but the final merge happens automatically.
+### --force-merge Mode
+
+When `--force-merge` is specified, the orchestrator:
+1. **Skips Gate 1**: Auto-adds `loom:issue` label instead of waiting for human approval
+2. **Skips Gate 2**: Auto-merges the PR after Judge approval
+3. **Resolves conflicts**: If merge conflicts exist, attempts to resolve them automatically
+
+Use `--force-merge` when you want fully hands-off orchestration from issue to merged PR.
+
+**Warning**: Force-merge mode will merge PRs without human review of the merge decision. The Judge still reviews code quality, but the final merge happens automatically.
 
 ## Phase Flow
 
