@@ -1,5 +1,5 @@
 [workspace]
-members = ["loom-daemon", "src-tauri"]
+members = ["loom-api", "loom-daemon", "src-tauri"]
 resolver = "2"
 
 [workspace.dependencies]
