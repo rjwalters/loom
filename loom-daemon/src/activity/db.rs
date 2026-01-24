@@ -825,7 +825,10 @@ impl ActivityDb {
 
     /// Get resource usage records for a specific input
     #[allow(dead_code)]
-    pub fn get_resource_usage(&self, input_id: i64) -> Result<Vec<super::resource_usage::ResourceUsage>> {
+    pub fn get_resource_usage(
+        &self,
+        input_id: i64,
+    ) -> Result<Vec<super::resource_usage::ResourceUsage>> {
         let mut stmt = self.conn.prepare(
             r"
             SELECT id, input_id, timestamp, model, tokens_input, tokens_output,
@@ -879,6 +882,42 @@ impl ActivityDb {
         )?;
 
         Ok(result)
+    }
+}
+
+// Implement StatsQueries trait for ActivityDb
+use super::stats::{
+    self, AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary,
+    WeeklyVelocity,
+};
+use chrono::NaiveDate;
+
+impl StatsQueries for ActivityDb {
+    fn get_agent_effectiveness(
+        &self,
+        role: Option<&str>,
+    ) -> rusqlite::Result<Vec<AgentEffectiveness>> {
+        stats::query_agent_effectiveness(&self.conn, role)
+    }
+
+    fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>> {
+        stats::query_cost_per_issue(&self.conn, issue_number)
+    }
+
+    fn get_daily_velocity(
+        &self,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+    ) -> rusqlite::Result<Vec<DailyVelocity>> {
+        stats::query_daily_velocity(&self.conn, start_date, end_date)
+    }
+
+    fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>> {
+        stats::query_weekly_velocity(&self.conn)
+    }
+
+    fn get_stats_summary(&self) -> rusqlite::Result<StatsSummary> {
+        stats::query_stats_summary(&self.conn)
     }
 }
 

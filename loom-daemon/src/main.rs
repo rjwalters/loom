@@ -10,7 +10,7 @@ mod metrics_collector;
 mod terminal;
 mod types;
 
-use activity::ActivityDb;
+use activity::{ActivityDb, StatsQueries};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use ipc::IpcServer;
@@ -48,6 +48,25 @@ enum Commands {
         /// Print what would be done without making changes
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Display agent effectiveness and activity metrics
+    Stats {
+        /// Filter by agent role (builder, judge, curator, etc.)
+        #[arg(long)]
+        role: Option<String>,
+
+        /// Filter by GitHub issue number
+        #[arg(long)]
+        issue: Option<i32>,
+
+        /// Show weekly trends instead of daily
+        #[arg(long)]
+        weekly: bool,
+
+        /// Output format: table (default), json
+        #[arg(long, default_value = "table")]
+        format: String,
     },
 }
 
@@ -225,9 +244,15 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
-/// Handle CLI commands (init mode)
+/// Handle CLI commands (init, stats modes)
 fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
+        Commands::Stats {
+            role,
+            issue,
+            weekly,
+            format,
+        } => handle_stats_command(role.as_deref(), issue, weekly, &format),
         Commands::Init {
             workspace,
             defaults,
@@ -292,7 +317,9 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             for file in &report.preserved {
                                 println!("  = {file}");
                             }
-                            println!("\n  ℹ️  Preserved files were not overwritten. To update them,");
+                            println!(
+                                "\n  ℹ️  Preserved files were not overwritten. To update them,"
+                            );
                             println!("     delete them and run install again, or use --force.");
                         }
                         if !report.updated.is_empty() && force {
@@ -307,7 +334,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  1. Commit the changes: git add -A && git commit -m 'Add Loom configuration'");
                     println!("  2. Choose your workflow:");
                     println!("     Manual Mode (recommended to start):");
-                    println!("       cd {} && claude", workspace_str);
+                    println!("       cd {workspace_str} && claude");
                     println!("       Then use /builder, /judge, or other role commands");
                     println!("     Tauri App Mode (requires Loom.app - see README):");
                     println!("       Download Loom.app from releases, open workspace");
@@ -320,4 +347,173 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             }
         }
     }
+}
+
+/// Handle the stats subcommand - display agent effectiveness and activity metrics.
+#[allow(clippy::too_many_lines)]
+fn handle_stats_command(
+    role: Option<&str>,
+    issue: Option<i32>,
+    weekly: bool,
+    format: &str,
+) -> Result<()> {
+    // Get database path
+    let loom_dir = dirs::home_dir()
+        .ok_or_else(|| anyhow!("No home directory"))?
+        .join(".loom");
+
+    let db_path = loom_dir.join("activity.db");
+
+    if !db_path.exists() {
+        eprintln!("No activity database found at {}", db_path.display());
+        eprintln!("Run the Loom daemon first to start collecting metrics.");
+        return Ok(());
+    }
+
+    let db = ActivityDb::new(db_path)?;
+
+    let is_json = format == "json";
+
+    // If issue filter is specified, show cost per issue
+    if let Some(issue_num) = issue {
+        let costs = db.get_cost_per_issue(Some(issue_num))?;
+
+        if is_json {
+            println!("{}", serde_json::to_string_pretty(&costs)?);
+        } else {
+            println!("\n=== Cost Breakdown for Issue #{issue_num} ===\n");
+            if costs.is_empty() {
+                println!("No data found for issue #{issue_num}");
+            } else {
+                for cost in &costs {
+                    println!("Issue #{}:", cost.issue_number);
+                    println!("  Prompts:      {}", cost.prompt_count);
+                    println!("  Total Cost:   ${:.4}", cost.total_cost);
+                    println!("  Total Tokens: {}", cost.total_tokens);
+                    if let Some(started) = &cost.started {
+                        println!("  Started:      {}", started.format("%Y-%m-%d %H:%M"));
+                    }
+                    if let Some(completed) = &cost.completed {
+                        println!("  Completed:    {}", completed.format("%Y-%m-%d %H:%M"));
+                    }
+                    println!();
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // If role filter is specified, show effectiveness for that role
+    if let Some(role_filter) = role {
+        let effectiveness = db.get_agent_effectiveness(Some(role_filter))?;
+
+        if is_json {
+            println!("{}", serde_json::to_string_pretty(&effectiveness)?);
+        } else {
+            println!("\n=== Agent Effectiveness: {role_filter} ===\n");
+            if effectiveness.is_empty() {
+                println!("No data found for role '{role_filter}'");
+            } else {
+                for agent in &effectiveness {
+                    print_agent_effectiveness(agent);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // If weekly flag, show weekly velocity
+    if weekly {
+        let velocity = db.get_weekly_velocity()?;
+
+        if is_json {
+            println!("{}", serde_json::to_string_pretty(&velocity)?);
+        } else {
+            println!("\n=== Weekly Velocity ===\n");
+            if velocity.is_empty() {
+                println!("No weekly data available.");
+            } else {
+                println!("{:<12} {:>10} {:>12}", "Week", "Prompts", "Cost (USD)");
+                println!("{:-<36}", "");
+                for week in &velocity {
+                    println!("{:<12} {:>10} {:>12.4}", week.week, week.prompts, week.cost);
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Default: show overall summary
+    let summary = db.get_stats_summary()?;
+    let effectiveness = db.get_agent_effectiveness(None)?;
+
+    if is_json {
+        #[derive(serde::Serialize)]
+        struct FullStats {
+            summary: activity::StatsSummary,
+            effectiveness: Vec<activity::AgentEffectiveness>,
+        }
+        let full = FullStats {
+            summary,
+            effectiveness,
+        };
+        println!("{}", serde_json::to_string_pretty(&full)?);
+    } else {
+        println!("\n=== Loom Activity Summary ===\n");
+        println!("Total Prompts:   {}", summary.total_prompts);
+        println!("Total Cost:      ${:.4}", summary.total_cost);
+        println!("Total Tokens:    {}", summary.total_tokens);
+        println!("Issues Worked:   {}", summary.issues_count);
+        println!("PRs Created:     {}", summary.prs_count);
+        println!("Avg Success:     {:.1}%", summary.avg_success_rate);
+
+        if !effectiveness.is_empty() {
+            println!("\n=== Agent Effectiveness by Role ===\n");
+            println!(
+                "{:<12} {:>10} {:>10} {:>12} {:>12} {:>12}",
+                "Role", "Prompts", "Success", "Rate", "Avg Cost", "Avg Time"
+            );
+            println!("{:-<70}", "");
+            for agent in &effectiveness {
+                println!(
+                    "{:<12} {:>10} {:>10} {:>11.1}% {:>11.4} {:>10.1}s",
+                    agent.agent_role,
+                    agent.total_prompts,
+                    agent.successful_prompts,
+                    agent.success_rate,
+                    agent.avg_cost,
+                    agent.avg_duration_sec
+                );
+            }
+        }
+
+        // Show top 5 most expensive issues
+        let top_issues = db.get_cost_per_issue(None)?;
+        if !top_issues.is_empty() {
+            println!("\n=== Top 5 Most Expensive Issues ===\n");
+            println!("{:<8} {:>10} {:>12} {:>12}", "Issue", "Prompts", "Cost (USD)", "Tokens");
+            println!("{:-<44}", "");
+            for cost in top_issues.iter().take(5) {
+                println!(
+                    "#{:<7} {:>10} {:>12.4} {:>12}",
+                    cost.issue_number, cost.prompt_count, cost.total_cost, cost.total_tokens
+                );
+            }
+        }
+
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Print agent effectiveness in a readable format.
+fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
+    println!("Role: {}", agent.agent_role);
+    println!("  Total Prompts:      {}", agent.total_prompts);
+    println!("  Successful Prompts: {}", agent.successful_prompts);
+    println!("  Success Rate:       {:.1}%", agent.success_rate);
+    println!("  Average Cost:       ${:.4}", agent.avg_cost);
+    println!("  Average Duration:   {:.1}s", agent.avg_duration_sec);
+    println!();
 }
