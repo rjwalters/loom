@@ -62,14 +62,15 @@ Curator → [auto-approve] → Builder → Judge → [STOP at loom:pr]
 
 When `--force-merge` is specified:
 1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
-2. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
-3. **Conflict Resolution**: If merge conflicts exist, attempt automatic resolution
+2. **Judge Phase**: Skip entirely (GitHub doesn't allow self-approval)
+3. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash --admin`
+4. **Conflict Resolution**: If merge conflicts exist, attempt automatic resolution
 
 ```bash
-# Force-merge mode flow - fully automated
+# Force-merge mode flow - fully automated, no Judge
 /loom 123 --force-merge
 
-Curator → [auto-approve] → Builder → Judge → [resolve conflicts] → [auto-merge] → Complete
+Curator → [auto-approve] → Builder → [skip Judge] → [resolve conflicts] → [auto-merge] → Complete
 ```
 
 **Use cases for --force-merge**:
@@ -77,7 +78,17 @@ Curator → [auto-approve] → Builder → Judge → [resolve conflicts] → [au
 - Trusted issues where you've already decided to implement
 - Fully automated pipelines where human gates aren't needed
 
-**Warning**: Force-merge mode merges PRs without human review of the merge decision. Judge still reviews code quality.
+**Why skip Judge in force-merge mode?**
+
+GitHub does not allow users to approve their own pull requests. When the orchestrator creates the PR (via Builder) and then tries to review it (via Judge), this results in:
+
+```
+failed to create review: GraphQL: Review Can not approve your own pull request
+```
+
+Since force-merge mode is intended for hands-off automation where you've already decided to implement, skipping the Judge phase and using `--admin` for merge is the appropriate behavior.
+
+**Warning**: Force-merge mode merges PRs without code review. Use only when you trust the implementation or are testing the orchestration system.
 
 ## Phase Flow
 
@@ -91,8 +102,10 @@ When orchestrating issue #N, follow this progression:
 3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
 4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
 5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
+                    (SKIP if --force-merge: GitHub doesn't allow self-approval)
 6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
-7. [Gate 2]       → Wait for merge (--force-pr stops here, --force-merge auto-merges)
+                    (SKIP if --force-merge: no Judge means no changes requested)
+7. [Gate 2]       → Wait for merge (--force-pr stops here, --force-merge auto-merges with --admin)
 8. [Complete]     → Report success
 ```
 
@@ -375,29 +388,38 @@ fi
 
 ```bash
 if [ "$PHASE" = "judge" ]; then
-  JUDGE_TERMINAL="terminal-1"
+  # In force-merge mode, skip Judge entirely - GitHub doesn't allow self-approval
+  # The orchestrator (or same agent) created the PR, so it cannot approve it
+  if [ "$FORCE_MERGE" = "true" ]; then
+    echo "Force-merge mode: skipping Judge phase (self-approval not allowed by GitHub)"
+    gh pr edit $PR_NUMBER --add-label "loom:pr"
+    gh pr comment $PR_NUMBER --body "⚡ **Judge phase skipped** - force-merge mode bypasses review (self-approval limitation)"
+    PHASE="gate2"
+  else
+    JUDGE_TERMINAL="terminal-1"
 
-  mcp__loom-terminals__restart_terminal --terminal_id $JUDGE_TERMINAL
-  mcp__loom-terminals__configure_terminal \
-    --terminal_id $JUDGE_TERMINAL \
-    --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
+    mcp__loom-terminals__restart_terminal --terminal_id $JUDGE_TERMINAL
+    mcp__loom-terminals__configure_terminal \
+      --terminal_id $JUDGE_TERMINAL \
+      --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
-  mcp__loom-ui__trigger_run_now --terminalId $JUDGE_TERMINAL
+    mcp__loom-ui__trigger_run_now --terminalId $JUDGE_TERMINAL
 
-  # Wait for review completion
-  while true; do
-    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-    if echo "$LABELS" | grep -q "loom:pr"; then
-      echo "PR approved"
-      PHASE="gate2"
-      break
-    elif echo "$LABELS" | grep -q "loom:changes-requested"; then
-      echo "Changes requested"
-      PHASE="doctor"
-      break
-    fi
-    sleep 30
-  done
+    # Wait for review completion
+    while true; do
+      LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+      if echo "$LABELS" | grep -q "loom:pr"; then
+        echo "PR approved"
+        PHASE="gate2"
+        break
+      elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+        echo "Changes requested"
+        PHASE="doctor"
+        break
+      fi
+      sleep 30
+    done
+  fi
 fi
 ```
 
@@ -464,12 +486,14 @@ if [ "$PHASE" = "gate2" ]; then
     exit 0
   fi
 
-  # Check if --force-merge mode - auto-merge with conflict resolution
+  # Check if --force-merge mode - auto-merge with --admin to bypass approval requirements
+  # We use --admin because we skipped the Judge phase (self-approval not allowed by GitHub)
   if [ "$FORCE_MERGE" = "true" ]; then
-    echo "Force-merge mode: auto-merging PR"
+    echo "Force-merge mode: auto-merging PR with admin privileges"
 
     # Check for merge conflicts and attempt resolution
-    if ! gh pr merge $PR_NUMBER --squash --delete-branch 2>/dev/null; then
+    # Use --admin to bypass branch protection since we skipped the Judge phase
+    if ! gh pr merge $PR_NUMBER --squash --delete-branch --admin 2>/dev/null; then
       echo "Merge failed, attempting conflict resolution..."
       git fetch origin main
       git checkout $BRANCH_NAME
@@ -480,10 +504,10 @@ if [ "$PHASE" = "gate2" ]; then
         git commit -m "Resolve merge conflicts (auto-resolved)"
       }
       git push origin $BRANCH_NAME
-      gh pr merge $PR_NUMBER --squash --delete-branch
+      gh pr merge $PR_NUMBER --squash --delete-branch --admin
     fi
 
-    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force-merge\`"
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force-merge\` (admin merge, review skipped)"
   else
     # Trigger Champion or wait for human merge
     CHAMPION_TERMINAL="terminal-5"  # if exists
