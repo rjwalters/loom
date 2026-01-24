@@ -241,6 +241,30 @@ pub struct LintResults {
     pub format_errors: i32,
 }
 
+/// PR rework statistics for tracking review cycles
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PrReworkStats {
+    /// Average number of rework cycles for PRs that needed changes
+    pub avg_rework_count: f64,
+    /// Maximum rework count seen for any PR
+    pub max_rework_count: i32,
+    /// Number of PRs that required at least one rework cycle
+    pub prs_with_rework: i64,
+    /// Total number of PRs with review tracking
+    pub total_prs_tracked: i64,
+}
+
+/// Prompt-to-test success correlation statistics
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptSuccessStats {
+    /// Total number of prompts that have test results
+    pub total_prompts_with_tests: i64,
+    /// Number of prompts where all tests passed (failed = 0, passed > 0)
+    pub prompts_with_all_passing: i64,
+    /// Average test pass rate across all prompts (passed / (passed + failed))
+    pub avg_test_pass_rate: f64,
+}
+
 /// Quality metrics record for tracking test outcomes and code quality
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -265,6 +289,10 @@ pub struct QualityMetrics {
     // PR review outcomes
     pub pr_approved: Option<bool>,
     pub pr_changes_requested: Option<bool>,
+
+    // Rework tracking (Issue #1054)
+    // Counts how many review cycles a PR goes through
+    pub rework_count: Option<i32>,
 
     // Human rating (1-5 stars, optional)
     pub human_rating: Option<i32>,

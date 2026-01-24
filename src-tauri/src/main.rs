@@ -192,6 +192,14 @@ fn main() {
             get_agent_metrics,
             get_metrics_by_role,
             log_github_event,
+            // Velocity tracking commands
+            generate_velocity_snapshot,
+            get_velocity_snapshots,
+            get_velocity_summary,
+            get_rolling_average,
+            backfill_velocity_history,
+            get_velocity_trends,
+            compare_velocity_periods,
             // Terminal commands
             create_terminal,
             list_terminals,

@@ -194,11 +194,13 @@ fn parse_go_test(output: &str) -> Option<TestResults> {
 ///
 /// Detects output from common linters:
 /// - `ESLint`
+/// - cargo clippy (Rust)
 /// - rustfmt
 /// - Prettier
 /// - Black (Python)
 pub fn parse_lint_results(output: &str) -> Option<LintResults> {
     parse_eslint(output)
+        .or_else(|| parse_clippy(output))
         .or_else(|| parse_rustfmt(output))
         .or_else(|| parse_prettier(output))
         .or_else(|| parse_black(output))
@@ -218,6 +220,68 @@ fn parse_eslint(output: &str) -> Option<LintResults> {
 
         return Some(LintResults {
             lint_errors: errors,
+            format_errors: 0,
+        });
+    }
+
+    None
+}
+
+/// Parse cargo clippy output.
+///
+/// clippy format examples:
+/// ```text
+/// warning: `project` (lib) generated 5 warnings
+/// warning: `project` (lib) generated 3 warnings (2 duplicates)
+/// error: could not compile `project` due to 2 previous errors
+/// warning: unused variable: `x`
+/// error[E0425]: cannot find value `x` in this scope
+/// ```
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn parse_clippy(output: &str) -> Option<LintResults> {
+    // Count explicit warning and error patterns
+    let warning_summary_re = Regex::new(r"generated\s+(\d+)\s+warnings?").ok()?;
+    let error_summary_re = Regex::new(r"due to\s+(\d+)\s+previous\s+errors?").ok()?;
+
+    // Try to get counts from summary lines first
+    let mut warnings = 0i32;
+    let mut errors = 0i32;
+
+    for cap in warning_summary_re.captures_iter(output) {
+        if let Some(m) = cap.get(1) {
+            warnings = warnings.saturating_add(m.as_str().parse().unwrap_or(0));
+        }
+    }
+
+    for cap in error_summary_re.captures_iter(output) {
+        if let Some(m) = cap.get(1) {
+            errors = errors.saturating_add(m.as_str().parse().unwrap_or(0));
+        }
+    }
+
+    // If no summary found, count individual warning/error lines
+    // Use string matching instead of regex look-ahead (not supported by regex crate)
+    if warnings == 0 && errors == 0 {
+        warnings = output
+            .lines()
+            .filter(|line| {
+                line.starts_with("warning:")
+                    && !line.contains("generated")
+                    && !line.contains("(lib)")
+                    && !line.contains("(bin)")
+            })
+            .count() as i32;
+
+        let error_line_re = Regex::new(r"^error(?:\[E\d+\])?:").ok()?;
+        errors = output
+            .lines()
+            .filter(|line| error_line_re.is_match(line))
+            .count() as i32;
+    }
+
+    if warnings > 0 || errors > 0 {
+        return Some(LintResults {
+            lint_errors: errors.saturating_add(warnings),
             format_errors: 0,
         });
     }
@@ -421,6 +485,52 @@ PASS
         let output = "  5 problems (3 errors, 2 warnings)";
         let result = parse_eslint(output).unwrap();
         assert_eq!(result.lint_errors, 3);
+        assert_eq!(result.format_errors, 0);
+    }
+
+    #[test]
+    fn test_parse_clippy_summary() {
+        let output = r#"
+    Checking loom-daemon v0.1.0
+warning: `loom-daemon` (lib) generated 5 warnings
+    Finished `dev` profile [unoptimized + debuginfo] target
+"#;
+        let result = parse_clippy(output).unwrap();
+        assert_eq!(result.lint_errors, 5);
+        assert_eq!(result.format_errors, 0);
+    }
+
+    #[test]
+    fn test_parse_clippy_errors() {
+        let output = r#"
+error[E0425]: cannot find value `x` in this scope
+  --> src/main.rs:10:5
+   |
+10 |     x
+   |     ^ not found in this scope
+
+error: could not compile `project` due to 2 previous errors
+"#;
+        let result = parse_clippy(output).unwrap();
+        assert_eq!(result.lint_errors, 2);
+        assert_eq!(result.format_errors, 0);
+    }
+
+    #[test]
+    fn test_parse_clippy_warnings_and_errors() {
+        let output = r#"
+warning: unused variable: `x`
+  --> src/main.rs:5:9
+   |
+5  |     let x = 5;
+   |         ^ help: if this is intentional, prefix it with an underscore: `_x`
+
+warning: `myproject` (lib) generated 3 warnings
+error: could not compile `myproject` due to 1 previous error
+"#;
+        let result = parse_clippy(output).unwrap();
+        // 3 warnings + 1 error = 4 total lint errors
+        assert_eq!(result.lint_errors, 4);
         assert_eq!(result.format_errors, 0);
     }
 

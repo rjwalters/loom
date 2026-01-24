@@ -140,6 +140,79 @@ fn migrate_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
+/// Migrate schema from v2 to v3
+/// Adds prompt_github table for linking prompts to GitHub entities
+fn migrate_v2_to_v3(conn: &Connection) -> SqliteResult<()> {
+    // Create prompt_github table for correlating prompts with GitHub entities
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS prompt_github (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_id INTEGER NOT NULL,
+            issue_number INTEGER,
+            pr_number INTEGER,
+            label_before TEXT,
+            label_after TEXT,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prompt_github_activity_id ON prompt_github(activity_id)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prompt_github_issue_number ON prompt_github(issue_number)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prompt_github_pr_number ON prompt_github(pr_number)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prompt_github_event_type ON prompt_github(event_type)",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_prompt_github_event_time ON prompt_github(event_time)",
+        [],
+    )?;
+
+    Ok(())
+}
+
+/// Migrate schema from v3 to v4
+/// Adds velocity_snapshots table for daily velocity tracking
+fn migrate_v3_to_v4(conn: &Connection) -> SqliteResult<()> {
+    // Create velocity_snapshots table for daily metrics
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS velocity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date DATE NOT NULL UNIQUE,
+            issues_closed INTEGER NOT NULL DEFAULT 0,
+            prs_merged INTEGER NOT NULL DEFAULT 0,
+            avg_cycle_time_hours REAL,
+            total_prompts INTEGER NOT NULL DEFAULT 0,
+            total_cost_usd REAL NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_velocity_snapshots_date ON velocity_snapshots(snapshot_date)",
+        [],
+    )?;
+
+    Ok(())
+}
+
 /// Run all pending migrations
 fn run_migrations(conn: &Connection) -> SqliteResult<()> {
     let current_version = get_schema_version(conn)?;
@@ -148,6 +221,18 @@ fn run_migrations(conn: &Connection) -> SqliteResult<()> {
     if current_version < 2 {
         migrate_v1_to_v2(conn)?;
         set_schema_version(conn, 2)?;
+    }
+
+    // Migrate to v3 if needed
+    if current_version < 3 {
+        migrate_v2_to_v3(conn)?;
+        set_schema_version(conn, 3)?;
+    }
+
+    // Migrate to v4 if needed
+    if current_version < 4 {
+        migrate_v3_to_v4(conn)?;
+        set_schema_version(conn, 4)?;
     }
 
     Ok(())
@@ -683,4 +768,1275 @@ pub fn log_github_event(
     .map_err(|e| format!("Failed to log GitHub event: {e}"))?;
 
     Ok(())
+}
+
+// ============================================================================
+// Prompt-GitHub Correlation (Phase 2: Correlation & Context)
+// ============================================================================
+
+/// GitHub event types for prompt correlation
+/// These map to specific GitHub CLI operations detected in terminal output
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptGitHubEventType {
+    /// Issue was claimed (label changed to loom:building)
+    IssueClaimed,
+    /// New PR was created
+    PrCreated,
+    /// PR was merged
+    PrMerged,
+    /// PR was closed without merge
+    PrClosed,
+    /// Label was added to issue or PR
+    LabelAdded,
+    /// Label was removed from issue or PR
+    LabelRemoved,
+    /// Issue was closed
+    IssueClosed,
+    /// Issue was reopened
+    IssueReopened,
+    /// PR review was submitted
+    PrReviewed,
+    /// PR changes were requested
+    PrChangesRequested,
+    /// PR was approved
+    PrApproved,
+}
+
+impl std::fmt::Display for PromptGitHubEventType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::IssueClaimed => "issue_claimed",
+            Self::PrCreated => "pr_created",
+            Self::PrMerged => "pr_merged",
+            Self::PrClosed => "pr_closed",
+            Self::LabelAdded => "label_added",
+            Self::LabelRemoved => "label_removed",
+            Self::IssueClosed => "issue_closed",
+            Self::IssueReopened => "issue_reopened",
+            Self::PrReviewed => "pr_reviewed",
+            Self::PrChangesRequested => "pr_changes_requested",
+            Self::PrApproved => "pr_approved",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Entry for prompt-GitHub correlation
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PromptGitHubEntry {
+    pub id: Option<i64>,
+    pub activity_id: i64,
+    pub issue_number: Option<i32>,
+    pub pr_number: Option<i32>,
+    pub label_before: Option<String>,
+    pub label_after: Option<String>,
+    pub event_type: String,
+    pub event_time: String,
+}
+
+/// Log a prompt-GitHub correlation entry
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn log_prompt_github(
+    workspace_path: String,
+    activity_id: i64,
+    event_type: String,
+    issue_number: Option<i32>,
+    pr_number: Option<i32>,
+    label_before: Option<String>,
+    label_after: Option<String>,
+) -> Result<i64, String> {
+    let conn =
+        open_activity_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    conn.execute(
+        "INSERT INTO prompt_github (
+            activity_id, issue_number, pr_number, label_before, label_after, event_type, event_time
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))",
+        params![
+            activity_id,
+            issue_number,
+            pr_number,
+            label_before,
+            label_after,
+            event_type
+        ],
+    )
+    .map_err(|e| format!("Failed to log prompt-GitHub correlation: {e}"))?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Query prompt-GitHub correlations for a specific issue
+#[tauri::command]
+pub fn get_prompts_for_issue(
+    workspace_path: &str,
+    issue_number: i32,
+) -> Result<Vec<PromptGitHubEntry>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, activity_id, issue_number, pr_number, label_before, label_after, event_type, event_time
+             FROM prompt_github
+             WHERE issue_number = ?1
+             ORDER BY event_time ASC",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let entries = stmt
+        .query_map([issue_number], |row| {
+            Ok(PromptGitHubEntry {
+                id: row.get(0)?,
+                activity_id: row.get(1)?,
+                issue_number: row.get(2)?,
+                pr_number: row.get(3)?,
+                label_before: row.get(4)?,
+                label_after: row.get(5)?,
+                event_type: row.get(6)?,
+                event_time: row.get(7)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query prompt-GitHub entries: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect entries: {e}"))?;
+
+    Ok(entries)
+}
+
+/// Query prompt-GitHub correlations for a specific PR
+#[tauri::command]
+pub fn get_prompts_for_pr(
+    workspace_path: &str,
+    pr_number: i32,
+) -> Result<Vec<PromptGitHubEntry>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, activity_id, issue_number, pr_number, label_before, label_after, event_type, event_time
+             FROM prompt_github
+             WHERE pr_number = ?1
+             ORDER BY event_time ASC",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let entries = stmt
+        .query_map([pr_number], |row| {
+            Ok(PromptGitHubEntry {
+                id: row.get(0)?,
+                activity_id: row.get(1)?,
+                issue_number: row.get(2)?,
+                pr_number: row.get(3)?,
+                label_before: row.get(4)?,
+                label_after: row.get(5)?,
+                event_type: row.get(6)?,
+                event_time: row.get(7)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query prompt-GitHub entries: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect entries: {e}"))?;
+
+    Ok(entries)
+}
+
+/// Issue resolution cost summary
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IssueCostSummary {
+    pub issue_number: i32,
+    pub prompt_count: i32,
+    pub total_tokens: i64,
+    pub total_cost: f64,
+    pub first_activity: String,
+    pub last_activity: String,
+    pub duration_hours: f64,
+    pub pr_number: Option<i32>,
+    pub merged: bool,
+}
+
+/// Get cost and metrics for resolving a specific issue
+#[tauri::command]
+pub fn get_issue_resolution_cost(
+    workspace_path: &str,
+    issue_number: i32,
+) -> Result<Option<IssueCostSummary>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    // Get all activity IDs associated with this issue
+    let activity_ids: Vec<i64> = conn
+        .prepare("SELECT DISTINCT activity_id FROM prompt_github WHERE issue_number = ?1")
+        .map_err(|e| format!("Failed to prepare query: {e}"))?
+        .query_map([issue_number], |row| row.get(0))
+        .map_err(|e| format!("Failed to query activity IDs: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect activity IDs: {e}"))?;
+
+    if activity_ids.is_empty() {
+        return Ok(None);
+    }
+
+    // Build comma-separated list for IN clause
+    let id_list = activity_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Get prompt count and timestamps
+    let (prompt_count, first_activity, last_activity): (i32, String, String) = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*), MIN(timestamp), MAX(timestamp)
+                 FROM agent_activity
+                 WHERE id IN ({id_list})"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| format!("Failed to query activity metrics: {e}"))?;
+
+    // Get token usage
+    let (prompt_tokens, completion_tokens, total_tokens): (i64, i64, i64) = conn
+        .query_row(
+            &format!(
+                "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0), COALESCE(SUM(total_tokens), 0)
+                 FROM token_usage
+                 WHERE activity_id IN ({id_list})"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((0, 0, 0));
+
+    // Calculate duration in hours
+    let duration_hours: f64 = conn
+        .query_row(
+            &format!(
+                "SELECT (julianday(MAX(timestamp)) - julianday(MIN(timestamp))) * 24
+                 FROM agent_activity
+                 WHERE id IN ({id_list})"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    // Check if there's an associated PR and if it was merged
+    let pr_info: Option<(i32, bool)> = conn
+        .query_row(
+            "SELECT pr_number, event_type = 'pr_merged'
+             FROM prompt_github
+             WHERE issue_number = ?1 AND pr_number IS NOT NULL
+             ORDER BY CASE WHEN event_type = 'pr_merged' THEN 0 ELSE 1 END
+             LIMIT 1",
+            [issue_number],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let (pr_number, merged) = pr_info.map_or((None, false), |(pr, m)| (Some(pr), m));
+
+    Ok(Some(IssueCostSummary {
+        issue_number,
+        prompt_count,
+        total_tokens,
+        total_cost: calculate_cost(prompt_tokens, completion_tokens),
+        first_activity,
+        last_activity,
+        duration_hours,
+        pr_number,
+        merged,
+    }))
+}
+
+/// Label transition record for tracking workflow state changes
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LabelTransition {
+    pub timestamp: String,
+    pub issue_number: Option<i32>,
+    pub pr_number: Option<i32>,
+    pub label_before: Option<String>,
+    pub label_after: Option<String>,
+    pub activity_id: i64,
+    pub role: String,
+}
+
+/// Get label transition history for tracking workflow state changes
+#[tauri::command]
+pub fn get_label_transitions(
+    workspace_path: &str,
+    time_range: &str,
+) -> Result<Vec<LabelTransition>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let since_clause = match time_range {
+        "today" => "datetime('now', 'start of day')",
+        "week" => "datetime('now', '-7 days')",
+        "month" => "datetime('now', '-30 days')",
+        _ => "datetime('1970-01-01')",
+    };
+
+    let query = format!(
+        "SELECT pg.event_time, pg.issue_number, pg.pr_number, pg.label_before, pg.label_after, pg.activity_id, a.role
+         FROM prompt_github pg
+         JOIN agent_activity a ON pg.activity_id = a.id
+         WHERE pg.event_type IN ('label_added', 'label_removed')
+           AND pg.event_time >= {since_clause}
+         ORDER BY pg.event_time DESC"
+    );
+
+    let mut stmt = conn
+        .prepare(&query)
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let transitions = stmt
+        .query_map([], |row| {
+            Ok(LabelTransition {
+                timestamp: row.get(0)?,
+                issue_number: row.get(1)?,
+                pr_number: row.get(2)?,
+                label_before: row.get(3)?,
+                label_after: row.get(4)?,
+                activity_id: row.get(5)?,
+                role: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query label transitions: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect transitions: {e}"))?;
+
+    Ok(transitions)
+}
+
+/// PR cycle time analysis
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PRCycleTime {
+    pub pr_number: i32,
+    pub issue_number: Option<i32>,
+    pub created_at: String,
+    pub merged_at: Option<String>,
+    pub closed_at: Option<String>,
+    pub review_requested_at: Option<String>,
+    pub approved_at: Option<String>,
+    pub cycle_time_hours: Option<f64>,
+    pub review_time_hours: Option<f64>,
+    pub prompt_count: i32,
+    pub total_cost: f64,
+}
+
+/// Get PR cycle time analysis for recent PRs
+#[tauri::command]
+pub fn get_pr_cycle_times(
+    workspace_path: &str,
+    limit: Option<i32>,
+) -> Result<Vec<PRCycleTime>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let limit = limit.unwrap_or(20);
+
+    // Get distinct PRs with their first and last events
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT pr_number FROM prompt_github
+             WHERE pr_number IS NOT NULL
+             ORDER BY event_time DESC
+             LIMIT ?1",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let pr_numbers: Vec<i32> = stmt
+        .query_map([limit], |row| row.get(0))
+        .map_err(|e| format!("Failed to query PR numbers: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect PR numbers: {e}"))?;
+
+    let mut results = Vec::new();
+
+    for pr_number in pr_numbers {
+        // Get all events for this PR
+        let mut events_stmt = conn
+            .prepare(
+                "SELECT event_type, event_time, issue_number
+                 FROM prompt_github
+                 WHERE pr_number = ?1
+                 ORDER BY event_time ASC",
+            )
+            .map_err(|e| format!("Failed to prepare events query: {e}"))?;
+
+        let events: Vec<(String, String, Option<i32>)> = events_stmt
+            .query_map([pr_number], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|e| format!("Failed to query events: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect events: {e}"))?;
+
+        if events.is_empty() {
+            continue;
+        }
+
+        let issue_number = events.iter().find_map(|(_, _, i)| *i);
+        let created_at = events
+            .iter()
+            .find(|(t, _, _)| t == "pr_created")
+            .map(|(_, time, _)| time.clone())
+            .unwrap_or_else(|| events[0].1.clone());
+
+        let merged_at = events
+            .iter()
+            .find(|(t, _, _)| t == "pr_merged")
+            .map(|(_, time, _)| time.clone());
+
+        let closed_at = events
+            .iter()
+            .find(|(t, _, _)| t == "pr_closed")
+            .map(|(_, time, _)| time.clone());
+
+        let review_requested_at = events
+            .iter()
+            .find(|(t, _, _)| t == "label_added")
+            .filter(|(_, _, _)| true) // Could check for loom:review-requested label
+            .map(|(_, time, _)| time.clone());
+
+        let approved_at = events
+            .iter()
+            .find(|(t, _, _)| t == "pr_approved")
+            .map(|(_, time, _)| time.clone());
+
+        // Calculate cycle time (creation to merge/close)
+        let cycle_time_hours = merged_at
+            .as_ref()
+            .or(closed_at.as_ref())
+            .and_then(|end_time| {
+                conn.query_row(
+                    "SELECT (julianday(?1) - julianday(?2)) * 24",
+                    params![end_time, &created_at],
+                    |row| row.get(0),
+                )
+                .ok()
+            });
+
+        // Calculate review time (review requested to approved)
+        let review_time_hours = match (&review_requested_at, &approved_at) {
+            (Some(start), Some(end)) => conn
+                .query_row(
+                    "SELECT (julianday(?1) - julianday(?2)) * 24",
+                    params![end, start],
+                    |row| row.get(0),
+                )
+                .ok(),
+            _ => None,
+        };
+
+        // Get activity IDs for this PR
+        let activity_ids: Vec<i64> = conn
+            .prepare("SELECT DISTINCT activity_id FROM prompt_github WHERE pr_number = ?1")
+            .map_err(|e| format!("Failed to prepare query: {e}"))?
+            .query_map([pr_number], |row| row.get(0))
+            .map_err(|e| format!("Failed to query activity IDs: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect activity IDs: {e}"))?;
+
+        let prompt_count = activity_ids.len() as i32;
+
+        // Calculate total cost
+        let total_cost = if activity_ids.is_empty() {
+            0.0
+        } else {
+            let id_list = activity_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let (prompt_tokens, completion_tokens): (i64, i64) = conn
+                .query_row(
+                    &format!(
+                        "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+                         FROM token_usage
+                         WHERE activity_id IN ({id_list})"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap_or((0, 0));
+
+            calculate_cost(prompt_tokens, completion_tokens)
+        };
+
+        results.push(PRCycleTime {
+            pr_number,
+            issue_number,
+            created_at,
+            merged_at,
+            closed_at,
+            review_requested_at,
+            approved_at,
+            cycle_time_hours,
+            review_time_hours,
+            prompt_count,
+            total_cost,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Average cost per issue resolved
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AverageIssueCost {
+    pub issues_resolved: i32,
+    pub total_cost: f64,
+    pub average_cost: f64,
+    pub total_prompts: i32,
+    pub average_prompts: f64,
+    pub average_duration_hours: f64,
+}
+
+/// Get average cost to resolve issues over a time range
+#[tauri::command]
+pub fn get_average_issue_cost(
+    workspace_path: &str,
+    time_range: &str,
+) -> Result<AverageIssueCost, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let since_clause = match time_range {
+        "today" => "datetime('now', 'start of day')",
+        "week" => "datetime('now', '-7 days')",
+        "month" => "datetime('now', '-30 days')",
+        _ => "datetime('1970-01-01')",
+    };
+
+    // Get all issues that were resolved (merged or closed) in the time range
+    let query = format!(
+        "SELECT DISTINCT issue_number
+         FROM prompt_github
+         WHERE issue_number IS NOT NULL
+           AND event_type IN ('pr_merged', 'issue_closed')
+           AND event_time >= {since_clause}"
+    );
+
+    let resolved_issues: Vec<i32> = conn
+        .prepare(&query)
+        .map_err(|e| format!("Failed to prepare query: {e}"))?
+        .query_map([], |row| row.get(0))
+        .map_err(|e| format!("Failed to query resolved issues: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect issues: {e}"))?;
+
+    if resolved_issues.is_empty() {
+        return Ok(AverageIssueCost {
+            issues_resolved: 0,
+            total_cost: 0.0,
+            average_cost: 0.0,
+            total_prompts: 0,
+            average_prompts: 0.0,
+            average_duration_hours: 0.0,
+        });
+    }
+
+    let issues_resolved = resolved_issues.len() as i32;
+
+    // Calculate totals across all resolved issues
+    let issue_list = resolved_issues
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Get all activity IDs for these issues
+    let activity_ids: Vec<i64> = conn
+        .prepare(&format!(
+            "SELECT DISTINCT activity_id FROM prompt_github WHERE issue_number IN ({issue_list})"
+        ))
+        .map_err(|e| format!("Failed to prepare query: {e}"))?
+        .query_map([], |row| row.get(0))
+        .map_err(|e| format!("Failed to query activity IDs: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect activity IDs: {e}"))?;
+
+    let total_prompts = activity_ids.len() as i32;
+
+    let total_cost = if activity_ids.is_empty() {
+        0.0
+    } else {
+        let id_list = activity_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let (prompt_tokens, completion_tokens): (i64, i64) = conn
+            .query_row(
+                &format!(
+                    "SELECT COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0)
+                     FROM token_usage
+                     WHERE activity_id IN ({id_list})"
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+
+        calculate_cost(prompt_tokens, completion_tokens)
+    };
+
+    // Calculate average duration per issue
+    let total_duration: f64 = resolved_issues
+        .iter()
+        .filter_map(|&issue_num| {
+            conn.query_row(
+                "SELECT (julianday(MAX(event_time)) - julianday(MIN(event_time))) * 24
+                 FROM prompt_github
+                 WHERE issue_number = ?1",
+                [issue_num],
+                |row| row.get::<_, f64>(0),
+            )
+            .ok()
+        })
+        .sum();
+
+    Ok(AverageIssueCost {
+        issues_resolved,
+        total_cost,
+        average_cost: total_cost / f64::from(issues_resolved),
+        total_prompts,
+        average_prompts: f64::from(total_prompts) / f64::from(issues_resolved),
+        average_duration_hours: total_duration / f64::from(issues_resolved),
+    })
+}
+
+// ============================================================================
+// Velocity Tracking and Trend Analysis (Phase 3: Intelligence & Learning)
+// ============================================================================
+
+/// Daily velocity snapshot
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VelocitySnapshot {
+    pub snapshot_date: String,
+    pub issues_closed: i32,
+    pub prs_merged: i32,
+    pub avg_cycle_time_hours: Option<f64>,
+    pub total_prompts: i32,
+    pub total_cost_usd: f64,
+}
+
+/// Trend direction indicator
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrendDirection {
+    /// Improving (higher is better)
+    Improving,
+    /// Declining (lower than before)
+    Declining,
+    /// Stable (within 10% variance)
+    Stable,
+}
+
+impl std::fmt::Display for TrendDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Improving => "improving",
+            Self::Declining => "declining",
+            Self::Stable => "stable",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Velocity summary with trends
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VelocitySummary {
+    /// Current period metrics
+    pub issues_closed: i32,
+    pub prs_merged: i32,
+    pub avg_cycle_time_hours: Option<f64>,
+    pub total_prompts: i32,
+    pub total_cost_usd: f64,
+    /// Previous period metrics (for comparison)
+    pub prev_issues_closed: i32,
+    pub prev_prs_merged: i32,
+    pub prev_avg_cycle_time_hours: Option<f64>,
+    /// Trend directions
+    pub issues_trend: TrendDirection,
+    pub prs_trend: TrendDirection,
+    pub cycle_time_trend: TrendDirection,
+}
+
+/// Rolling average metrics
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RollingAverage {
+    pub period_days: i32,
+    pub avg_issues_per_day: f64,
+    pub avg_prs_per_day: f64,
+    pub avg_cycle_time_hours: Option<f64>,
+    pub avg_cost_per_day: f64,
+}
+
+/// Calculate trend direction based on percentage change
+fn calculate_trend(current: f64, previous: f64, lower_is_better: bool) -> TrendDirection {
+    if previous == 0.0 {
+        if current > 0.0 {
+            return if lower_is_better {
+                TrendDirection::Declining
+            } else {
+                TrendDirection::Improving
+            };
+        }
+        return TrendDirection::Stable;
+    }
+
+    let change_pct = (current - previous) / previous;
+
+    // Within 10% is considered stable
+    if change_pct.abs() < 0.1 {
+        TrendDirection::Stable
+    } else if lower_is_better {
+        if change_pct < 0.0 {
+            TrendDirection::Improving
+        } else {
+            TrendDirection::Declining
+        }
+    } else if change_pct > 0.0 {
+        TrendDirection::Improving
+    } else {
+        TrendDirection::Declining
+    }
+}
+
+/// Generate or update today's velocity snapshot
+#[tauri::command]
+pub fn generate_velocity_snapshot(workspace_path: &str) -> Result<VelocitySnapshot, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    // Get issues closed today (from prompt_github events)
+    let issues_closed: i32 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT issue_number)
+             FROM prompt_github
+             WHERE event_type = 'issue_closed'
+               AND DATE(event_time) = ?1",
+            [&today],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    // Get PRs merged today
+    let prs_merged: i32 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT pr_number)
+             FROM prompt_github
+             WHERE event_type = 'pr_merged'
+               AND DATE(event_time) = ?1",
+            [&today],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    // Calculate average cycle time for PRs merged today
+    let avg_cycle_time: Option<f64> = conn
+        .query_row(
+            "SELECT AVG(
+                (julianday(merged.event_time) - julianday(created.event_time)) * 24
+             )
+             FROM prompt_github merged
+             INNER JOIN prompt_github created ON merged.pr_number = created.pr_number
+             WHERE merged.event_type = 'pr_merged'
+               AND created.event_type = 'pr_created'
+               AND DATE(merged.event_time) = ?1",
+            [&today],
+            |row| row.get(0),
+        )
+        .ok();
+
+    // Get total prompts today
+    let total_prompts: i32 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM agent_activity
+             WHERE DATE(timestamp) = ?1",
+            [&today],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    // Get total cost today
+    let (prompt_tokens, completion_tokens): (i64, i64) = conn
+        .query_row(
+            "SELECT COALESCE(SUM(t.prompt_tokens), 0), COALESCE(SUM(t.completion_tokens), 0)
+             FROM agent_activity a
+             JOIN token_usage t ON a.id = t.activity_id
+             WHERE DATE(a.timestamp) = ?1",
+            [&today],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+
+    let total_cost_usd = calculate_cost(prompt_tokens, completion_tokens);
+
+    // Insert or update today's snapshot
+    conn.execute(
+        "INSERT INTO velocity_snapshots (snapshot_date, issues_closed, prs_merged, avg_cycle_time_hours, total_prompts, total_cost_usd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(snapshot_date) DO UPDATE SET
+             issues_closed = excluded.issues_closed,
+             prs_merged = excluded.prs_merged,
+             avg_cycle_time_hours = excluded.avg_cycle_time_hours,
+             total_prompts = excluded.total_prompts,
+             total_cost_usd = excluded.total_cost_usd",
+        params![
+            &today,
+            issues_closed,
+            prs_merged,
+            avg_cycle_time,
+            total_prompts,
+            total_cost_usd
+        ],
+    )
+    .map_err(|e| format!("Failed to save velocity snapshot: {e}"))?;
+
+    Ok(VelocitySnapshot {
+        snapshot_date: today,
+        issues_closed,
+        prs_merged,
+        avg_cycle_time_hours: avg_cycle_time,
+        total_prompts,
+        total_cost_usd,
+    })
+}
+
+/// Get velocity snapshots for a date range
+#[tauri::command]
+pub fn get_velocity_snapshots(
+    workspace_path: &str,
+    days: Option<i32>,
+) -> Result<Vec<VelocitySnapshot>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let days_val = days.unwrap_or(30);
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT snapshot_date, issues_closed, prs_merged, avg_cycle_time_hours, total_prompts, total_cost_usd
+             FROM velocity_snapshots
+             WHERE snapshot_date >= DATE('now', '-' || ?1 || ' days')
+             ORDER BY snapshot_date DESC",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let snapshots = stmt
+        .query_map([days_val], |row| {
+            Ok(VelocitySnapshot {
+                snapshot_date: row.get(0)?,
+                issues_closed: row.get(1)?,
+                prs_merged: row.get(2)?,
+                avg_cycle_time_hours: row.get(3)?,
+                total_prompts: row.get(4)?,
+                total_cost_usd: row.get(5)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query snapshots: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect snapshots: {e}"))?;
+
+    Ok(snapshots)
+}
+
+/// Get velocity summary with week-over-week comparison
+#[tauri::command]
+pub fn get_velocity_summary(workspace_path: &str) -> Result<VelocitySummary, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    // Current week (last 7 days)
+    let current_query = "SELECT
+        COALESCE(SUM(issues_closed), 0) as issues,
+        COALESCE(SUM(prs_merged), 0) as prs,
+        AVG(avg_cycle_time_hours) as cycle_time,
+        COALESCE(SUM(total_prompts), 0) as prompts,
+        COALESCE(SUM(total_cost_usd), 0) as cost
+     FROM velocity_snapshots
+     WHERE snapshot_date >= DATE('now', '-7 days')";
+
+    let (issues_closed, prs_merged, avg_cycle_time_hours, total_prompts, total_cost_usd): (
+        i32,
+        i32,
+        Option<f64>,
+        i32,
+        f64,
+    ) = conn
+        .query_row(current_query, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap_or((0, 0, None, 0, 0.0));
+
+    // Previous week (8-14 days ago)
+    let prev_query = "SELECT
+        COALESCE(SUM(issues_closed), 0) as issues,
+        COALESCE(SUM(prs_merged), 0) as prs,
+        AVG(avg_cycle_time_hours) as cycle_time
+     FROM velocity_snapshots
+     WHERE snapshot_date >= DATE('now', '-14 days')
+       AND snapshot_date < DATE('now', '-7 days')";
+
+    let (prev_issues_closed, prev_prs_merged, prev_avg_cycle_time_hours): (i32, i32, Option<f64>) =
+        conn.query_row(prev_query, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap_or((0, 0, None));
+
+    // Calculate trends
+    let issues_trend =
+        calculate_trend(f64::from(issues_closed), f64::from(prev_issues_closed), false);
+    let prs_trend = calculate_trend(f64::from(prs_merged), f64::from(prev_prs_merged), false);
+    let cycle_time_trend = match (avg_cycle_time_hours, prev_avg_cycle_time_hours) {
+        (Some(current), Some(prev)) => calculate_trend(current, prev, true),
+        _ => TrendDirection::Stable,
+    };
+
+    Ok(VelocitySummary {
+        issues_closed,
+        prs_merged,
+        avg_cycle_time_hours,
+        total_prompts,
+        total_cost_usd,
+        prev_issues_closed,
+        prev_prs_merged,
+        prev_avg_cycle_time_hours,
+        issues_trend,
+        prs_trend,
+        cycle_time_trend,
+    })
+}
+
+/// Get rolling average metrics
+#[tauri::command]
+pub fn get_rolling_average(
+    workspace_path: &str,
+    period_days: Option<i32>,
+) -> Result<RollingAverage, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let days = period_days.unwrap_or(7);
+
+    let query = format!(
+        "SELECT
+            COALESCE(SUM(issues_closed), 0) as total_issues,
+            COALESCE(SUM(prs_merged), 0) as total_prs,
+            AVG(avg_cycle_time_hours) as avg_cycle,
+            COALESCE(SUM(total_cost_usd), 0) as total_cost,
+            COUNT(*) as days_with_data
+         FROM velocity_snapshots
+         WHERE snapshot_date >= DATE('now', '-{days} days')"
+    );
+
+    let (total_issues, total_prs, avg_cycle, total_cost, days_with_data): (
+        i32,
+        i32,
+        Option<f64>,
+        f64,
+        i32,
+    ) = conn
+        .query_row(&query, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+        })
+        .unwrap_or((0, 0, None, 0.0, 0));
+
+    // Calculate daily averages
+    let divisor = if days_with_data > 0 {
+        f64::from(days_with_data)
+    } else {
+        1.0
+    };
+
+    Ok(RollingAverage {
+        period_days: days,
+        avg_issues_per_day: f64::from(total_issues) / divisor,
+        avg_prs_per_day: f64::from(total_prs) / divisor,
+        avg_cycle_time_hours: avg_cycle,
+        avg_cost_per_day: total_cost / divisor,
+    })
+}
+
+/// Backfill historical velocity data from existing activity records
+#[tauri::command]
+pub fn backfill_velocity_history(workspace_path: &str, days: Option<i32>) -> Result<i32, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let days_val = days.unwrap_or(30);
+    let mut snapshots_created = 0;
+
+    // Get distinct dates from prompt_github events
+    let dates: Vec<String> = conn
+        .prepare(
+            "SELECT DISTINCT DATE(event_time) as date
+             FROM prompt_github
+             WHERE DATE(event_time) >= DATE('now', '-' || ?1 || ' days')
+             ORDER BY date",
+        )
+        .map_err(|e| format!("Failed to prepare query: {e}"))?
+        .query_map([days_val], |row| row.get(0))
+        .map_err(|e| format!("Failed to query dates: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect dates: {e}"))?;
+
+    for date in dates {
+        // Get issues closed on this date
+        let issues_closed: i32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT issue_number)
+                 FROM prompt_github
+                 WHERE event_type = 'issue_closed'
+                   AND DATE(event_time) = ?1",
+                [&date],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Get PRs merged on this date
+        let prs_merged: i32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT pr_number)
+                 FROM prompt_github
+                 WHERE event_type = 'pr_merged'
+                   AND DATE(event_time) = ?1",
+                [&date],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Calculate average cycle time for PRs merged on this date
+        let avg_cycle_time: Option<f64> = conn
+            .query_row(
+                "SELECT AVG(
+                    (julianday(merged.event_time) - julianday(created.event_time)) * 24
+                 )
+                 FROM prompt_github merged
+                 INNER JOIN prompt_github created ON merged.pr_number = created.pr_number
+                 WHERE merged.event_type = 'pr_merged'
+                   AND created.event_type = 'pr_created'
+                   AND DATE(merged.event_time) = ?1",
+                [&date],
+                |row| row.get(0),
+            )
+            .ok();
+
+        // Get total prompts on this date
+        let total_prompts: i32 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM agent_activity
+                 WHERE DATE(timestamp) = ?1",
+                [&date],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Get total cost on this date
+        let (prompt_tokens, completion_tokens): (i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(t.prompt_tokens), 0), COALESCE(SUM(t.completion_tokens), 0)
+                 FROM agent_activity a
+                 JOIN token_usage t ON a.id = t.activity_id
+                 WHERE DATE(a.timestamp) = ?1",
+                [&date],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+
+        let total_cost_usd = calculate_cost(prompt_tokens, completion_tokens);
+
+        // Insert snapshot if there's any activity
+        if issues_closed > 0 || prs_merged > 0 || total_prompts > 0 {
+            conn.execute(
+                "INSERT INTO velocity_snapshots (snapshot_date, issues_closed, prs_merged, avg_cycle_time_hours, total_prompts, total_cost_usd)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(snapshot_date) DO UPDATE SET
+                     issues_closed = excluded.issues_closed,
+                     prs_merged = excluded.prs_merged,
+                     avg_cycle_time_hours = excluded.avg_cycle_time_hours,
+                     total_prompts = excluded.total_prompts,
+                     total_cost_usd = excluded.total_cost_usd",
+                params![
+                    &date,
+                    issues_closed,
+                    prs_merged,
+                    avg_cycle_time,
+                    total_prompts,
+                    total_cost_usd
+                ],
+            )
+            .map_err(|e| format!("Failed to save velocity snapshot: {e}"))?;
+
+            snapshots_created += 1;
+        }
+    }
+
+    Ok(snapshots_created)
+}
+
+/// Velocity trend data point for charting
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VelocityTrendPoint {
+    pub date: String,
+    pub issues_closed: i32,
+    pub issues_closed_7day_avg: f64,
+    pub prs_merged: i32,
+    pub prs_merged_7day_avg: f64,
+    pub cycle_time_hours: Option<f64>,
+    pub cycle_time_7day_avg: Option<f64>,
+}
+
+/// Get velocity trend data with 7-day rolling averages
+#[tauri::command]
+pub fn get_velocity_trends(
+    workspace_path: &str,
+    days: Option<i32>,
+) -> Result<Vec<VelocityTrendPoint>, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    let days_val = days.unwrap_or(30);
+
+    // Query using window functions for rolling averages
+    let query = format!(
+        "SELECT
+            snapshot_date,
+            issues_closed,
+            AVG(issues_closed) OVER (ORDER BY snapshot_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) as issues_7day_avg,
+            prs_merged,
+            AVG(prs_merged) OVER (ORDER BY snapshot_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) as prs_7day_avg,
+            avg_cycle_time_hours,
+            AVG(avg_cycle_time_hours) OVER (ORDER BY snapshot_date ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) as cycle_7day_avg
+         FROM velocity_snapshots
+         WHERE snapshot_date >= DATE('now', '-{days_val} days')
+         ORDER BY snapshot_date DESC"
+    );
+
+    let mut stmt = conn
+        .prepare(&query)
+        .map_err(|e| format!("Failed to prepare query: {e}"))?;
+
+    let trends = stmt
+        .query_map([], |row| {
+            Ok(VelocityTrendPoint {
+                date: row.get(0)?,
+                issues_closed: row.get(1)?,
+                issues_closed_7day_avg: row.get(2)?,
+                prs_merged: row.get(3)?,
+                prs_merged_7day_avg: row.get(4)?,
+                cycle_time_hours: row.get(5)?,
+                cycle_time_7day_avg: row.get(6)?,
+            })
+        })
+        .map_err(|e| format!("Failed to query trends: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect trends: {e}"))?;
+
+    Ok(trends)
+}
+
+/// Compare two time periods for velocity metrics
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PeriodComparison {
+    pub period1_label: String,
+    pub period2_label: String,
+    pub period1_issues: i32,
+    pub period2_issues: i32,
+    pub issues_change_pct: f64,
+    pub period1_prs: i32,
+    pub period2_prs: i32,
+    pub prs_change_pct: f64,
+    pub period1_cycle_time: Option<f64>,
+    pub period2_cycle_time: Option<f64>,
+    pub cycle_time_change_pct: Option<f64>,
+}
+
+/// Compare velocity between two time periods
+#[tauri::command]
+pub fn compare_velocity_periods(
+    workspace_path: &str,
+    period1_start: &str,
+    period1_end: &str,
+    period2_start: &str,
+    period2_end: &str,
+) -> Result<PeriodComparison, String> {
+    let conn =
+        open_activity_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
+
+    // Period 1 metrics
+    let (period1_issues, period1_prs, period1_cycle_time): (i32, i32, Option<f64>) = conn
+        .query_row(
+            "SELECT
+                COALESCE(SUM(issues_closed), 0),
+                COALESCE(SUM(prs_merged), 0),
+                AVG(avg_cycle_time_hours)
+             FROM velocity_snapshots
+             WHERE snapshot_date >= ?1 AND snapshot_date <= ?2",
+            params![period1_start, period1_end],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((0, 0, None));
+
+    // Period 2 metrics
+    let (period2_issues, period2_prs, period2_cycle_time): (i32, i32, Option<f64>) = conn
+        .query_row(
+            "SELECT
+                COALESCE(SUM(issues_closed), 0),
+                COALESCE(SUM(prs_merged), 0),
+                AVG(avg_cycle_time_hours)
+             FROM velocity_snapshots
+             WHERE snapshot_date >= ?1 AND snapshot_date <= ?2",
+            params![period2_start, period2_end],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap_or((0, 0, None));
+
+    // Calculate percentage changes
+    let issues_change_pct = if period1_issues > 0 {
+        ((f64::from(period2_issues) - f64::from(period1_issues)) / f64::from(period1_issues))
+            * 100.0
+    } else if period2_issues > 0 {
+        100.0
+    } else {
+        0.0
+    };
+
+    let prs_change_pct = if period1_prs > 0 {
+        ((f64::from(period2_prs) - f64::from(period1_prs)) / f64::from(period1_prs)) * 100.0
+    } else if period2_prs > 0 {
+        100.0
+    } else {
+        0.0
+    };
+
+    let cycle_time_change_pct = match (period1_cycle_time, period2_cycle_time) {
+        (Some(p1), Some(p2)) if p1 > 0.0 => Some(((p2 - p1) / p1) * 100.0),
+        _ => None,
+    };
+
+    Ok(PeriodComparison {
+        period1_label: format!("{period1_start} to {period1_end}"),
+        period2_label: format!("{period2_start} to {period2_end}"),
+        period1_issues,
+        period2_issues,
+        issues_change_pct,
+        period1_prs,
+        period2_prs,
+        prs_change_pct,
+        period1_cycle_time,
+        period2_cycle_time,
+        cycle_time_change_pct,
+    })
 }

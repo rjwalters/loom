@@ -4,13 +4,18 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  formatChangePercent,
   formatCurrency,
+  formatCycleTime,
   formatNumber,
   formatPercent,
   formatTokens,
   getRoleDisplayName,
   getSuccessRateColor,
   getTimeRangeLabel,
+  getTrendColor,
+  // Velocity tracking utilities
+  getTrendIcon,
 } from "./agent-metrics";
 
 describe("agent-metrics", () => {
@@ -96,6 +101,84 @@ describe("agent-metrics", () => {
     it("should be case-insensitive", () => {
       expect(getRoleDisplayName("BUILDER")).toBe("Builder");
       expect(getRoleDisplayName("Judge")).toBe("Judge");
+    });
+  });
+
+  // ==========================================================================
+  // Velocity Tracking Tests
+  // ==========================================================================
+
+  describe("getTrendIcon", () => {
+    it("should return up arrow for improving", () => {
+      expect(getTrendIcon("improving")).toBe("\u2191");
+    });
+
+    it("should return down arrow for declining", () => {
+      expect(getTrendIcon("declining")).toBe("\u2193");
+    });
+
+    it("should return right arrow for stable", () => {
+      expect(getTrendIcon("stable")).toBe("\u2192");
+    });
+  });
+
+  describe("getTrendColor", () => {
+    it("should return green for improving trends", () => {
+      expect(getTrendColor("improving")).toContain("green");
+    });
+
+    it("should return red for declining trends", () => {
+      expect(getTrendColor("declining")).toContain("red");
+    });
+
+    it("should return gray for stable trends", () => {
+      expect(getTrendColor("stable")).toContain("gray");
+    });
+
+    it("should invert colors when lowerIsBetter is true", () => {
+      // For cycle time, declining (shorter time) is good
+      expect(getTrendColor("declining", true)).toContain("green");
+      expect(getTrendColor("improving", true)).toContain("red");
+    });
+  });
+
+  describe("formatCycleTime", () => {
+    it("should return dash for null", () => {
+      expect(formatCycleTime(null)).toBe("-");
+    });
+
+    it("should format sub-hour durations in minutes", () => {
+      expect(formatCycleTime(0.5)).toBe("30m");
+      expect(formatCycleTime(0.25)).toBe("15m");
+    });
+
+    it("should format hours with one decimal", () => {
+      expect(formatCycleTime(2.5)).toBe("2.5h");
+      expect(formatCycleTime(12.3)).toBe("12.3h");
+    });
+
+    it("should format multi-day durations in days", () => {
+      expect(formatCycleTime(48)).toBe("2.0d");
+      expect(formatCycleTime(72)).toBe("3.0d");
+    });
+  });
+
+  describe("formatChangePercent", () => {
+    it("should return dash for null", () => {
+      expect(formatChangePercent(null)).toBe("-");
+    });
+
+    it("should add + sign for positive changes", () => {
+      expect(formatChangePercent(25.5)).toBe("+25.5%");
+      expect(formatChangePercent(100)).toBe("+100.0%");
+    });
+
+    it("should show negative sign for negative changes", () => {
+      expect(formatChangePercent(-15.3)).toBe("-15.3%");
+    });
+
+    it("should show +0.0% for zero", () => {
+      expect(formatChangePercent(0)).toBe("+0.0%");
     });
   });
 });

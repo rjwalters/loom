@@ -11,8 +11,8 @@ use std::path::PathBuf;
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, BudgetConfig, BudgetPeriod,
     BudgetStatus, CostByIssue, CostByPr, CostByRole, CostSummary, InputContext, InputType,
-    ProductivitySummary, PromptChanges, PromptGitHubEvent, QualityMetrics, RunwayProjection,
-    TokenUsage,
+    PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent, PromptSuccessStats,
+    QualityMetrics, RunwayProjection, TokenUsage,
 };
 use super::schema::init_schema;
 use super::test_parser;
@@ -628,9 +628,9 @@ impl ActivityDb {
             INSERT INTO quality_metrics (
                 input_id, timestamp, tests_passed, tests_failed, tests_skipped,
                 test_runner, lint_errors, format_errors, build_success,
-                pr_approved, pr_changes_requested, human_rating
+                pr_approved, pr_changes_requested, rework_count, human_rating
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ",
             params![
                 metrics.input_id,
@@ -644,6 +644,7 @@ impl ActivityDb {
                 metrics.build_success,
                 metrics.pr_approved,
                 metrics.pr_changes_requested,
+                metrics.rework_count,
                 metrics.human_rating,
             ],
         )?;
@@ -679,6 +680,7 @@ impl ActivityDb {
             build_success: build_status,
             pr_approved: None,
             pr_changes_requested: None,
+            rework_count: None, // Rework count is updated separately via increment_rework_count
             human_rating: None,
         };
 
@@ -692,7 +694,7 @@ impl ActivityDb {
             r"
             SELECT id, input_id, timestamp, tests_passed, tests_failed, tests_skipped,
                    test_runner, lint_errors, format_errors, build_success,
-                   pr_approved, pr_changes_requested, human_rating
+                   pr_approved, pr_changes_requested, rework_count, human_rating
             FROM quality_metrics
             WHERE input_id = ?1
             ",
@@ -716,7 +718,8 @@ impl ActivityDb {
                     build_success: row.get(9)?,
                     pr_approved: row.get(10)?,
                     pr_changes_requested: row.get(11)?,
-                    human_rating: row.get(12)?,
+                    rework_count: row.get(12)?,
+                    human_rating: row.get(13)?,
                 })
             },
         );
@@ -770,6 +773,93 @@ impl ActivityDb {
         )?;
 
         Ok(())
+    }
+
+    /// Increment the rework count for a quality metrics record
+    ///
+    /// Called when a PR receives `changes_requested` feedback, indicating
+    /// another review cycle is needed.
+    #[allow(dead_code)]
+    pub fn increment_rework_count(&self, input_id: i64) -> Result<i32> {
+        self.conn.execute(
+            r"
+            UPDATE quality_metrics
+            SET rework_count = COALESCE(rework_count, 0) + 1
+            WHERE input_id = ?1
+            ",
+            params![input_id],
+        )?;
+
+        // Return the new rework count
+        let count: i32 = self.conn.query_row(
+            "SELECT COALESCE(rework_count, 0) FROM quality_metrics WHERE input_id = ?1",
+            params![input_id],
+            |row| row.get(0),
+        )?;
+
+        Ok(count)
+    }
+
+    /// Get PR rework statistics
+    ///
+    /// Returns summary statistics for PR review cycles:
+    /// - Average rework count per PR
+    /// - Max rework count
+    /// - Total PRs with rework (count > 0)
+    /// - Total PRs tracked
+    #[allow(dead_code)]
+    pub fn get_pr_rework_stats(&self) -> Result<PrReworkStats> {
+        let result = self.conn.query_row(
+            r"
+            SELECT
+                COALESCE(AVG(CASE WHEN rework_count > 0 THEN rework_count END), 0) as avg_rework,
+                COALESCE(MAX(rework_count), 0) as max_rework,
+                SUM(CASE WHEN rework_count > 0 THEN 1 ELSE 0 END) as prs_with_rework,
+                COUNT(*) as total_prs
+            FROM quality_metrics
+            WHERE pr_approved IS NOT NULL OR pr_changes_requested IS NOT NULL
+            ",
+            [],
+            |row| {
+                Ok(PrReworkStats {
+                    avg_rework_count: row.get(0)?,
+                    max_rework_count: row.get(1)?,
+                    prs_with_rework: row.get(2)?,
+                    total_prs_tracked: row.get(3)?,
+                })
+            },
+        )?;
+
+        Ok(result)
+    }
+
+    /// Get quality metrics correlation: prompts that led to passing tests
+    ///
+    /// Returns the count and average test pass rate for prompts with quality metrics.
+    #[allow(dead_code)]
+    pub fn get_prompt_success_correlation(&self) -> Result<PromptSuccessStats> {
+        let result = self.conn.query_row(
+            r"
+            SELECT
+                COUNT(*) as total_prompts,
+                SUM(CASE WHEN tests_failed = 0 AND tests_passed > 0 THEN 1 ELSE 0 END) as passing_prompts,
+                AVG(CASE WHEN tests_passed + tests_failed > 0
+                    THEN CAST(tests_passed AS REAL) / (tests_passed + tests_failed)
+                    ELSE NULL END) as avg_pass_rate
+            FROM quality_metrics
+            WHERE tests_passed IS NOT NULL OR tests_failed IS NOT NULL
+            ",
+            [],
+            |row| {
+                Ok(PromptSuccessStats {
+                    total_prompts_with_tests: row.get(0)?,
+                    prompts_with_all_passing: row.get(1)?,
+                    avg_test_pass_rate: row.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                })
+            },
+        )?;
+
+        Ok(result)
     }
 
     /// Record resource usage parsed from terminal output
@@ -827,7 +917,10 @@ impl ActivityDb {
 
     /// Get resource usage records for a specific input
     #[allow(dead_code)]
-    pub fn get_resource_usage(&self, input_id: i64) -> Result<Vec<super::resource_usage::ResourceUsage>> {
+    pub fn get_resource_usage(
+        &self,
+        input_id: i64,
+    ) -> Result<Vec<super::resource_usage::ResourceUsage>> {
         let mut stmt = self.conn.prepare(
             r"
             SELECT id, input_id, timestamp, model, tokens_input, tokens_output,
@@ -1365,6 +1458,42 @@ fn get_period_bounds(period: BudgetPeriod) -> (DateTime<Utc>, DateTime<Utc>) {
             };
             (month_start, next_month)
         }
+    }
+}
+
+// Implement StatsQueries trait for ActivityDb
+use super::stats::{
+    self, AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary,
+    WeeklyVelocity,
+};
+use chrono::NaiveDate;
+
+impl StatsQueries for ActivityDb {
+    fn get_agent_effectiveness(
+        &self,
+        role: Option<&str>,
+    ) -> rusqlite::Result<Vec<AgentEffectiveness>> {
+        stats::query_agent_effectiveness(&self.conn, role)
+    }
+
+    fn get_cost_per_issue(&self, issue_number: Option<i32>) -> rusqlite::Result<Vec<CostPerIssue>> {
+        stats::query_cost_per_issue(&self.conn, issue_number)
+    }
+
+    fn get_daily_velocity(
+        &self,
+        start_date: Option<NaiveDate>,
+        end_date: Option<NaiveDate>,
+    ) -> rusqlite::Result<Vec<DailyVelocity>> {
+        stats::query_daily_velocity(&self.conn, start_date, end_date)
+    }
+
+    fn get_weekly_velocity(&self) -> rusqlite::Result<Vec<WeeklyVelocity>> {
+        stats::query_weekly_velocity(&self.conn)
+    }
+
+    fn get_stats_summary(&self) -> rusqlite::Result<StatsSummary> {
+        stats::query_stats_summary(&self.conn)
     }
 }
 
@@ -2082,6 +2211,7 @@ mod tests {
             build_success: Some(true),
             pr_approved: None,
             pr_changes_requested: None,
+            rework_count: None,
             human_rating: None,
         };
 
@@ -2203,6 +2333,7 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
                 build_success: None,
                 pr_approved: None,
                 pr_changes_requested: None,
+                rework_count: None,
                 human_rating: None,
             };
             db.record_quality_metrics(&metrics)?;
@@ -2253,6 +2384,7 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
             build_success: Some(true),
             pr_approved: None,
             pr_changes_requested: None,
+            rework_count: None,
             human_rating: None,
         };
         db.record_quality_metrics(&metrics)?;
@@ -2276,6 +2408,181 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
             assert_eq!(m.pr_approved, Some(false));
             assert_eq!(m.pr_changes_requested, Some(true));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_increment_rework_count() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record an input and quality metrics
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "gh pr create".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        let metrics = QualityMetrics {
+            id: None,
+            input_id: Some(input_id),
+            timestamp: Utc::now(),
+            tests_passed: Some(10),
+            tests_failed: Some(0),
+            tests_skipped: Some(0),
+            test_runner: Some("cargo".to_string()),
+            lint_errors: None,
+            format_errors: None,
+            build_success: Some(true),
+            pr_approved: None,
+            pr_changes_requested: Some(true),
+            rework_count: Some(0),
+            human_rating: None,
+        };
+        db.record_quality_metrics(&metrics)?;
+
+        // Increment rework count
+        let count1 = db.increment_rework_count(input_id)?;
+        assert_eq!(count1, 1);
+
+        // Increment again
+        let count2 = db.increment_rework_count(input_id)?;
+        assert_eq!(count2, 2);
+
+        // Verify via get_quality_metrics
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.rework_count, Some(2));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_pr_rework_stats() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Create several PRs with varying rework counts
+        for i in 0..3 {
+            let input = AgentInput {
+                id: None,
+                terminal_id: "terminal-1".to_string(),
+                timestamp: Utc::now(),
+                input_type: InputType::Manual,
+                content: format!("gh pr create {i}"),
+                agent_role: Some("builder".to_string()),
+                context: InputContext::default(),
+            };
+            let input_id = db.record_input(&input)?;
+
+            let metrics = QualityMetrics {
+                id: None,
+                input_id: Some(input_id),
+                timestamp: Utc::now(),
+                tests_passed: Some(10),
+                tests_failed: Some(0),
+                tests_skipped: Some(0),
+                test_runner: Some("cargo".to_string()),
+                lint_errors: None,
+                format_errors: None,
+                build_success: Some(true),
+                pr_approved: Some(true),
+                pr_changes_requested: Some(false),
+                rework_count: Some(i), // 0, 1, 2 rework cycles
+                human_rating: None,
+            };
+            db.record_quality_metrics(&metrics)?;
+        }
+
+        let stats = db.get_pr_rework_stats()?;
+        assert_eq!(stats.total_prs_tracked, 3);
+        assert_eq!(stats.prs_with_rework, 2); // Only PRs with rework > 0
+        assert_eq!(stats.max_rework_count, 2);
+        // Average of 1 and 2 = 1.5
+        assert!((stats.avg_rework_count - 1.5).abs() < 0.01);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_prompt_success_correlation() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Create prompts with varying test results
+        // Prompt 1: All passing (10 passed, 0 failed)
+        let input1 = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "cargo test".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input1_id = db.record_input(&input1)?;
+
+        let metrics1 = QualityMetrics {
+            id: None,
+            input_id: Some(input1_id),
+            timestamp: Utc::now(),
+            tests_passed: Some(10),
+            tests_failed: Some(0),
+            tests_skipped: Some(0),
+            test_runner: Some("cargo".to_string()),
+            lint_errors: None,
+            format_errors: None,
+            build_success: Some(true),
+            pr_approved: None,
+            pr_changes_requested: None,
+            rework_count: None,
+            human_rating: None,
+        };
+        db.record_quality_metrics(&metrics1)?;
+
+        // Prompt 2: Some failing (8 passed, 2 failed) -> 80% pass rate
+        let input2 = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "cargo test".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input2_id = db.record_input(&input2)?;
+
+        let metrics2 = QualityMetrics {
+            id: None,
+            input_id: Some(input2_id),
+            timestamp: Utc::now(),
+            tests_passed: Some(8),
+            tests_failed: Some(2),
+            tests_skipped: Some(0),
+            test_runner: Some("cargo".to_string()),
+            lint_errors: None,
+            format_errors: None,
+            build_success: Some(true),
+            pr_approved: None,
+            pr_changes_requested: None,
+            rework_count: None,
+            human_rating: None,
+        };
+        db.record_quality_metrics(&metrics2)?;
+
+        let stats = db.get_prompt_success_correlation()?;
+        assert_eq!(stats.total_prompts_with_tests, 2);
+        assert_eq!(stats.prompts_with_all_passing, 1);
+        // Average pass rate: (1.0 + 0.8) / 2 = 0.9
+        assert!((stats.avg_test_pass_rate - 0.9).abs() < 0.01);
 
         Ok(())
     }
