@@ -1,0 +1,17 @@
+{
+  "version": "2",
+  "nextAgentNumber": 2,
+  "terminals": [
+    {
+      "id": "terminal-1",
+      "name": "Test Terminal",
+      "role": "default",
+      "roleConfig": {
+        "workerType": "shell",
+        "roleFile": "default.md",
+        "targetInterval": 0,
+        "intervalPrompt": ""
+      }
+    }
+  ]
+}
