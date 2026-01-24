@@ -23,11 +23,21 @@ interface Project {
   updated_at: string;
 }
 
+interface Session {
+  id: string;
+  user_id: string;
+  expires_at: string;
+}
+
+// Session configuration
+const SESSION_COOKIE_NAME = "loom-session";
+const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
 // Simple response helpers
-function json(data: unknown, status = 200) {
+function json(data: unknown, status = 200, headers: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...headers },
   });
 }
 
@@ -35,9 +45,257 @@ function error(message: string, status = 400) {
   return json({ error: message }, status);
 }
 
-// Extract user ID from X-User-Id header (demo auth - in production use proper session/JWT)
-function getUserId(request: Request): string | null {
-  return request.headers.get("X-User-Id");
+// Cookie helpers
+function setSessionCookie(sessionId: string, maxAge: number): string {
+  return `${SESSION_COOKIE_NAME}=${sessionId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${maxAge}`;
+}
+
+function clearSessionCookie(): string {
+  return `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
+}
+
+function getSessionIdFromCookie(request: Request): string | null {
+  const cookieHeader = request.headers.get("Cookie") || "";
+  const cookies = Object.fromEntries(
+    cookieHeader.split(";").map((c) => {
+      const [key, ...val] = c.trim().split("=");
+      return [key, val.join("=")];
+    })
+  );
+  return cookies[SESSION_COOKIE_NAME] || null;
+}
+
+// Password hashing using PBKDF2 (edge-compatible, more secure than plain SHA-256)
+async function hashPassword(password: string, salt?: string): Promise<{ hash: string; salt: string }> {
+  const encoder = new TextEncoder();
+  const passwordSalt = salt || btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: encoder.encode(passwordSalt),
+      iterations: 100000,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    256
+  );
+
+  const hash = btoa(String.fromCharCode(...new Uint8Array(derivedBits)));
+  return { hash: `${passwordSalt}:${hash}`, salt: passwordSalt };
+}
+
+async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+  const [salt, expectedHash] = storedHash.split(":");
+  if (!salt || !expectedHash) return false;
+
+  const { hash } = await hashPassword(password, salt);
+  const [, computedHash] = hash.split(":");
+
+  // Constant-time comparison to prevent timing attacks
+  if (computedHash.length !== expectedHash.length) return false;
+  let result = 0;
+  for (let i = 0; i < computedHash.length; i++) {
+    result |= computedHash.charCodeAt(i) ^ expectedHash.charCodeAt(i);
+  }
+  return result === 0;
+}
+
+// Session management
+async function createSession(env: Env, userId: string): Promise<string> {
+  const sessionId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
+
+  await env.DB.prepare(
+    "INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)"
+  )
+    .bind(sessionId, userId, expiresAt)
+    .run();
+
+  return sessionId;
+}
+
+async function getSessionUser(env: Env, sessionId: string): Promise<User | null> {
+  const result = await env.DB.prepare(`
+    SELECT u.id, u.email, u.name, u.created_at
+    FROM sessions s
+    JOIN users u ON s.user_id = u.id
+    WHERE s.id = ? AND s.expires_at > datetime('now')
+  `)
+    .bind(sessionId)
+    .first<User>();
+
+  return result || null;
+}
+
+async function deleteSession(env: Env, sessionId: string): Promise<void> {
+  await env.DB.prepare("DELETE FROM sessions WHERE id = ?")
+    .bind(sessionId)
+    .run();
+}
+
+async function refreshSession(env: Env, sessionId: string): Promise<void> {
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
+  await env.DB.prepare("UPDATE sessions SET expires_at = ? WHERE id = ?")
+    .bind(expiresAt, sessionId)
+    .run();
+}
+
+// Clean up expired sessions (call periodically)
+async function cleanupExpiredSessions(env: Env): Promise<void> {
+  await env.DB.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run();
+}
+
+// Get authenticated user from session cookie
+async function getAuthenticatedUser(env: Env, request: Request): Promise<User | null> {
+  const sessionId = getSessionIdFromCookie(request);
+  if (!sessionId) return null;
+  return getSessionUser(env, sessionId);
+}
+
+// Auth handlers
+async function handleLogin(env: Env, request: Request): Promise<Response> {
+  const body = await request.json() as { email?: string; password?: string };
+  const { email, password } = body;
+
+  if (!email || !password) {
+    return error("Email and password are required");
+  }
+
+  const user = await env.DB.prepare(
+    "SELECT id, email, name, password_hash, created_at FROM users WHERE email = ?"
+  )
+    .bind(email)
+    .first<User & { password_hash: string }>();
+
+  if (!user) {
+    return error("Invalid email or password", 401);
+  }
+
+  const validPassword = await verifyPassword(password, user.password_hash);
+  if (!validPassword) {
+    return error("Invalid email or password", 401);
+  }
+
+  const sessionId = await createSession(env, user.id);
+  const maxAge = Math.floor(SESSION_DURATION_MS / 1000);
+
+  return json(
+    { user: { id: user.id, email: user.email, name: user.name } },
+    200,
+    { "Set-Cookie": setSessionCookie(sessionId, maxAge) }
+  );
+}
+
+async function handleLogout(env: Env, request: Request): Promise<Response> {
+  const sessionId = getSessionIdFromCookie(request);
+
+  if (sessionId) {
+    await deleteSession(env, sessionId);
+  }
+
+  return json(
+    { success: true },
+    200,
+    { "Set-Cookie": clearSessionCookie() }
+  );
+}
+
+async function handleRegister(env: Env, request: Request): Promise<Response> {
+  const body = await request.json() as { email?: string; name?: string; password?: string };
+  const { email, name, password } = body;
+
+  if (!email || !name || !password) {
+    return error("Email, name, and password are required");
+  }
+
+  if (password.length < 8) {
+    return error("Password must be at least 8 characters");
+  }
+
+  const id = crypto.randomUUID();
+  const { hash: passwordHash } = await hashPassword(password);
+
+  try {
+    await env.DB.prepare(
+      "INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)"
+    )
+      .bind(id, email, name, passwordHash)
+      .run();
+
+    // Auto-login after registration
+    const sessionId = await createSession(env, id);
+    const maxAge = Math.floor(SESSION_DURATION_MS / 1000);
+
+    return json(
+      { user: { id, email, name } },
+      201,
+      { "Set-Cookie": setSessionCookie(sessionId, maxAge) }
+    );
+  } catch (e) {
+    if ((e as Error).message.includes("UNIQUE constraint failed")) {
+      return error("Email already exists", 409);
+    }
+    throw e;
+  }
+}
+
+async function handleGetMe(env: Env, request: Request): Promise<Response> {
+  const sessionId = getSessionIdFromCookie(request);
+
+  if (!sessionId) {
+    return error("Not authenticated", 401);
+  }
+
+  const user = await getSessionUser(env, sessionId);
+
+  if (!user) {
+    return json(
+      { error: "Session expired" },
+      401,
+      { "Set-Cookie": clearSessionCookie() }
+    );
+  }
+
+  // Refresh session on activity
+  await refreshSession(env, sessionId);
+
+  return json({ user });
+}
+
+async function handleRefreshSession(env: Env, request: Request): Promise<Response> {
+  const sessionId = getSessionIdFromCookie(request);
+
+  if (!sessionId) {
+    return error("Not authenticated", 401);
+  }
+
+  const user = await getSessionUser(env, sessionId);
+
+  if (!user) {
+    return json(
+      { error: "Session expired" },
+      401,
+      { "Set-Cookie": clearSessionCookie() }
+    );
+  }
+
+  await refreshSession(env, sessionId);
+  const maxAge = Math.floor(SESSION_DURATION_MS / 1000);
+
+  return json(
+    { user, expiresAt: new Date(Date.now() + SESSION_DURATION_MS).toISOString() },
+    200,
+    { "Set-Cookie": setSessionCookie(sessionId, maxAge) }
+  );
 }
 
 // Route handlers
@@ -68,8 +326,7 @@ async function handleCreateUser(env: Env, request: Request): Promise<Response> {
   }
 
   const id = crypto.randomUUID();
-  // In production, use proper password hashing (e.g., bcrypt via a Worker)
-  const passwordHash = await hashPassword(password);
+  const { hash: passwordHash } = await hashPassword(password);
 
   try {
     await env.DB.prepare("INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)")
@@ -89,6 +346,8 @@ async function handleHealthCheck(env: Env): Promise<Response> {
   // Quick DB health check
   try {
     await env.DB.prepare("SELECT 1").first();
+    // Opportunistically clean up expired sessions
+    await cleanupExpiredSessions(env);
     return json({
       status: "healthy",
       app: env.APP_NAME,
@@ -226,14 +485,6 @@ async function handleDeleteProject(env: Env, id: string, userId: string): Promis
   return json({ success: true });
 }
 
-// Simple password hashing (for demo - use bcrypt in production)
-async function hashPassword(password: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(`${password}loom-quickstart-salt`);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return btoa(String.fromCharCode(...new Uint8Array(hash)));
-}
-
 // Main request handler
 export const onRequest: PagesFunction<Env> = async (context) => {
   const { request, env, params } = context;
@@ -247,6 +498,27 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     // Health check
     if (path === "/api/health" && method === "GET") {
       return handleHealthCheck(env);
+    }
+
+    // Auth endpoints
+    if (path === "/api/auth/login" && method === "POST") {
+      return handleLogin(env, request);
+    }
+
+    if (path === "/api/auth/logout" && method === "POST") {
+      return handleLogout(env, request);
+    }
+
+    if (path === "/api/auth/register" && method === "POST") {
+      return handleRegister(env, request);
+    }
+
+    if (path === "/api/auth/me" && method === "GET") {
+      return handleGetMe(env, request);
+    }
+
+    if (path === "/api/auth/refresh" && method === "POST") {
+      return handleRefreshSession(env, request);
     }
 
     // Users endpoints
@@ -263,33 +535,33 @@ export const onRequest: PagesFunction<Env> = async (context) => {
       return handleGetUser(env, userMatch[1]);
     }
 
-    // Projects endpoints (require authentication)
+    // Projects endpoints (require authentication via session cookie)
     if (path === "/api/projects" && method === "GET") {
-      const userId = getUserId(request);
-      if (!userId) return error("Unauthorized", 401);
-      return handleGetProjects(env, userId);
+      const user = await getAuthenticatedUser(env, request);
+      if (!user) return error("Unauthorized", 401);
+      return handleGetProjects(env, user.id);
     }
 
     if (path === "/api/projects" && method === "POST") {
-      const userId = getUserId(request);
-      if (!userId) return error("Unauthorized", 401);
-      return handleCreateProject(env, request, userId);
+      const user = await getAuthenticatedUser(env, request);
+      if (!user) return error("Unauthorized", 401);
+      return handleCreateProject(env, request, user.id);
     }
 
     const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
     if (projectMatch) {
-      const userId = getUserId(request);
-      if (!userId) return error("Unauthorized", 401);
+      const user = await getAuthenticatedUser(env, request);
+      if (!user) return error("Unauthorized", 401);
       const projectId = projectMatch[1];
 
       if (method === "GET") {
-        return handleGetProject(env, projectId, userId);
+        return handleGetProject(env, projectId, user.id);
       }
       if (method === "PUT") {
-        return handleUpdateProject(env, request, projectId, userId);
+        return handleUpdateProject(env, request, projectId, user.id);
       }
       if (method === "DELETE") {
-        return handleDeleteProject(env, projectId, userId);
+        return handleDeleteProject(env, projectId, user.id);
       }
     }
 

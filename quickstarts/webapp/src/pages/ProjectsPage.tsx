@@ -17,7 +17,7 @@ export function ProjectsPage() {
 
     try {
       const response = await fetch("/api/projects", {
-        headers: { "X-User-Id": user.id },
+        credentials: "include",
       });
       if (!response.ok) throw new Error("Failed to fetch projects");
       const data = await response.json();
@@ -38,7 +38,8 @@ export function ProjectsPage() {
 
     const response = await fetch("/api/projects", {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-User-Id": user.id },
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
       body: JSON.stringify(data),
     });
 
@@ -57,7 +58,7 @@ export function ProjectsPage() {
 
     const response = await fetch(`/api/projects/${id}`, {
       method: "DELETE",
-      headers: { "X-User-Id": user.id },
+      credentials: "include",
     });
     if (!response.ok) throw new Error("Failed to delete project");
     setProjects((prev) => prev.filter((p) => p.id !== id));
@@ -68,7 +69,8 @@ export function ProjectsPage() {
 
     const response = await fetch(`/api/projects/${id}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", "X-User-Id": user.id },
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
       body: JSON.stringify({ status }),
     });
 

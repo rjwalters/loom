@@ -21,7 +21,7 @@ export function ProjectDetailPage() {
 
     try {
       const response = await fetch(`/api/projects/${id}`, {
-        headers: { "X-User-Id": user.id },
+        credentials: "include",
       });
       if (response.status === 404) {
         setError("Project not found");
@@ -46,7 +46,8 @@ export function ProjectDetailPage() {
 
     const response = await fetch(`/api/projects/${id}`, {
       method: "PUT",
-      headers: { "Content-Type": "application/json", "X-User-Id": user.id },
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
       body: JSON.stringify(data),
     });
 
@@ -65,7 +66,7 @@ export function ProjectDetailPage() {
 
     const response = await fetch(`/api/projects/${id}`, {
       method: "DELETE",
-      headers: { "X-User-Id": user.id },
+      credentials: "include",
     });
     if (!response.ok) throw new Error("Failed to delete project");
     navigate("/projects");
