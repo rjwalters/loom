@@ -37,28 +37,48 @@ You orchestrate the issue lifecycle by:
 |------|-------------|
 | `--to <phase>` | Stop after specified phase (curated, pr, approved) |
 | `--resume` | Resume from last checkpoint in issue comments |
-| `--force` | Bypass approval gates - auto-approve and auto-merge |
+| `--force-pr` | Auto-approve issue, run through Judge, stop at `loom:pr` state |
+| `--force-merge` | Auto-approve, resolve merge conflicts, auto-merge after Judge approval |
 
-### --force Mode
+### --force-pr Mode
 
-When `--force` is specified:
+When `--force-pr` is specified:
+1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
+2. **Gate 2 (Merge)**: Stop at `loom:pr` state, wait for human to merge
+
+```bash
+# Force-pr mode flow - stops at reviewed PR
+/loom 123 --force-pr
+
+Curator → [auto-approve] → Builder → Judge → [STOP at loom:pr]
+```
+
+**Use cases for --force-pr**:
+- Automated development with human merge approval
+- Testing the build/review pipeline
+- When you trust automation but want final merge control
+
+### --force-merge Mode
+
+When `--force-merge` is specified:
 1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
 2. **Judge Phase**: Skip entirely (GitHub doesn't allow self-approval)
 3. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash --admin`
+4. **Conflict Resolution**: If merge conflicts exist, attempt automatic resolution
 
 ```bash
-# Force mode flow - no waiting at gates, no Judge
-/loom 123 --force
+# Force-merge mode flow - fully automated, no Judge
+/loom 123 --force-merge
 
-Curator → [auto-approve] → Builder → [skip Judge] → [auto-merge] → Complete
+Curator → [auto-approve] → Builder → [skip Judge] → [resolve conflicts] → [auto-merge] → Complete
 ```
 
-**Use cases for --force**:
+**Use cases for --force-merge**:
 - Dogfooding/testing the orchestration system
 - Trusted issues where you've already decided to implement
-- Automated pipelines where human gates aren't needed
+- Fully automated pipelines where human gates aren't needed
 
-**Why skip Judge in force mode?**
+**Why skip Judge in force-merge mode?**
 
 GitHub does not allow users to approve their own pull requests. When the orchestrator creates the PR (via Builder) and then tries to review it (via Judge), this results in:
 
@@ -66,9 +86,9 @@ GitHub does not allow users to approve their own pull requests. When the orchest
 failed to create review: GraphQL: Review Can not approve your own pull request
 ```
 
-Since force mode is intended for hands-off automation where you've already decided to implement, skipping the Judge phase and using `--admin` for merge is the appropriate behavior.
+Since force-merge mode is intended for hands-off automation where you've already decided to implement, skipping the Judge phase and using `--admin` for merge is the appropriate behavior.
 
-**Warning**: Force mode merges PRs without code review. Use only when you trust the implementation or are testing the orchestration system.
+**Warning**: Force-merge mode merges PRs without code review. Use only when you trust the implementation or are testing the orchestration system.
 
 ## Phase Flow
 
@@ -79,13 +99,13 @@ When orchestrating issue #N, follow this progression:
 
 1. [Check State]  → Read issue labels, determine current phase
 2. [Curator]      → trigger_run_now(curator) → wait for loom:curated
-3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force)
+3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
 4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
 5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
-                    (SKIP if --force: GitHub doesn't allow self-approval)
+                    (SKIP if --force-merge: GitHub doesn't allow self-approval)
 6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
-                    (SKIP if --force: no Judge means no changes requested)
-7. [Gate 2]       → Wait for merge (or auto-merge with --admin if --force)
+                    (SKIP if --force-merge: no Judge means no changes requested)
+7. [Gate 2]       → Wait for merge (--force-pr stops here, --force-merge auto-merges with --admin)
 8. [Complete]     → Report success
 ```
 
@@ -306,11 +326,11 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate1" ]; then
-  # Check if --force mode - auto-approve
-  if [ "$FORCE_MODE" = "true" ]; then
+  # Check if --force-pr or --force-merge mode - auto-approve
+  if [ "$FORCE_PR" = "true" ] || [ "$FORCE_MERGE" = "true" ]; then
     echo "Force mode: auto-approving issue"
     gh issue edit $ISSUE_NUMBER --add-label "loom:issue"
-    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-approved** via \`/loom --force\`"
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-approved** via \`/loom --force-pr\` or \`--force-merge\`"
   else
     # Wait for human or Champion to promote to loom:issue
     TIMEOUT=1800  # 30 minutes
@@ -368,12 +388,12 @@ fi
 
 ```bash
 if [ "$PHASE" = "judge" ]; then
-  # In force mode, skip Judge entirely - GitHub doesn't allow self-approval
+  # In force-merge mode, skip Judge entirely - GitHub doesn't allow self-approval
   # The orchestrator (or same agent) created the PR, so it cannot approve it
-  if [ "$FORCE_MODE" = "true" ]; then
-    echo "Force mode: skipping Judge phase (self-approval not allowed by GitHub)"
+  if [ "$FORCE_MERGE" = "true" ]; then
+    echo "Force-merge mode: skipping Judge phase (self-approval not allowed by GitHub)"
     gh pr edit $PR_NUMBER --add-label "loom:pr"
-    gh pr comment $PR_NUMBER --body "⚡ **Judge phase skipped** - force mode bypasses review (self-approval limitation)"
+    gh pr comment $PR_NUMBER --body "⚡ **Judge phase skipped** - force-merge mode bypasses review (self-approval limitation)"
     PHASE="gate2"
   else
     JUDGE_TERMINAL="terminal-1"
@@ -459,13 +479,35 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate2" ]; then
-  # Check if --force mode - auto-merge with --admin to bypass approval requirements
-  if [ "$FORCE_MODE" = "true" ]; then
-    echo "Force mode: auto-merging PR with admin privileges"
+  # Check if --force-pr mode - stop here, don't merge
+  if [ "$FORCE_PR" = "true" ]; then
+    echo "Force-pr mode: stopping at loom:pr state"
+    gh issue comment $ISSUE_NUMBER --body "✅ **PR approved** - stopping at \`loom:pr\` per \`--force-pr\`. Ready for human merge."
+    exit 0
+  fi
+
+  # Check if --force-merge mode - auto-merge with --admin to bypass approval requirements
+  # We use --admin because we skipped the Judge phase (self-approval not allowed by GitHub)
+  if [ "$FORCE_MERGE" = "true" ]; then
+    echo "Force-merge mode: auto-merging PR with admin privileges"
+
+    # Check for merge conflicts and attempt resolution
     # Use --admin to bypass branch protection since we skipped the Judge phase
-    # This is safe because force mode is explicitly opted into
-    gh pr merge $PR_NUMBER --squash --delete-branch --admin
-    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force\` (admin merge, review skipped)"
+    if ! gh pr merge $PR_NUMBER --squash --delete-branch --admin 2>/dev/null; then
+      echo "Merge failed, attempting conflict resolution..."
+      git fetch origin main
+      git checkout $BRANCH_NAME
+      git merge origin/main --no-edit || {
+        # Auto-resolve conflicts if possible
+        git checkout --theirs .
+        git add -A
+        git commit -m "Resolve merge conflicts (auto-resolved)"
+      }
+      git push origin $BRANCH_NAME
+      gh pr merge $PR_NUMBER --squash --delete-branch --admin
+    fi
+
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force-merge\` (admin merge, review skipped)"
   else
     # Trigger Champion or wait for human merge
     CHAMPION_TERMINAL="terminal-5"  # if exists

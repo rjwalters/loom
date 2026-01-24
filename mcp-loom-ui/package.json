@@ -11,7 +11,7 @@
     "watch": "tsc --watch"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.20.0",
+    "@modelcontextprotocol/sdk": "^1.25.3",
     "fast-glob": "^3.3.2",
     "ignore": "^6.0.2"
   },

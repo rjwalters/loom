@@ -14,48 +14,65 @@ interface AuthContextValue {
   register: (email: string, password: string, name: string) => Promise<void>;
 }
 
+interface ApiError {
+  error: string;
+}
+
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
-const STORAGE_KEY = "loom-quickstart-auth";
+async function fetchWithCredentials(url: string, options: RequestInit = {}): Promise<Response> {
+  return fetch(url, {
+    ...options,
+    credentials: "include", // Include cookies for session management
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+}
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
+  // Check for existing session on mount
   useEffect(() => {
-    // Check for existing session
-    const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored) {
+    const checkSession = async () => {
       try {
-        setUser(JSON.parse(stored));
+        const response = await fetchWithCredentials("/api/auth/me");
+        if (response.ok) {
+          const data = await response.json();
+          setUser(data.user);
+        } else {
+          // Session expired or invalid - clear user state
+          setUser(null);
+        }
       } catch {
-        localStorage.removeItem(STORAGE_KEY);
+        // Network error or server unavailable
+        setUser(null);
+      } finally {
+        setIsLoading(false);
       }
-    }
-    setIsLoading(false);
+    };
+
+    checkSession();
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
-    // In a real app, this would call your authentication API
-    // For demo purposes, we'll simulate a successful login
     setIsLoading(true);
     try {
-      // Simulate API call
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      const response = await fetchWithCredentials("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ email, password }),
+      });
 
-      // Demo: accept any email/password with basic validation
-      if (!email || !password) {
-        throw new Error("Email and password are required");
+      if (!response.ok) {
+        const data: ApiError = await response.json();
+        throw new Error(data.error || "Login failed");
       }
 
-      const newUser: User = {
-        id: crypto.randomUUID(),
-        email,
-        name: email.split("@")[0],
-      };
-
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(newUser));
-      setUser(newUser);
+      const data = await response.json();
+      setUser(data.user);
     } finally {
       setIsLoading(false);
     }
@@ -64,9 +81,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = useCallback(async () => {
     setIsLoading(true);
     try {
-      // Simulate API call
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      localStorage.removeItem(STORAGE_KEY);
+      await fetchWithCredentials("/api/auth/logout", {
+        method: "POST",
+      });
       setUser(null);
     } finally {
       setIsLoading(false);
@@ -76,21 +93,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const register = useCallback(async (email: string, password: string, name: string) => {
     setIsLoading(true);
     try {
-      // Simulate API call
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      const response = await fetchWithCredentials("/api/auth/register", {
+        method: "POST",
+        body: JSON.stringify({ email, password, name }),
+      });
 
-      if (!email || !password || !name) {
-        throw new Error("All fields are required");
+      if (!response.ok) {
+        const data: ApiError = await response.json();
+        throw new Error(data.error || "Registration failed");
       }
 
-      const newUser: User = {
-        id: crypto.randomUUID(),
-        email,
-        name,
-      };
-
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(newUser));
-      setUser(newUser);
+      const data = await response.json();
+      setUser(data.user);
     } finally {
       setIsLoading(false);
     }
