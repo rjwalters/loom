@@ -7,16 +7,33 @@
 //!
 //! The initialization process:
 //! 1. Validates the target is a git repository
-//! 2. Copies `.loom/` configuration from `defaults/`
+//! 2. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
 //! 3. Sets up repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
 //! 4. Updates .gitignore with Loom ephemeral patterns
+//! 5. Reports which files were preserved vs added
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Local;
+
+/// Report of files affected during initialization
+///
+/// This struct tracks which files were added from defaults vs preserved
+/// from the existing installation, enabling users to identify custom files
+/// and deprecated files that may need cleanup.
+#[derive(Debug, Default)]
+pub struct InitReport {
+    /// Files that were added from defaults (didn't exist before)
+    pub added: Vec<String>,
+    /// Files that were preserved (existed before, not overwritten)
+    pub preserved: Vec<String>,
+    /// Files that were updated (existed before, overwritten in force mode)
+    pub updated: Vec<String>,
+}
 
 /// Loom installation metadata for template variable substitution
 #[derive(Default)]
@@ -124,93 +141,118 @@ fn substitute_template_variables(
 ///
 /// * `workspace_path` - Path to the workspace directory (must be a git repository)
 /// * `defaults_path` - Path to the defaults directory (usually "defaults" or bundled resource)
-/// * `force` - If true, overwrite existing `.loom` directory
+/// * `force` - If true, overwrite existing files (otherwise merge mode preserves custom files)
 ///
 /// # Returns
 ///
-/// * `Ok(())` - Workspace successfully initialized
+/// * `Ok(InitReport)` - Workspace successfully initialized with report of changes
 /// * `Err(String)` - Initialization failed with error message
+///
+/// # Behavior
+///
+/// - **Fresh install** (no .loom directory): Copies all files from defaults
+/// - **Reinstall with force=false** (merge mode): Adds new files, preserves existing files
+/// - **Reinstall with force=true**: Overwrites all files from defaults
+///
+/// Merge mode is recommended for reinstalls to preserve custom project roles/commands.
 ///
 /// # Errors
 ///
 /// This function will return an error if:
 /// - The workspace path doesn't exist or isn't a directory
 /// - The workspace isn't a git repository (no .git directory)
-/// - The `.loom` directory already exists (unless `force` is true)
 /// - File operations fail (insufficient permissions, disk full, etc.)
 pub fn initialize_workspace(
     workspace_path: &str,
     defaults_path: &str,
     force: bool,
-) -> Result<(), String> {
+) -> Result<InitReport, String> {
     let workspace = Path::new(workspace_path);
     let loom_path = workspace.join(".loom");
+    let mut report = InitReport::default();
 
     // Validate workspace is a git repository
     validate_git_repository(workspace_path)?;
 
-    // Check if .loom already exists
-    if loom_path.exists() && !force {
-        return Err(
-            "Workspace already initialized (.loom directory exists). Use --force to overwrite."
-                .to_string(),
-        );
-    }
+    // Resolve defaults path (development mode or bundled resource)
+    let defaults = resolve_defaults_path(defaults_path)?;
 
-    // Remove existing .loom if force mode
-    if loom_path.exists() && force {
+    // Determine if this is a fresh install or reinstall
+    let is_reinstall = loom_path.exists();
+
+    if is_reinstall && force {
+        // Force mode: remove existing .loom directory completely
         fs::remove_dir_all(&loom_path)
             .map_err(|e| format!("Failed to remove existing .loom directory: {e}"))?;
     }
 
-    // Resolve defaults path (development mode or bundled resource)
-    let defaults = resolve_defaults_path(defaults_path)?;
-
-    // Create .loom directory
+    // Create .loom directory if it doesn't exist
     fs::create_dir_all(&loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
-    // Copy only .loom-specific files from defaults
-    // (NOT entire defaults/ tree which would create duplicates)
-
-    // Copy config.json
+    // Copy config.json (always overwrite - this is Loom's config, not user data)
     let config_src = defaults.join("config.json");
     let config_dst = loom_path.join("config.json");
     if config_src.exists() {
+        let existed = config_dst.exists();
         fs::copy(&config_src, &config_dst)
             .map_err(|e| format!("Failed to copy config.json: {e}"))?;
+        if existed {
+            report.updated.push(".loom/config.json".to_string());
+        } else {
+            report.added.push(".loom/config.json".to_string());
+        }
     }
 
-    // Copy roles/ directory
+    // Copy roles/ directory with merge mode (preserve custom roles)
     let roles_src = defaults.join("roles");
     let roles_dst = loom_path.join("roles");
     if roles_src.exists() {
-        copy_dir_recursive(&roles_src, &roles_dst)
-            .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
+        if is_reinstall && !force {
+            // Merge mode: preserve existing custom roles
+            merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
+                .map_err(|e| format!("Failed to merge roles directory: {e}"))?;
+        } else {
+            // Fresh install or force mode: copy all
+            copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
+                .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
+        }
     }
 
-    // Copy scripts/ directory
+    // Copy scripts/ directory (always overwrite - these are Loom's scripts)
     let scripts_src = defaults.join("scripts");
     let scripts_dst = loom_path.join("scripts");
     if scripts_src.exists() {
-        copy_dir_recursive(&scripts_src, &scripts_dst)
-            .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
+        if is_reinstall && !force {
+            // Merge mode for scripts too - user might have custom scripts
+            merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
+                .map_err(|e| format!("Failed to merge scripts directory: {e}"))?;
+        } else {
+            copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
+                .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
+        }
     }
 
     // Copy .loom-specific README
     let loom_readme_src = defaults.join(".loom-README.md");
     let loom_readme_dst = loom_path.join("README.md");
     if loom_readme_src.exists() {
+        let existed = loom_readme_dst.exists();
         fs::copy(&loom_readme_src, &loom_readme_dst)
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
+        if existed {
+            report.updated.push(".loom/README.md".to_string());
+        } else {
+            report.added.push(".loom/README.md".to_string());
+        }
     }
 
     // Update .gitignore with Loom ephemeral patterns
     update_gitignore(workspace)?;
 
     // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
-    setup_repository_scaffolding(workspace, &defaults, force)?;
+    setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
 
-    Ok(())
+    Ok(report)
 }
 
 /// Validate that a path is a git repository
@@ -337,6 +379,7 @@ fn resolve_defaults_path(defaults_path: &str) -> Result<PathBuf, String> {
 /// Copy directory recursively
 ///
 /// Creates the destination directory and copies all files and subdirectories.
+#[cfg(test)]
 fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
 
@@ -360,6 +403,7 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 ///
 /// Copies files from src to dst, but only if they don't already exist in dst.
 /// This allows merging new files from defaults while preserving existing customizations.
+#[cfg(test)]
 fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
 
@@ -382,6 +426,97 @@ fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Copy directory recursively with reporting
+///
+/// Like copy_dir_recursive but tracks which files were added.
+fn copy_dir_with_report(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
+        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+
+        if file_type.is_dir() {
+            copy_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
+        } else {
+            let existed = dst_path.exists();
+            fs::copy(&src_path, &dst_path)?;
+            if existed {
+                report.updated.push(rel_path);
+            } else {
+                report.added.push(rel_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Merge directory recursively with reporting
+///
+/// Like merge_dir_recursive but tracks which files were added vs preserved.
+fn merge_dir_with_report(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+
+    // Collect files in source for comparison
+    let src_files: HashSet<_> = fs::read_dir(src)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect();
+
+    // Check for files in dst that aren't in src (custom files)
+    if dst.exists() {
+        for entry in fs::read_dir(dst)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if !src_files.contains(&file_name) {
+                let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+                // This is a custom file not in defaults - preserved
+                if entry.file_type()?.is_file() {
+                    report.preserved.push(rel_path);
+                }
+            }
+        }
+    }
+
+    // Process source files
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
+        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+
+        if file_type.is_dir() {
+            merge_dir_with_report(&src_path, &dst_path, &rel_path, report)?;
+        } else if dst_path.exists() {
+            // File exists - preserve it (don't overwrite)
+            report.preserved.push(rel_path);
+        } else {
+            // File doesn't exist - add it
+            fs::copy(&src_path, &dst_path)?;
+            report.added.push(rel_path);
+        }
+    }
+
+    Ok(())
+}
+
 /// Setup repository scaffolding files
 ///
 /// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
@@ -394,6 +529,7 @@ fn setup_repository_scaffolding(
     workspace_path: &Path,
     defaults_path: &Path,
     force: bool,
+    report: &mut InitReport,
 ) -> Result<(), String> {
     // Extract repository owner and name for template substitution
     let repo_info = extract_repo_info(workspace_path);
@@ -406,44 +542,56 @@ fn setup_repository_scaffolding(
     let loom_metadata = LoomMetadata::from_env();
 
     // Helper to copy file with template variable substitution
-    let copy_file_with_substitution = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
-        if src.exists() {
-            if force && dst.exists() {
-                fs::remove_file(dst)
-                    .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+    let copy_file_with_substitution =
+        |src: &Path, dst: &Path, name: &str, report: &mut InitReport| -> Result<(), String> {
+            if src.exists() {
+                let existed = dst.exists();
+                if force && existed {
+                    fs::remove_file(dst)
+                        .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+                }
+                if force || !existed {
+                    let content =
+                        fs::read_to_string(src).map_err(|e| format!("Failed to read {name}: {e}"))?;
+                    let substituted = substitute_template_variables(
+                        &content,
+                        repo_owner.as_deref(),
+                        repo_name.as_deref(),
+                        &loom_metadata,
+                    );
+                    fs::write(dst, substituted)
+                        .map_err(|e| format!("Failed to write {name}: {e}"))?;
+                    if existed {
+                        report.updated.push(name.to_string());
+                    } else {
+                        report.added.push(name.to_string());
+                    }
+                } else {
+                    report.preserved.push(name.to_string());
+                }
             }
-            if force || !dst.exists() {
-                let content =
-                    fs::read_to_string(src).map_err(|e| format!("Failed to read {name}: {e}"))?;
-                let substituted = substitute_template_variables(
-                    &content,
-                    repo_owner.as_deref(),
-                    repo_name.as_deref(),
-                    &loom_metadata,
-                );
-                fs::write(dst, substituted).map_err(|e| format!("Failed to write {name}: {e}"))?;
-            }
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
-    // Helper to copy directory with force logic
-    let copy_directory = |src: &Path, dst: &Path, name: &str| -> Result<(), String> {
-        if src.exists() {
-            if force && dst.exists() {
-                fs::remove_dir_all(dst)
-                    .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+    // Helper to copy directory with force logic and reporting
+    let copy_directory =
+        |src: &Path, dst: &Path, name: &str, report: &mut InitReport| -> Result<(), String> {
+            if src.exists() {
+                if force && dst.exists() {
+                    fs::remove_dir_all(dst)
+                        .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
+                }
+                if force || !dst.exists() {
+                    copy_dir_with_report(src, dst, name, report)
+                        .map_err(|e| format!("Failed to copy {name}: {e}"))?;
+                } else {
+                    // Merge mode: copy files that don't exist, preserve existing
+                    merge_dir_with_report(src, dst, name, report)
+                        .map_err(|e| format!("Failed to merge {name}: {e}"))?;
+                }
             }
-            if force || !dst.exists() {
-                copy_dir_recursive(src, dst).map_err(|e| format!("Failed to copy {name}: {e}"))?;
-            } else {
-                // Merge mode: copy files that don't exist
-                merge_dir_recursive(src, dst)
-                    .map_err(|e| format!("Failed to merge {name}: {e}"))?;
-            }
-        }
-        Ok(())
-    };
+            Ok(())
+        };
 
     // Copy target-repo-specific CLAUDE.md and AGENTS.md from defaults/.loom/
     // (NOT defaults/CLAUDE.md which is for Loom repo itself)
@@ -452,33 +600,38 @@ fn setup_repository_scaffolding(
         &defaults_path.join(".loom").join("CLAUDE.md"),
         &workspace_path.join("CLAUDE.md"),
         "CLAUDE.md",
+        report,
     )?;
 
     copy_file_with_substitution(
         &defaults_path.join(".loom").join("AGENTS.md"),
         &workspace_path.join("AGENTS.md"),
         "AGENTS.md",
+        report,
     )?;
 
-    // Copy .claude/ directory
+    // Copy .claude/ directory (merge mode preserves custom commands)
     copy_directory(
         &defaults_path.join(".claude"),
         &workspace_path.join(".claude"),
-        ".claude directory",
+        ".claude",
+        report,
     )?;
 
     // Copy .codex/ directory
     copy_directory(
         &defaults_path.join(".codex"),
         &workspace_path.join(".codex"),
-        ".codex directory",
+        ".codex",
+        report,
     )?;
 
     // Copy .github/ directory
     copy_directory(
         &defaults_path.join(".github"),
         &workspace_path.join(".github"),
-        ".github directory",
+        ".github",
+        report,
     )?;
 
     // Process workflow files with template variable substitution
@@ -759,7 +912,8 @@ mod tests {
             .unwrap();
 
         // Run setup with force=true
-        setup_repository_scaffolding(workspace, &defaults, true).unwrap();
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
 
         // Verify .claude was overwritten (custom commands removed)
         assert!(!workspace
@@ -818,7 +972,8 @@ mod tests {
         .unwrap();
 
         // Run setup with force=false (merge mode)
-        setup_repository_scaffolding(workspace, &defaults, false).unwrap();
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
         // Verify custom.md still exists (preserved)
         assert!(workspace
@@ -874,7 +1029,8 @@ mod tests {
         assert!(!workspace.join("package.json").exists());
 
         // Run setup
-        setup_repository_scaffolding(workspace, &defaults, false).unwrap();
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
         // Verify package.json was copied
         assert!(workspace.join("package.json").exists());
@@ -908,7 +1064,8 @@ mod tests {
         .unwrap();
 
         // Run setup with force=true (should STILL preserve package.json)
-        setup_repository_scaffolding(workspace, &defaults, true).unwrap();
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
 
         // Verify package.json was NOT overwritten
         let content = fs::read_to_string(workspace.join("package.json")).unwrap();
