@@ -292,6 +292,17 @@ fn main() {
             train_prediction_model,
             get_prediction_model_stats,
             record_prediction_outcome,
+            // Template generation commands
+            generate_templates_from_patterns,
+            get_templates,
+            get_template,
+            find_matching_template,
+            instantiate_template,
+            record_template_usage,
+            record_template_outcome,
+            retire_underperforming_templates,
+            reactivate_template,
+            get_template_stats,
         ])
         .run(tauri::generate_context!())
     {
