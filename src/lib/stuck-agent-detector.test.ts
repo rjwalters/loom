@@ -6,7 +6,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppState, setAppState } from "./state";
 import {
   DEFAULT_STUCK_THRESHOLDS,
+  detectProgress,
   getStuckAgentDetector,
+  hashChunk,
+  isSimilarChunk,
+  normalizeForHash,
+  type OutputChunk,
+  PROGRESS_PATTERNS,
   ROLE_DEFAULT_THRESHOLDS,
   StuckAgentDetector,
 } from "./stuck-agent-detector";
@@ -31,6 +37,13 @@ vi.mock("./terminal-state-parser", () => ({
       raw: "",
     })
   ),
+}));
+
+// Mock the interval prompt manager
+vi.mock("./interval-prompt-manager", () => ({
+  getIntervalPromptManager: vi.fn(() => ({
+    getStatus: vi.fn(() => null),
+  })),
 }));
 
 describe("StuckAgentDetector", () => {
@@ -481,6 +494,324 @@ describe("StuckAgentDetector", () => {
         }
       }
     });
+  });
+});
+
+describe("Phase 2a: Pattern Detection", () => {
+  describe("normalizeForHash", () => {
+    it("should remove ISO timestamps", () => {
+      const input = "Output at 2025-01-23T10:30:00Z was generated";
+      const normalized = normalizeForHash(input);
+      expect(normalized).not.toContain("2025-01-23T10:30:00Z");
+      expect(normalized).toContain("Output at");
+    });
+
+    it("should remove date formats", () => {
+      const input = "Created on 2025-01-23 successfully";
+      const normalized = normalizeForHash(input);
+      expect(normalized).not.toContain("2025-01-23");
+    });
+
+    it("should remove time formats", () => {
+      const input = "Started at 10:30:00 and ended at 11:45:30";
+      const normalized = normalizeForHash(input);
+      expect(normalized).not.toContain("10:30:00");
+      expect(normalized).not.toContain("11:45:30");
+    });
+
+    it("should normalize whitespace", () => {
+      const input = "Multiple   spaces\n\nand   newlines";
+      const normalized = normalizeForHash(input);
+      expect(normalized).toBe("Multiple spaces and newlines");
+    });
+  });
+
+  describe("hashChunk", () => {
+    it("should return consistent hash for same input", () => {
+      const input = "Hello, World!";
+      const hash1 = hashChunk(input);
+      const hash2 = hashChunk(input);
+      expect(hash1).toBe(hash2);
+    });
+
+    it("should return different hashes for different content", () => {
+      const hash1 = hashChunk("Hello, World!");
+      const hash2 = hashChunk("Goodbye, World!");
+      expect(hash1).not.toBe(hash2);
+    });
+
+    it("should normalize before hashing (timestamps don't affect hash)", () => {
+      const hash1 = hashChunk("Output at 2025-01-23T10:00:00Z: data");
+      const hash2 = hashChunk("Output at 2025-01-24T15:30:00Z: data");
+      expect(hash1).toBe(hash2);
+    });
+  });
+
+  describe("isSimilarChunk", () => {
+    it("should return true for identical chunks", () => {
+      const chunk1: OutputChunk = { hash: 12345, length: 100, timestamp: Date.now() };
+      const chunk2: OutputChunk = { hash: 12345, length: 100, timestamp: Date.now() };
+      expect(isSimilarChunk(chunk1, chunk2)).toBe(true);
+    });
+
+    it("should return false for different hashes", () => {
+      const chunk1: OutputChunk = { hash: 12345, length: 100, timestamp: Date.now() };
+      const chunk2: OutputChunk = { hash: 67890, length: 100, timestamp: Date.now() };
+      expect(isSimilarChunk(chunk1, chunk2)).toBe(false);
+    });
+
+    it("should return true for same hash with similar lengths (within 80%)", () => {
+      const chunk1: OutputChunk = { hash: 12345, length: 100, timestamp: Date.now() };
+      const chunk2: OutputChunk = { hash: 12345, length: 85, timestamp: Date.now() };
+      expect(isSimilarChunk(chunk1, chunk2)).toBe(true);
+    });
+
+    it("should return false for same hash with very different lengths", () => {
+      const chunk1: OutputChunk = { hash: 12345, length: 100, timestamp: Date.now() };
+      const chunk2: OutputChunk = { hash: 12345, length: 50, timestamp: Date.now() };
+      expect(isSimilarChunk(chunk1, chunk2)).toBe(false);
+    });
+  });
+
+  describe("recordOutput and pattern detection", () => {
+    let detector: StuckAgentDetector;
+    let appState: AppState;
+
+    beforeEach(() => {
+      appState = new AppState();
+      setAppState(appState);
+      detector = new StuckAgentDetector();
+
+      appState.terminals.addTerminal({
+        id: "terminal-1",
+        name: "Builder",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "builder",
+      });
+    });
+
+    afterEach(() => {
+      detector.stop();
+    });
+
+    it("should accumulate output in chunks", () => {
+      detector.recordOutput("terminal-1", "First output");
+      const state = detector.getTerminalStuckState("terminal-1");
+      expect(state?.patternState.currentChunkContent).toContain("First output");
+    });
+
+    it("should track progress when tool calls detected", () => {
+      detector.recordOutput("terminal-1", "<function_calls>something</function_calls>");
+      const state = detector.getTerminalStuckState("terminal-1");
+      expect(state?.progressState.lastProgressTime).not.toBeNull();
+      expect(state?.progressState.recentProgress.length).toBeGreaterThan(0);
+    });
+
+    it("should detect repeated patterns when threshold exceeded", async () => {
+      // Mock health monitor with recent activity (so time-based detection doesn't trigger)
+      const { getHealthMonitor } = await import("./health-monitor");
+      vi.mocked(getHealthMonitor).mockReturnValue({
+        getLastActivity: vi.fn(() => Date.now() - 60000), // 1 minute ago
+      } as unknown as ReturnType<typeof getHealthMonitor>);
+
+      // First, initialize state by analyzing terminal
+      await detector.analyzeTerminal("terminal-1");
+
+      // Now manually populate chunks with identical content
+      const state = detector.getTerminalStuckState("terminal-1");
+      expect(state).toBeDefined();
+      if (state) {
+        const hash = hashChunk("Repeated content");
+        const chunkLength = "Repeated content".length;
+        // Add 4 identical chunks (exceeds default threshold of 3)
+        state.patternState.chunks = [];
+        for (let i = 0; i < 4; i++) {
+          state.patternState.chunks.push({
+            hash,
+            length: chunkLength,
+            timestamp: Date.now() - i * 30000,
+          });
+        }
+      }
+
+      const analysis = await detector.analyzeTerminal("terminal-1");
+      expect(analysis.signals.repeatedPatterns).toBe(true);
+      expect(analysis.isStuck).toBe(true);
+      expect(analysis.reason).toContain("repeated output patterns");
+    });
+  });
+});
+
+describe("Phase 2b: Progress Tracking", () => {
+  describe("PROGRESS_PATTERNS", () => {
+    it("should detect function_calls tags", () => {
+      expect(PROGRESS_PATTERNS.toolCall.test("<function_calls>")).toBe(true);
+      expect(PROGRESS_PATTERNS.toolCall.test("regular text")).toBe(false);
+    });
+
+    it("should detect function_results tags", () => {
+      expect(PROGRESS_PATTERNS.toolResult.test("<function_results>")).toBe(true);
+      expect(PROGRESS_PATTERNS.toolResult.test("regular text")).toBe(false);
+    });
+
+    it("should detect git operations", () => {
+      expect(PROGRESS_PATTERNS.gitOp.test("git push origin main")).toBe(true);
+      expect(PROGRESS_PATTERNS.gitOp.test("git commit -m 'message'")).toBe(true);
+      expect(PROGRESS_PATTERNS.gitOp.test("git status")).toBe(false);
+    });
+
+    it("should detect gh operations", () => {
+      expect(PROGRESS_PATTERNS.ghOp.test("gh pr create")).toBe(true);
+      expect(PROGRESS_PATTERNS.ghOp.test("gh issue edit 123")).toBe(true);
+      expect(PROGRESS_PATTERNS.ghOp.test("gh pr list")).toBe(false);
+    });
+  });
+
+  describe("detectProgress", () => {
+    it("should return true for tool calls", () => {
+      expect(detectProgress("<function_calls>something")).toBe(true);
+    });
+
+    it("should return true for tool results", () => {
+      expect(detectProgress("<function_results>something")).toBe(true);
+    });
+
+    it("should return false for regular text", () => {
+      expect(detectProgress("Just some regular text output")).toBe(false);
+    });
+  });
+
+  describe("prompt without progress detection", () => {
+    let detector: StuckAgentDetector;
+    let appState: AppState;
+
+    beforeEach(() => {
+      appState = new AppState();
+      setAppState(appState);
+      detector = new StuckAgentDetector();
+
+      appState.terminals.addTerminal({
+        id: "terminal-1",
+        name: "Builder",
+        status: TerminalStatus.Idle,
+        isPrimary: false,
+        role: "builder",
+      });
+    });
+
+    afterEach(() => {
+      detector.stop();
+    });
+
+    it("should record prompt sent time", () => {
+      detector.recordPromptSent("terminal-1");
+      const state = detector.getTerminalStuckState("terminal-1");
+      expect(state?.progressState.lastPromptTime).not.toBeNull();
+    });
+
+    it("should not flag prompt without progress when progress detected after prompt", async () => {
+      // Mock health monitor with recent activity
+      const { getHealthMonitor } = await import("./health-monitor");
+      vi.mocked(getHealthMonitor).mockReturnValue({
+        getLastActivity: vi.fn(() => Date.now() - 60000),
+      } as unknown as ReturnType<typeof getHealthMonitor>);
+
+      detector.recordPromptSent("terminal-1");
+
+      // Simulate progress after prompt
+      detector.recordOutput("terminal-1", "<function_calls>tool call</function_calls>");
+
+      const analysis = await detector.analyzeTerminal("terminal-1");
+      expect(analysis.signals.promptWithoutProgress).toBe(false);
+    });
+
+    it("should flag prompt without progress when timeout exceeded", async () => {
+      // Mock health monitor with recent activity
+      const { getHealthMonitor } = await import("./health-monitor");
+      vi.mocked(getHealthMonitor).mockReturnValue({
+        getLastActivity: vi.fn(() => Date.now() - 60000),
+      } as unknown as ReturnType<typeof getHealthMonitor>);
+
+      // Initialize state first
+      await detector.analyzeTerminal("terminal-1");
+
+      // Set prompt time to exceed timeout (10 minutes for builder)
+      const state = detector.getTerminalStuckState("terminal-1");
+      if (state) {
+        state.progressState.lastPromptTime = Date.now() - 15 * 60 * 1000; // 15 minutes ago
+        state.progressState.lastProgressTime = null; // No progress
+      }
+
+      const analysis = await detector.analyzeTerminal("terminal-1");
+      expect(analysis.signals.promptWithoutProgress).toBe(true);
+      expect(analysis.isStuck).toBe(true);
+      expect(analysis.reason).toContain("No tool calls after prompt");
+    });
+  });
+});
+
+describe("Phase 2 role-specific thresholds", () => {
+  it("should have chunkWindowSeconds for all roles", () => {
+    const standardRoles = [
+      "builder",
+      "judge",
+      "curator",
+      "champion",
+      "doctor",
+      "architect",
+      "hermit",
+      "guide",
+      "shepherd",
+      "loom",
+    ];
+
+    for (const role of standardRoles) {
+      expect(ROLE_DEFAULT_THRESHOLDS[role].chunkWindowSeconds).toBeDefined();
+      expect(ROLE_DEFAULT_THRESHOLDS[role].chunkWindowSeconds).toBeGreaterThan(0);
+    }
+  });
+
+  it("should have noProgressTimeout for all roles", () => {
+    const standardRoles = [
+      "builder",
+      "judge",
+      "curator",
+      "champion",
+      "doctor",
+      "architect",
+      "hermit",
+      "guide",
+      "shepherd",
+      "loom",
+    ];
+
+    for (const role of standardRoles) {
+      expect(ROLE_DEFAULT_THRESHOLDS[role].noProgressTimeout).toBeDefined();
+      expect(ROLE_DEFAULT_THRESHOLDS[role].noProgressTimeout).toBeGreaterThan(0);
+    }
+  });
+
+  it("should have champion with shortest noProgressTimeout", () => {
+    const championTimeout = ROLE_DEFAULT_THRESHOLDS.champion.noProgressTimeout || Infinity;
+
+    for (const [role, thresholds] of Object.entries(ROLE_DEFAULT_THRESHOLDS)) {
+      if (role !== "champion") {
+        const timeout = thresholds.noProgressTimeout || DEFAULT_STUCK_THRESHOLDS.noProgressTimeout;
+        expect(timeout).toBeGreaterThanOrEqual(championTimeout);
+      }
+    }
+  });
+
+  it("should have shepherd with longest noProgressTimeout", () => {
+    const shepherdTimeout = ROLE_DEFAULT_THRESHOLDS.shepherd.noProgressTimeout || 0;
+
+    for (const [role, thresholds] of Object.entries(ROLE_DEFAULT_THRESHOLDS)) {
+      if (role !== "shepherd") {
+        const timeout = thresholds.noProgressTimeout || DEFAULT_STUCK_THRESHOLDS.noProgressTimeout;
+        expect(timeout).toBeLessThanOrEqual(shepherdTimeout);
+      }
+    }
   });
 });
 
