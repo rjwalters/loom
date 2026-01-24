@@ -309,6 +309,109 @@ The worktree helper script prevents common errors:
 
 This on-demand approach prevents worktree clutter and reduces resource usage.
 
+## Handling Merge Conflicts in Worktrees
+
+When your feature branch has conflicts with main, you have two options depending on the severity of divergence.
+
+### Option 1: Resolve Conflicts in the Worktree (Recommended)
+
+For minor conflicts or small divergence from main:
+
+```bash
+# In the worktree directory (.loom/worktrees/issue-XX)
+git fetch origin main
+git rebase origin/main
+
+# If conflicts occur:
+# 1. Edit conflicting files to resolve
+# 2. Stage resolved files
+git add <resolved-files>
+
+# 3. Continue the rebase
+git rebase --continue
+
+# 4. Force push (rebase rewrites history)
+git push --force-with-lease
+```
+
+**When to use this approach:**
+- Few files have conflicts
+- Conflicts are straightforward to resolve
+- Your changes are relatively small
+
+### Option 2: Create a Fresh Worktree (For Significant Divergence)
+
+If conflicts are too complex or main has changed significantly:
+
+```bash
+# 1. Save your work (note what you changed)
+git diff HEAD > ~/my-changes.patch  # Optional: save as patch
+
+# 2. Return to main repository (not the worktree)
+cd /path/to/main/repo
+
+# 3. Remove the stale worktree
+git worktree remove .loom/worktrees/issue-XX --force
+
+# 4. Delete the old branch
+git branch -D feature/issue-XX
+
+# 5. Fetch latest main
+git fetch origin main
+
+# 6. Create fresh worktree from updated main
+./.loom/scripts/worktree.sh XX
+
+# 7. Re-implement changes in the fresh worktree
+cd .loom/worktrees/issue-XX
+# Cherry-pick, apply patch, or reimplement manually
+```
+
+**When to use this approach:**
+- Many files have conflicts
+- Main has diverged significantly (many commits ahead)
+- Conflicts are in areas you didn't intentionally change
+- Easier to reimplement than untangle
+
+### Never Do This
+
+❌ **Don't switch to the main repository directory to work on features**
+- Always work in worktrees for isolation
+- Main should stay clean and on the default branch
+
+❌ **Don't create branches directly in main**
+- Always use `./.loom/scripts/worktree.sh` to create branches
+- Prevents nested worktree issues
+
+❌ **Don't run `git stash` in main and try to apply in worktrees**
+- Stash is local to the repository, not shared between worktrees
+- Each worktree has its own working directory
+
+❌ **Don't use `git push --force` without `--force-with-lease`**
+- `--force-with-lease` is safer - it fails if someone else pushed
+- Prevents accidentally overwriting others' work
+
+### Preventing Merge Conflicts
+
+To minimize conflicts in the first place:
+
+1. **Pull frequently**: Before starting significant work
+   ```bash
+   git fetch origin main
+   git rebase origin/main
+   ```
+
+2. **Keep PRs small**: Smaller PRs = fewer conflicts = faster merges
+
+3. **Communicate**: If working on shared areas, coordinate with other builders
+
+4. **Rebase before PR**: Always rebase onto latest main before creating PR
+   ```bash
+   git fetch origin main
+   git rebase origin/main
+   git push --force-with-lease
+   ```
+
 ## Working in Tauri App Mode with Terminal Worktrees
 
 When running as an autonomous agent in the Tauri App, you start in a **terminal worktree** (e.g., `.loom/worktrees/terminal-1`), not the main workspace. This provides isolation between multiple autonomous agents.
