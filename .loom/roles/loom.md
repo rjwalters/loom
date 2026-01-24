@@ -127,7 +127,7 @@ In Manual Orchestration Mode, use the **Task tool with `run_in_background: true`
 ```
 Task(
   subagent_type: "general-purpose",
-  prompt: "/shepherd 123 --force-merge",
+  prompt: "/shepherd 123 --force-pr",
   run_in_background: true
 ) → Returns task_id and output_file
 ```
@@ -212,7 +212,7 @@ def auto_spawn_shepherds():
         # Spawn shepherd subagent
         Task(
             description=f"Shepherd issue #{issue}",
-            prompt=f"/shepherd {issue} --force-merge",
+            prompt=f"/shepherd {issue} --force-pr",
             run_in_background=True
         )
 
@@ -475,7 +475,7 @@ def auto_spawn_shepherds():
         # Spawn shepherd
         result = Task(
             description=f"Shepherd issue #{issue}",
-            prompt=f"/shepherd {issue} --force-merge",
+            prompt=f"/shepherd {issue} --force-pr",
             run_in_background=True
         )
 
