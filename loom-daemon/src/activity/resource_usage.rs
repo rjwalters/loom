@@ -287,6 +287,7 @@ fn extract_duration(text: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -350,7 +351,7 @@ mod tests {
         // 50 cache write @ $0.00375/1k = $0.0001875
         // Total = $0.0108375
         let cost = pricing.calculate_cost(1000, 500, Some(200), Some(50));
-        assert!((cost - 0.0108375).abs() < 0.0001);
+        assert!((cost - 0.010_837_5).abs() < 0.0001);
     }
 
     #[test]

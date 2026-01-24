@@ -330,13 +330,13 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             }
 
                             // Print any issues found
-                            if !validation.issues.is_empty() {
+                            if validation.issues.is_empty() {
+                                println!("\n✅ Loom source repository is properly configured");
+                            } else {
                                 println!("\n⚠️  Issues found:");
                                 for issue in &validation.issues {
                                     println!("  - {issue}");
                                 }
-                            } else {
-                                println!("\n✅ Loom source repository is properly configured");
                             }
 
                             // Print role details

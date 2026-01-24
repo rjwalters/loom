@@ -157,8 +157,8 @@ mod tests {
 
     #[test]
     fn test_parse_standard_commit() {
-        let output = r#"[main abc1234] Add new feature
- 3 files changed, 42 insertions(+), 5 deletions(-)"#;
+        let output = r"[main abc1234] Add new feature
+ 3 files changed, 42 insertions(+), 5 deletions(-)";
 
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 1);
@@ -192,8 +192,8 @@ mod tests {
 
     #[test]
     fn test_parse_commit_with_only_insertions() {
-        let output = r#"[main abc1234] New file only
- 1 file changed, 100 insertions(+)"#;
+        let output = r"[main abc1234] New file only
+ 1 file changed, 100 insertions(+)";
 
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 1);
@@ -204,8 +204,8 @@ mod tests {
 
     #[test]
     fn test_parse_commit_with_only_deletions() {
-        let output = r#"[main abc1234] Remove old code
- 2 files changed, 50 deletions(-)"#;
+        let output = r"[main abc1234] Remove old code
+ 2 files changed, 50 deletions(-)";
 
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 1);
@@ -216,11 +216,11 @@ mod tests {
 
     #[test]
     fn test_parse_git_log_output() {
-        let output = r#"commit 1234567890abcdef1234567890abcdef12345678
+        let output = r"commit 1234567890abcdef1234567890abcdef12345678
 Author: Test User <test@example.com>
 Date:   Thu Jan 23 10:00:00 2025 -0800
 
-    Commit message here"#;
+    Commit message here";
 
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 1);
@@ -265,10 +265,10 @@ Date:   Thu Jan 23 10:00:00 2025 -0800
 
     #[test]
     fn test_multiple_commits_in_output() {
-        let output = r#"[main abc1234] First commit
+        let output = r"[main abc1234] First commit
  1 file changed, 10 insertions(+)
 [main def5678] Second commit
- 2 files changed, 20 insertions(+), 5 deletions(-)"#;
+ 2 files changed, 20 insertions(+), 5 deletions(-)";
 
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 2);
