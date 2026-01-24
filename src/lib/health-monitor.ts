@@ -6,10 +6,12 @@
  * - For session health, uses IPC `check_session_health` command to verify tmux sessions exist
  * - For daemon health, uses IPC `check_daemon_health` command (ping every 10s)
  * - For activity tracking, receives callbacks from output-poller (recordActivity method)
+ * - Integrates with circuit breaker for IPC resilience
  *
  * Separation of Concerns:
  * - health-monitor.ts (this file): SCHEDULER - periodic checks, activity timestamps, daemon connectivity
  * - terminal-probe.ts: CHECKER - terminal TYPE detection (agent vs shell) via probe commands
+ * - circuit-breaker.ts: RESILIENCE - fail-fast protection for daemon IPC
  *
  * These modules are intentionally separate:
  * - Health monitoring checks if terminals are ALIVE (session exists, responding)
@@ -20,9 +22,16 @@
  *
  * @see terminal-probe.ts for terminal type detection
  * @see output-poller.ts for activity tracking integration
+ * @see circuit-breaker.ts for IPC resilience
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import {
+  type CircuitBreakerSnapshot,
+  CircuitOpenError,
+  CircuitState,
+  getDaemonCircuitBreaker,
+} from "./circuit-breaker";
 import { Logger } from "./logger";
 import { getAppState, TerminalStatus } from "./state";
 
@@ -48,6 +57,8 @@ export interface DaemonHealth {
   lastPing: number | null; // Last successful ping timestamp
   timeSincePing: number | null; // Milliseconds since last ping
   consecutiveFailures: number; // Consecutive ping failures
+  circuitState: CircuitState; // Current circuit breaker state
+  circuitSnapshot: CircuitBreakerSnapshot | null; // Full circuit breaker state
 }
 
 /**
@@ -88,6 +99,8 @@ export class HealthMonitor {
     lastPing: null,
     timeSincePing: null,
     consecutiveFailures: 0,
+    circuitState: CircuitState.CLOSED,
+    circuitSnapshot: null,
   };
 
   private healthCallbacks: Set<(health: SystemHealth) => void> = new Set();
@@ -104,6 +117,21 @@ export class HealthMonitor {
 
     logger.info("Starting health monitoring");
     this.running = true;
+
+    // Subscribe to circuit breaker events for coordinated state updates
+    const circuitBreaker = getDaemonCircuitBreaker();
+    circuitBreaker.onEvent((event) => {
+      if (event.type === "state-change") {
+        logger.info("Circuit breaker state changed", {
+          from: event.from,
+          to: event.to,
+        });
+        // Update daemon health with circuit state
+        this.daemonHealth.circuitState = event.to;
+        this.daemonHealth.circuitSnapshot = circuitBreaker.getSnapshot();
+        this.notifyHealthUpdate();
+      }
+    });
 
     // Initial checks
     this.performHealthCheck();
@@ -276,6 +304,39 @@ export class HealthMonitor {
   }
 
   /**
+   * Get the current circuit breaker state
+   */
+  getCircuitState(): CircuitState {
+    return getDaemonCircuitBreaker().getState();
+  }
+
+  /**
+   * Get the full circuit breaker snapshot
+   */
+  getCircuitSnapshot(): CircuitBreakerSnapshot {
+    return getDaemonCircuitBreaker().getSnapshot();
+  }
+
+  /**
+   * Check if daemon IPC is available (circuit not open)
+   */
+  isDaemonAvailable(): boolean {
+    return getDaemonCircuitBreaker().isAvailable();
+  }
+
+  /**
+   * Reset the circuit breaker to closed state
+   * Use when daemon is known to be recovered (e.g., after manual restart)
+   */
+  resetCircuitBreaker(): void {
+    logger.info("Resetting circuit breaker");
+    getDaemonCircuitBreaker().reset();
+    this.daemonHealth.circuitState = CircuitState.CLOSED;
+    this.daemonHealth.circuitSnapshot = getDaemonCircuitBreaker().getSnapshot();
+    this.notifyHealthUpdate();
+  }
+
+  /**
    * Perform health check on all terminals
    * Public to allow immediate health checks on workspace start
    */
@@ -387,11 +448,19 @@ export class HealthMonitor {
 
   /**
    * Ping daemon to check connectivity
+   *
+   * Uses the circuit breaker to coordinate with other IPC operations.
+   * In half-open state, the ping serves as the probe to test daemon recovery.
    */
   private async pingDaemon(): Promise<void> {
+    const circuitBreaker = getDaemonCircuitBreaker();
+
     try {
-      // Send ping request (daemon should respond with true if connected)
-      await invoke<boolean>("check_daemon_health");
+      // Use circuit breaker for the daemon ping
+      // This coordinates failure tracking across all IPC operations
+      await circuitBreaker.execute(async () => {
+        await invoke<boolean>("check_daemon_health");
+      });
 
       const now = Date.now();
       this.daemonHealth = {
@@ -399,22 +468,42 @@ export class HealthMonitor {
         lastPing: now,
         timeSincePing: 0,
         consecutiveFailures: 0,
+        circuitState: circuitBreaker.getState(),
+        circuitSnapshot: circuitBreaker.getSnapshot(),
       };
 
-      logger.info("Daemon ping successful", { timestamp: now });
-    } catch (error) {
-      this.daemonHealth.consecutiveFailures++;
-      this.daemonHealth.connected = this.daemonHealth.consecutiveFailures < 3; // Mark disconnected after 3 failures
-
-      const timeSincePing = this.daemonHealth.lastPing
-        ? Date.now() - this.daemonHealth.lastPing
-        : null;
-      this.daemonHealth.timeSincePing = timeSincePing;
-
-      logger.error("Daemon ping failed", error, {
-        consecutiveFailures: this.daemonHealth.consecutiveFailures,
-        connected: this.daemonHealth.connected,
+      logger.info("Daemon ping successful", {
+        timestamp: now,
+        circuitState: circuitBreaker.getState(),
       });
+    } catch (error) {
+      // Check if this was a circuit rejection vs actual failure
+      if (error instanceof CircuitOpenError) {
+        // Circuit is open - don't update failure count, just reflect state
+        logger.info("Daemon ping skipped - circuit open", {
+          circuitState: error.state,
+        });
+        this.daemonHealth.connected = false;
+        this.daemonHealth.circuitState = circuitBreaker.getState();
+        this.daemonHealth.circuitSnapshot = circuitBreaker.getSnapshot();
+      } else {
+        // Actual failure - circuit breaker already recorded it
+        this.daemonHealth.consecutiveFailures++;
+        this.daemonHealth.connected = this.daemonHealth.consecutiveFailures < 3;
+
+        const timeSincePing = this.daemonHealth.lastPing
+          ? Date.now() - this.daemonHealth.lastPing
+          : null;
+        this.daemonHealth.timeSincePing = timeSincePing;
+        this.daemonHealth.circuitState = circuitBreaker.getState();
+        this.daemonHealth.circuitSnapshot = circuitBreaker.getSnapshot();
+
+        logger.error("Daemon ping failed", error, {
+          consecutiveFailures: this.daemonHealth.consecutiveFailures,
+          connected: this.daemonHealth.connected,
+          circuitState: circuitBreaker.getState(),
+        });
+      }
     }
 
     // Notify listeners

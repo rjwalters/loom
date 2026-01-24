@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { CircuitOpenError, getDaemonCircuitBreaker } from "./circuit-breaker";
 import { getHistoryCache } from "./history-cache";
 import { Logger } from "./logger";
 import { getTerminalManager } from "./terminal-manager";
@@ -150,15 +151,33 @@ export class OutputPoller {
 
   /**
    * Perform a single poll for output
+   *
+   * Uses the circuit breaker to fail fast if daemon is unresponsive.
+   * This prevents polling from queueing up requests during daemon outages.
    */
   private async pollOnce(state: PollerState): Promise<void> {
+    const circuitBreaker = getDaemonCircuitBreaker();
+
+    // Check if circuit allows the operation before attempting
+    if (!circuitBreaker.canAttempt()) {
+      // Circuit is open - skip this poll, will retry on next interval
+      // Don't increment error counter - circuit will manage recovery
+      logger.info("Poll skipped - circuit breaker open", {
+        terminalId: state.terminalId,
+        circuitState: circuitBreaker.getState(),
+      });
+      return;
+    }
+
     try {
       // Get new bytes since last poll (or all bytes on first poll)
       const startByte = state.lastByteCount > 0 ? state.lastByteCount : null;
 
-      const result = await invoke<TerminalOutput>("get_terminal_output", {
-        id: state.terminalId,
-        startByte,
+      const result = await circuitBreaker.execute(async () => {
+        return invoke<TerminalOutput>("get_terminal_output", {
+          id: state.terminalId,
+          startByte,
+        });
       });
 
       // Decode base64 output and write to xterm.js terminal
@@ -226,7 +245,17 @@ export class OutputPoller {
       // Adjust polling frequency based on activity
       this.adjustPollingFrequency(state);
     } catch (error) {
-      // Track consecutive errors
+      // Check if this was a circuit rejection
+      if (error instanceof CircuitOpenError) {
+        // Circuit opened during this request - don't treat as terminal-specific error
+        logger.info("Poll rejected by circuit breaker", {
+          terminalId: state.terminalId,
+          circuitState: error.state,
+        });
+        return;
+      }
+
+      // Track consecutive errors (only for actual IPC failures)
       state.consecutiveErrors++;
       state.lastErrorTime = Date.now();
 
@@ -238,6 +267,7 @@ export class OutputPoller {
         logger.error("Error polling terminal", error, {
           terminalId: state.terminalId,
           consecutiveErrors: state.consecutiveErrors,
+          circuitState: circuitBreaker.getState(),
         });
       }
 
