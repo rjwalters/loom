@@ -274,7 +274,22 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Create cost analytics views
     create_cost_analytics_views(conn);
 
+    // Create tuning schema (Issue #1074)
+    create_tuning_schema(conn);
+
     Ok(())
+}
+
+/// Create tuning-related database tables (Issue #1074).
+///
+/// Wraps the tuning module's schema creation and handles errors gracefully.
+fn create_tuning_schema(conn: &Connection) {
+    match super::tuning::create_tuning_schema(conn) {
+        Ok(()) => log::debug!("Created or verified tuning schema"),
+        Err(e) => {
+            log::warn!("Could not create tuning schema: {e}");
+        }
+    }
 }
 
 /// Create SQL views for cost analytics (Issue #1064).
@@ -434,7 +449,9 @@ fn migrate_quality_metrics_table(conn: &Connection) {
             if err_str.contains("duplicate column") || err_str.contains("already exists") {
                 log::debug!("Column rework_count already exists in quality_metrics table");
             } else {
-                log::debug!("Could not add column rework_count to quality_metrics: {e} (may be expected)");
+                log::debug!(
+                    "Could not add column rework_count to quality_metrics: {e} (may be expected)"
+                );
             }
         }
     }

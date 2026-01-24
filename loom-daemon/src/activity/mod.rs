@@ -42,6 +42,7 @@ pub mod resource_usage;
 mod schema;
 pub mod stats;
 pub mod test_parser;
+pub mod tuning;
 
 // Re-export public types from models
 // Only export types that are used by other modules
@@ -50,9 +51,8 @@ pub use models::{ActivityEntry, AgentInput, AgentOutput, InputContext, InputType
 // These types are available for future use but not currently imported elsewhere
 #[allow(unused_imports)]
 pub use models::{
-    AgentMetric, LintResults, PrReworkStats, ProductivitySummary, PromptChanges,
-    PromptGitHubEvent, PromptGitHubEventType, PromptSuccessStats, QualityMetrics,
-    TestResults, TokenUsage,
+    AgentMetric, LintResults, PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent,
+    PromptGitHubEventType, PromptSuccessStats, QualityMetrics, TestResults, TokenUsage,
 };
 
 // Cost analytics types (Issue #1064)
@@ -77,4 +77,12 @@ pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, Re
 #[allow(unused_imports)]
 pub use stats::{
     AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary, WeeklyVelocity,
+};
+
+// Re-export tuning types and functions (Issue #1074)
+// These types are used for self-tuning based on effectiveness data
+#[allow(unused_imports)]
+pub use tuning::{
+    create_tuning_schema, EffectivenessSnapshot, ProposalStatus, TunableParameter, TuningConfig,
+    TuningHistory, TuningProposal, TuningSummary,
 };
