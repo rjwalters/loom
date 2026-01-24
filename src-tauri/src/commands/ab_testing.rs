@@ -1240,19 +1240,22 @@ pub fn get_experiment_variants(
         )
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    stmt.query_map([experiment_id], |row| {
-        Ok(Variant {
-            id: row.get(0)?,
-            experiment_id: row.get(1)?,
-            name: row.get(2)?,
-            description: row.get(3)?,
-            config_json: row.get(4)?,
-            weight: row.get(5)?,
+    let results: Vec<Variant> = stmt
+        .query_map([experiment_id], |row| {
+            Ok(Variant {
+                id: row.get(0)?,
+                experiment_id: row.get(1)?,
+                name: row.get(2)?,
+                description: row.get(3)?,
+                config_json: row.get(4)?,
+                weight: row.get(5)?,
+            })
         })
-    })
-    .map_err(|e| format!("Failed to query variants: {e}"))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect variants: {e}"))
+        .map_err(|e| format!("Failed to query variants: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect variants: {e}"))?;
+
+    Ok(results)
 }
 
 /// Get summary of all experiments
@@ -1311,17 +1314,20 @@ pub fn get_experiment_results(
         )
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    stmt.query_map([experiment_id], |row| {
-        Ok(ExperimentResult {
-            id: row.get(0)?,
-            assignment_id: row.get(1)?,
-            success_factor_id: row.get(2)?,
-            outcome: row.get(3)?,
-            metric_value: row.get(4)?,
-            recorded_at: row.get(5)?,
+    let results: Vec<ExperimentResult> = stmt
+        .query_map([experiment_id], |row| {
+            Ok(ExperimentResult {
+                id: row.get(0)?,
+                assignment_id: row.get(1)?,
+                success_factor_id: row.get(2)?,
+                outcome: row.get(3)?,
+                metric_value: row.get(4)?,
+                recorded_at: row.get(5)?,
+            })
         })
-    })
-    .map_err(|e| format!("Failed to query results: {e}"))?
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect results: {e}"))
+        .map_err(|e| format!("Failed to query results: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to collect results: {e}"))?;
+
+    Ok(results)
 }

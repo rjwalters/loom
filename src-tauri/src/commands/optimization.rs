@@ -497,7 +497,7 @@ fn calculate_specificity_score(prompt: &str) -> f64 {
 
 /// Calculate structural quality of a prompt (0.0 to 1.0)
 fn calculate_structure_score(prompt: &str) -> f64 {
-    let mut score = 0.5;
+    let mut score: f64 = 0.5;
 
     let word_count = prompt.split_whitespace().count();
 

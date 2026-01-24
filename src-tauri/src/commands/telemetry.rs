@@ -180,7 +180,7 @@ pub fn get_performance_metrics(
     let limit = limit.unwrap_or(100);
 
     // Build query and parameters based on which filters are provided
-    let metrics = match (&category, &since) {
+    let metrics: Vec<PerformanceMetric> = match (&category, &since) {
         (Some(cat), Some(since_time)) => {
             let mut stmt = conn
                 .prepare(
@@ -191,10 +191,12 @@ pub fn get_performance_metrics(
                      LIMIT ?3",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![cat, since_time, limit], map_performance_row)
+            let results: Vec<PerformanceMetric> = stmt
+                .query_map(params![cat, since_time, limit], map_performance_row)
                 .map_err(|e| format!("Failed to query metrics: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect metrics: {e}"))?
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?;
+            results
         }
         (Some(cat), None) => {
             let mut stmt = conn
@@ -206,10 +208,12 @@ pub fn get_performance_metrics(
                      LIMIT ?2",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![cat, limit], map_performance_row)
+            let results: Vec<PerformanceMetric> = stmt
+                .query_map(params![cat, limit], map_performance_row)
                 .map_err(|e| format!("Failed to query metrics: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect metrics: {e}"))?
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?;
+            results
         }
         (None, Some(since_time)) => {
             let mut stmt = conn
@@ -221,10 +225,12 @@ pub fn get_performance_metrics(
                      LIMIT ?2",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![since_time, limit], map_performance_row)
+            let results: Vec<PerformanceMetric> = stmt
+                .query_map(params![since_time, limit], map_performance_row)
                 .map_err(|e| format!("Failed to query metrics: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect metrics: {e}"))?
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?;
+            results
         }
         (None, None) => {
             let mut stmt = conn
@@ -235,10 +241,12 @@ pub fn get_performance_metrics(
                      LIMIT ?1",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![limit], map_performance_row)
+            let results: Vec<PerformanceMetric> = stmt
+                .query_map(params![limit], map_performance_row)
                 .map_err(|e| format!("Failed to query metrics: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect metrics: {e}"))?
+                .map_err(|e| format!("Failed to collect metrics: {e}"))?;
+            results
         }
     };
 
@@ -294,33 +302,39 @@ pub fn get_performance_stats(since: Option<String>) -> Result<Vec<PerformanceSta
         .prepare(query)
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    let stats = if let Some(since_time) = since {
-        stmt.query_map([since_time], |row| {
-            Ok(PerformanceStats {
-                category: row.get(0)?,
-                count: row.get(1)?,
-                avg_duration_ms: row.get(2)?,
-                max_duration_ms: row.get(3)?,
-                min_duration_ms: row.get(4)?,
-                success_rate: row.get(5)?,
+    let stats: Vec<PerformanceStats> = if let Some(since_time) = since {
+        let results: Vec<PerformanceStats> = stmt
+            .query_map([since_time], |row| {
+                Ok(PerformanceStats {
+                    category: row.get(0)?,
+                    count: row.get(1)?,
+                    avg_duration_ms: row.get(2)?,
+                    max_duration_ms: row.get(3)?,
+                    min_duration_ms: row.get(4)?,
+                    success_rate: row.get(5)?,
+                })
             })
-        })
-        .map_err(|e| format!("Failed to query stats: {e}"))?
+            .map_err(|e| format!("Failed to query stats: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect stats: {e}"))?;
+        results
     } else {
-        stmt.query_map([], |row| {
-            Ok(PerformanceStats {
-                category: row.get(0)?,
-                count: row.get(1)?,
-                avg_duration_ms: row.get(2)?,
-                max_duration_ms: row.get(3)?,
-                min_duration_ms: row.get(4)?,
-                success_rate: row.get(5)?,
+        let results: Vec<PerformanceStats> = stmt
+            .query_map([], |row| {
+                Ok(PerformanceStats {
+                    category: row.get(0)?,
+                    count: row.get(1)?,
+                    avg_duration_ms: row.get(2)?,
+                    max_duration_ms: row.get(3)?,
+                    min_duration_ms: row.get(4)?,
+                    success_rate: row.get(5)?,
+                })
             })
-        })
-        .map_err(|e| format!("Failed to query stats: {e}"))?
-    }
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect stats: {e}"))?;
+            .map_err(|e| format!("Failed to query stats: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect stats: {e}"))?;
+        results
+    };
 
     Ok(stats)
 }
@@ -367,7 +381,7 @@ pub fn get_error_reports(
     let limit = limit.unwrap_or(50);
 
     // Build query and parameters based on whether since filter is provided
-    let errors = if let Some(since_time) = since {
+    let errors: Vec<ErrorReport> = if let Some(since_time) = since {
         let mut stmt = conn
             .prepare(
                 "SELECT message, stack, timestamp, component, context
@@ -377,10 +391,12 @@ pub fn get_error_reports(
                  LIMIT ?2",
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
-        stmt.query_map(params![since_time, limit], map_error_row)
+        let results: Vec<ErrorReport> = stmt
+            .query_map(params![since_time, limit], map_error_row)
             .map_err(|e| format!("Failed to query errors: {e}"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to collect errors: {e}"))?
+            .map_err(|e| format!("Failed to collect errors: {e}"))?;
+        results
     } else {
         let mut stmt = conn
             .prepare(
@@ -390,10 +406,12 @@ pub fn get_error_reports(
                  LIMIT ?1",
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
-        stmt.query_map(params![limit], map_error_row)
+        let results: Vec<ErrorReport> = stmt
+            .query_map(params![limit], map_error_row)
             .map_err(|e| format!("Failed to query errors: {e}"))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to collect errors: {e}"))?
+            .map_err(|e| format!("Failed to collect errors: {e}"))?;
+        results
     };
 
     Ok(errors)
@@ -454,7 +472,7 @@ pub fn get_usage_events(
     let limit = limit.unwrap_or(100);
 
     // Build query and parameters based on which filters are provided
-    let events = match (&category, &since) {
+    let events: Vec<UsageEvent> = match (&category, &since) {
         (Some(cat), Some(since_time)) => {
             let mut stmt = conn
                 .prepare(
@@ -465,10 +483,12 @@ pub fn get_usage_events(
                      LIMIT ?3",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![cat, since_time, limit], map_usage_row)
+            let results: Vec<UsageEvent> = stmt
+                .query_map(params![cat, since_time, limit], map_usage_row)
                 .map_err(|e| format!("Failed to query events: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect events: {e}"))?
+                .map_err(|e| format!("Failed to collect events: {e}"))?;
+            results
         }
         (Some(cat), None) => {
             let mut stmt = conn
@@ -480,10 +500,12 @@ pub fn get_usage_events(
                      LIMIT ?2",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![cat, limit], map_usage_row)
+            let results: Vec<UsageEvent> = stmt
+                .query_map(params![cat, limit], map_usage_row)
                 .map_err(|e| format!("Failed to query events: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect events: {e}"))?
+                .map_err(|e| format!("Failed to collect events: {e}"))?;
+            results
         }
         (None, Some(since_time)) => {
             let mut stmt = conn
@@ -495,10 +517,12 @@ pub fn get_usage_events(
                      LIMIT ?2",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![since_time, limit], map_usage_row)
+            let results: Vec<UsageEvent> = stmt
+                .query_map(params![since_time, limit], map_usage_row)
                 .map_err(|e| format!("Failed to query events: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect events: {e}"))?
+                .map_err(|e| format!("Failed to collect events: {e}"))?;
+            results
         }
         (None, None) => {
             let mut stmt = conn
@@ -509,10 +533,12 @@ pub fn get_usage_events(
                      LIMIT ?1",
                 )
                 .map_err(|e| format!("Failed to prepare query: {e}"))?;
-            stmt.query_map(params![limit], map_usage_row)
+            let results: Vec<UsageEvent> = stmt
+                .query_map(params![limit], map_usage_row)
                 .map_err(|e| format!("Failed to query events: {e}"))?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| format!("Failed to collect events: {e}"))?
+                .map_err(|e| format!("Failed to collect events: {e}"))?;
+            results
         }
     };
 
@@ -562,29 +588,35 @@ pub fn get_usage_stats(since: Option<String>) -> Result<Vec<UsageStats>, String>
         .prepare(query)
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    let stats = if let Some(since_time) = since {
-        stmt.query_map([since_time], |row| {
-            Ok(UsageStats {
-                event_name: row.get(0)?,
-                category: row.get(1)?,
-                count: row.get(2)?,
-                last_occurrence: row.get(3)?,
+    let stats: Vec<UsageStats> = if let Some(since_time) = since {
+        let results: Vec<UsageStats> = stmt
+            .query_map([since_time], |row| {
+                Ok(UsageStats {
+                    event_name: row.get(0)?,
+                    category: row.get(1)?,
+                    count: row.get(2)?,
+                    last_occurrence: row.get(3)?,
+                })
             })
-        })
-        .map_err(|e| format!("Failed to query stats: {e}"))?
+            .map_err(|e| format!("Failed to query stats: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect stats: {e}"))?;
+        results
     } else {
-        stmt.query_map([], |row| {
-            Ok(UsageStats {
-                event_name: row.get(0)?,
-                category: row.get(1)?,
-                count: row.get(2)?,
-                last_occurrence: row.get(3)?,
+        let results: Vec<UsageStats> = stmt
+            .query_map([], |row| {
+                Ok(UsageStats {
+                    event_name: row.get(0)?,
+                    category: row.get(1)?,
+                    count: row.get(2)?,
+                    last_occurrence: row.get(3)?,
+                })
             })
-        })
-        .map_err(|e| format!("Failed to query stats: {e}"))?
-    }
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(|e| format!("Failed to collect stats: {e}"))?;
+            .map_err(|e| format!("Failed to query stats: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect stats: {e}"))?;
+        results
+    };
 
     Ok(stats)
 }
