@@ -36,6 +36,7 @@
 
 mod db;
 mod models;
+pub mod resource_usage;
 mod schema;
 
 // Re-export public types from models
@@ -48,3 +49,8 @@ pub use models::{AgentMetric, ProductivitySummary, PromptChanges, TokenUsage};
 
 // Re-export the database struct
 pub use db::ActivityDb;
+
+// Re-export resource usage parsing and cost calculation
+// These are available for future integration with terminal output parsing
+#[allow(unused_imports)]
+pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, ResourceUsage};

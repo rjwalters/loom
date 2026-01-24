@@ -231,15 +231,20 @@ impl ActivityDb {
     }
 
     /// Record token usage for an API request
+    ///
+    /// Records comprehensive LLM resource usage including token counts, cache usage,
+    /// duration, and cost. If a metric_id is provided, also updates the aggregate
+    /// token counts in agent_metrics.
     #[allow(dead_code)]
     pub fn record_token_usage(&self, usage: &TokenUsage) -> Result<i64> {
         self.conn.execute(
             r"
             INSERT INTO token_usage (
                 input_id, metric_id, timestamp, prompt_tokens,
-                completion_tokens, total_tokens, model, estimated_cost_usd
+                completion_tokens, total_tokens, model, estimated_cost_usd,
+                tokens_cache_read, tokens_cache_write, duration_ms, provider
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ",
             params![
                 usage.input_id,
@@ -250,6 +255,10 @@ impl ActivityDb {
                 usage.total_tokens,
                 &usage.model,
                 usage.estimated_cost_usd,
+                usage.tokens_cache_read,
+                usage.tokens_cache_write,
+                usage.duration_ms,
+                &usage.provider,
             ],
         )?;
 
@@ -723,7 +732,7 @@ mod tests {
 
         let metric_id = db.start_task(&metric)?;
 
-        // Record token usage
+        // Record token usage with enhanced fields
         let usage = TokenUsage {
             id: None,
             input_id: None,
@@ -734,6 +743,10 @@ mod tests {
             total_tokens: 1500,
             model: Some("claude-sonnet-4".to_string()),
             estimated_cost_usd: 0.045,
+            tokens_cache_read: Some(200),
+            tokens_cache_write: Some(50),
+            duration_ms: Some(1500),
+            provider: Some("anthropic".to_string()),
         };
 
         let usage_id = db.record_token_usage(&usage)?;
@@ -746,7 +759,7 @@ mod tests {
         assert_eq!(retrieved.total_tokens, 1500);
         assert!((retrieved.estimated_cost_usd - 0.045).abs() < 0.001);
 
-        // Record another token usage
+        // Record another token usage with enhanced fields
         let usage2 = TokenUsage {
             id: None,
             input_id: None,
@@ -757,6 +770,10 @@ mod tests {
             total_tokens: 1200,
             model: Some("claude-sonnet-4".to_string()),
             estimated_cost_usd: 0.036,
+            tokens_cache_read: Some(100),
+            tokens_cache_write: None,
+            duration_ms: Some(1200),
+            provider: Some("anthropic".to_string()),
         };
 
         db.record_token_usage(&usage2)?;
@@ -872,6 +889,10 @@ mod tests {
                 total_tokens: 1500,
                 model: Some("claude-sonnet-4".to_string()),
                 estimated_cost_usd: 0.045,
+                tokens_cache_read: None,
+                tokens_cache_write: None,
+                duration_ms: Some(1000),
+                provider: Some("anthropic".to_string()),
             };
             db.record_token_usage(&usage)?;
 
@@ -919,6 +940,10 @@ mod tests {
                 total_tokens: 1200,
                 model: Some("codex".to_string()),
                 estimated_cost_usd: 0.024,
+                tokens_cache_read: None,
+                tokens_cache_write: None,
+                duration_ms: Some(800),
+                provider: Some("openai".to_string()),
             };
             db.record_token_usage(&usage)?;
 
