@@ -109,6 +109,54 @@ Launch the Loom desktop application for automated orchestration with visual term
 - Autonomous mode with configurable intervals
 - Persistent workspace configuration
 
+### 3. Daemon Mode (Fully Autonomous)
+
+Run the Loom daemon for fully autonomous system orchestration without any human intervention for routine operations.
+
+**Setup**:
+```bash
+# Start the daemon (runs continuously)
+/loom
+
+# The daemon will AUTOMATICALLY:
+# 1. Spawn shepherds when ready issues are available
+# 2. Trigger Architect/Hermit when backlog is low
+# 3. Ensure Guide and Champion keep running
+# 4. Scale based on demand - no human decisions needed
+```
+
+**Key Principle: FULLY AUTONOMOUS**
+
+The daemon makes ALL spawning and scaling decisions automatically:
+- Shepherds are spawned automatically when `loom:issue` issues exist
+- Architect/Hermit are triggered automatically when backlog < threshold
+- Guide/Champion are respawned automatically on their intervals
+- No human approval needed for ANY of the above
+
+**Human intervention is ONLY required for**:
+- Approving proposals: `loom:architect` -> `loom:issue`
+- Approving proposals: `loom:hermit` -> `loom:issue`
+- Handling `loom:blocked` issues
+- Strategic direction changes
+
+**When to use Daemon Mode**:
+- Fully autonomous development
+- System should generate its own work
+- Multiple issues need parallel processing
+- Production-scale orchestration
+
+**Observing the daemon**:
+```bash
+# Check daemon state
+cat .loom/daemon-state.json | jq
+
+# View active shepherds
+jq '.shepherds | to_entries[] | select(.value.issue != null)' .loom/daemon-state.json
+
+# Graceful shutdown
+touch .loom/stop-daemon
+```
+
 ## Agent Roles
 
 Loom provides specialized roles for different development tasks. Each role follows specific guidelines and uses GitHub labels for coordination.
