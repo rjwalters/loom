@@ -293,6 +293,22 @@ fn handle_request(
                                 }
                             }
 
+                            // Parse terminal output for quality metrics (test results, lint errors, build status)
+                            // Issue #1054: Track test and quality outcomes
+                            match db.record_quality_from_output(0, &output_str) {
+                                Ok(Some(metrics_id)) => {
+                                    log::debug!(
+                                        "Recorded quality metrics (id: {metrics_id}) from terminal output"
+                                    );
+                                }
+                                Ok(None) => {
+                                    // No quality metrics found in output - this is normal
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to record quality metrics: {e}");
+                                }
+                            }
+
                             // Parse terminal output for git commits and record changes
                             // This enables automatic prompt-to-commit correlation
                             if git_parser::contains_git_commit(&output_str) {
