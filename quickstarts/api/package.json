@@ -1,6 +1,6 @@
 {
   "name": "loom-quickstart-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Loom quickstart template for API backends with Cloudflare Workers, Hono, and D1",
   "type": "module",
   "scripts": {
