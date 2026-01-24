@@ -769,6 +769,117 @@ impl ActivityDb {
 
         Ok(())
     }
+
+    /// Record resource usage parsed from terminal output
+    ///
+    /// Stores LLM resource consumption metrics including token counts, model,
+    /// cost, duration, and provider information.
+    pub fn record_resource_usage(
+        &self,
+        usage: &super::resource_usage::ResourceUsage,
+    ) -> Result<i64> {
+        self.conn.execute(
+            r"
+            INSERT INTO resource_usage (
+                input_id, timestamp, model, tokens_input, tokens_output,
+                tokens_cache_read, tokens_cache_write, cost_usd, duration_ms, provider
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                usage.input_id,
+                usage.timestamp.to_rfc3339(),
+                &usage.model,
+                usage.tokens_input,
+                usage.tokens_output,
+                usage.tokens_cache_read,
+                usage.tokens_cache_write,
+                usage.cost_usd,
+                usage.duration_ms,
+                &usage.provider,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Parse and record resource usage from terminal output
+    ///
+    /// Automatically parses token usage, model, and cost information from
+    /// Claude Code terminal output and stores it in the database.
+    pub fn record_resource_usage_from_output(
+        &self,
+        input_id: Option<i64>,
+        output: &str,
+        duration_ms: Option<i64>,
+    ) -> Result<Option<i64>> {
+        use super::resource_usage::parse_resource_usage;
+
+        if let Some(mut usage) = parse_resource_usage(output, duration_ms) {
+            usage.input_id = input_id;
+            Ok(Some(self.record_resource_usage(&usage)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get resource usage records for a specific input
+    #[allow(dead_code)]
+    pub fn get_resource_usage(&self, input_id: i64) -> Result<Vec<super::resource_usage::ResourceUsage>> {
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, input_id, timestamp, model, tokens_input, tokens_output,
+                   tokens_cache_read, tokens_cache_write, cost_usd, duration_ms, provider
+            FROM resource_usage
+            WHERE input_id = ?1
+            ORDER BY timestamp
+            ",
+        )?;
+
+        let usages = stmt.query_map(params![input_id], |row| {
+            let timestamp_str: String = row.get(2)?;
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                .with_timezone(&Utc);
+
+            Ok(super::resource_usage::ResourceUsage {
+                input_id: row.get(1)?,
+                model: row.get(3)?,
+                tokens_input: row.get(4)?,
+                tokens_output: row.get(5)?,
+                tokens_cache_read: row.get(6)?,
+                tokens_cache_write: row.get(7)?,
+                cost_usd: row.get(8)?,
+                duration_ms: row.get(9)?,
+                provider: row.get(10)?,
+                timestamp,
+            })
+        })?;
+
+        usages.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Get total resource usage summary for a terminal
+    ///
+    /// Returns a tuple of (input tokens, output tokens, total cost in USD)
+    #[allow(dead_code)]
+    pub fn get_terminal_resource_summary(&self, terminal_id: &str) -> Result<(i64, i64, f64)> {
+        let result = self.conn.query_row(
+            r"
+            SELECT
+                COALESCE(SUM(ru.tokens_input), 0) as total_input,
+                COALESCE(SUM(ru.tokens_output), 0) as total_output,
+                COALESCE(SUM(ru.cost_usd), 0.0) as total_cost
+            FROM resource_usage ru
+            JOIN agent_inputs ai ON ru.input_id = ai.id
+            WHERE ai.terminal_id = ?1
+            ",
+            params![terminal_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -1679,6 +1790,171 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
             assert_eq!(m.pr_approved, Some(false));
             assert_eq!(m.pr_changes_requested, Some(true));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_resource_usage() -> Result<()> {
+        use super::super::resource_usage::ResourceUsage;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input to link to
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "Build the feature".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record resource usage
+        let usage = ResourceUsage {
+            input_id: Some(input_id),
+            model: "claude-3-5-sonnet".to_string(),
+            tokens_input: 1000,
+            tokens_output: 500,
+            tokens_cache_read: Some(200),
+            tokens_cache_write: Some(50),
+            cost_usd: 0.0108375,
+            duration_ms: Some(1500),
+            provider: "anthropic".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        let usage_id = db.record_resource_usage(&usage)?;
+        assert!(usage_id > 0);
+
+        // Retrieve and verify
+        let retrieved = db.get_resource_usage(input_id)?;
+        assert_eq!(retrieved.len(), 1);
+        let r = &retrieved[0];
+        assert_eq!(r.model, "claude-3-5-sonnet");
+        assert_eq!(r.tokens_input, 1000);
+        assert_eq!(r.tokens_output, 500);
+        assert_eq!(r.tokens_cache_read, Some(200));
+        assert_eq!(r.tokens_cache_write, Some(50));
+        assert!((r.cost_usd - 0.0108375).abs() < 0.0001);
+        assert_eq!(r.duration_ms, Some(1500));
+        assert_eq!(r.provider, "anthropic");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_resource_usage_from_output() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "Build the feature".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Simulate terminal output with token usage
+        let output = "Model: claude-3-5-sonnet\nTokens: 1000 in / 500 out\nDuration: 1.5s";
+
+        let usage_id = db.record_resource_usage_from_output(Some(input_id), output, None)?;
+        assert!(usage_id.is_some());
+
+        // Verify parsed data was stored
+        let retrieved = db.get_resource_usage(input_id)?;
+        assert_eq!(retrieved.len(), 1);
+        let r = &retrieved[0];
+        assert_eq!(r.model, "claude-3-5-sonnet");
+        assert_eq!(r.tokens_input, 1000);
+        assert_eq!(r.tokens_output, 500);
+        assert_eq!(r.duration_ms, Some(1500));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_resource_usage_from_output_no_tokens() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "ls -la".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Output with no token information
+        let output = "total 42\ndrwxr-xr-x  5 user staff 160 Jan 23 10:00 .\n";
+
+        let usage_id = db.record_resource_usage_from_output(Some(input_id), output, None)?;
+        assert!(usage_id.is_none()); // No usage recorded
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_resource_summary() -> Result<()> {
+        use super::super::resource_usage::ResourceUsage;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record multiple resource usages for the same terminal
+        for i in 0..3 {
+            let input = AgentInput {
+                id: None,
+                terminal_id: "terminal-1".to_string(),
+                timestamp: Utc::now(),
+                input_type: InputType::Manual,
+                content: format!("command {i}"),
+                agent_role: Some("builder".to_string()),
+                context: InputContext::default(),
+            };
+            let input_id = db.record_input(&input)?;
+
+            let usage = ResourceUsage {
+                input_id: Some(input_id),
+                model: "claude-3-5-sonnet".to_string(),
+                tokens_input: 1000,
+                tokens_output: 500,
+                tokens_cache_read: None,
+                tokens_cache_write: None,
+                cost_usd: 0.0105, // 1000 * 0.003/1k + 500 * 0.015/1k
+                duration_ms: Some(1000),
+                provider: "anthropic".to_string(),
+                timestamp: Utc::now(),
+            };
+            db.record_resource_usage(&usage)?;
+        }
+
+        // Get summary
+        let (input_tokens, output_tokens, total_cost) =
+            db.get_terminal_resource_summary("terminal-1")?;
+        assert_eq!(input_tokens, 3000); // 3 * 1000
+        assert_eq!(output_tokens, 1500); // 3 * 500
+        assert!((total_cost - 0.0315).abs() < 0.0001); // 3 * 0.0105
+
+        // Different terminal should have no usage
+        let (input_tokens, output_tokens, total_cost) =
+            db.get_terminal_resource_summary("terminal-2")?;
+        assert_eq!(input_tokens, 0);
+        assert_eq!(output_tokens, 0);
+        assert!((total_cost - 0.0).abs() < 0.0001);
 
         Ok(())
     }

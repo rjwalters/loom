@@ -57,6 +57,8 @@ pub use models::{
 pub use db::ActivityDb;
 
 // Re-export resource usage parsing and cost calculation
-// These are available for future integration with terminal output parsing
+// Used internally by db.rs for terminal output parsing
+// Note: db.rs accesses these via super::resource_usage, so these re-exports
+// are provided for external crate access (future MCP servers, etc.)
 #[allow(unused_imports)]
 pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, ResourceUsage};

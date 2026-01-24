@@ -22,7 +22,6 @@ use std::sync::LazyLock;
 
 /// Parsed resource usage data from terminal output
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct ResourceUsage {
     pub input_id: Option<i64>,
     pub model: String,
@@ -38,7 +37,7 @@ pub struct ResourceUsage {
 
 /// Model pricing configuration (cost per 1000 tokens)
 #[derive(Debug, Clone)]
-#[allow(dead_code, clippy::struct_field_names)]
+#[allow(clippy::struct_field_names)]
 pub struct ModelPricing {
     pub input_cost_per_1k: f64,
     pub output_cost_per_1k: f64,
@@ -131,7 +130,6 @@ impl ModelPricing {
 }
 
 /// Detect provider from model name
-#[allow(dead_code)]
 pub fn detect_provider(model: &str) -> &'static str {
     let model_lower = model.to_lowercase();
     if model_lower.contains("claude") {
@@ -152,7 +150,7 @@ pub fn detect_provider(model: &str) -> &'static str {
 // Note: expect() is appropriate here since these are compile-time constant patterns
 
 /// Pattern: "Total tokens: 1,234 in / 567 out"
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 static TOKEN_PATTERN_SLASH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?i)(?:total\s+)?tokens?:\s*([\d,]+)\s*(?:in|input)\s*/\s*([\d,]+)\s*(?:out|output)",
@@ -161,14 +159,14 @@ static TOKEN_PATTERN_SLASH: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Pattern: "Input: 1,234 tokens, Output: 567 tokens"
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 static TOKEN_PATTERN_LABELED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)input:\s*([\d,]+)\s*tokens?.*?output:\s*([\d,]+)\s*tokens?")
         .expect("Invalid regex")
 });
 
 /// Pattern: "Cache read: 1,234 tokens" or `cache_read_input_tokens`: 1234
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 static CACHE_READ_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match both "cache read: 200 tokens" and "cache_read_input_tokens: 200"
     Regex::new(r"(?i)cache[_\s]*read[_\s]*(?:input[_\s]*)?(?:tokens?)?[:\s]*([\d,]+)")
@@ -176,7 +174,7 @@ static CACHE_READ_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Pattern: "Cache write: 1,234 tokens" or `cache_creation_input_tokens`: 1234
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 static CACHE_WRITE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     // Match both "cache write: 50 tokens" and "cache_creation_input_tokens: 50"
     Regex::new(r"(?i)cache[_\s]*(?:write|creation)[_\s]*(?:input[_\s]*)?(?:tokens?)?[:\s]*([\d,]+)")
@@ -184,21 +182,20 @@ static CACHE_WRITE_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// Pattern: Model name detection - "Model: claude-3-5-sonnet" or "using claude-sonnet-4"
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 static MODEL_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:model[:\s]+|using\s+)(claude[a-z0-9-]+|gpt-[a-z0-9.-]+|o1[a-z0-9-]*|gemini[a-z0-9-]*)")
         .expect("Invalid regex")
 });
 
 /// Pattern for extracting duration: "Duration: 5.2s" or "took 5200ms"
-#[allow(dead_code, clippy::expect_used)]
+#[allow(clippy::expect_used)]
 static DURATION_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:duration|took|time)[:\s]*([\d.]+)\s*(ms|s|seconds?|milliseconds?)")
         .expect("Invalid regex")
 });
 
 /// Parse a number that may contain commas
-#[allow(dead_code)]
 fn parse_token_count(s: &str) -> Option<i64> {
     s.replace(',', "").parse().ok()
 }
@@ -207,7 +204,6 @@ fn parse_token_count(s: &str) -> Option<i64> {
 ///
 /// Attempts to extract token usage, model information, and timing from
 /// Claude Code or similar AI tool output.
-#[allow(dead_code)]
 pub fn parse_resource_usage(output: &str, duration_ms: Option<i64>) -> Option<ResourceUsage> {
     // Try to extract input/output tokens
     let (tokens_input, tokens_output) = extract_tokens(output)?;
@@ -255,7 +251,6 @@ pub fn parse_resource_usage(output: &str, duration_ms: Option<i64>) -> Option<Re
 }
 
 /// Extract input and output token counts from text
-#[allow(dead_code)]
 fn extract_tokens(text: &str) -> Option<(i64, i64)> {
     // Try "X in / Y out" pattern first
     if let Some(caps) = TOKEN_PATTERN_SLASH.captures(text) {
@@ -275,7 +270,7 @@ fn extract_tokens(text: &str) -> Option<(i64, i64)> {
 }
 
 /// Extract duration from text
-#[allow(dead_code, clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 fn extract_duration(text: &str) -> Option<i64> {
     let caps = DURATION_PATTERN.captures(text)?;
     let value: f64 = caps.get(1)?.as_str().parse().ok()?;

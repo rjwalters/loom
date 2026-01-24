@@ -278,6 +278,21 @@ fn handle_request(
                                 }
                             }
 
+                            // Parse terminal output for resource usage (token counts, costs)
+                            match db.record_resource_usage_from_output(None, &output_str, None) {
+                                Ok(Some(usage_id)) => {
+                                    log::debug!(
+                                        "Recorded resource usage (id: {usage_id}) from terminal output"
+                                    );
+                                }
+                                Ok(None) => {
+                                    // No resource usage found in output - this is normal
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to record resource usage: {e}");
+                                }
+                            }
+
                             // Parse terminal output for git commits and record changes
                             // This enables automatic prompt-to-commit correlation
                             if git_parser::contains_git_commit(&output_str) {
