@@ -764,6 +764,94 @@ echo "Issue closure verification complete for PR #$PR_NUMBER"
 - **Fallback case**: If auto-close fails, Champion closes manually with explanation
 - **Error case**: If closing fails, warns but continues (human can fix later)
 
+### Step 5: Unblock Dependent Issues
+
+After verifying issue closure, check for blocked issues that can now be unblocked.
+
+**Implementation**:
+
+```bash
+#!/bin/bash
+# Unblock issues that depended on the closed issue
+# Usage: unblock_dependents <pr-number> <closed-issue>
+
+PR_NUMBER=$1
+CLOSED_ISSUE=$2
+
+echo "Checking for issues blocked by #$CLOSED_ISSUE..."
+
+# Find issues with loom:blocked that reference the closed issue
+# Matches patterns like: "Blocked by #123", "Depends on #123", "- [x] #123"
+BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --json number,body \
+  --jq ".[] | select(.body | test(\"(Blocked by|Depends on|Requires) #$CLOSED_ISSUE\"; \"i\")) | .number")
+
+if [ -z "$BLOCKED_ISSUES" ]; then
+  echo "No issues found blocked by #$CLOSED_ISSUE"
+  return 0
+fi
+
+for blocked in $BLOCKED_ISSUES; do
+  echo "Checking if #$blocked can be unblocked..."
+
+  # Get the issue body to check ALL dependencies
+  BLOCKED_BODY=$(gh issue view "$blocked" --json body --jq -r '.body')
+
+  # Extract all referenced dependencies
+  ALL_DEPS=$(echo "$BLOCKED_BODY" | grep -Eo "(Blocked by|Depends on|Requires) #[0-9]+" | grep -Eo "[0-9]+" | sort -u)
+
+  # Check if ALL dependencies are now closed
+  ALL_RESOLVED=true
+  for dep in $ALL_DEPS; do
+    DEP_STATE=$(gh issue view "$dep" --json state --jq -r '.state' 2>/dev/null)
+    if [ "$DEP_STATE" != "CLOSED" ]; then
+      echo "  Still blocked: dependency #$dep is still open"
+      ALL_RESOLVED=false
+      break
+    fi
+  done
+
+  if [ "$ALL_RESOLVED" = true ]; then
+    echo "  🔓 All dependencies resolved - unblocking #$blocked"
+    gh issue edit "$blocked" --remove-label "loom:blocked" --add-label "loom:issue"
+    gh issue comment "$blocked" --body "$(cat <<EOF
+🔓 **Unblocked** by merge of PR #$PR_NUMBER (resolved #$CLOSED_ISSUE)
+
+All dependencies are now resolved. This issue is ready for implementation.
+
+---
+*Automated by Champion role*
+EOF
+    )"
+  fi
+done
+```
+
+**Key features**:
+- **Pattern matching**: Detects "Blocked by #N", "Depends on #N", "Requires #N" patterns
+- **Multi-dependency support**: Only unblocks when ALL dependencies are resolved
+- **Label transition**: Moves from `loom:blocked` to `loom:issue` (ready for Builder)
+- **Audit trail**: Leaves comment explaining why issue was unblocked
+
+**Why this matters**:
+
+When issues have dependencies (e.g., "#963 blocked by #962"), they can remain blocked indefinitely after the blocking issue is resolved. Champion's post-merge unblocking provides:
+
+1. **Immediate unblocking**: No waiting for polling intervals
+2. **Event-driven**: Triggers at the exact moment when unblocking is possible
+3. **Safety**: Only unblocks when ALL dependencies resolve, not just the current one
+
+**Relationship to Guide role**:
+
+| Role | Trigger | Timing |
+|------|---------|--------|
+| Champion | Event-driven (on merge) | Immediate |
+| Guide | Polling (every 15 min) | Backup/catchup |
+
+Champion provides instant unblocking; Guide catches:
+- Manual merges (not via Champion)
+- External issue closures
+- Missed events
+
 ## PR Rejection Workflow
 
 If ANY safety criterion fails, do NOT merge. Instead, add a comment explaining why:
@@ -1093,7 +1181,7 @@ echo ""
 # STEP 1: Verify Safety Criteria
 # ============================================
 
-echo "STEP 1/4: Verifying safety criteria..."
+echo "STEP 1/5: Verifying safety criteria..."
 echo ""
 
 # Run verification checks (see "Step 1: Verify Safety Criteria" section above)
@@ -1114,7 +1202,7 @@ echo ""
 # STEP 2: Post Pre-Merge Comment
 # ============================================
 
-echo "STEP 2/4: Posting pre-merge comment..."
+echo "STEP 2/5: Posting pre-merge comment..."
 echo ""
 
 # Gather PR data
@@ -1166,7 +1254,7 @@ echo ""
 # STEP 3: Execute Merge
 # ============================================
 
-echo "STEP 3/4: Executing squash merge..."
+echo "STEP 3/5: Executing squash merge..."
 echo ""
 
 MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1)
@@ -1216,7 +1304,7 @@ echo ""
 # STEP 4: Verify Issue Closure
 # ============================================
 
-echo "STEP 4/4: Verifying linked issue closure..."
+echo "STEP 4/5: Verifying linked issue closure..."
 echo ""
 
 # Extract linked issues
@@ -1248,6 +1336,68 @@ else
 fi
 
 echo ""
+
+# ============================================
+# STEP 5: Unblock Dependent Issues
+# ============================================
+
+echo "STEP 5/5: Checking for dependent issues to unblock..."
+echo ""
+
+# For each closed issue, find and unblock dependents
+for closed_issue in $LINKED_ISSUES; do
+  echo "Checking for issues blocked by #$closed_issue..."
+
+  # Find issues with loom:blocked that reference the closed issue
+  BLOCKED_ISSUES=$(gh issue list --label "loom:blocked" --state open --json number,body --jq ".[] | select(.body | test(\"(Blocked by|Depends on|Requires|blocked by|depends on|requires|\\\\- \\\\[.\\\\]) #$closed_issue\"; \"i\")) | .number")
+
+  if [ -z "$BLOCKED_ISSUES" ]; then
+    echo "  No issues found blocked by #$closed_issue"
+    continue
+  fi
+
+  echo "  Found blocked issues: $BLOCKED_ISSUES"
+
+  for blocked in $BLOCKED_ISSUES; do
+    echo "  Checking if #$blocked can be unblocked..."
+
+    # Get the issue body to check ALL dependencies
+    BLOCKED_BODY=$(gh issue view "$blocked" --json body --jq -r '.body')
+
+    # Extract all referenced dependencies (looking for patterns like "Blocked by #123" or "- [ ] #456")
+    ALL_DEPS=$(echo "$BLOCKED_BODY" | grep -Eo "(Blocked by|Depends on|Requires|blocked by|depends on|requires) #[0-9]+" | grep -Eo "[0-9]+" | sort -u)
+    CHECKBOX_DEPS=$(echo "$BLOCKED_BODY" | grep -Eo "\- \[.\] #[0-9]+" | grep -Eo "[0-9]+" | sort -u)
+    ALL_DEPS=$(echo -e "$ALL_DEPS\n$CHECKBOX_DEPS" | sort -u | grep -v '^$')
+
+    # Check if ALL dependencies are now closed
+    ALL_RESOLVED=true
+    for dep in $ALL_DEPS; do
+      DEP_STATE=$(gh issue view "$dep" --json state --jq -r '.state' 2>/dev/null)
+      if [ "$DEP_STATE" != "CLOSED" ]; then
+        echo "    ⏳ Still blocked: dependency #$dep is still open"
+        ALL_RESOLVED=false
+        break
+      fi
+    done
+
+    if [ "$ALL_RESOLVED" = true ]; then
+      echo "    🔓 All dependencies resolved - unblocking #$blocked"
+      gh issue edit "$blocked" --remove-label "loom:blocked" --add-label "loom:issue"
+      gh issue comment "$blocked" --body "$(cat <<EOF
+🔓 **Unblocked** by merge of PR #$PR_NUMBER (resolved #$closed_issue)
+
+All dependencies are now resolved. This issue is ready for implementation.
+
+---
+*Automated by Champion role*
+EOF
+      )"
+      echo "    ✅ Unblocked issue #$blocked"
+    fi
+  done
+done
+
+echo ""
 echo "========================================="
 echo "✅ Champion auto-merge complete!"
 echo "========================================="
@@ -1273,11 +1423,12 @@ done
 ```
 
 **Key features**:
-- **Sequential execution**: Runs all 4 steps in order
+- **Sequential execution**: Runs all 5 steps in order
 - **Clear progress**: Shows which step is executing
 - **Early exit**: Stops at first failure (verification or merge)
 - **Complete audit trail**: Logs all actions and decisions
 - **Error recovery**: Posts comments on failure, preserves state
+- **Dependency unblocking**: Automatically unblocks issues that depended on the merged PR's closed issue
 - **Summary output**: Reports final results
 
 **Integration with Champion role**:
