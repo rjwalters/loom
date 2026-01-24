@@ -33,12 +33,17 @@ set -euo pipefail
 
 # Parse command line arguments
 NON_INTERACTIVE=false
+FORCE_OVERWRITE=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     -y|--yes)
       NON_INTERACTIVE=true
+      shift
+      ;;
+    -f|--force)
+      FORCE_OVERWRITE=true
       shift
       ;;
     *)
@@ -346,10 +351,14 @@ success "loom-daemon binary ready"
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
-# Use merge mode (no --force) to preserve custom project roles/commands
-# New files are added, existing files are preserved
+# Use --force to overwrite existing installation when requested
+# Otherwise, use merge mode to preserve custom project roles/commands
 # Use --defaults to point to Loom's defaults directory
-"$LOOM_ROOT/target/release/loom-daemon" init --defaults "$LOOM_ROOT/defaults" . || \
+INIT_FLAGS=""
+if [ "$FORCE_OVERWRITE" = true ]; then
+  INIT_FLAGS="--force"
+fi
+"$LOOM_ROOT/target/release/loom-daemon" init $INIT_FLAGS --defaults "$LOOM_ROOT/defaults" . || \
   error "loom-daemon init failed"
 
 echo ""
