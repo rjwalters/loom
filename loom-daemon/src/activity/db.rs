@@ -10,9 +10,10 @@ use std::path::PathBuf;
 
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, InputContext, InputType,
-    ProductivitySummary, PromptChanges, PromptGitHubEvent, TokenUsage,
+    ProductivitySummary, PromptChanges, PromptGitHubEvent, QualityMetrics, TokenUsage,
 };
 use super::schema::init_schema;
+use super::test_parser;
 
 /// Activity database for tracking agent inputs and results
 pub struct ActivityDb {
@@ -233,8 +234,8 @@ impl ActivityDb {
     /// Record token usage for an API request
     ///
     /// Records comprehensive LLM resource usage including token counts, cache usage,
-    /// duration, and cost. If a metric_id is provided, also updates the aggregate
-    /// token counts in agent_metrics.
+    /// duration, and cost. If a `metric_id` is provided, also updates the aggregate
+    /// token counts in `agent_metrics`.
     #[allow(dead_code)]
     pub fn record_token_usage(&self, usage: &TokenUsage) -> Result<i64> {
         self.conn.execute(
@@ -615,6 +616,158 @@ impl ActivityDb {
         )?;
 
         Ok(result)
+    }
+
+    /// Record quality metrics for an input/output
+    #[allow(dead_code)]
+    pub fn record_quality_metrics(&self, metrics: &QualityMetrics) -> Result<i64> {
+        self.conn.execute(
+            r"
+            INSERT INTO quality_metrics (
+                input_id, timestamp, tests_passed, tests_failed, tests_skipped,
+                test_runner, lint_errors, format_errors, build_success,
+                pr_approved, pr_changes_requested, human_rating
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ",
+            params![
+                metrics.input_id,
+                metrics.timestamp.to_rfc3339(),
+                metrics.tests_passed,
+                metrics.tests_failed,
+                metrics.tests_skipped,
+                &metrics.test_runner,
+                metrics.lint_errors,
+                metrics.format_errors,
+                metrics.build_success,
+                metrics.pr_approved,
+                metrics.pr_changes_requested,
+                metrics.human_rating,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Parse and record quality metrics from terminal output
+    ///
+    /// Automatically parses test results, lint errors, and build status from
+    /// the output content and stores them in the database.
+    #[allow(dead_code)]
+    pub fn record_quality_from_output(&self, input_id: i64, output: &str) -> Result<Option<i64>> {
+        let test_results = test_parser::parse_test_results(output);
+        let lint_results = test_parser::parse_lint_results(output);
+        let build_status = test_parser::parse_build_status(output);
+
+        // Only record if we found at least some quality metrics
+        if test_results.is_none() && lint_results.is_none() && build_status.is_none() {
+            return Ok(None);
+        }
+
+        let metrics = QualityMetrics {
+            id: None,
+            input_id: Some(input_id),
+            timestamp: Utc::now(),
+            tests_passed: test_results.as_ref().map(|t| t.passed),
+            tests_failed: test_results.as_ref().map(|t| t.failed),
+            tests_skipped: test_results.as_ref().map(|t| t.skipped),
+            test_runner: test_results.and_then(|t| t.runner),
+            lint_errors: lint_results.as_ref().map(|l| l.lint_errors),
+            format_errors: lint_results.map(|l| l.format_errors),
+            build_success: build_status,
+            pr_approved: None,
+            pr_changes_requested: None,
+            human_rating: None,
+        };
+
+        Ok(Some(self.record_quality_metrics(&metrics)?))
+    }
+
+    /// Get quality metrics for a specific input
+    #[allow(dead_code)]
+    pub fn get_quality_metrics(&self, input_id: i64) -> Result<Option<QualityMetrics>> {
+        let result = self.conn.query_row(
+            r"
+            SELECT id, input_id, timestamp, tests_passed, tests_failed, tests_skipped,
+                   test_runner, lint_errors, format_errors, build_success,
+                   pr_approved, pr_changes_requested, human_rating
+            FROM quality_metrics
+            WHERE input_id = ?1
+            ",
+            params![input_id],
+            |row| {
+                let timestamp_str: String = row.get(2)?;
+                let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+                    .with_timezone(&Utc);
+
+                Ok(QualityMetrics {
+                    id: Some(row.get(0)?),
+                    input_id: row.get(1)?,
+                    timestamp,
+                    tests_passed: row.get(3)?,
+                    tests_failed: row.get(4)?,
+                    tests_skipped: row.get(5)?,
+                    test_runner: row.get(6)?,
+                    lint_errors: row.get(7)?,
+                    format_errors: row.get(8)?,
+                    build_success: row.get(9)?,
+                    pr_approved: row.get(10)?,
+                    pr_changes_requested: row.get(11)?,
+                    human_rating: row.get(12)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(metrics) => Ok(Some(metrics)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get aggregate test outcomes for a terminal
+    ///
+    /// Returns a tuple of (passed, failed, skipped) counts across all quality metrics
+    /// for the given terminal.
+    #[allow(dead_code)]
+    pub fn get_terminal_test_summary(&self, terminal_id: &str) -> Result<(i64, i64, i64)> {
+        let result = self.conn.query_row(
+            r"
+            SELECT
+                COALESCE(SUM(qm.tests_passed), 0) as total_passed,
+                COALESCE(SUM(qm.tests_failed), 0) as total_failed,
+                COALESCE(SUM(qm.tests_skipped), 0) as total_skipped
+            FROM quality_metrics qm
+            JOIN agent_inputs ai ON qm.input_id = ai.id
+            WHERE ai.terminal_id = ?1
+            ",
+            params![terminal_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        Ok(result)
+    }
+
+    /// Update PR review status for a quality metrics record
+    #[allow(dead_code)]
+    pub fn update_pr_review_status(
+        &self,
+        input_id: i64,
+        approved: Option<bool>,
+        changes_requested: Option<bool>,
+    ) -> Result<()> {
+        self.conn.execute(
+            r"
+            UPDATE quality_metrics
+            SET pr_approved = COALESCE(?1, pr_approved),
+                pr_changes_requested = COALESCE(?2, pr_changes_requested)
+            WHERE input_id = ?3
+            ",
+            params![approved, changes_requested, input_id],
+        )?;
+
+        Ok(())
     }
 }
 
@@ -1297,6 +1450,235 @@ mod tests {
 
         let event_id = db.record_prompt_github_event(&event)?;
         assert!(event_id > 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_and_get_quality_metrics() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input to link to
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "cargo test".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record quality metrics
+        let metrics = QualityMetrics {
+            id: None,
+            input_id: Some(input_id),
+            timestamp: Utc::now(),
+            tests_passed: Some(42),
+            tests_failed: Some(3),
+            tests_skipped: Some(1),
+            test_runner: Some("cargo test".to_string()),
+            lint_errors: Some(0),
+            format_errors: Some(2),
+            build_success: Some(true),
+            pr_approved: None,
+            pr_changes_requested: None,
+            human_rating: None,
+        };
+
+        let metrics_id = db.record_quality_metrics(&metrics)?;
+        assert!(metrics_id > 0);
+
+        // Retrieve and verify
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.tests_passed, Some(42));
+            assert_eq!(m.tests_failed, Some(3));
+            assert_eq!(m.tests_skipped, Some(1));
+            assert_eq!(m.test_runner, Some("cargo test".to_string()));
+            assert_eq!(m.lint_errors, Some(0));
+            assert_eq!(m.format_errors, Some(2));
+            assert_eq!(m.build_success, Some(true));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_quality_from_output() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "cargo test".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Simulate cargo test output
+        let output = r#"
+running 10 tests
+test test_one ... ok
+test test_two ... ok
+test test_three ... FAILED
+test result: FAILED. 9 passed; 1 failed; 0 ignored
+"#;
+
+        let metrics_id = db.record_quality_from_output(input_id, output)?;
+        assert!(metrics_id.is_some());
+
+        // Verify parsed metrics
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.tests_passed, Some(9));
+            assert_eq!(m.tests_failed, Some(1));
+            assert_eq!(m.tests_skipped, Some(0));
+            assert_eq!(m.test_runner, Some("cargo".to_string()));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_quality_from_output_no_tests() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "ls -la".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Output with no test results
+        let output = "total 42\ndrwxr-xr-x  5 user staff 160 Jan 23 10:00 .\n";
+
+        let metrics_id = db.record_quality_from_output(input_id, output)?;
+        assert!(metrics_id.is_none()); // No metrics recorded for non-test output
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_test_summary() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record multiple test runs for the same terminal
+        for i in 0..3 {
+            let input = AgentInput {
+                id: None,
+                terminal_id: "terminal-1".to_string(),
+                timestamp: Utc::now(),
+                input_type: InputType::Manual,
+                content: format!("cargo test run {i}"),
+                agent_role: Some("builder".to_string()),
+                context: InputContext::default(),
+            };
+            let input_id = db.record_input(&input)?;
+
+            let metrics = QualityMetrics {
+                id: None,
+                input_id: Some(input_id),
+                timestamp: Utc::now(),
+                tests_passed: Some(10),
+                tests_failed: Some(i),
+                tests_skipped: Some(1),
+                test_runner: Some("cargo".to_string()),
+                lint_errors: None,
+                format_errors: None,
+                build_success: None,
+                pr_approved: None,
+                pr_changes_requested: None,
+                human_rating: None,
+            };
+            db.record_quality_metrics(&metrics)?;
+        }
+
+        // Get summary
+        let (passed, failed, skipped) = db.get_terminal_test_summary("terminal-1")?;
+        assert_eq!(passed, 30); // 3 * 10
+        assert_eq!(failed, 3); // 0 + 1 + 2
+        assert_eq!(skipped, 3); // 3 * 1
+
+        // Different terminal should have no tests
+        let (passed, failed, skipped) = db.get_terminal_test_summary("terminal-2")?;
+        assert_eq!(passed, 0);
+        assert_eq!(failed, 0);
+        assert_eq!(skipped, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_update_pr_review_status() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record an input and quality metrics
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "gh pr create".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        let metrics = QualityMetrics {
+            id: None,
+            input_id: Some(input_id),
+            timestamp: Utc::now(),
+            tests_passed: Some(10),
+            tests_failed: Some(0),
+            tests_skipped: Some(0),
+            test_runner: Some("cargo".to_string()),
+            lint_errors: None,
+            format_errors: None,
+            build_success: Some(true),
+            pr_approved: None,
+            pr_changes_requested: None,
+            human_rating: None,
+        };
+        db.record_quality_metrics(&metrics)?;
+
+        // Update PR review status to approved
+        db.update_pr_review_status(input_id, Some(true), Some(false))?;
+
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.pr_approved, Some(true));
+            assert_eq!(m.pr_changes_requested, Some(false));
+        }
+
+        // Update to changes requested
+        db.update_pr_review_status(input_id, Some(false), Some(true))?;
+
+        let retrieved = db.get_quality_metrics(input_id)?;
+        assert!(retrieved.is_some());
+        if let Some(m) = retrieved {
+            assert_eq!(m.pr_approved, Some(false));
+            assert_eq!(m.pr_changes_requested, Some(true));
+        }
 
         Ok(())
     }
