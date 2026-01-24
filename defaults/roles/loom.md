@@ -517,6 +517,82 @@ When queried for status:
   - Hermit: 45m ago (cooldown: 30m)
 ```
 
+## Cleanup Integration
+
+The daemon integrates with cleanup scripts to manage task artifacts and worktrees safely.
+
+### Cleanup Events
+
+The daemon triggers cleanup at specific events:
+
+| Event | When | What Gets Cleaned |
+|-------|------|-------------------|
+| `shepherd-complete` | After shepherd finishes issue | Task outputs archived, worktree (if PR merged) |
+| `daemon-startup` | When daemon starts | Stale artifacts from previous session |
+| `daemon-shutdown` | Before daemon exits | Archive task outputs |
+| `periodic` | Configurable interval | Conservative cleanup respecting active shepherds |
+
+### Cleanup Scripts
+
+```bash
+# Archive task outputs to .loom/logs/{date}/
+./scripts/archive-logs.sh [--dry-run] [--retention-days N]
+
+# Safe worktree cleanup (only MERGED PRs)
+./scripts/safe-worktree-cleanup.sh [--dry-run] [--grace-period N]
+
+# Event-driven daemon cleanup
+./scripts/daemon-cleanup.sh <event> [options]
+```
+
+### Cleanup Configuration
+
+Configure via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOOM_CLEANUP_ENABLED` | true | Enable/disable cleanup |
+| `LOOM_ARCHIVE_LOGS` | true | Archive logs before deletion |
+| `LOOM_RETENTION_DAYS` | 7 | Days to retain archives |
+| `LOOM_CLEANUP_INTERVAL` | 360 | Minutes between periodic cleanups |
+| `LOOM_GRACE_PERIOD` | 600 | Seconds after PR merge before cleanup |
+
+### Cleanup State Tracking
+
+The daemon state includes a `cleanup` section:
+
+```json
+{
+  "cleanup": {
+    "lastRun": "2026-01-23T11:00:00Z",
+    "lastEvent": "periodic",
+    "lastCleaned": ["issue-120", "issue-121"],
+    "pendingCleanup": ["issue-122"],
+    "errors": []
+  }
+}
+```
+
+### Integrating Cleanup into Daemon Loop
+
+Add cleanup calls at appropriate points:
+
+```python
+# After shepherd completion is detected
+for completed_issue in newly_completed_issues:
+    run("./scripts/daemon-cleanup.sh shepherd-complete {completed_issue}")
+
+# On startup (once)
+run("./scripts/daemon-cleanup.sh daemon-startup")
+
+# On shutdown
+run("./scripts/daemon-cleanup.sh daemon-shutdown")
+
+# Optionally, periodic cleanup
+if should_run_periodic_cleanup():
+    run("./scripts/daemon-cleanup.sh periodic")
+```
+
 ## Terminal Probe Protocol
 
 When you receive a probe command, respond with:

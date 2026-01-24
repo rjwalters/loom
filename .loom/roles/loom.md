@@ -467,8 +467,88 @@ The daemon tracks state in `.loom/daemon-state.json`:
     }
   },
   "last_architect_trigger": "2026-01-23T10:00:00Z",
-  "last_hermit_trigger": "2026-01-23T10:30:00Z"
+  "last_hermit_trigger": "2026-01-23T10:30:00Z",
+  "cleanup": {
+    "lastRun": "2026-01-23T11:00:00Z",
+    "lastEvent": "periodic",
+    "lastCleaned": ["issue-120", "issue-121"],
+    "pendingCleanup": ["issue-122"],
+    "errors": []
+  }
 }
+```
+
+## Cleanup Integration
+
+The daemon integrates with cleanup scripts to manage task artifacts and worktrees safely.
+
+### Cleanup Events
+
+The daemon triggers cleanup at specific events:
+
+| Event | When | What Gets Cleaned |
+|-------|------|-------------------|
+| `shepherd-complete` | After shepherd finishes issue | Task outputs archived, worktree (if PR merged) |
+| `daemon-startup` | When daemon starts | Stale artifacts from previous session |
+| `daemon-shutdown` | Before daemon exits | Archive task outputs |
+| `periodic` | Configurable interval | Conservative cleanup respecting active shepherds |
+
+### Cleanup Scripts
+
+```bash
+# Archive task outputs to .loom/logs/{date}/
+./scripts/archive-logs.sh [--dry-run] [--retention-days N]
+
+# Safe worktree cleanup (only MERGED PRs)
+./scripts/safe-worktree-cleanup.sh [--dry-run] [--grace-period N]
+
+# Event-driven daemon cleanup
+./scripts/daemon-cleanup.sh <event> [options]
+```
+
+### Cleanup Configuration
+
+Configure via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOOM_CLEANUP_ENABLED` | true | Enable/disable cleanup |
+| `LOOM_ARCHIVE_LOGS` | true | Archive logs before deletion |
+| `LOOM_RETENTION_DAYS` | 7 | Days to retain archives |
+| `LOOM_CLEANUP_INTERVAL` | 360 | Minutes between periodic cleanups |
+| `LOOM_GRACE_PERIOD` | 600 | Seconds after PR merge before cleanup |
+
+### Cleanup State Tracking
+
+The `cleanup` section in daemon-state.json tracks:
+
+- `lastRun`: Timestamp of last cleanup
+- `lastEvent`: Type of last cleanup event
+- `lastCleaned`: Recently cleaned issues
+- `pendingCleanup`: Issues awaiting cleanup (e.g., grace period)
+- `errors`: Any cleanup errors for debugging
+
+### Integrating Cleanup into Daemon Loop
+
+Add cleanup calls to the daemon loop:
+
+```bash
+# After check_shepherd_completions
+for completed_issue in $COMPLETED_ISSUES; do
+  ./scripts/daemon-cleanup.sh shepherd-complete "$completed_issue"
+done
+
+# On startup (once)
+./scripts/daemon-cleanup.sh daemon-startup
+
+# On shutdown
+./scripts/daemon-cleanup.sh daemon-shutdown
+
+# Optionally, periodic cleanup (every N iterations)
+if should_run_periodic_cleanup; then
+  ./scripts/daemon-cleanup.sh periodic
+fi
+```
 ```
 
 ## Terminal Configuration Requirements
