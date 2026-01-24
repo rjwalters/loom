@@ -153,6 +153,23 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_github_events_event_time ON github_events(event_time);
             CREATE INDEX IF NOT EXISTS idx_github_events_pr_number ON github_events(pr_number);
             CREATE INDEX IF NOT EXISTS idx_github_events_issue_number ON github_events(issue_number);
+
+            -- Per-prompt git change tracking
+            -- Links individual prompts to the git changes they caused
+            CREATE TABLE IF NOT EXISTS prompt_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                before_commit TEXT,
+                after_commit TEXT,
+                files_changed INTEGER DEFAULT 0,
+                lines_added INTEGER DEFAULT 0,
+                lines_removed INTEGER DEFAULT 0,
+                tests_added INTEGER DEFAULT 0,
+                tests_modified INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prompt_changes_input_id ON prompt_changes(input_id);
+            CREATE INDEX IF NOT EXISTS idx_prompt_changes_after_commit ON prompt_changes(after_commit);
             ",
     )?;
 

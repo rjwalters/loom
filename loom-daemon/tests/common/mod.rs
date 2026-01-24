@@ -264,8 +264,9 @@ impl TestClient {
     }
 
     /// Helper: Send input to terminal
+    /// Returns the input_id for tracking git changes
     #[allow(dead_code)]
-    pub async fn send_input(&mut self, id: &str, data: &str) -> Result<()> {
+    pub async fn send_input(&mut self, id: &str, data: &str) -> Result<i64> {
         let request = serde_json::json!({
             "type": "SendInput",
             "payload": { "id": id, "data": data }
@@ -273,11 +274,20 @@ impl TestClient {
 
         let response = self.send_request(request).await?;
 
-        if response != serde_json::json!({"type": "Success"}) {
-            anyhow::bail!("Expected Success, got: {response:?}");
+        // Accept both Success (legacy) and InputSent (new) responses
+        if response.get("type") == Some(&serde_json::json!("Success")) {
+            return Ok(0);
         }
 
-        Ok(())
+        if response.get("type") == Some(&serde_json::json!("InputSent")) {
+            if let Some(payload) = response.get("payload") {
+                if let Some(input_id) = payload.get("input_id") {
+                    return Ok(input_id.as_i64().unwrap_or(0));
+                }
+            }
+        }
+
+        anyhow::bail!("Expected Success or InputSent, got: {response:?}");
     }
 
     /// Helper: Check session health for a terminal ID
