@@ -40,6 +40,7 @@ mod db;
 mod models;
 pub mod resource_usage;
 mod schema;
+pub mod stats;
 pub mod test_parser;
 
 // Re-export public types from models
@@ -63,3 +64,10 @@ pub use db::ActivityDb;
 // are provided for external crate access (future MCP servers, etc.)
 #[allow(unused_imports)]
 pub use resource_usage::{detect_provider, parse_resource_usage, ModelPricing, ResourceUsage};
+
+// Re-export stats types and trait for metrics queries
+// These types are used for the `loom stats` CLI commands
+#[allow(unused_imports)]
+pub use stats::{
+    AgentEffectiveness, CostPerIssue, DailyVelocity, StatsQueries, StatsSummary, WeeklyVelocity,
+};
