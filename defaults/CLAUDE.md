@@ -109,13 +109,16 @@ Launch the Loom desktop application for automated orchestration with visual term
 - Autonomous mode with configurable intervals
 - Persistent workspace configuration
 
-### 3. Daemon Mode (Background Process)
+### 3. Daemon Mode (Fully Autonomous)
 
-Run the Loom daemon as a background process for fully autonomous system orchestration.
+Run the Loom daemon for fully autonomous system orchestration.
 
 **Setup**:
 ```bash
-# Start the daemon (spawns background process, returns immediately)
+# Start the daemon (runs continuously, or as background process)
+/loom
+
+# Or start as background process
 /loom start
 
 # Check daemon progress (read-only observer mode)
@@ -123,21 +126,28 @@ Run the Loom daemon as a background process for fully autonomous system orchestr
 
 # Stop the daemon gracefully
 /loom stop
+# Or: touch .loom/stop-daemon
 ```
 
-**Key Principle: Autonomous Operation**
+**Key Principle: FULLY AUTONOMOUS**
 
-The daemon makes ALL spawning decisions. The human observer session should NOT:
+The daemon makes ALL spawning and scaling decisions automatically:
+- Shepherds are spawned automatically when `loom:issue` issues exist
+- Architect/Hermit are triggered automatically when backlog < threshold
+- Guide/Champion are respawned automatically on their intervals
+- No human approval needed for ANY of the above
+
+The human observer should NOT:
 - Manually spawn shepherds or agents
 - Manually trigger Architect/Hermit
 - Override daemon scaling decisions
 - "Help" by manually running agents
 
-The human observer SHOULD:
-- Monitor progress with `/loom status`
-- Approve proposals: `gh issue edit 123 --remove-label "loom:architect" --add-label "loom:issue"`
-- Handle edge cases and blocked issues
-- Stop the daemon when needed
+**Human intervention is ONLY required for**:
+- Approving proposals: `loom:architect` -> `loom:issue`
+- Approving proposals: `loom:hermit` -> `loom:issue`
+- Handling `loom:blocked` issues
+- Strategic direction changes
 
 **When to use Daemon Mode**:
 - Fully autonomous development
@@ -147,35 +157,35 @@ The human observer SHOULD:
 
 **Example workflow**:
 ```bash
-# Session 1: Start daemon and become observer
+# Start daemon
 /loom start
 # Daemon spawns in background, session becomes observer
 
 # Check progress periodically
 /loom status
 
-# Approve architect proposals
+# Or check state file directly
+cat .loom/daemon-state.json | jq
+
+# Approve architect proposals (human action)
 gh issue edit 1050 --remove-label "loom:architect" --add-label "loom:issue"
 
-# Handle blocked issues
+# Handle blocked issues (human action)
 gh issue view 1045 --comments
 gh issue edit 1045 --remove-label "loom:blocked"
 
 # When done
 /loom stop
+# Or: touch .loom/stop-daemon
 ```
 
-**Why Background Process?**
+**Why Autonomous Daemon?**
 
-Running the daemon interactively has problems:
-1. **Blurs responsibilities**: Operator tempted to "help" with manual decisions
-2. **Context limits**: Long-running sessions accumulate context
-3. **No clear separation**: Hard to distinguish daemon actions from human actions
-
-The background model solves these:
 1. **Clear separation**: Daemon executes, human observes
 2. **Fresh context**: Each subagent starts fresh
 3. **True autonomy**: Daemon scales without human intervention
+4. **No manual decisions**: All spawning is automatic based on thresholds
+
 
 ## Agent Roles
 
