@@ -177,6 +177,37 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_input_id ON prompt_changes(input_id);
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_after_commit ON prompt_changes(after_commit);
+
+            -- Quality metrics for tracking test outcomes and code quality
+            CREATE TABLE IF NOT EXISTS quality_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                timestamp DATETIME NOT NULL,
+
+                -- Test results
+                tests_passed INTEGER,
+                tests_failed INTEGER,
+                tests_skipped INTEGER,
+                test_runner TEXT,
+
+                -- Lint/format results
+                lint_errors INTEGER,
+                format_errors INTEGER,
+
+                -- Build status
+                build_success BOOLEAN,
+
+                -- PR review outcomes (populated later)
+                pr_approved BOOLEAN,
+                pr_changes_requested BOOLEAN,
+
+                -- Human rating (optional, for future use)
+                human_rating INTEGER
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_quality_metrics_input_id ON quality_metrics(input_id);
+            CREATE INDEX IF NOT EXISTS idx_quality_metrics_timestamp ON quality_metrics(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_quality_metrics_test_runner ON quality_metrics(test_runner);
             ",
     )?;
 
