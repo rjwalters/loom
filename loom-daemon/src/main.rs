@@ -5,7 +5,6 @@ mod github_parser;
 mod health_monitor;
 mod init;
 mod ipc;
-mod logging;
 mod metrics_collector;
 mod terminal;
 mod types;
