@@ -140,3 +140,48 @@ pub struct ActivityEntry {
 
 /// Type alias for productivity summary: (`agent_system`, `tasks_completed`, `avg_minutes`, `avg_tokens`, `total_cost`)
 pub type ProductivitySummary = Vec<(String, i64, f64, f64, f64)>;
+
+/// Test results parsed from terminal output
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TestResults {
+    pub passed: i32,
+    pub failed: i32,
+    pub skipped: i32,
+    pub runner: Option<String>,
+}
+
+/// Lint/format results parsed from terminal output
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LintResults {
+    pub lint_errors: i32,
+    pub format_errors: i32,
+}
+
+/// Quality metrics record for tracking test outcomes and code quality
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct QualityMetrics {
+    pub id: Option<i64>,
+    pub input_id: Option<i64>,
+    pub timestamp: DateTime<Utc>,
+
+    // Test results
+    pub tests_passed: Option<i32>,
+    pub tests_failed: Option<i32>,
+    pub tests_skipped: Option<i32>,
+    pub test_runner: Option<String>,
+
+    // Lint/format results
+    pub lint_errors: Option<i32>,
+    pub format_errors: Option<i32>,
+
+    // Build status
+    pub build_success: Option<bool>,
+
+    // PR review outcomes
+    pub pr_approved: Option<bool>,
+    pub pr_changes_requested: Option<bool>,
+
+    // Human rating (1-5 stars, optional)
+    pub human_rating: Option<i32>,
+}
