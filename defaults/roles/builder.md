@@ -533,6 +533,151 @@ done
 
 This workflow ensures clean isolation between agents and issues while maintaining a consistent "home base" for each autonomous agent.
 
+## Claiming Workflow (Parallel Mode)
+
+When working with parallel agents (multiple Builders running simultaneously), use the atomic claiming system to prevent race conditions.
+
+### Why Use Atomic Claims?
+
+**The Problem with Labels Alone:**
+- Two Builders see `loom:issue` at the same time
+- Both try to claim by adding `loom:building`
+- Race condition: both may succeed, causing duplicate work
+
+**The Solution:**
+- Use `claim.sh` for atomic file-based locking
+- Label change is still needed (for visibility), but claim.sh prevents races
+- First Builder to claim wins; others move to next issue
+
+### Claiming Workflow
+
+**1. Check for stop signals before claiming new work:**
+
+```bash
+# Check if stop signal exists (graceful shutdown)
+if ./.loom/scripts/signal.sh check "$AGENT_ID"; then
+  echo "Stop signal received, completing current work and exiting"
+  exit 0
+fi
+```
+
+**2. Attempt atomic claim before label change:**
+
+```bash
+# Try to claim atomically (prevents race conditions)
+if ./.loom/scripts/claim.sh claim "$ISSUE_NUMBER" "$AGENT_ID"; then
+  # Claim succeeded - now update labels for visibility
+  gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
+  echo "✓ Claimed issue #$ISSUE_NUMBER"
+else
+  # Another agent claimed it first
+  echo "Issue #$ISSUE_NUMBER already claimed, trying next issue"
+  continue  # In a loop, move to next issue
+fi
+```
+
+**3. Extend claim for long-running work:**
+
+```bash
+# If work takes longer than 30 minutes, extend the claim
+./.loom/scripts/claim.sh extend "$ISSUE_NUMBER" "$AGENT_ID" 3600  # Extend by 1 hour
+```
+
+**4. Release claim on completion or abandonment:**
+
+```bash
+# When PR is created or work is blocked, release the claim
+./.loom/scripts/claim.sh release "$ISSUE_NUMBER" "$AGENT_ID"
+```
+
+### Full Parallel Mode Example
+
+```bash
+#!/bin/bash
+AGENT_ID="${AGENT_ID:-builder-$$}"
+
+while true; do
+  # Check for stop signal
+  if ./.loom/scripts/signal.sh check "$AGENT_ID"; then
+    echo "Stop signal received, exiting"
+    exit 0
+  fi
+
+  # Find available issues
+  ISSUES=$(gh issue list --label="loom:issue" --state=open --json number --jq '.[].number')
+
+  for ISSUE_NUMBER in $ISSUES; do
+    # Try atomic claim
+    if ./.loom/scripts/claim.sh claim "$ISSUE_NUMBER" "$AGENT_ID" 1800; then
+      # Claim succeeded
+      gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
+
+      # Create worktree and do work
+      ./.loom/scripts/worktree.sh "$ISSUE_NUMBER"
+      cd ".loom/worktrees/issue-$ISSUE_NUMBER"
+
+      # ... implement feature ...
+      # ... run tests ...
+      # ... create PR ...
+
+      # Release claim (PR will handle the rest)
+      ./.loom/scripts/claim.sh release "$ISSUE_NUMBER" "$AGENT_ID"
+
+      break  # Move to next iteration
+    fi
+  done
+
+  # No issues available, wait before retrying
+  sleep 60
+done
+```
+
+### Claim Commands Reference
+
+| Command | Purpose |
+|---------|---------|
+| `claim.sh claim <issue> [agent-id] [ttl]` | Atomically claim an issue (default TTL: 30 min) |
+| `claim.sh extend <issue> <agent-id> [seconds]` | Extend claim TTL for long work |
+| `claim.sh release <issue> [agent-id]` | Release claim when done |
+| `claim.sh check <issue>` | Check if issue is claimed |
+| `claim.sh list` | List all active claims |
+| `claim.sh cleanup` | Remove expired claims |
+
+### Signal Commands Reference
+
+| Command | Purpose |
+|---------|---------|
+| `signal.sh stop <agent-id\|all>` | Send stop signal |
+| `signal.sh check <agent-id>` | Check for stop signal (exit 0 if signal exists) |
+| `signal.sh clear <agent-id\|all>` | Clear stop signal |
+
+### When to Use Parallel Mode
+
+**Use atomic claiming when:**
+- Multiple Builder agents run simultaneously (Tauri App Mode)
+- Risk of two agents picking the same issue
+- Need graceful shutdown capability
+
+**Skip atomic claiming when:**
+- Single Builder in Manual Orchestration Mode
+- Human directly assigns issues
+- Testing/debugging workflows
+
+### Graceful Degradation
+
+If `claim.sh` or `signal.sh` don't exist (older installations), fall back to label-only claiming:
+
+```bash
+# Check if claiming system exists
+if [[ -x ./.loom/scripts/claim.sh ]]; then
+  # Use atomic claiming
+  ./.loom/scripts/claim.sh claim "$ISSUE_NUMBER" "$AGENT_ID" || continue
+fi
+
+# Always update labels (works with or without claiming system)
+gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
+```
+
 ## Reading Issues: ALWAYS Read Comments First
 
 **CRITICAL:** Curator adds implementation guidance in comments (and sometimes amends descriptions). You MUST read both the issue body AND all comments before starting work.
