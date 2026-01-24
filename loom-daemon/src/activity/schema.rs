@@ -245,13 +245,160 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_resource_usage_timestamp ON resource_usage(timestamp);
             CREATE INDEX IF NOT EXISTS idx_resource_usage_model ON resource_usage(model);
             CREATE INDEX IF NOT EXISTS idx_resource_usage_provider ON resource_usage(provider);
+
+            -- Budget configuration for cost tracking (Issue #1064)
+            -- Allows setting budget limits per period with alert thresholds
+            CREATE TABLE IF NOT EXISTS budget_config (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                period TEXT NOT NULL CHECK(period IN ('daily', 'weekly', 'monthly')),
+                limit_usd REAL NOT NULL,
+                alert_threshold REAL NOT NULL DEFAULT 0.8,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_budget_config_period ON budget_config(period);
+            CREATE INDEX IF NOT EXISTS idx_budget_config_active ON budget_config(is_active);
             ",
     )?;
 
     // Run migrations for existing databases
     migrate_token_usage_table(conn);
 
+    // Create cost analytics views
+    create_cost_analytics_views(conn);
+
     Ok(())
+}
+
+/// Create SQL views for cost analytics (Issue #1064).
+///
+/// Creates views for aggregating costs by:
+/// - Agent role (`cost_by_role`)
+/// - GitHub issue (`cost_by_issue`)
+/// - PR (`cost_by_pr`)
+/// - Time period (`cost_by_day`, `cost_by_week`, `cost_by_month`)
+fn create_cost_analytics_views(conn: &Connection) {
+    // Cost by role view - aggregates costs from resource_usage joined with agent_inputs
+    let views: [(&str, &str); 6] = [
+        (
+            "cost_by_role",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_role AS
+            SELECT
+                COALESCE(ai.agent_role, 'unknown') as agent_role,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                AVG(ru.cost_usd) as avg_cost,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens,
+                MIN(ru.timestamp) as first_usage,
+                MAX(ru.timestamp) as last_usage
+            FROM resource_usage ru
+            LEFT JOIN agent_inputs ai ON ru.input_id = ai.id
+            GROUP BY COALESCE(ai.agent_role, 'unknown')
+            ",
+        ),
+        (
+            "cost_by_issue",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_issue AS
+            SELECT
+                pg.issue_number,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(DISTINCT ru.input_id) as prompt_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens,
+                MIN(ru.timestamp) as first_usage,
+                MAX(ru.timestamp) as last_usage
+            FROM resource_usage ru
+            JOIN agent_inputs ai ON ru.input_id = ai.id
+            JOIN prompt_github pg ON ai.id = pg.input_id
+            WHERE pg.issue_number IS NOT NULL
+            GROUP BY pg.issue_number
+            ",
+        ),
+        (
+            "cost_by_pr",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_pr AS
+            SELECT
+                pg.pr_number,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(DISTINCT ru.input_id) as prompt_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens,
+                MIN(ru.timestamp) as first_usage,
+                MAX(ru.timestamp) as last_usage
+            FROM resource_usage ru
+            JOIN agent_inputs ai ON ru.input_id = ai.id
+            JOIN prompt_github pg ON ai.id = pg.input_id
+            WHERE pg.pr_number IS NOT NULL
+            GROUP BY pg.pr_number
+            ",
+        ),
+        (
+            "cost_by_day",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_day AS
+            SELECT
+                DATE(ru.timestamp) as date,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens
+            FROM resource_usage ru
+            GROUP BY DATE(ru.timestamp)
+            ORDER BY date DESC
+            ",
+        ),
+        (
+            "cost_by_week",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_week AS
+            SELECT
+                strftime('%Y-W%W', ru.timestamp) as week,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens
+            FROM resource_usage ru
+            GROUP BY strftime('%Y-W%W', ru.timestamp)
+            ORDER BY week DESC
+            ",
+        ),
+        (
+            "cost_by_month",
+            r"
+            CREATE VIEW IF NOT EXISTS cost_by_month AS
+            SELECT
+                strftime('%Y-%m', ru.timestamp) as month,
+                SUM(ru.cost_usd) as total_cost,
+                COUNT(*) as request_count,
+                SUM(ru.tokens_input) as total_input_tokens,
+                SUM(ru.tokens_output) as total_output_tokens
+            FROM resource_usage ru
+            GROUP BY strftime('%Y-%m', ru.timestamp)
+            ORDER BY month DESC
+            ",
+        ),
+    ];
+
+    for (view_name, sql) in views {
+        match conn.execute_batch(sql) {
+            Ok(()) => log::debug!("Created or verified view: {view_name}"),
+            Err(e) => {
+                // Views already existing is fine
+                let err_str = e.to_string();
+                if err_str.contains("already exists") {
+                    log::debug!("View {view_name} already exists");
+                } else {
+                    log::warn!("Could not create view {view_name}: {e}");
+                }
+            }
+        }
+    }
 }
 
 /// Migrate `token_usage` table to add new columns for resource tracking.

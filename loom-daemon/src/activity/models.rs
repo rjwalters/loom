@@ -269,3 +269,161 @@ pub struct QualityMetrics {
     // Human rating (1-5 stars, optional)
     pub human_rating: Option<i32>,
 }
+
+// ============================================================================
+// Cost Analytics Models (Issue #1064)
+// ============================================================================
+
+/// Budget period type for budget configuration
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BudgetPeriod {
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+impl BudgetPeriod {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Monthly => "monthly",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "daily" => Some(Self::Daily),
+            "weekly" => Some(Self::Weekly),
+            "monthly" => Some(Self::Monthly),
+            _ => None,
+        }
+    }
+}
+
+/// Budget configuration record for tracking spending limits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetConfig {
+    pub id: Option<i64>,
+    pub period: BudgetPeriod,
+    pub limit_usd: f64,
+    /// Alert threshold as a fraction (0.0-1.0), default 0.8 (80%)
+    pub alert_threshold: f64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub is_active: bool,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            id: None,
+            period: BudgetPeriod::Monthly,
+            limit_usd: 100.0,
+            alert_threshold: 0.8,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            is_active: true,
+        }
+    }
+}
+
+/// Cost summary for a specific time period
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostSummary {
+    /// Start of the period
+    pub start_date: DateTime<Utc>,
+    /// End of the period
+    pub end_date: DateTime<Utc>,
+    /// Total cost in USD
+    pub total_cost: f64,
+    /// Number of API requests
+    pub request_count: i64,
+    /// Total input tokens consumed
+    pub total_input_tokens: i64,
+    /// Total output tokens consumed
+    pub total_output_tokens: i64,
+    /// Average cost per request
+    pub avg_cost_per_request: f64,
+}
+
+/// Cost breakdown by agent role
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostByRole {
+    pub agent_role: String,
+    pub total_cost: f64,
+    pub request_count: i64,
+    pub avg_cost: f64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub first_usage: Option<DateTime<Utc>>,
+    pub last_usage: Option<DateTime<Utc>>,
+}
+
+/// Cost breakdown by GitHub issue
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostByIssue {
+    pub issue_number: i32,
+    pub total_cost: f64,
+    pub prompt_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub first_usage: Option<DateTime<Utc>>,
+    pub last_usage: Option<DateTime<Utc>>,
+}
+
+/// Cost breakdown by pull request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostByPr {
+    pub pr_number: i32,
+    pub total_cost: f64,
+    pub prompt_count: i64,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
+    pub first_usage: Option<DateTime<Utc>>,
+    pub last_usage: Option<DateTime<Utc>>,
+}
+
+/// Budget status showing current spend against limits
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BudgetStatus {
+    /// The budget configuration
+    pub config: BudgetConfig,
+    /// Amount spent in the current period
+    pub spent: f64,
+    /// Remaining budget
+    pub remaining: f64,
+    /// Usage as a percentage (0-100)
+    pub usage_percent: f64,
+    /// Whether the alert threshold has been crossed
+    pub alert_triggered: bool,
+    /// Whether the budget has been exceeded
+    pub budget_exceeded: bool,
+    /// Current period start
+    pub period_start: DateTime<Utc>,
+    /// Current period end
+    pub period_end: DateTime<Utc>,
+}
+
+/// Runway projection based on burn rate
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunwayProjection {
+    /// Current remaining budget
+    pub remaining_budget: f64,
+    /// Average daily cost over the lookback period
+    pub avg_daily_cost: f64,
+    /// Estimated days until budget exhaustion
+    pub days_remaining: f64,
+    /// Projected exhaustion date
+    pub exhaustion_date: Option<DateTime<Utc>>,
+    /// Number of days used for the calculation
+    pub lookback_days: i32,
+}
