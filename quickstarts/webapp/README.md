@@ -192,7 +192,7 @@ npx wrangler secret put MY_SECRET
 
 ## Learn More
 
-- [Loom Documentation](https://github.com/loomhq/loom)
+- [Loom Documentation](https://github.com/rjwalters/loom)
 - [Cloudflare Pages](https://developers.cloudflare.com/pages/)
 - [Cloudflare D1](https://developers.cloudflare.com/d1/)
 - [React](https://react.dev)

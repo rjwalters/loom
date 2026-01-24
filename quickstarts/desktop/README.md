@@ -220,7 +220,7 @@ For cross-compilation, see the [Tauri cross-compilation guide](https://tauri.app
 
 ## Learn More
 
-- [Loom Documentation](https://github.com/loomhq/loom)
+- [Loom Documentation](https://github.com/rjwalters/loom)
 - [Tauri 2.0 Guides](https://tauri.app/v2/guides/)
 - [React](https://react.dev)
 - [Tailwind CSS](https://tailwindcss.com)

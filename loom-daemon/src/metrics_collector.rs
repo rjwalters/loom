@@ -28,7 +28,7 @@ use std::time::Duration;
 pub struct MetricsConfig {
     /// Path to workspace directory
     pub workspace_path: String,
-    /// GitHub repository owner (e.g., "loomhq")
+    /// GitHub repository owner (e.g., "rjwalters")
     pub repo_owner: String,
     /// GitHub repository name (e.g., "loom")
     pub repo_name: String,
@@ -198,7 +198,7 @@ fn validate_github_workspace(workspace_path: &str) -> Result<(String, String)> {
 ///
 /// let config = metrics_collector::MetricsConfig {
 ///     workspace_path: "/path/to/workspace".to_string(),
-///     repo_owner: "loomhq".to_string(),
+///     repo_owner: "rjwalters".to_string(),
 ///     repo_name: "loom".to_string(),
 ///     interval_secs: 900,
 ///     db_path: "/path/to/activity.db".to_string(),

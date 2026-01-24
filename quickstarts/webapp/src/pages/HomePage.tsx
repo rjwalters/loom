@@ -29,7 +29,7 @@ export function HomePage() {
               <Link to="/login">Get Started</Link>
             </Button>
             <Button asChild variant="outline" size="lg">
-              <a href="https://github.com/loomhq/loom" target="_blank" rel="noopener noreferrer">
+              <a href="https://github.com/rjwalters/loom" target="_blank" rel="noopener noreferrer">
                 Learn More
               </a>
             </Button>

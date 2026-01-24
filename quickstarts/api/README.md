@@ -284,7 +284,7 @@ pnpm db:migrate:prod
 
 ## Learn More
 
-- [Loom Documentation](https://github.com/loomhq/loom)
+- [Loom Documentation](https://github.com/rjwalters/loom)
 - [Hono](https://hono.dev/)
 - [Cloudflare Workers](https://developers.cloudflare.com/workers/)
 - [Cloudflare D1](https://developers.cloudflare.com/d1/)

@@ -119,7 +119,7 @@ export function SettingsPage() {
               <Button
                 variant="outline"
                 className="w-full"
-                onClick={() => open("https://github.com/loomhq/loom")}
+                onClick={() => open("https://github.com/rjwalters/loom")}
               >
                 <ExternalLink className="mr-2 h-4 w-4" />
                 View on GitHub
