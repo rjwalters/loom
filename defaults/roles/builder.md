@@ -1152,6 +1152,134 @@ After PR creation:
 - [ ] STOP - do not touch any PR labels
 - [ ] Move to next issue
 
+## Handling Pre-existing Lint/Build Failures
+
+**IMPORTANT**: When the target codebase has pre-existing issues, don't let them block your focused work.
+
+### The Problem
+
+Target codebases may have pre-existing failures that are unrelated to your issue:
+- Deprecated linter configurations
+- CSS classes not defined in newer framework versions
+- A11y warnings in unrelated files
+- Type errors in untouched code
+
+**These are NOT your responsibility to fix when implementing a specific feature.**
+
+### Strategy: Focus on Your Changes
+
+**Step 1: Identify what you changed**
+
+```bash
+# Get list of files you modified
+git diff --name-only origin/main
+```
+
+**Step 2: Run scoped checks on your changes only**
+
+```bash
+# Lint only changed files (Biome)
+git diff --name-only origin/main -- '*.ts' '*.tsx' '*.js' '*.jsx' | xargs npx biome check
+
+# Lint only changed files (ESLint)
+git diff --name-only origin/main -- '*.ts' '*.tsx' '*.js' '*.jsx' | xargs npx eslint
+
+# Type-check affected files (TypeScript will check dependencies automatically)
+npx tsc --noEmit
+```
+
+**Step 3: If full checks fail on pre-existing issues**
+
+1. **Document in PR description** what pre-existing issues exist
+2. **Don't fix unrelated issues** - this expands scope
+3. **Optionally create a follow-up issue** for the tech debt
+
+### PR Documentation Template
+
+When pre-existing issues exist, add this to your PR:
+
+```markdown
+## Pre-existing Issues (Not Addressed)
+
+The following issues exist in the codebase but are outside the scope of this PR:
+
+- [ ] `biome.json` uses deprecated v1 schema (needs migration to v2)
+- [ ] `DashboardPage.tsx` has a11y warnings (unrelated to this feature)
+- [ ] Tailwind 4 CSS class `border-border` not defined
+
+These should be addressed in separate PRs to maintain focused scope.
+```
+
+### Decision Tree
+
+```
+Lint/Build fails
+↓
+Is the failure in YOUR changed files?
+├─ YES → Fix it (your responsibility)
+└─ NO → Pre-existing issue
+         ├─ Document in PR description
+         ├─ Continue with your implementation
+         └─ Optionally create follow-up issue
+```
+
+### Creating Follow-up Issues (Optional)
+
+If you want to track pre-existing issues for future cleanup:
+
+```bash
+gh issue create --title "Tech debt: Migrate biome.json to v2 schema" --body "$(cat <<'EOF'
+## Problem
+
+`biome.json` uses deprecated v1 schema which causes warnings on every lint run.
+
+## Discovery
+
+Found while working on #969. Not fixed there to maintain focused scope.
+
+## Solution
+
+Run `npx @biomejs/biome migrate` to update configuration.
+
+## Impact
+
+- Removes deprecation warnings
+- Enables new linter rules
+- Estimated: 30 minutes
+EOF
+)"
+```
+
+### What NOT to Do
+
+❌ **Don't block your PR on unrelated failures**
+```bash
+# WRONG: Spending hours fixing biome config for an unrelated feature
+```
+
+❌ **Don't include unrelated fixes in your PR**
+```bash
+# WRONG: PR titled "Add login button" that also migrates linter config
+```
+
+❌ **Don't ignore failures in YOUR code**
+```bash
+# WRONG: Introducing new lint errors in the code you wrote
+```
+
+### Why This Matters
+
+**Scope creep kills productivity:**
+- Issue #921 spent 2+ hours on biome migration (unrelated to feature)
+- Issue #922 fixed a11y warnings in files not touched by the feature
+- Each detour adds risk and delays the actual goal
+
+**Focused PRs are better:**
+- Easier to review (one concern per PR)
+- Faster to merge (no surprises)
+- Clearer git history (each commit has one purpose)
+- Lower risk (smaller blast radius)
+
 ## Raising Concerns
 
 After completing your assigned work, you can suggest improvements by creating unlabeled issues. The Architect will triage them and the user decides priority.
