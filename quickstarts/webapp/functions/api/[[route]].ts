@@ -13,6 +13,16 @@ interface User {
   created_at: string;
 }
 
+interface Project {
+  id: string;
+  user_id: string;
+  name: string;
+  description: string | null;
+  status: "active" | "archived";
+  created_at: string;
+  updated_at: string;
+}
+
 interface Session {
   id: string;
   user_id: string;
@@ -142,6 +152,13 @@ async function refreshSession(env: Env, sessionId: string): Promise<void> {
 // Clean up expired sessions (call periodically)
 async function cleanupExpiredSessions(env: Env): Promise<void> {
   await env.DB.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')").run();
+}
+
+// Get authenticated user from session cookie
+async function getAuthenticatedUser(env: Env, request: Request): Promise<User | null> {
+  const sessionId = getSessionIdFromCookie(request);
+  if (!sessionId) return null;
+  return getSessionUser(env, sessionId);
 }
 
 // Auth handlers
@@ -284,15 +301,13 @@ async function handleRefreshSession(env: Env, request: Request): Promise<Respons
 // Route handlers
 async function handleGetUsers(env: Env): Promise<Response> {
   const { results } = await env.DB.prepare(
-    "SELECT id, email, name, created_at FROM users ORDER BY created_at DESC LIMIT 100"
+    "SELECT id, email, name, created_at FROM users ORDER BY created_at DESC LIMIT 100",
   ).all<User>();
   return json({ users: results });
 }
 
 async function handleGetUser(env: Env, id: string): Promise<Response> {
-  const user = await env.DB.prepare(
-    "SELECT id, email, name, created_at FROM users WHERE id = ?"
-  )
+  const user = await env.DB.prepare("SELECT id, email, name, created_at FROM users WHERE id = ?")
     .bind(id)
     .first<User>();
 
@@ -303,7 +318,7 @@ async function handleGetUser(env: Env, id: string): Promise<Response> {
 }
 
 async function handleCreateUser(env: Env, request: Request): Promise<Response> {
-  const body = await request.json() as { email?: string; name?: string; password?: string };
+  const body = (await request.json()) as { email?: string; name?: string; password?: string };
   const { email, name, password } = body;
 
   if (!email || !name || !password) {
@@ -314,9 +329,7 @@ async function handleCreateUser(env: Env, request: Request): Promise<Response> {
   const { hash: passwordHash } = await hashPassword(password);
 
   try {
-    await env.DB.prepare(
-      "INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)"
-    )
+    await env.DB.prepare("INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)")
       .bind(id, email, name, passwordHash)
       .run();
 
@@ -343,6 +356,133 @@ async function handleHealthCheck(env: Env): Promise<Response> {
   } catch {
     return json({ status: "unhealthy", error: "Database unavailable" }, 503);
   }
+}
+
+// Project handlers
+async function handleGetProjects(env: Env, userId: string): Promise<Response> {
+  const { results } = await env.DB.prepare(
+    "SELECT id, user_id, name, description, status, created_at, updated_at FROM projects WHERE user_id = ? ORDER BY created_at DESC",
+  )
+    .bind(userId)
+    .all<Project>();
+  return json({ projects: results });
+}
+
+async function handleGetProject(env: Env, id: string, userId: string): Promise<Response> {
+  const project = await env.DB.prepare(
+    "SELECT id, user_id, name, description, status, created_at, updated_at FROM projects WHERE id = ? AND user_id = ?",
+  )
+    .bind(id, userId)
+    .first<Project>();
+
+  if (!project) {
+    return error("Project not found", 404);
+  }
+  return json({ project });
+}
+
+async function handleCreateProject(env: Env, request: Request, userId: string): Promise<Response> {
+  const body = (await request.json()) as { name?: string; description?: string };
+  const { name, description } = body;
+
+  if (!name) {
+    return error("Name is required");
+  }
+
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(
+    "INSERT INTO projects (id, user_id, name, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, 'active', ?, ?)",
+  )
+    .bind(id, userId, name, description || null, now, now)
+    .run();
+
+  return json(
+    {
+      project: {
+        id,
+        user_id: userId,
+        name,
+        description: description || null,
+        status: "active",
+        created_at: now,
+        updated_at: now,
+      },
+    },
+    201,
+  );
+}
+
+async function handleUpdateProject(
+  env: Env,
+  request: Request,
+  id: string,
+  userId: string,
+): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND user_id = ?")
+    .bind(id, userId)
+    .first();
+
+  if (!existing) {
+    return error("Project not found", 404);
+  }
+
+  const body = (await request.json()) as { name?: string; description?: string; status?: string };
+  const updates: string[] = [];
+  const values: (string | null)[] = [];
+
+  if (body.name !== undefined) {
+    updates.push("name = ?");
+    values.push(body.name);
+  }
+  if (body.description !== undefined) {
+    updates.push("description = ?");
+    values.push(body.description);
+  }
+  if (body.status !== undefined) {
+    if (body.status !== "active" && body.status !== "archived") {
+      return error("Status must be 'active' or 'archived'");
+    }
+    updates.push("status = ?");
+    values.push(body.status);
+  }
+
+  if (updates.length === 0) {
+    return error("No fields to update");
+  }
+
+  const now = new Date().toISOString();
+  updates.push("updated_at = ?");
+  values.push(now);
+  values.push(id);
+  values.push(userId);
+
+  await env.DB.prepare(`UPDATE projects SET ${updates.join(", ")} WHERE id = ? AND user_id = ?`)
+    .bind(...values)
+    .run();
+
+  const project = await env.DB.prepare(
+    "SELECT id, user_id, name, description, status, created_at, updated_at FROM projects WHERE id = ?",
+  )
+    .bind(id)
+    .first<Project>();
+
+  return json({ project });
+}
+
+async function handleDeleteProject(env: Env, id: string, userId: string): Promise<Response> {
+  const existing = await env.DB.prepare("SELECT id FROM projects WHERE id = ? AND user_id = ?")
+    .bind(id, userId)
+    .first();
+
+  if (!existing) {
+    return error("Project not found", 404);
+  }
+
+  await env.DB.prepare("DELETE FROM projects WHERE id = ? AND user_id = ?").bind(id, userId).run();
+
+  return json({ success: true });
 }
 
 // Main request handler
@@ -393,6 +533,36 @@ export const onRequest: PagesFunction<Env> = async (context) => {
     const userMatch = path.match(/^\/api\/users\/([^/]+)$/);
     if (userMatch && method === "GET") {
       return handleGetUser(env, userMatch[1]);
+    }
+
+    // Projects endpoints (require authentication via session cookie)
+    if (path === "/api/projects" && method === "GET") {
+      const user = await getAuthenticatedUser(env, request);
+      if (!user) return error("Unauthorized", 401);
+      return handleGetProjects(env, user.id);
+    }
+
+    if (path === "/api/projects" && method === "POST") {
+      const user = await getAuthenticatedUser(env, request);
+      if (!user) return error("Unauthorized", 401);
+      return handleCreateProject(env, request, user.id);
+    }
+
+    const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
+    if (projectMatch) {
+      const user = await getAuthenticatedUser(env, request);
+      if (!user) return error("Unauthorized", 401);
+      const projectId = projectMatch[1];
+
+      if (method === "GET") {
+        return handleGetProject(env, projectId, user.id);
+      }
+      if (method === "PUT") {
+        return handleUpdateProject(env, request, projectId, user.id);
+      }
+      if (method === "DELETE") {
+        return handleDeleteProject(env, projectId, user.id);
+      }
     }
 
     // 404 for unknown routes
