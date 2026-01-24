@@ -7,10 +7,11 @@
 //!
 //! The initialization process:
 //! 1. Validates the target is a git repository
-//! 2. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
-//! 3. Sets up repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
-//! 4. Updates .gitignore with Loom ephemeral patterns
-//! 5. Reports which files were preserved vs added
+//! 2. Detects self-installation (Loom source repo) and runs validation-only mode
+//! 3. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
+//! 4. Sets up repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+//! 5. Updates .gitignore with Loom ephemeral patterns
+//! 6. Reports which files were preserved vs added
 
 use std::collections::HashSet;
 use std::fs;
@@ -33,6 +34,29 @@ pub struct InitReport {
     pub preserved: Vec<String>,
     /// Files that were updated (existed before, overwritten in force mode)
     pub updated: Vec<String>,
+    /// Whether this was a self-installation (Loom source repo)
+    pub is_self_install: bool,
+    /// Validation results for self-installation mode
+    pub validation: Option<ValidationReport>,
+}
+
+/// Validation report for self-installation mode
+#[derive(Debug, Default)]
+pub struct ValidationReport {
+    /// Role definitions found
+    pub roles_found: Vec<String>,
+    /// Scripts found
+    pub scripts_found: Vec<String>,
+    /// Slash commands found
+    pub commands_found: Vec<String>,
+    /// Whether CLAUDE.md exists
+    pub has_claude_md: bool,
+    /// Whether AGENTS.md exists
+    pub has_agents_md: bool,
+    /// Whether .github/labels.yml exists
+    pub has_labels_yml: bool,
+    /// Issues found during validation
+    pub issues: Vec<String>,
 }
 
 /// Loom installation metadata for template variable substitution
@@ -102,6 +126,160 @@ fn extract_repo_info(workspace_path: &Path) -> Option<(String, String)> {
     }
 
     None
+}
+
+/// Check if the workspace is the Loom source repository itself
+///
+/// This detects self-installation to prevent overwriting the source of truth
+/// with minimal defaults. When detected, initialization switches to validation-only mode.
+///
+/// # Detection Methods
+///
+/// 1. **Marker file**: `.loom-source` file exists (most reliable)
+/// 2. **Directory structure**: Has `src-tauri/`, `loom-daemon/`, and `defaults/` directories
+/// 3. **Git remote**: Remote URL matches known Loom repositories
+///
+/// # Returns
+///
+/// `true` if this appears to be the Loom source repository
+pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
+    // Method 1: Check for explicit marker file
+    if workspace_path.join(".loom-source").exists() {
+        return true;
+    }
+
+    // Method 2: Check for Loom-specific directory structure
+    let has_src_tauri = workspace_path.join("src-tauri").is_dir();
+    let has_loom_daemon = workspace_path.join("loom-daemon").is_dir();
+    let has_defaults = workspace_path.join("defaults").is_dir();
+
+    if has_src_tauri && has_loom_daemon && has_defaults {
+        // Additional check: defaults should have config.json and roles/
+        let defaults_has_config = workspace_path.join("defaults").join("config.json").exists();
+        let defaults_has_roles = workspace_path.join("defaults").join("roles").is_dir();
+
+        if defaults_has_config && defaults_has_roles {
+            return true;
+        }
+    }
+
+    // Method 3: Check git remote for known Loom repositories
+    if let Some((owner, repo)) = extract_repo_info(workspace_path) {
+        // Match various Loom repository locations
+        let is_loom_repo = (owner == "loomhq" && repo == "loom")
+            || (owner == "rjwalters" && repo == "loom")
+            || repo == "loom" && workspace_path.join("src-tauri").is_dir();
+
+        if is_loom_repo {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Validate an existing Loom source repository configuration
+///
+/// Instead of copying files, this validates that the expected structure exists
+/// and reports any issues found.
+fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
+    let mut report = ValidationReport::default();
+    let loom_path = workspace_path.join(".loom");
+
+    // Check roles
+    let roles_dir = loom_path.join("roles");
+    if roles_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&roles_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    if let Some(name) = path.file_stem() {
+                        report.roles_found.push(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        report.issues.push("Missing .loom/roles/ directory".to_string());
+    }
+
+    // Check scripts
+    let scripts_dir = loom_path.join("scripts");
+    if scripts_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&scripts_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "sh") {
+                    if let Some(name) = path.file_stem() {
+                        report.scripts_found.push(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        report.issues.push("Missing .loom/scripts/ directory".to_string());
+    }
+
+    // Check .claude/commands/
+    let commands_dir = workspace_path.join(".claude").join("commands");
+    if commands_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&commands_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                let path = entry.path();
+                if path.extension().is_some_and(|e| e == "md") {
+                    if let Some(name) = path.file_stem() {
+                        report.commands_found.push(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    } else {
+        report.issues.push("Missing .claude/commands/ directory".to_string());
+    }
+
+    // Check documentation files
+    report.has_claude_md = workspace_path.join("CLAUDE.md").exists();
+    if !report.has_claude_md {
+        report.issues.push("Missing CLAUDE.md".to_string());
+    }
+
+    report.has_agents_md = workspace_path.join("AGENTS.md").exists();
+    if !report.has_agents_md {
+        report.issues.push("Missing AGENTS.md".to_string());
+    }
+
+    // Check labels.yml
+    report.has_labels_yml = workspace_path
+        .join(".github")
+        .join("labels.yml")
+        .exists();
+    if !report.has_labels_yml {
+        report.issues.push("Missing .github/labels.yml".to_string());
+    }
+
+    // Validate minimum expected counts
+    if report.roles_found.len() < 5 {
+        report.issues.push(format!(
+            "Expected at least 5 role definitions, found {}",
+            report.roles_found.len()
+        ));
+    }
+
+    if report.scripts_found.len() < 2 {
+        report.issues.push(format!(
+            "Expected at least 2 scripts, found {}",
+            report.scripts_found.len()
+        ));
+    }
+
+    if report.commands_found.len() < 4 {
+        report.issues.push(format!(
+            "Expected at least 4 slash commands, found {}",
+            report.commands_found.len()
+        ));
+    }
+
+    report
 }
 
 /// Replace template variables in a string
@@ -174,6 +352,20 @@ pub fn initialize_workspace(
 
     // Validate workspace is a git repository
     validate_git_repository(workspace_path)?;
+
+    // Check for self-installation (Loom source repo)
+    if is_loom_source_repo(workspace) {
+        report.is_self_install = true;
+
+        // Run validation instead of copying files
+        let validation = validate_loom_source_repo(workspace);
+        report.validation = Some(validation);
+
+        // Update .gitignore (this is safe even for self-install)
+        update_gitignore(workspace)?;
+
+        return Ok(report);
+    }
 
     // Resolve defaults path (development mode or bundled resource)
     let defaults = resolve_defaults_path(defaults_path)?;
@@ -1196,5 +1388,102 @@ mod tests {
         let content = fs::read_to_string(workspace.join("package.json")).unwrap();
         assert!(content.contains("my-rust-project"));
         assert!(!content.contains("loom-workspace"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_is_loom_source_repo_marker_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        // Initially not a Loom source repo
+        assert!(!is_loom_source_repo(workspace));
+
+        // Create marker file
+        fs::write(workspace.join(".loom-source"), "").unwrap();
+
+        // Now it should be detected as Loom source repo
+        assert!(is_loom_source_repo(workspace));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_is_loom_source_repo_directory_structure() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        // Initially not a Loom source repo
+        assert!(!is_loom_source_repo(workspace));
+
+        // Create partial structure (not enough)
+        fs::create_dir(workspace.join("src-tauri")).unwrap();
+        assert!(!is_loom_source_repo(workspace));
+
+        // Create more structure
+        fs::create_dir(workspace.join("loom-daemon")).unwrap();
+        assert!(!is_loom_source_repo(workspace));
+
+        // Create defaults directory
+        fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
+        fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();
+
+        // Now it should be detected as Loom source repo
+        assert!(is_loom_source_repo(workspace));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_self_install_returns_validation_report() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        // Create git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create Loom source structure
+        fs::create_dir(workspace.join("src-tauri")).unwrap();
+        fs::create_dir(workspace.join("loom-daemon")).unwrap();
+        fs::create_dir_all(workspace.join("defaults").join("roles")).unwrap();
+        fs::write(workspace.join("defaults").join("config.json"), "{}").unwrap();
+
+        // Create minimal .loom structure
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("scripts")).unwrap();
+        fs::write(workspace.join(".loom").join("roles").join("builder.md"), "").unwrap();
+        fs::write(workspace.join(".loom").join("scripts").join("worktree.sh"), "").unwrap();
+
+        // Create .claude/commands/
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(workspace.join(".claude").join("commands").join("builder.md"), "").unwrap();
+
+        // Create docs
+        fs::write(workspace.join("CLAUDE.md"), "").unwrap();
+        fs::write(workspace.join("AGENTS.md"), "").unwrap();
+
+        // Create labels.yml
+        fs::create_dir_all(workspace.join(".github")).unwrap();
+        fs::write(workspace.join(".github").join("labels.yml"), "").unwrap();
+
+        // Run initialization
+        let result = initialize_workspace(
+            workspace.to_str().unwrap(),
+            "nonexistent-defaults", // Should not be used for self-install
+            false,
+        );
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Verify self-install detection
+        assert!(report.is_self_install);
+        assert!(report.validation.is_some());
+
+        let validation = report.validation.unwrap();
+        assert!(validation.roles_found.contains(&"builder".to_string()));
+        assert!(validation.scripts_found.contains(&"worktree".to_string()));
+        assert!(validation.commands_found.contains(&"builder".to_string()));
+        assert!(validation.has_claude_md);
+        assert!(validation.has_agents_md);
+        assert!(validation.has_labels_yml);
     }
 }
