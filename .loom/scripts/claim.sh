@@ -7,6 +7,7 @@
 #
 # Usage:
 #   claim.sh claim <issue-number> [agent-id] [ttl-seconds]
+#   claim.sh extend <issue-number> <agent-id> [additional-seconds]
 #   claim.sh release <issue-number> [agent-id]
 #   claim.sh check <issue-number>
 #   claim.sh list
@@ -162,6 +163,76 @@ EOF
             return $?
         fi
     fi
+}
+
+# Extend a claim's TTL
+# Usage: extend_claim <issue-number> <agent-id> [additional-seconds]
+extend_claim() {
+    local issue_number="$1"
+    local agent_id="$2"
+    local additional_seconds="${3:-$DEFAULT_TTL}"
+
+    if [[ -z "$issue_number" ]]; then
+        echo -e "${RED}Error: Issue number required${NC}" >&2
+        return 2
+    fi
+
+    if [[ -z "$agent_id" ]]; then
+        echo -e "${RED}Error: Agent ID required for extend${NC}" >&2
+        return 2
+    fi
+
+    local claim_dir="$CLAIMS_DIR/issue-${issue_number}.lock"
+    local claim_file="$claim_dir/claim.json"
+
+    if [[ ! -d "$claim_dir" ]]; then
+        echo -e "${YELLOW}⚠ No claim found for issue #${issue_number}${NC}"
+        return 3
+    fi
+
+    if [[ ! -f "$claim_file" ]]; then
+        echo -e "${YELLOW}⚠ Incomplete claim found for issue #${issue_number}${NC}"
+        return 3
+    fi
+
+    # Verify agent owns the claim
+    local existing_agent
+    existing_agent=$(grep -o '"agent_id": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+
+    if [[ "$existing_agent" != "$agent_id" ]]; then
+        echo -e "${RED}✗ Cannot extend: claim owned by different agent${NC}" >&2
+        echo -e "  Owner: ${existing_agent}" >&2
+        echo -e "  Requested by: ${agent_id}" >&2
+        return 4
+    fi
+
+    # Calculate new expiration from now + additional_seconds
+    local new_expiration
+    new_expiration=$(get_expiration "$additional_seconds")
+
+    # Read current values
+    local issue
+    local claimed_at
+    local ttl_seconds
+    issue=$(grep -o '"issue": [0-9]*' "$claim_file" | cut -d' ' -f2)
+    claimed_at=$(grep -o '"claimed_at": "[^"]*"' "$claim_file" | cut -d'"' -f4)
+    ttl_seconds=$(grep -o '"ttl_seconds": [0-9]*' "$claim_file" | cut -d' ' -f2)
+
+    # Write updated claim
+    cat > "$claim_file" << EOF
+{
+  "issue": $issue,
+  "agent_id": "$agent_id",
+  "claimed_at": "$claimed_at",
+  "expires_at": "$new_expiration",
+  "ttl_seconds": $additional_seconds
+}
+EOF
+
+    echo -e "${GREEN}✓ Extended claim for issue #${issue_number}${NC}"
+    echo -e "  New expiration: ${new_expiration}"
+    echo -e "  Extended by: ${additional_seconds} seconds"
+    return 0
 }
 
 # Release a claim
@@ -323,6 +394,11 @@ Commands:
       Atomically claim an issue. Default TTL is 30 minutes (1800 seconds).
       Exits 0 on success, 1 if already claimed.
 
+  extend <issue-number> <agent-id> [additional-seconds]
+      Extend an existing claim's TTL. Agent must own the claim.
+      Default extension is 30 minutes (1800 seconds) from now.
+      Exits 0 on success, 3 if no claim exists, 4 if agent mismatch.
+
   release <issue-number> [agent-id]
       Release a claim. If agent-id is provided, verifies ownership.
       Exits 0 on success, 3 if no claim exists, 4 if agent mismatch.
@@ -340,6 +416,8 @@ Commands:
 Examples:
   $(basename "$0") claim 123                    # Claim issue with default agent ID
   $(basename "$0") claim 123 builder-1 3600     # Claim for 1 hour
+  $(basename "$0") extend 123 builder-1         # Extend by default 30 minutes
+  $(basename "$0") extend 123 builder-1 7200    # Extend by 2 hours
   $(basename "$0") release 123 builder-1        # Release with ownership check
   $(basename "$0") check 123                    # Check claim status
   $(basename "$0") list                         # List all claims
@@ -354,6 +432,9 @@ main() {
     case "$command" in
         claim)
             claim_issue "${2:-}" "${3:-}" "${4:-}"
+            ;;
+        extend)
+            extend_claim "${2:-}" "${3:-}" "${4:-}"
             ;;
         release)
             release_claim "${2:-}" "${3:-}"
