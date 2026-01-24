@@ -139,7 +139,9 @@ fi
 
 # If target is inside a worktree, resolve to the main repository root
 # git worktree list --porcelain returns the main worktree first
-MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | grep -m1 '^worktree ' | cut -d' ' -f2-)
+# Note: Use head -4 before grep to avoid SIGPIPE when repo has many worktrees
+# (grep -m1 exits early, causing SIGPIPE to git with pipefail enabled)
+MAIN_WORKTREE=$(git -C "$TARGET_PATH" worktree list --porcelain 2>/dev/null | head -4 | grep -m1 '^worktree ' | cut -d' ' -f2- || true)
 if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
   warning "Target path is inside a worktree: $TARGET_PATH"
   info "Resolving to main repository root: $MAIN_WORKTREE"
