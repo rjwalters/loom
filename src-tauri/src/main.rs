@@ -277,6 +277,16 @@ fn main() {
             get_experiment_variants,
             get_experiments_summary,
             get_experiment_results,
+            // Prompt optimization commands
+            analyze_prompt,
+            generate_optimization_suggestions,
+            record_suggestion_decision,
+            record_suggestion_outcome,
+            get_optimization_stats,
+            get_recent_suggestions,
+            get_optimization_rules,
+            toggle_optimization_rule,
+            refine_optimization_rules,
         ])
         .run(tauri::generate_context!())
     {
