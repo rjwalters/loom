@@ -204,14 +204,25 @@ cd .loom/worktrees/issue-84
 # 5. Do your work (implement, test, commit)
 # ... work work work ...
 
-# 6. Push and create PR from worktree
+# 6. Rebase on latest main before pushing
+#    CRITICAL: This prevents merge conflicts if main changed during your work
+git fetch origin main
+if ! git rebase origin/main; then
+  # Rebase failed - conflicts need resolution
+  echo "Merge conflict detected - resolve before creating PR"
+  # Either resolve conflicts manually, or mark issue as blocked:
+  # gh issue edit 84 --add-label "loom:blocked"
+  # gh issue comment 84 --body "⚠️ Merge conflict with main. Manual resolution required."
+fi
+
+# 7. Push and create PR from worktree
 git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested"
 
-# 7. Return to main workspace
+# 8. Return to main workspace
 cd ../..  # Back to workspace root
 
-# 8. Clean up worktree (optional - done automatically on terminal destroy)
+# 9. Clean up worktree (optional - done automatically on terminal destroy)
 git worktree remove .loom/worktrees/issue-84
 ```
 
@@ -224,6 +235,38 @@ The worktree script creates branches from your **local** `main` branch. If your 
 - Missing recent changes from other contributors
 
 **Always pull the latest `main` before creating a new worktree.**
+
+### Why Rebase Before Pushing?
+
+Even if you pull main before creating your worktree, **other PRs may merge during your implementation**. This creates merge conflicts that block your PR from merging cleanly.
+
+**The problem:**
+```
+main:     A ── B ── C ── D (another PR merged while you worked)
+                \
+your-branch:     X ── Y (your commits, based on B)
+```
+
+**The solution - rebase before pushing:**
+```bash
+git fetch origin main
+git rebase origin/main
+# Your commits are now based on D, not B
+```
+
+**After rebase:**
+```
+main:     A ── B ── C ── D
+                          \
+your-branch:               X' ── Y' (rebased commits)
+```
+
+**If rebase fails** (conflicts detected):
+1. Mark the issue as `loom:blocked`
+2. Add a comment explaining the conflict
+3. Move to another issue - don't leave broken worktrees
+
+This ensures PRs always merge cleanly and prevents the merge conflict chaos that occurs when multiple agents work simultaneously.
 
 ### Collision Detection
 
@@ -297,16 +340,26 @@ cd .loom/worktrees/issue-84
 git add -A
 git commit -m "Implement feature for issue #84"
 
-# 6. Push and create PR
+# 6. Rebase on latest main before pushing
+#    CRITICAL: Prevents merge conflicts if main changed during implementation
+git fetch origin main
+if ! git rebase origin/main; then
+  # Rebase failed - mark as blocked and notify
+  gh issue edit 84 --add-label "loom:blocked"
+  gh issue comment 84 --body "⚠️ Merge conflict with main. Manual resolution required."
+  exit 1  # Stop - don't create PR with conflicts
+fi
+
+# 7. Push and create PR
 git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested" --body "Closes #84"
 
-# 7. Return to terminal worktree
+# 8. Return to terminal worktree
 pnpm worktree:return
 # → Changes back to .loom/worktrees/terminal-1
 # → Ready for next issue!
 
-# 8. Clean up happens automatically when PR is merged
+# 9. Clean up happens automatically when PR is merged
 ```
 
 ### Machine-Readable Output
@@ -367,6 +420,16 @@ while true; do
 
     # Do the work...
     # ... implementation ...
+
+    # Rebase on latest main before pushing (prevents merge conflicts)
+    git fetch origin main
+    if ! git rebase origin/main; then
+      # Conflict detected - mark blocked and skip this issue
+      gh issue edit "$ISSUE" --add-label "loom:blocked"
+      gh issue comment "$ISSUE" --body "⚠️ Merge conflict with main. Manual resolution required."
+      pnpm worktree:return
+      continue  # Skip to next issue
+    fi
 
     # Push and create PR
     git push -u origin feature/issue-"$ISSUE"
