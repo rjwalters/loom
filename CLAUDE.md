@@ -717,6 +717,34 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+**Orphaned issues stuck in loom:building state**:
+
+When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Use the stale-building-check script to detect and recover these:
+
+```bash
+# Check for stale building issues (dry run)
+./.loom/scripts/stale-building-check.sh
+
+# Show detailed progress
+./.loom/scripts/stale-building-check.sh --verbose
+
+# Auto-recover stale issues (resets to loom:issue)
+./.loom/scripts/stale-building-check.sh --recover
+
+# JSON output for automation
+./.loom/scripts/stale-building-check.sh --json
+```
+
+**Configuration via environment**:
+- `STALE_THRESHOLD_HOURS=2` - Hours before issue without PR is considered stale
+- `STALE_WITH_PR_HOURS=24` - Hours before issue with stale PR is flagged
+
+**What it does**:
+- Finds issues with `loom:building` label that have been stuck
+- Checks if there's an associated PR (by branch name or body reference)
+- Issues without PRs older than threshold are flagged/recovered
+- Issues with stale PRs are flagged but not auto-recovered (need manual review)
+
 ### Stuck Agent Detection
 
 The Loom daemon automatically detects stuck or struggling agents and can trigger interventions.

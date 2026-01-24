@@ -121,7 +121,26 @@ Sometimes issues are completed but stay open because PRs didn't use the magic ke
 
 **1. Check for Orphaned `loom:building` Issues**
 
-Find issues with `loom:building` but no active PRs:
+Use the stale-building-check script to find and recover orphaned issues:
+
+```bash
+# Check for stale building issues (dry run)
+./.loom/scripts/stale-building-check.sh --verbose
+
+# Auto-recover stale issues (resets to loom:issue)
+./.loom/scripts/stale-building-check.sh --recover
+
+# JSON output for automation
+./.loom/scripts/stale-building-check.sh --json
+```
+
+The script automatically:
+- Finds issues with `loom:building` but no active PRs
+- Flags issues stale after 2 hours (configurable via `STALE_THRESHOLD_HOURS`)
+- With `--recover`, resets stale issues to `loom:issue` for re-claiming
+- Flags issues with stale PRs (>24h) but doesn't auto-recover them
+
+**Manual verification** (if script not available):
 
 ```bash
 # Get all loom:building issues
@@ -131,9 +150,10 @@ gh issue list --label "loom:building" --state open --json number,title
 gh pr list --search "issue-NUMBER in:body OR issue NUMBER in:body" --state open
 ```
 
-**If no PR found and issue is old (>7 days):**
-- Comment asking for status update
-- If no response in 2 days, remove `loom:building` and mark as `loom:blocked`
+**If no PR found and issue is old (>2 hours):**
+- Run `--recover` to auto-reset, or manually:
+- Remove `loom:building` and add `loom:issue`
+- Comment explaining the recovery
 
 **2. Verify Merged PRs Closed Their Issues**
 
