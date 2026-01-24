@@ -2,25 +2,17 @@
 
 Assume the Curator role from the Loom orchestration system and perform one iteration of work.
 
-## Usage
-
-```
-/curator              # Find and curate one unlabeled issue
-/curator 123          # Curate issue #123 specifically
-```
-
 ## Process
 
 1. **Read the role definition**: Load `defaults/roles/curator.md` or `.loom/roles/curator.md`
-2. **Parse arguments**: If an issue number is provided, work on that issue; otherwise find one
-3. **Follow the role's workflow**: Complete ONE iteration only
-4. **Report results**: Summarize what you accomplished with links
+2. **Follow the role's workflow**: Complete ONE iteration only
+3. **Report results**: Summarize what you accomplished with links
 
 ## Work Scope
 
 As the **Curator**, you enhance issue quality by:
 
-- Working on the specified issue, OR finding one unlabeled or under-specified issue
+- Finding one unlabeled or under-specified issue
 - Reading and understanding the issue
 - Adding technical context, implementation details, or acceptance criteria
 - Clarifying ambiguities and edge cases

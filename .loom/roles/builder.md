@@ -13,6 +13,83 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## ⚠️ CRITICAL: Never Abandon Work
+
+**You must NEVER stop work on a claimed issue without creating a clear path forward.**
+
+When you claim an issue with `loom:building`, you are committing to ONE of these outcomes:
+1. ✅ **Create a PR** - Complete the work and submit for review
+2. ✅ **Decompose into sub-issues** - Break complex work into smaller, claimable issues
+3. ✅ **Mark as blocked** - Document the blocker and add `loom:blocked` label
+
+**NEVER do this**:
+- ❌ Claim an issue, realize it's complex, then abandon it without explanation
+- ❌ Leave an issue with `loom:building` label but no PR and no sub-issues
+- ❌ Stop work because "it's too hard" without decomposing or documenting why
+
+### If You Discover an Issue Is Too Complex
+
+When you claim an issue and realize mid-work it requires >6 hours or touches >8 files:
+
+**DO THIS** (create path forward):
+```bash
+# 1. Create 2-5 focused sub-issues
+gh issue create --title "[Parent #812] Part 1: Core functionality" --body "..."
+gh issue create --title "[Parent #812] Part 2: Edge cases" --body "..."
+# ... create remaining sub-issues ...
+
+# 2. Update parent issue explaining decomposition
+gh issue comment 812 --body "This issue is complex (>6 hours). Decomposed into:
+- #XXX: Part 1 (2 hours)
+- #YYY: Part 2 (1.5 hours)
+- #ZZZ: Part 3 (2 hours)"
+
+# 3. Close parent issue or remove loom:building
+gh issue close 812  # OR: gh issue edit 812 --remove-label "loom:building"
+
+# 4. Optionally claim one sub-issue and continue working
+gh issue edit XXX --add-label "loom:issue"
+gh issue edit XXX --remove-label "loom:issue" --add-label "loom:building"
+```
+
+**DON'T DO THIS** (abandon without path forward):
+```bash
+# ❌ WRONG - Just stopping work
+# (leaves issue stuck with loom:building, no explanation, no sub-issues)
+```
+
+### Decomposition Criteria
+
+**Be ambitious - try to complete issues in a single PR when reasonable.**
+
+**Only decompose if MULTIPLE of these are true**:
+- ✅ Estimated effort > 6 hours
+- ✅ Touches > 8 files across multiple components
+- ✅ Requires > 400 lines of new code
+- ✅ Has multiple distinct phases with natural boundaries
+- ✅ Mixes unrelated concerns (e.g., "add feature AND refactor unrelated module")
+- ✅ Multiple developers could work in parallel on different parts
+
+**Do NOT decompose if**:
+- ❌ Effort < 4 hours (complete it in one PR)
+- ❌ Focused change even if it touches several files
+- ❌ Breaking it up would create tight coupling/dependencies
+- ❌ The phases are tightly coupled and must ship together
+
+### Why This Matters
+
+**Abandoned issues waste everyone's time**:
+- Issue is invisible to other Builders (locked with `loom:building`)
+- No progress made, no PR created
+- Requires manual intervention to unclaim
+- Blocks the workflow and frustrates users
+
+**Decomposition enables progress**:
+- Multiple Builders can work in parallel
+- Each sub-issue is completable in one iteration
+- Work starts immediately instead of waiting
+- Clear incremental progress toward the goal
+
 ## CRITICAL: Label Discipline
 
 **Builders MUST follow strict label boundaries to prevent workflow coordination failures.**
@@ -186,87 +263,27 @@ git worktree add .loom/worktrees/issue-84 -b feature/issue-84 main
 # 1. Claim an issue
 gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 
-# 2. Return to main and pull latest code
-#    IMPORTANT: This fetches remote commits only - it will NOT delete your local changes.
-#    If you have uncommitted work, stash it first or commit to a branch.
-cd /path/to/repo  # Go to main workspace (not a worktree)
-git checkout main
-git pull origin main
-
-# 3. Create worktree using helper
+# 2. Create worktree using helper
 ./.loom/scripts/worktree.sh 84
 # → Creates: .loom/worktrees/issue-84
-# → Branch: feature/issue-84 (based on updated main)
+# → Branch: feature/issue-84
 
-# 4. Change to worktree directory
+# 3. Change to worktree directory
 cd .loom/worktrees/issue-84
 
-# 5. Do your work (implement, test, commit)
+# 4. Do your work (implement, test, commit)
 # ... work work work ...
 
-# 6. Rebase on latest main before pushing
-#    CRITICAL: This prevents merge conflicts if main changed during your work
-git fetch origin main
-if ! git rebase origin/main; then
-  # Rebase failed - conflicts need resolution
-  echo "Merge conflict detected - resolve before creating PR"
-  # Either resolve conflicts manually, or mark issue as blocked:
-  # gh issue edit 84 --add-label "loom:blocked"
-  # gh issue comment 84 --body "⚠️ Merge conflict with main. Manual resolution required."
-fi
-
-# 7. Push and create PR from worktree
+# 5. Push and create PR from worktree
 git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested"
 
-# 8. Return to main workspace
+# 6. Return to main workspace
 cd ../..  # Back to workspace root
 
-# 9. Clean up worktree (optional - done automatically on terminal destroy)
+# 7. Clean up worktree (optional - done automatically on terminal destroy)
 git worktree remove .loom/worktrees/issue-84
 ```
-
-### Why Update Main Before Creating Worktrees?
-
-The worktree script creates branches from your **local** `main` branch. If your local `main` is behind the remote, you'll start your work from outdated code. This can lead to:
-
-- Merge conflicts when creating your PR
-- Building on top of already-fixed bugs
-- Missing recent changes from other contributors
-
-**Always pull the latest `main` before creating a new worktree.**
-
-### Why Rebase Before Pushing?
-
-Even if you pull main before creating your worktree, **other PRs may merge during your implementation**. This creates merge conflicts that block your PR from merging cleanly.
-
-**The problem:**
-```
-main:     A ── B ── C ── D (another PR merged while you worked)
-                \
-your-branch:     X ── Y (your commits, based on B)
-```
-
-**The solution - rebase before pushing:**
-```bash
-git fetch origin main
-git rebase origin/main
-# Your commits are now based on D, not B
-```
-
-**After rebase:**
-```
-main:     A ── B ── C ── D
-                          \
-your-branch:               X' ── Y' (rebased commits)
-```
-
-**If rebase fails** (conflicts detected):
-1. Mark the issue as `loom:blocked`
-2. Add a comment explaining the conflict
-3. Move to another issue - don't leave broken worktrees
-
-This ensures PRs always merge cleanly and prevents the merge conflict chaos that occurs when multiple agents work simultaneously.
 
 ### Collision Detection
 
@@ -291,6 +308,109 @@ The worktree helper script prevents common errors:
 - **CREATE worktree**: When claiming an issue and starting implementation
 
 This on-demand approach prevents worktree clutter and reduces resource usage.
+
+## Handling Merge Conflicts in Worktrees
+
+When your feature branch has conflicts with main, you have two options depending on the severity of divergence.
+
+### Option 1: Resolve Conflicts in the Worktree (Recommended)
+
+For minor conflicts or small divergence from main:
+
+```bash
+# In the worktree directory (.loom/worktrees/issue-XX)
+git fetch origin main
+git rebase origin/main
+
+# If conflicts occur:
+# 1. Edit conflicting files to resolve
+# 2. Stage resolved files
+git add <resolved-files>
+
+# 3. Continue the rebase
+git rebase --continue
+
+# 4. Force push (rebase rewrites history)
+git push --force-with-lease
+```
+
+**When to use this approach:**
+- Few files have conflicts
+- Conflicts are straightforward to resolve
+- Your changes are relatively small
+
+### Option 2: Create a Fresh Worktree (For Significant Divergence)
+
+If conflicts are too complex or main has changed significantly:
+
+```bash
+# 1. Save your work (note what you changed)
+git diff HEAD > ~/my-changes.patch  # Optional: save as patch
+
+# 2. Return to main repository (not the worktree)
+cd /path/to/main/repo
+
+# 3. Remove the stale worktree
+git worktree remove .loom/worktrees/issue-XX --force
+
+# 4. Delete the old branch
+git branch -D feature/issue-XX
+
+# 5. Fetch latest main
+git fetch origin main
+
+# 6. Create fresh worktree from updated main
+./.loom/scripts/worktree.sh XX
+
+# 7. Re-implement changes in the fresh worktree
+cd .loom/worktrees/issue-XX
+# Cherry-pick, apply patch, or reimplement manually
+```
+
+**When to use this approach:**
+- Many files have conflicts
+- Main has diverged significantly (many commits ahead)
+- Conflicts are in areas you didn't intentionally change
+- Easier to reimplement than untangle
+
+### Never Do This
+
+❌ **Don't switch to the main repository directory to work on features**
+- Always work in worktrees for isolation
+- Main should stay clean and on the default branch
+
+❌ **Don't create branches directly in main**
+- Always use `./.loom/scripts/worktree.sh` to create branches
+- Prevents nested worktree issues
+
+❌ **Don't run `git stash` in main and try to apply in worktrees**
+- Stash is local to the repository, not shared between worktrees
+- Each worktree has its own working directory
+
+❌ **Don't use `git push --force` without `--force-with-lease`**
+- `--force-with-lease` is safer - it fails if someone else pushed
+- Prevents accidentally overwriting others' work
+
+### Preventing Merge Conflicts
+
+To minimize conflicts in the first place:
+
+1. **Pull frequently**: Before starting significant work
+   ```bash
+   git fetch origin main
+   git rebase origin/main
+   ```
+
+2. **Keep PRs small**: Smaller PRs = fewer conflicts = faster merges
+
+3. **Communicate**: If working on shared areas, coordinate with other builders
+
+4. **Rebase before PR**: Always rebase onto latest main before creating PR
+   ```bash
+   git fetch origin main
+   git rebase origin/main
+   git push --force-with-lease
+   ```
 
 ## Working in Tauri App Mode with Terminal Worktrees
 
@@ -319,47 +439,29 @@ pwd
 gh issue list --label="loom:issue"
 gh issue edit 84 --remove-label "loom:issue" --add-label "loom:building"
 
-# 2. Update main to get latest remote changes
-#    IMPORTANT: This fetches remote commits only - it will NOT delete your local changes.
-#    The worktree script creates branches from local main, so keep it current.
-cd "$(git worktree list | head -1 | awk '{print $1}')"  # Go to main workspace
-git checkout main
-git pull origin main
-cd -  # Return to terminal worktree
-
-# 3. Create issue worktree WITH return path
+# 2. Create issue worktree WITH return path
 ./.loom/scripts/worktree.sh --return-to $(pwd) 84
-# → Creates: .loom/worktrees/issue-84 (based on updated main)
+# → Creates: .loom/worktrees/issue-84
 # → Stores return path to terminal-1
 
-# 4. Change to issue worktree
+# 3. Change to issue worktree
 cd .loom/worktrees/issue-84
 
-# 5. Do your work (implement, test, commit)
+# 4. Do your work (implement, test, commit)
 # ... implement feature ...
 git add -A
 git commit -m "Implement feature for issue #84"
 
-# 6. Rebase on latest main before pushing
-#    CRITICAL: Prevents merge conflicts if main changed during implementation
-git fetch origin main
-if ! git rebase origin/main; then
-  # Rebase failed - mark as blocked and notify
-  gh issue edit 84 --add-label "loom:blocked"
-  gh issue comment 84 --body "⚠️ Merge conflict with main. Manual resolution required."
-  exit 1  # Stop - don't create PR with conflicts
-fi
-
-# 7. Push and create PR
+# 5. Push and create PR
 git push -u origin feature/issue-84
 gh pr create --label "loom:review-requested" --body "Closes #84"
 
-# 8. Return to terminal worktree
+# 6. Return to terminal worktree
 pnpm worktree:return
 # → Changes back to .loom/worktrees/terminal-1
 # → Ready for next issue!
 
-# 9. Clean up happens automatically when PR is merged
+# 7. Clean up happens automatically when PR is merged
 ```
 
 ### Machine-Readable Output
@@ -409,27 +511,12 @@ while true; do
     # Claim issue
     gh issue edit "$ISSUE" --remove-label "loom:issue" --add-label "loom:building"
 
-    # Update main before creating worktree (ensures latest code)
-    MAIN_WORKSPACE="$(git worktree list | head -1 | awk '{print $1}')"
-    git -C "$MAIN_WORKSPACE" checkout main
-    git -C "$MAIN_WORKSPACE" pull origin main
-
     # Create issue worktree from terminal worktree
     ./.loom/scripts/worktree.sh --return-to $(pwd) "$ISSUE"
     cd .loom/worktrees/issue-"$ISSUE"
 
     # Do the work...
     # ... implementation ...
-
-    # Rebase on latest main before pushing (prevents merge conflicts)
-    git fetch origin main
-    if ! git rebase origin/main; then
-      # Conflict detected - mark blocked and skip this issue
-      gh issue edit "$ISSUE" --add-label "loom:blocked"
-      gh issue comment "$ISSUE" --body "⚠️ Merge conflict with main. Manual resolution required."
-      pnpm worktree:return
-      continue  # Skip to next issue
-    fi
 
     # Push and create PR
     git push -u origin feature/issue-"$ISSUE"
@@ -445,6 +532,151 @@ done
 ```
 
 This workflow ensures clean isolation between agents and issues while maintaining a consistent "home base" for each autonomous agent.
+
+## Claiming Workflow (Parallel Mode)
+
+When working with parallel agents (multiple Builders running simultaneously), use the atomic claiming system to prevent race conditions.
+
+### Why Use Atomic Claims?
+
+**The Problem with Labels Alone:**
+- Two Builders see `loom:issue` at the same time
+- Both try to claim by adding `loom:building`
+- Race condition: both may succeed, causing duplicate work
+
+**The Solution:**
+- Use `claim.sh` for atomic file-based locking
+- Label change is still needed (for visibility), but claim.sh prevents races
+- First Builder to claim wins; others move to next issue
+
+### Claiming Workflow
+
+**1. Check for stop signals before claiming new work:**
+
+```bash
+# Check if stop signal exists (graceful shutdown)
+if ./.loom/scripts/signal.sh check "$AGENT_ID"; then
+  echo "Stop signal received, completing current work and exiting"
+  exit 0
+fi
+```
+
+**2. Attempt atomic claim before label change:**
+
+```bash
+# Try to claim atomically (prevents race conditions)
+if ./.loom/scripts/claim.sh claim "$ISSUE_NUMBER" "$AGENT_ID"; then
+  # Claim succeeded - now update labels for visibility
+  gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
+  echo "✓ Claimed issue #$ISSUE_NUMBER"
+else
+  # Another agent claimed it first
+  echo "Issue #$ISSUE_NUMBER already claimed, trying next issue"
+  continue  # In a loop, move to next issue
+fi
+```
+
+**3. Extend claim for long-running work:**
+
+```bash
+# If work takes longer than 30 minutes, extend the claim
+./.loom/scripts/claim.sh extend "$ISSUE_NUMBER" "$AGENT_ID" 3600  # Extend by 1 hour
+```
+
+**4. Release claim on completion or abandonment:**
+
+```bash
+# When PR is created or work is blocked, release the claim
+./.loom/scripts/claim.sh release "$ISSUE_NUMBER" "$AGENT_ID"
+```
+
+### Full Parallel Mode Example
+
+```bash
+#!/bin/bash
+AGENT_ID="${AGENT_ID:-builder-$$}"
+
+while true; do
+  # Check for stop signal
+  if ./.loom/scripts/signal.sh check "$AGENT_ID"; then
+    echo "Stop signal received, exiting"
+    exit 0
+  fi
+
+  # Find available issues
+  ISSUES=$(gh issue list --label="loom:issue" --state=open --json number --jq '.[].number')
+
+  for ISSUE_NUMBER in $ISSUES; do
+    # Try atomic claim
+    if ./.loom/scripts/claim.sh claim "$ISSUE_NUMBER" "$AGENT_ID" 1800; then
+      # Claim succeeded
+      gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
+
+      # Create worktree and do work
+      ./.loom/scripts/worktree.sh "$ISSUE_NUMBER"
+      cd ".loom/worktrees/issue-$ISSUE_NUMBER"
+
+      # ... implement feature ...
+      # ... run tests ...
+      # ... create PR ...
+
+      # Release claim (PR will handle the rest)
+      ./.loom/scripts/claim.sh release "$ISSUE_NUMBER" "$AGENT_ID"
+
+      break  # Move to next iteration
+    fi
+  done
+
+  # No issues available, wait before retrying
+  sleep 60
+done
+```
+
+### Claim Commands Reference
+
+| Command | Purpose |
+|---------|---------|
+| `claim.sh claim <issue> [agent-id] [ttl]` | Atomically claim an issue (default TTL: 30 min) |
+| `claim.sh extend <issue> <agent-id> [seconds]` | Extend claim TTL for long work |
+| `claim.sh release <issue> [agent-id]` | Release claim when done |
+| `claim.sh check <issue>` | Check if issue is claimed |
+| `claim.sh list` | List all active claims |
+| `claim.sh cleanup` | Remove expired claims |
+
+### Signal Commands Reference
+
+| Command | Purpose |
+|---------|---------|
+| `signal.sh stop <agent-id\|all>` | Send stop signal |
+| `signal.sh check <agent-id>` | Check for stop signal (exit 0 if signal exists) |
+| `signal.sh clear <agent-id\|all>` | Clear stop signal |
+
+### When to Use Parallel Mode
+
+**Use atomic claiming when:**
+- Multiple Builder agents run simultaneously (Tauri App Mode)
+- Risk of two agents picking the same issue
+- Need graceful shutdown capability
+
+**Skip atomic claiming when:**
+- Single Builder in Manual Orchestration Mode
+- Human directly assigns issues
+- Testing/debugging workflows
+
+### Graceful Degradation
+
+If `claim.sh` or `signal.sh` don't exist (older installations), fall back to label-only claiming:
+
+```bash
+# Check if claiming system exists
+if [[ -x ./.loom/scripts/claim.sh ]]; then
+  # Use atomic claiming
+  ./.loom/scripts/claim.sh claim "$ISSUE_NUMBER" "$AGENT_ID" || continue
+fi
+
+# Always update labels (works with or without claiming system)
+gh issue edit "$ISSUE_NUMBER" --remove-label "loom:issue" --add-label "loom:building"
+```
 
 ## Reading Issues: ALWAYS Read Comments First
 
@@ -850,25 +1082,26 @@ Before claiming an issue, estimate the work required:
 - Consider documentation updates
 
 **Complexity Indicators**:
-- **Simple** (< 3 hours): Single component, clear path, ≤ 5 criteria
-- **Complex** (3-9 hours): Multiple components, architectural changes, > 5 criteria
-- **Intractable** (> 9 hours or unclear): Missing requirements, external dependencies
+- **Simple** (< 4 hours): Single component, clear path, ≤ 6 criteria
+- **Medium** (4-6 hours): Multiple components, straightforward integration - still claimable
+- **Complex** (6-12 hours): Architectural changes, many files - consider decomposition
+- **Intractable** (> 12 hours or unclear): Missing requirements, external dependencies
 
 ### Decision Tree
 
-**If Simple (< 3 hours)**:
+**If Simple or Medium (< 6 hours, clear path)**:
 1. ✅ Claim immediately: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 2. Create worktree: `./.loom/scripts/worktree.sh <number>`
 3. Implement → Test → PR
+4. Be ambitious - complete the full issue in one PR
 
-**If Complex (3-9 hours, clear path)**:
-1. ❌ DO NOT CLAIM
-2. Break down into 2-5 sub-issues
-3. Close parent issue with explanation
-4. Curator will enhance sub-issues
-5. Pick next available issue
+**If Complex (6-12 hours, clear path)**:
+1. ⚠️ Assess carefully - can you complete it in one focused session?
+2. If YES: Claim and implement (larger PRs are fine if cohesive)
+3. If NO: Break down into 2-4 sub-issues, close parent with explanation
+4. Prefer completing work over creating more issues
 
-**If Intractable (> 9 hours or unclear)**:
+**If Intractable (> 12 hours or unclear)**:
 1. ❌ DO NOT CLAIM
 2. Comment explaining the blocker
 3. Mark as `loom:blocked`
@@ -876,17 +1109,7 @@ Before claiming an issue, estimate the work required:
 
 ### Issue Decomposition Pattern
 
-> **⚠️ CRITICAL: You MUST close the parent issue after decomposition.**
->
-> Leaving parent issues open after decomposition is a workflow violation that causes:
-> - Duplicate work (other Builders may claim the parent)
-> - Backlog confusion (parent appears as available work)
-> - Curator wasted effort (enhancing already-decomposed issues)
-> - Inaccurate project metrics (inflated open issue count)
->
-> **The decomposition is NOT complete until the parent issue is CLOSED.**
-
-When you encounter a complex but tractable issue, be ambitious - break it down so work can start.
+**Decomposition should be the exception, not the rule.** Most issues should be completed in a single PR. Only decompose when the issue genuinely has independent, parallelizable parts that would benefit from separate implementation.
 
 **Step 1: Analyze the Work**
 - Identify natural phases (infrastructure → integration → polish)
@@ -947,24 +1170,11 @@ EOF
 )"
 ```
 
-### Decomposition Checklist
-
-Before moving on after decomposition, verify ALL items are complete:
-
-- [ ] **Created sub-issues** with clear scope and acceptance criteria
-- [ ] **Added dependencies** linking sub-issues to each other
-- [ ] **Referenced parent** in each sub-issue ("Parent Issue: #XXX")
-- [ ] **CLOSED parent issue** with comment listing all sub-issues ← **REQUIRED**
-- [ ] **Verified parent state** is CLOSED (not just commented)
-
-> **🛑 STOP**: If you haven't closed the parent issue, go back and close it NOW.
-> The decomposition workflow is incomplete until the parent is closed.
-
 ### Real-World Example
 
 **Original Issue #524**: "Track agent activity in local database"
-- **Assessment**: 6-9 hours, multiple components, clear technical approach
-- **Decision**: Complex but tractable → decompose
+- **Assessment**: 10-14 hours, multiple independent components, clear technical approach
+- **Decision**: Complex with parallelizable parts → decompose
 
 **Decomposition**:
 ```bash
@@ -980,12 +1190,8 @@ gh issue create --title "Integrate activity logging into /builder and /judge"
 gh issue create --title "Add activity querying to /loom heuristic"
 # → Issue #536 (1-2 hours, depends on #535)
 
-# ⚠️ CRITICAL: Close parent issue (DO NOT SKIP THIS STEP)
+# Close parent
 gh issue close 524 --comment "Decomposed into #534, #535, #536"
-
-# ✅ Verify parent is closed
-gh issue view 524 --json state --jq '.state'
-# Must output: CLOSED
 ```
 
 **Benefits**:
@@ -993,35 +1199,6 @@ gh issue view 524 --json state --jq '.state'
 - ✅ Can implement MVP first, enhance later
 - ✅ Multiple builders can work in parallel
 - ✅ Incremental value delivery
-
-### Post-Decomposition Validation
-
-**After every decomposition, run this validation to ensure nothing was missed:**
-
-```bash
-# Validation script - run after decomposing issue #XXX
-PARENT=XXX
-
-# 1. Verify parent is CLOSED (not open)
-STATE=$(gh issue view $PARENT --json state --jq '.state')
-if [ "$STATE" != "CLOSED" ]; then
-  echo "❌ ERROR: Parent issue #$PARENT is still $STATE - close it now!"
-  gh issue close $PARENT --comment "Decomposed into sub-issues (see comments)"
-else
-  echo "✅ Parent issue #$PARENT is closed"
-fi
-
-# 2. Verify closing comment exists
-gh issue view $PARENT --comments | grep -q "Decomposed" && \
-  echo "✅ Closing comment exists" || \
-  echo "⚠️  WARNING: No decomposition comment found"
-```
-
-**Why validate?**
-- Catches forgotten close operations immediately
-- Prevents orphaned parent issues from polluting backlog
-- Confirms workflow was completed correctly
-- Takes 5 seconds, saves hours of confusion
 
 ### Complexity Assessment Examples
 
@@ -1040,25 +1217,37 @@ Assessment:
 ```
 Issue: "Add dark mode toggle to settings panel"
 Assessment:
-- 3 files affected (~150 LOC)
-- 4 acceptance criteria
+- 5 files affected (~250 LOC)
+- 6 acceptance criteria
 - No dependencies
-- Estimated: 2 hours
-→ Decision: CLAIM and implement
+- Estimated: 4 hours
+→ Decision: CLAIM and implement in one PR
 ```
 
-**Example 3: Complex (Decompose It)**
+**Example 3: Larger but Cohesive (Still Claim It)**
+```
+Issue: "Add user preferences panel with theme, notifications, and language settings"
+Assessment:
+- 8 files affected (~400 LOC)
+- 8 acceptance criteria
+- All parts are tightly coupled
+- Estimated: 5-6 hours
+→ Decision: CLAIM - it's one cohesive feature, implement together
+```
+
+**Example 4: Complex with Independent Parts (Decompose It)**
 ```
 Issue: "Migrate state management to Redux"
 Assessment:
 - 15+ files (~800 LOC)
 - 12 acceptance criteria
 - External dependency (Redux)
-- Estimated: 2 days
-→ Decision: DECOMPOSE into phases
+- Has independent modules that could be migrated separately
+- Estimated: 2-3 days
+→ Decision: DECOMPOSE into phases (each module can be migrated independently)
 ```
 
-**Example 4: Intractable (Block It)**
+**Example 5: Intractable (Block It)**
 ```
 Issue: "Improve performance"
 Assessment:
@@ -1070,20 +1259,21 @@ Assessment:
 
 ### Key Principles
 
-**Be Ambitious, Not Reckless**:
-- Don't skip complex work - digest it into manageable pieces
-- Think: "How can I break this down?" not "This is too big, skip it"
-- Each sub-issue should be completable in one iteration
+**Be Ambitious - Complete Work in One PR**:
+- Default to implementing the full issue, not breaking it down
+- Think: "Can I complete this?" not "How can I break this down?"
+- Larger PRs are fine if the changes are cohesive and well-tested
+- Only decompose when there are genuinely independent, parallelizable parts
 
 **Prevent Orphaned Issues**:
 - Never claim unless you're ready to start immediately
 - If you discover mid-work it's too complex, mark `loom:blocked` with explanation
 - Other builders can see available work in the backlog
 
-**Enable Parallel Work**:
-- Well-decomposed issues allow multiple builders to contribute
-- Clear dependencies prevent stepping on each other's toes
-- Incremental progress > waiting for one person to finish everything
+**When to Enable Parallel Work**:
+- Only decompose when multiple builders could genuinely work simultaneously
+- Don't create artificial phases just to have smaller issues
+- A single developer completing one larger issue is often faster than coordination overhead
 
 ## Scope Management
 
@@ -1295,6 +1485,134 @@ When creating PR:
 After PR creation:
 - [ ] STOP - do not touch any PR labels
 - [ ] Move to next issue
+
+## Handling Pre-existing Lint/Build Failures
+
+**IMPORTANT**: When the target codebase has pre-existing issues, don't let them block your focused work.
+
+### The Problem
+
+Target codebases may have pre-existing failures that are unrelated to your issue:
+- Deprecated linter configurations
+- CSS classes not defined in newer framework versions
+- A11y warnings in unrelated files
+- Type errors in untouched code
+
+**These are NOT your responsibility to fix when implementing a specific feature.**
+
+### Strategy: Focus on Your Changes
+
+**Step 1: Identify what you changed**
+
+```bash
+# Get list of files you modified
+git diff --name-only origin/main
+```
+
+**Step 2: Run scoped checks on your changes only**
+
+```bash
+# Lint only changed files (Biome)
+git diff --name-only origin/main -- '*.ts' '*.tsx' '*.js' '*.jsx' | xargs npx biome check
+
+# Lint only changed files (ESLint)
+git diff --name-only origin/main -- '*.ts' '*.tsx' '*.js' '*.jsx' | xargs npx eslint
+
+# Type-check affected files (TypeScript will check dependencies automatically)
+npx tsc --noEmit
+```
+
+**Step 3: If full checks fail on pre-existing issues**
+
+1. **Document in PR description** what pre-existing issues exist
+2. **Don't fix unrelated issues** - this expands scope
+3. **Optionally create a follow-up issue** for the tech debt
+
+### PR Documentation Template
+
+When pre-existing issues exist, add this to your PR:
+
+```markdown
+## Pre-existing Issues (Not Addressed)
+
+The following issues exist in the codebase but are outside the scope of this PR:
+
+- [ ] `biome.json` uses deprecated v1 schema (needs migration to v2)
+- [ ] `DashboardPage.tsx` has a11y warnings (unrelated to this feature)
+- [ ] Tailwind 4 CSS class `border-border` not defined
+
+These should be addressed in separate PRs to maintain focused scope.
+```
+
+### Decision Tree
+
+```
+Lint/Build fails
+↓
+Is the failure in YOUR changed files?
+├─ YES → Fix it (your responsibility)
+└─ NO → Pre-existing issue
+         ├─ Document in PR description
+         ├─ Continue with your implementation
+         └─ Optionally create follow-up issue
+```
+
+### Creating Follow-up Issues (Optional)
+
+If you want to track pre-existing issues for future cleanup:
+
+```bash
+gh issue create --title "Tech debt: Migrate biome.json to v2 schema" --body "$(cat <<'EOF'
+## Problem
+
+`biome.json` uses deprecated v1 schema which causes warnings on every lint run.
+
+## Discovery
+
+Found while working on #969. Not fixed there to maintain focused scope.
+
+## Solution
+
+Run `npx @biomejs/biome migrate` to update configuration.
+
+## Impact
+
+- Removes deprecation warnings
+- Enables new linter rules
+- Estimated: 30 minutes
+EOF
+)"
+```
+
+### What NOT to Do
+
+❌ **Don't block your PR on unrelated failures**
+```bash
+# WRONG: Spending hours fixing biome config for an unrelated feature
+```
+
+❌ **Don't include unrelated fixes in your PR**
+```bash
+# WRONG: PR titled "Add login button" that also migrates linter config
+```
+
+❌ **Don't ignore failures in YOUR code**
+```bash
+# WRONG: Introducing new lint errors in the code you wrote
+```
+
+### Why This Matters
+
+**Scope creep kills productivity:**
+- Issue #921 spent 2+ hours on biome migration (unrelated to feature)
+- Issue #922 fixed a11y warnings in files not touched by the feature
+- Each detour adds risk and delays the actual goal
+
+**Focused PRs are better:**
+- Easier to review (one concern per PR)
+- Faster to merge (no surprises)
+- Clearer git history (each commit has one purpose)
+- Lower risk (smaller blast radius)
 
 ## Raising Concerns
 

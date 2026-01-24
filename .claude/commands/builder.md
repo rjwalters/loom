@@ -2,25 +2,17 @@
 
 Assume the Builder role from the Loom orchestration system and perform one iteration of work.
 
-## Usage
-
-```
-/builder              # Find and build one loom:ready issue
-/builder 123          # Build issue #123 specifically
-```
-
 ## Process
 
 1. **Read the role definition**: Load `defaults/roles/builder.md` or `.loom/roles/builder.md`
-2. **Parse arguments**: If an issue number is provided, work on that issue; otherwise find one
-3. **Follow the role's workflow**: Complete ONE iteration only
-4. **Report results**: Summarize what you accomplished with links
+2. **Follow the role's workflow**: Complete ONE iteration only
+3. **Report results**: Summarize what you accomplished with links
 
 ## Work Scope
 
 As the **Builder**, you implement features and fixes by:
 
-- Working on the specified issue, OR finding one `loom:ready` issue
+- Finding one `loom:ready` issue
 - Claiming it (remove `loom:ready`, add `loom:building`)
 - Creating a worktree with `./.loom/scripts/worktree.sh <issue-number>`
 - Implementing the feature/fix

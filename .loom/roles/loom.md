@@ -66,60 +66,6 @@ The daemon runs **continuously** until:
 
 The daemon should NEVER exit just because the backlog is temporarily empty. Work generation (Architect/Hermit) will replenish the backlog.
 
-### Session Limit Awareness
-
-For multi-day autonomous operation, the daemon integrates with [claude-monitor](https://github.com/rjwalters/claude-monitor) to detect approaching session limits and pause gracefully.
-
-**Startup Detection**:
-
-When `/loom` starts, check for claude-monitor:
-
-```bash
-if [ -f ~/.claude-monitor/usage.db ]; then
-    echo "✓ claude-monitor detected - session limit awareness enabled"
-else
-    echo "⚠ claude-monitor not detected"
-    echo "  For multi-day autonomous operation, install claude-monitor:"
-    echo "  https://github.com/rjwalters/claude-monitor"
-    echo ""
-    echo "  Without it, the daemon will not pause proactively at session limits."
-fi
-```
-
-**Session Limit Check** (each iteration):
-
-```python
-def check_session_limits():
-    """Check if we should pause due to session limits."""
-    result = run("./.loom/scripts/check-usage.sh")
-
-    if result.exit_code != 0:
-        return None  # No database, feature disabled
-
-    data = json.loads(result.stdout)
-    session_percent = data["session_percent"]
-    session_reset = data["session_reset"]
-
-    if session_percent >= 97:
-        return {
-            "should_pause": True,
-            "percent": session_percent,
-            "reset_in": session_reset
-        }
-
-    return {"should_pause": False, "percent": session_percent}
-```
-
-**Pause Behavior** (different from shutdown):
-
-When pausing for rate limits:
-1. Stop spawning new shepherds
-2. Signal existing shepherds via `.loom/stop-shepherds`
-3. Keep issues in `loom:building` state (don't revert)
-4. Store shepherd assignments in daemon-state for resume
-5. Sleep until session reset time
-6. On resume, continue with preserved state
-
 ### Parallelism via Subagents
 
 In Manual Orchestration Mode, use the **Task tool with `run_in_background: true`** to spawn parallel shepherd subagents:
@@ -144,33 +90,21 @@ DAEMON ITERATION:
 ├── 1. SHUTDOWN CHECK
 │   └── if .loom/stop-daemon exists → graceful shutdown
 │
-├── 2. SESSION LIMIT CHECK (if claude-monitor available)
-│   ├── usage = check_session_limits()
-│   ├── if usage.should_pause (session >= 97%):
-│   │   ├── create .loom/stop-shepherds (pause signal)
-│   │   ├── wait for active shepherds to reach phase boundary
-│   │   ├── calculate wake_time from session_reset
-│   │   ├── save pause state to daemon-state.json
-│   │   ├── sleep until wake_time
-│   │   ├── remove .loom/stop-shepherds
-│   │   └── continue (shepherds resume with preserved assignments)
-│   └── else: continue normally
-│
-├── 3. ASSESS SYSTEM STATE (automatic)
+├── 2. ASSESS SYSTEM STATE (automatic)
 │   ├── ready_issues = gh issue list --label "loom:issue" count
 │   ├── building_issues = gh issue list --label "loom:building" count
 │   ├── architect_proposals = gh issue list --label "loom:architect" count
 │   ├── hermit_proposals = gh issue list --label "loom:hermit" count
 │   └── prs_pending = gh pr list --label "loom:review-requested" count
 │
-├── 4. CHECK SUBAGENT COMPLETIONS (non-blocking)
+├── 3. CHECK SUBAGENT COMPLETIONS (non-blocking)
 │   └── For each active shepherd/role: TaskOutput with block=false
 │
-├── 5. AUTO-SPAWN SHEPHERDS (no human decision)
+├── 4. AUTO-SPAWN SHEPHERDS (no human decision)
 │   └── while active_shepherds < MAX_SHEPHERDS AND ready_issues > 0:
 │       └── spawn_shepherd_for_next_ready_issue()
 │
-├── 6. AUTO-TRIGGER WORK GENERATION (no human decision)
+├── 5. AUTO-TRIGGER WORK GENERATION (no human decision)
 │   ├── if ready_issues < ISSUE_THRESHOLD:
 │   │   ├── if architect_cooldown_elapsed AND architect_proposals < MAX:
 │   │   │   └── spawn_architect()
@@ -178,19 +112,19 @@ DAEMON ITERATION:
 │   │       └── spawn_hermit()
 │   └── (Proposals feed pipeline when humans approve them)
 │
-├── 7. AUTO-ENSURE SUPPORT ROLES (no human decision)
+├── 6. AUTO-ENSURE SUPPORT ROLES (no human decision)
 │   ├── if guide_not_running OR guide_idle > GUIDE_INTERVAL:
 │   │   └── spawn_guide()
 │   └── if champion_not_running OR champion_idle > CHAMPION_INTERVAL:
 │       └── spawn_champion()
 │
-├── 8. SAVE STATE
+├── 7. SAVE STATE
 │   └── Update .loom/daemon-state.json
 │
-├── 9. REPORT STATUS
-│   └── Print status report (include session usage if available)
+├── 8. REPORT STATUS
+│   └── Print status report to console
 │
-└── 10. SLEEP(POLL_INTERVAL) and repeat
+└── 9. SLEEP(POLL_INTERVAL) and repeat
 ```
 
 ### Spawning Shepherd Subagents (Automatic)
@@ -238,7 +172,7 @@ def auto_generate_work():
         if architect_cooldown_ok() and architect_proposals < 2:
             Task(
                 description="Architect work generation",
-                prompt="/architect --autonomous",
+                prompt="/architect",
                 run_in_background=True
             )
             update_last_architect_trigger()
@@ -435,22 +369,17 @@ def daemon_loop():
         auto_ensure_support_roles()  # Guide and Champion
 
         # ═══════════════════════════════════════════════════
-        # STEP 7: STUCK AGENT DETECTION (automatic)
-        # ═══════════════════════════════════════════════════
-        check_stuck_agents()  # Detect and intervene for stuck shepherds
-
-        # ═══════════════════════════════════════════════════
-        # STEP 8: SAVE STATE
+        # STEP 7: SAVE STATE
         # ═══════════════════════════════════════════════════
         save_daemon_state()
 
         # ═══════════════════════════════════════════════════
-        # STEP 9: REPORT STATUS
+        # STEP 8: REPORT STATUS
         # ═══════════════════════════════════════════════════
         print_status_report()
 
         # ═══════════════════════════════════════════════════
-        # STEP 10: SLEEP AND REPEAT
+        # STEP 9: SLEEP AND REPEAT
         # ═══════════════════════════════════════════════════
         print(f"\nSleeping {POLL_INTERVAL}s until next iteration...")
         sleep(POLL_INTERVAL)
@@ -513,7 +442,7 @@ def auto_generate_work():
     if architect_proposals < MAX_ARCHITECT_PROPOSALS and architect_elapsed > ARCHITECT_COOLDOWN:
         result = Task(
             description="Architect work generation",
-            prompt="/architect --autonomous",
+            prompt="/architect",
             run_in_background=True
         )
         record_support_role("architect", result.task_id, result.output_file)
@@ -582,61 +511,26 @@ def auto_ensure_support_roles():
 
 ### Graceful Shutdown
 
-The daemon uses a signal-based approach to stop shepherds gracefully at phase boundaries.
-
 ```python
 def graceful_shutdown():
     print("\nShutdown signal received...")
 
-    # Create shepherd stop signal
-    # Shepherds check for this at phase boundaries and exit cleanly
-    touch(".loom/stop-shepherds")
-    print("  Created .loom/stop-shepherds signal")
-
-    # Wait for active shepherds (reduced timeout since they exit at phase boundaries)
-    # Phase boundaries typically occur every 1-5 minutes, so 2 minutes is usually sufficient
-    timeout = 120  # 2 minutes instead of 5
+    # Wait for active shepherds (max 5 min)
+    timeout = 300
     start = now()
 
     while count_active_shepherds() > 0 and elapsed(start) < timeout:
-        active = count_active_shepherds()
-        print(f"  Waiting for {active} shepherds to reach phase boundary...")
+        print(f"  Waiting for {count_active_shepherds()} shepherds...")
         check_all_subagent_completions()
         sleep(10)
 
-    # Report any shepherds that didn't exit in time
-    remaining = count_active_shepherds()
-    if remaining > 0:
-        print(f"  Warning: {remaining} shepherds did not exit within timeout")
-        print(f"  These shepherds will continue in background and exit at next phase boundary")
-
-    # Cleanup signals and state
-    rm(".loom/stop-shepherds")
-    rm(".loom/stop-daemon")
+    # Cleanup
     run("./scripts/daemon-cleanup.sh daemon-shutdown")
+    rm(".loom/stop-daemon")
     state["running"] = False
     state["stopped_at"] = now()
     save_daemon_state()
     print("Daemon stopped gracefully")
-```
-
-### Shepherd Stop Signal
-
-The `.loom/stop-shepherds` file acts as a coordination signal:
-
-1. **Daemon creates** `.loom/stop-shepherds` when shutdown begins
-2. **Shepherds check** for this file at phase boundaries (after Curator, Builder, Judge)
-3. **When detected**, shepherds:
-   - Complete current phase (don't abandon mid-work)
-   - Revert issue from `loom:building` to `loom:issue`
-   - Add comment explaining graceful exit
-   - Exit cleanly
-4. **Daemon removes** `.loom/stop-shepherds` after cleanup
-
-This ensures:
-- No half-completed work left behind
-- Issues remain in valid states for next daemon start
-- Shutdown is responsive (1-5 minutes vs 15+ minutes)
 ```
 
 ## State File Format
@@ -690,46 +584,7 @@ Track state in `.loom/daemon-state.json`:
   "completed_issues": [100, 101, 102],
   "total_prs_merged": 3,
   "last_architect_trigger": "2026-01-23T10:00:00Z",
-  "last_hermit_trigger": "2026-01-23T10:30:00Z",
-
-  "session_limit_awareness": {
-    "enabled": true,
-    "last_check": "2026-01-23T11:30:00Z",
-    "session_percent": 45,
-    "paused_for_rate_limit": false,
-    "pause_started_at": null,
-    "expected_resume_at": null,
-    "session_percent_at_pause": null,
-    "total_pauses": 0,
-    "total_pause_duration_minutes": 0
-  },
-
-  "stuck_detection": {
-    "enabled": true,
-    "last_check": "2026-01-23T11:30:00Z",
-    "config": {
-      "idle_threshold": 600,
-      "working_threshold": 1800,
-      "loop_threshold": 3,
-      "error_spike_threshold": 5,
-      "intervention_mode": "escalate"
-    },
-    "active_interventions": [],
-    "recent_detections": [
-      {
-        "agent_id": "shepherd-1",
-        "issue": 123,
-        "detected_at": "2026-01-23T11:25:00Z",
-        "severity": "warning",
-        "indicators": ["no_progress:720s"],
-        "intervention": "alert",
-        "resolved_at": null
-      }
-    ],
-    "total_detections": 1,
-    "total_interventions": 1,
-    "false_positive_rate": 0.1
-  }
+  "last_hermit_trigger": "2026-01-23T10:30:00Z"
 }
 ```
 
@@ -788,21 +643,9 @@ Print status after each iteration showing ALL autonomous decisions:
     Issues completed: 3
     PRs merged: 3
 
-  CLAUDE USAGE (via claude-monitor):
-    Session:  45% used (resets in 2h 15m)  ✓ Healthy
-    Weekly:   31% used (resets Thu 10:00 PM)
-    [Pause threshold: 97%]
-
-  STUCK DETECTION:
-    Status: ✓ All agents healthy
-    Active interventions: 0
-    Recent detections: 1 (last: 35m ago, resolved)
-    Config: idle=10m, working=30m, mode=escalate
-
   AUTONOMOUS DECISIONS THIS ITERATION:
     ✓ Auto-spawned shepherd for #789
     ✓ Auto-triggered Hermit (backlog low)
-    ✓ Stuck detection check completed (0 stuck)
     - Architect skipped (proposals at max)
     - Guide still running (idle < interval)
 ═══════════════════════════════════════════════════════════════════
@@ -819,118 +662,30 @@ Print status after each iteration showing ALL autonomous decisions:
 
 ## Error Handling
 
-### Stuck Agent Detection
+### Shepherd Stuck
 
-The daemon automatically detects stuck agents using the `stuck-detection.sh` script. This provides comprehensive detection of various stuck indicators.
-
-#### Stuck Indicators
-
-| Indicator | Default Threshold | Description |
-|-----------|-------------------|-------------|
-| `no_progress` | 10 minutes | No output written to task output file |
-| `extended_work` | 30 minutes | Working on same issue without creating PR |
-| `looping` | 3 occurrences | Repeated similar error patterns |
-| `error_spike` | 5 errors | Multiple errors in short period |
-
-#### Detection Integration
+The daemon automatically detects stuck shepherds:
 
 ```python
-def check_stuck_agents():
-    """Auto-detect stuck agents and trigger appropriate interventions."""
+def check_stuck_shepherds():
+    """Auto-detect stuck shepherds - report but don't auto-restart (needs human judgment)."""
 
-    # Run stuck detection script
-    result = run("./.loom/scripts/stuck-detection.sh check --json")
+    for shepherd_id, info in active_shepherds.items():
+        elapsed = seconds_since(info["started"])
 
-    if result.exit_code == 2:  # Stuck agents found
-        stuck_data = json.loads(result.stdout)
+        if elapsed > STUCK_THRESHOLD:  # 30 minutes
+            labels = gh_get_issue_labels(info["issue"])
 
-        for agent_result in stuck_data["results"]:
-            if agent_result["stuck"]:
-                severity = agent_result["severity"]
-                intervention = agent_result["suggested_intervention"]
-                issue = agent_result["issue"]
-                indicators = agent_result["indicators"]
-
-                print(f"  ⚠ STUCK: {agent_result['agent_id']} on #{issue}")
-                print(f"    Severity: {severity}")
-                print(f"    Indicators: {', '.join(indicators)}")
-                print(f"    Intervention: {intervention}")
-
-                # Record in daemon state
-                record_stuck_detection(agent_result)
-
-                # Intervention already triggered by script if configured
+            if "loom:blocked" in labels:
+                # Issue is explicitly blocked - needs human
+                print(f"  ⚠ BLOCKED: #{info['issue']} - needs human intervention")
+                # Record in state for dashboard visibility
+                record_blocked_issue(info["issue"])
+            else:
+                print(f"  ⚠ STUCK?: shepherd-{shepherd_id} on #{info['issue']} ({elapsed//60}m)")
+                # Don't auto-restart - may just be slow
+                # Human can check via: cat .loom/daemon-state.json
 ```
-
-#### Intervention Types
-
-| Type | Trigger | Action |
-|------|---------|--------|
-| `alert` | Low severity (warning) | Write to `.loom/interventions/`, human reviews |
-| `suggest` | Medium severity (elevated) | Suggest role switch (e.g., Builder -> Doctor) |
-| `pause` | High severity (critical) | Auto-pause via signal.sh, requires manual restart |
-| `clarify` | Error spike | Suggest requesting clarification from issue author |
-| `escalate` | Critical + multiple indicators | Full escalation: pause + alert + loom:blocked label |
-
-#### Configuring Stuck Detection
-
-```bash
-# Configure thresholds
-./.loom/scripts/stuck-detection.sh configure \
-  --idle-threshold 900 \
-  --working-threshold 2400 \
-  --intervention-mode escalate
-
-# View current configuration
-./.loom/scripts/stuck-detection.sh status
-
-# Check specific agent
-./.loom/scripts/stuck-detection.sh check-agent shepherd-1 --verbose
-```
-
-#### Intervention Files
-
-When interventions are triggered, files are created in `.loom/interventions/`:
-
-```
-.loom/interventions/
-├── shepherd-1-20260124120000.json  # Full detection data
-├── shepherd-1-latest.txt           # Human-readable summary
-├── shepherd-2-20260124121500.json
-└── shepherd-2-latest.txt
-```
-
-#### Clearing Stuck State
-
-```bash
-# Clear interventions for specific agent
-./.loom/scripts/stuck-detection.sh clear shepherd-1
-
-# Clear all interventions
-./.loom/scripts/stuck-detection.sh clear all
-
-# Resume paused agent (also clears stop signal)
-./.loom/scripts/signal.sh clear shepherd-1
-```
-
-#### False Positive Mitigation
-
-The detection system includes safeguards against false positives:
-
-1. **Multiple indicators required**: Single threshold breach triggers warning, not pause
-2. **PR existence check**: Extended work check is skipped if PR already exists
-3. **Configurable thresholds**: Adjust via `stuck-detection.sh configure`
-4. **Escalation chain**: warn -> suggest -> pause (not immediate pause)
-5. **Human override**: Layer 3 can clear any intervention
-
-#### Distinguishing Stuck vs Working on Hard Problem
-
-The detection script uses these heuristics:
-
-- **Output file activity**: Actively working agents write output periodically
-- **Loop pattern analysis**: Stuck agents repeat similar errors; hard problems show varied attempts
-- **PR progress**: Building agents eventually create PRs; stuck agents don't
-- **Error diversity**: Hard problems have varied errors; stuck agents repeat the same ones
 
 ### Empty Backlog (Autonomous Response)
 

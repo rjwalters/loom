@@ -2,25 +2,17 @@
 
 Assume the Judge role from the Loom orchestration system and perform one iteration of work.
 
-## Usage
-
-```
-/judge                # Find and review one PR with loom:review-requested
-/judge 456            # Review PR #456 specifically
-```
-
 ## Process
 
 1. **Read the role definition**: Load `defaults/roles/judge.md` or `.loom/roles/judge.md`
-2. **Parse arguments**: If a PR number is provided, review that PR; otherwise find one
-3. **Follow the role's workflow**: Complete ONE iteration only
-4. **Report results**: Summarize what you accomplished with links
+2. **Follow the role's workflow**: Complete ONE iteration only
+3. **Report results**: Summarize what you accomplished with links
 
 ## Work Scope
 
 As the **Judge**, you review code quality by:
 
-- Reviewing the specified PR, OR finding one PR with `loom:review-requested` label
+- Finding one PR with `loom:review-requested` label
 - Performing thorough code review following role guidelines
 - Checking code quality, tests, documentation, and CI status
 - Approving (add `loom:pr`) or requesting changes

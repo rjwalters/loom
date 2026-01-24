@@ -523,49 +523,6 @@ output_formatted() {
     fi
     echo ""
 
-    # Stuck Detection Status
-    echo -e "  ${BOLD}Stuck Detection:${NC}"
-    local interventions_dir="$REPO_ROOT/.loom/interventions"
-    local stuck_config="$REPO_ROOT/.loom/stuck-config.json"
-
-    # Count active interventions
-    local intervention_count=0
-    if [[ -d "$interventions_dir" ]]; then
-        intervention_count=$(find "$interventions_dir" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
-    fi
-
-    if [[ "$intervention_count" -gt 0 ]]; then
-        echo -e "    Status: ${RED}${intervention_count} active intervention(s)${NC}"
-        # Show details of each intervention
-        for intervention_file in "$interventions_dir"/*.json; do
-            if [[ -f "$intervention_file" ]]; then
-                local agent_id
-                local severity
-                local intervention_type
-                agent_id=$(jq -r '.agent_id // "unknown"' "$intervention_file" 2>/dev/null)
-                severity=$(jq -r '.severity // "unknown"' "$intervention_file" 2>/dev/null)
-                intervention_type=$(jq -r '.intervention_type // "unknown"' "$intervention_file" 2>/dev/null)
-                echo -e "      ${YELLOW}$agent_id${NC}: $intervention_type ($severity)"
-            fi
-        done
-    else
-        echo -e "    Status: ${GREEN}All agents healthy${NC}"
-    fi
-
-    # Show configuration
-    if [[ -f "$stuck_config" ]]; then
-        local idle_threshold
-        local working_threshold
-        local intervention_mode
-        idle_threshold=$(jq -r '.idle_threshold // 600' "$stuck_config")
-        working_threshold=$(jq -r '.working_threshold // 1800' "$stuck_config")
-        intervention_mode=$(jq -r '.intervention_mode // "escalate"' "$stuck_config")
-        echo -e "    Config: idle=$((idle_threshold / 60))m, working=$((working_threshold / 60))m, mode=$intervention_mode"
-    else
-        echo -e "    Config: ${GRAY}Using defaults (idle=10m, working=30m, mode=escalate)${NC}"
-    fi
-    echo ""
-
     # Layer 3 Actions
     echo -e "  ${BOLD}Layer 3 Actions Available:${NC}"
     echo ""
@@ -599,16 +556,6 @@ output_formatted() {
     fi
     echo -e "      - View daemon state: ${CYAN}cat .loom/daemon-state.json | jq${NC}"
     echo ""
-
-    # Show stuck detection actions if interventions exist
-    if [[ "$intervention_count" -gt 0 ]]; then
-        echo -e "    ${YELLOW}Stuck Agent Actions:${NC}"
-        echo -e "      - View stuck status: ${CYAN}./.loom/scripts/stuck-detection.sh status${NC}"
-        echo -e "      - Clear intervention: ${CYAN}./.loom/scripts/stuck-detection.sh clear <agent-id>${NC}"
-        echo -e "      - Resume agent: ${CYAN}./.loom/scripts/signal.sh clear <agent-id>${NC}"
-        echo -e "      - View history: ${CYAN}./.loom/scripts/stuck-detection.sh history${NC}"
-        echo ""
-    fi
 
     echo -e "${BOLD}${CYAN}=======================================================================${NC}"
     echo ""

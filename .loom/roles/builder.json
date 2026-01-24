@@ -8,9 +8,5 @@
   "gitIdentity": {
     "name": "Loom Worker",
     "email": "loom-worker@users.noreply.github.com"
-  },
-  "stuckThresholds": {
-    "maxNoOutput": 1800000,
-    "maxNeedsInput": 300000
   }
 }

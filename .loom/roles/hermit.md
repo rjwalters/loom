@@ -534,6 +534,110 @@ Track your random file reviews:
 - < 1 issue per month from random reviews → Lower your bar slightly
 - Workers consistently skip your suggestions → Ask for feedback on criteria
 
+## Scaffolding vs Bloat Validation
+
+Before proposing removal of code that appears unused, **verify it's not intentional scaffolding** for planned future work.
+
+### Why This Matters
+
+The historical analysis techniques (finding code with only 1 commit, never modified, etc.) can correctly identify scaffolding but fail to distinguish between:
+
+- **True bloat**: Abandoned experiments, forgotten code, dead features
+- **Forward-looking scaffolding**: Intentional placeholders for planned work
+
+Creating false positive issues for intentional scaffolding:
+- Wastes user time reviewing and rejecting proposals
+- Erodes trust in Hermit's recommendations
+- Creates noise in the issue backlog
+
+### When to Check for Scaffolding
+
+Run this validation when you find:
+- Stub/placeholder implementations (empty functions, placeholder comments)
+- Workspace crates/modules with minimal code
+- Code with only 1 commit and no subsequent development
+- Infrastructure that seems prepared but unused
+
+### Validation Steps
+
+**1. Check Project Planning Documents**
+
+```bash
+# Look for mentions in README
+rg -i "<module-name>|<feature-name>" README.md
+
+# Check work plans and roadmaps
+rg -i "<module-name>|<feature-name>" WORK_PLAN.md ROADMAP.md PROJECT_PLAN.md
+
+# Search all markdown docs
+rg -i "<module-name>|<feature-name>" --type md
+```
+
+**2. Check Open Issues and Milestones**
+
+```bash
+# Search for related issues
+gh issue list --search "<feature-name>" --state open
+
+# Check milestones mentioning the feature
+gh issue list --milestone "<milestone-name>"
+```
+
+**3. Evaluate Age and Context**
+
+```bash
+# Check when the workspace/project was initialized
+git log --reverse --oneline | head -5
+
+# If scaffolding was added during initial setup (same day/week as project init):
+# → Likely intentional forward-looking infrastructure
+# → Review planning docs more carefully before flagging
+```
+
+### Decision Criteria
+
+**DO NOT FLAG** if:
+- Mentioned in README/WORK_PLAN under "Future Work" or "Planned Phases"
+- Part of initial workspace scaffolding (added during project setup)
+- Referenced in open issues/milestones as planned work
+- Documented in architecture docs as "to be implemented"
+
+**FLAG AS BLOAT** if:
+- Not mentioned anywhere in planning documents
+- Added months/years ago with no plan to implement
+- From abandoned experiment (git history shows failed attempt)
+- Duplicate/redundant with existing implemented code
+
+### Example Workflow
+
+```bash
+# Found: transaction crate with only 1 commit, no usage
+
+# Step 1: Check planning docs
+$ rg -i "transaction" README.md WORK_PLAN.md
+README.md:56:- Savepoints in transactions
+WORK_PLAN.md:142:Phase 5 includes transaction support
+
+# RESULT: Mentioned in Phase 5 roadmap → NOT BLOAT, intentional scaffolding
+
+# Step 2: Verify it's part of workspace scaffolding
+$ git log --oneline crates/transaction/
+49e1816 ADR-0001: Choose Rust + Initialize Cargo workspace
+$ git log --oneline | head -1
+49e1816 ADR-0001: Choose Rust + Initialize Cargo workspace
+
+# RESULT: Added during workspace initialization → Forward-looking infrastructure
+
+# DECISION: Skip this - it's intentional scaffolding for Phase 5
+```
+
+### Notes
+
+- **Better to skip** than create false positive issues
+- **Check context** before relying purely on technical evidence
+- **Ask if unsure**: Create issue tagged as "question" rather than "loom:hermit"
+- **Learn from rejections**: If users repeatedly reject scaffolding flags, raise your validation bar
+
 ## Creating Removal Proposals
 
 When you identify bloat, you have two options:

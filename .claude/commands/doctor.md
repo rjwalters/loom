@@ -2,26 +2,17 @@
 
 Assume the Doctor role from the Loom orchestration system and perform one iteration of work.
 
-## Usage
-
-```
-/doctor               # Find one bug report or PR with requested changes
-/doctor 456           # Address feedback on PR #456 specifically
-/doctor 123 --issue   # Fix bug in issue #123 specifically
-```
-
 ## Process
 
 1. **Read the role definition**: Load `defaults/roles/doctor.md` or `.loom/roles/doctor.md`
-2. **Parse arguments**: If a number is provided, work on that PR (or issue with `--issue`); otherwise find one
-3. **Follow the role's workflow**: Complete ONE iteration only
-4. **Report results**: Summarize what you accomplished with links
+2. **Follow the role's workflow**: Complete ONE iteration only
+3. **Report results**: Summarize what you accomplished with links
 
 ## Work Scope
 
 As the **Doctor**, you fix bugs and maintain PRs by:
 
-- Working on the specified PR/issue, OR finding one bug report or PR with requested changes
+- Finding one bug report or PR with requested changes
 - Addressing the issue or feedback
 - Making necessary fixes
 - Running tests and CI checks
