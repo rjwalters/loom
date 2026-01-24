@@ -111,18 +111,22 @@ Launch the Loom desktop application for automated orchestration with visual term
 
 ### 3. Daemon Mode (Fully Autonomous)
 
-Run the Loom daemon for fully autonomous system orchestration without any human intervention for routine operations.
+Run the Loom daemon for fully autonomous system orchestration.
 
 **Setup**:
 ```bash
-# Start the daemon (runs continuously)
+# Start the daemon (runs continuously, or as background process)
 /loom
 
-# The daemon will AUTOMATICALLY:
-# 1. Spawn shepherds when ready issues are available
-# 2. Trigger Architect/Hermit when backlog is low
-# 3. Ensure Guide and Champion keep running
-# 4. Scale based on demand - no human decisions needed
+# Or start as background process
+/loom start
+
+# Check daemon progress (read-only observer mode)
+/loom status
+
+# Stop the daemon gracefully
+/loom stop
+# Or: touch .loom/stop-daemon
 ```
 
 **Key Principle: FULLY AUTONOMOUS**
@@ -132,6 +136,12 @@ The daemon makes ALL spawning and scaling decisions automatically:
 - Architect/Hermit are triggered automatically when backlog < threshold
 - Guide/Champion are respawned automatically on their intervals
 - No human approval needed for ANY of the above
+
+The human observer should NOT:
+- Manually spawn shepherds or agents
+- Manually trigger Architect/Hermit
+- Override daemon scaling decisions
+- "Help" by manually running agents
 
 **Human intervention is ONLY required for**:
 - Approving proposals: `loom:architect` -> `loom:issue`
@@ -145,17 +155,37 @@ The daemon makes ALL spawning and scaling decisions automatically:
 - Multiple issues need parallel processing
 - Production-scale orchestration
 
-**Observing the daemon**:
+**Example workflow**:
 ```bash
-# Check daemon state
+# Start daemon
+/loom start
+# Daemon spawns in background, session becomes observer
+
+# Check progress periodically
+/loom status
+
+# Or check state file directly
 cat .loom/daemon-state.json | jq
 
-# View active shepherds
-jq '.shepherds | to_entries[] | select(.value.issue != null)' .loom/daemon-state.json
+# Approve architect proposals (human action)
+gh issue edit 1050 --remove-label "loom:architect" --add-label "loom:issue"
 
-# Graceful shutdown
-touch .loom/stop-daemon
+# Handle blocked issues (human action)
+gh issue view 1045 --comments
+gh issue edit 1045 --remove-label "loom:blocked"
+
+# When done
+/loom stop
+# Or: touch .loom/stop-daemon
 ```
+
+**Why Autonomous Daemon?**
+
+1. **Clear separation**: Daemon executes, human observes
+2. **Fresh context**: Each subagent starts fresh
+3. **True autonomy**: Daemon scales without human intervention
+4. **No manual decisions**: All spawning is automatic based on thresholds
+
 
 ## Agent Roles
 

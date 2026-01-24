@@ -34,9 +34,35 @@ You don't shepherd issues yourself - you spawn subagent shepherds to do the work
 | Command | Description |
 |---------|-------------|
 | (none) | Start continuous daemon loop |
-| `status` | Report system state without starting loop |
+| `status` | Report system state without starting loop (see Status Command below) |
 | `spawn <issue>` | Manually spawn a shepherd subagent for specific issue |
 | `stop` | Create `.loom/stop-daemon` for graceful shutdown |
+
+## Status Command
+
+The `status` command is a **read-only observation interface** for Layer 3 (human observer). It displays the current system state without taking any action.
+
+**To run status**, execute the helper script:
+
+```bash
+# Display formatted status
+./.loom/scripts/loom-status.sh
+
+# Get status as JSON for scripting
+./.loom/scripts/loom-status.sh --json
+```
+
+**Status shows**:
+- Daemon status (running/stopped, uptime)
+- System state (issue counts by label)
+- Shepherd pool status (active/idle, assigned issues)
+- Support role status (Architect, Hermit, Guide, Champion)
+- Session statistics (completed issues, PRs merged)
+- Available Layer 3 interventions
+
+**Important**: `/loom status` is for Layer 3 observation - it never modifies state.
+- `/loom` = Run the daemon (Layer 2 executor role)
+- `/loom status` = Observe the system (Layer 3 observer role)
 
 ## Continuous Loop
 
