@@ -435,17 +435,22 @@ def daemon_loop():
         auto_ensure_support_roles()  # Guide and Champion
 
         # ═══════════════════════════════════════════════════
-        # STEP 7: SAVE STATE
+        # STEP 7: STUCK AGENT DETECTION (automatic)
+        # ═══════════════════════════════════════════════════
+        check_stuck_agents()  # Detect and intervene for stuck shepherds
+
+        # ═══════════════════════════════════════════════════
+        # STEP 8: SAVE STATE
         # ═══════════════════════════════════════════════════
         save_daemon_state()
 
         # ═══════════════════════════════════════════════════
-        # STEP 8: REPORT STATUS
+        # STEP 9: REPORT STATUS
         # ═══════════════════════════════════════════════════
         print_status_report()
 
         # ═══════════════════════════════════════════════════
-        # STEP 9: SLEEP AND REPEAT
+        # STEP 10: SLEEP AND REPEAT
         # ═══════════════════════════════════════════════════
         print(f"\nSleeping {POLL_INTERVAL}s until next iteration...")
         sleep(POLL_INTERVAL)
@@ -697,6 +702,33 @@ Track state in `.loom/daemon-state.json`:
     "session_percent_at_pause": null,
     "total_pauses": 0,
     "total_pause_duration_minutes": 0
+  },
+
+  "stuck_detection": {
+    "enabled": true,
+    "last_check": "2026-01-23T11:30:00Z",
+    "config": {
+      "idle_threshold": 600,
+      "working_threshold": 1800,
+      "loop_threshold": 3,
+      "error_spike_threshold": 5,
+      "intervention_mode": "escalate"
+    },
+    "active_interventions": [],
+    "recent_detections": [
+      {
+        "agent_id": "shepherd-1",
+        "issue": 123,
+        "detected_at": "2026-01-23T11:25:00Z",
+        "severity": "warning",
+        "indicators": ["no_progress:720s"],
+        "intervention": "alert",
+        "resolved_at": null
+      }
+    ],
+    "total_detections": 1,
+    "total_interventions": 1,
+    "false_positive_rate": 0.1
   }
 }
 ```
@@ -761,9 +793,16 @@ Print status after each iteration showing ALL autonomous decisions:
     Weekly:   31% used (resets Thu 10:00 PM)
     [Pause threshold: 97%]
 
+  STUCK DETECTION:
+    Status: ✓ All agents healthy
+    Active interventions: 0
+    Recent detections: 1 (last: 35m ago, resolved)
+    Config: idle=10m, working=30m, mode=escalate
+
   AUTONOMOUS DECISIONS THIS ITERATION:
     ✓ Auto-spawned shepherd for #789
     ✓ Auto-triggered Hermit (backlog low)
+    ✓ Stuck detection check completed (0 stuck)
     - Architect skipped (proposals at max)
     - Guide still running (idle < interval)
 ═══════════════════════════════════════════════════════════════════
@@ -780,30 +819,118 @@ Print status after each iteration showing ALL autonomous decisions:
 
 ## Error Handling
 
-### Shepherd Stuck
+### Stuck Agent Detection
 
-The daemon automatically detects stuck shepherds:
+The daemon automatically detects stuck agents using the `stuck-detection.sh` script. This provides comprehensive detection of various stuck indicators.
+
+#### Stuck Indicators
+
+| Indicator | Default Threshold | Description |
+|-----------|-------------------|-------------|
+| `no_progress` | 10 minutes | No output written to task output file |
+| `extended_work` | 30 minutes | Working on same issue without creating PR |
+| `looping` | 3 occurrences | Repeated similar error patterns |
+| `error_spike` | 5 errors | Multiple errors in short period |
+
+#### Detection Integration
 
 ```python
-def check_stuck_shepherds():
-    """Auto-detect stuck shepherds - report but don't auto-restart (needs human judgment)."""
+def check_stuck_agents():
+    """Auto-detect stuck agents and trigger appropriate interventions."""
 
-    for shepherd_id, info in active_shepherds.items():
-        elapsed = seconds_since(info["started"])
+    # Run stuck detection script
+    result = run("./.loom/scripts/stuck-detection.sh check --json")
 
-        if elapsed > STUCK_THRESHOLD:  # 30 minutes
-            labels = gh_get_issue_labels(info["issue"])
+    if result.exit_code == 2:  # Stuck agents found
+        stuck_data = json.loads(result.stdout)
 
-            if "loom:blocked" in labels:
-                # Issue is explicitly blocked - needs human
-                print(f"  ⚠ BLOCKED: #{info['issue']} - needs human intervention")
-                # Record in state for dashboard visibility
-                record_blocked_issue(info["issue"])
-            else:
-                print(f"  ⚠ STUCK?: shepherd-{shepherd_id} on #{info['issue']} ({elapsed//60}m)")
-                # Don't auto-restart - may just be slow
-                # Human can check via: cat .loom/daemon-state.json
+        for agent_result in stuck_data["results"]:
+            if agent_result["stuck"]:
+                severity = agent_result["severity"]
+                intervention = agent_result["suggested_intervention"]
+                issue = agent_result["issue"]
+                indicators = agent_result["indicators"]
+
+                print(f"  ⚠ STUCK: {agent_result['agent_id']} on #{issue}")
+                print(f"    Severity: {severity}")
+                print(f"    Indicators: {', '.join(indicators)}")
+                print(f"    Intervention: {intervention}")
+
+                # Record in daemon state
+                record_stuck_detection(agent_result)
+
+                # Intervention already triggered by script if configured
 ```
+
+#### Intervention Types
+
+| Type | Trigger | Action |
+|------|---------|--------|
+| `alert` | Low severity (warning) | Write to `.loom/interventions/`, human reviews |
+| `suggest` | Medium severity (elevated) | Suggest role switch (e.g., Builder -> Doctor) |
+| `pause` | High severity (critical) | Auto-pause via signal.sh, requires manual restart |
+| `clarify` | Error spike | Suggest requesting clarification from issue author |
+| `escalate` | Critical + multiple indicators | Full escalation: pause + alert + loom:blocked label |
+
+#### Configuring Stuck Detection
+
+```bash
+# Configure thresholds
+./.loom/scripts/stuck-detection.sh configure \
+  --idle-threshold 900 \
+  --working-threshold 2400 \
+  --intervention-mode escalate
+
+# View current configuration
+./.loom/scripts/stuck-detection.sh status
+
+# Check specific agent
+./.loom/scripts/stuck-detection.sh check-agent shepherd-1 --verbose
+```
+
+#### Intervention Files
+
+When interventions are triggered, files are created in `.loom/interventions/`:
+
+```
+.loom/interventions/
+├── shepherd-1-20260124120000.json  # Full detection data
+├── shepherd-1-latest.txt           # Human-readable summary
+├── shepherd-2-20260124121500.json
+└── shepherd-2-latest.txt
+```
+
+#### Clearing Stuck State
+
+```bash
+# Clear interventions for specific agent
+./.loom/scripts/stuck-detection.sh clear shepherd-1
+
+# Clear all interventions
+./.loom/scripts/stuck-detection.sh clear all
+
+# Resume paused agent (also clears stop signal)
+./.loom/scripts/signal.sh clear shepherd-1
+```
+
+#### False Positive Mitigation
+
+The detection system includes safeguards against false positives:
+
+1. **Multiple indicators required**: Single threshold breach triggers warning, not pause
+2. **PR existence check**: Extended work check is skipped if PR already exists
+3. **Configurable thresholds**: Adjust via `stuck-detection.sh configure`
+4. **Escalation chain**: warn -> suggest -> pause (not immediate pause)
+5. **Human override**: Layer 3 can clear any intervention
+
+#### Distinguishing Stuck vs Working on Hard Problem
+
+The detection script uses these heuristics:
+
+- **Output file activity**: Actively working agents write output periodically
+- **Loop pattern analysis**: Stuck agents repeat similar errors; hard problems show varied attempts
+- **PR progress**: Building agents eventually create PRs; stuck agents don't
+- **Error diversity**: Hard problems have varied errors; stuck agents repeat the same ones
 
 ### Empty Backlog (Autonomous Response)
 
