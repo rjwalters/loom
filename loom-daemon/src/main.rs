@@ -343,7 +343,9 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             println!("\nRoles found: {}", validation.roles_found.join(", "));
                         }
 
-                        println!("\nℹ️  Self-installation skips file copying to prevent data loss.");
+                        println!(
+                            "\nℹ️  Self-installation skips file copying to prevent data loss."
+                        );
                         println!("   The Loom repo's .loom/ directory IS the source of truth.");
                         println!("\nTo use Loom orchestration:");
                         println!("  - Open Claude Code terminals with /builder, /judge, etc.");
