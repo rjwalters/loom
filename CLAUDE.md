@@ -795,6 +795,7 @@ Loom provides MCP (Model Context Protocol) servers that allow Claude Code to pro
 - `check_tmux_server_health` - Check tmux server status
 - `get_tmux_server_info` - Get tmux server details
 - `toggle_tmux_verbose_logging` - Enable tmux debug logging
+- `get_agent_metrics` - Get agent performance metrics for self-aware behavior
 
 **loom-ui** - UI control via file-based IPC:
 - `read_console_log` - Read browser console logs
@@ -831,6 +832,58 @@ mcp__loom-ui__stop_engine
 
 # Get comprehensive state
 mcp__loom-ui__get_ui_state
+```
+
+### Agent Performance Metrics
+
+Agents can query their own performance metrics to make informed decisions. This enables self-aware behavior where agents can:
+- Check if struggling with a task type and escalate
+- Select approaches based on historical success rates
+- Monitor costs and adjust behavior accordingly
+
+**Via MCP Tool**:
+```bash
+# Get overall metrics summary
+mcp__loom-terminals__get_agent_metrics --command summary --period week
+
+# Get effectiveness metrics for a specific role
+mcp__loom-terminals__get_agent_metrics --command effectiveness --role builder
+
+# Get cost breakdown for a specific issue
+mcp__loom-terminals__get_agent_metrics --command costs --issue 123
+
+# Get velocity trends
+mcp__loom-terminals__get_agent_metrics --command velocity
+```
+
+**Via CLI Script**:
+```bash
+# Get my metrics as a builder
+./.loom/scripts/agent-metrics.sh --role builder
+
+# Check effectiveness by role
+./.loom/scripts/agent-metrics.sh effectiveness
+
+# Get cost for specific issue
+./.loom/scripts/agent-metrics.sh costs --issue 123
+
+# JSON output for programmatic use
+./.loom/scripts/agent-metrics.sh summary --format json
+```
+
+**Metrics Available**:
+- **Summary**: Total prompts, tokens, cost, issues worked, PRs created, success rate
+- **Effectiveness**: Per-role success rates, average cost, average duration
+- **Costs**: Cost per issue, tokens per issue, time spent
+- **Velocity**: Issues closed, PRs merged, cycle time trends
+
+**Example Use Case (Agent Escalation)**:
+```bash
+# Check if success rate is below threshold
+success_rate=$(./loom/scripts/agent-metrics.sh --role builder --format json | jq '.success_rate')
+if (( $(echo "$success_rate < 70" | bc -l) )); then
+    echo "Consider escalating - success rate below threshold"
+fi
 ```
 
 ### MCP Server Configuration

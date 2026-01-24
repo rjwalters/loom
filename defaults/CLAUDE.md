@@ -426,6 +426,59 @@ gh pr create --label "loom:review-requested"
    gh issue edit 42 --add-label "loom:issue"
    ```
 
+## Agent Performance Metrics
+
+Agents can query their own performance metrics to make informed decisions. This enables self-aware behavior where agents can check their success rates, costs, and velocity.
+
+### Via CLI Script
+
+```bash
+# Get overall metrics summary
+./.loom/scripts/agent-metrics.sh summary
+
+# Get effectiveness metrics for a specific role
+./.loom/scripts/agent-metrics.sh effectiveness --role builder
+
+# Get cost breakdown for a specific issue
+./.loom/scripts/agent-metrics.sh costs --issue 123
+
+# Get velocity trends
+./.loom/scripts/agent-metrics.sh velocity
+
+# JSON output for programmatic use
+./.loom/scripts/agent-metrics.sh summary --format json --period week
+```
+
+### Available Metrics
+
+- **Summary**: Total prompts, tokens, cost, issues worked, PRs created, success rate
+- **Effectiveness**: Per-role success rates, average cost, average duration
+- **Costs**: Cost per issue, tokens per issue, time spent
+- **Velocity**: Issues closed, PRs merged, cycle time trends
+
+### Use Cases
+
+**Check if struggling with task type**:
+```bash
+./.loom/scripts/agent-metrics.sh effectiveness --role builder
+# If success rate is low, consider escalating or trying a different approach
+```
+
+**Make informed decisions based on historical success**:
+```bash
+success_rate=$(./.loom/scripts/agent-metrics.sh --role builder --format json | jq '.success_rate')
+if (( $(echo "$success_rate < 70" | bc -l) )); then
+    echo "Consider escalating - success rate below threshold"
+fi
+```
+
+### Data Source
+
+Metrics are read from:
+- Activity database: `~/.loom/activity.db` (if activity tracking is enabled)
+- Daemon state: `.loom/daemon-state.json` (for completed counts)
+- GitHub API: Issue/PR counts via `gh` CLI
+
 ## Configuration
 
 ### Workspace Configuration
