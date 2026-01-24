@@ -45,12 +45,116 @@ Task(
 ) → Returns task_id and output_file
 ```
 
+## Manual Orchestration Mode Implementation
+
+In Manual Orchestration Mode (Claude Code CLI), use the **Task tool** to spawn background subagents instead of MCP terminal control.
+
+### Daemon Loop with Task Tool
+
+Each daemon iteration should:
+
+1. **Load state** from `.loom/daemon-state.json`
+2. **Assess system** using `gh` CLI commands
+3. **Check subagent completions** using TaskOutput tool (non-blocking)
+4. **Spawn new subagents** using Task tool with `run_in_background: true`
+5. **Update state** and save to `.loom/daemon-state.json`
+
+### Spawning Shepherd Subagents
+
+```
+# Check if shepherd slot is available
+if shepherd-1 has no active task_id OR task completed:
+
+  # Find an unclaimed issue
+  issue_number=$(gh issue list --label "loom:issue" --state open --json number --jq '.[0].number')
+
+  # Spawn shepherd subagent
+  Task tool:
+    subagent_type: "general-purpose"
+    run_in_background: true
+    description: "Shepherd issue #<number>"
+    prompt: "Run /shepherd <number> --force-merge to orchestrate issue #<number> through its full lifecycle"
+
+  # Store task_id and output_file in daemon state
+  Update daemon-state.json with { issue, task_id, output_file, started }
+```
+
+### Spawning Work Generation Roles
+
+When `loom:issue` count < threshold AND cooldown elapsed:
+
+```
+# Spawn Architect (if < 2 architect proposals pending)
+Task tool:
+  subagent_type: "general-purpose"
+  run_in_background: true
+  description: "Architect proposals"
+  prompt: "Run /architect to analyze the codebase and create feature proposal issues"
+
+# Spawn Hermit (if < 2 hermit proposals pending)
+Task tool:
+  subagent_type: "general-purpose"
+  run_in_background: true
+  description: "Hermit simplifications"
+  prompt: "Run /hermit to analyze the codebase and propose code simplifications"
+```
+
+### Spawning Continuous Support Roles
+
+```
+# Spawn Guide (if not already running or last completed > 15 min ago)
+Task tool:
+  subagent_type: "general-purpose"
+  run_in_background: true
+  description: "Guide triage"
+  prompt: "Run /guide to triage and prioritize the issue backlog"
+
+# Spawn Champion (if not already running or last completed > 10 min ago)
+Task tool:
+  subagent_type: "general-purpose"
+  run_in_background: true
+  description: "Champion merge"
+  prompt: "Run /champion to auto-merge approved PRs with loom:pr label"
+```
+
+### Checking Subagent Status
+
+Use TaskOutput with `block: false` to check subagent status:
+
+```
+TaskOutput tool:
+  task_id: "<task_id from daemon state>"
+  block: false
+  timeout: 1000
+
+# If status is "completed":
+#   - Mark shepherd as idle
+#   - Update completed_issues list
+#   - Check if issue was closed successfully
+
+# If status is "running":
+#   - Optionally read output_file to check progress
+```
+
 ## Configuration Parameters
+
+### Scaling Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `MAX_SHEPHERDS` | 3 | Maximum concurrent shepherd subagents |
 | `POLL_INTERVAL` | 30s | Seconds between daemon loop iterations |
+
+### Support Role Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ARCHITECT_COOLDOWN` | 1800 | Seconds between Architect triggers (30 min) |
+| `HERMIT_COOLDOWN` | 1800 | Seconds between Hermit triggers (30 min) |
+| `GUIDE_INTERVAL` | 900 | Seconds between Guide runs (15 min) |
+| `CHAMPION_INTERVAL` | 600 | Seconds between Champion runs (10 min) |
+| `MAX_ARCHITECT_PROPOSALS` | 2 | Max pending architect proposals before pausing |
+| `MAX_HERMIT_PROPOSALS` | 2 | Max pending hermit proposals before pausing |
 
 ## Daemon Loop
 
@@ -191,18 +295,63 @@ Track state in `.loom/daemon-state.json`:
     "shepherd-1": {
       "issue": 123,
       "task_id": "abc123",
-      "output_file": "/path/to/output",
+      "output_file": "/tmp/claude/.../abc123.output",
       "started": "2026-01-23T10:15:00Z"
     },
     "shepherd-2": {
       "issue": null,
       "idle_since": "2026-01-23T11:00:00Z"
+    },
+    "shepherd-3": {
+      "issue": 456,
+      "task_id": "def456",
+      "output_file": "/tmp/claude/.../def456.output",
+      "started": "2026-01-23T10:45:00Z"
+    }
+  },
+  "support_roles": {
+    "architect": {
+      "task_id": "ghi789",
+      "output_file": "/tmp/claude/.../ghi789.output",
+      "started": "2026-01-23T10:00:00Z"
+    },
+    "hermit": {
+      "task_id": null,
+      "last_completed": "2026-01-23T09:30:00Z"
+    },
+    "guide": {
+      "task_id": "jkl012",
+      "output_file": "/tmp/claude/.../jkl012.output",
+      "started": "2026-01-23T10:05:00Z"
+    },
+    "champion": {
+      "task_id": "mno345",
+      "output_file": "/tmp/claude/.../mno345.output",
+      "started": "2026-01-23T10:10:00Z"
     }
   },
   "completed_issues": [100, 101, 102],
-  "total_prs_merged": 15
+  "total_prs_merged": 3,
+  "last_architect_trigger": "2026-01-23T10:00:00Z",
+  "last_hermit_trigger": "2026-01-23T10:30:00Z"
 }
 ```
+
+## Terminal/Subagent Configuration
+
+### Manual Orchestration Mode (Claude Code CLI)
+
+In MOM, the daemon spawns subagents using the Task tool. No pre-configured terminals needed.
+
+| Subagent Pool | Max | Purpose |
+|---------------|-----|---------|
+| Shepherds | 3 | Issue lifecycle orchestration |
+| Architect | 1 | Work generation (feature proposals) |
+| Hermit | 1 | Work generation (simplification proposals) |
+| Guide | 1 | Backlog triage and prioritization |
+| Champion | 1 | Auto-merge approved PRs |
+
+### Tauri App Mode (MCP)
 
 ## Status Report Format
 
@@ -326,3 +475,80 @@ To restart fresh:
 rm .loom/daemon-state.json
 /loom
 ```
+
+## Report Format
+
+When queried for status:
+
+```
+✓ Role: Loom Daemon (Layer 2)
+✓ Status: Running
+✓ Uptime: 2h 15m
+
+✓ System State:
+  - Ready issues (loom:issue): 5
+  - Building (loom:building): 2
+  - Curated (awaiting approval): 3
+  - PRs pending review: 2
+  - PRs ready to merge (loom:pr): 1
+
+✓ Proposals:
+  - Architect proposals: 2
+  - Hermit proposals: 1
+  - Total: 3 / 5 max
+
+✓ Shepherds: 2/3 active
+  - shepherd-1: Issue #123 (45m) [task:abc123]
+  - shepherd-2: Issue #456 (12m) [task:def456]
+  - shepherd-3: idle
+
+✓ Support Roles:
+  - Architect: idle (last: 28m ago, 2 proposals pending)
+  - Hermit: running [task:ghi789] (started: 5m ago)
+  - Guide: running [task:jkl012] (last completed: 8m ago)
+  - Champion: running [task:mno345] (last completed: 3m ago)
+
+✓ Completed This Session:
+  - Issues closed: 3
+  - PRs merged: 3
+
+✓ Work Generation Triggers:
+  - Architect: 28m ago (cooldown: 30m)
+  - Hermit: 45m ago (cooldown: 30m)
+```
+
+## Terminal Probe Protocol
+
+When you receive a probe command, respond with:
+
+```
+AGENT:LoomDaemon:running:shepherds=2/3:issues=5
+```
+
+Or if not running:
+
+```
+AGENT:LoomDaemon:stopped
+```
+
+## Command Interface
+
+The daemon responds to these commands via its interval prompt:
+
+| Command | Description |
+|---------|-------------|
+| `status` | Report current system state |
+| `spawn <issue>` | Manually assign issue to next idle shepherd |
+| `stop` | Initiate graceful shutdown |
+| `pause` | Stop spawning new shepherds, let active ones complete |
+| `resume` | Resume normal operation |
+
+## Context Clearing
+
+The daemon runs continuously and maintains state externally, so context clearing is not typically needed. However, if restarted:
+
+```
+/clear
+```
+
+Then the daemon will restore state from `.loom/daemon-state.json`.
