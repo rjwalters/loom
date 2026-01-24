@@ -177,6 +177,22 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_input_id ON prompt_changes(input_id);
             CREATE INDEX IF NOT EXISTS idx_prompt_changes_after_commit ON prompt_changes(after_commit);
+
+            -- Prompt-GitHub correlation table for linking prompts to GitHub actions
+            CREATE TABLE IF NOT EXISTS prompt_github (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                issue_number INTEGER,
+                pr_number INTEGER,
+                label_before TEXT,  -- JSON array of labels
+                label_after TEXT,   -- JSON array of labels
+                event_type TEXT NOT NULL  -- 'issue_created', 'pr_created', 'pr_merged', 'label_changed', etc.
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_input_id ON prompt_github(input_id);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_issue_number ON prompt_github(issue_number);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_pr_number ON prompt_github(pr_number);
+            CREATE INDEX IF NOT EXISTS idx_prompt_github_event_type ON prompt_github(event_type);
             ",
     )?;
 

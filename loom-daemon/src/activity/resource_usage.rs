@@ -154,8 +154,10 @@ pub fn detect_provider(model: &str) -> &'static str {
 
 /// Pattern: "Total tokens: 1,234 in / 567 out"
 static TOKEN_PATTERN_SLASH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:total\s+)?tokens?:\s*([\d,]+)\s*(?:in|input)\s*/\s*([\d,]+)\s*(?:out|output)")
-        .expect("Invalid regex")
+    Regex::new(
+        r"(?i)(?:total\s+)?tokens?:\s*([\d,]+)\s*(?:in|input)\s*/\s*([\d,]+)\s*(?:out|output)",
+    )
+    .expect("Invalid regex")
 });
 
 /// Pattern: "Input: 1,234 tokens, Output: 567 tokens"
@@ -236,12 +238,8 @@ pub fn parse_resource_usage(output: &str, duration_ms: Option<i64>) -> Option<Re
 
     // Calculate cost
     let pricing = ModelPricing::for_model(&model);
-    let cost_usd = pricing.calculate_cost(
-        tokens_input,
-        tokens_output,
-        tokens_cache_read,
-        tokens_cache_write,
-    );
+    let cost_usd =
+        pricing.calculate_cost(tokens_input, tokens_output, tokens_cache_read, tokens_cache_write);
 
     Some(ResourceUsage {
         input_id: None,

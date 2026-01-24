@@ -1,5 +1,6 @@
 use crate::activity::{ActivityDb, AgentInput, InputContext, InputType};
 use crate::git_utils;
+use crate::github_parser::parse_github_events;
 use crate::terminal::TerminalManager;
 use crate::types::{Request, Response};
 use anyhow::Result;
@@ -172,9 +173,9 @@ fn handle_request(
             let workspace_path = worktree_path.or(working_dir.clone());
 
             // Capture current git commit before sending input (for change tracking)
-            let before_commit = workspace_path.as_ref().and_then(|ws| {
-                git_utils::get_current_commit(std::path::Path::new(ws))
-            });
+            let before_commit = workspace_path
+                .as_ref()
+                .and_then(|ws| git_utils::get_current_commit(std::path::Path::new(ws)));
 
             // Get git branch from workspace
             let git_branch = get_git_branch(workspace_path.as_ref());
@@ -241,7 +242,7 @@ fn handle_request(
                             input_id: None, // Could link to last input if tracked
                             terminal_id: id.clone(),
                             timestamp: Utc::now(),
-                            content: Some(output_str),
+                            content: Some(output_str.clone()),
                             content_preview: Some(preview),
                             exit_code: None,
                             metadata: None,
@@ -250,6 +251,22 @@ fn handle_request(
                         if let Ok(db) = activity_db.lock() {
                             if let Err(e) = db.record_output(&output_record) {
                                 log::warn!("Failed to record output to activity database: {e}");
+                            }
+
+                            // Parse terminal output for GitHub events and record them
+                            let github_events = parse_github_events(&output_str);
+                            for parsed_event in github_events {
+                                let prompt_event = parsed_event.to_prompt_github_event(None);
+                                if let Err(e) = db.record_prompt_github_event(&prompt_event) {
+                                    log::warn!("Failed to record GitHub event: {e}");
+                                } else {
+                                    log::debug!(
+                                        "Recorded GitHub event: {:?} (issue: {:?}, pr: {:?})",
+                                        prompt_event.event_type,
+                                        prompt_event.issue_number,
+                                        prompt_event.pr_number
+                                    );
+                                }
                             }
                         }
                     }

@@ -68,19 +68,34 @@ pub enum Request {
 #[serde(tag = "type", content = "payload")]
 pub enum Response {
     Pong,
-    TerminalCreated { id: TerminalId },
-    TerminalList { terminals: Vec<TerminalInfo> },
-    TerminalOutput { output: String, byte_count: usize },
+    TerminalCreated {
+        id: TerminalId,
+    },
+    TerminalList {
+        terminals: Vec<TerminalInfo>,
+    },
+    TerminalOutput {
+        output: String,
+        byte_count: usize,
+    },
     /// Response from SendInput with tracking info for git changes
     InputSent {
         input_id: i64,
         before_commit: Option<String>,
     },
-    SessionHealth { has_session: bool },
-    AvailableSessions { sessions: Vec<String> },
-    TerminalActivity { entries: Vec<ActivityEntry> },
+    SessionHealth {
+        has_session: bool,
+    },
+    AvailableSessions {
+        sessions: Vec<String>,
+    },
+    TerminalActivity {
+        entries: Vec<ActivityEntry>,
+    },
     /// Response with current git commit hash
-    CurrentCommit { commit: Option<String> },
+    CurrentCommit {
+        commit: Option<String>,
+    },
     /// Response with git changes captured
     GitChangesCaptured {
         files_changed: i32,
@@ -88,7 +103,9 @@ pub enum Response {
         lines_removed: i32,
     },
     Success,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

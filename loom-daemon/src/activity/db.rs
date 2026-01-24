@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, InputContext, InputType,
-    ProductivitySummary, PromptChanges, TokenUsage,
+    ProductivitySummary, PromptChanges, PromptGitHubEvent, TokenUsage,
 };
 use super::schema::init_schema;
 
@@ -286,6 +286,94 @@ impl ActivityDb {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Record a prompt-GitHub correlation event
+    ///
+    /// Links a prompt (agent input) with a GitHub action it triggered,
+    /// such as creating an issue, opening a PR, or changing labels.
+    pub fn record_prompt_github_event(&self, event: &PromptGitHubEvent) -> Result<i64> {
+        let label_before_json = event
+            .label_before
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        let label_after_json = event
+            .label_after
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+
+        self.conn.execute(
+            r"
+            INSERT INTO prompt_github (input_id, issue_number, pr_number, label_before, label_after, event_type)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ",
+            params![
+                event.input_id,
+                event.issue_number,
+                event.pr_number,
+                label_before_json,
+                label_after_json,
+                event.event_type.as_str(),
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get prompt-GitHub events for a specific input
+    #[allow(dead_code)]
+    pub fn get_prompt_github_events(&self, input_id: i64) -> Result<Vec<PromptGitHubEvent>> {
+        use super::models::PromptGitHubEventType;
+
+        let mut stmt = self.conn.prepare(
+            r"
+            SELECT id, input_id, issue_number, pr_number, label_before, label_after, event_type
+            FROM prompt_github
+            WHERE input_id = ?1
+            ORDER BY id
+            ",
+        )?;
+
+        let events = stmt.query_map(params![input_id], |row| {
+            let id: i64 = row.get(0)?;
+            let input_id: Option<i64> = row.get(1)?;
+            let issue_number: Option<i32> = row.get(2)?;
+            let pr_number: Option<i32> = row.get(3)?;
+            let label_before_json: Option<String> = row.get(4)?;
+            let label_after_json: Option<String> = row.get(5)?;
+            let event_type_str: String = row.get(6)?;
+
+            let label_before = label_before_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let label_after = label_after_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+
+            let event_type = PromptGitHubEventType::from_str(&event_type_str).ok_or_else(|| {
+                rusqlite::Error::ToSqlConversionFailure(
+                    format!("Invalid event_type: {event_type_str}").into(),
+                )
+            })?;
+
+            Ok(PromptGitHubEvent {
+                id: Some(id),
+                input_id,
+                issue_number,
+                pr_number,
+                label_before,
+                label_after,
+                event_type,
+            })
+        })?;
+
+        events.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Get metrics for a specific task
     #[allow(dead_code)]
     pub fn get_task_metrics(&self, metric_id: i64) -> Result<AgentMetric> {
@@ -510,10 +598,7 @@ impl ActivityDb {
 
     /// Get total lines changed across all prompts for a terminal
     #[allow(dead_code)]
-    pub fn get_terminal_changes_summary(
-        &self,
-        terminal_id: &str,
-    ) -> Result<(i64, i64, i64)> {
+    pub fn get_terminal_changes_summary(&self, terminal_id: &str) -> Result<(i64, i64, i64)> {
         // Returns (total_files_changed, total_lines_added, total_lines_removed)
         let result = self.conn.query_row(
             r"
@@ -1014,15 +1099,16 @@ mod tests {
         // Retrieve and verify
         let retrieved = db.get_prompt_changes(input_id)?;
         assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.input_id, input_id);
-        assert_eq!(retrieved.before_commit, Some("abc123".to_string()));
-        assert_eq!(retrieved.after_commit, Some("def456".to_string()));
-        assert_eq!(retrieved.files_changed, 5);
-        assert_eq!(retrieved.lines_added, 150);
-        assert_eq!(retrieved.lines_removed, 30);
-        assert_eq!(retrieved.tests_added, 2);
-        assert_eq!(retrieved.tests_modified, 1);
+        if let Some(retrieved) = retrieved {
+            assert_eq!(retrieved.input_id, input_id);
+            assert_eq!(retrieved.before_commit, Some("abc123".to_string()));
+            assert_eq!(retrieved.after_commit, Some("def456".to_string()));
+            assert_eq!(retrieved.files_changed, 5);
+            assert_eq!(retrieved.lines_added, 150);
+            assert_eq!(retrieved.lines_removed, 30);
+            assert_eq!(retrieved.tests_added, 2);
+            assert_eq!(retrieved.tests_modified, 1);
+        }
 
         Ok(())
     }
@@ -1073,7 +1159,7 @@ mod tests {
 
         // Get summary
         let (files, added, removed) = db.get_terminal_changes_summary("terminal-1")?;
-        assert_eq!(files, 6);   // 3 * 2
+        assert_eq!(files, 6); // 3 * 2
         assert_eq!(added, 150); // 3 * 50
         assert_eq!(removed, 30); // 3 * 10
 
@@ -1082,6 +1168,135 @@ mod tests {
         assert_eq!(files, 0);
         assert_eq!(added, 0);
         assert_eq!(removed, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_prompt_github_event() -> Result<()> {
+        use super::super::models::PromptGitHubEventType;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input to link to
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "gh issue edit 42 --add-label loom:building".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record a GitHub event linked to this input
+        let event = PromptGitHubEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: Some(42),
+            pr_number: None,
+            label_before: None,
+            label_after: Some(vec!["loom:building".to_string()]),
+            event_type: PromptGitHubEventType::LabelAdded,
+        };
+
+        let event_id = db.record_prompt_github_event(&event)?;
+        assert!(event_id > 0);
+
+        // Retrieve the events
+        let events = db.get_prompt_github_events(input_id)?;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].issue_number, Some(42));
+        assert_eq!(events[0].event_type, PromptGitHubEventType::LabelAdded);
+        assert_eq!(events[0].label_after, Some(vec!["loom:building".to_string()]));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_multiple_github_events() -> Result<()> {
+        use super::super::models::PromptGitHubEventType;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record an input
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "gh pr create".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record multiple events from the same input
+        let event1 = PromptGitHubEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: None,
+            pr_number: Some(123),
+            label_before: None,
+            label_after: None,
+            event_type: PromptGitHubEventType::PrCreated,
+        };
+        db.record_prompt_github_event(&event1)?;
+
+        let event2 = PromptGitHubEvent {
+            id: None,
+            input_id: Some(input_id),
+            issue_number: None,
+            pr_number: Some(123),
+            label_before: None,
+            label_after: Some(vec!["loom:review-requested".to_string()]),
+            event_type: PromptGitHubEventType::LabelAdded,
+        };
+        db.record_prompt_github_event(&event2)?;
+
+        // Retrieve all events for this input
+        let retrieved_events = db.get_prompt_github_events(input_id)?;
+        assert_eq!(retrieved_events.len(), 2);
+
+        let pr_created = retrieved_events
+            .iter()
+            .find(|e| e.event_type == PromptGitHubEventType::PrCreated);
+        assert!(pr_created.is_some());
+        if let Some(evt) = pr_created {
+            assert_eq!(evt.pr_number, Some(123));
+        }
+
+        let label_added = retrieved_events
+            .iter()
+            .find(|e| e.event_type == PromptGitHubEventType::LabelAdded);
+        assert!(label_added.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_github_event_without_input_link() -> Result<()> {
+        use super::super::models::PromptGitHubEventType;
+
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record a GitHub event without linking to a specific input
+        let event = PromptGitHubEvent {
+            id: None,
+            input_id: None,
+            issue_number: Some(100),
+            pr_number: None,
+            label_before: Some(vec!["loom:issue".to_string()]),
+            label_after: Some(vec!["loom:building".to_string()]),
+            event_type: PromptGitHubEventType::LabelAdded,
+        };
+
+        let event_id = db.record_prompt_github_event(&event)?;
+        assert!(event_id > 0);
 
         Ok(())
     }
