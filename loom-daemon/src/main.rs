@@ -1,4 +1,5 @@
 mod activity;
+mod git_utils;
 mod health_monitor;
 mod init;
 mod ipc;

@@ -140,3 +140,19 @@ pub struct ActivityEntry {
 
 /// Type alias for productivity summary: (`agent_system`, `tasks_completed`, `avg_minutes`, `avg_tokens`, `total_cost`)
 pub type ProductivitySummary = Vec<(String, i64, f64, f64, f64)>;
+
+/// Git changes associated with a prompt
+/// Links individual prompts to the git commits/changes they caused
+#[derive(Debug, Clone)]
+pub struct PromptChanges {
+    #[allow(dead_code)]
+    pub id: Option<i64>,
+    pub input_id: i64,
+    pub before_commit: Option<String>,
+    pub after_commit: Option<String>,
+    pub files_changed: i32,
+    pub lines_added: i32,
+    pub lines_removed: i32,
+    pub tests_added: i32,
+    pub tests_modified: i32,
+}

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, InputContext, InputType,
-    ProductivitySummary, TokenUsage,
+    ProductivitySummary, PromptChanges, TokenUsage,
 };
 use super::schema::init_schema;
 
@@ -440,6 +440,88 @@ impl ActivityDb {
 
         entries.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
+
+    /// Record git changes associated with a prompt
+    pub fn record_prompt_changes(&self, changes: &PromptChanges) -> Result<i64> {
+        self.conn.execute(
+            r"
+            INSERT INTO prompt_changes (
+                input_id, before_commit, after_commit, files_changed,
+                lines_added, lines_removed, tests_added, tests_modified
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ",
+            params![
+                changes.input_id,
+                &changes.before_commit,
+                &changes.after_commit,
+                changes.files_changed,
+                changes.lines_added,
+                changes.lines_removed,
+                changes.tests_added,
+                changes.tests_modified,
+            ],
+        )?;
+
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Get prompt changes for a specific input
+    #[allow(dead_code)]
+    pub fn get_prompt_changes(&self, input_id: i64) -> Result<Option<PromptChanges>> {
+        let result = self.conn.query_row(
+            r"
+            SELECT id, input_id, before_commit, after_commit, files_changed,
+                   lines_added, lines_removed, tests_added, tests_modified
+            FROM prompt_changes
+            WHERE input_id = ?1
+            ",
+            params![input_id],
+            |row| {
+                Ok(PromptChanges {
+                    id: Some(row.get(0)?),
+                    input_id: row.get(1)?,
+                    before_commit: row.get(2)?,
+                    after_commit: row.get(3)?,
+                    files_changed: row.get(4)?,
+                    lines_added: row.get(5)?,
+                    lines_removed: row.get(6)?,
+                    tests_added: row.get(7)?,
+                    tests_modified: row.get(8)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(changes) => Ok(Some(changes)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Get total lines changed across all prompts for a terminal
+    #[allow(dead_code)]
+    pub fn get_terminal_changes_summary(
+        &self,
+        terminal_id: &str,
+    ) -> Result<(i64, i64, i64)> {
+        // Returns (total_files_changed, total_lines_added, total_lines_removed)
+        let result = self.conn.query_row(
+            r"
+            SELECT
+                COALESCE(SUM(pc.files_changed), 0),
+                COALESCE(SUM(pc.lines_added), 0),
+                COALESCE(SUM(pc.lines_removed), 0)
+            FROM prompt_changes pc
+            JOIN agent_inputs ai ON pc.input_id = ai.id
+            WHERE ai.terminal_id = ?1
+            ",
+            params![terminal_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -867,6 +949,114 @@ mod tests {
             assert_eq!(summary.1, 2); // tasks_completed
             assert!((summary.3 - 1200.0).abs() < 0.1); // avg_tokens
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_and_retrieve_prompt_changes() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // First record an input to link to
+        let input = AgentInput {
+            id: None,
+            terminal_id: "terminal-1".to_string(),
+            timestamp: Utc::now(),
+            input_type: InputType::Manual,
+            content: "cargo build".to_string(),
+            agent_role: Some("builder".to_string()),
+            context: InputContext::default(),
+        };
+        let input_id = db.record_input(&input)?;
+
+        // Record prompt changes
+        let changes = PromptChanges {
+            id: None,
+            input_id,
+            before_commit: Some("abc123".to_string()),
+            after_commit: Some("def456".to_string()),
+            files_changed: 5,
+            lines_added: 150,
+            lines_removed: 30,
+            tests_added: 2,
+            tests_modified: 1,
+        };
+
+        let changes_id = db.record_prompt_changes(&changes)?;
+        assert!(changes_id > 0);
+
+        // Retrieve and verify
+        let retrieved = db.get_prompt_changes(input_id)?;
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.input_id, input_id);
+        assert_eq!(retrieved.before_commit, Some("abc123".to_string()));
+        assert_eq!(retrieved.after_commit, Some("def456".to_string()));
+        assert_eq!(retrieved.files_changed, 5);
+        assert_eq!(retrieved.lines_added, 150);
+        assert_eq!(retrieved.lines_removed, 30);
+        assert_eq!(retrieved.tests_added, 2);
+        assert_eq!(retrieved.tests_modified, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_prompt_changes_not_found() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Query for non-existent input_id
+        let result = db.get_prompt_changes(999)?;
+        assert!(result.is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_terminal_changes_summary() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let db = ActivityDb::new(temp_file.path().to_path_buf())?;
+
+        // Record multiple inputs and changes for the same terminal
+        for i in 0..3 {
+            let input = AgentInput {
+                id: None,
+                terminal_id: "terminal-1".to_string(),
+                timestamp: Utc::now(),
+                input_type: InputType::Manual,
+                content: format!("command {i}"),
+                agent_role: Some("builder".to_string()),
+                context: InputContext::default(),
+            };
+            let input_id = db.record_input(&input)?;
+
+            let changes = PromptChanges {
+                id: None,
+                input_id,
+                before_commit: Some(format!("commit{i}")),
+                after_commit: Some(format!("commit{}", i + 1)),
+                files_changed: 2,
+                lines_added: 50,
+                lines_removed: 10,
+                tests_added: 1,
+                tests_modified: 0,
+            };
+            db.record_prompt_changes(&changes)?;
+        }
+
+        // Get summary
+        let (files, added, removed) = db.get_terminal_changes_summary("terminal-1")?;
+        assert_eq!(files, 6);   // 3 * 2
+        assert_eq!(added, 150); // 3 * 50
+        assert_eq!(removed, 30); // 3 * 10
+
+        // Different terminal should have no changes
+        let (files, added, removed) = db.get_terminal_changes_summary("terminal-2")?;
+        assert_eq!(files, 0);
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
 
         Ok(())
     }
