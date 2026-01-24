@@ -34,6 +34,9 @@
 //! }
 //! ```
 
+// This module is WIP - allow dead code until fully integrated
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -308,10 +311,10 @@ pub fn create_tuning_schema(conn: &Connection) -> rusqlite::Result<()> {
         (
             "autonomous_interval_ms",
             "Time between autonomous agent actions",
-            300000.0,
-            300000.0,
-            60000.0,
-            3600000.0,
+            300_000.0,
+            300_000.0,
+            60_000.0,
+            3_600_000.0,
             "ms",
             true,
         ),
@@ -328,10 +331,10 @@ pub fn create_tuning_schema(conn: &Connection) -> rusqlite::Result<()> {
         (
             "escalation_timeout_ms",
             "Time before escalating blocked issues to human",
-            1800000.0,
-            1800000.0,
-            300000.0,
-            7200000.0,
+            1_800_000.0,
+            1_800_000.0,
+            300_000.0,
+            7_200_000.0,
             "ms",
             true,
         ),
@@ -393,9 +396,7 @@ pub fn get_tunable_parameters(conn: &Connection) -> rusqlite::Result<Vec<Tunable
 
     let rows = stmt.query_map([], |row| {
         let updated_at_str: String = row.get(8)?;
-        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
         Ok(TunableParameter {
             name: row.get(0)?,
@@ -422,9 +423,7 @@ pub fn get_parameter(conn: &Connection, name: &str) -> rusqlite::Result<Option<T
         params![name],
         |row| {
             let updated_at_str: String = row.get(8)?;
-            let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+            let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
             Ok(TunableParameter {
                 name: row.get(0)?,
@@ -547,9 +546,7 @@ fn map_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<TuningProposal> {
         status: ProposalStatus::from_str(&status_str).unwrap_or(ProposalStatus::Pending),
         confidence: row.get(8)?,
         requires_approval: row.get(9)?,
-        created_at: DateTime::parse_from_rfc3339(&created_at_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
+        created_at: DateTime::parse_from_rfc3339(&created_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
         applied_at: applied_at_str.and_then(|s| {
             DateTime::parse_from_rfc3339(&s)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -667,9 +664,7 @@ pub fn get_effectiveness_history(
     let rows = stmt.query_map(params![days_str], |row| {
         let timestamp_str: String = row.get(0)?;
         Ok(EffectivenessSnapshot {
-            timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            timestamp: DateTime::parse_from_rfc3339(&timestamp_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
             success_rate: row.get(1)?,
             avg_cycle_time_hours: row.get(2)?,
             avg_cost_per_task: row.get(3)?,
@@ -706,9 +701,7 @@ pub fn get_parameter_history(
             proposal_id: row.get(4)?,
             changed_by: row.get(5)?,
             reason: row.get(6)?,
-            timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            timestamp: DateTime::parse_from_rfc3339(&timestamp_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
         })
     })?;
 
@@ -946,8 +939,7 @@ fn analyze_parameter(
             success_trend * 100.0,
             snapshots
                 .first()
-                .map(|s| s.success_rate * 100.0)
-                .unwrap_or(0.0)
+                .map_or(0.0, |s| s.success_rate * 100.0)
         ),
         status,
         confidence,
@@ -985,14 +977,12 @@ pub fn check_for_rollbacks(conn: &Connection, config: &TuningConfig) -> rusqlite
         .query_map(params![hours_str], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(std::result::Result::ok)
         .collect();
 
     // Get effectiveness before and after each proposal was applied
-    for (proposal_id, _param_name, old_value, applied_at_str) in recent_applied {
-        let applied_at = DateTime::parse_from_rfc3339(&applied_at_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+    for (proposal_id, param_name, old_value, applied_at_str) in recent_applied {
+        let applied_at = DateTime::parse_from_rfc3339(&applied_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
         // Get success rate before the change
         let before_rate: Option<f64> = conn
@@ -1029,21 +1019,18 @@ pub fn check_for_rollbacks(conn: &Connection, config: &TuningConfig) -> rusqlite
 
             if degradation_pct > config.rollback_threshold_percent {
                 log::warn!(
-                    "Proposal #{} caused {:.1}% degradation, scheduling rollback",
-                    proposal_id,
-                    degradation_pct
+                    "Proposal #{proposal_id} caused {degradation_pct:.1}% degradation, scheduling rollback"
                 );
 
                 // Create rollback proposal
                 let rollback = TuningProposal {
                     id: None,
-                    parameter_name: _param_name.clone(),
+                    parameter_name: param_name.clone(),
                     old_value, // This is what we're rolling back TO
                     new_value: old_value,
                     change_percent: 0.0, // Rollback to previous value
                     reason: format!(
-                        "Automatic rollback due to {:.1}% performance degradation",
-                        degradation_pct
+                        "Automatic rollback due to {degradation_pct:.1}% performance degradation"
                     ),
                     evidence: format!(
                         "Before: {:.2}%, After: {:.2}%",
@@ -1075,6 +1062,7 @@ pub fn check_for_rollbacks(conn: &Connection, config: &TuningConfig) -> rusqlite
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
@@ -1133,8 +1121,8 @@ mod tests {
         let proposal = TuningProposal {
             id: None,
             parameter_name: "autonomous_interval_ms".to_string(),
-            old_value: 300000.0,
-            new_value: 270000.0,
+            old_value: 300_000.0,
+            new_value: 270_000.0,
             change_percent: 10.0,
             reason: "Test proposal".to_string(),
             evidence: "Test evidence".to_string(),

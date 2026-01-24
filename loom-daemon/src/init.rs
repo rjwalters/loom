@@ -62,9 +62,9 @@ pub struct ValidationReport {
 /// Loom installation metadata for template variable substitution
 #[derive(Default)]
 struct LoomMetadata {
-    /// Loom version from LOOM_VERSION env var (e.g., "0.1.0")
+    /// Loom version from `LOOM_VERSION` env var (e.g., "0.1.0")
     version: Option<String>,
-    /// Loom commit hash from LOOM_COMMIT env var (e.g., "d6cf9ac")
+    /// Loom commit hash from `LOOM_COMMIT` env var (e.g., "d6cf9ac")
     commit: Option<String>,
     /// Installation date (generated at runtime)
     install_date: String,
@@ -633,7 +633,7 @@ fn merge_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Copy directory recursively with reporting
 ///
-/// Like copy_dir_recursive but tracks which files were added.
+/// Like `copy_dir_recursive` but tracks which files were added.
 fn copy_dir_with_report(
     src: &Path,
     dst: &Path,
@@ -668,7 +668,7 @@ fn copy_dir_with_report(
 
 /// Merge directory recursively with reporting
 ///
-/// Like merge_dir_recursive but tracks which files were added vs preserved.
+/// Like `merge_dir_recursive` but tracks which files were added vs preserved.
 fn merge_dir_with_report(
     src: &Path,
     dst: &Path,
@@ -679,7 +679,7 @@ fn merge_dir_with_report(
 
     // Collect files in source for comparison
     let src_files: HashSet<_> = fs::read_dir(src)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name())
         .collect();
 
@@ -724,7 +724,7 @@ fn merge_dir_with_report(
 
 /// Force-merge directory recursively with reporting
 ///
-/// Like merge_dir_with_report but OVERWRITES files from defaults while
+/// Like `merge_dir_with_report` but OVERWRITES files from defaults while
 /// still preserving custom files (files in dst that don't exist in src).
 /// This is used for reinstallation to update Loom files while keeping
 /// project-specific customizations.
@@ -738,7 +738,7 @@ fn force_merge_dir_with_report(
 
     // Collect files in source for comparison
     let src_files: HashSet<_> = fs::read_dir(src)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.file_name())
         .collect();
 
@@ -1024,12 +1024,12 @@ mod tests {
 
     #[test]
     fn test_substitute_template_variables() {
-        let content = r#"
+        let content = r"
 **Loom Version**: {{LOOM_VERSION}}
 **Loom Commit**: {{LOOM_COMMIT}}
 **Installation Date**: {{INSTALL_DATE}}
 **Repository**: {{REPO_OWNER}}/{{REPO_NAME}}
-"#;
+";
 
         // Test with all values provided
         let metadata = LoomMetadata {

@@ -482,6 +482,7 @@ pub fn query_stats_summary(conn: &Connection) -> rusqlite::Result<StatsSummary> 
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
     use crate::activity::schema::init_schema;

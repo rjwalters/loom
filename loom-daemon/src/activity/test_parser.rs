@@ -400,6 +400,7 @@ pub fn parse_build_status(output: &str) -> Option<bool> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -463,13 +464,13 @@ mod tests {
 
     #[test]
     fn test_parse_go_test() {
-        let output = r#"
+        let output = r"
 --- PASS: TestFoo (0.00s)
 --- PASS: TestBar (0.00s)
 --- FAIL: TestBaz (0.00s)
 --- SKIP: TestQux (0.00s)
 PASS
-"#;
+";
         let result = parse_go_test(output).unwrap();
         assert_eq!(result.passed, 2);
         assert_eq!(result.failed, 1);
@@ -487,11 +488,11 @@ PASS
 
     #[test]
     fn test_parse_clippy_summary() {
-        let output = r#"
+        let output = r"
     Checking loom-daemon v0.1.0
 warning: `loom-daemon` (lib) generated 5 warnings
     Finished `dev` profile [unoptimized + debuginfo] target
-"#;
+";
         let result = parse_clippy(output).unwrap();
         assert_eq!(result.lint_errors, 5);
         assert_eq!(result.format_errors, 0);
@@ -499,7 +500,7 @@ warning: `loom-daemon` (lib) generated 5 warnings
 
     #[test]
     fn test_parse_clippy_errors() {
-        let output = r#"
+        let output = r"
 error[E0425]: cannot find value `x` in this scope
   --> src/main.rs:10:5
    |
@@ -507,7 +508,7 @@ error[E0425]: cannot find value `x` in this scope
    |     ^ not found in this scope
 
 error: could not compile `project` due to 2 previous errors
-"#;
+";
         let result = parse_clippy(output).unwrap();
         assert_eq!(result.lint_errors, 2);
         assert_eq!(result.format_errors, 0);
@@ -515,7 +516,7 @@ error: could not compile `project` due to 2 previous errors
 
     #[test]
     fn test_parse_clippy_warnings_and_errors() {
-        let output = r#"
+        let output = r"
 warning: unused variable: `x`
   --> src/main.rs:5:9
    |
@@ -524,7 +525,7 @@ warning: unused variable: `x`
 
 warning: `myproject` (lib) generated 3 warnings
 error: could not compile `myproject` due to 1 previous error
-"#;
+";
         let result = parse_clippy(output).unwrap();
         // 3 warnings + 1 error = 4 total lint errors
         assert_eq!(result.lint_errors, 4);

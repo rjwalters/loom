@@ -78,7 +78,7 @@ pub enum Response {
         output: String,
         byte_count: usize,
     },
-    /// Response from SendInput with tracking info for git changes
+    /// Response from `SendInput` with tracking info for git changes
     InputSent {
         input_id: i64,
         before_commit: Option<String>,

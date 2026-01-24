@@ -984,6 +984,7 @@ impl ActivityDb {
     ///
     /// If the budget for the given period already exists, it will be updated.
     /// Otherwise, a new record will be created.
+    #[allow(dead_code)] // Available for future budget management features
     pub fn save_budget_config(&self, config: &BudgetConfig) -> Result<i64> {
         // Deactivate any existing budget for this period
         self.conn.execute(
@@ -1030,13 +1031,9 @@ impl ActivityDb {
                     )
                 })?;
 
-                let created_at = DateTime::parse_from_rfc3339(&created_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
+                let created_at = DateTime::parse_from_rfc3339(&created_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
-                let updated_at = DateTime::parse_from_rfc3339(&updated_str)
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(|_| Utc::now());
+                let updated_at = DateTime::parse_from_rfc3339(&updated_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
                 Ok(BudgetConfig {
                     id: row.get(0)?,
@@ -1080,13 +1077,9 @@ impl ActivityDb {
                 )
             })?;
 
-            let created_at = DateTime::parse_from_rfc3339(&created_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+            let created_at = DateTime::parse_from_rfc3339(&created_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
-            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now());
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
             Ok(BudgetConfig {
                 id: row.get(0)?,
@@ -1217,7 +1210,7 @@ impl ActivityDb {
                 GROUP BY pg.issue_number
                 ",
             )?;
-            let results = stmt.query_map(params![issue_num], |row| parse_cost_by_issue(row))?;
+            let results = stmt.query_map(params![issue_num], parse_cost_by_issue)?;
             results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         } else {
             let mut stmt = self.conn.prepare(
@@ -1238,7 +1231,7 @@ impl ActivityDb {
                 ORDER BY total_cost DESC
                 ",
             )?;
-            let results = stmt.query_map([], |row| parse_cost_by_issue(row))?;
+            let results = stmt.query_map([], parse_cost_by_issue)?;
             results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         }
     }
@@ -1264,7 +1257,7 @@ impl ActivityDb {
                 GROUP BY pg.pr_number
                 ",
             )?;
-            let results = stmt.query_map(params![pr_num], |row| parse_cost_by_pr(row))?;
+            let results = stmt.query_map(params![pr_num], parse_cost_by_pr)?;
             results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         } else {
             let mut stmt = self.conn.prepare(
@@ -1285,7 +1278,7 @@ impl ActivityDb {
                 ORDER BY total_cost DESC
                 ",
             )?;
-            let results = stmt.query_map([], |row| parse_cost_by_pr(row))?;
+            let results = stmt.query_map([], parse_cost_by_pr)?;
             results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         }
     }
@@ -1295,9 +1288,8 @@ impl ActivityDb {
     /// Calculates current spend within the period and compares against the budget limit.
     #[allow(dead_code)]
     pub fn get_budget_status(&self, period: BudgetPeriod) -> Result<Option<BudgetStatus>> {
-        let config = match self.get_budget_config(period)? {
-            Some(c) => c,
-            None => return Ok(None),
+        let Some(config) = self.get_budget_config(period)? else {
+            return Ok(None);
         };
 
         let (period_start, period_end) = get_period_bounds(period);
@@ -1335,15 +1327,14 @@ impl ActivityDb {
         period: BudgetPeriod,
         lookback_days: i32,
     ) -> Result<Option<RunwayProjection>> {
-        let config = match self.get_budget_config(period)? {
-            Some(c) => c,
-            None => return Ok(None),
+        let Some(config) = self.get_budget_config(period)? else {
+            return Ok(None);
         };
 
         // Get current period status
         let (period_start, _) = get_period_bounds(period);
         let status = self.get_budget_status(period)?;
-        let remaining_budget = status.map(|s| s.remaining).unwrap_or(config.limit_usd);
+        let remaining_budget = status.map_or(config.limit_usd, |s| s.remaining);
 
         // Calculate average daily cost over lookback period
         let lookback_start = Utc::now() - chrono::Duration::days(i64::from(lookback_days));
@@ -2251,13 +2242,13 @@ mod tests {
         let input_id = db.record_input(&input)?;
 
         // Simulate cargo test output
-        let output = r#"
+        let output = r"
 running 10 tests
 test test_one ... ok
 test test_two ... ok
 test test_three ... FAILED
 test result: FAILED. 9 passed; 1 failed; 0 ignored
-"#;
+";
 
         let metrics_id = db.record_quality_from_output(input_id, output)?;
         assert!(metrics_id.is_some());
@@ -2613,7 +2604,7 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
             tokens_output: 500,
             tokens_cache_read: Some(200),
             tokens_cache_write: Some(50),
-            cost_usd: 0.0108375,
+            cost_usd: 0.010_837_5,
             duration_ms: Some(1500),
             provider: "anthropic".to_string(),
             timestamp: Utc::now(),
@@ -2631,7 +2622,7 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
         assert_eq!(r.tokens_output, 500);
         assert_eq!(r.tokens_cache_read, Some(200));
         assert_eq!(r.tokens_cache_write, Some(50));
-        assert!((r.cost_usd - 0.0108375).abs() < 0.0001);
+        assert!((r.cost_usd - 0.010_837_5).abs() < 0.0001);
         assert_eq!(r.duration_ms, Some(1500));
         assert_eq!(r.provider, "anthropic");
 

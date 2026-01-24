@@ -264,7 +264,7 @@ impl TestClient {
     }
 
     /// Helper: Send input to terminal
-    /// Returns the input_id for tracking git changes
+    /// Returns the `input_id` for tracking git changes
     #[allow(dead_code)]
     pub async fn send_input(&mut self, id: &str, data: &str) -> Result<i64> {
         let request = serde_json::json!({

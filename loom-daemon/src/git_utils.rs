@@ -166,7 +166,7 @@ pub fn capture_git_changes(
     }
 }
 
-/// Capture git changes and create a PromptChanges record
+/// Capture git changes and create a `PromptChanges` record
 ///
 /// This is the main entry point for capturing git state after a prompt.
 pub fn capture_prompt_changes(
