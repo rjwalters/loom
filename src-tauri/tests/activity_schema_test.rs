@@ -1138,3 +1138,540 @@ fn test_pattern_category_query() {
     assert_eq!(category_counts[0].0, "build");
     assert_eq!(category_counts[0].1, 2);
 }
+
+// ============================================================================
+// Recommendation Engine Tests (v6 schema)
+// ============================================================================
+
+#[test]
+fn test_v5_to_v6_migration() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create v5 schema
+    conn.execute(
+        "CREATE TABLE agent_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            role TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            work_found INTEGER NOT NULL,
+            work_completed INTEGER,
+            outcome TEXT NOT NULL
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)", [])
+        .unwrap();
+    conn.execute("INSERT INTO schema_version (version) VALUES (5)", [])
+        .unwrap();
+
+    conn.execute(
+        "CREATE TABLE prompt_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_text TEXT NOT NULL UNIQUE,
+            category TEXT,
+            times_used INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            success_rate REAL DEFAULT 0.0
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Simulate v6 migration - create recommendations and recommendation_rules tables
+    conn.execute(
+        "CREATE TABLE recommendations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            confidence REAL DEFAULT 0.0,
+            evidence TEXT,
+            context_role TEXT,
+            context_task_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            dismissed_at TIMESTAMP,
+            acted_on INTEGER DEFAULT 0
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TABLE recommendation_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            rule_type TEXT NOT NULL,
+            description TEXT,
+            threshold_value REAL,
+            threshold_count INTEGER,
+            recommendation_template TEXT NOT NULL,
+            priority INTEGER DEFAULT 5,
+            enabled INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Update schema version
+    conn.execute("UPDATE schema_version SET version = 6", [])
+        .unwrap();
+
+    // Verify recommendations table exists
+    let recommendations_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recommendations'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )
+        .unwrap();
+    assert!(recommendations_exists, "recommendations table should exist");
+
+    // Verify recommendation_rules table exists
+    let rules_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='recommendation_rules'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )
+        .unwrap();
+    assert!(rules_exists, "recommendation_rules table should exist");
+
+    // Verify schema version is 6
+    let version: i32 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6, "Schema version should be 6");
+}
+
+#[test]
+fn test_recommendations_crud() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create recommendations table
+    conn.execute(
+        "CREATE TABLE recommendations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            confidence REAL DEFAULT 0.0,
+            evidence TEXT,
+            context_role TEXT,
+            context_task_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            dismissed_at TIMESTAMP,
+            acted_on INTEGER DEFAULT 0
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert a recommendation
+    conn.execute(
+        "INSERT INTO recommendations (type, title, description, confidence, evidence, context_role)
+         VALUES ('warning', 'Low success pattern', 'Pattern X has low success rate', 0.8, '{\"pattern_id\": 1}', 'builder')",
+        [],
+    )
+    .unwrap();
+
+    let rec_id = conn.last_insert_rowid();
+
+    // Verify insertion
+    let (rec_type, title, confidence): (String, String, f64) = conn
+        .query_row(
+            "SELECT type, title, confidence FROM recommendations WHERE id = ?1",
+            [rec_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+
+    assert_eq!(rec_type, "warning");
+    assert_eq!(title, "Low success pattern");
+    assert!((confidence - 0.8).abs() < 0.01);
+
+    // Test dismiss
+    conn.execute(
+        "UPDATE recommendations SET dismissed_at = datetime('now') WHERE id = ?1",
+        [rec_id],
+    )
+    .unwrap();
+
+    let dismissed: bool = conn
+        .query_row(
+            "SELECT dismissed_at IS NOT NULL FROM recommendations WHERE id = ?1",
+            [rec_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(dismissed, "Recommendation should be dismissed");
+
+    // Test mark acted on
+    conn.execute(
+        "UPDATE recommendations SET acted_on = 1 WHERE id = ?1",
+        [rec_id],
+    )
+    .unwrap();
+
+    let acted_on: bool = conn
+        .query_row(
+            "SELECT acted_on = 1 FROM recommendations WHERE id = ?1",
+            [rec_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(acted_on, "Recommendation should be marked as acted on");
+}
+
+#[test]
+fn test_recommendation_rules_crud() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create recommendation_rules table
+    conn.execute(
+        "CREATE TABLE recommendation_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            rule_type TEXT NOT NULL,
+            description TEXT,
+            threshold_value REAL,
+            threshold_count INTEGER,
+            recommendation_template TEXT NOT NULL,
+            priority INTEGER DEFAULT 5,
+            enabled INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert a rule
+    conn.execute(
+        "INSERT INTO recommendation_rules (name, rule_type, description, threshold_value, threshold_count, recommendation_template, priority)
+         VALUES ('low_success_pattern', 'warning', 'Warns about low success patterns', 0.5, 5, 'Pattern has {{success_rate}}% success', 1)",
+        [],
+    )
+    .unwrap();
+
+    let rule_id = conn.last_insert_rowid();
+
+    // Verify insertion
+    let (name, rule_type, threshold_value, priority): (String, String, f64, i32) = conn
+        .query_row(
+            "SELECT name, rule_type, threshold_value, priority FROM recommendation_rules WHERE id = ?1",
+            [rule_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+
+    assert_eq!(name, "low_success_pattern");
+    assert_eq!(rule_type, "warning");
+    assert!((threshold_value - 0.5).abs() < 0.01);
+    assert_eq!(priority, 1);
+
+    // Test update threshold
+    conn.execute(
+        "UPDATE recommendation_rules SET threshold_value = 0.4, updated_at = datetime('now') WHERE id = ?1",
+        [rule_id],
+    )
+    .unwrap();
+
+    let new_threshold: f64 = conn
+        .query_row(
+            "SELECT threshold_value FROM recommendation_rules WHERE id = ?1",
+            [rule_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!((new_threshold - 0.4).abs() < 0.01);
+
+    // Test disable rule
+    conn.execute(
+        "UPDATE recommendation_rules SET enabled = 0 WHERE id = ?1",
+        [rule_id],
+    )
+    .unwrap();
+
+    let enabled: bool = conn
+        .query_row(
+            "SELECT enabled = 1 FROM recommendation_rules WHERE id = ?1",
+            [rule_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!enabled, "Rule should be disabled");
+}
+
+#[test]
+fn test_recommendations_filtering() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create recommendations table
+    conn.execute(
+        "CREATE TABLE recommendations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT,
+            confidence REAL DEFAULT 0.0,
+            evidence TEXT,
+            context_role TEXT,
+            context_task_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            dismissed_at TIMESTAMP,
+            acted_on INTEGER DEFAULT 0
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert various recommendations
+    conn.execute(
+        "INSERT INTO recommendations (type, title, confidence, context_role, context_task_type)
+         VALUES ('warning', 'Warning 1', 0.9, 'builder', 'build')",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO recommendations (type, title, confidence, context_role, context_task_type)
+         VALUES ('prompt', 'Prompt 1', 0.8, 'builder', 'build')",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO recommendations (type, title, confidence, context_role, context_task_type)
+         VALUES ('cost', 'Cost 1', 0.7, 'judge', 'review')",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO recommendations (type, title, confidence, context_role, dismissed_at)
+         VALUES ('warning', 'Dismissed Warning', 0.6, 'builder', datetime('now'))",
+        [],
+    )
+    .unwrap();
+
+    // Query active recommendations (not dismissed)
+    let active_count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recommendations WHERE dismissed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(active_count, 3, "Should have 3 active recommendations");
+
+    // Query by role
+    let builder_count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recommendations WHERE context_role = 'builder' AND dismissed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(builder_count, 2, "Should have 2 active builder recommendations");
+
+    // Query by type
+    let warning_count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recommendations WHERE type = 'warning' AND dismissed_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(warning_count, 1, "Should have 1 active warning");
+
+    // Query sorted by confidence
+    let top_rec: String = conn
+        .query_row(
+            "SELECT title FROM recommendations WHERE dismissed_at IS NULL ORDER BY confidence DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(top_rec, "Warning 1", "Highest confidence should be Warning 1");
+}
+
+#[test]
+fn test_default_recommendation_rules() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create recommendation_rules table
+    conn.execute(
+        "CREATE TABLE recommendation_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            rule_type TEXT NOT NULL,
+            description TEXT,
+            threshold_value REAL,
+            threshold_count INTEGER,
+            recommendation_template TEXT NOT NULL,
+            priority INTEGER DEFAULT 5,
+            enabled INTEGER DEFAULT 1
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert default rules (simulating what migrate_v5_to_v6 does)
+    conn.execute(
+        "INSERT INTO recommendation_rules (name, rule_type, description, threshold_value, threshold_count, recommendation_template, priority)
+         VALUES ('low_success_pattern', 'warning', 'Warns about patterns with low success rate', 0.5, 5, 'Pattern has low success', 1)",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO recommendation_rules (name, rule_type, description, threshold_value, threshold_count, recommendation_template, priority)
+         VALUES ('high_cost_alert', 'cost', 'Alerts when a feature costs significantly more than average', 2.0, 3, 'High cost detected', 2)",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO recommendation_rules (name, rule_type, description, threshold_value, threshold_count, recommendation_template, priority)
+         VALUES ('optimal_timing', 'timing', 'Suggests optimal times based on success correlation', 0.7, 10, 'Best time is...', 3)",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO recommendation_rules (name, rule_type, description, threshold_value, threshold_count, recommendation_template, priority)
+         VALUES ('similar_prompt', 'prompt', 'Suggests similar prompts that had higher success', 0.8, 3, 'Try this prompt...', 4)",
+        [],
+    ).unwrap();
+
+    // Verify all 4 default rules exist
+    let rule_count: i32 = conn
+        .query_row("SELECT COUNT(*) FROM recommendation_rules", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rule_count, 4, "Should have 4 default rules");
+
+    // Verify all are enabled by default
+    let enabled_count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM recommendation_rules WHERE enabled = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(enabled_count, 4, "All rules should be enabled by default");
+
+    // Verify rule types
+    let rule_types: Vec<String> = conn
+        .prepare("SELECT DISTINCT rule_type FROM recommendation_rules ORDER BY rule_type")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(rule_types.len(), 4);
+    assert!(rule_types.contains(&"cost".to_string()));
+    assert!(rule_types.contains(&"prompt".to_string()));
+    assert!(rule_types.contains(&"timing".to_string()));
+    assert!(rule_types.contains(&"warning".to_string()));
+}
+
+#[test]
+fn test_recommendation_evidence_json() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create recommendations table
+    conn.execute(
+        "CREATE TABLE recommendations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            evidence TEXT
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert with JSON evidence
+    let evidence = r#"{"pattern_id": 42, "pattern_text": "build issue #n", "success_rate": 0.3, "times_used": 10}"#;
+    conn.execute(
+        "INSERT INTO recommendations (type, title, evidence)
+         VALUES ('warning', 'Low success pattern', ?1)",
+        [evidence],
+    )
+    .unwrap();
+
+    let rec_id = conn.last_insert_rowid();
+
+    // Retrieve and verify evidence
+    let stored_evidence: String = conn
+        .query_row(
+            "SELECT evidence FROM recommendations WHERE id = ?1",
+            [rec_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    // Verify it's valid JSON by parsing
+    let parsed: serde_json::Value = serde_json::from_str(&stored_evidence).unwrap();
+    assert_eq!(parsed["pattern_id"], 42);
+    assert_eq!(parsed["pattern_text"], "build issue #n");
+    assert!((parsed["success_rate"].as_f64().unwrap() - 0.3).abs() < 0.01);
+    assert_eq!(parsed["times_used"], 10);
+}
+
+#[test]
+fn test_recommendations_indexes() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create table with indexes
+    conn.execute(
+        "CREATE TABLE recommendations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            dismissed_at TIMESTAMP
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE INDEX idx_recommendations_type ON recommendations(type)",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE INDEX idx_recommendations_created_at ON recommendations(created_at DESC)",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE INDEX idx_recommendations_dismissed ON recommendations(dismissed_at)",
+        [],
+    )
+    .unwrap();
+
+    // Verify indexes exist
+    let index_count: i32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_recommendations%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(index_count, 3, "Should have 3 indexes on recommendations table");
+}
