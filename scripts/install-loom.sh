@@ -346,9 +346,10 @@ success "loom-daemon binary ready"
 
 # Run loom-daemon init in the worktree
 cd "$TARGET_PATH/$WORKTREE_PATH"
-# Use --force in case .loom already exists in the target repo
+# Use merge mode (no --force) to preserve custom project roles/commands
+# New files are added, existing files are preserved
 # Use --defaults to point to Loom's defaults directory
-"$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" . || \
+"$LOOM_ROOT/target/release/loom-daemon" init --defaults "$LOOM_ROOT/defaults" . || \
   error "loom-daemon init failed"
 
 echo ""
