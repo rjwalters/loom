@@ -468,20 +468,40 @@ if [ "$PHASE" = "gate2" ]; then
   if [ "$FORCE_MERGE" = "true" ]; then
     echo "Force-merge mode: auto-merging PR"
 
-    # Check for merge conflicts and attempt resolution
-    if ! gh pr merge $PR_NUMBER --squash --delete-branch 2>/dev/null; then
-      echo "Merge failed, attempting conflict resolution..."
-      git fetch origin main
-      git checkout $BRANCH_NAME
-      git merge origin/main --no-edit || {
-        # Auto-resolve conflicts if possible
-        git checkout --theirs .
-        git add -A
-        git commit -m "Resolve merge conflicts (auto-resolved)"
-      }
-      git push origin $BRANCH_NAME
-      gh pr merge $PR_NUMBER --squash --delete-branch
-    fi
+    # Attempt merge - may fail locally when running from worktree (main already checked out)
+    # The gh CLI succeeds on GitHub but fails on local checkout, so we verify actual state
+    MERGE_OUTPUT=$(gh pr merge $PR_NUMBER --squash --delete-branch 2>&1) || {
+      MERGE_EXIT=$?
+
+      # Check if merge actually succeeded on GitHub despite local error
+      PR_STATE=$(gh pr view $PR_NUMBER --json state,mergedAt --jq '.state')
+      if [ "$PR_STATE" = "MERGED" ]; then
+        echo "✓ PR merged successfully (local checkout skipped - worktree conflict)"
+      else
+        # Genuine merge failure - attempt conflict resolution
+        echo "Merge failed, attempting conflict resolution..."
+        git fetch origin main
+        git checkout $BRANCH_NAME
+        git merge origin/main --no-edit || {
+          # Auto-resolve conflicts if possible
+          git checkout --theirs .
+          git add -A
+          git commit -m "Resolve merge conflicts (auto-resolved)"
+        }
+        git push origin $BRANCH_NAME
+
+        # Retry merge with verification
+        gh pr merge $PR_NUMBER --squash --delete-branch 2>&1 || {
+          # Verify again in case it succeeded despite error
+          PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
+          if [ "$PR_STATE" != "MERGED" ]; then
+            echo "✗ Merge failed after conflict resolution"
+            exit 1
+          fi
+          echo "✓ PR merged successfully after conflict resolution"
+        }
+      fi
+    }
 
     gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force-merge\`"
   else
