@@ -290,6 +290,69 @@ fn handle_cli_command(command: Commands) -> Result<()> {
 
             match init::initialize_workspace(workspace_str, &defaults, force) {
                 Ok(report) => {
+                    // Handle self-installation (Loom source repo)
+                    if report.is_self_install {
+                        println!("\n✅ Loom source repository detected!");
+                        println!("\nMode: Validation only (self-installation)");
+                        println!("\nValidating configuration...");
+
+                        if let Some(ref validation) = report.validation {
+                            // Print validation results
+                            println!(
+                                "  ✓ .loom/roles/    - {} role definitions found",
+                                validation.roles_found.len()
+                            );
+                            println!(
+                                "  ✓ .loom/scripts/  - {} scripts found",
+                                validation.scripts_found.len()
+                            );
+                            println!(
+                                "  ✓ .claude/commands/ - {} slash commands found",
+                                validation.commands_found.len()
+                            );
+
+                            if validation.has_claude_md {
+                                println!("  ✓ CLAUDE.md       - Present");
+                            } else {
+                                println!("  ✗ CLAUDE.md       - Missing");
+                            }
+
+                            if validation.has_agents_md {
+                                println!("  ✓ AGENTS.md       - Present");
+                            } else {
+                                println!("  ✗ AGENTS.md       - Missing");
+                            }
+
+                            if validation.has_labels_yml {
+                                println!("  ✓ .github/labels.yml - Present");
+                            } else {
+                                println!("  ✗ .github/labels.yml - Missing");
+                            }
+
+                            // Print any issues found
+                            if !validation.issues.is_empty() {
+                                println!("\n⚠️  Issues found:");
+                                for issue in &validation.issues {
+                                    println!("  - {issue}");
+                                }
+                            } else {
+                                println!("\n✅ Loom source repository is properly configured");
+                            }
+
+                            // Print role details
+                            println!("\nRoles found: {}", validation.roles_found.join(", "));
+                        }
+
+                        println!("\nℹ️  Self-installation skips file copying to prevent data loss.");
+                        println!("   The Loom repo's .loom/ directory IS the source of truth.");
+                        println!("\nTo use Loom orchestration:");
+                        println!("  - Open Claude Code terminals with /builder, /judge, etc.");
+                        println!("  - Or launch the Loom Tauri app with this workspace");
+
+                        return Ok(());
+                    }
+
+                    // Normal installation output
                     println!("\n✅ Loom workspace initialized successfully!");
                     println!("\nFiles installed:");
                     println!("  📁 .loom/          - Configuration directory");

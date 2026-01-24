@@ -153,8 +153,37 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
   echo ""
 fi
 
-# Check if Loom is already installed
-if [[ -d "$TARGET_PATH/.loom" ]]; then
+# Check if this is the Loom source repository (self-installation)
+is_loom_source_repo() {
+  local path="$1"
+  # Check for marker file
+  [[ -f "$path/.loom-source" ]] && return 0
+  # Check for Loom-specific directory structure
+  [[ -d "$path/src-tauri" && -d "$path/loom-daemon" && -d "$path/defaults" ]] && return 0
+  return 1
+}
+
+if is_loom_source_repo "$TARGET_PATH"; then
+  echo ""
+  header "╔═══════════════════════════════════════════════════════════╗"
+  header "║              Loom Source Repository Detected              ║"
+  header "╚═══════════════════════════════════════════════════════════╝"
+  echo ""
+  info "This appears to be the Loom source repository itself."
+  info "Self-installation runs in validation-only mode to prevent data loss."
+  echo ""
+  info "The Loom repo's .loom/ directory IS the source of truth for defaults."
+  info "Installing would overwrite rich content with minimal templates."
+  echo ""
+  read -r -p "Run validation to check configuration? [Y/n] " -n 1 VALIDATE_REPLY
+  echo ""
+  if [[ $VALIDATE_REPLY =~ ^[Nn]$ ]]; then
+    info "Installation cancelled"
+    exit 0
+  fi
+  FORCE_FLAG=""
+  SELF_INSTALL=true
+elif [[ -d "$TARGET_PATH/.loom" ]]; then
   warning "Loom appears to be already installed in this repository"
   echo ""
   read -r -p "Reinstall and overwrite existing configuration? [y/N] " -n 1 REPLY
@@ -164,8 +193,10 @@ if [[ -d "$TARGET_PATH/.loom" ]]; then
     exit 0
   fi
   FORCE_FLAG="--force"
+  SELF_INSTALL=false
 else
   FORCE_FLAG=""
+  SELF_INSTALL=false
 fi
 
 echo ""
