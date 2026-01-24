@@ -1,4 +1,5 @@
 mod activity;
+mod git_parser;
 mod git_utils;
 mod github_parser;
 mod health_monitor;
@@ -264,7 +265,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             println!("  Defaults:  {defaults}");
 
             match init::initialize_workspace(workspace_str, &defaults, force) {
-                Ok(()) => {
+                Ok(report) => {
                     println!("\n✅ Loom workspace initialized successfully!");
                     println!("\nFiles installed:");
                     println!("  📁 .loom/          - Configuration directory");
@@ -276,6 +277,32 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  📁 .codex/         - Codex configuration");
                     println!("  📁 .github/        - GitHub workflow templates");
                     println!("  📄 .gitignore      - Updated with Loom patterns");
+
+                    // Print report of what was added vs preserved
+                    if !report.added.is_empty() || !report.preserved.is_empty() {
+                        println!();
+                        if !report.added.is_empty() {
+                            println!("Files added ({}):", report.added.len());
+                            for file in &report.added {
+                                println!("  + {file}");
+                            }
+                        }
+                        if !report.preserved.is_empty() {
+                            println!("\nFiles preserved ({}):", report.preserved.len());
+                            for file in &report.preserved {
+                                println!("  = {file}");
+                            }
+                            println!("\n  ℹ️  Preserved files were not overwritten. To update them,");
+                            println!("     delete them and run install again, or use --force.");
+                        }
+                        if !report.updated.is_empty() && force {
+                            println!("\nFiles updated ({}):", report.updated.len());
+                            for file in &report.updated {
+                                println!("  ~ {file}");
+                            }
+                        }
+                    }
+
                     println!("\nNext steps:");
                     println!("  1. Commit the changes: git add -A && git commit -m 'Add Loom configuration'");
                     println!("  2. Choose your workflow:");

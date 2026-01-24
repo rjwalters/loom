@@ -1,4 +1,5 @@
-use crate::activity::{ActivityDb, AgentInput, InputContext, InputType};
+use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputType};
+use crate::git_parser;
 use crate::git_utils;
 use crate::github_parser::parse_github_events;
 use crate::terminal::TerminalManager;
@@ -222,6 +223,14 @@ fn handle_request(
         Request::GetTerminalOutput { id, start_byte } => {
             use base64::{engine::general_purpose, Engine as _};
 
+            // Get terminal info first (before releasing lock for output)
+            let terminal_info = {
+                let mut tm = terminal_manager
+                    .lock()
+                    .expect("Terminal manager mutex poisoned");
+                tm.list_terminals().into_iter().find(|t| t.id == id)
+            };
+
             let tm = terminal_manager
                 .lock()
                 .expect("Terminal manager mutex poisoned");
@@ -237,7 +246,7 @@ fn handle_request(
                             output_str.clone()
                         };
 
-                        let output_record = crate::activity::AgentOutput {
+                        let output_record = AgentOutput {
                             id: None,
                             input_id: None, // Could link to last input if tracked
                             terminal_id: id.clone(),
@@ -281,6 +290,56 @@ fn handle_request(
                                 }
                                 Err(e) => {
                                     log::warn!("Failed to record resource usage: {e}");
+                                }
+                            }
+
+                            // Parse terminal output for git commits and record changes
+                            // This enables automatic prompt-to-commit correlation
+                            if git_parser::contains_git_commit(&output_str) {
+                                let git_commits = git_parser::parse_git_commits(&output_str);
+                                for commit_event in git_commits {
+                                    log::info!(
+                                        "Detected git commit: {} ({:?})",
+                                        commit_event.commit_hash,
+                                        commit_event.commit_message
+                                    );
+
+                                    // Record the commit correlation if we have the terminal's workspace
+                                    if let Some(ref info) = terminal_info {
+                                        let workspace_path = info.worktree_path.as_ref()
+                                            .or(info.working_dir.as_ref());
+
+                                        if let Some(ws) = workspace_path {
+                                            // Create a prompt_changes record linking to the commit
+                                            // We use the commit hash as after_commit
+                                            // The input_id would ideally link to the most recent input
+                                            // but we don't have that context here, so we record
+                                            // the commit with metrics from the parsed output
+                                            let changes = crate::activity::PromptChanges {
+                                                id: None,
+                                                input_id: 0, // Will be correlated by timestamp
+                                                before_commit: None,
+                                                after_commit: Some(commit_event.commit_hash.clone()),
+                                                files_changed: commit_event.files_changed.unwrap_or(0),
+                                                lines_added: commit_event.lines_added.unwrap_or(0),
+                                                lines_removed: commit_event.lines_removed.unwrap_or(0),
+                                                tests_added: 0, // Not available from commit output
+                                                tests_modified: 0,
+                                            };
+
+                                            if let Err(e) = db.record_prompt_changes(&changes) {
+                                                log::warn!(
+                                                    "Failed to record git commit correlation: {e}"
+                                                );
+                                            } else {
+                                                log::debug!(
+                                                    "Recorded git commit {} in workspace {}",
+                                                    commit_event.commit_hash,
+                                                    ws
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

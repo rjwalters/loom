@@ -1,6 +1,6 @@
 {
   "name": "loom-quickstart-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Loom quickstart template for desktop applications with Tauri, Vite, React, Tailwind, and shadcn/ui",
   "type": "module",
   "scripts": {
