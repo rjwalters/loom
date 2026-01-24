@@ -70,7 +70,11 @@ pub fn build_menu<R: tauri::Runtime>(
         .id("reset_zoom")
         .accelerator("CmdOrCtrl+0")
         .build(handle)?;
-    let show_metrics = MenuItemBuilder::new("Metrics & Telemetry")
+    let show_agent_metrics = MenuItemBuilder::new("Agent Metrics")
+        .id("show_agent_metrics")
+        .accelerator("CmdOrCtrl+M")
+        .build(handle)?;
+    let show_metrics = MenuItemBuilder::new("Telemetry")
         .id("show_metrics")
         .accelerator("CmdOrCtrl+Shift+M")
         .build(handle)?;
@@ -82,6 +86,7 @@ pub fn build_menu<R: tauri::Runtime>(
         .item(&zoom_out)
         .item(&reset_zoom)
         .separator()
+        .item(&show_agent_metrics)
         .item(&show_metrics)
         .separator()
         .fullscreen()
@@ -185,6 +190,11 @@ pub fn handle_menu_event<R: tauri::Runtime>(
         "reset_zoom" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("reset-zoom", ());
+            }
+        }
+        "show_agent_metrics" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-agent-metrics", ());
             }
         }
         "show_metrics" => {

@@ -482,6 +482,11 @@ if (!eventListenersRegistered) {
     showMetricsModal();
   });
 
+  listen("show-agent-metrics", async () => {
+    const { showAgentMetricsModal } = await import("./lib/agent-metrics-modal");
+    showAgentMetricsModal();
+  });
+
   listen("show-daemon-status", async () => {
     showDaemonStatusDialog();
   });

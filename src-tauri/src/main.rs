@@ -188,6 +188,10 @@ fn main() {
             get_activity_by_role,
             query_token_usage_by_role,
             query_token_usage_timeline,
+            // Agent metrics commands
+            get_agent_metrics,
+            get_metrics_by_role,
+            log_github_event,
             // Terminal commands
             create_terminal,
             list_terminals,
