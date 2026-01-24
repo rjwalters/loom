@@ -66,6 +66,60 @@ The daemon runs **continuously** until:
 
 The daemon should NEVER exit just because the backlog is temporarily empty. Work generation (Architect/Hermit) will replenish the backlog.
 
+### Session Limit Awareness
+
+For multi-day autonomous operation, the daemon integrates with [claude-monitor](https://github.com/rjwalters/claude-monitor) to detect approaching session limits and pause gracefully.
+
+**Startup Detection**:
+
+When `/loom` starts, check for claude-monitor:
+
+```bash
+if [ -f ~/.claude-monitor/usage.db ]; then
+    echo "✓ claude-monitor detected - session limit awareness enabled"
+else
+    echo "⚠ claude-monitor not detected"
+    echo "  For multi-day autonomous operation, install claude-monitor:"
+    echo "  https://github.com/rjwalters/claude-monitor"
+    echo ""
+    echo "  Without it, the daemon will not pause proactively at session limits."
+fi
+```
+
+**Session Limit Check** (each iteration):
+
+```python
+def check_session_limits():
+    """Check if we should pause due to session limits."""
+    result = run("./.loom/scripts/check-usage.sh")
+
+    if result.exit_code != 0:
+        return None  # No database, feature disabled
+
+    data = json.loads(result.stdout)
+    session_percent = data["session_percent"]
+    session_reset = data["session_reset"]
+
+    if session_percent >= 97:
+        return {
+            "should_pause": True,
+            "percent": session_percent,
+            "reset_in": session_reset
+        }
+
+    return {"should_pause": False, "percent": session_percent}
+```
+
+**Pause Behavior** (different from shutdown):
+
+When pausing for rate limits:
+1. Stop spawning new shepherds
+2. Signal existing shepherds via `.loom/stop-shepherds`
+3. Keep issues in `loom:building` state (don't revert)
+4. Store shepherd assignments in daemon-state for resume
+5. Sleep until session reset time
+6. On resume, continue with preserved state
+
 ### Parallelism via Subagents
 
 In Manual Orchestration Mode, use the **Task tool with `run_in_background: true`** to spawn parallel shepherd subagents:
@@ -90,21 +144,33 @@ DAEMON ITERATION:
 ├── 1. SHUTDOWN CHECK
 │   └── if .loom/stop-daemon exists → graceful shutdown
 │
-├── 2. ASSESS SYSTEM STATE (automatic)
+├── 2. SESSION LIMIT CHECK (if claude-monitor available)
+│   ├── usage = check_session_limits()
+│   ├── if usage.should_pause (session >= 97%):
+│   │   ├── create .loom/stop-shepherds (pause signal)
+│   │   ├── wait for active shepherds to reach phase boundary
+│   │   ├── calculate wake_time from session_reset
+│   │   ├── save pause state to daemon-state.json
+│   │   ├── sleep until wake_time
+│   │   ├── remove .loom/stop-shepherds
+│   │   └── continue (shepherds resume with preserved assignments)
+│   └── else: continue normally
+│
+├── 3. ASSESS SYSTEM STATE (automatic)
 │   ├── ready_issues = gh issue list --label "loom:issue" count
 │   ├── building_issues = gh issue list --label "loom:building" count
 │   ├── architect_proposals = gh issue list --label "loom:architect" count
 │   ├── hermit_proposals = gh issue list --label "loom:hermit" count
 │   └── prs_pending = gh pr list --label "loom:review-requested" count
 │
-├── 3. CHECK SUBAGENT COMPLETIONS (non-blocking)
+├── 4. CHECK SUBAGENT COMPLETIONS (non-blocking)
 │   └── For each active shepherd/role: TaskOutput with block=false
 │
-├── 4. AUTO-SPAWN SHEPHERDS (no human decision)
+├── 5. AUTO-SPAWN SHEPHERDS (no human decision)
 │   └── while active_shepherds < MAX_SHEPHERDS AND ready_issues > 0:
 │       └── spawn_shepherd_for_next_ready_issue()
 │
-├── 5. AUTO-TRIGGER WORK GENERATION (no human decision)
+├── 6. AUTO-TRIGGER WORK GENERATION (no human decision)
 │   ├── if ready_issues < ISSUE_THRESHOLD:
 │   │   ├── if architect_cooldown_elapsed AND architect_proposals < MAX:
 │   │   │   └── spawn_architect()
@@ -112,19 +178,19 @@ DAEMON ITERATION:
 │   │       └── spawn_hermit()
 │   └── (Proposals feed pipeline when humans approve them)
 │
-├── 6. AUTO-ENSURE SUPPORT ROLES (no human decision)
+├── 7. AUTO-ENSURE SUPPORT ROLES (no human decision)
 │   ├── if guide_not_running OR guide_idle > GUIDE_INTERVAL:
 │   │   └── spawn_guide()
 │   └── if champion_not_running OR champion_idle > CHAMPION_INTERVAL:
 │       └── spawn_champion()
 │
-├── 7. SAVE STATE
+├── 8. SAVE STATE
 │   └── Update .loom/daemon-state.json
 │
-├── 8. REPORT STATUS
-│   └── Print status report to console
+├── 9. REPORT STATUS
+│   └── Print status report (include session usage if available)
 │
-└── 9. SLEEP(POLL_INTERVAL) and repeat
+└── 10. SLEEP(POLL_INTERVAL) and repeat
 ```
 
 ### Spawning Shepherd Subagents (Automatic)
@@ -619,7 +685,19 @@ Track state in `.loom/daemon-state.json`:
   "completed_issues": [100, 101, 102],
   "total_prs_merged": 3,
   "last_architect_trigger": "2026-01-23T10:00:00Z",
-  "last_hermit_trigger": "2026-01-23T10:30:00Z"
+  "last_hermit_trigger": "2026-01-23T10:30:00Z",
+
+  "session_limit_awareness": {
+    "enabled": true,
+    "last_check": "2026-01-23T11:30:00Z",
+    "session_percent": 45,
+    "paused_for_rate_limit": false,
+    "pause_started_at": null,
+    "expected_resume_at": null,
+    "session_percent_at_pause": null,
+    "total_pauses": 0,
+    "total_pause_duration_minutes": 0
+  }
 }
 ```
 
@@ -677,6 +755,11 @@ Print status after each iteration showing ALL autonomous decisions:
   SESSION STATS:
     Issues completed: 3
     PRs merged: 3
+
+  CLAUDE USAGE (via claude-monitor):
+    Session:  45% used (resets in 2h 15m)  ✓ Healthy
+    Weekly:   31% used (resets Thu 10:00 PM)
+    [Pause threshold: 97%]
 
   AUTONOMOUS DECISIONS THIS ITERATION:
     ✓ Auto-spawned shepherd for #789
