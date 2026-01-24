@@ -1,4 +1,5 @@
 mod activity;
+mod git_parser;
 mod git_utils;
 mod github_parser;
 mod health_monitor;
