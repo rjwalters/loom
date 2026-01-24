@@ -214,14 +214,14 @@ fn initialize_default_rules(conn: &Connection) -> SqliteResult<()> {
         (
             "vague_prompt",
             "specificity",
-            r#"{"keywords": ["fix", "update", "change", "modify"], "lacks": ["#", "function", "file", "error"]}"#,
+            r##"{"keywords": ["fix", "update", "change", "modify"], "lacks": ["#", "function", "file", "error"]}"##,
             "Be more specific: Instead of '{{original}}', try: '{{original}} in {{suggested_scope}}'",
             0.20,
         ),
         (
             "missing_issue_ref",
             "structure",
-            r#"{"lacks_pattern": "#[0-9]+"}"#,
+            r##"{"lacks_pattern": "#[0-9]+"}"##,
             "Reference the issue: {{original}} (see issue #N for details)",
             0.12,
         ),
@@ -497,7 +497,7 @@ fn calculate_specificity_score(prompt: &str) -> f64 {
 
 /// Calculate structural quality of a prompt (0.0 to 1.0)
 fn calculate_structure_score(prompt: &str) -> f64 {
-    let mut score = 0.5;
+    let mut score: f64 = 0.5;
 
     let word_count = prompt.split_whitespace().count();
 

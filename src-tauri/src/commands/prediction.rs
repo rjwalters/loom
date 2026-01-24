@@ -6,6 +6,7 @@
 //!
 //! Part of Phase 4 (Advanced Analytics) - Builds on Phase 3 correlation analysis.
 
+use chrono::{Datelike, Timelike};
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
