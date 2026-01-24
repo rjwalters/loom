@@ -238,7 +238,7 @@ def auto_generate_work():
         if architect_cooldown_ok() and architect_proposals < 2:
             Task(
                 description="Architect work generation",
-                prompt="/architect",
+                prompt="/architect --autonomous",
                 run_in_background=True
             )
             update_last_architect_trigger()
@@ -508,7 +508,7 @@ def auto_generate_work():
     if architect_proposals < MAX_ARCHITECT_PROPOSALS and architect_elapsed > ARCHITECT_COOLDOWN:
         result = Task(
             description="Architect work generation",
-            prompt="/architect",
+            prompt="/architect --autonomous",
             run_in_background=True
         )
         record_support_role("architect", result.task_id, result.output_file)
