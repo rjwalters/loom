@@ -408,6 +408,34 @@ async function startAutonomousMode(state: AppState): Promise<void> {
 }
 
 /**
+ * Start stuck agent detection monitoring
+ *
+ * Monitors terminals for stuck conditions (no output, waiting for input too long)
+ * and shows notifications when agents may need intervention.
+ */
+async function startStuckAgentDetection(): Promise<void> {
+  const { getStuckAgentDetector } = await import("./stuck-agent-detector");
+  const detector = getStuckAgentDetector();
+
+  // Register callback to show toast when agent is stuck
+  detector.onStuckDetected((terminalId, analysis) => {
+    if (analysis.isStuck && analysis.recommendedAction !== "none") {
+      const actionText =
+        analysis.recommendedAction === "restart"
+          ? "Consider restarting the terminal."
+          : analysis.recommendedAction === "escalate"
+            ? "Multiple consecutive stuck detections - investigation recommended."
+            : "";
+
+      showToast(`Agent in ${terminalId} may be stuck: ${analysis.reason}. ${actionText}`, "info");
+    }
+  });
+
+  detector.start();
+  logger.info("Started stuck agent detector");
+}
+
+/**
  * Persist workspace path for next app launch
  *
  * @param workspacePath - Path to workspace
@@ -470,6 +498,9 @@ export async function handleWorkspacePathInput(
 
     // Step 9: Start autonomous mode
     await startAutonomousMode(deps.state);
+
+    // Step 9.5: Start stuck agent detection
+    await startStuckAgentDetection();
 
     // Step 10: Set workspace as active
     deps.state.workspace.setWorkspace(expandedPath);

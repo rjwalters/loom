@@ -8,5 +8,9 @@
   "gitIdentity": {
     "name": "Shepherd",
     "email": "shepherd@users.noreply.github.com"
+  },
+  "stuckThresholds": {
+    "maxNoOutput": 2700000,
+    "maxNeedsInput": 300000
   }
 }
