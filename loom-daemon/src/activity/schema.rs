@@ -224,6 +224,27 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_quality_metrics_input_id ON quality_metrics(input_id);
             CREATE INDEX IF NOT EXISTS idx_quality_metrics_timestamp ON quality_metrics(timestamp);
             CREATE INDEX IF NOT EXISTS idx_quality_metrics_test_runner ON quality_metrics(test_runner);
+
+            -- Resource usage tracking for LLM API calls (Issue #1053)
+            -- Links terminal output parsing to token consumption and costs
+            CREATE TABLE IF NOT EXISTS resource_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER REFERENCES agent_inputs(id),
+                timestamp DATETIME NOT NULL,
+                model TEXT NOT NULL,
+                tokens_input INTEGER NOT NULL,
+                tokens_output INTEGER NOT NULL,
+                tokens_cache_read INTEGER,
+                tokens_cache_write INTEGER,
+                cost_usd REAL NOT NULL,
+                duration_ms INTEGER,
+                provider TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_input_id ON resource_usage(input_id);
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_timestamp ON resource_usage(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_model ON resource_usage(model);
+            CREATE INDEX IF NOT EXISTS idx_resource_usage_provider ON resource_usage(provider);
             ",
     )?;
 
