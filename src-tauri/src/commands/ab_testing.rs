@@ -1119,51 +1119,33 @@ pub fn get_experiments(
         .prepare(query)
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    let experiments: Vec<Experiment> = if let Some(ref s) = status {
-        let results: Vec<Experiment> = stmt
-            .query_map([s], |row| {
-                Ok(Experiment {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    hypothesis: row.get(3)?,
-                    status: row.get(4)?,
-                    created_at: row.get(5)?,
-                    started_at: row.get(6)?,
-                    concluded_at: row.get(7)?,
-                    min_sample_size: row.get(8)?,
-                    target_metric: row.get(9)?,
-                    target_direction: row.get(10)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query experiments: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to collect experiments: {e}"))?;
-        results
-    } else {
-        let results: Vec<Experiment> = stmt
-            .query_map([], |row| {
-                Ok(Experiment {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    hypothesis: row.get(3)?,
-                    status: row.get(4)?,
-                    created_at: row.get(5)?,
-                    started_at: row.get(6)?,
-                    concluded_at: row.get(7)?,
-                    min_sample_size: row.get(8)?,
-                    target_metric: row.get(9)?,
-                    target_direction: row.get(10)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query experiments: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to collect experiments: {e}"))?;
-        results
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<Experiment> {
+        Ok(Experiment {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            hypothesis: row.get(3)?,
+            status: row.get(4)?,
+            created_at: row.get(5)?,
+            started_at: row.get(6)?,
+            concluded_at: row.get(7)?,
+            min_sample_size: row.get(8)?,
+            target_metric: row.get(9)?,
+            target_direction: row.get(10)?,
+        })
     };
 
-    Ok(experiments)
+    if let Some(ref s) = status {
+        stmt.query_map([s], map_row)
+            .map_err(|e| format!("Failed to query experiments: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect experiments: {e}"))
+    } else {
+        stmt.query_map([], map_row)
+            .map_err(|e| format!("Failed to query experiments: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to collect experiments: {e}"))
+    }
 }
 
 /// Get a single experiment by ID
