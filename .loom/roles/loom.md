@@ -43,13 +43,14 @@ You orchestrate the issue lifecycle by:
 
 When `--force` is specified:
 1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
-2. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
+2. **Judge Phase**: Skip entirely (GitHub doesn't allow self-approval)
+3. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash --admin`
 
 ```bash
-# Force mode flow - no waiting at gates
+# Force mode flow - no waiting at gates, no Judge
 /loom 123 --force
 
-Curator → [auto-approve] → Builder → Judge → [auto-merge] → Complete
+Curator → [auto-approve] → Builder → [skip Judge] → [auto-merge] → Complete
 ```
 
 **Use cases for --force**:
@@ -57,7 +58,17 @@ Curator → [auto-approve] → Builder → Judge → [auto-merge] → Complete
 - Trusted issues where you've already decided to implement
 - Automated pipelines where human gates aren't needed
 
-**Warning**: Force mode merges PRs without human review of the merge decision. Judge still reviews code quality.
+**Why skip Judge in force mode?**
+
+GitHub does not allow users to approve their own pull requests. When the orchestrator creates the PR (via Builder) and then tries to review it (via Judge), this results in:
+
+```
+failed to create review: GraphQL: Review Can not approve your own pull request
+```
+
+Since force mode is intended for hands-off automation where you've already decided to implement, skipping the Judge phase and using `--admin` for merge is the appropriate behavior.
+
+**Warning**: Force mode merges PRs without code review. Use only when you trust the implementation or are testing the orchestration system.
 
 ## Phase Flow
 
@@ -71,8 +82,10 @@ When orchestrating issue #N, follow this progression:
 3. [Gate 1]       → Wait for loom:issue (or auto-approve if --force)
 4. [Builder]      → trigger_run_now(builder) → wait for loom:review-requested
 5. [Judge]        → trigger_run_now(judge) → wait for loom:pr or loom:changes-requested
+                    (SKIP if --force: GitHub doesn't allow self-approval)
 6. [Doctor loop]  → If changes requested: trigger_run_now(doctor) → goto 5 (max 3x)
-7. [Gate 2]       → Wait for merge (or auto-merge if --force)
+                    (SKIP if --force: no Judge means no changes requested)
+7. [Gate 2]       → Wait for merge (or auto-merge with --admin if --force)
 8. [Complete]     → Report success
 ```
 
@@ -355,29 +368,38 @@ fi
 
 ```bash
 if [ "$PHASE" = "judge" ]; then
-  JUDGE_TERMINAL="terminal-1"
+  # In force mode, skip Judge entirely - GitHub doesn't allow self-approval
+  # The orchestrator (or same agent) created the PR, so it cannot approve it
+  if [ "$FORCE_MODE" = "true" ]; then
+    echo "Force mode: skipping Judge phase (self-approval not allowed by GitHub)"
+    gh pr edit $PR_NUMBER --add-label "loom:pr"
+    gh pr comment $PR_NUMBER --body "⚡ **Judge phase skipped** - force mode bypasses review (self-approval limitation)"
+    PHASE="gate2"
+  else
+    JUDGE_TERMINAL="terminal-1"
 
-  mcp__loom-terminals__restart_terminal --terminal_id $JUDGE_TERMINAL
-  mcp__loom-terminals__configure_terminal \
-    --terminal_id $JUDGE_TERMINAL \
-    --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
+    mcp__loom-terminals__restart_terminal --terminal_id $JUDGE_TERMINAL
+    mcp__loom-terminals__configure_terminal \
+      --terminal_id $JUDGE_TERMINAL \
+      --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
-  mcp__loom-ui__trigger_run_now --terminalId $JUDGE_TERMINAL
+    mcp__loom-ui__trigger_run_now --terminalId $JUDGE_TERMINAL
 
-  # Wait for review completion
-  while true; do
-    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-    if echo "$LABELS" | grep -q "loom:pr"; then
-      echo "PR approved"
-      PHASE="gate2"
-      break
-    elif echo "$LABELS" | grep -q "loom:changes-requested"; then
-      echo "Changes requested"
-      PHASE="doctor"
-      break
-    fi
-    sleep 30
-  done
+    # Wait for review completion
+    while true; do
+      LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+      if echo "$LABELS" | grep -q "loom:pr"; then
+        echo "PR approved"
+        PHASE="gate2"
+        break
+      elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+        echo "Changes requested"
+        PHASE="doctor"
+        break
+      fi
+      sleep 30
+    done
+  fi
 fi
 ```
 
@@ -437,11 +459,13 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate2" ]; then
-  # Check if --force mode - auto-merge
+  # Check if --force mode - auto-merge with --admin to bypass approval requirements
   if [ "$FORCE_MODE" = "true" ]; then
-    echo "Force mode: auto-merging PR"
-    gh pr merge $PR_NUMBER --squash --delete-branch
-    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force\`"
+    echo "Force mode: auto-merging PR with admin privileges"
+    # Use --admin to bypass branch protection since we skipped the Judge phase
+    # This is safe because force mode is explicitly opted into
+    gh pr merge $PR_NUMBER --squash --delete-branch --admin
+    gh issue comment $ISSUE_NUMBER --body "🚀 **Auto-merged** PR #$PR_NUMBER via \`/loom --force\` (admin merge, review skipped)"
   else
     # Trigger Champion or wait for human merge
     CHAMPION_TERMINAL="terminal-5"  # if exists
