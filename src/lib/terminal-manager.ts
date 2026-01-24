@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@tauri-apps/api/core";
+import { CircuitOpenError, getDaemonCircuitBreaker } from "./circuit-breaker";
 import { Logger } from "./logger";
 
 const logger = Logger.forComponent("terminal-manager");
@@ -112,10 +113,33 @@ export class TerminalManager {
     terminal.open(container);
 
     // Hook up input handler - send user input directly to daemon
+    // Uses circuit breaker to fail fast if daemon is unresponsive
     terminal.onData((data) => {
-      invoke("send_terminal_input", { id: terminalId, data }).catch((e) => {
-        logger.error("Failed to send input", e, { terminalId });
-      });
+      const circuitBreaker = getDaemonCircuitBreaker();
+
+      // Check circuit before attempting to send input
+      if (!circuitBreaker.canAttempt()) {
+        logger.warn("Input rejected - circuit breaker open", {
+          terminalId,
+          circuitState: circuitBreaker.getState(),
+        });
+        return;
+      }
+
+      circuitBreaker
+        .execute(async () => {
+          await invoke("send_terminal_input", { id: terminalId, data });
+        })
+        .catch((e) => {
+          if (e instanceof CircuitOpenError) {
+            logger.warn("Input rejected - circuit breaker opened", {
+              terminalId,
+              circuitState: e.state,
+            });
+          } else {
+            logger.error("Failed to send input", e, { terminalId });
+          }
+        });
 
       // Clear needs-input state when user types
       import("./state")
@@ -618,9 +642,32 @@ export class TerminalManager {
     managed.lastKnownCols = cols;
     managed.lastKnownRows = rows;
 
-    invoke("resize_terminal", { id: terminalId, cols, rows }).catch((error) => {
-      logger.error("Failed to resize tmux session", error, { terminalId, cols, rows });
-    });
+    // Use circuit breaker for resize IPC
+    const circuitBreaker = getDaemonCircuitBreaker();
+    if (!circuitBreaker.canAttempt()) {
+      logger.info("Resize skipped - circuit breaker open", {
+        terminalId,
+        cols,
+        rows,
+        circuitState: circuitBreaker.getState(),
+      });
+      return;
+    }
+
+    circuitBreaker
+      .execute(async () => {
+        await invoke("resize_terminal", { id: terminalId, cols, rows });
+      })
+      .catch((error) => {
+        if (error instanceof CircuitOpenError) {
+          logger.info("Resize rejected - circuit breaker opened", {
+            terminalId,
+            circuitState: error.state,
+          });
+        } else {
+          logger.error("Failed to resize tmux session", error, { terminalId, cols, rows });
+        }
+      });
   }
 
   /**
