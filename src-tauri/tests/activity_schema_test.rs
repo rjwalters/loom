@@ -728,3 +728,413 @@ fn test_prompt_github_indexes() {
 
     assert_eq!(index_count, 5, "Should have 5 indexes on prompt_github table");
 }
+
+#[test]
+fn test_v4_to_v5_migration() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create v4 schema (with velocity_snapshots from v4)
+    conn.execute(
+        "CREATE TABLE agent_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            role TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            work_found INTEGER NOT NULL,
+            work_completed INTEGER,
+            issue_number INTEGER,
+            duration_ms INTEGER,
+            outcome TEXT NOT NULL,
+            notes TEXT
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)", [])
+        .unwrap();
+    conn.execute("INSERT INTO schema_version (version) VALUES (4)", [])
+        .unwrap();
+
+    conn.execute(
+        "CREATE TABLE prompt_github (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            activity_id INTEGER NOT NULL,
+            issue_number INTEGER,
+            pr_number INTEGER,
+            label_before TEXT,
+            label_after TEXT,
+            event_type TEXT NOT NULL,
+            event_time TEXT NOT NULL,
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TABLE velocity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_date DATE NOT NULL UNIQUE,
+            issues_closed INTEGER NOT NULL DEFAULT 0,
+            prs_merged INTEGER NOT NULL DEFAULT 0,
+            avg_cycle_time_hours REAL,
+            total_prompts INTEGER NOT NULL DEFAULT 0,
+            total_cost_usd REAL NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert some v4 data
+    conn.execute(
+        "INSERT INTO agent_activity (timestamp, role, trigger, work_found, work_completed, outcome)
+         VALUES ('2026-01-23T08:00:00Z', 'builder', 'Build issue #42', 1, 1, 'success')",
+        [],
+    )
+    .unwrap();
+
+    // Simulate v5 migration - create prompt_patterns and pattern_matches tables
+    conn.execute(
+        "CREATE TABLE prompt_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_text TEXT NOT NULL,
+            category TEXT,
+            times_used INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            failure_count INTEGER DEFAULT 0,
+            success_rate REAL DEFAULT 0.0,
+            avg_cost_usd REAL DEFAULT 0.0,
+            avg_duration_seconds INTEGER DEFAULT 0,
+            avg_tokens INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            last_used_at TEXT,
+            UNIQUE(pattern_text)
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TABLE pattern_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_id INTEGER NOT NULL,
+            activity_id INTEGER NOT NULL,
+            similarity_score REAL DEFAULT 1.0,
+            matched_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (pattern_id) REFERENCES prompt_patterns(id),
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Update schema version
+    conn.execute("UPDATE schema_version SET version = 5", [])
+        .unwrap();
+
+    // Verify prompt_patterns table exists
+    let patterns_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='prompt_patterns'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )
+        .unwrap();
+    assert!(patterns_exists, "prompt_patterns table should exist");
+
+    // Verify pattern_matches table exists
+    let matches_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='pattern_matches'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )
+        .unwrap();
+    assert!(matches_exists, "pattern_matches table should exist");
+
+    // Verify velocity_snapshots still exists (from v4)
+    let velocity_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='velocity_snapshots'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )
+        .unwrap();
+    assert!(velocity_exists, "velocity_snapshots table should still exist");
+
+    // Verify schema version is 5
+    let version: i32 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 5, "Schema version should be 5");
+}
+
+#[test]
+fn test_prompt_patterns_crud() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Create tables
+    conn.execute(
+        "CREATE TABLE prompt_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_text TEXT NOT NULL,
+            category TEXT,
+            times_used INTEGER DEFAULT 0,
+            success_count INTEGER DEFAULT 0,
+            failure_count INTEGER DEFAULT 0,
+            success_rate REAL DEFAULT 0.0,
+            avg_cost_usd REAL DEFAULT 0.0,
+            avg_duration_seconds INTEGER DEFAULT 0,
+            avg_tokens INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            last_used_at TEXT,
+            UNIQUE(pattern_text)
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert a pattern
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category, times_used, success_count, success_rate)
+         VALUES ('build issue #n', 'build', 5, 4, 0.8)",
+        [],
+    )
+    .unwrap();
+
+    let pattern_id = conn.last_insert_rowid();
+
+    // Verify pattern was inserted
+    let (text, category, times_used, success_rate): (String, String, i32, f64) = conn
+        .query_row(
+            "SELECT pattern_text, category, times_used, success_rate FROM prompt_patterns WHERE id = ?1",
+            [pattern_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+
+    assert_eq!(text, "build issue #n");
+    assert_eq!(category, "build");
+    assert_eq!(times_used, 5);
+    assert!((success_rate - 0.8).abs() < 0.01);
+
+    // Update pattern
+    conn.execute(
+        "UPDATE prompt_patterns SET times_used = times_used + 1, success_count = success_count + 1,
+         success_rate = CAST(success_count + 1 AS REAL) / (times_used + 1)
+         WHERE id = ?1",
+        [pattern_id],
+    )
+    .unwrap();
+
+    // Verify update
+    let (new_times, new_rate): (i32, f64) = conn
+        .query_row(
+            "SELECT times_used, success_rate FROM prompt_patterns WHERE id = ?1",
+            [pattern_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+
+    assert_eq!(new_times, 6);
+    assert!((new_rate - 0.833).abs() < 0.01);
+}
+
+#[test]
+fn test_pattern_matches_linking() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    // Enable foreign keys
+    conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+
+    // Create tables
+    conn.execute(
+        "CREATE TABLE agent_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            role TEXT NOT NULL,
+            trigger TEXT NOT NULL,
+            work_found INTEGER NOT NULL,
+            outcome TEXT NOT NULL
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TABLE prompt_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_text TEXT NOT NULL UNIQUE,
+            category TEXT,
+            times_used INTEGER DEFAULT 0
+        )",
+        [],
+    )
+    .unwrap();
+
+    conn.execute(
+        "CREATE TABLE pattern_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_id INTEGER NOT NULL,
+            activity_id INTEGER NOT NULL,
+            similarity_score REAL DEFAULT 1.0,
+            matched_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (pattern_id) REFERENCES prompt_patterns(id),
+            FOREIGN KEY (activity_id) REFERENCES agent_activity(id)
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert activity
+    conn.execute(
+        "INSERT INTO agent_activity (timestamp, role, trigger, work_found, outcome)
+         VALUES (datetime('now'), 'builder', 'Build issue #42', 1, 'success')",
+        [],
+    )
+    .unwrap();
+    let activity_id = conn.last_insert_rowid();
+
+    // Insert pattern
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category, times_used)
+         VALUES ('build issue #n', 'build', 1)",
+        [],
+    )
+    .unwrap();
+    let pattern_id = conn.last_insert_rowid();
+
+    // Link them via pattern_matches
+    conn.execute(
+        "INSERT INTO pattern_matches (pattern_id, activity_id, similarity_score)
+         VALUES (?1, ?2, 1.0)",
+        [pattern_id, activity_id],
+    )
+    .unwrap();
+
+    // Verify we can query activities for a pattern
+    let matched_activities: Vec<i64> = conn
+        .prepare("SELECT activity_id FROM pattern_matches WHERE pattern_id = ?1")
+        .unwrap()
+        .query_map([pattern_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(matched_activities.len(), 1);
+    assert_eq!(matched_activities[0], activity_id);
+
+    // Verify we can query patterns for an activity
+    let matched_patterns: Vec<i64> = conn
+        .prepare("SELECT pattern_id FROM pattern_matches WHERE activity_id = ?1")
+        .unwrap()
+        .query_map([activity_id], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(matched_patterns.len(), 1);
+    assert_eq!(matched_patterns[0], pattern_id);
+}
+
+#[test]
+fn test_pattern_uniqueness() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    conn.execute(
+        "CREATE TABLE prompt_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_text TEXT NOT NULL UNIQUE,
+            category TEXT
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert first pattern
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category) VALUES ('build issue #n', 'build')",
+        [],
+    )
+    .unwrap();
+
+    // Try to insert duplicate - should fail
+    let result = conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category) VALUES ('build issue #n', 'build')",
+        [],
+    );
+    assert!(result.is_err(), "Duplicate pattern_text should fail");
+
+    // Insert different pattern - should succeed
+    let result = conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category) VALUES ('fix bug #n', 'fix')",
+        [],
+    );
+    assert!(result.is_ok(), "Different pattern should succeed");
+}
+
+#[test]
+fn test_pattern_category_query() {
+    let (_temp, workspace_path) = create_temp_workspace();
+    let conn = open_test_db(&workspace_path).unwrap();
+
+    conn.execute(
+        "CREATE TABLE prompt_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern_text TEXT NOT NULL UNIQUE,
+            category TEXT,
+            success_rate REAL DEFAULT 0.0
+        )",
+        [],
+    )
+    .unwrap();
+
+    // Insert patterns in different categories
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category, success_rate) VALUES ('build feature #n', 'build', 0.9)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category, success_rate) VALUES ('implement #n', 'build', 0.8)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category, success_rate) VALUES ('fix bug #n', 'fix', 0.7)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO prompt_patterns (pattern_text, category, success_rate) VALUES ('review pr #n', 'review', 0.95)",
+        [],
+    ).unwrap();
+
+    // Query by category
+    let build_patterns: Vec<String> = conn
+        .prepare("SELECT pattern_text FROM prompt_patterns WHERE category = 'build' ORDER BY success_rate DESC")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(build_patterns.len(), 2);
+    assert_eq!(build_patterns[0], "build feature #n"); // Higher success rate first
+
+    // Count by category
+    let category_counts: Vec<(String, i32)> = conn
+        .prepare("SELECT category, COUNT(*) FROM prompt_patterns GROUP BY category ORDER BY COUNT(*) DESC")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    assert_eq!(category_counts.len(), 3);
+    assert_eq!(category_counts[0].0, "build");
+    assert_eq!(category_counts[0].1, 2);
+}

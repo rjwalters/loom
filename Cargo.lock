@@ -121,6 +121,7 @@ dependencies = [
  "dirs",
  "dotenvy",
  "notify",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
