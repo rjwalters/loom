@@ -109,6 +109,74 @@ Launch the Loom desktop application for automated orchestration with visual term
 - Autonomous mode with configurable intervals
 - Persistent workspace configuration
 
+### 3. Daemon Mode (Background Process)
+
+Run the Loom daemon as a background process for fully autonomous system orchestration.
+
+**Setup**:
+```bash
+# Start the daemon (spawns background process, returns immediately)
+/loom start
+
+# Check daemon progress (read-only observer mode)
+/loom status
+
+# Stop the daemon gracefully
+/loom stop
+```
+
+**Key Principle: Autonomous Operation**
+
+The daemon makes ALL spawning decisions. The human observer session should NOT:
+- Manually spawn shepherds or agents
+- Manually trigger Architect/Hermit
+- Override daemon scaling decisions
+- "Help" by manually running agents
+
+The human observer SHOULD:
+- Monitor progress with `/loom status`
+- Approve proposals: `gh issue edit 123 --remove-label "loom:architect" --add-label "loom:issue"`
+- Handle edge cases and blocked issues
+- Stop the daemon when needed
+
+**When to use Daemon Mode**:
+- Fully autonomous development
+- System should generate its own work
+- Multiple issues need parallel processing
+- Production-scale orchestration
+
+**Example workflow**:
+```bash
+# Session 1: Start daemon and become observer
+/loom start
+# Daemon spawns in background, session becomes observer
+
+# Check progress periodically
+/loom status
+
+# Approve architect proposals
+gh issue edit 1050 --remove-label "loom:architect" --add-label "loom:issue"
+
+# Handle blocked issues
+gh issue view 1045 --comments
+gh issue edit 1045 --remove-label "loom:blocked"
+
+# When done
+/loom stop
+```
+
+**Why Background Process?**
+
+Running the daemon interactively has problems:
+1. **Blurs responsibilities**: Operator tempted to "help" with manual decisions
+2. **Context limits**: Long-running sessions accumulate context
+3. **No clear separation**: Hard to distinguish daemon actions from human actions
+
+The background model solves these:
+1. **Clear separation**: Daemon executes, human observes
+2. **Fresh context**: Each subagent starts fresh
+3. **True autonomy**: Daemon scales without human intervention
+
 ## Agent Roles
 
 Loom provides specialized roles for different development tasks. Each role follows specific guidelines and uses GitHub labels for coordination.
