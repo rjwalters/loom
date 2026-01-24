@@ -322,7 +322,9 @@ fn handle_request(
 
                                     // Record the commit correlation if we have the terminal's workspace
                                     if let Some(ref info) = terminal_info {
-                                        let workspace_path = info.worktree_path.as_ref()
+                                        let workspace_path = info
+                                            .worktree_path
+                                            .as_ref()
                                             .or(info.working_dir.as_ref());
 
                                         if let Some(ws) = workspace_path {
@@ -335,10 +337,16 @@ fn handle_request(
                                                 id: None,
                                                 input_id: 0, // Will be correlated by timestamp
                                                 before_commit: None,
-                                                after_commit: Some(commit_event.commit_hash.clone()),
-                                                files_changed: commit_event.files_changed.unwrap_or(0),
+                                                after_commit: Some(
+                                                    commit_event.commit_hash.clone(),
+                                                ),
+                                                files_changed: commit_event
+                                                    .files_changed
+                                                    .unwrap_or(0),
                                                 lines_added: commit_event.lines_added.unwrap_or(0),
-                                                lines_removed: commit_event.lines_removed.unwrap_or(0),
+                                                lines_removed: commit_event
+                                                    .lines_removed
+                                                    .unwrap_or(0),
                                                 tests_added: 0, // Not available from commit output
                                                 tests_modified: 0,
                                             };

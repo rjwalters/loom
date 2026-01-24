@@ -9,10 +9,10 @@ use rusqlite::{params, Connection};
 use std::path::PathBuf;
 
 use super::models::{
-    ActivityEntry, AgentInput, AgentMetric, AgentOutput, BudgetConfig, BudgetPeriod,
-    BudgetStatus, CostByIssue, CostByPr, CostByRole, CostSummary, InputContext, InputType,
-    PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent, PromptSuccessStats,
-    QualityMetrics, RunwayProjection, TokenUsage,
+    ActivityEntry, AgentInput, AgentMetric, AgentOutput, BudgetConfig, BudgetPeriod, BudgetStatus,
+    CostByIssue, CostByPr, CostByRole, CostSummary, InputContext, InputType, PrReworkStats,
+    ProductivitySummary, PromptChanges, PromptGitHubEvent, PromptSuccessStats, QualityMetrics,
+    RunwayProjection, TokenUsage,
 };
 use super::schema::init_schema;
 use super::test_parser;
@@ -1126,12 +1126,7 @@ impl ActivityDb {
             |row| {
                 let total_cost: f64 = row.get(0)?;
                 let request_count: i64 = row.get(1)?;
-                Ok((
-                    total_cost,
-                    request_count,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
+                Ok((total_cost, request_count, row.get::<_, i64>(2)?, row.get::<_, i64>(3)?))
             },
         )?;
 
@@ -1335,7 +1330,11 @@ impl ActivityDb {
     /// Uses the last N days of spending to calculate average daily cost and
     /// estimate when the budget will be exhausted.
     #[allow(dead_code)]
-    pub fn project_runway(&self, period: BudgetPeriod, lookback_days: i32) -> Result<Option<RunwayProjection>> {
+    pub fn project_runway(
+        &self,
+        period: BudgetPeriod,
+        lookback_days: i32,
+    ) -> Result<Option<RunwayProjection>> {
         let config = match self.get_budget_config(period)? {
             Some(c) => c,
             None => return Ok(None),

@@ -177,10 +177,7 @@ mod tests {
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].commit_hash, "def5678");
-        assert_eq!(
-            events[0].commit_message,
-            Some("Implement user authentication".to_string())
-        );
+        assert_eq!(events[0].commit_message, Some("Implement user authentication".to_string()));
         assert_eq!(events[0].branch, Some("feature/issue-42".to_string()));
     }
 
@@ -190,10 +187,7 @@ mod tests {
 
         let events = parse_git_commits(output);
         assert_eq!(events.len(), 1);
-        assert_eq!(
-            events[0].commit_hash,
-            "1234567890abcdef1234567890abcdef12345678"
-        );
+        assert_eq!(events[0].commit_hash, "1234567890abcdef1234567890abcdef12345678");
     }
 
     #[test]
@@ -244,10 +238,7 @@ Date:   Thu Jan 23 10:00:00 2025 -0800
         ];
 
         for output in &outputs {
-            assert!(
-                contains_git_commit(output),
-                "Should detect commit in: {output}"
-            );
+            assert!(contains_git_commit(output), "Should detect commit in: {output}");
         }
     }
 
@@ -261,10 +252,7 @@ Date:   Thu Jan 23 10:00:00 2025 -0800
         ];
 
         for output in &outputs {
-            assert!(
-                !contains_git_commit(output),
-                "Should not detect commit in: {output}"
-            );
+            assert!(!contains_git_commit(output), "Should not detect commit in: {output}");
         }
     }
 
