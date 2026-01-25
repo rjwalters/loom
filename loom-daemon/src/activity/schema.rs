@@ -264,6 +264,26 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
             CREATE INDEX IF NOT EXISTS idx_budget_config_period ON budget_config(period);
             CREATE INDEX IF NOT EXISTS idx_budget_config_active ON budget_config(is_active);
+
+            -- Issue claim registry for reliable work distribution (Issue #1159)
+            -- Tracks which agent/terminal has claimed which issue/PR
+            -- Prevents race conditions and enables crash recovery
+            CREATE TABLE IF NOT EXISTS issue_claims (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number INTEGER NOT NULL,
+                claim_type TEXT NOT NULL CHECK(claim_type IN ('issue', 'pr')),
+                terminal_id TEXT NOT NULL,
+                claimed_at DATETIME NOT NULL,
+                last_heartbeat DATETIME NOT NULL,
+                label TEXT,
+                agent_role TEXT,
+                -- Unique constraint: only one claim per issue/PR type combo
+                UNIQUE(number, claim_type)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_issue_claims_terminal ON issue_claims(terminal_id);
+            CREATE INDEX IF NOT EXISTS idx_issue_claims_heartbeat ON issue_claims(last_heartbeat);
+            CREATE INDEX IF NOT EXISTS idx_issue_claims_type ON issue_claims(claim_type);
             ",
     )?;
 

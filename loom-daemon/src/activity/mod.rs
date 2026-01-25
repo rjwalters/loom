@@ -86,3 +86,7 @@ pub use tuning::{
     create_tuning_schema, EffectivenessSnapshot, ProposalStatus, TunableParameter, TuningConfig,
     TuningHistory, TuningProposal, TuningSummary,
 };
+
+// Issue claim registry types (Issue #1159)
+// Used for reliable work distribution and crash recovery
+pub use models::{ClaimResult, ClaimsSummary, ClaimType, IssueClaim};

@@ -518,6 +518,188 @@ fn handle_request(
             Response::CurrentCommit { commit }
         }
 
+        // ====================================================================
+        // Issue Claim Registry Handlers (Issue #1159)
+        // ====================================================================
+        Request::ClaimIssue {
+            number,
+            claim_type,
+            terminal_id,
+            label,
+            agent_role,
+            stale_threshold_secs,
+        } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.claim_issue(
+                    number,
+                    claim_type,
+                    &terminal_id,
+                    label.as_deref(),
+                    agent_role.as_deref(),
+                    stale_threshold_secs,
+                ) {
+                    Ok(result) => Response::ClaimResult(result),
+                    Err(e) => Response::Error {
+                        message: format!("Failed to claim issue: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::ReleaseClaim {
+            number,
+            claim_type,
+            terminal_id,
+        } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.release_claim(number, claim_type, terminal_id.as_deref()) {
+                    Ok(released) => {
+                        if released {
+                            Response::Success
+                        } else {
+                            Response::Error {
+                                message: "Claim not found or not owned".to_string(),
+                            }
+                        }
+                    }
+                    Err(e) => Response::Error {
+                        message: format!("Failed to release claim: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::HeartbeatClaim {
+            number,
+            claim_type,
+            terminal_id,
+        } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.heartbeat_claim(number, claim_type, &terminal_id) {
+                    Ok(updated) => {
+                        if updated {
+                            Response::Success
+                        } else {
+                            Response::Error {
+                                message: "Claim not found or not owned".to_string(),
+                            }
+                        }
+                    }
+                    Err(e) => Response::Error {
+                        message: format!("Failed to update heartbeat: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::GetClaim { number, claim_type } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.get_claim(number, claim_type) {
+                    Ok(claim) => Response::Claim(claim),
+                    Err(e) => Response::Error {
+                        message: format!("Failed to get claim: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::GetTerminalClaims { terminal_id } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.get_claims_by_terminal(&terminal_id) {
+                    Ok(claims) => Response::Claims(claims),
+                    Err(e) => Response::Error {
+                        message: format!("Failed to get terminal claims: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::GetAllClaims => {
+            if let Ok(db) = activity_db.lock() {
+                match db.get_all_claims() {
+                    Ok(claims) => Response::Claims(claims),
+                    Err(e) => Response::Error {
+                        message: format!("Failed to get all claims: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::GetClaimsSummary {
+            stale_threshold_secs,
+        } => {
+            if let Ok(db) = activity_db.lock() {
+                let threshold = stale_threshold_secs.unwrap_or(3600);
+                match db.get_claims_summary(threshold) {
+                    Ok(summary) => Response::ClaimsSummary(summary),
+                    Err(e) => Response::Error {
+                        message: format!("Failed to get claims summary: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::ReleaseStaleCliams {
+            stale_threshold_secs,
+        } => {
+            if let Ok(db) = activity_db.lock() {
+                let threshold = stale_threshold_secs.unwrap_or(3600);
+                match db.release_stale_claims(threshold) {
+                    Ok(count) => Response::ClaimsReleased { count },
+                    Err(e) => Response::Error {
+                        message: format!("Failed to release stale claims: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
+        Request::ReleaseTerminalClaims { terminal_id } => {
+            if let Ok(db) = activity_db.lock() {
+                match db.release_terminal_claims(&terminal_id) {
+                    Ok(count) => Response::ClaimsReleased { count },
+                    Err(e) => Response::Error {
+                        message: format!("Failed to release terminal claims: {e}"),
+                    },
+                }
+            } else {
+                Response::Error {
+                    message: "Database lock failed".to_string(),
+                }
+            }
+        }
+
         Request::Shutdown => {
             log::info!("Shutdown requested");
             std::process::exit(0);

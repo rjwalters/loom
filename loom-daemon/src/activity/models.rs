@@ -455,3 +455,87 @@ pub struct RunwayProjection {
     /// Number of days used for the calculation
     pub lookback_days: i32,
 }
+
+// ============================================================================
+// Issue Claim Registry Models (Issue #1159)
+// ============================================================================
+
+/// Type of claim (issue or PR)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaimType {
+    Issue,
+    Pr,
+}
+
+impl ClaimType {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Issue => "issue",
+            Self::Pr => "pr",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "issue" => Some(Self::Issue),
+            "pr" => Some(Self::Pr),
+            _ => None,
+        }
+    }
+}
+
+/// An active claim on an issue or PR by a terminal/agent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueClaim {
+    pub id: Option<i64>,
+    /// The issue or PR number being claimed
+    pub number: i32,
+    /// Type of claim (issue or PR)
+    pub claim_type: ClaimType,
+    /// Terminal ID that holds the claim
+    pub terminal_id: String,
+    /// When the claim was created
+    pub claimed_at: DateTime<Utc>,
+    /// Last heartbeat/activity timestamp for TTL tracking
+    pub last_heartbeat: DateTime<Utc>,
+    /// The GitHub label associated with this claim (e.g., "loom:building")
+    pub label: Option<String>,
+    /// Optional agent role for tracking
+    pub agent_role: Option<String>,
+}
+
+/// Result of attempting to claim an issue
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimResult {
+    /// Successfully claimed
+    Success {
+        claim_id: i64,
+    },
+    /// Already claimed by another terminal
+    AlreadyClaimed {
+        terminal_id: String,
+        claimed_at: DateTime<Utc>,
+    },
+    /// Claim was stale and has been reclaimed
+    Reclaimed {
+        claim_id: i64,
+        previous_terminal: String,
+    },
+}
+
+/// Summary of all active claims for visibility
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaimsSummary {
+    /// Total active claims
+    pub total_claims: i64,
+    /// Claims by type (issue, pr)
+    pub by_type: std::collections::HashMap<String, i64>,
+    /// Claims by terminal
+    pub by_terminal: std::collections::HashMap<String, Vec<i32>>,
+    /// Stale claims (older than TTL threshold)
+    pub stale_claims: Vec<IssueClaim>,
+}

@@ -128,6 +128,27 @@ async fn main() -> Result<()> {
     let activity_db = ActivityDb::new(db_path.clone())?;
     log::info!("Activity database initialized");
 
+    // Crash recovery: Release stale claims on startup (Issue #1159)
+    // Claims older than 1 hour without heartbeat are considered stale
+    let stale_threshold_secs = std::env::var("LOOM_CLAIM_TTL_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3600); // Default: 1 hour
+
+    match activity_db.release_stale_claims(stale_threshold_secs) {
+        Ok(count) if count > 0 => {
+            log::warn!(
+                "Crash recovery: Released {count} stale claims (older than {stale_threshold_secs}s)"
+            );
+        }
+        Ok(_) => {
+            log::debug!("No stale claims to release on startup");
+        }
+        Err(e) => {
+            log::warn!("Failed to release stale claims on startup: {e}");
+        }
+    }
+
     let activity_db = Arc::new(Mutex::new(activity_db));
 
     // Initialize terminal manager
