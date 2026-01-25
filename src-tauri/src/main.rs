@@ -317,6 +317,8 @@ fn main() {
             get_budget_config,
             save_budget_config,
             get_costs_by_issue,
+            // Activity playback commands
+            get_activity_timeline,
         ])
         .run(tauri::generate_context!())
     {

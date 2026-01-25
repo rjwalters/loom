@@ -511,6 +511,25 @@ if (!eventListenersRegistered) {
     showComparativeAnalysisModal();
   });
 
+  listen("show-activity-playback", async () => {
+    const { showActivityPlaybackModal } = await import("./lib/activity-playback-modal");
+    showActivityPlaybackModal();
+  });
+
+  // Event listener for opening activity playback for a specific issue
+  listen("show-activity-playback-issue", async (event) => {
+    const issueNumber = event.payload as number;
+    const { showActivityPlaybackForIssue } = await import("./lib/activity-playback-modal");
+    showActivityPlaybackForIssue(issueNumber);
+  });
+
+  // Event listener for opening activity playback for a specific PR
+  listen("show-activity-playback-pr", async (event) => {
+    const prNumber = event.payload as number;
+    const { showActivityPlaybackForPR } = await import("./lib/activity-playback-modal");
+    showActivityPlaybackForPR(prNumber);
+  });
+
   logger?.info("Event listeners registered successfully");
 } else {
   logger?.info("Event listeners already registered, skipping duplicate registration");
