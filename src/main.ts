@@ -487,6 +487,11 @@ if (!eventListenersRegistered) {
     showAgentMetricsModal();
   });
 
+  listen("show-prompt-library", async () => {
+    const { showPromptLibraryModal } = await import("./lib/prompt-library-modal");
+    showPromptLibraryModal();
+  });
+
   listen("show-daemon-status", async () => {
     showDaemonStatusDialog();
   });

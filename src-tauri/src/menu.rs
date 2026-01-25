@@ -74,6 +74,10 @@ pub fn build_menu<R: tauri::Runtime>(
         .id("show_agent_metrics")
         .accelerator("CmdOrCtrl+M")
         .build(handle)?;
+    let show_prompt_library = MenuItemBuilder::new("Prompt Library")
+        .id("show_prompt_library")
+        .accelerator("CmdOrCtrl+L")
+        .build(handle)?;
     let show_metrics = MenuItemBuilder::new("Telemetry")
         .id("show_metrics")
         .accelerator("CmdOrCtrl+Shift+M")
@@ -87,6 +91,7 @@ pub fn build_menu<R: tauri::Runtime>(
         .item(&reset_zoom)
         .separator()
         .item(&show_agent_metrics)
+        .item(&show_prompt_library)
         .item(&show_metrics)
         .separator()
         .fullscreen()
@@ -200,6 +205,11 @@ pub fn handle_menu_event<R: tauri::Runtime>(
         "show_metrics" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("show-metrics", ());
+            }
+        }
+        "show_prompt_library" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-prompt-library", ());
             }
         }
         "documentation" => {
