@@ -37,6 +37,48 @@ print_warning() {
     echo -e "${YELLOW}⚠ $1${NC}"
 }
 
+# Function to pull latest changes from origin/main
+# Stashes local changes, pulls with fast-forward only, then restores stash
+pull_latest_main() {
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_info "Pulling latest changes from origin/main..."
+    fi
+
+    # Stash any local changes first
+    STASH_OUTPUT=$(git stash push -m "worktree-creation-auto-stash" 2>&1)
+    STASHED=false
+    if [[ "$STASH_OUTPUT" != *"No local changes"* ]] && [[ "$STASH_OUTPUT" != *"nothing to save"* ]]; then
+        STASHED=true
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Stashed local changes"
+        fi
+    fi
+
+    # Pull latest with fast-forward only (prevents accidental merge commits on main)
+    if git pull --ff-only origin main 2>/dev/null; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_success "Updated main to latest"
+        fi
+    else
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_warning "Could not fast-forward main (may need manual intervention)"
+        fi
+    fi
+
+    # Pop stash if we stashed
+    if [[ "$STASHED" == "true" ]]; then
+        if git stash pop 2>/dev/null; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_info "Restored stashed changes"
+            fi
+        else
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Could not restore stash (check 'git stash list')"
+            fi
+        fi
+    fi
+}
+
 # Function to check if we're in a worktree
 check_if_in_worktree() {
     local git_dir=$(git rev-parse --git-common-dir 2>/dev/null)
@@ -102,11 +144,13 @@ Examples:
 Safety Features:
   ✓ Detects if already in a worktree
   ✓ Uses sandbox-safe path (.loom/worktrees/)
+  ✓ Pulls latest origin/main before creating worktree
   ✓ Automatically creates branch from main
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
   ✓ Runs project-specific hooks after creation
+  ✓ Stashes/restores local changes during pull
 
 Project-Specific Hooks:
   Create .loom/hooks/post-worktree.sh to run custom setup after worktree creation.
@@ -251,6 +295,32 @@ if check_if_in_worktree; then
         echo ""
     fi
 fi
+
+# Ensure we're on main branch and pull latest changes
+# This happens whether we came from a worktree (already switched above) or started in main workspace
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_info "Switching from $CURRENT_BRANCH to main branch..."
+    fi
+    if git checkout main 2>/dev/null; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_success "Switched to main branch"
+        fi
+    else
+        if [[ "$JSON_OUTPUT" == "true" ]]; then
+            echo '{"error": "Failed to switch to main branch"}'
+        else
+            print_error "Failed to switch to main branch"
+            print_info "Please manually run: git checkout main"
+        fi
+        exit 1
+    fi
+fi
+
+# Pull latest changes from origin/main before creating the worktree
+# This ensures new worktrees are based on the most up-to-date code
+pull_latest_main
 
 # Determine branch name
 if [[ -n "$CUSTOM_BRANCH" ]]; then
