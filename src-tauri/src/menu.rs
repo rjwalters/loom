@@ -86,6 +86,10 @@ pub fn build_menu<R: tauri::Runtime>(
         .id("show_prompt_library")
         .accelerator("CmdOrCtrl+L")
         .build(handle)?;
+    let show_comparative_analysis = MenuItemBuilder::new("Comparative Analysis")
+        .id("show_comparative_analysis")
+        .accelerator("CmdOrCtrl+Shift+A")
+        .build(handle)?;
     let show_metrics = MenuItemBuilder::new("Telemetry")
         .id("show_metrics")
         .accelerator("CmdOrCtrl+Shift+M")
@@ -102,6 +106,7 @@ pub fn build_menu<R: tauri::Runtime>(
         .item(&show_budget_management)
         .item(&show_agent_metrics)
         .item(&show_prompt_library)
+        .item(&show_comparative_analysis)
         .item(&show_metrics)
         .separator()
         .fullscreen()
@@ -230,6 +235,11 @@ pub fn handle_menu_event<R: tauri::Runtime>(
         "show_prompt_library" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("show-prompt-library", ());
+            }
+        }
+        "show_comparative_analysis" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-comparative-analysis", ());
             }
         }
         "documentation" => {

@@ -506,6 +506,11 @@ if (!eventListenersRegistered) {
     showBudgetManagementModal();
   });
 
+  listen("show-comparative-analysis", async () => {
+    const { showComparativeAnalysisModal } = await import("./lib/comparative-analysis-modal");
+    showComparativeAnalysisModal();
+  });
+
   logger?.info("Event listeners registered successfully");
 } else {
   logger?.info("Event listeners already registered, skipping duplicate registration");
