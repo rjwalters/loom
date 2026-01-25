@@ -111,8 +111,26 @@ export async function launchAgentInTerminal(
   // Note: We send the role as the first message instead of writing CLAUDE.md
   // This prevents conflicts with the main workspace CLAUDE.md (project instructions)
   // Using --dangerously-skip-permissions to bypass the interactive warning prompt
-  const command = "claude --dangerously-skip-permissions";
-  logger.info("Sending Claude command to terminal", { terminalId, command });
+  //
+  // The resilient wrapper (claude-wrapper.sh) provides:
+  // - Pre-flight checks (CLI availability, API reachability)
+  // - Automatic retry with exponential backoff for transient errors
+  // - Graceful shutdown via stop signal files
+  // - Detailed logging for debugging
+  //
+  // The wrapper is used automatically when launching Claude in a terminal.
+  // The wrapper passes all arguments through to the underlying claude CLI.
+  // Environment variables can be set on the wrapper command line to configure behavior:
+  // - LOOM_TERMINAL_ID: Terminal ID for stop signal detection
+  // - LOOM_WORKSPACE: Workspace path for stop signal detection
+  // - LOOM_MAX_RETRIES: Maximum retry attempts (default: 5)
+  // - LOOM_INITIAL_WAIT: Initial backoff wait in seconds (default: 60)
+  // - LOOM_MAX_WAIT: Maximum backoff wait in seconds (default: 1800)
+  const command = `LOOM_TERMINAL_ID=${terminalId} LOOM_WORKSPACE=${workspacePath} ./.loom/scripts/claude-wrapper.sh --dangerously-skip-permissions`;
+  logger.info("Sending Claude command to terminal", {
+    terminalId,
+    command,
+  });
 
   // Wait for any previous commands to fully complete
   // This prevents command concatenation with worktree setup commands
