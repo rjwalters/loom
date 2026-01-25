@@ -889,16 +889,16 @@ The setup script configures these repository settings:
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| `allow_merge_commit` | true | Default merge strategy - preserves clear history of PRs |
-| `allow_squash_merge` | false | Disabled - preserves individual commits from agents |
-| `allow_rebase_merge` | false | Disabled - keeps merge commits visible |
+| `allow_merge_commit` | false | Disabled - use squash merge instead |
+| `allow_squash_merge` | true | Default merge strategy - flattens PR to single commit |
+| `allow_rebase_merge` | false | Disabled - use squash merge instead |
 | `delete_branch_on_merge` | true | Auto-cleanup feature branches after merge |
 | `allow_auto_merge` | true | Enables Champion role to auto-merge approved PRs |
 | `allow_update_branch` | true | Suggests keeping branches up-to-date with base |
 
 #### Why These Settings?
 
-- **Merge commits only**: Maintains clear history showing which PRs introduced changes; important for understanding agent work
+- **Squash merge only**: Flattens each PR into a single commit for clean history; each issue becomes one atomic commit on main
 - **Delete branches after merge**: Prevents accumulation of stale branches from issue worktrees
 - **Auto-merge enabled**: Required for Champion role to automatically merge approved PRs
 - **Suggest updating branches**: Helps agents keep branches current with main
