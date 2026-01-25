@@ -522,25 +522,88 @@ The Loom daemon uses these configuration parameters:
 
 **Daemon State File** (`.loom/daemon-state.json`):
 
+The daemon state file provides comprehensive information for debugging, crash recovery, and system observability.
+
 ```json
 {
   "started_at": "2026-01-23T10:00:00Z",
   "last_poll": "2026-01-23T11:30:00Z",
   "running": true,
+  "iteration": 42,
+
   "shepherds": {
     "shepherd-1": {
+      "status": "working",
       "issue": 123,
-      "started": "2026-01-23T10:15:00Z"
+      "task_id": "abc123",
+      "output_file": "/tmp/claude/.../abc123.output",
+      "started": "2026-01-23T10:15:00Z",
+      "last_phase": "builder",
+      "pr_number": null
     },
     "shepherd-2": {
+      "status": "idle",
       "issue": null,
-      "idle_since": "2026-01-23T11:00:00Z"
+      "idle_since": "2026-01-23T11:00:00Z",
+      "idle_reason": "no_ready_issues",
+      "last_issue": 100,
+      "last_completed": "2026-01-23T10:58:00Z"
     }
   },
+
+  "pipeline_state": {
+    "ready": ["#1083", "#1080"],
+    "building": ["#1044"],
+    "review_requested": ["PR #1056"],
+    "changes_requested": ["PR #1059"],
+    "ready_to_merge": ["PR #1058"],
+    "blocked": [
+      {
+        "type": "pr",
+        "number": 1059,
+        "reason": "merge_conflicts",
+        "detected_at": "2026-01-23T11:20:00Z"
+      }
+    ],
+    "last_updated": "2026-01-23T11:30:00Z"
+  },
+
+  "warnings": [
+    {
+      "time": "2026-01-23T11:10:00Z",
+      "type": "blocked_pr",
+      "severity": "warning",
+      "message": "PR #1059 has merge conflicts",
+      "context": {"pr_number": 1059, "requires_role": "doctor"},
+      "acknowledged": false
+    }
+  ],
+
+  "completed_issues": [100, 101, 102],
+  "total_prs_merged": 3,
   "last_architect_trigger": "2026-01-23T10:00:00Z",
   "last_hermit_trigger": "2026-01-23T10:30:00Z"
 }
 ```
+
+**Shepherd Status Values**:
+- `working` - Actively processing an issue
+- `idle` - No issue assigned, waiting for work
+- `errored` - Encountered an error, may need intervention
+- `paused` - Manually paused via signal or stuck detection
+
+**Idle Reasons**:
+- `no_ready_issues` - No issues with `loom:issue` label available
+- `at_capacity` - All shepherd slots filled
+- `completed_issue` - Just finished an issue, waiting for next
+- `rate_limited` - Paused due to API rate limits
+- `shutdown_signal` - Paused due to graceful shutdown
+
+**Warning Types**:
+- `blocked_pr` - PR has merge conflicts or failed checks
+- `shepherd_error` - Shepherd encountered recoverable error
+- `role_failure` - Support role failed to complete
+- `stuck_agent` - Agent detected as stuck
 
 **Required Terminal Configuration for Daemon**:
 

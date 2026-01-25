@@ -14,43 +14,88 @@ Loom is a multi-terminal desktop application for macOS that orchestrates AI-powe
 
 ## Three-Layer Architecture
 
-Loom uses a three-layer orchestration architecture:
+Loom uses a three-layer orchestration architecture for scalable automation:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Layer 3: Human Observer                      │
-│  - Approves proposals (loom:architect → loom:issue)             │
+│  - Watches system health and intervenes when needed             │
+│  - Approves architectural proposals (loom:architect → loom:issue)│
 │  - Handles edge cases and blocked issues                        │
+│  - Provides strategic direction                                 │
 └─────────────────────────────────────────────────────────────────┘
+                              │
                               │ observes/intervenes
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Layer 2: Loom Daemon (/loom)                 │
-│  - Spawns shepherds for ready issues                            │
-│  - Triggers Architect/Hermit when backlog is low                │
+│                    Layer 2: Loom Daemon                         │
+│  /loom - Continuous system orchestrator                         │
+│  - Monitors system state (issue counts, PR status)              │
+│  - Generates work (triggers Architect/Hermit when backlog low)  │
+│  - Scales shepherd pool based on demand                         │
 │  - Maintains daemon-state.json for crash recovery               │
 └─────────────────────────────────────────────────────────────────┘
+                              │
                               │ spawns/manages
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Layer 1: Shepherds (/shepherd <issue>)       │
-│  - Orchestrates full issue lifecycle                            │
+│                    Layer 1: Shepherds                           │
+│  /shepherd <issue> - Single-issue lifecycle orchestrator        │
 │  - Coordinates: Curator → Builder → Judge → Doctor → Merge      │
+│  - Handles full lifecycle including code review (Judge phase)   │
+│  - Tracks progress in issue comments                            │
 └─────────────────────────────────────────────────────────────────┘
+                              │
                               │ triggers
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    Layer 0: Worker Roles                        │
-│  /builder, /judge, /curator, /doctor, etc.                      │
+│                    Worker Roles                                 │
+│  Curator, Builder, Judge, Doctor, etc.                          │
+│  - Execute single tasks (curate issue, build feature, review)   │
+│  - Standalone - no knowledge of orchestration                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-| Layer | Role | Purpose |
-|-------|------|---------|
-| Layer 3 | Human | Oversight - approve proposals, handle edge cases |
-| Layer 2 | `/loom` | System orchestration - work generation, scaling |
-| Layer 1 | `/shepherd` | Issue orchestration - full lifecycle |
-| Layer 0 | `/builder` etc. | Task execution - single focused work |
+### Layer Summary
+
+| Layer | Role | Purpose | Mode |
+|-------|------|---------|------|
+| Layer 3 | Human | Oversight - approve proposals, handle edge cases | Observer |
+| Layer 2 | `/loom` | System orchestration - work generation, shepherd scaling | Continuous daemon |
+| Layer 1 | `/shepherd <issue>` | Issue orchestration - lifecycle from creation to merge | Per-issue |
+| Layer 0 | `/builder`, `/judge`, etc. | Task execution - single focused work units | Per-task |
+
+### Layer Responsibilities
+
+**Layer 3 (Human Observer)**:
+- Approve Architect/Hermit proposals (convert `loom:architect` → `loom:issue`)
+- Monitor system health via daemon-state.json
+- Intervene for blocked issues or stuck agents
+- Provide strategic direction on what to build
+
+**Layer 2 (Loom Daemon)**:
+- Automatically maintained by `/loom` - no manual updates needed
+- Triggers Architect/Hermit when issue backlog is low
+- Spawns shepherds for ready issues (`loom:issue`)
+- Tracks state for crash recovery
+
+**Layer 1 (Shepherds)**:
+- Fully autonomous once spawned
+- Handles entire issue lifecycle including Judge review
+- Uses `--force-pr` by default (stops at ready-to-merge), or `--force-merge` for full automation
+
+### When to Use Which Layer
+
+**Use `/shepherd <issue>`** (Layer 1) when:
+- You have a specific issue to implement
+- You want to orchestrate one issue through its full lifecycle
+- Running manual orchestration mode
+
+**Use `/loom`** (Layer 2) when:
+- You want fully autonomous development
+- The system should generate its own work
+- Multiple issues need parallel processing
+- Running production-scale orchestration
 
 ## Usage Modes
 
@@ -109,89 +154,67 @@ Launch the Loom desktop application for automated orchestration with visual term
 - Autonomous mode with configurable intervals
 - Persistent workspace configuration
 
-### 3. Daemon Mode (Fully Autonomous)
+### 3. Daemon Mode (Layer 2)
 
 Run the Loom daemon for fully autonomous system orchestration.
 
 **Setup**:
 ```bash
-# Start the daemon (runs continuously, or as background process)
+# Start the daemon (runs continuously)
 /loom
 
-# Or start as background process
-/loom start
-
-# Check daemon progress (read-only observer mode)
-/loom status
-
-# Stop the daemon gracefully
-/loom stop
-# Or: touch .loom/stop-daemon
+# The daemon will:
+# 1. Monitor system state every 60 seconds
+# 2. Trigger Architect/Hermit when backlog is low
+# 3. Spawn shepherds for ready issues
+# 4. Ensure Guide and Champion keep running
 ```
 
-**Key Principle: FULLY AUTONOMOUS**
+**Example daemon workflow**:
+```
+Daemon Loop:
+  ├── Assess: 2 ready issues, 1 building, 0 proposals
+  ├── Generate: Trigger Architect (backlog < threshold)
+  ├── Scale: Spawn shepherd-1 for issue #123
+  ├── Scale: Spawn shepherd-2 for issue #456
+  ├── Ensure: Guide running, Champion running
+  └── Sleep 60s, repeat
 
-The daemon makes ALL spawning and scaling decisions automatically:
-- Shepherds are spawned automatically when `loom:issue` issues exist
-- Architect/Hermit are triggered automatically when backlog < threshold
-- Guide/Champion are respawned automatically on their intervals
-- No human approval needed for ANY of the above
+Shepherd-1 (issue #123):
+  └── Curator → Builder → Judge → Merge ✓
 
-The human observer should NOT:
-- Manually spawn shepherds or agents
-- Manually trigger Architect/Hermit
-- Override daemon scaling decisions
-- "Help" by manually running agents
+Shepherd-2 (issue #456):
+  └── Curator → Builder → Judge → Doctor → Judge → Merge ✓
+```
 
-**Human intervention is ONLY required for**:
-- Approving proposals: `loom:architect` -> `loom:issue`
-- Approving proposals: `loom:hermit` -> `loom:issue`
-- Handling `loom:blocked` issues
-- Strategic direction changes
-
-**When to use Daemon Mode**:
-- Fully autonomous development
-- System should generate its own work
-- Multiple issues need parallel processing
-- Production-scale orchestration
-
-**Example workflow**:
+**Graceful shutdown**:
 ```bash
-# Start daemon
-/loom start
-# Daemon spawns in background, session becomes observer
+# Signal the daemon to stop
+touch .loom/stop-daemon
 
-# Check progress periodically
-/loom status
-
-# Or check state file directly
-cat .loom/daemon-state.json | jq
-
-# Approve architect proposals (human action)
-gh issue edit 1050 --remove-label "loom:architect" --add-label "loom:issue"
-
-# Handle blocked issues (human action)
-gh issue view 1045 --comments
-gh issue edit 1045 --remove-label "loom:blocked"
-
-# When done
-/loom stop
-# Or: touch .loom/stop-daemon
+# Daemon will:
+# 1. Stop spawning new shepherds
+# 2. Wait for active shepherds to complete (max 5 min)
+# 3. Clean up state and exit
 ```
-
-**Why Autonomous Daemon?**
-
-1. **Clear separation**: Daemon executes, human observes
-2. **Fresh context**: Each subagent starts fresh
-3. **True autonomy**: Daemon scales without human intervention
-4. **No manual decisions**: All spawning is automatic based on thresholds
-
 
 ## Agent Roles
 
 Loom provides specialized roles for different development tasks. Each role follows specific guidelines and uses GitHub labels for coordination.
 
-### Available Roles
+### Orchestration Roles (Layer 1 & 2)
+
+**Loom Daemon** (Autonomous 1min, `loom.md`) - *Layer 2*
+- **Purpose**: System-level orchestration and work generation
+- **Workflow**: Monitors state → triggers Architect/Hermit → scales shepherds → ensures support roles
+- **When to use**: Fully autonomous development with automatic work generation
+
+**Shepherd** (Manual, `shepherd.md`) - *Layer 1*
+- **Purpose**: Single-issue lifecycle orchestration
+- **Workflow**: Coordinates Curator → Builder → Judge → Doctor → Merge for one issue
+- **When to use**: Orchestrating a specific issue through its full development lifecycle
+
+### Worker Roles (Layer 0)
 
 **Builder** (Manual, `builder.md`)
 - **Purpose**: Implement features and fixes
@@ -211,9 +234,8 @@ Loom provides specialized roles for different development tasks. Each role follo
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
-- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated`
+- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated` (human approves → `loom:issue`)
 - **When to use**: Issue backlog maintenance, quality improvement
-- **Note**: Human approves curated issues (`loom:curated` → `loom:issue`)
 
 **Architect** (Autonomous 15min, `architect.md`)
 - **Purpose**: Create architectural proposals
@@ -243,10 +265,16 @@ Loom provides specialized roles for different development tasks. Each role follo
 ### Role Definitions
 
 Full role definitions with detailed guidelines are available in:
-- `.loom/roles/builder.md`
-- `.loom/roles/judge.md`
-- `.loom/roles/curator.md`
-- And more...
+- `.loom/roles/loom.md` - Layer 2 daemon orchestration
+- `.loom/roles/shepherd.md` - Layer 1 issue orchestration
+- `.loom/roles/builder.md` - Feature implementation
+- `.loom/roles/judge.md` - Code review
+- `.loom/roles/curator.md` - Issue enhancement
+- `.loom/roles/doctor.md` - Bug fixes and PR feedback
+- `.loom/roles/champion.md` - Auto-merge approved PRs
+- `.loom/roles/architect.md` - Architectural proposals
+- `.loom/roles/hermit.md` - Code simplification
+- `.loom/roles/guide.md` - Issue triage and prioritization
 
 ## Label-Based Workflow
 
@@ -268,8 +296,8 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 **PR Lifecycle**:
 ```
-(created) → loom:review-requested → loom:pr → (merged)
-           ↑ Builder                ↑ Judge    ↑ Human
+(created) → loom:review-requested → loom:pr → (auto-merged)
+           ↑ Builder                ↑ Judge    ↑ Champion
 ```
 
 **Proposal Lifecycle**:
@@ -290,7 +318,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 - **`loom:treating`**: Doctor is actively fixing this bug or addressing PR feedback
 - **`loom:review-requested`**: PR ready for Judge to review
 - **`loom:changes-requested`**: PR requires changes (Judge requested modifications)
-- **`loom:pr`**: PR approved by Judge, ready for human to merge
+- **`loom:pr`**: PR approved by Judge, ready for Champion to auto-merge
 
 **Proposal Labels**:
 - **`loom:architect`**: Architectural proposal awaiting user approval
@@ -303,7 +331,36 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 ## Git Worktree Workflow
 
-Loom uses git worktrees to isolate agent work. Each issue gets its own worktree.
+Loom uses git worktrees to isolate agent work. Loom supports two types of worktrees depending on the usage mode:
+
+### Worktree Strategy Overview
+
+**Terminal Worktrees** (`.loom/worktrees/terminal-N`):
+- **Purpose**: Agent isolation in Tauri App Mode
+- **When**: Created automatically for each terminal in the Loom desktop application
+- **Why**: Allows multiple autonomous agents to work on different branches simultaneously without conflicts
+- **Scope**: Per terminal/agent (persistent across app restarts)
+- **Used in**: Tauri App Mode only
+
+**Issue Worktrees** (`.loom/worktrees/issue-N`):
+- **Purpose**: Issue-specific work isolation for Builder agents
+- **When**: Created manually by Builder when claiming an issue (both MOM and Tauri App)
+- **Why**: Isolates work on specific issues with dedicated feature branches
+- **Scope**: Per issue (temporary, cleaned up when PR is merged)
+- **Used in**: Both Manual Orchestration Mode and Tauri App Mode
+
+### When to Use Which Worktree Type
+
+**Manual Orchestration Mode (Claude Code CLI)**:
+- No terminal worktrees (agents work in main workspace initially)
+- Builder creates issue worktrees via `./.loom/scripts/worktree.sh <issue-number>`
+- Single agent per terminal, human-controlled
+
+**Tauri App Mode (Autonomous Agents)**:
+- Automatic terminal worktrees for agent isolation (`.loom/worktrees/terminal-N`)
+- Builder ALSO creates issue worktrees when claiming work (`.loom/worktrees/issue-N`)
+- Multiple autonomous agents can run simultaneously
+- Builder works in issue worktree, not terminal worktree
 
 ### Creating Worktrees (for Agents)
 
@@ -412,7 +469,7 @@ gh pr create --label "loom:review-requested"
 
 1. **Find unlabeled issues**:
    ```bash
-   gh issue list --label="!loom:issue,!loom:building,!loom:curating,!loom:treating,!loom:architect,!loom:hermit"
+   gh issue list --label="!loom:issue,!loom:building,!loom:architect,!loom:hermit,!loom:curated,!loom:curating"
    ```
 
 2. **Enhance issue**:
@@ -421,63 +478,10 @@ gh pr create --label "loom:review-requested"
    gh issue edit 42 --body "Enhanced description..."
    ```
 
-3. **Mark as ready**:
+3. **Mark as curated** (human will approve to add `loom:issue`):
    ```bash
-   gh issue edit 42 --add-label "loom:issue"
+   gh issue edit 42 --add-label "loom:curated"
    ```
-
-## Agent Performance Metrics
-
-Agents can query their own performance metrics to make informed decisions. This enables self-aware behavior where agents can check their success rates, costs, and velocity.
-
-### Via CLI Script
-
-```bash
-# Get overall metrics summary
-./.loom/scripts/agent-metrics.sh summary
-
-# Get effectiveness metrics for a specific role
-./.loom/scripts/agent-metrics.sh effectiveness --role builder
-
-# Get cost breakdown for a specific issue
-./.loom/scripts/agent-metrics.sh costs --issue 123
-
-# Get velocity trends
-./.loom/scripts/agent-metrics.sh velocity
-
-# JSON output for programmatic use
-./.loom/scripts/agent-metrics.sh summary --format json --period week
-```
-
-### Available Metrics
-
-- **Summary**: Total prompts, tokens, cost, issues worked, PRs created, success rate
-- **Effectiveness**: Per-role success rates, average cost, average duration
-- **Costs**: Cost per issue, tokens per issue, time spent
-- **Velocity**: Issues closed, PRs merged, cycle time trends
-
-### Use Cases
-
-**Check if struggling with task type**:
-```bash
-./.loom/scripts/agent-metrics.sh effectiveness --role builder
-# If success rate is low, consider escalating or trying a different approach
-```
-
-**Make informed decisions based on historical success**:
-```bash
-success_rate=$(./.loom/scripts/agent-metrics.sh --role builder --format json | jq '.success_rate')
-if (( $(echo "$success_rate < 70" | bc -l) )); then
-    echo "Consider escalating - success rate below threshold"
-fi
-```
-
-### Data Source
-
-Metrics are read from:
-- Activity database: `~/.loom/activity.db` (if activity tracking is enabled)
-- Daemon state: `.loom/daemon-state.json` (for completed counts)
-- GitHub API: Issue/PR counts via `gh` CLI
 
 ## Configuration
 
@@ -487,7 +491,6 @@ Configuration is stored in `.loom/config.json` (gitignored, local to your machin
 
 ```json
 {
-  "version": "2",
   "nextAgentNumber": 3,
   "terminals": [
     {
@@ -505,69 +508,112 @@ Configuration is stored in `.loom/config.json` (gitignored, local to your machin
 }
 ```
 
-**Config Versioning**:
+### Daemon Configuration (Layer 2)
 
-Loom uses an explicit `version` field to enable safe future migrations:
+The Loom daemon uses these configuration parameters:
 
-- **Current version**: `"2"` (string literal, not number)
-- **Migration**: Happens automatically when loading config files
-- **v1 → v2**: Detects configs missing `version` field or with `"version": "1"`
-- **Future-proof**: Unknown versions throw clear error prompting user to upgrade Loom
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ISSUE_THRESHOLD` | 3 | Trigger Architect/Hermit when `loom:issue` count below this |
+| `MAX_PROPOSALS` | 5 | Maximum pending proposal issues |
+| `MAX_SHEPHERDS` | 3 | Maximum concurrent shepherd processes |
+| `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
+| `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
 
-**Example Migration**:
-```typescript
-// Old config (v1) without version field
+**Daemon State File** (`.loom/daemon-state.json`):
+
+The daemon state file provides comprehensive information for debugging, crash recovery, and system observability.
+
+```json
 {
-  "nextAgentNumber": 4,
-  "agents": [...]
-}
+  "started_at": "2026-01-23T10:00:00Z",
+  "last_poll": "2026-01-23T11:30:00Z",
+  "running": true,
+  "iteration": 42,
 
-// Automatically migrated to v2 on load
-{
-  "version": "2",
-  "nextAgentNumber": 4,
-  "agents": [...]
-}
+  "shepherds": {
+    "shepherd-1": {
+      "status": "working",
+      "issue": 123,
+      "task_id": "abc123",
+      "output_file": "/tmp/claude/.../abc123.output",
+      "started": "2026-01-23T10:15:00Z",
+      "last_phase": "builder",
+      "pr_number": null
+    },
+    "shepherd-2": {
+      "status": "idle",
+      "issue": null,
+      "idle_since": "2026-01-23T11:00:00Z",
+      "idle_reason": "no_ready_issues",
+      "last_issue": 100,
+      "last_completed": "2026-01-23T10:58:00Z"
+    }
+  },
 
-// Config auto-saved with version after migration
+  "pipeline_state": {
+    "ready": ["#1083", "#1080"],
+    "building": ["#1044"],
+    "review_requested": ["PR #1056"],
+    "changes_requested": ["PR #1059"],
+    "ready_to_merge": ["PR #1058"],
+    "blocked": [
+      {
+        "type": "pr",
+        "number": 1059,
+        "reason": "merge_conflicts",
+        "detected_at": "2026-01-23T11:20:00Z"
+      }
+    ],
+    "last_updated": "2026-01-23T11:30:00Z"
+  },
+
+  "warnings": [
+    {
+      "time": "2026-01-23T11:10:00Z",
+      "type": "blocked_pr",
+      "severity": "warning",
+      "message": "PR #1059 has merge conflicts",
+      "context": {"pr_number": 1059, "requires_role": "doctor"},
+      "acknowledged": false
+    }
+  ],
+
+  "completed_issues": [100, 101, 102],
+  "total_prs_merged": 3,
+  "last_architect_trigger": "2026-01-23T10:00:00Z",
+  "last_hermit_trigger": "2026-01-23T10:30:00Z"
+}
 ```
 
-**Adding Future Versions** (example for v3):
+**Shepherd Status Values**:
+- `working` - Actively processing an issue
+- `idle` - No issue assigned, waiting for work
+- `errored` - Encountered an error, may need intervention
+- `paused` - Manually paused via signal or stuck detection
 
-When config schema changes:
+**Idle Reasons**:
+- `no_ready_issues` - No issues with `loom:issue` label available
+- `at_capacity` - All shepherd slots filled
+- `completed_issue` - Just finished an issue, waiting for next
+- `rate_limited` - Paused due to API rate limits
+- `shutdown_signal` - Paused due to graceful shutdown
 
-1. Add new migration function in `src/lib/config.ts`:
-   ```typescript
-   function migrateFromV2(raw: unknown): LoomConfig {
-     const v2 = raw as V2Config;
+**Warning Types**:
+- `blocked_pr` - PR has merge conflicts or failed checks
+- `shepherd_error` - Shepherd encountered recoverable error
+- `role_failure` - Support role failed to complete
+- `stuck_agent` - Agent detected as stuck
 
-     // Transform v2 → v3 (e.g., rename field, add new required field)
-     return {
-       version: "3",
-       terminals: v2.agents.map(transformAgent),
-       // ... new fields ...
-     };
-   }
-   ```
+**Required Terminal Configuration for Daemon**:
 
-2. Update `migrateToLatest()` switch:
-   ```typescript
-   switch (version) {
-     case "1": return migrateFromV2(migrateFromV1(raw));
-     case "2": return migrateFromV2(raw);
-     case "3": return raw as LoomConfig;
-     default: throw new Error(`Unsupported version "${version}"`);
-   }
-   ```
-
-3. Update version constant and save logic to use `"3"`
-
-**Why Workspace-Specific Config?**
-- Each git repo has independent agent numbering and terminal configurations
-- Config persists across app restarts
-- No parsing of agent names (users can rename freely)
-- Stored in workspace, not in app directory
-- Role assignments and autonomous settings preserved
+| Terminal ID | Role | Purpose |
+|-------------|------|---------|
+| shepherd-1, shepherd-2, shepherd-3 | shepherd.md | Issue orchestration pool |
+| terminal-architect | architect.md | Work generation (proposals) |
+| terminal-hermit | hermit.md | Simplification proposals |
+| terminal-guide | guide.md | Backlog triage (always running) |
+| terminal-champion | champion.md | Auto-merge (always running) |
 
 ### Custom Roles
 
@@ -596,6 +642,71 @@ cat > .loom/roles/my-role.json <<EOF
 }
 EOF
 ```
+
+### Branch Protection
+
+Loom works best with branch protection enabled on your default branch. Branch protection ensures all changes go through the PR workflow and prevents accidental direct commits.
+
+#### During Installation
+
+The installation script optionally configures branch protection:
+
+**Interactive mode**: Prompts you to enable protection
+```bash
+./scripts/install-loom.sh /path/to/repo
+# Will prompt: Configure branch protection rules for 'main' branch? (y/N)
+```
+
+**Non-interactive mode**: Skips branch protection (configure manually)
+```bash
+./scripts/install-loom.sh --yes /path/to/repo
+# Skips protection setup for automation safety
+```
+
+#### Manual Configuration
+
+Configure branch protection after installation:
+
+```bash
+./scripts/install/setup-branch-protection.sh /path/to/repo main
+```
+
+Or configure via GitHub Settings:
+1. Go to: `Settings > Branches` in your repository
+2. Add rule for your default branch (usually `main`)
+3. Enable:
+   - Require pull request reviews (1 approval)
+   - Dismiss stale reviews on new commits
+   - Prevent force pushes
+   - Prevent branch deletion
+
+#### Protection Rules Applied
+
+The setup script configures these rules:
+- ✅ Require pull request before merging
+- ✅ Require 1 approval (can be bypassed by admins)
+- ✅ Dismiss stale reviews when new commits pushed
+- ✅ Prevent force pushes
+- ✅ Prevent branch deletion
+
+#### Why Branch Protection?
+
+**Enforces Loom workflow**:
+- All changes require pull requests
+- PRs require Judge review before merge
+- Prevents bypassing label-based coordination
+- Maintains audit trail of all changes
+
+**Requirements**:
+- Admin permissions on target repository
+- GitHub CLI authenticated
+- Default branch must exist
+
+**Troubleshooting**:
+If setup fails, it's usually due to:
+- Lacking admin permissions (ask repo owner)
+- Branch doesn't exist yet (push at least one commit)
+- GitHub API unreachable (check network/auth)
 
 ## Troubleshooting
 
@@ -696,6 +807,266 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 - Checks if there's an associated PR (by branch name or body reference)
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
+
+### Stuck Agent Detection
+
+The Loom daemon automatically detects stuck or struggling agents and can trigger interventions.
+
+**Check for stuck agents**:
+```bash
+# Run stuck detection check
+./.loom/scripts/stuck-detection.sh check
+
+# Check with JSON output
+./.loom/scripts/stuck-detection.sh check --json
+
+# Check specific agent
+./.loom/scripts/stuck-detection.sh check-agent shepherd-1
+```
+
+**View stuck detection status**:
+```bash
+# Show status summary
+./.loom/scripts/stuck-detection.sh status
+
+# View intervention history
+./.loom/scripts/stuck-detection.sh history
+./.loom/scripts/stuck-detection.sh history shepherd-1
+```
+
+**Configure stuck detection thresholds**:
+```bash
+# Adjust thresholds
+./.loom/scripts/stuck-detection.sh configure \
+  --idle-threshold 900 \
+  --working-threshold 2400 \
+  --intervention-mode escalate
+
+# Intervention modes: none, alert, suggest, pause, clarify, escalate
+```
+
+**Handle stuck agents**:
+```bash
+# Clear intervention for specific agent
+./.loom/scripts/stuck-detection.sh clear shepherd-1
+
+# Clear all interventions
+./.loom/scripts/stuck-detection.sh clear all
+
+# Resume a paused agent
+./.loom/scripts/signal.sh clear shepherd-1
+```
+
+**Stuck indicators**:
+| Indicator | Default Threshold | Description |
+|-----------|-------------------|-------------|
+| `no_progress` | 10 minutes | No output written to task output file |
+| `extended_work` | 30 minutes | Working on same issue without creating PR |
+| `looping` | 3 occurrences | Repeated similar error patterns |
+| `error_spike` | 5 errors | Multiple errors in short period |
+
+**Intervention types**:
+| Type | Trigger | Action |
+|------|---------|--------|
+| `alert` | Low severity | Write to `.loom/interventions/`, human reviews |
+| `suggest` | Medium severity | Suggest role switch (e.g., Builder -> Doctor) |
+| `pause` | High severity | Auto-pause via signal.sh, requires manual restart |
+| `clarify` | Error spike | Suggest requesting clarification from issue author |
+| `escalate` | Critical | Full escalation: pause + alert + human notification |
+
+### Daemon Troubleshooting (Layer 2)
+
+**Check daemon state**:
+```bash
+# View current daemon state
+cat .loom/daemon-state.json | jq
+
+# Check if daemon is running
+jq '.running' .loom/daemon-state.json
+
+# View active shepherds
+jq '.shepherds | to_entries[] | select(.value.issue != null)' .loom/daemon-state.json
+```
+
+**Graceful shutdown**:
+```bash
+# Signal daemon to stop
+touch .loom/stop-daemon
+
+# Monitor shutdown progress
+watch -n 5 'cat .loom/daemon-state.json | jq ".shepherds"'
+```
+
+**Force stop** (use with caution):
+```bash
+# Remove stop signal if exists
+rm -f .loom/stop-daemon
+
+# Clear daemon state (will restart fresh)
+rm -f .loom/daemon-state.json
+```
+
+**Stuck shepherd**:
+```bash
+# Check shepherd assignments
+jq '.shepherds' .loom/daemon-state.json
+
+# Check if assigned issue is blocked
+gh issue view <issue-number> --json labels --jq '.labels[].name'
+
+# Manually clear stuck shepherd (daemon will reassign)
+jq '.shepherds["shepherd-1"] = {"issue": null, "idle_since": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'"}' \
+  .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
+```
+
+**Work generation not triggering**:
+```bash
+# Check issue count vs threshold
+echo "Ready issues: $(gh issue list --label 'loom:issue' --state open --json number --jq 'length')"
+echo "Threshold: 3 (default)"
+
+# Check cooldown timestamps
+jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
+
+# Check proposal count
+echo "Proposals: $(gh issue list --label 'loom:architect,loom:hermit' --state open --json number --jq 'length')"
+```
+
+## MCP Hooks for Programmatic Control
+
+Loom provides MCP (Model Context Protocol) servers that allow Claude Code to programmatically control the Loom application. This enables automation, testing, and advanced workflows.
+
+### Available MCP Servers
+
+**loom-terminals** - Terminal management via daemon socket:
+- `list_terminals` - List all active terminal sessions
+- `get_terminal_output` - Get recent output from a terminal
+- `get_selected_terminal` - Get info about the currently selected terminal
+- `send_terminal_input` - Send input to a terminal
+- `create_terminal` - Create a new terminal session
+- `delete_terminal` - Delete a terminal session
+- `restart_terminal` - Restart a terminal preserving its config
+- `configure_terminal` - Update terminal settings (name, role, interval)
+- `set_primary_terminal` - Set which terminal is selected in the UI
+- `clear_terminal_history` - Clear terminal scrollback and log file
+- `check_tmux_server_health` - Check tmux server status
+- `get_tmux_server_info` - Get tmux server details
+- `toggle_tmux_verbose_logging` - Enable tmux debug logging
+- `get_agent_metrics` - Get agent performance metrics for self-aware behavior
+
+**loom-ui** - UI control via file-based IPC:
+- `read_console_log` - Read browser console logs
+- `read_state_file` - Read workspace state
+- `read_config_file` - Read workspace config
+- `get_heartbeat` - Check if Loom app is running
+- `get_ui_state` - Get comprehensive UI state (terminals, workspace, engine)
+- `trigger_start` - Start engine with confirmation dialog
+- `trigger_force_start` - Start engine without confirmation
+- `trigger_factory_reset` - Reset workspace with confirmation
+- `trigger_force_factory_reset` - Reset workspace without confirmation
+- `trigger_restart_terminal` - Restart a specific terminal
+- `stop_engine` - Stop all terminals and clean up
+- `trigger_run_now` - Execute interval prompt immediately
+- `get_random_file` - Get random file from workspace
+
+### Example Usage
+
+```bash
+# Create a terminal with specific role
+mcp__loom-terminals__create_terminal --name "Builder" --role "builder"
+
+# Configure autonomous operation
+mcp__loom-terminals__configure_terminal \
+  --terminal_id terminal-1 \
+  --target_interval 300000 \
+  --interval_prompt "Check for new issues"
+
+# Trigger immediate autonomous run
+mcp__loom-ui__trigger_run_now --terminalId terminal-1
+
+# Stop all terminals
+mcp__loom-ui__stop_engine
+
+# Get comprehensive state
+mcp__loom-ui__get_ui_state
+```
+
+### Agent Performance Metrics
+
+Agents can query their own performance metrics to make informed decisions. This enables self-aware behavior where agents can:
+- Check if struggling with a task type and escalate
+- Select approaches based on historical success rates
+- Monitor costs and adjust behavior accordingly
+
+**Via MCP Tool**:
+```bash
+# Get overall metrics summary
+mcp__loom-terminals__get_agent_metrics --command summary --period week
+
+# Get effectiveness metrics for a specific role
+mcp__loom-terminals__get_agent_metrics --command effectiveness --role builder
+
+# Get cost breakdown for a specific issue
+mcp__loom-terminals__get_agent_metrics --command costs --issue 123
+
+# Get velocity trends
+mcp__loom-terminals__get_agent_metrics --command velocity
+```
+
+**Via CLI Script**:
+```bash
+# Get my metrics as a builder
+./.loom/scripts/agent-metrics.sh --role builder
+
+# Check effectiveness by role
+./.loom/scripts/agent-metrics.sh effectiveness
+
+# Get cost for specific issue
+./.loom/scripts/agent-metrics.sh costs --issue 123
+
+# JSON output for programmatic use
+./.loom/scripts/agent-metrics.sh summary --format json
+```
+
+**Metrics Available**:
+- **Summary**: Total prompts, tokens, cost, issues worked, PRs created, success rate
+- **Effectiveness**: Per-role success rates, average cost, average duration
+- **Costs**: Cost per issue, tokens per issue, time spent
+- **Velocity**: Issues closed, PRs merged, cycle time trends
+
+**Example Use Case (Agent Escalation)**:
+```bash
+# Check if success rate is below threshold
+success_rate=$(./loom/scripts/agent-metrics.sh --role builder --format json | jq '.success_rate')
+if (( $(echo "$success_rate < 70" | bc -l) )); then
+    echo "Consider escalating - success rate below threshold"
+fi
+```
+
+### MCP Server Configuration
+
+Add these MCP servers to your Claude Code configuration:
+
+```json
+{
+  "mcpServers": {
+    "loom-terminals": {
+      "command": "node",
+      "args": ["/path/to/loom/mcp-loom-terminals/dist/index.js"],
+      "env": {
+        "LOOM_WORKSPACE": "/path/to/your/workspace"
+      }
+    },
+    "loom-ui": {
+      "command": "node",
+      "args": ["/path/to/loom/mcp-loom-ui/dist/index.js"],
+      "env": {
+        "LOOM_WORKSPACE": "/path/to/your/workspace"
+      }
+    }
+  }
+}
+```
 
 ## Resources
 
