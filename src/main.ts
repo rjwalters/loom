@@ -501,6 +501,11 @@ if (!eventListenersRegistered) {
     showIntelligenceDashboard();
   });
 
+  listen("show-budget-management", async () => {
+    const { showBudgetManagementModal } = await import("./lib/budget-management");
+    showBudgetManagementModal();
+  });
+
   logger?.info("Event listeners registered successfully");
 } else {
   logger?.info("Event listeners already registered, skipping duplicate registration");

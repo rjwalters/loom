@@ -303,6 +303,10 @@ fn main() {
             retire_underperforming_templates,
             reactivate_template,
             get_template_stats,
+            // Budget management commands
+            get_budget_config,
+            save_budget_config,
+            get_costs_by_issue,
         ])
         .run(tauri::generate_context!())
     {
