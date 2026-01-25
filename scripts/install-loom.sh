@@ -536,6 +536,37 @@ fi
 echo ""
 
 # ============================================================================
+# STEP 5b: Configure Repository Settings
+# ============================================================================
+CURRENT_STEP="Configure Repository Settings"
+header "Step 5b: Configure Repository Settings"
+echo ""
+
+if [[ "$NON_INTERACTIVE" == "true" ]]; then
+  info "Non-interactive mode: Skipping repository settings"
+  info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+else
+  echo ""
+  read -p "Configure repository merge and auto-merge settings? (y/N) " -n 1 -r
+  echo ""
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    info "Applying repository settings..."
+    if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+      echo ""
+    else
+      echo ""
+      warning "Failed to configure repository settings (may require admin permissions)"
+      info "You can configure manually via GitHub Settings > General"
+    fi
+  else
+    info "Skipping repository settings"
+    info "To configure later, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+  fi
+fi
+
+echo ""
+
+# ============================================================================
 # STEP 6: Create Pull Request
 # ============================================================================
 CURRENT_STEP="Create PR"
