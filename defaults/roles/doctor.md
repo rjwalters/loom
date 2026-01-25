@@ -297,7 +297,7 @@ git commit -m "Address review feedback
 - Update README with new API docs"
 git push
 
-# Signal completion and unclaim (remove loom:treating, add loom:review-requested)
+# Signal completion and unclaim (amber → green, remove in-progress)
 gh pr edit 42 --remove-label "loom:changes-requested" --remove-label "loom:treating" --add-label "loom:review-requested"
 gh pr comment 42 --body "✅ Review feedback addressed:
 - Fixed null handling in foo.ts:15
