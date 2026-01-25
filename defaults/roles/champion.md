@@ -49,6 +49,107 @@ If neither queue has work, report "No work for Champion" and stop.
 
 ---
 
+## Force Mode (Aggressive Autonomous Development)
+
+When the Loom daemon is running with `--force` flag, Champion operates in **force mode** for aggressive autonomous development. This mode auto-promotes all qualifying proposals without applying the full 8-criterion evaluation.
+
+### Detecting Force Mode
+
+Check for force mode at the start of each iteration:
+
+```bash
+# Check daemon state for force mode
+FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
+
+if [ "$FORCE_MODE" = "true" ]; then
+    echo "🚀 FORCE MODE ACTIVE - Auto-promoting qualifying proposals"
+fi
+```
+
+### Force Mode Behavior
+
+**When force mode is enabled:**
+
+1. **Auto-Promote Architect Proposals**: Promote all `loom:architect` issues that have:
+   - A clear title (not vague like "Improve things")
+   - At least one acceptance criterion
+   - No `loom:blocked` label
+
+2. **Auto-Promote Hermit Proposals**: Promote all `loom:hermit` issues that have:
+   - A specific simplification target (file, module, or pattern)
+   - At least one concrete removal action
+   - No `loom:blocked` label
+
+3. **Auto-Promote Curated Issues**: Promote all `loom:curated` issues that have:
+   - A problem statement
+   - At least one acceptance criterion
+   - No `loom:blocked` label
+
+4. **Audit Trail**: Add `[force-mode]` prefix to all promotion comments
+
+### Force Mode Promotion Workflow
+
+```bash
+# Check for force mode
+FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
+
+if [ "$FORCE_MODE" = "true" ]; then
+    # Auto-promote architect proposals
+    ARCHITECT_ISSUES=$(gh issue list --label="loom:architect" --state=open --json number --jq '.[].number')
+    for issue in $ARCHITECT_ISSUES; do
+        # Minimal validation - just check it's not blocked
+        IS_BLOCKED=$(gh issue view "$issue" --json labels --jq '[.labels[].name] | contains(["loom:blocked"])')
+        if [ "$IS_BLOCKED" = "false" ]; then
+            gh issue edit "$issue" --remove-label "loom:architect" --add-label "loom:issue"
+            gh issue comment "$issue" --body "**[force-mode] Champion Auto-Promote**
+
+This proposal has been auto-promoted in force mode. The daemon is configured for aggressive autonomous development.
+
+**Promoted to \`loom:issue\` - Ready for Builder.**
+
+---
+*Automated by Champion role (force mode)*"
+
+            # Track in daemon state
+            jq --arg issue "$issue" --arg type "architect" --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.force_mode_auto_promotions += [{"issue": ($issue|tonumber), "type": $type, "time": $time}]' \
+                .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
+        fi
+    done
+
+    # Repeat for hermit and curated issues...
+fi
+```
+
+### When NOT to Auto-Promote (Even in Force Mode)
+
+Even in force mode, do NOT auto-promote if:
+
+- Issue has `loom:blocked` label
+- Issue title contains "DISCUSSION" or "RFC" (requires human input)
+- Issue mentions breaking changes without migration plan
+- Issue references external dependencies that need coordination
+
+### Force Mode Safety Guardrails
+
+Force mode still respects these boundaries:
+
+| Guardrail | Behavior |
+|-----------|----------|
+| `loom:blocked` | Never promote blocked issues |
+| Critical file changes | Still flagged in PR review (Judge) |
+| CI failures | PRs still blocked on failing CI |
+| Merge conflicts | Still require Doctor intervention |
+
+### Exiting Force Mode
+
+Force mode can be disabled by:
+1. Stopping daemon and restarting without `--force`
+2. Manually updating daemon state: `jq '.force_mode = false' .loom/daemon-state.json`
+3. Creating `.loom/stop-force-mode` file (daemon will detect and disable)
+
+---
+
 # Part 1: Issue Promotion
 
 ## Overview

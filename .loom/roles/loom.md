@@ -386,20 +386,41 @@ When `/loom` is invoked, execute this FULLY AUTONOMOUS continuous loop.
 ### Initialization
 
 ```python
-def start_daemon():
+def start_daemon(force_mode=False):
     # 1. Load or create state
     state = load_or_create_state(".loom/daemon-state.json")
     state["started_at"] = now()
     state["running"] = True
 
-    # 2. Run startup cleanup
+    # 2. Set force mode if enabled
+    if force_mode:
+        state["force_mode"] = True
+        state["force_mode_started"] = now()
+        state["force_mode_auto_promotions"] = []
+        print("🚀 FORCE MODE ENABLED - Champion will auto-promote all proposals")
+    else:
+        state["force_mode"] = False
+
+    # 3. Run startup cleanup
     run("./scripts/daemon-cleanup.sh daemon-startup")
 
-    # 3. Assess and report initial state
+    # 4. Assess and report initial state
     assess_and_report_state()
 
-    # 4. Enter main loop
+    # 5. Enter main loop
     daemon_loop()
+```
+
+**Force mode detection:**
+
+```bash
+# Parse command line for --force flag
+if [ "$1" = "--force" ]; then
+    FORCE_MODE=true
+    echo "🚀 Starting daemon in FORCE MODE"
+else
+    FORCE_MODE=false
+fi
 ```
 
 ### Main Loop (Fully Autonomous)
@@ -1117,9 +1138,74 @@ Print status after each iteration showing ALL autonomous decisions:
 | Command | Description |
 |---------|-------------|
 | `/loom` | Start daemon loop (runs continuously) |
+| `/loom --force` | Start daemon with force mode (auto-promotes proposals) |
 | `/loom status` | Report current state without running loop |
 | `/loom spawn 123` | Manually spawn shepherd for issue #123 |
 | `/loom stop` | Create stop signal, initiate shutdown |
+
+### --force Mode (Aggressive Autonomous Development)
+
+When `/loom --force` is invoked, the daemon enables **force mode** for aggressive autonomous development. This mode auto-promotes proposals from Architect and Hermit roles without waiting for human approval.
+
+**What changes in force mode:**
+
+1. **Auto-Promote Proposals**: Champion automatically promotes `loom:architect` and `loom:hermit` proposals to `loom:issue` without human review
+2. **Auto-Promote Curated Issues**: Champion automatically promotes `loom:curated` issues to `loom:issue`
+3. **Audit Trail**: All auto-promoted items include `[force-mode]` marker in comments
+4. **Safety Guardrails Remain**: No force-push, respect `loom:blocked`, stop on CI failure
+
+**Force mode state tracking:**
+
+The daemon state file includes force mode information:
+
+```json
+{
+  "force_mode": true,
+  "force_mode_started": "2026-01-24T10:00:00Z",
+  "force_mode_auto_promotions": [
+    {"issue": 123, "type": "architect", "time": "2026-01-24T10:05:00Z"},
+    {"issue": 456, "type": "curated", "time": "2026-01-24T10:10:00Z"}
+  ]
+}
+```
+
+**When to use force mode:**
+
+| Use Case | Description |
+|----------|-------------|
+| New project bootstrap | Get from zero to working MVP faster |
+| Solo developer | Trusts AI judgment for routine decisions |
+| Clear roadmap | Project has well-defined milestones |
+| Weekend hack mode | "Make progress while I'm away" |
+
+**Safety considerations:**
+
+Even in force mode, the daemon still:
+- Never force-pushes or deletes branches
+- Respects `loom:blocked` and `loom:urgent` semantics
+- Leaves audit trail comments on all auto-promoted items
+- Allows human override at any time
+- Stops on first CI failure or conflict
+
+**Example:**
+
+```bash
+# Normal mode - proposals wait for Champion evaluation (which may require human input)
+/loom
+
+# Force mode - Champion auto-promotes all qualifying proposals
+/loom --force
+```
+
+**Exiting force mode:**
+
+To exit force mode without stopping the daemon:
+```bash
+# Remove force mode flag from state
+jq '.force_mode = false' .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
+```
+
+Or stop and restart the daemon without the `--force` flag.
 
 ## Error Handling
 
