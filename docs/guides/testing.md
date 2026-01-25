@@ -124,9 +124,9 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
 ```json
 {
   "mcpServers": {
-    "loom-ui": {
+    "loom": {
       "command": "node",
-      "args": ["mcp-loom-ui/dist/index.js"],
+      "args": ["mcp-loom/dist/index.js"],
       "env": {
         "LOOM_WORKSPACE": "/Users/rwalters/GitHub/loom"
       }
@@ -138,10 +138,10 @@ MCP server providing tools for Claude Code to interact with Loom's state and log
 **Usage Example** (from Claude Code):
 ```bash
 # Read recent console logs to see workspace start progress
-mcp__loom-ui__read_console_log
+mcp__loom__read_console_log
 
 # Check terminal state after start
-mcp__loom-ui__read_state_file
+mcp__loom__read_state_file
 
 # Check terminal configuration
 mcp__loom-ui__read_config_file

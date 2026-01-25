@@ -1,5 +1,8 @@
 # MCP Loom Terminals
 
+> **DEPRECATED**: This package has been consolidated into the unified `mcp-loom` package.
+> Please use `mcp-loom` instead. See [mcp-loom/README.md](../mcp-loom/README.md) for migration instructions.
+
 MCP server for interacting with Loom terminal sessions. Provides tools to list terminals, read their output, and send commands.
 
 ## Features
