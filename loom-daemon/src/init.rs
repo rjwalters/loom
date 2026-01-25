@@ -400,10 +400,12 @@ pub fn initialize_workspace(
         }
     }
 
-    // Copy roles/ directory - always preserve custom roles
+    // Copy roles/ directory - always update default roles, preserve custom roles
     // - Fresh install: copy all from defaults
-    // - Reinstall (merge): add new files, preserve all existing
-    // - Reinstall (force): update default files, preserve custom files
+    // - Reinstall: always force-merge (update defaults, preserve custom)
+    //
+    // This ensures role updates from loom propagate to target repos while
+    // preserving any custom roles the project has added.
     let roles_src = defaults.join("roles");
     let roles_dst = loom_path.join("roles");
     if roles_src.exists() {
@@ -411,18 +413,15 @@ pub fn initialize_workspace(
             // Fresh install: copy all
             copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
                 .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
-        } else if force {
-            // Force reinstall: update defaults, preserve custom
+        } else {
+            // Reinstall: always force-merge to update default roles
+            // Custom roles (files not in defaults) are preserved
             force_merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
                 .map_err(|e| format!("Failed to force-merge roles directory: {e}"))?;
-        } else {
-            // Merge reinstall: add new files only, preserve all existing
-            merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
-                .map_err(|e| format!("Failed to merge roles directory: {e}"))?;
         }
     }
 
-    // Copy scripts/ directory - always preserve custom scripts
+    // Copy scripts/ directory - always update default scripts, preserve custom scripts
     // Same logic as roles
     let scripts_src = defaults.join("scripts");
     let scripts_dst = loom_path.join("scripts");
@@ -431,14 +430,11 @@ pub fn initialize_workspace(
             // Fresh install: copy all
             copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
                 .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
-        } else if force {
-            // Force reinstall: update defaults, preserve custom
+        } else {
+            // Reinstall: always force-merge to update default scripts
+            // Custom scripts (files not in defaults) are preserved
             force_merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
                 .map_err(|e| format!("Failed to force-merge scripts directory: {e}"))?;
-        } else {
-            // Merge reinstall: add new files only, preserve all existing
-            merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
-                .map_err(|e| format!("Failed to merge scripts directory: {e}"))?;
         }
     }
 
@@ -1520,6 +1516,70 @@ mod tests {
         assert!(report.updated.contains(&"roles/builder.md".to_string()));
         assert!(report.added.contains(&"roles/judge.md".to_string()));
         assert!(report.preserved.contains(&"roles/designer.md".to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_roles_always_updated_on_reinstall() {
+        // Roles should always be force-merged on reinstall (without --force flag)
+        // This ensures role updates propagate while custom roles are preserved
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with roles
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "new builder content v2").unwrap();
+        fs::write(defaults.join("roles").join("judge.md"), "new judge content").unwrap();
+
+        // Create existing .loom directory (simulates previous install)
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("roles").join("builder.md"),
+            "old builder content v1",
+        )
+        .unwrap();
+        fs::write(workspace.join(".loom").join("roles").join("custom-role.md"), "my custom role")
+            .unwrap();
+
+        // Run initialization WITHOUT force flag (simulates normal reinstall)
+        let result = initialize_workspace(
+            workspace.to_str().unwrap(),
+            defaults.to_str().unwrap(),
+            false, // No force flag
+        );
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Verify: builder.md was UPDATED (default role updated)
+        let builder =
+            fs::read_to_string(workspace.join(".loom").join("roles").join("builder.md")).unwrap();
+        assert_eq!(builder, "new builder content v2");
+
+        // Verify: judge.md was ADDED (new default role)
+        let judge =
+            fs::read_to_string(workspace.join(".loom").join("roles").join("judge.md")).unwrap();
+        assert_eq!(judge, "new judge content");
+
+        // Verify: custom-role.md was PRESERVED (custom role not in defaults)
+        let custom =
+            fs::read_to_string(workspace.join(".loom").join("roles").join("custom-role.md"))
+                .unwrap();
+        assert_eq!(custom, "my custom role");
+
+        // Verify report reflects the changes
+        assert!(report
+            .updated
+            .contains(&".loom/roles/builder.md".to_string()));
+        assert!(report.added.contains(&".loom/roles/judge.md".to_string()));
+        assert!(report
+            .preserved
+            .contains(&".loom/roles/custom-role.md".to_string()));
     }
 
     #[test]
