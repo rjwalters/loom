@@ -5,10 +5,11 @@
 # delegating iteration work to Claude via the /loom iterate command.
 #
 # Usage:
-#   ./.loom/scripts/daemon-loop.sh [--force]
+#   ./.loom/scripts/daemon-loop.sh [--force] [--status]
 #
 # Options:
 #   --force    Enable force mode for aggressive autonomous development
+#   --status   Check if daemon loop is running
 #
 # Environment Variables:
 #   LOOM_POLL_INTERVAL - Seconds between iterations (default: 120)
@@ -22,6 +23,7 @@
 #   - Graceful shutdown via .loom/stop-daemon signal file
 #   - Session state rotation on startup
 #   - Force mode support passed to iterations
+#   - PID file prevents multiple instances (.loom/daemon-loop.pid)
 #
 # Example:
 #   # Start daemon with default settings
@@ -32,6 +34,9 @@
 #
 #   # Run in background
 #   nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
+#
+#   # Check if daemon is running
+#   ./.loom/scripts/daemon-loop.sh --status
 #
 #   # Stop daemon gracefully
 #   touch .loom/stop-daemon
@@ -44,6 +49,7 @@ ITERATION_TIMEOUT="${LOOM_ITERATION_TIMEOUT:-300}"
 LOG_FILE=".loom/daemon.log"
 STATE_FILE=".loom/daemon-state.json"
 STOP_SIGNAL=".loom/stop-daemon"
+PID_FILE=".loom/daemon-loop.pid"
 
 # ANSI colors (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -70,11 +76,28 @@ while [[ $# -gt 0 ]]; do
             FORCE_FLAG="--force"
             shift
             ;;
+        --status)
+            if [[ -f "$PID_FILE" ]]; then
+                pid=$(cat "$PID_FILE")
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo -e "${GREEN}Daemon loop running (PID: $pid)${NC}"
+                    exit 0
+                else
+                    echo -e "${YELLOW}Daemon loop not running (stale PID file)${NC}"
+                    rm -f "$PID_FILE"
+                    exit 1
+                fi
+            else
+                echo "Daemon loop not running"
+                exit 1
+            fi
+            ;;
         --help|-h)
-            echo "Usage: $0 [--force]"
+            echo "Usage: $0 [--force] [--status]"
             echo ""
             echo "Options:"
             echo "  --force, -f    Enable force mode for aggressive autonomous development"
+            echo "  --status       Check if daemon loop is running"
             echo "  --help, -h     Show this help message"
             echo ""
             echo "Environment Variables:"
@@ -99,6 +122,22 @@ if [[ ! -d ".loom" ]]; then
     echo "Run this script from a Loom-enabled repository root" >&2
     exit 1
 fi
+
+# Check for existing daemon instance
+if [[ -f "$PID_FILE" ]]; then
+    existing_pid=$(cat "$PID_FILE")
+    if kill -0 "$existing_pid" 2>/dev/null; then
+        echo -e "${RED}Error: Daemon loop already running (PID: $existing_pid)${NC}" >&2
+        echo "Use --status to check status or stop the existing daemon first" >&2
+        exit 1
+    else
+        echo -e "${YELLOW}Removing stale PID file${NC}"
+        rm -f "$PID_FILE"
+    fi
+fi
+
+# Write PID file
+echo $$ > "$PID_FILE"
 
 # Check for claude CLI
 if ! command -v claude &> /dev/null; then
@@ -129,9 +168,11 @@ log_header() {
     echo -e "${CYAN}  LOOM DAEMON - SHELL SCRIPT WRAPPER MODE${NC}" | tee -a "$LOG_FILE"
     echo "═══════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  Started: $(date -Iseconds)" | tee -a "$LOG_FILE"
+    echo "  PID: $$" | tee -a "$LOG_FILE"
     echo "  Mode: ${FORCE_FLAG:-Normal}" | tee -a "$LOG_FILE"
     echo "  Poll interval: ${POLL_INTERVAL}s" | tee -a "$LOG_FILE"
     echo "  Iteration timeout: ${ITERATION_TIMEOUT}s" | tee -a "$LOG_FILE"
+    echo "  PID file: $PID_FILE" | tee -a "$LOG_FILE"
     echo "  Stop signal: $STOP_SIGNAL" | tee -a "$LOG_FILE"
     echo "═══════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
@@ -143,6 +184,7 @@ cleanup() {
     echo "" | tee -a "$LOG_FILE"
     log "${YELLOW}Daemon loop terminated (exit code: $exit_code)${NC}"
     rm -f "$STOP_SIGNAL"
+    rm -f "$PID_FILE"
 
     # Update state file to mark as not running
     if [[ -f "$STATE_FILE" ]]; then
