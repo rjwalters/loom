@@ -228,7 +228,7 @@ GH_PR_OUTPUT=$(gh pr create \
   --base "$BASE_BRANCH" \
   --title "Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})" \
   --body "$PR_BODY" \
-  --label "loom:review-requested" 2>&1)
+  --label "loom:pr" 2>&1)
 
 # Extract URL from output (gh CLI outputs the PR URL as the last line)
 PR_URL=$(echo "$GH_PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
