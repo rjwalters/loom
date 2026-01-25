@@ -104,6 +104,7 @@ Launch the Loom desktop application for automated orchestration:
 | Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
 | Guide | `guide.md` | Prioritize and triage issues | Autonomous 15min |
 | Driver | `driver.md` | Direct command execution | Manual |
+| Auditor | `auditor.md` | Verify runtime behavior of built software | Autonomous 10min |
 
 Full role definitions: `.loom/roles/*.md`
 
