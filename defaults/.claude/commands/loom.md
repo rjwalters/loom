@@ -836,7 +836,7 @@ Return ONLY the compact summary line (e.g., "ready=5 building=2 shepherds=2/3").
 Do not include any other text or explanation.""",
             subagent_type="general-purpose",
             run_in_background=False,  # Wait for iteration to complete
-            model="haiku"  # Fast, cheap - iteration work is straightforward
+            model="sonnet"  # Iteration logic is complex - needs reliable instruction following
         )
 
         # ═══════════════════════════════════════════════════

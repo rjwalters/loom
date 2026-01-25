@@ -671,7 +671,7 @@ Loom uses different AI models optimized for each role's task complexity. Model p
 
 | Role | Model | Rationale |
 |------|-------|-----------|
-| Loom Daemon | `haiku` | Status checks and simple decisions - fast and cheap |
+| Loom Daemon | `sonnet` | Iteration logic is complex - needs reliable instruction following |
 | Shepherd | `sonnet` | Orchestration is systematic with clear state transitions |
 | Builder | `opus` | Complex implementation requires deep reasoning |
 | Judge | `opus` | Code review needs thorough understanding |
