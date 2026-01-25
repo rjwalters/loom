@@ -4,7 +4,6 @@
 set -euo pipefail
 
 TARGET_PATH="${1:-.}"
-ISSUE_NUMBER="${2:-}"
 
 # ANSI color codes
 RED='\033[0;31m'
@@ -25,19 +24,15 @@ success() {
   echo -e "${GREEN}✓ $*${NC}" >&2
 }
 
-if [[ -z "$ISSUE_NUMBER" ]]; then
-  error "Issue number required as second argument"
-fi
-
 cd "$TARGET_PATH"
 
 # Ensure .loom/worktrees directory exists
 mkdir -p .loom/worktrees
 
-WORKTREE_PATH=".loom/worktrees/issue-${ISSUE_NUMBER}"
+WORKTREE_PATH=".loom/worktrees/loom-installation"
 BASE_BRANCH_NAME="feature/loom-installation"
 
-info "Creating worktree for issue #${ISSUE_NUMBER}..."
+info "Creating worktree for Loom installation..."
 
 # Detect the default branch (usually 'main' or 'master')
 # Strategy: Try multiple detection methods and validate the result

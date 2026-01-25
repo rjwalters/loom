@@ -13,12 +13,11 @@
 #
 #   What this script does:
 #     1. Validates target repository (must be a Git repo)
-#     2. Creates tracking issue in target repository
-#     3. Creates installation worktree (.loom/worktrees/issue-XXX)
-#     4. Initializes Loom configuration (copies defaults to .loom/)
-#     5. Syncs GitHub labels for Loom workflow
-#     6. Configures branch protection rules (interactive mode only)
-#     7. Creates pull request with loom:review-requested label
+#     2. Creates installation worktree (.loom/worktrees/loom-installation)
+#     3. Initializes Loom configuration (copies defaults to .loom/)
+#     4. Syncs GitHub labels for Loom workflow
+#     5. Configures branch protection rules (interactive mode only)
+#     6. Creates pull request with loom:review-requested label
 #
 #   Requirements:
 #     - Target must be a Git repository
@@ -91,18 +90,6 @@ cleanup_on_error() {
   if [[ $exit_code -ne 0 ]]; then
     echo ""
     warning "Installation failed at step: ${CURRENT_STEP:-unknown}"
-
-    if [[ -n "${ISSUE_NUMBER:-}" ]]; then
-      info "Cleaning up tracking issue #${ISSUE_NUMBER}..."
-      cd "$TARGET_PATH" 2>/dev/null || true
-      # Detect repo for gh commands (best effort, ignore errors in cleanup)
-      CLEANUP_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
-      if [[ -n "$CLEANUP_REPO" ]] && [[ "$CLEANUP_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-        gh issue close "${ISSUE_NUMBER}" -R "$CLEANUP_REPO" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
-      else
-        gh issue close "${ISSUE_NUMBER}" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
-      fi
-    fi
 
     if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -d "${TARGET_PATH}/${WORKTREE_PATH}" ]]; then
       info "Cleaning up worktree: ${WORKTREE_PATH}..."
@@ -391,38 +378,17 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 2: Create Tracking Issue
-# ============================================================================
-CURRENT_STEP="Create Issue"
-header "Step 2: Creating Tracking Issue"
-echo ""
-
-if [[ ! -x "$LOOM_ROOT/scripts/install/create-issue.sh" ]]; then
-  error "Installation script not found: create-issue.sh"
-fi
-
-ISSUE_NUMBER=$("$LOOM_ROOT/scripts/install/create-issue.sh" "$TARGET_PATH") || \
-  error "Failed to create tracking issue"
-
-if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
-  error "Invalid issue number returned: $ISSUE_NUMBER"
-fi
-
-info "Tracking issue: #${ISSUE_NUMBER}"
-echo ""
-
-# ============================================================================
-# STEP 3: Create Installation Worktree
+# STEP 2: Create Installation Worktree
 # ============================================================================
 CURRENT_STEP="Create Worktree"
-header "Step 3: Creating Installation Worktree"
+header "Step 2: Creating Installation Worktree"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/create-worktree.sh" ]]; then
   error "Installation script not found: create-worktree.sh"
 fi
 
-WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH" "$ISSUE_NUMBER") || \
+WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH") || \
   error "Failed to create worktree"
 
 # Parse output: WORKTREE_PATH|BRANCH_NAME|BASE_BRANCH
@@ -445,10 +411,10 @@ info "Base branch: $BASE_BRANCH"
 echo ""
 
 # ============================================================================
-# STEP 4: Initialize Loom Configuration
+# STEP 3: Initialize Loom Configuration
 # ============================================================================
 CURRENT_STEP="Initialize Loom"
-header "Step 4: Initializing Loom Configuration"
+header "Step 3: Initializing Loom Configuration"
 echo ""
 
 # Check if loom-daemon is built
@@ -515,10 +481,10 @@ success "✓ Installed cleanup scripts to .loom/scripts/"
 echo ""
 
 # ============================================================================
-# STEP 5: Sync GitHub Labels
+# STEP 4: Sync GitHub Labels
 # ============================================================================
 CURRENT_STEP="Sync Labels"
-header "Step 5: Syncing GitHub Labels"
+header "Step 4: Syncing GitHub Labels"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/sync-labels.sh" ]]; then
@@ -530,28 +496,11 @@ fi
 
 echo ""
 
-# Now that labels are synced, ensure the tracking issue has the loom:building label
-info "Ensuring tracking issue has loom:building label..."
-cd "$TARGET_PATH"
-# Detect the target repository from git remote
-TARGET_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
-if [[ -n "$TARGET_REPO" ]] && [[ "$TARGET_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-  if gh issue edit "$ISSUE_NUMBER" -R "$TARGET_REPO" --add-label "loom:building" >/dev/null 2>&1; then
-    success "Added loom:building label to issue #${ISSUE_NUMBER}"
-  else
-    warning "Could not add loom:building label to issue #${ISSUE_NUMBER}"
-  fi
-else
-  warning "Could not detect repository for label update"
-fi
-
-echo ""
-
 # ============================================================================
-# STEP 6: Configure Branch Protection
+# STEP 5: Configure Branch Protection
 # ============================================================================
 CURRENT_STEP="Configure Branch Protection"
-header "Step 6: Configure Branch Protection"
+header "Step 5: Configure Branch Protection"
 echo ""
 
 # Detect default branch
@@ -587,17 +536,17 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 7: Create Pull Request
+# STEP 6: Create Pull Request
 # ============================================================================
 CURRENT_STEP="Create PR"
-header "Step 7: Creating Pull Request"
+header "Step 6: Creating Pull Request"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
   error "Installation script not found: create-pr.sh"
 fi
 
-PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER" "$BASE_BRANCH") || \
+PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$BASE_BRANCH") || \
   error "Failed to create pull request"
 
 # Check if installation was already complete (no changes needed)
@@ -605,17 +554,8 @@ PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_P
 if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   info "Loom is already installed - cleaning up..."
 
-  # Close the tracking issue
-  cd "$TARGET_PATH"
-  # Detect the target repository from git remote
-  TARGET_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
-  if [[ -n "$TARGET_REPO" ]] && [[ "$TARGET_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-    gh issue close "${ISSUE_NUMBER}" -R "$TARGET_REPO" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
-  else
-    gh issue close "${ISSUE_NUMBER}" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
-  fi
-
   # Remove the worktree
+  cd "$TARGET_PATH"
   git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
   git branch -D "${BRANCH_NAME}" 2>/dev/null || true
 
@@ -658,7 +598,6 @@ echo ""
 success "Loom ${LOOM_VERSION} installed successfully"
 echo ""
 
-info "📋 Tracking Issue: #${ISSUE_NUMBER}"
 info "📦 Pull Request: ${PR_URL}"
 echo ""
 
