@@ -72,7 +72,129 @@ echo ""
 
 # Check if it's a git repository
 if [[ ! -d "$TARGET_PATH/.git" ]]; then
-  error "Not a git repository: $TARGET_PATH\n       Run 'git init' first or choose a different directory."
+  warning "$TARGET_PATH is not a git repository."
+  echo ""
+  echo "Would you like to initialize git and optionally set up GitHub?"
+  echo ""
+  echo "This will:"
+  echo "  1. Run 'git init' in the directory"
+  echo "  2. Create a sensible .gitignore file"
+  echo "  3. Create an initial commit"
+  echo "  4. Optionally create a GitHub repository and set up remote"
+  echo ""
+  read -r -p "Initialize git repository? [y/N] " -n 1 INIT_GIT
+  echo ""
+
+  if [[ ! $INIT_GIT =~ ^[Yy]$ ]]; then
+    error "Cannot proceed without a git repository.\n       Run 'git init' manually or choose a different directory."
+  fi
+
+  # Initialize git
+  info "Initializing git repository..."
+  cd "$TARGET_PATH"
+  git init --quiet || error "Failed to initialize git repository"
+  success "Git repository initialized"
+
+  # Create basic .gitignore if it doesn't exist
+  if [[ ! -f "$TARGET_PATH/.gitignore" ]]; then
+    info "Creating .gitignore..."
+    cat > "$TARGET_PATH/.gitignore" << 'GITIGNORE'
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+build/
+target/
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE/Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Loom (will be added by installation)
+# .loom/state.json
+# .loom/worktrees/
+# .loom/*.log
+GITIGNORE
+    success "Created .gitignore"
+  fi
+
+  # Create initial commit
+  info "Creating initial commit..."
+  git add -A
+  git commit -m "Initial commit" --quiet || error "Failed to create initial commit"
+  success "Initial commit created"
+  echo ""
+
+  # Offer GitHub repository creation
+  if command -v gh &> /dev/null; then
+    echo "Would you like to create a GitHub repository for this project?"
+    echo ""
+    read -r -p "Create GitHub repository? [y/N] " -n 1 CREATE_REPO
+    echo ""
+
+    if [[ $CREATE_REPO =~ ^[Yy]$ ]]; then
+      # Check GitHub authentication
+      if ! gh auth status &> /dev/null; then
+        warning "GitHub CLI is not authenticated"
+        info "Please authenticate with GitHub:"
+        echo ""
+        gh auth login || error "GitHub authentication failed"
+        echo ""
+      fi
+
+      # Prompt for repository visibility
+      echo "Repository visibility:"
+      echo "  1. Private (default)"
+      echo "  2. Public"
+      read -r -p "Choose visibility [1/2]: " -n 1 VISIBILITY
+      echo ""
+
+      VISIBILITY_FLAG="--private"
+      if [[ "$VISIBILITY" == "2" ]]; then
+        VISIBILITY_FLAG="--public"
+      fi
+
+      # Get directory name for repo name suggestion
+      DIR_NAME=$(basename "$TARGET_PATH")
+      read -r -p "Repository name [$DIR_NAME]: " REPO_NAME
+      REPO_NAME="${REPO_NAME:-$DIR_NAME}"
+
+      info "Creating GitHub repository: $REPO_NAME..."
+      if gh repo create "$REPO_NAME" $VISIBILITY_FLAG --source="$TARGET_PATH" --push; then
+        success "GitHub repository created and pushed"
+      else
+        warning "Failed to create GitHub repository. Continuing with local git only."
+        info "You can create the repository later with: gh repo create"
+      fi
+      echo ""
+    fi
+  else
+    info "GitHub CLI (gh) not found - skipping GitHub repository creation"
+    info "Install with: brew install gh"
+    echo ""
+  fi
 fi
 
 success "Valid git repository detected"
