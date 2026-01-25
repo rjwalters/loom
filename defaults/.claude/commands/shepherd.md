@@ -31,23 +31,23 @@ The orchestrator operates in one of two modes depending on the environment:
 - Supports parallelism (multiple agents simultaneously)
 - Requires Loom desktop app running
 
-**Direct Mode** (Subagent Execution):
-- Executes role phases as subagents in current terminal
+**Direct Mode** (Task Subagent Execution):
+- Spawns each role phase as a Task subagent with fresh context
 - Sequential execution through orchestration phases
-- Context accumulates between phases
+- Fresh context per subagent (no accumulation between phases)
 - Works anywhere Claude Code runs (no additional dependencies)
 
-### Fresh Context Per Phase (MCP Mode Only)
-- Each role terminal should be restarted before triggering
+### Fresh Context Per Phase
+- Each role phase runs with fresh context (no accumulated pollution)
+- In MCP Mode: Terminal is restarted before triggering each phase
+- In Direct Mode: Each phase spawns as a Task subagent with clean context
 - This ensures maximum cognitive clarity for each phase
-- No accumulated context pollution between phases
-- **Note**: In Direct Mode, context accumulates across phases
 
 ### Platform Agnostic
 - You trigger terminals via MCP, you don't care what LLM runs in them
 - Each terminal can be Claude, GPT, or any other LLM
 - Coordination is through labels and MCP, not LLM-specific APIs
-- In Direct Mode, you execute roles yourself following their guidelines
+- In Direct Mode, you spawn Task subagents that execute roles with fresh context
 
 ## Command Options
 
@@ -199,7 +199,7 @@ if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
   echo "🎭 MCP Mode: Loom app detected, will delegate to role terminals"
 else
   MODE="direct"
-  echo "🎭 Direct Mode: Executing role phases as subagents"
+  echo "🎭 Direct Mode: Spawning each phase as a Task subagent with fresh context"
 fi
 ```
 
@@ -218,15 +218,15 @@ Always inform the user which mode is active at orchestration start:
 Will delegate each phase to configured role terminals.
 ```
 
-**Direct Mode (Subagent Execution):**
+**Direct Mode (Task Subagent Execution):**
 ```
 ## 🎭 Loom Orchestration Started
 
-**Mode**: Direct (Subagent Execution)
+**Mode**: Direct (Task Subagent Execution)
 **Issue**: #123 - [Title]
 **Phases**: Curator → Approval → Builder → Judge → Merge
 
-Executing role phases using Claude Code subagents.
+Spawning each phase as a Task subagent with fresh context.
 ```
 
 **Mode Characteristics:**
@@ -235,14 +235,14 @@ Executing role phases using Claude Code subagents.
 |--------|----------|-------------|
 | Requires | Loom Tauri app running | Claude Code CLI only |
 | Parallelism | Multiple terminals | Sequential phases |
-| Context | Fresh per terminal | Accumulates in session |
+| Context | Fresh per terminal | Fresh per subagent |
 | Best for | Multi-agent workflows | Single-issue orchestration |
 
 Both modes are fully functional. Direct Mode is the default for CLI-based workflows and works without any additional dependencies.
 
 ### Direct Mode Execution
 
-In Direct Mode, the shepherd executes each role phase as a subagent rather than delegating to Tauri-managed terminals:
+In Direct Mode, the shepherd spawns each role phase as a Task subagent with fresh context, rather than delegating to Tauri-managed terminals:
 
 **MCP Mode (Tauri App):**
 ```bash
@@ -252,104 +252,159 @@ mcp__loom-ui__trigger_run_now --terminalId terminal-2
 # Wait for terminal to complete by polling labels...
 ```
 
-**Direct Mode (Subagent Execution):**
-```bash
-# Execute Curator role as subagent
-echo "📋 Curator phase..."
-
-# 1. Follow the role definition
-# (Apply .loom/roles/curator.md guidelines)
-
-# 2. Perform the role's work
-# - Analyze the issue
-# - Add implementation details
-# - Update acceptance criteria
-# - Add technical guidance
-
-# 3. Apply the completion label
-gh issue edit 123 --add-label "loom:curated"
-
-echo "✅ Curator phase complete"
+**Direct Mode (Task Subagent Execution):**
+```python
+# Spawn Curator phase as a Task subagent with fresh context
+result = Task(
+    description=f"Curator phase for issue #{issue_number}",
+    prompt=f"/curator {issue_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
+# Task completes when subagent finishes - poll labels to verify
 ```
+
+### Why Task Subagents?
+
+Each phase spawns as a separate Task subagent because:
+- **Fresh context**: Each subagent starts with a clean slate, avoiding context pollution
+- **Cognitive clarity**: Role-specific focus without accumulated noise from previous phases
+- **Consistency**: Same fresh-context benefits as MCP Mode terminals
+- **Isolation**: Phase failures don't corrupt the shepherd's orchestration state
 
 ### Direct Mode Role Execution Pattern
 
-For each phase, the shepherd orchestrates work by:
+For each phase, the shepherd spawns a Task subagent:
 
-1. **Announcing the phase**: `"📋 [Role] phase..."`
-2. **Following role guidelines**: Apply `.loom/roles/[role].md` instructions
-3. **Performing the work**: Complete the role's primary task
-4. **Applying completion signals**: Add appropriate labels or create PRs
-5. **Announcing completion**: `"✅ [Role] phase complete"`
+1. **Announce the phase**: `"📋 Starting [Role] phase..."`
+2. **Spawn Task subagent**: Use Task tool with role-specific slash command
+3. **Wait for completion**: Task runs synchronously (run_in_background=False)
+4. **Verify completion**: Poll labels to confirm the role completed successfully
+5. **Announce completion**: `"✅ [Role] phase complete"`
 
 ### Phase-Specific Direct Execution
 
-**Curator Phase (Direct):**
-```bash
-# 1. Read issue details
-gh issue view $ISSUE_NUMBER --comments
+**Curator Phase (Task Subagent):**
+```python
+# Spawn curator subagent with fresh context
+result = Task(
+    description=f"Curate issue #{issue_number} - add implementation details and acceptance criteria",
+    prompt=f"/curator {issue_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
 
-# 2. Analyze and enhance
-# - Add implementation guidance
-# - Add acceptance criteria
-# - Add technical approach
-
-# 3. Update issue with enhancements
-gh issue comment $ISSUE_NUMBER --body "[Curator enhancement content]"
-
-# 4. Mark complete
-gh issue edit $ISSUE_NUMBER --add-label "loom:curated"
+# Verify completion by checking labels
+labels = gh_issue_view(issue_number, "--json labels --jq '.labels[].name'")
+assert "loom:curated" in labels or "loom:issue" in labels
 ```
 
-**Builder Phase (Direct):**
-```bash
-# 1. Claim issue
-gh issue edit $ISSUE_NUMBER --remove-label "loom:issue" --add-label "loom:building"
+**Builder Phase (Task Subagent):**
+```python
+# Spawn builder subagent with fresh context
+result = Task(
+    description=f"Build issue #{issue_number} - implement feature and create PR",
+    prompt=f"/builder {issue_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
 
-# 2. Create worktree
-./.loom/scripts/worktree.sh $ISSUE_NUMBER
-cd .loom/worktrees/issue-$ISSUE_NUMBER
-
-# 3. Implement the feature
-# (Follow builder.md guidelines)
-
-# 4. Rebase and push
-git fetch origin main && git rebase origin/main
-git push -u origin feature/issue-$ISSUE_NUMBER
-
-# 5. Create PR
-gh pr create --label "loom:review-requested" --body "Closes #$ISSUE_NUMBER"
+# Verify completion by checking for PR
+pr_number = gh_pr_list(f"--search 'Closes #{issue_number}' --json number --jq '.[0].number'")
+assert pr_number is not None
 ```
 
-**Judge Phase (Direct):**
-```bash
-# 1. Review the PR
-gh pr diff $PR_NUMBER
-gh pr view $PR_NUMBER --json additions,deletions,changedFiles
+**Judge Phase (Task Subagent):**
+```python
+# Spawn judge subagent with fresh context
+result = Task(
+    description=f"Review PR #{pr_number} for issue #{issue_number}",
+    prompt=f"/judge {pr_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
 
-# 2. Check code quality
-# (Follow judge.md guidelines)
+# Verify completion by checking PR labels
+labels = gh_pr_view(pr_number, "--json labels --jq '.labels[].name'")
+if "loom:pr" in labels:
+    phase = "gate2"  # Approved
+elif "loom:changes-requested" in labels:
+    phase = "doctor"  # Needs fixes
+```
 
-# 3. Apply verdict
-# If approved:
-gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:pr"
-# If changes needed:
-gh pr review $PR_NUMBER --request-changes --body "[Feedback]"
-gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+**Doctor Phase (Task Subagent):**
+```python
+# Spawn doctor subagent with fresh context
+result = Task(
+    description=f"Address review feedback on PR #{pr_number} for issue #{issue_number}",
+    prompt=f"/doctor {pr_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
+
+# Verify completion by checking for review-requested label
+labels = gh_pr_view(pr_number, "--json labels --jq '.labels[].name'")
+assert "loom:review-requested" in labels
+```
+
+### Complete Direct Mode Example
+
+Here's the full orchestration flow using Task subagents:
+
+```python
+# Shepherd orchestrating issue #123 in Direct Mode
+issue_number = 123
+
+# Phase 1: Curator
+print(f"📋 Starting Curator phase for issue #{issue_number}...")
+Task(
+    description=f"Curator phase for #{issue_number}",
+    prompt=f"/curator {issue_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
+print("✅ Curator phase complete")
+
+# Gate 1: Wait for approval (or auto-approve in force mode)
+if force_mode:
+    gh_issue_edit(issue_number, "--add-label 'loom:issue'")
+
+# Phase 2: Builder
+print(f"📋 Starting Builder phase for issue #{issue_number}...")
+Task(
+    description=f"Builder phase for #{issue_number}",
+    prompt=f"/builder {issue_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
+pr_number = get_pr_for_issue(issue_number)
+print(f"✅ Builder phase complete - PR #{pr_number} created")
+
+# Phase 3: Judge
+print(f"📋 Starting Judge phase for PR #{pr_number}...")
+Task(
+    description=f"Judge phase for PR #{pr_number}",
+    prompt=f"/judge {pr_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
+print("✅ Judge phase complete")
+
+# Continue with Doctor loop and merge as needed...
 ```
 
 ### When to Use Each Mode
 
 **MCP Mode is better when:**
 - Running Loom desktop app
-- Need parallelism (multiple agents)
-- Want fresh context per phase
-- Long orchestration sessions
+- Need parallelism (multiple agents simultaneously)
+- Want visual terminal monitoring
+- Long orchestration sessions with multiple issues
 
-**Direct Mode is acceptable when:**
-- Running in Claude Code CLI only
+**Direct Mode is equivalent when:**
+- Running in Claude Code CLI only (no Loom app)
 - Single issue orchestration
-- Quick fixes or small features
+- Fresh context per phase (same as MCP Mode via Task subagents)
 - Testing orchestration workflow
 
 ## Phase Flow
@@ -370,7 +425,7 @@ When orchestrating issue #N, follow this progression:
 8. [Complete]     → Report success
 ```
 
-**Note**: In Direct Mode, "trigger_run_now" becomes "execute directly following role guidelines".
+**Note**: In Direct Mode, "trigger_run_now" becomes "spawn Task subagent with role-specific slash command".
 
 **Important**: Curation is mandatory. Even if an issue already has `loom:issue` label, the shepherd will run Curator first if `loom:curated` is not present. This ensures all issues receive proper enhancement (acceptance criteria, implementation guidance, test plans) before building begins.
 
@@ -439,22 +494,31 @@ mcp__loom-ui__trigger_run_now --terminalId <terminal-id>
 
 ### Direct Mode Alternative
 
-In Direct Mode, skip the MCP calls and execute the role directly:
+In Direct Mode, skip the MCP calls and spawn the role as a Task subagent:
 
-```bash
-# Instead of triggering a terminal, become the role
-echo "📋 Executing [Role] phase directly..."
+```python
+# Instead of triggering a terminal, spawn a Task subagent with fresh context
+print(f"📋 Spawning [Role] phase as Task subagent...")
 
-# Follow the role's guidelines from .loom/roles/[role].md
-# Perform the role's primary task
-# Apply completion labels when done
+result = Task(
+    description=f"[Role] phase for issue #{issue_number}",
+    prompt=f"/[role] {issue_number}",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
 
-echo "✅ [Role] phase complete"
+# Subagent follows the role's guidelines from .loom/roles/[role].md
+# Subagent performs the role's primary task
+# Subagent applies completion labels when done
+
+print("✅ [Role] phase complete")
 ```
+
+This ensures each phase has fresh context, matching the isolation benefits of MCP Mode.
 
 ## Waiting for Completion
 
-**Note**: In Direct Mode, you don't need to poll - you know when you're done because you executed the phase yourself. Just proceed to the next phase after applying completion labels.
+**Note**: In Direct Mode, the Task subagent runs synchronously (run_in_background=False), so you know when the phase completes. However, you should still verify success by polling labels - the subagent may have encountered issues or been unable to complete its task.
 
 ### Label Polling (MCP Mode Only)
 
@@ -910,7 +974,7 @@ You can discover terminal configurations with:
 mcp__loom-ui__get_ui_state
 ```
 
-**Note**: In Direct Mode, terminal configuration is not required. The orchestrator executes roles directly.
+**Note**: In Direct Mode, terminal configuration is not required. The orchestrator spawns Task subagents for each role phase.
 
 ## Auto-Configuring Missing Terminals (Force Mode)
 
@@ -1141,13 +1205,13 @@ if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
   echo "🎭 MCP Mode: Loom app detected"
 else
   MODE="direct"
-  echo "🎭 Direct Mode: Executing as subagents"
+  echo "🎭 Direct Mode: Spawning Task subagents for each phase"
 fi
 ```
 
-Both modes are fully supported. Direct Mode is the default for CLI-based workflows:
+Both modes are fully supported and provide fresh context per phase:
 1. Announce the active mode at orchestration start
-2. Execute role phases appropriately for the mode
+2. Execute role phases appropriately for the mode (MCP terminals or Task subagents)
 3. Complete the orchestration successfully
 
 ## Report Format
