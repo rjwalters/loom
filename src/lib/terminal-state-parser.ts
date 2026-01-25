@@ -37,6 +37,9 @@ export type TerminalStatus =
   | "working" // Agent actively processing a task
   | "bypass-prompt" // Claude Code showing bypass permissions warning
   | "paused" // Agent paused (⏸)
+  | "wrapper-retrying" // Claude wrapper is in backoff/retry mode
+  | "wrapper-failed" // Claude wrapper max retries exceeded
+  | "wrapper-starting" // Claude wrapper is running pre-flight checks
   | "unknown"; // Cannot determine state from output
 
 /**
@@ -85,6 +88,43 @@ export function parseTerminalState(output: string): TerminalState {
     cleanedLength: cleaned.length,
     outputPreview: cleaned.substring(0, 100).replace(/\n/g, "\\n"),
   });
+
+  // Priority 0: Check for Claude wrapper states (highest priority for orchestration)
+  // The resilient wrapper logs specific patterns we can detect
+  // Check failure FIRST (most specific) before retry (more generic "Waiting")
+  if (/Max retries.*exceeded/i.test(cleaned) || /\[ERROR\].*Max retries/i.test(cleaned)) {
+    logger.info("Detected Claude wrapper max retries exceeded", {
+      outputPreview: cleaned.substring(0, 200),
+    });
+    return {
+      type: "claude-code",
+      status: "wrapper-failed",
+      raw: output,
+    };
+  }
+
+  if (
+    /Transient error detected.*Waiting/i.test(cleaned) ||
+    /\[WARN\].*before retry/i.test(cleaned)
+  ) {
+    logger.info("Detected Claude wrapper in retry/backoff mode", {
+      outputPreview: cleaned.substring(0, 200),
+    });
+    return {
+      type: "claude-code",
+      status: "wrapper-retrying",
+      raw: output,
+    };
+  }
+
+  if (/Claude wrapper starting/i.test(cleaned) || /Running pre-flight checks/i.test(cleaned)) {
+    logger.info("Detected Claude wrapper starting", { outputPreview: cleaned.substring(0, 200) });
+    return {
+      type: "claude-code",
+      status: "wrapper-starting",
+      raw: output,
+    };
+  }
 
   // Priority 1: Check for Claude Code bypass permissions prompt
   // This is highest priority because it requires immediate action (send "2")
