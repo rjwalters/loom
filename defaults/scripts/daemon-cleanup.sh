@@ -7,6 +7,7 @@
 #   daemon-startup                   - Cleanup stale artifacts from previous session
 #   daemon-shutdown                  - Archive logs and cleanup before exit
 #   periodic                         - Conservative periodic cleanup
+#   prune-sessions                   - Prune old daemon state session archives
 
 set -euo pipefail
 
@@ -51,6 +52,7 @@ Events:
   daemon-startup              Cleanup stale artifacts from previous session
   daemon-shutdown             Archive logs and cleanup before exit
   periodic                    Conservative periodic cleanup
+  prune-sessions              Prune old daemon state session archives
 
 Options:
   --dry-run                   Show what would be cleaned
@@ -310,6 +312,65 @@ handle_daemon_shutdown() {
   success "Daemon shutdown cleanup complete"
 }
 
+# Event: prune-sessions
+# Prune old daemon state session archives
+handle_prune_sessions() {
+  header "Prune Session Archives"
+  echo ""
+
+  local max_sessions="${LOOM_MAX_ARCHIVED_SESSIONS:-10}"
+
+  # Find all archived session files
+  local archives
+  archives=$(find "$REPO_ROOT/.loom" -maxdepth 1 -name '[0-9][0-9]-daemon-state.json' 2>/dev/null | sort || echo "")
+
+  if [[ -z "$archives" ]]; then
+    info "No archived sessions found"
+    return
+  fi
+
+  local archive_count
+  archive_count=$(echo "$archives" | wc -l | tr -d ' ')
+
+  info "Found $archive_count archived session(s) (max: $max_sessions)"
+
+  # Calculate how many to delete
+  local to_delete=$((archive_count - max_sessions))
+
+  if [[ $to_delete -le 0 ]]; then
+    info "No pruning needed (under limit)"
+    return
+  fi
+
+  info "Pruning $to_delete oldest session(s)..."
+
+  # Delete oldest archives
+  local deleted=0
+  for archive in $archives; do
+    if [[ $deleted -ge $to_delete ]]; then
+      break
+    fi
+
+    local basename
+    basename=$(basename "$archive")
+
+    if [[ "$DRY_RUN" == true ]]; then
+      info "[DRY-RUN] Would delete: $basename"
+    else
+      rm -f "$archive"
+      info "Deleted: $basename"
+    fi
+
+    ((deleted++))
+  done
+
+  if [[ "$DRY_RUN" != true ]]; then
+    update_cleanup_timestamp "prune-sessions"
+  fi
+
+  success "Session pruning complete"
+}
+
 # Event: periodic
 # Conservative periodic cleanup (respects active shepherds)
 handle_periodic() {
@@ -372,7 +433,10 @@ case "$EVENT" in
   periodic)
     handle_periodic
     ;;
+  prune-sessions)
+    handle_prune_sessions
+    ;;
   *)
-    error "Unknown event: $EVENT\nValid events: shepherd-complete, daemon-startup, daemon-shutdown, periodic"
+    error "Unknown event: $EVENT\nValid events: shepherd-complete, daemon-startup, daemon-shutdown, periodic, prune-sessions"
     ;;
 esac

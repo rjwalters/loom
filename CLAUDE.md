@@ -633,6 +633,53 @@ The daemon state file provides comprehensive information for debugging, crash re
 - `role_failure` - Support role failed to complete
 - `stuck_agent` - Agent detected as stuck
 
+**Session Rotation**:
+
+When a new daemon session starts, the existing `daemon-state.json` is automatically rotated to preserve session history:
+
+```
+.loom/
+├── daemon-state.json          # Current session (always this name)
+├── 00-daemon-state.json       # First archived session
+├── 01-daemon-state.json       # Second archived session
+├── 02-daemon-state.json       # Third archived session
+└── ...
+```
+
+**Why session rotation?**
+- Debugging patterns across multiple sessions
+- Analyzing daemon behavior over time
+- Post-mortem analysis when issues occur
+- Understanding long-term trends in the development pipeline
+
+**Configuration**:
+- `LOOM_MAX_ARCHIVED_SESSIONS` - Maximum sessions to keep (default: 10)
+
+**Commands**:
+```bash
+# Preview session rotation
+./.loom/scripts/rotate-daemon-state.sh --dry-run
+
+# Manually prune old sessions
+./.loom/scripts/daemon-cleanup.sh prune-sessions
+
+# Keep more archived sessions
+./.loom/scripts/rotate-daemon-state.sh --max-sessions 20
+```
+
+Archived sessions include a `session_summary` field with final statistics:
+```json
+{
+  "session_summary": {
+    "session_id": 5,
+    "archived_at": "2026-01-24T15:30:00Z",
+    "issues_completed": 12,
+    "prs_merged": 10,
+    "total_iterations": 156
+  }
+}
+```
+
 **Required Terminal Configuration for Daemon**:
 
 | Terminal ID | Role | Purpose |

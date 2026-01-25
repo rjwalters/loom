@@ -728,12 +728,16 @@ When `/loom` is invoked (without `iterate`), run the **thin parent loop** that s
 
 ```python
 def start_daemon(force_mode=False):
-    # 1. Load or create state
+    # 1. Rotate existing state file to preserve session history
+    # This archives the previous session's state before creating a fresh one
+    run("./.loom/scripts/rotate-daemon-state.sh")
+
+    # 2. Load or create state (will be fresh after rotation)
     state = load_or_create_state(".loom/daemon-state.json")
     state["started_at"] = now()
     state["running"] = True
 
-    # 2. Set force mode if enabled
+    # 3. Set force mode if enabled
     if force_mode:
         state["force_mode"] = True
         state["force_mode_started"] = now()
@@ -742,20 +746,20 @@ def start_daemon(force_mode=False):
     else:
         state["force_mode"] = False
 
-    # 3. Validate role configuration
+    # 4. Validate role configuration
     if not validate_at_startup():
         if VALIDATION_MODE == "strict":
             print("❌ Startup aborted due to validation errors (strict mode)")
             return
         # In warn mode, continue with warnings logged
 
-    # 4. Run startup cleanup
+    # 5. Run startup cleanup
     run("./scripts/daemon-cleanup.sh daemon-startup")
 
-    # 5. Save initial state
+    # 6. Save initial state
     save_daemon_state(state)
 
-    # 6. Enter thin parent loop
+    # 7. Enter thin parent loop
     parent_loop(force_mode)
 ```
 
