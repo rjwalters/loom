@@ -16,6 +16,7 @@
     "daemon:stop": "./scripts/stop-daemon.sh",
     "daemon:preview": "cargo run --package loom-daemon --release",
     "daemon:build": "cargo build --package loom-daemon --release && rm -f target/release/loom-daemon-aarch64-apple-darwin && cp target/release/loom-daemon target/release/loom-daemon-aarch64-apple-darwin",
+    "mcp:build": "cd mcp-loom && npm run build",
     "daemon:test": "cargo test --package loom-daemon",
     "app:dev": "./scripts/dev-app.sh",
     "app:dev:headless": "./scripts/dev-app-headless.sh",
