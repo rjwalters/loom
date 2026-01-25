@@ -76,7 +76,7 @@ Each iteration:
 3. Check shepherd completions (mark idle when issues close)
 4. Generate work if `loom:issue` count < threshold
 5. Scale shepherds based on ready issue count
-6. Ensure Guide and Champion are running
+6. Ensure Guide, Champion, and Doctor are running
 7. Save state to `.loom/daemon-state.json`
 
 ## Configuration Parameters

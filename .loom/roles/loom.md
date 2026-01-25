@@ -12,6 +12,7 @@ You are FULLY AUTONOMOUS for:
 - Triggering Hermit when backlog is low
 - Ensuring Guide is always running (backlog triage)
 - Ensuring Champion is always running (PR merging)
+- Ensuring Doctor is always running (PR conflict resolution)
 - Scaling shepherd pool based on demand
 
 You do NOT require human input for any of the above. The only human intervention needed is:
@@ -35,9 +36,10 @@ Each 30-second iteration:
   6. AUTO-trigger Hermit if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
   7. AUTO-ensure Guide is running (respawn if idle > GUIDE_INTERVAL)
   8. AUTO-ensure Champion is running (respawn if idle > CHAMPION_INTERVAL)
-  9. Update daemon-state.json
-  10. Report status
-  11. Sleep and repeat
+  9. AUTO-ensure Doctor is running (respawn if idle > DOCTOR_INTERVAL)
+  10. Update daemon-state.json
+  11. Report status
+  12. Sleep and repeat
 ```
 
 **NO MANUAL INTERVENTION** means:
@@ -257,7 +259,7 @@ def auto_generate_work():
 
 ### Support Role Management (Automatic)
 
-The daemon AUTOMATICALLY ensures Guide and Champion keep running:
+The daemon AUTOMATICALLY ensures Guide, Champion, and Doctor keep running:
 
 ```python
 # This happens automatically every iteration
@@ -279,6 +281,15 @@ def auto_ensure_support_roles():
             run_in_background=True
         )
         print("AUTO-SPAWNED Champion")
+
+    # Doctor - PR conflict resolution (runs every 5 min)
+    if not doctor_is_running() or doctor_idle_time() > DOCTOR_INTERVAL:
+        Task(
+            description="Doctor PR conflict resolution",
+            prompt="/doctor",
+            run_in_background=True
+        )
+        print("AUTO-SPAWNED Doctor")
 ```
 
 ### Checking Subagent Status (Non-blocking)
@@ -326,6 +337,7 @@ All thresholds that drive automatic decisions:
 |-----------|---------|-------------|
 | `GUIDE_INTERVAL` | 900s | Respawn if: not running OR idle > interval |
 | `CHAMPION_INTERVAL` | 600s | Respawn if: not running OR idle > interval |
+| `DOCTOR_INTERVAL` | 300s | Respawn if: not running OR idle > interval |
 
 ### Decision Matrix
 
@@ -355,6 +367,10 @@ GUIDE:
 CHAMPION:
   IF not_running OR idle_time > CHAMPION_INTERVAL
   THEN spawn_champion()  ← AUTOMATIC
+
+DOCTOR:
+  IF not_running OR idle_time > DOCTOR_INTERVAL
+  THEN spawn_doctor()  ← AUTOMATIC
 ```
 
 **Human only intervenes for**:
@@ -545,7 +561,7 @@ def auto_generate_work():
 
 ```python
 def auto_ensure_support_roles():
-    """Automatically keep Guide and Champion running - NO human decision required."""
+    """Automatically keep Guide, Champion, and Doctor running - NO human decision required."""
 
     # Guide - backlog triage
     guide_running = is_support_role_running("guide")
@@ -578,6 +594,22 @@ def auto_ensure_support_roles():
         print(f"  AUTO-SPAWNED: Champion ({reason})")
     else:
         print(f"  Champion: running (idle {champion_idle}s)")
+
+    # Doctor - PR conflict resolution
+    doctor_running = is_support_role_running("doctor")
+    doctor_idle = get_support_role_idle_time("doctor")
+
+    if not doctor_running or doctor_idle > DOCTOR_INTERVAL:
+        result = Task(
+            description="Doctor PR conflict resolution",
+            prompt="/doctor",
+            run_in_background=True
+        )
+        record_support_role("doctor", result.task_id, result.output_file)
+        reason = "not running" if not doctor_running else f"idle {doctor_idle}s > {DOCTOR_INTERVAL}s"
+        print(f"  AUTO-SPAWNED: Doctor ({reason})")
+    else:
+        print(f"  Doctor: running (idle {doctor_idle}s)")
 ```
 
 ### Graceful Shutdown
@@ -783,6 +815,7 @@ Print status after each iteration showing ALL autonomous decisions:
     Hermit:    running (started: 5m ago)
     Guide:     running (idle 8m, interval: 15m)
     Champion:  running (idle 3m, interval: 10m)
+    Doctor:    running (idle 2m, interval: 5m)
 
   SESSION STATS:
     Issues completed: 3
@@ -1103,6 +1136,7 @@ SUPPORT ROLES (auto-managed):
   Hermit:    running [task:ghi789] (started: 5m ago)
   Guide:     running [task:jkl012] (idle 8m, interval: 15m)
   Champion:  running [task:mno345] (idle 3m, interval: 10m)
+  Doctor:    running [task:pqr678] (idle 2m, interval: 5m)
 
 SESSION STATS:
   Issues completed: 3
@@ -1120,6 +1154,7 @@ AUTONOMOUS DECISIONS (no human required):
   ✓ Hermit triggering (when backlog < 3)
   ✓ Guide respawning (every 15m)
   ✓ Champion respawning (every 10m)
+  ✓ Doctor respawning (every 5m)
 
 HUMAN ACTIONS (when you want to):
   - Approve proposals: gh issue edit N --add-label loom:issue
