@@ -100,7 +100,7 @@ Interact with the Loom application UI and state:
 
 ## Slash Commands
 
-The `commands/` directory contains slash commands that invoke Loom roles. Each command instructs Claude to assume a specific role defined in `.loom/roles/`.
+The `commands/` directory contains slash commands that define Loom roles. Each command file contains the complete role definition - there's no indirection to separate role files.
 
 ### Available Commands
 
@@ -123,10 +123,10 @@ The `commands/` directory contains slash commands that invoke Loom roles. Each c
 /judge      # Assume Judge role, review a PR with loom:review-requested
 ```
 
-Each slash command tells Claude to:
-1. Read the role definition from `.loom/roles/<role>.md`
-2. Follow the role's workflow guidelines
-3. Complete ONE iteration of the role's task
+Each slash command contains the complete role definition, including:
+1. The role's purpose and responsibilities
+2. Workflow guidelines and label transitions
+3. Instructions for completing ONE iteration of the role's task
 
 ### Agent Roles in Workflow
 
@@ -146,11 +146,11 @@ The roles work together following the label-based workflow:
 
 To create a custom slash command:
 
-1. Create `.claude/commands/your-command.md`
-2. Reference a role file or write custom instructions
+1. Create `.claude/commands/your-command.md` with the complete role definition
+2. Include role purpose, workflow guidelines, and iteration instructions
 3. Use it with `/your-command`
 
-See `.loom/roles/README.md` for creating custom role definitions.
+**Note**: `.loom/roles/` contains symlinks to `.claude/commands/` for Tauri App compatibility. The single source of truth for all role definitions is `.claude/commands/`.
 
 ## Documentation
 

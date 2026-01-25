@@ -1,61 +1,55 @@
 # Loom Role Definitions
 
-This directory contains role definition templates for different terminal roles in Loom.
+This directory contains role definitions for Loom terminal configurations.
 
 ## Source of Truth
 
-**This directory is the single source of truth for all Loom role definitions.**
+**The single source of truth for all Loom role definitions is `.claude/commands/*.md`.**
 
-- **Edit role files HERE** (in `defaults/roles/*.md` or `.loom/roles/*.md`)
-- Slash commands (`.claude/commands/*.md`) reference these role files directly
+This directory contains:
+- **Symlinks** (`*.md`) pointing to `../.claude/commands/*.md` for Tauri App compatibility
+- **Metadata files** (`*.json`) with default settings for each role
 
-## Available Prompts
+### Why Symlinks?
 
-Each prompt consists of two files:
-- **`.md`** - The role definition text (markdown format)
-- **`.json`** - Metadata with default settings (optional)
+- **Claude Code CLI** uses `.claude/commands/` for slash commands (e.g., `/builder`, `/loom`)
+- **Tauri App** reads role files from `.loom/roles/` for terminal configuration
+- Symlinks ensure both access the same content - single source of truth
 
-### Prompt Roles
+### Editing Roles
 
-- **`default.md`** - Plain shell environment, no specialized role
-- **`worker.md`** - General development worker for features, bugs, and refactoring
-- **`reviewer.md`** - Code review specialist for thorough PR reviews
-- **`architect.md`** - System architecture and technical decision making
-- **`curator.md`** - Issue maintenance and quality improvement
-- **`critic.md`** - Critical analysis and architectural review specialist
-- **`fixer.md`** - Bug fixing and PR maintenance specialist
-- **`triage.md`** - Issue prioritization and focus management
+To edit a role definition:
+1. Edit the file in `.claude/commands/<role>.md`
+2. The symlink in `roles/<role>.md` automatically reflects changes
+3. Both CLI and Tauri App get the updated content
 
-## Usage
+## Available Roles
 
-When configuring a terminal role in the Terminal Settings modal, select a prompt file from the dropdown. The prompt will be loaded and the `{{workspace}}` variable will be replaced with your workspace path.
+| Role | Purpose | Autonomous |
+|------|---------|------------|
+| `architect` | System architecture proposals | 15min |
+| `builder` | Feature implementation | Manual |
+| `champion` | Proposal evaluation and PR auto-merge | 10min |
+| `curator` | Issue enhancement | 5min |
+| `doctor` | Bug fixes and PR feedback | Manual |
+| `driver` | Plain shell environment | Manual |
+| `guide` | Issue triage and prioritization | 15min |
+| `hermit` | Code simplification proposals | 15min |
+| `judge` | Code review | 5min |
+| `loom` | Layer 2 daemon orchestration | 1min |
+| `shepherd` | Layer 1 issue lifecycle orchestration | Manual |
 
-## Creating Custom Prompts
+## Metadata Files (*.json)
 
-You can add your own prompt files to `.loom/roles/` in any workspace. All `.md` files will automatically appear in the prompt selection dropdown.
+Each role can have an optional JSON metadata file with default settings:
 
-### Prompt File Structure
-
-Each prompt can have two files:
-
-**`my-prompt.md`** (required) - The role definition text
-```markdown
-# My Custom Role
-
-You are a specialist in {{workspace}} repository...
-
-## Your Role
-...
-```
-
-**`my-prompt.json`** (optional) - Metadata with default settings
 ```json
 {
-  "name": "My Custom Role",
-  "description": "Brief description of what this role does",
-  "defaultInterval": 300000,
-  "defaultIntervalPrompt": "The prompt to send at each interval...",
-  "autonomousRecommended": true,
+  "name": "Builder",
+  "description": "Implements features and fixes",
+  "defaultInterval": 0,
+  "defaultIntervalPrompt": "",
+  "autonomousRecommended": false,
   "suggestedWorkerType": "claude"
 }
 ```
@@ -69,24 +63,43 @@ You are a specialist in {{workspace}} repository...
 - **`autonomousRecommended`** (boolean): Whether autonomous mode is recommended
 - **`suggestedWorkerType`** (string): "claude" or "codex"
 
-When a user selects a prompt from the dropdown, if a metadata file exists, the form fields will be pre-populated with these defaults.
+## Creating Custom Roles
+
+To create a custom role:
+
+1. Create `.claude/commands/my-role.md` with the full role definition
+2. Optionally create `roles/my-role.json` with metadata
+3. Use it via `/my-role` in CLI or select in Tauri App terminal settings
+
+### Role File Structure
+
+```markdown
+# My Custom Role
+
+You are a specialist in {{workspace}} repository...
+
+## Your Role
+- Primary responsibility
+- Secondary responsibility
+
+## Workflow
+1. First step
+2. Second step
+
+## Guidelines
+- Best practices
+- Working style
+```
 
 ### Template Variables
 
 - `{{workspace}}` - Replaced with the absolute path to the workspace directory
 
-### Prompt Structure
+## Default vs Workspace Roles
 
-A good prompt should include:
+When installed to a target repository:
+- `defaults/.claude/commands/*.md` → copied to `.claude/commands/`
+- `defaults/roles/*.md` (symlinks) → copied as files to `.loom/roles/`
+- `defaults/roles/*.json` → copied to `.loom/roles/`
 
-1. **Role Definition**: Clear description of the terminal's purpose
-2. **Responsibilities**: What tasks this role handles
-3. **Guidelines**: Best practices and working style
-4. **Examples**: Sample workflows or outputs (when helpful)
-
-## Default vs Workspace Prompts
-
-- **`defaults/roles/`** (this directory): Committed to git, serves as examples and fallbacks
-- **`.loom/roles/`** (in each workspace): Gitignored, workspace-specific customizations
-
-When a prompt file exists in both locations, the workspace version takes precedence.
+The installation process dereferences symlinks, so target repos get regular files (not symlinks).
