@@ -167,7 +167,7 @@ Run the Loom daemon for fully autonomous system orchestration.
 # 1. Monitor system state every 60 seconds
 # 2. Trigger Architect/Hermit when backlog is low
 # 3. Spawn shepherds for ready issues
-# 4. Ensure Guide and Champion keep running
+# 4. Ensure Guide, Champion, and Doctor keep running
 ```
 
 **Example daemon workflow**:
@@ -177,7 +177,7 @@ Daemon Loop:
   ├── Generate: Trigger Architect (backlog < threshold)
   ├── Scale: Spawn shepherd-1 for issue #123
   ├── Scale: Spawn shepherd-2 for issue #456
-  ├── Ensure: Guide running, Champion running
+  ├── Ensure: Guide running, Champion running, Doctor running
   └── Sleep 60s, repeat
 
 Shepherd-1 (issue #123):
@@ -551,6 +551,7 @@ The Loom daemon uses these configuration parameters:
 | terminal-hermit | hermit.md | Simplification proposals |
 | terminal-guide | guide.md | Backlog triage (always running) |
 | terminal-champion | champion.md | Auto-merge (always running) |
+| terminal-doctor | doctor.md | PR conflict resolution (always running) |
 
 ### Custom Roles
 
