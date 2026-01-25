@@ -1,4 +1,4 @@
-use crate::activity::ActivityEntry;
+use crate::activity::{ActivityEntry, ClaimResult, ClaimsSummary, ClaimType, IssueClaim};
 use serde::{Deserialize, Serialize};
 
 pub type TerminalId = String;
@@ -61,6 +61,57 @@ pub enum Request {
     GetCurrentCommit {
         working_dir: String,
     },
+    // ========================================================================
+    // Issue Claim Registry Requests (Issue #1159)
+    // ========================================================================
+    /// Claim an issue or PR for a terminal
+    ClaimIssue {
+        number: i32,
+        claim_type: ClaimType,
+        terminal_id: TerminalId,
+        label: Option<String>,
+        agent_role: Option<String>,
+        /// Stale threshold in seconds (default: 3600 = 1 hour)
+        stale_threshold_secs: Option<i64>,
+    },
+    /// Release a claim on an issue or PR
+    ReleaseClaim {
+        number: i32,
+        claim_type: ClaimType,
+        /// Only release if owned by this terminal
+        terminal_id: Option<TerminalId>,
+    },
+    /// Update heartbeat for an active claim
+    HeartbeatClaim {
+        number: i32,
+        claim_type: ClaimType,
+        terminal_id: TerminalId,
+    },
+    /// Get a specific claim
+    GetClaim {
+        number: i32,
+        claim_type: ClaimType,
+    },
+    /// Get all claims for a terminal
+    GetTerminalClaims {
+        terminal_id: TerminalId,
+    },
+    /// Get all active claims
+    GetAllClaims,
+    /// Get claims summary
+    GetClaimsSummary {
+        /// Stale threshold in seconds (default: 3600 = 1 hour)
+        stale_threshold_secs: Option<i64>,
+    },
+    /// Release all stale claims (crash recovery)
+    ReleaseStaleCliams {
+        /// Stale threshold in seconds (default: 3600 = 1 hour)
+        stale_threshold_secs: Option<i64>,
+    },
+    /// Release all claims for a terminal
+    ReleaseTerminalClaims {
+        terminal_id: TerminalId,
+    },
     Shutdown,
 }
 
@@ -101,6 +152,21 @@ pub enum Response {
         files_changed: i32,
         lines_added: i32,
         lines_removed: i32,
+    },
+    // ========================================================================
+    // Issue Claim Registry Responses (Issue #1159)
+    // ========================================================================
+    /// Result of claiming an issue
+    ClaimResult(ClaimResult),
+    /// A specific claim
+    Claim(Option<IssueClaim>),
+    /// List of claims
+    Claims(Vec<IssueClaim>),
+    /// Claims summary
+    ClaimsSummary(ClaimsSummary),
+    /// Count of claims released
+    ClaimsReleased {
+        count: usize,
     },
     Success,
     Error {
