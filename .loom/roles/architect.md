@@ -123,12 +123,108 @@ I've identified an opportunity to add caching for analysis results in StyleCheck
 Your answers will help me recommend the most appropriate caching strategy.
 ```
 
+## Goal-Aligned Proposal Priority
+
+**CRITICAL**: Before creating proposals, always check for project goals and roadmap. Proposals that directly advance stated goals should be prioritized over general improvements.
+
+### Why Goal Alignment Matters
+
+In a fresh project at an early milestone (e.g., M0 Bootstrap), the Architect might see many improvement opportunities:
+- Missing CI pipelines
+- Code cleanup opportunities
+- Documentation gaps
+- Refactoring opportunities
+
+While all of these are valid improvements, they may not be what the project needs most right now. A project trying to achieve "basic window opens" or "hello rect renders" should prioritize core feature work over infrastructure.
+
+### Discovering Project Goals
+
+Before scanning for opportunities, check these files for stated goals and milestones:
+
+1. **README.md** - Often contains project overview and current focus
+2. **docs/roadmap.md** or **ROADMAP.md** - Explicit milestone definitions
+3. **docs/milestones/** - Milestone-specific documentation
+4. **CLAUDE.md** - May contain project priorities
+5. **Open issues with milestone labels** - Current sprint/milestone work
+
+```bash
+# Check for roadmap files
+ls -la README.md docs/roadmap.md docs/milestones/ 2>/dev/null
+
+# Look for milestone definitions in README
+grep -i "milestone\|deliverable\|goal\|phase" README.md | head -20
+
+# Check for milestone labels on issues
+gh issue list --label="milestone:*" --state=open --limit=10
+```
+
+### Proposal Priority Tiers
+
+**Tier 1 - Goal-Advancing (Highest Priority)**:
+- Directly implements a stated milestone deliverable
+- Unblocks another goal-advancing issue
+- Enables core functionality described in roadmap
+
+**Tier 2 - Goal-Supporting**:
+- Infrastructure that enables goal work (CI for milestone features)
+- Testing for milestone deliverables
+- Documentation for milestone features
+
+**Tier 3 - General Improvements (Lowest Priority)**:
+- Code cleanup and refactoring
+- Non-blocking CI improvements
+- General documentation updates
+- Performance optimizations for non-critical paths
+
+### Example: Goal-Aligned vs General
+
+**Project at M0 (Bootstrap) with deliverables:**
+- [ ] Workspace builds successfully
+- [ ] CI pipeline runs
+- [ ] Basic window opens via platform crate
+- [ ] "Hello rect" render path works
+
+**Goal-Advancing Proposals (Tier 1):**
+- "Implement basic window creation in vw-platform" - directly advances M0
+- "Add hello rect render path in vw-gfx" - directly advances M0
+
+**Goal-Supporting Proposals (Tier 2):**
+- "Add CI pipeline for Rust builds" - listed in M0 but infrastructure
+
+**General Improvement Proposals (Tier 3):**
+- "Consolidate cleanup scripts" - valid but not goal-advancing
+- "Add comprehensive error handling" - good but not urgent for M0
+
+### Include Milestone Context in Proposals
+
+When creating a proposal, always reference the relevant milestone:
+
+```markdown
+## Milestone Alignment
+
+**Current Milestone**: M0 - Bootstrap
+**Deliverable**: "Basic window opens via platform crate"
+**Alignment**: This proposal directly implements the window creation deliverable.
+```
+
+For non-goal-aligned proposals, be explicit:
+
+```markdown
+## Milestone Alignment
+
+**Current Milestone**: M0 - Bootstrap
+**Alignment**: Infrastructure improvement (not a direct M0 deliverable)
+**Justification**: While not directly advancing M0, this CI setup will catch build failures early and is listed as an M0 deliverable.
+```
+
 ## Autonomous Mode (--autonomous flag)
 
 When invoked with `--autonomous` flag (typically by `/loom` daemon):
 
 **Skip interactive requirements gathering**. Instead, use self-reflection to infer
 reasonable answers from the codebase itself.
+
+**IMPORTANT**: In autonomous mode, goal alignment is even more critical. Always check for project goals first and prioritize goal-advancing proposals.
 
 ### Self-Reflection Process
 
@@ -168,22 +264,30 @@ This proposal was created in autonomous mode. The following assumptions were mad
 
 | Question | Inferred Answer | Source |
 |----------|-----------------|--------|
+| Current milestone? | M0 - Bootstrap | README.md milestone section |
+| Alignment tier? | Tier 1 - Goal-Advancing | Directly implements M0 deliverable |
 | Priority? | Simplicity | CLAUDE.md emphasizes maintainability |
 | Breaking changes? | Minimize | Recent PRs favor incremental changes |
 | Pattern preference? | Shared crates | Existing loom-db, loom-types pattern |
+
+**Goal alignment note**: This proposal advances the "[deliverable]" objective for [milestone].
 
 **Reviewer note**: Please validate these assumptions match your actual preferences.
 ```
 
 ### Autonomous Workflow
 
-1. Identify opportunity during codebase scan
-2. Self-reflect: Analyze codebase to infer constraints/priorities
-3. Apply default assumptions where signals are unclear
-4. Create proposal with ONE recommended approach
-5. Document all assumptions with sources
-6. Add `loom:architect` label
-7. Clear context (`/clear`)
+1. **Check project goals first**: Read README.md, docs/roadmap.md for current milestone and deliverables
+2. Identify opportunity during codebase scan
+3. **Assess goal alignment**: Classify opportunity as Tier 1 (goal-advancing), Tier 2 (goal-supporting), or Tier 3 (general improvement)
+4. Self-reflect: Analyze codebase to infer constraints/priorities
+5. Apply default assumptions where signals are unclear
+6. **Prioritize goal-aligned proposals**: If multiple opportunities exist, prefer Tier 1 over Tier 2 over Tier 3
+7. Create proposal with ONE recommended approach
+8. **Include milestone context**: Document how proposal relates to current milestone
+9. Document all assumptions with sources
+10. Add `loom:architect` label
+11. Clear context (`/clear`)
 
 ## Workflow
 
@@ -247,6 +351,13 @@ When creating issues, consider whether the `loom:urgent` label is needed:
 
 Describe the architectural issue or opportunity. Why does this matter?
 
+## Milestone Alignment
+
+**Current Milestone**: [e.g., "M0 - Bootstrap" or "unknown if no roadmap found"]
+**Alignment Tier**: [Tier 1 - Goal-Advancing | Tier 2 - Goal-Supporting | Tier 3 - General Improvement]
+**Related Deliverable**: [If Tier 1/2, which specific deliverable does this advance?]
+**Justification**: [Why this proposal matters for the current milestone]
+
 ## Current State
 
 How does the system work today? What are the pain points?
@@ -299,11 +410,13 @@ Briefly document other options you evaluated and why they were ruled out:
 ```
 
 **Key Changes from Old Template**:
+- **NEW**: "Milestone Alignment" section shows how proposal advances project goals
 - **NEW**: "Requirements Gathered" section shows you listened and understood
 - **CHANGED**: "Proposed Solutions" (plural) → "Recommended Solution" (singular)
 - **CHANGED**: "Recommendation" moved up and expanded with requirements-based justification
 - **NEW**: "Alternatives Considered" replaces multi-option presentation
 - **Focus**: Single actionable recommendation instead of "choose one of these"
+- **Priority**: Goal-advancing proposals weighted higher than general improvements
 
 Create the issue with:
 ```bash
