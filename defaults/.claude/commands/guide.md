@@ -121,24 +121,38 @@ Sometimes issues are completed but stay open because PRs didn't use the magic ke
 
 **1. Check for Orphaned `loom:building` Issues**
 
-Use the stale-building-check script to find and recover orphaned issues:
+**ALWAYS run stale detection with `--recover` to automatically fix orphaned issues:**
 
 ```bash
-# Check for stale building issues (dry run)
-./.loom/scripts/stale-building-check.sh --verbose
-
-# Auto-recover stale issues (resets to loom:issue)
+# Proactively recover stale issues (recommended - run every triage cycle)
 ./.loom/scripts/stale-building-check.sh --recover
+
+# Check for stale building issues (dry run, for investigation)
+./.loom/scripts/stale-building-check.sh --verbose
 
 # JSON output for automation
 ./.loom/scripts/stale-building-check.sh --json
 ```
 
-The script automatically:
-- Finds issues with `loom:building` but no active PRs
-- Flags issues stale after 2 hours (configurable via `STALE_THRESHOLD_HOURS`)
-- With `--recover`, resets stale issues to `loom:issue` for re-claiming
-- Flags issues with stale PRs (>24h) but doesn't auto-recover them
+The script detects orphaned work by cross-referencing three sources:
+1. **GitHub labels**: Issues with `loom:building` label
+2. **Worktree existence**: `.loom/worktrees/issue-N` directories
+3. **Open PRs**: PRs referencing the issue (via branch name or body)
+
+**Detection cases and actions:**
+
+| Case | Condition | Auto-Recovery Action |
+|------|-----------|---------------------|
+| `no_pr` | `loom:building` but no worktree and no PR (>2h) | Reset to `loom:issue` |
+| `blocked_pr` | Has PR with `loom:changes-requested` label | Transition to `loom:blocked` |
+| `stale_pr` | Has PR but no activity for >24h | Flag only (needs manual review) |
+
+**Why proactive recovery matters:**
+
+Without stale detection, orphaned `loom:building` labels cause:
+- False capacity signals (daemon thinks work is happening)
+- Pipeline stalls (no new work gets picked up)
+- Silent failures (no alerts or recovery)
 
 **Manual verification** (if script not available):
 
@@ -146,11 +160,18 @@ The script automatically:
 # Get all loom:building issues
 gh issue list --label "loom:building" --state open --json number,title
 
-# For each issue, check if there's an active PR
+# For each issue, check:
+# 1. Worktree exists?
+ls -la .loom/worktrees/issue-NUMBER 2>/dev/null
+
+# 2. PR exists?
 gh pr list --search "issue-NUMBER in:body OR issue NUMBER in:body" --state open
+
+# 3. Shepherd assigned? (if daemon running)
+jq '.shepherds | to_entries[] | select(.value.issue == NUMBER)' .loom/daemon-state.json
 ```
 
-**If no PR found and issue is old (>2 hours):**
+**If no worktree, no PR, and no shepherd (>2 hours):**
 - Run `--recover` to auto-reset, or manually:
 - Remove `loom:building` and add `loom:issue`
 - Comment explaining the recovery

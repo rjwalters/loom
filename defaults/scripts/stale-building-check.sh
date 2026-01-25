@@ -15,9 +15,14 @@
 #   STALE_WITH_PR_HOURS=24     # Hours before issue with stale PR is flagged
 #
 # Detection cases:
-#   1. no_pr       - Issue has loom:building but no associated PR (recoverable)
+#   1. no_pr       - Issue has loom:building but no worktree AND no PR (recoverable)
 #   2. stale_pr    - Issue has PR but no activity for >24h (flagged, not auto-recovered)
 #   3. blocked_pr  - Issue has PR with loom:changes-requested label (transitions to loom:blocked)
+#
+# Detection sources (cross-referenced):
+#   - GitHub labels: Issues with loom:building label
+#   - Worktree existence: .loom/worktrees/issue-N directories
+#   - Open PRs: PRs referencing the issue via branch name or body
 
 set -euo pipefail
 
@@ -66,8 +71,13 @@ while [[ $# -gt 0 ]]; do
       echo "  STALE_THRESHOLD_HOURS    Hours before no-PR issue is stale (default: 2)"
       echo "  STALE_WITH_PR_HOURS      Hours before stale-PR issue is flagged (default: 24)"
       echo ""
+      echo "Detection sources (cross-referenced):"
+      echo "  - GitHub labels: Issues with loom:building label"
+      echo "  - Worktree existence: .loom/worktrees/issue-N directories"
+      echo "  - Open PRs: PRs referencing the issue via branch name or body"
+      echo ""
       echo "Detection cases:"
-      echo "  no_pr       Issue has loom:building but no associated PR"
+      echo "  no_pr       Issue has loom:building but no worktree AND no PR"
       echo "              → With --recover: transitions to loom:issue"
       echo "  stale_pr    Issue has PR but no activity for >24h"
       echo "              → Flagged only, requires manual review"
@@ -168,6 +178,14 @@ for i in $(seq 0 $((ISSUE_COUNT - 1))); do
 
   [[ "$VERBOSE" == "true" ]] && log_info "Checking #$NUMBER (updated ${AGE_HOURS}h ago)"
 
+  # Check if worktree exists for this issue
+  WORKTREE_PATH=".loom/worktrees/issue-$NUMBER"
+  HAS_WORKTREE=false
+  if [[ -d "$WORKTREE_PATH" ]]; then
+    HAS_WORKTREE=true
+    [[ "$VERBOSE" == "true" ]] && log_info "  Worktree exists: $WORKTREE_PATH"
+  fi
+
   # Check if there's an open PR for this issue
   # Search for PRs that reference this issue number in body or branch name
   OPEN_PR=$(echo "$OPEN_PRS" | jq --arg num "$NUMBER" \
@@ -177,9 +195,21 @@ for i in $(seq 0 $((ISSUE_COUNT - 1))); do
     )] | first // empty' 2>/dev/null || echo "")
 
   if [[ -z "$OPEN_PR" || "$OPEN_PR" == "null" ]]; then
-    # No open PR found
+    # No open PR found - but worktree might exist (work in progress)
     if [[ $AGE_SECS -gt $STALE_THRESHOLD_SECS ]]; then
-      log_warn "#$NUMBER: No PR found after ${AGE_HOURS}h - STALE"
+      # Only consider stale if BOTH no worktree AND no PR
+      if [[ "$HAS_WORKTREE" == "false" ]]; then
+        log_warn "#$NUMBER: No PR and no worktree after ${AGE_HOURS}h - STALE"
+      else
+        # Worktree exists but no PR - work may be in progress, use longer threshold
+        EXTENDED_THRESHOLD=$((STALE_THRESHOLD_SECS * 2))
+        if [[ $AGE_SECS -gt $EXTENDED_THRESHOLD ]]; then
+          log_warn "#$NUMBER: Worktree exists but no PR after ${AGE_HOURS}h - STALE (extended)"
+        else
+          [[ "$VERBOSE" == "true" ]] && log_info "#$NUMBER: Worktree exists, waiting for PR (${AGE_HOURS}h)"
+          continue
+        fi
+      fi
 
       if [[ "$RECOVER" == "true" ]]; then
         log_info "Recovering #$NUMBER..."
@@ -205,10 +235,10 @@ This issue is now ready to be claimed by another agent."
         log_success "Recovered #$NUMBER"
       fi
 
-      # Add to stale list
+      # Add to stale list (include worktree status)
       CURRENT=$(cat "$STALE_FILE")
-      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "no_pr" \
-        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": false}]' > "$STALE_FILE"
+      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "no_pr" --argjson has_worktree "$HAS_WORKTREE" \
+        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": false, "has_worktree": $has_worktree}]' > "$STALE_FILE"
     fi
   else
     # Has open PR - check various blocked states
@@ -250,16 +280,16 @@ This issue's PR #$PR_NUMBER has been marked \`loom:changes-requested\`, indicati
 
       # Add to stale list with blocked_pr reason
       CURRENT=$(cat "$STALE_FILE")
-      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "blocked_pr" --arg pr "$PR_NUMBER" \
-        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": true, "pr_number": ($pr | tonumber)}]' > "$STALE_FILE"
+      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "blocked_pr" --arg pr "$PR_NUMBER" --argjson has_worktree "$HAS_WORKTREE" \
+        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": true, "pr_number": ($pr | tonumber), "has_worktree": $has_worktree}]' > "$STALE_FILE"
     elif [[ -n "$PR_NUMBER" && $AGE_SECS -gt $STALE_WITH_PR_SECS ]]; then
       # PR exists but is stale (no activity)
       log_warn "#$NUMBER: PR #$PR_NUMBER exists but no progress for ${AGE_HOURS}h"
 
       # Don't auto-recover issues with stale PRs - they need manual review
       CURRENT=$(cat "$STALE_FILE")
-      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "stale_pr" --arg pr "$PR_NUMBER" \
-        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": true, "pr_number": ($pr | tonumber)}]' > "$STALE_FILE"
+      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "stale_pr" --arg pr "$PR_NUMBER" --argjson has_worktree "$HAS_WORKTREE" \
+        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": true, "pr_number": ($pr | tonumber), "has_worktree": $has_worktree}]' > "$STALE_FILE"
     else
       [[ "$VERBOSE" == "true" ]] && log_success "#$NUMBER: Has active PR #$PR_NUMBER"
     fi
