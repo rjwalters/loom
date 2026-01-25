@@ -178,6 +178,48 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
 
 **IMPORTANT**: Task subagents don't automatically interpret slash commands (like `/shepherd`) as Skill invocations. They see the prompt as plain text. You MUST explicitly instruct the subagent to use the Skill tool with `Skill(skill="...", args="...")` syntax.
 
+### Task Spawn Verification
+
+After spawning a Task subagent, you MUST verify the task actually started before recording its task_id in daemon-state.json. This prevents recording invalid task IDs that would cause spurious "completed" detections.
+
+```python
+def verify_task_spawn(result, description="task"):
+    """Verify a Task spawn succeeded by checking TaskOutput immediately.
+
+    Args:
+        result: The result object from Task() call containing task_id
+        description: Human-readable description for logging
+
+    Returns:
+        True if task verified running, False if spawn failed
+    """
+    if not result or not result.task_id:
+        print(f"  SPAWN FAILED: {description} - no task_id returned")
+        return False
+
+    try:
+        # Non-blocking check - just verify task exists
+        check = TaskOutput(task_id=result.task_id, block=False, timeout=1000)
+        # If we get here without exception, task exists
+        # Status can be "running", "completed", or "failed"
+        if check.status in ["running", "completed"]:
+            return True
+        elif check.status == "failed":
+            print(f"  SPAWN FAILED: {description} - task immediately failed")
+            return False
+    except Exception as e:
+        print(f"  SPAWN FAILED: {description} - verification error: {e}")
+        return False
+
+    return True
+```
+
+**Why verify spawns?**
+- Task() can return a task_id even when the underlying spawn fails
+- Recording invalid task_ids pollutes daemon-state.json
+- Invalid task_ids cause `TaskOutput` to report "completed" spuriously
+- This leads to incorrect shepherd completion detection and state corruption
+
 ## Iteration Mode (`/loom iterate`)
 
 When invoked with `iterate`, execute exactly ONE daemon iteration with fresh context, then return a compact summary.
@@ -266,6 +308,7 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `stuck=N` - Stuck agents detected (if any)
 - `completed=#N` - Issue completed this iteration (if any)
 - `recovered=N` - Stale building issues recovered (if any)
+- `spawn-fail=N` - Task spawns that failed verification (if any)
 
 **Example summaries:**
 ```
@@ -273,6 +316,7 @@ ready=5 building=2 shepherds=2/3
 ready=3 building=3 shepherds=3/3 +shepherd=#456 completed=#123
 ready=0 building=1 shepherds=1/3 +architect +hermit
 ready=2 building=2 shepherds=2/3 stuck=1
+ready=2 building=2 shepherds=2/3 spawn-fail=1
 SHUTDOWN_SIGNAL
 ```
 
@@ -436,7 +480,7 @@ def auto_spawn_shepherds():
         # Spawn shepherd subagent
         # NOTE: We must explicitly instruct the subagent to use the Skill tool
         # because Task subagents don't automatically interpret slash commands.
-        Task(
+        result = Task(
             description=f"Shepherd issue #{issue}",
             prompt=f"""Execute the shepherd workflow by invoking the Skill tool:
 
@@ -446,11 +490,17 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
             run_in_background=True
         )
 
-        # Record in state
-        save_shepherd_assignment(issue, task_id, output_file)
+        # IMPORTANT: Verify spawn succeeded before recording task_id
+        if not verify_task_spawn(result, f"shepherd for #{issue}"):
+            # Revert labels on spawn failure so issue returns to ready pool
+            gh issue edit {issue} --remove-label "loom:building" --add-label "loom:issue"
+            continue
+
+        # Record in state (only after verification)
+        save_shepherd_assignment(issue, result.task_id, result.output_file)
         active_count += 1
 
-        print(f"AUTO-SPAWNED shepherd for issue #{issue}")
+        print(f"AUTO-SPAWNED shepherd for issue #{issue} (verified)")
 ```
 
 ### Work Generation (Automatic)
@@ -466,7 +516,7 @@ def auto_generate_work():
     if ready_count < ISSUE_THRESHOLD:  # Default: 3
         # Trigger Architect if cooldown elapsed and < 2 proposals pending
         if architect_cooldown_ok() and architect_proposals < 2:
-            Task(
+            result = Task(
                 description="Architect work generation",
                 prompt="""Execute the architect role by invoking the Skill tool:
 
@@ -475,12 +525,15 @@ Skill(skill="architect", args="--autonomous")
 Complete one work generation iteration.""",
                 run_in_background=True
             )
-            update_last_architect_trigger()
-            print("AUTO-TRIGGERED Architect (backlog low)")
+            # Verify spawn before recording
+            if verify_task_spawn(result, "Architect"):
+                record_support_role("architect", result.task_id, result.output_file)
+                update_last_architect_trigger()
+                print("AUTO-TRIGGERED Architect (backlog low, verified)")
 
         # Trigger Hermit if cooldown elapsed and < 2 proposals pending
         if hermit_cooldown_ok() and hermit_proposals < 2:
-            Task(
+            result = Task(
                 description="Hermit simplification proposals",
                 prompt="""Execute the hermit role by invoking the Skill tool:
 
@@ -489,8 +542,11 @@ Skill(skill="hermit")
 Complete one simplification analysis iteration.""",
                 run_in_background=True
             )
-            update_last_hermit_trigger()
-            print("AUTO-TRIGGERED Hermit (backlog low)")
+            # Verify spawn before recording
+            if verify_task_spawn(result, "Hermit"):
+                record_support_role("hermit", result.task_id, result.output_file)
+                update_last_hermit_trigger()
+                print("AUTO-TRIGGERED Hermit (backlog low, verified)")
 ```
 
 ### Support Role Management (Automatic)
@@ -502,7 +558,7 @@ The daemon AUTOMATICALLY ensures Guide, Champion, and Doctor keep running:
 def auto_ensure_support_roles():
     # Guide - backlog triage (runs every 15 min)
     if not guide_is_running() or guide_idle_time() > GUIDE_INTERVAL:
-        Task(
+        result = Task(
             description="Guide backlog triage",
             prompt="""Execute the guide role by invoking the Skill tool:
 
@@ -511,11 +567,14 @@ Skill(skill="guide")
 Complete one triage iteration.""",
             run_in_background=True
         )
-        print("AUTO-SPAWNED Guide")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Guide"):
+            record_support_role("guide", result.task_id, result.output_file)
+            print("AUTO-SPAWNED Guide (verified)")
 
     # Champion - PR merging (runs every 10 min)
     if not champion_is_running() or champion_idle_time() > CHAMPION_INTERVAL:
-        Task(
+        result = Task(
             description="Champion PR merge",
             prompt="""Execute the champion role by invoking the Skill tool:
 
@@ -524,11 +583,14 @@ Skill(skill="champion")
 Complete one PR evaluation and merge iteration.""",
             run_in_background=True
         )
-        print("AUTO-SPAWNED Champion")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Champion"):
+            record_support_role("champion", result.task_id, result.output_file)
+            print("AUTO-SPAWNED Champion (verified)")
 
     # Doctor - PR conflict resolution (runs every 5 min)
     if not doctor_is_running() or doctor_idle_time() > DOCTOR_INTERVAL:
-        Task(
+        result = Task(
             description="Doctor PR conflict resolution",
             prompt="""Execute the doctor role by invoking the Skill tool:
 
@@ -537,7 +599,10 @@ Skill(skill="doctor")
 Complete one PR conflict resolution iteration.""",
             run_in_background=True
         )
-        print("AUTO-SPAWNED Doctor")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Doctor"):
+            record_support_role("doctor", result.task_id, result.output_file)
+            print("AUTO-SPAWNED Doctor (verified)")
 ```
 
 ### Checking Subagent Status (Non-blocking)
@@ -971,6 +1036,7 @@ def auto_spawn_shepherds(debug_mode=False):
     debug(f"Issue selection: {len(ready_issues)} ready issues, {active_count}/{MAX_SHEPHERDS} shepherds active")
 
     spawned = 0
+    spawn_failures = 0
     while active_count < MAX_SHEPHERDS and len(ready_issues) > 0:
         issue = ready_issues.pop(0)  # Highest priority issue
 
@@ -998,18 +1064,32 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
             run_in_background=True
         )
 
+        # Verify the task actually started before recording
+        if not verify_task_spawn(result, f"shepherd for #{issue}"):
+            debug(f"Spawn verification failed for #{issue}, reverting labels")
+            # Revert the label change so the issue can be retried
+            gh issue edit {issue} --remove-label "loom:building" --add-label "loom:issue"
+            spawn_failures += 1
+            add_warning(
+                "spawn_failed",
+                f"Shepherd spawn for #{issue} failed verification",
+                severity="warning",
+                context={"issue": issue, "task_id": result.task_id if result else None}
+            )
+            continue
+
         # Debug: Show spawn details
-        debug(f"Spawning decision: shepherd assigned to #{issue}")
+        debug(f"Spawning decision: shepherd assigned to #{issue} (verified)")
         debug(f"  Task ID: {result.task_id}")
         debug(f"  Output file: {result.output_file}")
         debug(f"  Command: /shepherd {issue} --force-pr")
 
-        # Record assignment
+        # Record assignment (only after verification)
         record_shepherd_assignment(issue, result.task_id, result.output_file)
         active_count += 1
         spawned += 1
 
-        print(f"  AUTO-SPAWNED: shepherd for issue #{issue}")
+        print(f"  AUTO-SPAWNED: shepherd for issue #{issue} (verified)")
 
     if spawned == 0 and len(ready_issues) == 0:
         print(f"  Shepherds: {active_count}/{MAX_SHEPHERDS} active, no ready issues")
@@ -1017,6 +1097,11 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
     elif spawned == 0:
         print(f"  Shepherds: {active_count}/{MAX_SHEPHERDS} active (at capacity)")
         debug(f"No shepherds spawned: at capacity ({MAX_SHEPHERDS} max)")
+
+    if spawn_failures > 0:
+        print(f"  WARNING: {spawn_failures} shepherd spawn(s) failed verification")
+
+    return {"spawned": spawned, "failures": spawn_failures}
 ```
 
 ### Step 5 Detail: Auto-Generate Work
@@ -1055,10 +1140,15 @@ Skill(skill="architect", args="--autonomous")
 Complete one work generation iteration.""",
             run_in_background=True
         )
-        record_support_role("architect", result.task_id, result.output_file)
-        update_last_trigger("architect")
-        print(f"    AUTO-TRIGGERED: Architect (proposals={architect_proposals}, cooldown ok)")
-        debug(f"Architect spawned: task_id={result.task_id}, output={result.output_file}")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Architect"):
+            record_support_role("architect", result.task_id, result.output_file)
+            update_last_trigger("architect")
+            print(f"    AUTO-TRIGGERED: Architect (proposals={architect_proposals}, cooldown ok, verified)")
+            debug(f"Architect spawned: task_id={result.task_id}, output={result.output_file}")
+        else:
+            print(f"    AUTO-TRIGGERED: Architect FAILED verification")
+            debug(f"Architect spawn failed verification, not recording task_id")
     else:
         reason = f"proposals={architect_proposals}" if architect_proposals >= MAX_ARCHITECT_PROPOSALS else f"cooldown={ARCHITECT_COOLDOWN - architect_elapsed}s remaining"
         print(f"    Architect: skipped ({reason})")
@@ -1080,10 +1170,15 @@ Skill(skill="hermit")
 Complete one simplification analysis iteration.""",
             run_in_background=True
         )
-        record_support_role("hermit", result.task_id, result.output_file)
-        update_last_trigger("hermit")
-        print(f"    AUTO-TRIGGERED: Hermit (proposals={hermit_proposals}, cooldown ok)")
-        debug(f"Hermit spawned: task_id={result.task_id}, output={result.output_file}")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Hermit"):
+            record_support_role("hermit", result.task_id, result.output_file)
+            update_last_trigger("hermit")
+            print(f"    AUTO-TRIGGERED: Hermit (proposals={hermit_proposals}, cooldown ok, verified)")
+            debug(f"Hermit spawned: task_id={result.task_id}, output={result.output_file}")
+        else:
+            print(f"    AUTO-TRIGGERED: Hermit FAILED verification")
+            debug(f"Hermit spawn failed verification, not recording task_id")
     else:
         reason = f"proposals={hermit_proposals}" if hermit_proposals >= MAX_HERMIT_PROPOSALS else f"cooldown={HERMIT_COOLDOWN - hermit_elapsed}s remaining"
         print(f"    Hermit: skipped ({reason})")
@@ -1118,10 +1213,15 @@ Skill(skill="guide")
 Complete one triage iteration.""",
             run_in_background=True
         )
-        record_support_role("guide", result.task_id, result.output_file)
-        reason = "not running" if not guide_running else f"idle {guide_idle}s > {GUIDE_INTERVAL}s"
-        print(f"  AUTO-SPAWNED: Guide ({reason})")
-        debug(f"Guide spawned: task_id={result.task_id}, output={result.output_file}")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Guide"):
+            record_support_role("guide", result.task_id, result.output_file)
+            reason = "not running" if not guide_running else f"idle {guide_idle}s > {GUIDE_INTERVAL}s"
+            print(f"  AUTO-SPAWNED: Guide ({reason}, verified)")
+            debug(f"Guide spawned: task_id={result.task_id}, output={result.output_file}")
+        else:
+            print(f"  SPAWN FAILED: Guide - verification failed")
+            debug(f"Guide spawn failed verification, not recording task_id")
     else:
         print(f"  Guide: running (idle {guide_idle}s)")
 
@@ -1141,10 +1241,15 @@ Skill(skill="champion")
 Complete one PR evaluation and merge iteration.""",
             run_in_background=True
         )
-        record_support_role("champion", result.task_id, result.output_file)
-        reason = "not running" if not champion_running else f"idle {champion_idle}s > {CHAMPION_INTERVAL}s"
-        print(f"  AUTO-SPAWNED: Champion ({reason})")
-        debug(f"Champion spawned: task_id={result.task_id}, output={result.output_file}")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Champion"):
+            record_support_role("champion", result.task_id, result.output_file)
+            reason = "not running" if not champion_running else f"idle {champion_idle}s > {CHAMPION_INTERVAL}s"
+            print(f"  AUTO-SPAWNED: Champion ({reason}, verified)")
+            debug(f"Champion spawned: task_id={result.task_id}, output={result.output_file}")
+        else:
+            print(f"  SPAWN FAILED: Champion - verification failed")
+            debug(f"Champion spawn failed verification, not recording task_id")
     else:
         print(f"  Champion: running (idle {champion_idle}s)")
 
@@ -1164,10 +1269,15 @@ Skill(skill="doctor")
 Complete one PR conflict resolution iteration.""",
             run_in_background=True
         )
-        record_support_role("doctor", result.task_id, result.output_file)
-        reason = "not running" if not doctor_running else f"idle {doctor_idle}s > {DOCTOR_INTERVAL}s"
-        print(f"  AUTO-SPAWNED: Doctor ({reason})")
-        debug(f"Doctor spawned: task_id={result.task_id}, output={result.output_file}")
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Doctor"):
+            record_support_role("doctor", result.task_id, result.output_file)
+            reason = "not running" if not doctor_running else f"idle {doctor_idle}s > {DOCTOR_INTERVAL}s"
+            print(f"  AUTO-SPAWNED: Doctor ({reason}, verified)")
+            debug(f"Doctor spawned: task_id={result.task_id}, output={result.output_file}")
+        else:
+            print(f"  SPAWN FAILED: Doctor - verification failed")
+            debug(f"Doctor spawn failed verification, not recording task_id")
     else:
         print(f"  Doctor: running (idle {doctor_idle}s)")
 ```
