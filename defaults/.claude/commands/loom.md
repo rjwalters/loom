@@ -1070,6 +1070,12 @@ def graceful_shutdown():
         print(f"  Warning: {remaining} shepherds did not exit within timeout")
         print(f"  These shepherds will continue in background and exit at next phase boundary")
 
+    # ═══════════════════════════════════════════════════════════════
+    # SESSION REFLECTION - Identify improvements before exit
+    # ═══════════════════════════════════════════════════════════════
+    print("  Running session reflection...")
+    run("./.loom/scripts/session-reflection.sh")
+
     # Cleanup signals and state
     rm(".loom/stop-shepherds")
     rm(".loom/stop-daemon")
