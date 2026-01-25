@@ -5,7 +5,7 @@
 #   ./scripts/install/setup-repository-settings.sh /path/to/target-repo [--dry-run]
 #
 # Configures:
-#   - Merge strategy (merge commits only)
+#   - Merge strategy (squash merge only)
 #   - Auto-delete head branches
 #   - Allow auto-merge
 #   - Suggest updating branches
@@ -79,8 +79,8 @@ fi
 
 # Define the settings to apply
 SETTINGS_JSON='{
-  "allow_merge_commit": true,
-  "allow_squash_merge": false,
+  "allow_merge_commit": false,
+  "allow_squash_merge": true,
   "allow_rebase_merge": false,
   "delete_branch_on_merge": true,
   "allow_auto_merge": true,
@@ -95,8 +95,8 @@ if [[ "$DRY_RUN" == "true" ]]; then
   echo "  Repository: ${OWNER}/${REPO}"
   echo ""
   echo "  Settings to be configured:"
-  echo "    allow_merge_commit: true (preserve commit history)"
-  echo "    allow_squash_merge: false (disabled)"
+  echo "    allow_merge_commit: false (disabled)"
+  echo "    allow_squash_merge: true (default strategy - flattens PR to single commit)"
   echo "    allow_rebase_merge: false (disabled)"
   echo "    delete_branch_on_merge: true (auto-cleanup branches)"
   echo "    allow_auto_merge: true (enables Champion auto-merge)"
@@ -114,9 +114,9 @@ then
   success "Repository settings configured successfully"
   echo ""
   echo "Applied settings:"
-  echo "  - Allow merge commits: Yes (default strategy)"
-  echo "  - Allow squash merging: No (preserves commit history)"
-  echo "  - Allow rebase merging: No (keeps merge commits visible)"
+  echo "  - Allow merge commits: No (disabled)"
+  echo "  - Allow squash merging: Yes (default strategy - flattens PR to single commit)"
+  echo "  - Allow rebase merging: No (disabled)"
   echo "  - Delete branches on merge: Yes (auto-cleanup)"
   echo "  - Allow auto-merge: Yes (enables Champion workflow)"
   echo "  - Suggest updating branches: Yes"
@@ -134,8 +134,8 @@ else
   echo "  1. Go to: https://github.com/${OWNER}/${REPO}/settings"
   echo "  2. Scroll to 'Pull Requests' section"
   echo "  3. Configure merge options:"
-  echo "     - Enable: Allow merge commits"
-  echo "     - Disable: Allow squash merging"
+  echo "     - Disable: Allow merge commits"
+  echo "     - Enable: Allow squash merging"
   echo "     - Disable: Allow rebase merging"
   echo "     - Enable: Always suggest updating pull request branches"
   echo "     - Enable: Automatically delete head branches"
