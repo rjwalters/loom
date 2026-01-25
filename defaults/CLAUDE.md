@@ -163,12 +163,23 @@ Run the Loom daemon for fully autonomous system orchestration.
 # Start the daemon (runs continuously)
 /loom
 
+# Start with force mode for aggressive autonomous development
+/loom --force
+
 # The daemon will:
 # 1. Monitor system state every 60 seconds
 # 2. Trigger Architect/Hermit when backlog is low
 # 3. Spawn shepherds for ready issues
 # 4. Ensure Guide and Champion keep running
 ```
+
+**Force Mode** (`--force`):
+
+When running with `--force`, the daemon enables aggressive autonomous development:
+- Champion auto-promotes all `loom:architect` and `loom:hermit` proposals
+- Champion auto-promotes all `loom:curated` issues
+- Audit trail with `[force-mode]` markers on all auto-promoted items
+- Safety guardrails still apply (no force-push, respect `loom:blocked`)
 
 **Example daemon workflow**:
 ```
