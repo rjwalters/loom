@@ -1054,12 +1054,34 @@ echo "Attempting to merge PR #$PR_NUMBER..."
 MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1)
 MERGE_EXIT_CODE=$?
 
-# Check if merge succeeded
-if [ $MERGE_EXIT_CODE -eq 0 ]; then
-  echo "✅ Successfully merged PR #$PR_NUMBER"
+# IMPORTANT: Worktree Checkout Error Handling
+# ============================================
+# When running from a worktree, `gh pr merge` may succeed on GitHub but fail
+# locally with: "fatal: 'main' is already used by worktree at '/path/to/repo'"
+#
+# This is EXPECTED behavior - the merge completes remotely but git can't switch
+# to main locally because another worktree already has it checked out.
+#
+# Solution: Always verify PR state via GitHub API rather than relying on exit code.
+
+# Always verify actual merge state via GitHub API (exit code is unreliable in worktrees)
+PR_STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+
+if [ "$PR_STATE" = "MERGED" ]; then
+  # Merge succeeded - any error was just the local checkout failure (expected in worktrees)
+  if [ $MERGE_EXIT_CODE -ne 0 ]; then
+    if echo "$MERGE_OUTPUT" | grep -q "already used by worktree"; then
+      echo "✅ Successfully merged PR #$PR_NUMBER (local checkout skipped - worktree conflict is expected)"
+    else
+      echo "✅ Successfully merged PR #$PR_NUMBER (non-fatal local error ignored)"
+    fi
+  else
+    echo "✅ Successfully merged PR #$PR_NUMBER"
+  fi
   echo "$MERGE_OUTPUT"
   return 0
 else
+  # Merge actually failed on GitHub - this is a real error
   echo "❌ Merge failed for PR #$PR_NUMBER"
   echo "Error: $MERGE_OUTPUT"
 
@@ -1078,6 +1100,7 @@ $MERGE_OUTPUT
 - GitHub API rate limiting
 - Network connectivity issues
 - Branch was force-pushed during merge attempt
+- Merge conflicts with base branch
 
 **Next steps:**
 - A human will need to investigate and merge manually
@@ -1097,8 +1120,9 @@ fi
 
 **Key features**:
 - **Error capture**: Captures both stdout and stderr from `gh pr merge`
-- **Exit code checking**: Verifies merge success before continuing
-- **Automatic error reporting**: Posts detailed error comment to PR on failure
+- **API-based verification**: Always verifies merge success via GitHub API, not exit code
+- **Worktree-aware**: Recognizes "already used by worktree" as a non-fatal error
+- **Automatic error reporting**: Posts detailed error comment to PR on real failures
 - **Preserves label**: Keeps `loom:pr` label on failure for human visibility
 - **Graceful degradation**: Returns error code but doesn't abort entire iteration
 
@@ -1106,6 +1130,8 @@ fi
 - **`--squash`**: Combines all commits into single commit (clean history)
 - **`--auto`**: Enables GitHub's auto-merge if branch protection requires wait
 - **`--delete-branch`**: Automatically removes feature branch after merge
+
+**Note on worktree errors**: When running from a worktree (common in Loom workflows), the `gh pr merge` command may return exit code 1 even though the merge succeeded on GitHub. This happens because git cannot switch to the main branch locally when another worktree has it checked out. The API verification ensures we correctly detect successful merges regardless of local checkout status.
 
 ### Step 4: Verify Issue Auto-Close
 
@@ -1688,7 +1714,28 @@ echo ""
 MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" --squash --auto --delete-branch 2>&1)
 MERGE_EXIT_CODE=$?
 
-if [ $MERGE_EXIT_CODE -ne 0 ]; then
+# IMPORTANT: Worktree Checkout Error Handling
+# When running from a worktree, `gh pr merge` may succeed on GitHub but fail
+# locally with: "fatal: 'main' is already used by worktree at '/path/to/repo'"
+# Always verify PR state via GitHub API rather than relying on exit code.
+
+PR_STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state')
+
+if [ "$PR_STATE" = "MERGED" ]; then
+  # Merge succeeded - any error was just the local checkout failure (expected in worktrees)
+  if [ $MERGE_EXIT_CODE -ne 0 ]; then
+    if echo "$MERGE_OUTPUT" | grep -q "already used by worktree"; then
+      echo "✅ Successfully merged PR #$PR_NUMBER (local checkout skipped - worktree conflict is expected)"
+    else
+      echo "✅ Successfully merged PR #$PR_NUMBER (non-fatal local error ignored)"
+    fi
+  else
+    echo "✅ Successfully merged PR #$PR_NUMBER"
+  fi
+  echo "Merge output: $MERGE_OUTPUT"
+  echo ""
+else
+  # Merge actually failed on GitHub - this is a real error
   echo "❌ Merge failed!"
   echo "Error output: $MERGE_OUTPUT"
   echo ""
@@ -1708,6 +1755,7 @@ $MERGE_OUTPUT
 - GitHub API rate limiting
 - Network connectivity issues
 - Branch was force-pushed during merge attempt
+- Merge conflicts with base branch
 
 **Next steps:**
 - A human will need to investigate and merge manually
@@ -1723,10 +1771,6 @@ EOF
   echo "Posted failure comment to PR #$PR_NUMBER"
   exit 1
 fi
-
-echo "✅ Successfully merged PR #$PR_NUMBER"
-echo "Merge output: $MERGE_OUTPUT"
-echo ""
 
 # ============================================
 # STEP 4: Verify Issue Closure
