@@ -265,6 +265,55 @@ os.rename(".loom/daemon-state.json.tmp", ".loom/daemon-state.json")
 
 **Important:** All context-heavy operations (gh commands, TaskOutput, spawning) happen ONLY in iteration mode.
 
+### Using daemon-snapshot.sh for State Assessment
+
+The `daemon-snapshot.sh` script consolidates all state queries into a single tool call, replacing 10+ individual `gh` commands:
+
+```bash
+# Get complete system state in one call
+snapshot=$(./.loom/scripts/daemon-snapshot.sh)
+
+# Parse the JSON output
+ready_count=$(echo "$snapshot" | jq '.computed.total_ready')
+needs_work_gen=$(echo "$snapshot" | jq -r '.computed.needs_work_generation')
+actions=$(echo "$snapshot" | jq -r '.computed.recommended_actions[]')
+
+# Use pre-computed decisions
+if [[ "$needs_work_gen" == "true" ]]; then
+    # Trigger architect/hermit
+fi
+
+# Check recommended actions
+if echo "$actions" | grep -q "spawn_shepherds"; then
+    # Auto-spawn shepherds for ready issues
+fi
+```
+
+**Benefits of daemon-snapshot.sh:**
+- **Single tool call**: Replaces 10+ individual `gh` commands
+- **Parallel queries**: Runs all `gh` queries concurrently for efficiency
+- **Pre-computed decisions**: Includes `computed.recommended_actions` for immediate use
+- **Token efficient**: Reduces context usage by ~50% per iteration
+- **Deterministic**: Same output format every time, easy to parse
+
+**Output structure:**
+```json
+{
+  "timestamp": "2026-01-25T08:00:00Z",
+  "pipeline": { "ready_issues": [...], "building_issues": [...], "blocked_issues": [...] },
+  "proposals": { "architect": [...], "hermit": [...], "curated": [...] },
+  "prs": { "review_requested": [...], "changes_requested": [...], "ready_to_merge": [...] },
+  "usage": { "session_percent": 45, "healthy": true },
+  "computed": {
+    "total_ready": 3,
+    "needs_work_generation": false,
+    "available_shepherd_slots": 2,
+    "recommended_actions": ["spawn_shepherds", "check_stuck"]
+  },
+  "config": { "issue_threshold": 3, "max_shepherds": 3 }
+}
+```
+
 ---
 
 ## Parent Loop Mode (`/loom`)
@@ -295,12 +344,16 @@ DAEMON ITERATION:
 │   │   └── continue (shepherds resume with preserved assignments)
 │   └── else: continue normally
 │
-├── 3. ASSESS SYSTEM STATE (automatic)
-│   ├── ready_issues = gh issue list --label "loom:issue" count
-│   ├── building_issues = gh issue list --label "loom:building" count
-│   ├── architect_proposals = gh issue list --label "loom:architect" count
-│   ├── hermit_proposals = gh issue list --label "loom:hermit" count
-│   └── prs_pending = gh pr list --label "loom:review-requested" count
+├── 3. ASSESS SYSTEM STATE (automatic via daemon-snapshot.sh)
+│   └── snapshot = ./.loom/scripts/daemon-snapshot.sh
+│       Returns JSON with:
+│       ├── pipeline.ready_issues, pipeline.building_issues, pipeline.blocked_issues
+│       ├── proposals.architect, proposals.hermit, proposals.curated
+│       ├── prs.review_requested, prs.changes_requested, prs.ready_to_merge
+│       ├── usage.session_percent, usage.healthy
+│       ├── computed.total_ready, computed.needs_work_generation
+│       ├── computed.recommended_actions (["spawn_shepherds", "trigger_architect", etc.])
+│       └── config.issue_threshold, config.max_shepherds
 │
 ├── 4. CHECK SUBAGENT COMPLETIONS (non-blocking)
 │   └── For each active shepherd/role: TaskOutput with block=false
