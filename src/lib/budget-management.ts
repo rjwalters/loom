@@ -148,10 +148,7 @@ export async function getBudgetConfig(workspacePath: string): Promise<BudgetConf
 /**
  * Save the budget configuration
  */
-export async function saveBudgetConfig(
-  workspacePath: string,
-  config: BudgetConfig
-): Promise<void> {
+export async function saveBudgetConfig(workspacePath: string, config: BudgetConfig): Promise<void> {
   try {
     await invoke("save_budget_config", {
       workspacePath,
@@ -305,11 +302,12 @@ export async function checkBudgetAlerts(workspacePath: string): Promise<void> {
       const lastAlert = config.lastAlerts[status.period][threshold] || 0;
 
       if (now - lastAlert > alertCooldown) {
-        // Send alert
+        // Send alert (status.limit is guaranteed non-null when we have triggeredThresholds)
+        const limitValue = status.limit ?? 0;
         const message =
           status.isOverBudget && threshold === 100
-            ? `Budget exceeded! ${status.period} spend: ${formatCurrency(status.spent)} / ${formatCurrency(status.limit!)}`
-            : `${status.period.charAt(0).toUpperCase() + status.period.slice(1)} budget ${threshold}% used: ${formatCurrency(status.spent)} / ${formatCurrency(status.limit!)}`;
+            ? `Budget exceeded! ${status.period} spend: ${formatCurrency(status.spent)} / ${formatCurrency(limitValue)}`
+            : `${status.period.charAt(0).toUpperCase() + status.period.slice(1)} budget ${threshold}% used: ${formatCurrency(status.spent)} / ${formatCurrency(limitValue)}`;
 
         const toastType = status.isOverBudget ? "error" : threshold >= 90 ? "error" : "info";
         showToast(message, toastType, 5000);
@@ -557,10 +555,10 @@ function createBudgetStatusSection(statuses: BudgetStatus[]): string {
         </div>
 
         ${
-          hasLimit
+          hasLimit && status.limit !== null
             ? `
           <div class="text-sm text-gray-500 dark:text-gray-400 mb-2">
-            of ${formatCurrency(status.limit!)} (${status.remaining !== null && status.remaining >= 0 ? formatCurrency(status.remaining) + " remaining" : "exceeded"})
+            of ${formatCurrency(status.limit)} (${status.remaining !== null && status.remaining >= 0 ? `${formatCurrency(status.remaining)} remaining` : "exceeded"})
           </div>
 
           <div class="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
@@ -778,7 +776,7 @@ function setupBudgetEventHandlers(modal: ModalBuilder, workspacePath: string): v
         await saveBudgetConfig(workspacePath, newConfig);
         showToast("Budget settings saved", "success");
         await refreshBudgetModal(modal);
-      } catch (error) {
+      } catch (_error) {
         showToast("Failed to save budget settings", "error");
       }
     });

@@ -2,8 +2,10 @@
  * Tests for Budget Management Module
  */
 
-import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as agentMetrics from "./agent-metrics";
 import {
+  type BudgetConfig,
   checkBudgetAlerts,
   closeBudgetManagementModal,
   getBudgetConfig,
@@ -12,10 +14,8 @@ import {
   isBudgetModalVisible,
   saveBudgetConfig,
   showBudgetManagementModal,
-  type BudgetConfig,
 } from "./budget-management";
-import * as agentMetrics from "./agent-metrics";
-import { setAppState, AppState } from "./state";
+import { AppState, setAppState } from "./state";
 import * as toast from "./toast";
 
 // Mock localStorage
@@ -135,7 +135,13 @@ describe("Budget Management", () => {
     });
 
     vi.mocked(agentMetrics.getMetricsByRole).mockResolvedValue([
-      { role: "builder", prompt_count: 100, total_tokens: 250000, total_cost: 12.5, success_rate: 0.85 },
+      {
+        role: "builder",
+        prompt_count: 100,
+        total_tokens: 250000,
+        total_cost: 12.5,
+        success_rate: 0.85,
+      },
       { role: "judge", prompt_count: 60, total_tokens: 150000, total_cost: 7.5, success_rate: 0.9 },
     ]);
 
