@@ -31,17 +31,17 @@ The orchestrator operates in one of two modes depending on the environment:
 - Supports parallelism (multiple agents simultaneously)
 - Requires Loom desktop app running
 
-**Direct Mode** (CLI Fallback):
-- Executes role phases directly in current terminal
-- No separate terminals - orchestrator becomes a meta-agent
-- Context accumulates between phases (no fresh starts)
-- Works anywhere Claude Code runs
+**Direct Mode** (Subagent Execution):
+- Executes role phases as subagents in current terminal
+- Sequential execution through orchestration phases
+- Context accumulates between phases
+- Works anywhere Claude Code runs (no additional dependencies)
 
 ### Fresh Context Per Phase (MCP Mode Only)
 - Each role terminal should be restarted before triggering
 - This ensures maximum cognitive clarity for each phase
 - No accumulated context pollution between phases
-- **Note**: In Direct Mode, context accumulates - this is a known limitation
+- **Note**: In Direct Mode, context accumulates across phases
 
 ### Platform Agnostic
 - You trigger terminals via MCP, you don't care what LLM runs in them
@@ -188,18 +188,18 @@ fi
 
 ## Execution Mode Detection
 
-At orchestration start, detect which mode to use:
+At orchestration start, detect which mode to use. Loom supports two primary execution modes, both fully functional:
 
 ### Mode Detection
 
 ```bash
-# Attempt MCP call to detect Loom app
+# Attempt MCP call to detect Loom Tauri app
 if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
   MODE="mcp"
   echo "🎭 MCP Mode: Loom app detected, will delegate to role terminals"
 else
   MODE="direct"
-  echo "🎭 Direct Mode: MCP unavailable, executing roles in current terminal"
+  echo "🎭 Direct Mode: Executing role phases as subagents"
 fi
 ```
 
@@ -207,7 +207,7 @@ fi
 
 Always inform the user which mode is active at orchestration start:
 
-**MCP Mode:**
+**MCP Mode (Tauri App):**
 ```
 ## 🎭 Loom Orchestration Started
 
@@ -218,25 +218,33 @@ Always inform the user which mode is active at orchestration start:
 Will delegate each phase to configured role terminals.
 ```
 
-**Direct Mode:**
+**Direct Mode (Subagent Execution):**
 ```
 ## 🎭 Loom Orchestration Started
 
-**Mode**: Direct Execution (CLI Fallback)
+**Mode**: Direct (Subagent Execution)
 **Issue**: #123 - [Title]
-**Note**: MCP unavailable - executing roles directly in this terminal
+**Phases**: Curator → Approval → Builder → Judge → Merge
 
-⚠️ **Limitations in Direct Mode:**
-- No parallelism (phases run sequentially)
-- Context accumulates between phases
-- No fresh context per role (may affect quality on long orchestrations)
+Executing role phases using Claude Code subagents.
 ```
+
+**Mode Characteristics:**
+
+| Aspect | MCP Mode | Direct Mode |
+|--------|----------|-------------|
+| Requires | Loom Tauri app running | Claude Code CLI only |
+| Parallelism | Multiple terminals | Sequential phases |
+| Context | Fresh per terminal | Accumulates in session |
+| Best for | Multi-agent workflows | Single-issue orchestration |
+
+Both modes are fully functional. Direct Mode is the default for CLI-based workflows and works without any additional dependencies.
 
 ### Direct Mode Execution
 
-In Direct Mode, instead of triggering terminals via MCP, you execute each role phase directly:
+In Direct Mode, the shepherd executes each role phase as a subagent rather than delegating to Tauri-managed terminals:
 
-**Instead of (MCP Mode):**
+**MCP Mode (Tauri App):**
 ```bash
 mcp__loom-terminals__restart_terminal --terminal_id terminal-2
 mcp__loom-terminals__configure_terminal --terminal_id terminal-2 --interval_prompt "Curate issue #123"
@@ -244,13 +252,13 @@ mcp__loom-ui__trigger_run_now --terminalId terminal-2
 # Wait for terminal to complete by polling labels...
 ```
 
-**Do this (Direct Mode):**
+**Direct Mode (Subagent Execution):**
 ```bash
-# Execute Curator role directly
-echo "📋 Executing Curator phase directly..."
+# Execute Curator role as subagent
+echo "📋 Curator phase..."
 
-# 1. Read the role definition
-# (Mentally follow .loom/roles/curator.md guidelines)
+# 1. Follow the role definition
+# (Apply .loom/roles/curator.md guidelines)
 
 # 2. Perform the role's work
 # - Analyze the issue
@@ -266,13 +274,13 @@ echo "✅ Curator phase complete"
 
 ### Direct Mode Role Execution Pattern
 
-For each phase, the orchestrator becomes a meta-agent that:
+For each phase, the shepherd orchestrates work by:
 
-1. **Announces the phase**: `"📋 Executing [Role] phase directly..."`
-2. **Reads the role guidelines**: Follow `.loom/roles/[role].md` instructions
-3. **Performs the work**: Complete the role's primary task
-4. **Applies completion signals**: Add appropriate labels or create PRs
-5. **Announces completion**: `"✅ [Role] phase complete"`
+1. **Announcing the phase**: `"📋 [Role] phase..."`
+2. **Following role guidelines**: Apply `.loom/roles/[role].md` instructions
+3. **Performing the work**: Complete the role's primary task
+4. **Applying completion signals**: Add appropriate labels or create PRs
+5. **Announcing completion**: `"✅ [Role] phase complete"`
 
 ### Phase-Specific Direct Execution
 
@@ -1122,25 +1130,25 @@ echo "ERROR: No terminal found for role '$ROLE'. Configure a terminal with roleF
 gh issue comment $ISSUE_NUMBER --body "⚠️ **Orchestration paused**: Missing terminal for $ROLE role. Run with --force to auto-configure."
 ```
 
-### MCP Connection Failed (Triggers Direct Mode)
+### Mode Selection
 
-If MCP calls fail at orchestration start, automatically switch to Direct Mode:
+The shepherd automatically selects the appropriate execution mode:
 
 ```bash
 # At start of orchestration
-if ! mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
-  echo "MCP unavailable - switching to Direct Mode"
+if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
+  MODE="mcp"
+  echo "🎭 MCP Mode: Loom app detected"
+else
   MODE="direct"
-  # Continue with direct execution instead of failing
+  echo "🎭 Direct Mode: Executing as subagents"
 fi
 ```
 
-**This is NOT an error** - Direct Mode is a supported fallback. The orchestrator should:
-1. Announce it's running in Direct Mode
-2. Execute roles directly instead of delegating
+Both modes are fully supported. Direct Mode is the default for CLI-based workflows:
+1. Announce the active mode at orchestration start
+2. Execute role phases appropriately for the mode
 3. Complete the orchestration successfully
-
-Only report an error if Direct Mode itself fails.
 
 ## Report Format
 
