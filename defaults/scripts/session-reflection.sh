@@ -149,29 +149,38 @@ fi
 
 # Calculate session duration
 calculate_duration() {
-  local started_at
+  local started_at shutdown_at
   started_at=$(jq -r '.started_at // empty' "$DAEMON_STATE")
+  shutdown_at=$(jq -r '.shutdown_at // empty' "$DAEMON_STATE")
 
   if [[ -z "$started_at" ]]; then
     echo "0"
     return
   fi
 
+  # Use shutdown_at if session has ended, otherwise use current time
+  local end_time
+  if [[ -n "$shutdown_at" ]]; then
+    end_time="$shutdown_at"
+  else
+    end_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  fi
+
   local start_epoch
-  local now_epoch
+  local end_epoch
 
   # macOS and Linux compatible date parsing
   if date --version >/dev/null 2>&1; then
     # GNU date (Linux)
     start_epoch=$(date -d "$started_at" +%s 2>/dev/null || echo "0")
-    now_epoch=$(date +%s)
+    end_epoch=$(date -d "$end_time" +%s 2>/dev/null || echo "0")
   else
     # BSD date (macOS)
     start_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$started_at" +%s 2>/dev/null || echo "0")
-    now_epoch=$(date +%s)
+    end_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$end_time" +%s 2>/dev/null || echo "0")
   fi
 
-  echo $((now_epoch - start_epoch))
+  echo $((end_epoch - start_epoch))
 }
 
 duration=$(calculate_duration)
