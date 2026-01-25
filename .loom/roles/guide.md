@@ -362,6 +362,92 @@ pr_state=$(gh pr view "$pr_number" --json state,mergedAt --jq '.state')
 - If any dependency is still OPEN → Keep blocked
 - If issue was blocked for non-dependency reasons → Check comments for context
 
+## Epic Progress Tracking
+
+**Run every 15-30 minutes** to check epic progress and report status.
+
+### Check Active Epics
+
+```bash
+# Get all open epics
+gh issue list --label "loom:epic" --state open --json number,title,body
+```
+
+### Track Phase Progress
+
+For each epic, check how many issues in each phase are complete:
+
+```bash
+check_epic_progress() {
+  local epic_number=$1
+
+  # Get epic body to parse phases
+  local body=$(gh issue view "$epic_number" --json body --jq '.body')
+
+  # Find all phase issues for this epic
+  local phase_issues=$(gh issue list \
+    --label="loom:epic-phase" \
+    --state=all \
+    --search="Epic: #$epic_number in:body" \
+    --json number,state,title)
+
+  local total=$(echo "$phase_issues" | jq 'length')
+  local closed=$(echo "$phase_issues" | jq '[.[] | select(.state == "CLOSED")] | length')
+  local open=$(echo "$phase_issues" | jq '[.[] | select(.state == "OPEN")] | length')
+
+  echo "Epic #$epic_number: $closed/$total complete ($open in progress)"
+}
+```
+
+### Epic Status Report
+
+Include epic status in triage summaries:
+
+```markdown
+## Active Epics
+
+| Epic | Title | Progress | Current Phase |
+|------|-------|----------|---------------|
+| #123 | Agent Metrics System | 6/9 (67%) | Phase 2 |
+| #456 | Workflow Improvements | 2/4 (50%) | Phase 1 |
+
+**Epic Details:**
+- **#123**: Phase 1 ✅, Phase 2 in progress (2/3 issues complete)
+- **#456**: Phase 1 in progress (2/2 issues open)
+```
+
+### Alert on Stale Epics
+
+If an epic has had no progress in 7+ days:
+
+```bash
+# Check last activity on epic issues
+LAST_CLOSED=$(gh issue list \
+  --label="loom:epic-phase" \
+  --state=closed \
+  --search="Epic: #$epic_number in:body" \
+  --json closedAt \
+  --jq 'sort_by(.closedAt) | last | .closedAt')
+
+# Calculate days since last progress
+# If > 7 days, flag for attention
+```
+
+Add comment to stale epics:
+
+```markdown
+⚠️ **Epic Stale Alert**
+
+No progress on this epic for 7+ days. Current status:
+- Phase 1: 2/3 complete
+- Phase 2: Not started
+
+**Recommended actions:**
+- Check if remaining Phase 1 issues are blocked
+- Verify epic is still aligned with project goals
+- Consider closing epic if no longer relevant
+```
+
 ### Comment Format
 
 When unblocking an issue:
