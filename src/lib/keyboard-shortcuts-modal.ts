@@ -52,6 +52,15 @@ function createShortcutsContent(): string {
       </div>
     </div>
 
+    <!-- Intelligence shortcuts -->
+    <div class="mb-6">
+      <h3 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Intelligence</h3>
+      <div class="space-y-2">
+        ${shortcutRow("Intelligence Dashboard", "Cmd+I")}
+        ${shortcutRow("Agent Metrics", "Cmd+Shift+M")}
+      </div>
+    </div>
+
     <!-- Help shortcuts -->
     <div class="mb-4">
       <h3 class="text-lg font-semibold mb-3 text-gray-800 dark:text-gray-200">Help</h3>

@@ -70,6 +70,10 @@ pub fn build_menu<R: tauri::Runtime>(
         .id("reset_zoom")
         .accelerator("CmdOrCtrl+0")
         .build(handle)?;
+    let show_intelligence_dashboard = MenuItemBuilder::new("Intelligence Dashboard")
+        .id("show_intelligence_dashboard")
+        .accelerator("CmdOrCtrl+I")
+        .build(handle)?;
     let show_agent_metrics = MenuItemBuilder::new("Agent Metrics")
         .id("show_agent_metrics")
         .accelerator("CmdOrCtrl+M")
@@ -90,6 +94,7 @@ pub fn build_menu<R: tauri::Runtime>(
         .item(&zoom_out)
         .item(&reset_zoom)
         .separator()
+        .item(&show_intelligence_dashboard)
         .item(&show_agent_metrics)
         .item(&show_prompt_library)
         .item(&show_metrics)
@@ -195,6 +200,11 @@ pub fn handle_menu_event<R: tauri::Runtime>(
         "reset_zoom" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("reset-zoom", ());
+            }
+        }
+        "show_intelligence_dashboard" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-intelligence-dashboard", ());
             }
         }
         "show_agent_metrics" => {

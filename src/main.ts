@@ -496,6 +496,11 @@ if (!eventListenersRegistered) {
     showDaemonStatusDialog();
   });
 
+  listen("show-intelligence-dashboard", async () => {
+    const { showIntelligenceDashboard } = await import("./lib/intelligence-dashboard");
+    showIntelligenceDashboard();
+  });
+
   logger?.info("Event listeners registered successfully");
 } else {
   logger?.info("Event listeners already registered, skipping duplicate registration");
