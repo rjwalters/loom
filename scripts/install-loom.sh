@@ -477,7 +477,7 @@ cp "$LOOM_ROOT/scripts/cleanup-branches.sh" ".loom/scripts/cleanup-branches.sh" 
   error "Failed to copy cleanup-branches.sh"
 chmod +x ".loom/scripts/cleanup.sh"
 chmod +x ".loom/scripts/cleanup-branches.sh"
-success "✓ Installed cleanup scripts to .loom/scripts/"
+success "Installed cleanup scripts to .loom/scripts/"
 echo ""
 
 # ============================================================================
