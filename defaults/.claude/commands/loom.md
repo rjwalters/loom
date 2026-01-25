@@ -208,13 +208,18 @@ def loom_iterate(force_mode=False):
     # 8. Stuck detection
     stuck_count = check_stuck_agents(state)
 
-    # 9. Save state to JSON
+    # 9. Stale building detection (every 10 iterations)
+    recovered_count = 0
+    if state.get("iteration", 0) % 10 == 0:
+        recovered_count = check_stale_building(state)
+
+    # 10. Save state to JSON
     state["iteration"] = state.get("iteration", 0) + 1
     state["last_poll"] = now()
     save_daemon_state(state)
 
-    # 10. Return compact summary (ONE LINE)
-    return format_iteration_summary(pipeline, spawned_shepherds, triggered_generation, stuck_count)
+    # 11. Return compact summary (ONE LINE)
+    return format_iteration_summary(pipeline, spawned_shepherds, triggered_generation, stuck_count, recovered_count)
 ```
 
 ### Iteration Summary Format
@@ -237,6 +242,7 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `+doctor` - Respawned Doctor (if respawned)
 - `stuck=N` - Stuck agents detected (if any)
 - `completed=#N` - Issue completed this iteration (if any)
+- `recovered=N` - Stale building issues recovered (if any)
 
 **Example summaries:**
 ```
@@ -1740,6 +1746,115 @@ The detection script uses these heuristics:
 - **Loop pattern analysis**: Stuck agents repeat similar errors; hard problems show varied attempts
 - **PR progress**: Building agents eventually create PRs; stuck agents don't
 - **Error diversity**: Hard problems have varied errors; stuck agents repeat the same ones
+
+### Stale Building Detection
+
+The daemon periodically detects orphaned `loom:building` issues that have no active work happening. This prevents pipeline stalls caused by crashed or cancelled builders.
+
+#### Problem: Orphaned Building Labels
+
+When a builder agent crashes, times out, or is cancelled mid-work:
+- The `loom:building` label persists on the issue
+- No worktree exists (or worktree is stale)
+- No PR is created
+- Daemon sees "building" issues and doesn't spawn new shepherds
+- **Result**: Pipeline stalls, velocity collapses
+
+#### Detection Integration (Every 10 Iterations)
+
+```python
+def check_stale_building(state):
+    """Detect and recover orphaned building issues."""
+
+    # Run stale detection script with recovery enabled
+    result = run("./.loom/scripts/stale-building-check.sh --recover --json")
+
+    if result.exit_code == 0:
+        data = json.loads(result.stdout)
+        recovered = [i for i in data.get("stale_issues", []) if i["reason"] == "no_pr"]
+
+        for issue in recovered:
+            print(f"  ♻️ RECOVERED: #{issue['number']} (stale {issue['age_hours']}h, no PR)")
+
+            # Record in warnings
+            add_warning(
+                "stale_building_recovered",
+                f"Issue #{issue['number']} recovered from stale building state",
+                severity="info",
+                context={"issue": issue["number"], "age_hours": issue["age_hours"]}
+            )
+
+        # Track in state
+        state.setdefault("stale_detection", {})
+        state["stale_detection"]["last_check"] = now()
+        state["stale_detection"]["last_recovered"] = [i["number"] for i in recovered]
+
+        return len(recovered)
+
+    return 0
+```
+
+#### Detection Sources
+
+The script cross-references three sources to detect orphaned work:
+
+| Source | What It Checks | Orphan Signal |
+|--------|---------------|---------------|
+| GitHub Labels | `loom:building` issues | Issue has building label |
+| Worktrees | `.loom/worktrees/issue-N` | No worktree for issue |
+| Open PRs | `feature/issue-N` branch | No PR referencing issue |
+
+If **all three** indicate no active work and issue is >2 hours old → **orphaned**.
+
+#### Recovery Actions
+
+| Condition | Recovery Action |
+|-----------|-----------------|
+| No worktree, no PR (>2h) | Reset to `loom:issue`, add recovery comment |
+| Has PR with `loom:changes-requested` | Transition to `loom:blocked` |
+| Has PR but stale (>24h) | Flag only (needs manual review) |
+
+#### Configuration
+
+```bash
+# Environment variables for thresholds
+STALE_THRESHOLD_HOURS=2       # Hours before no-PR issue is stale
+STALE_WITH_PR_HOURS=24        # Hours before stale-PR issue is flagged
+
+# Run manually to check status
+./.loom/scripts/stale-building-check.sh --verbose
+
+# Auto-recover (run by daemon)
+./.loom/scripts/stale-building-check.sh --recover
+
+# JSON output for integration
+./.loom/scripts/stale-building-check.sh --json
+```
+
+#### State Tracking
+
+The daemon state includes stale detection status:
+
+```json
+{
+  "stale_detection": {
+    "last_check": "2026-01-25T10:00:00Z",
+    "last_recovered": [123, 456],
+    "total_recovered": 5,
+    "check_interval": 10
+  }
+}
+```
+
+#### Daemon Iteration Summary
+
+Stale recovery is reflected in the iteration summary:
+
+```
+ready=3 building=1 shepherds=2/3 recovered=2
+```
+
+The `recovered=N` field indicates issues that were recovered from stale building state.
 
 ### Empty Backlog (Autonomous Response)
 
