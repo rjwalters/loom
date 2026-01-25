@@ -823,9 +823,17 @@ def parent_loop(force_mode=False):
         # - Stuck detection
         # - Save state to JSON
 
+        # NOTE: We must explicitly instruct the subagent to use the Skill tool
+        # because Task subagents don't automatically interpret "/loom" as a Skill invocation.
+        # They see it as plain text unless we tell them to invoke the skill.
         result = Task(
             description=f"Daemon iteration {iteration}",
-            prompt=f"/loom iterate {force_flag}",
+            prompt=f"""Execute the Loom daemon iteration by invoking the Skill tool:
+
+Skill(skill="loom", args="iterate {force_flag}")
+
+Return ONLY the compact summary line (e.g., "ready=5 building=2 shepherds=2/3").
+Do not include any other text or explanation.""",
             subagent_type="general-purpose",
             run_in_background=False,  # Wait for iteration to complete
             model="haiku"  # Fast, cheap - iteration work is straightforward
