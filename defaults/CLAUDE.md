@@ -628,6 +628,32 @@ The daemon state file provides comprehensive information for debugging, crash re
 | terminal-guide | guide.md | Backlog triage (always running) |
 | terminal-champion | champion.md | Auto-merge (always running) |
 
+### Model Selection Strategy
+
+Loom uses different AI models optimized for each role's task complexity. Model preferences are defined in each role's JSON metadata file via the `suggestedModel` field.
+
+**Model assignments by role**:
+
+| Role | Model | Rationale |
+|------|-------|-----------|
+| Loom Daemon | `haiku` | Status checks and simple decisions - fast and cheap |
+| Shepherd | `sonnet` | Orchestration is systematic with clear state transitions |
+| Builder | `opus` | Complex implementation requires deep reasoning |
+| Judge | `opus` | Code review needs thorough understanding |
+| Curator | `sonnet` | Issue enhancement is structured |
+| Doctor | `sonnet` | PR fixes are usually targeted and scoped |
+| Architect | `opus` | System design requires sophisticated thinking |
+| Hermit | `sonnet` | Code removal analysis is pattern-based |
+| Champion | `sonnet` | Proposal evaluation has clear criteria |
+| Guide | `sonnet` | Triage is systematic |
+| Driver | `sonnet` | General-purpose default |
+
+**Valid model values**: `haiku`, `sonnet`, `opus`
+
+- **haiku**: Fast, cheap - for simple status checks and monitoring
+- **sonnet**: Balanced - for structured tasks with clear criteria
+- **opus**: Most capable - for complex reasoning and implementation
+
 ### Custom Roles
 
 Create custom roles by adding files to `.loom/roles/`:
@@ -648,6 +674,7 @@ cat > .loom/roles/my-role.json <<EOF
 {
   "name": "My Custom Role",
   "description": "Brief description",
+  "suggestedModel": "sonnet",
   "defaultInterval": 300000,
   "defaultIntervalPrompt": "Continue working",
   "autonomousRecommended": false,
