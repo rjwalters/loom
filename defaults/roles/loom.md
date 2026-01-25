@@ -313,6 +313,157 @@ DOCTOR:
 - Handling blocked: `loom:blocked` issues
 - Strategic direction changes
 
+## Startup Validation
+
+Before entering the main loop, the daemon validates that all required roles are configured and their dependencies are satisfied. This prevents silent failures where work gets routed to non-existent roles.
+
+### Role Dependencies
+
+Roles have dependencies on other roles to handle specific label transitions:
+
+| Role | Creates Label | Requires Role | To Handle |
+|------|---------------|---------------|-----------|
+| Champion | `loom:changes-requested` | Doctor | Address PR feedback |
+| Builder | `loom:review-requested` | Judge | Review PRs |
+| Curator | `loom:curated` | Champion (or human) | Promote to `loom:issue` |
+| Judge | `loom:pr` | Champion | Auto-merge approved PRs |
+| Judge | `loom:changes-requested` | Doctor | Address feedback |
+
+### Validation Logic
+
+```python
+def validate_role_completeness(config):
+    """Validate that all role dependencies are satisfied."""
+
+    warnings = []
+    errors = []
+
+    # Get configured roles from terminals
+    configured_roles = set()
+    for terminal in config.get("terminals", []):
+        role_config = terminal.get("roleConfig", {})
+        role_file = role_config.get("roleFile", "")
+        if role_file:
+            # Extract role name from filename (e.g., "judge.md" -> "judge")
+            role_name = role_file.replace(".md", "")
+            configured_roles.add(role_name)
+
+    # Check role dependencies
+    role_dependencies = {
+        "champion": {
+            "doctor": "Champion can set loom:changes-requested, but Doctor is not configured to handle it"
+        },
+        "builder": {
+            "judge": "Builder creates PRs with loom:review-requested, but Judge is not configured to review them"
+        },
+        "judge": {
+            "doctor": "Judge can request changes with loom:changes-requested, but Doctor is not configured to address them",
+            "champion": "Judge approves PRs with loom:pr, but Champion is not configured to merge them"
+        }
+    }
+
+    for role, dependencies in role_dependencies.items():
+        if role in configured_roles:
+            for dep_role, message in dependencies.items():
+                if dep_role not in configured_roles:
+                    warnings.append({
+                        "role": role,
+                        "missing_dependency": dep_role,
+                        "message": message
+                    })
+
+    return {
+        "valid": len(errors) == 0,
+        "warnings": warnings,
+        "errors": errors,
+        "configured_roles": list(configured_roles)
+    }
+```
+
+### Startup Validation in Practice
+
+```python
+def validate_at_startup():
+    """Run validation and report results."""
+
+    # Load config
+    config = load_config(".loom/config.json")
+
+    # Run validation
+    result = validate_role_completeness(config)
+
+    # Report findings
+    if result["warnings"]:
+        print("⚠️  ROLE CONFIGURATION WARNINGS:")
+        for warning in result["warnings"]:
+            print(f"  - {warning['role'].upper()} → {warning['missing_dependency'].upper()}: {warning['message']}")
+        print()
+        print("  The daemon will continue, but some workflows may get stuck.")
+        print("  Consider adding the missing roles to .loom/config.json")
+        print()
+
+    if result["errors"]:
+        print("❌ ROLE CONFIGURATION ERRORS:")
+        for error in result["errors"]:
+            print(f"  - {error['message']}")
+        print()
+        print("  The daemon cannot start with these errors.")
+        return False
+
+    # Log configured roles
+    print(f"✓ Configured roles: {', '.join(sorted(result['configured_roles']))}")
+
+    return True
+```
+
+### Validation Script
+
+You can also validate configuration manually:
+
+```bash
+# Validate role configuration
+./.loom/scripts/validate-roles.sh
+
+# Output:
+# ✓ Configured roles: builder, champion, curator, hermit, judge
+# ⚠️  WARNINGS:
+#   - champion → doctor: PRs with loom:changes-requested will get stuck
+#   - judge → doctor: PRs with loom:changes-requested will get stuck
+
+# JSON output for automation
+./.loom/scripts/validate-roles.sh --json
+```
+
+### Validation Modes
+
+| Mode | Behavior |
+|------|----------|
+| `--warn` (default) | Log warnings, continue startup |
+| `--strict` | Fail startup if any warnings |
+| `--ignore` | Skip validation entirely |
+
+Configure via environment variable:
+
+```bash
+export LOOM_VALIDATION_MODE=strict
+/loom
+```
+
+Or in daemon state:
+
+```json
+{
+  "validation_mode": "warn",
+  "last_validation": {
+    "timestamp": "2026-01-24T10:00:00Z",
+    "warnings": [
+      {"role": "champion", "missing": "doctor", "message": "..."}
+    ],
+    "errors": []
+  }
+}
+```
+
 ## Daemon Loop
 
 When `/loom` is invoked, execute this FULLY AUTONOMOUS continuous loop.
@@ -326,13 +477,20 @@ def start_daemon():
     state["started_at"] = now()
     state["running"] = True
 
-    # 2. Run startup cleanup
+    # 2. Validate role configuration (NEW - addresses issue #1136)
+    if not validate_at_startup():
+        if VALIDATION_MODE == "strict":
+            print("❌ Startup aborted due to validation errors (strict mode)")
+            return
+        # In warn mode, continue with warnings logged
+
+    # 3. Run startup cleanup
     run("./scripts/daemon-cleanup.sh daemon-startup")
 
-    # 3. Assess and report initial state
+    # 4. Assess and report initial state
     assess_and_report_state()
 
-    # 4. Enter main loop
+    # 5. Enter main loop
     daemon_loop()
 ```
 
