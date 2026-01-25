@@ -320,6 +320,17 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
            ↑ Hermit       ↑ Champion    ↑ Ready for Builder
 ```
 
+**Epic Lifecycle**:
+```
+(created) → loom:epic → (evaluated) → Phase 1 issues created
+           ↑ Architect  ↑ Champion    ↓ loom:architect + loom:epic-phase
+
+Phase 1 complete → Phase 2 issues created → ... → Epic closed
+                   ↑ Champion auto-creates
+```
+
+Epics are multi-phase work items that decompose into individual issues. When Champion approves an epic, it creates Phase 1 issues with `loom:architect` and `loom:epic-phase` labels. As phases complete, Champion automatically creates subsequent phase issues until the epic is fully implemented.
+
 **Note**: Champion evaluates proposals from Architect and Hermit roles using the same 8 quality criteria as curated issues. Well-formed proposals are promoted automatically; only ambiguous or controversial proposals require human intervention.
 
 ### Label Definitions
@@ -337,6 +348,10 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 - **`loom:architect`**: Architectural proposal awaiting Champion evaluation
 - **`loom:hermit`**: Simplification proposal awaiting Champion evaluation
 - **`loom:curated`**: Issue enhanced by Curator, awaiting Champion evaluation
+
+**Epic Labels**:
+- **`loom:epic`**: Multi-phase epic proposal awaiting Champion evaluation
+- **`loom:epic-phase`**: Issue is part of an epic phase (references parent epic)
 
 **Status Labels**:
 - **`loom:blocked`**: Implementation blocked, needs help or clarification

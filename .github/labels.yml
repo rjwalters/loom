@@ -72,3 +72,12 @@
 - name: loom:abort
   description: Signal to abort shepherd for this issue (returns to loom:issue)
   color: "F97316"  # orange-500 - warning/signal color
+
+# Epic Labels
+- name: loom:epic
+  description: Multi-phase epic proposal (decomposes into implementation issues)
+  color: "7C3AED"  # violet-600 - distinguishes from regular proposals
+
+- name: loom:epic-phase
+  description: Issue is part of an epic phase (references parent epic)
+  color: "8B5CF6"  # violet-500 - lighter variant for child issues

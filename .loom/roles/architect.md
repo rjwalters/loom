@@ -430,6 +430,199 @@ EOF
 gh issue edit <number> --add-label "loom:architect"
 ```
 
+## Epic Proposals
+
+For large features that span multiple phases or require coordinated implementation, create an **Epic** instead of a single issue. Epics decompose into multiple implementation issues with clear phase dependencies.
+
+### When to Create an Epic
+
+Create an epic when:
+- Feature requires 4+ distinct implementation issues
+- Work has natural phases with dependencies between them
+- Multiple shepherds could work on different parts in parallel
+- Feature spans multiple subsystems or architectural layers
+- Implementation order matters (foundation before features)
+
+**Don't create an epic when:**
+- Feature can be implemented in a single PR
+- Work is straightforward with no phase dependencies
+- Changes are isolated to one subsystem
+
+### Epic Template
+
+```markdown
+# Epic: [Title]
+
+## Overview
+
+[High-level description of the multi-phase feature. What problem does it solve?
+Why is this being built as an epic rather than individual issues?]
+
+## Milestone Alignment
+
+**Current Milestone**: [e.g., "M1 - Core Features"]
+**Alignment Tier**: [Tier 1 - Goal-Advancing | Tier 2 - Goal-Supporting]
+**Justification**: [How this epic advances the project roadmap]
+
+## Phases
+
+### Phase 1: [Foundation]
+**Goal**: [What this phase accomplishes]
+**Can parallelize**: [Yes/No - can issues within this phase run in parallel?]
+
+- [ ] Issue A: [Brief description - enough for Builder to understand scope]
+- [ ] Issue B: [Brief description]
+
+### Phase 2: [Core Implementation]
+**Blocked by**: Phase 1
+**Goal**: [What this phase accomplishes]
+**Can parallelize**: [Yes/No]
+
+- [ ] Issue C: [Brief description]
+- [ ] Issue D: [Brief description]
+
+### Phase 3: [Polish/Integration]
+**Blocked by**: Phase 2
+**Goal**: [What this phase accomplishes]
+
+- [ ] Issue E: [Brief description]
+
+## Success Criteria
+
+How do we know this epic is complete?
+- [ ] [Measurable outcome 1]
+- [ ] [Measurable outcome 2]
+
+## Risks & Considerations
+
+- [Risk 1 and mitigation]
+- [Risk 2 and mitigation]
+
+## Complexity Estimate
+
+| Phase | Complexity | Est. Issues |
+|-------|------------|-------------|
+| Phase 1 | Low/Medium/High | N |
+| Phase 2 | Low/Medium/High | N |
+| Phase 3 | Low/Medium/High | N |
+| **Total** | | N |
+```
+
+### Creating an Epic
+
+```bash
+# Create epic issue
+gh issue create --title "Epic: [Title]" --body "$(cat <<'EOF'
+[epic content using template above]
+EOF
+)"
+
+# Add epic label (NOT loom:architect)
+gh issue edit <number> --add-label "loom:epic"
+```
+
+**Important**: Use `loom:epic` label, not `loom:architect`. Epics follow a different approval workflow.
+
+### Epic Workflow
+
+```
+Architect creates epic → loom:epic label
+        ↓
+Champion evaluates epic structure
+        ↓
+Champion approves → Creates Phase 1 issues with loom:architect
+        ↓
+Phase 1 issues get loom:issue → Shepherds implement
+        ↓
+Phase 1 completes → Champion creates Phase 2 issues
+        ↓
+... repeat until all phases complete ...
+        ↓
+Epic issue closed
+```
+
+### Phase Issue Creation
+
+When Champion approves an epic, Phase 1 issues are created with:
+- `loom:architect` label (awaiting individual approval)
+- `loom:epic-phase` label (indicates part of epic)
+- Body includes: `**Epic**: #[epic-number] | **Phase**: 1`
+- Dependencies reference the epic: `Blocked by: Epic #[number] approval`
+
+### Example Epic
+
+```markdown
+# Epic: Implement Agent Performance Metrics System
+
+## Overview
+
+Add comprehensive performance tracking for Loom agents, enabling self-aware
+behavior where agents can check their own success rates and adjust strategies.
+
+## Milestone Alignment
+
+**Current Milestone**: M2 - Observability
+**Alignment Tier**: Tier 1 - Goal-Advancing
+**Justification**: Directly implements the "agent self-monitoring" M2 deliverable.
+
+## Phases
+
+### Phase 1: Data Collection
+**Goal**: Capture raw performance data from agent operations
+**Can parallelize**: Yes
+
+- [ ] Add metrics schema to daemon-state.json
+- [ ] Capture prompt counts and token usage per role
+- [ ] Track issue completion success/failure
+
+### Phase 2: Aggregation & Storage
+**Blocked by**: Phase 1
+**Goal**: Process and store metrics for querying
+**Can parallelize**: Yes
+
+- [ ] Add metrics aggregation on daemon iteration
+- [ ] Implement time-windowed statistics (hourly, daily, weekly)
+- [ ] Add MCP tool: get_agent_metrics
+
+### Phase 3: Agent Integration
+**Blocked by**: Phase 2
+**Goal**: Enable agents to use their own metrics
+**Can parallelize**: No
+
+- [ ] Add agent-metrics.sh CLI script
+- [ ] Document self-aware agent patterns
+- [ ] Add escalation triggers based on success rate
+
+## Success Criteria
+
+- [ ] Agents can query their own success rate
+- [ ] Metrics visible in daemon status reports
+- [ ] Documented pattern for metric-based escalation
+
+## Risks & Considerations
+
+- Performance overhead of metrics collection
+- Privacy of metrics data (no PII in metrics)
+
+## Complexity Estimate
+
+| Phase | Complexity | Est. Issues |
+|-------|------------|-------------|
+| Phase 1 | Low | 3 |
+| Phase 2 | Medium | 3 |
+| Phase 3 | Low | 3 |
+| **Total** | Medium | 9 |
+```
+
+### Guidelines for Epics
+
+- **Keep phases small**: 2-4 issues per phase is ideal
+- **Clear dependencies**: Each phase should have explicit blockers
+- **Parallelizable work**: Note which issues within a phase can run in parallel
+- **Standalone issues**: Each issue should be implementable without epic context
+- **Progress tracking**: Champion updates epic checkboxes as issues complete
+- **Don't over-epic**: Simple features don't need epic structure
+
 ## Tracking Dependencies with Task Lists
 
 When an issue depends on other issues being completed first, use GitHub task lists to make dependencies explicit and trackable.
