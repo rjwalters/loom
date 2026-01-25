@@ -7,6 +7,7 @@ This directory contains Claude Code configuration for the Loom project.
 - **`settings.json`**: Team-wide permissions and settings (committed to git)
 - **`settings.local.json`**: Personal preferences (gitignored, create if needed)
 - **`../.mcp.json`**: MCP server configuration (at project root, committed to git)
+- **`agents/`**: Custom subagent definitions for Loom roles (see below)
 
 ## Pre-approved Commands
 
@@ -151,6 +152,65 @@ To create a custom slash command:
 3. Use it with `/your-command`
 
 **Note**: `.loom/roles/` contains symlinks to `.claude/commands/` for Tauri App compatibility. The single source of truth for all role definitions is `.claude/commands/`.
+
+## Custom Subagents
+
+The `agents/` directory contains custom subagent definitions for Loom roles. These subagents can be used with Claude Code's Task tool for spawning role-specific agents with fresh context.
+
+### Available Subagents
+
+| Subagent | Model | Purpose |
+|----------|-------|---------|
+| `loom-shepherd` | sonnet | Single-issue lifecycle orchestration (Layer 1) |
+| `loom-daemon` | sonnet | System orchestration, work generation (Layer 2) |
+| `loom-builder` | opus | Implement features and fixes |
+| `loom-judge` | opus | Review pull requests |
+| `loom-curator` | sonnet | Enhance and organize issues |
+| `loom-doctor` | sonnet | Fix bugs and address PR feedback |
+| `loom-champion` | sonnet | Evaluate proposals, auto-merge PRs |
+| `loom-architect` | opus | Create architectural proposals |
+| `loom-hermit` | sonnet | Identify simplification opportunities |
+| `loom-guide` | sonnet | Prioritize and triage issues |
+| `loom-auditor` | sonnet | Verify runtime behavior of built software |
+
+### How Subagents Work
+
+Subagents are specialized AI assistants that run in their own context window. Each has:
+- Custom system prompt referencing the role definition in `.loom/roles/`
+- Specific tool access appropriate for the role
+- Model selection optimized for the task complexity
+
+**Using Subagents with Task**:
+
+The Loom Shepherd (or daemon) can spawn subagents for each phase:
+
+```python
+# Spawn builder subagent with fresh context
+result = Task(
+    description="Builder phase for issue #123",
+    prompt="/builder 123",
+    subagent_type="loom-builder",
+    run_in_background=False
+)
+```
+
+**Benefits**:
+- **Fresh context**: Each subagent starts clean, avoiding context pollution
+- **Role isolation**: Subagents focus on their specific task
+- **Cost control**: Use faster/cheaper models for simpler roles (sonnet vs opus)
+- **Better observability**: Clear which role is running
+
+### Subagents vs Slash Commands
+
+| Feature | Slash Commands | Subagents |
+|---------|----------------|-----------|
+| Context | Shared with main conversation | Isolated, fresh context |
+| Invocation | `/builder 123` | `Task(subagent_type="loom-builder")` |
+| Use case | Manual orchestration | Automated orchestration |
+| Visibility | In main conversation | Spawned as separate task |
+
+**Use slash commands** for manual orchestration mode where you want direct control.
+**Use subagents** for automated orchestration where shepherds coordinate roles with fresh context per phase.
 
 ## Documentation
 
