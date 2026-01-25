@@ -787,6 +787,28 @@ If setup fails, it's usually due to:
 
 ### Common Issues
 
+**'main already used by worktree' error during PR merge**:
+
+When running `gh pr merge` from a worktree, you may see this error:
+```
+fatal: 'main' is already used by worktree at '/path/to/repo'
+```
+
+This is **expected behavior**, not a failure. The merge succeeds on GitHub, but git cannot switch to `main` locally because another worktree has it checked out.
+
+**Solution**: Verify merge success via GitHub API instead of exit code:
+```bash
+# After gh pr merge, check the actual state:
+PR_STATE=$(gh pr view <PR_NUMBER> --json state --jq '.state')
+if [ "$PR_STATE" = "MERGED" ]; then
+  echo "Merge succeeded (local checkout error can be ignored)"
+fi
+```
+
+The Shepherd and Champion roles handle this automatically by verifying PR state via the GitHub API rather than relying on `gh pr merge` exit codes.
+
+---
+
 **Cleaning Up Stale Worktrees and Branches**:
 
 Use the `clean.sh` helper script to restore your repository to a clean state:
