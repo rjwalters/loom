@@ -5,11 +5,12 @@
 # delegating iteration work to Claude via the /loom iterate command.
 #
 # Usage:
-#   ./.loom/scripts/daemon-loop.sh [--force] [--status]
+#   ./.loom/scripts/daemon-loop.sh [--force] [--status] [--health]
 #
 # Options:
 #   --force    Enable force mode for aggressive autonomous development
 #   --status   Check if daemon loop is running
+#   --health   Show daemon health status and exit
 #
 # Environment Variables:
 #   LOOM_POLL_INTERVAL - Seconds between iterations (default: 120)
@@ -28,6 +29,7 @@
 #   - Session state rotation on startup
 #   - Force mode support passed to iterations
 #   - PID file prevents multiple instances (.loom/daemon-loop.pid)
+#   - Iteration metrics and health reporting (.loom/daemon-metrics.json)
 #
 # Example:
 #   # Start daemon with default settings
@@ -42,6 +44,9 @@
 #   # Check if daemon is running
 #   ./.loom/scripts/daemon-loop.sh --status
 #
+#   # Check daemon health
+#   ./.loom/scripts/daemon-loop.sh --health
+#
 #   # Stop daemon gracefully
 #   touch .loom/stop-daemon
 
@@ -55,6 +60,7 @@ BACKOFF_MULTIPLIER="${LOOM_BACKOFF_MULTIPLIER:-2}"
 BACKOFF_THRESHOLD="${LOOM_BACKOFF_THRESHOLD:-3}"
 LOG_FILE=".loom/daemon.log"
 STATE_FILE=".loom/daemon-state.json"
+METRICS_FILE=".loom/daemon-metrics.json"
 STOP_SIGNAL=".loom/stop-daemon"
 PID_FILE=".loom/daemon-loop.pid"
 
@@ -77,6 +83,7 @@ fi
 
 # Parse arguments
 FORCE_FLAG=""
+SHOW_HEALTH=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --force|-f)
@@ -99,12 +106,17 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --health)
+            SHOW_HEALTH=true
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--force] [--status]"
+            echo "Usage: $0 [--force] [--status] [--health]"
             echo ""
             echo "Options:"
             echo "  --force, -f    Enable force mode for aggressive autonomous development"
             echo "  --status       Check if daemon loop is running"
+            echo "  --health       Show daemon health status and exit"
             echo "  --help, -h     Show this help message"
             echo ""
             echo "Environment Variables:"
@@ -133,6 +145,51 @@ if [[ ! -d ".loom" ]]; then
     exit 1
 fi
 
+# Handle --health flag early (before other checks that might modify state)
+if [[ "$SHOW_HEALTH" == true ]]; then
+    if [[ ! -f "$METRICS_FILE" ]]; then
+        echo "Daemon: not running (no metrics file)"
+        exit 1
+    fi
+    # Check for running daemon via PID file (more reliable than state file)
+    running_status="stopped"
+    if [[ -f "$PID_FILE" ]]; then
+        pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            running_status="running (PID: $pid)"
+        fi
+    fi
+    # Extract and display metrics
+    health_status=$(jq -r '.health.status // "unknown"' "$METRICS_FILE" 2>/dev/null || echo "unknown")
+    total_iterations=$(jq -r '.total_iterations // 0' "$METRICS_FILE" 2>/dev/null || echo "0")
+    consecutive_failures=$(jq -r '.health.consecutive_failures // 0' "$METRICS_FILE" 2>/dev/null || echo "0")
+    avg_duration=$(jq -r '.average_iteration_seconds // 0' "$METRICS_FILE" 2>/dev/null || echo "0")
+    last_status=$(jq -r '.last_iteration.status // "none"' "$METRICS_FILE" 2>/dev/null || echo "none")
+    last_duration=$(jq -r '.last_iteration.duration_seconds // 0' "$METRICS_FILE" 2>/dev/null || echo "0")
+    # Calculate success rate
+    if [[ "$total_iterations" -gt 0 ]]; then
+        successful=$(jq -r '.successful_iterations // 0' "$METRICS_FILE" 2>/dev/null || echo "0")
+        success_rate=$(( (successful * 100) / total_iterations ))
+    else
+        success_rate="n/a"
+    fi
+    # Format health status with failure count if unhealthy
+    health_display="$health_status"
+    if [[ "$health_status" == "unhealthy" ]]; then
+        health_display="$health_status ($consecutive_failures consecutive failures)"
+    fi
+    echo "Daemon: $running_status"
+    echo "Health: $health_display"
+    echo "Iterations: $total_iterations (${success_rate}% success)"
+    echo "Avg duration: ${avg_duration}s"
+    echo "Last iteration: $last_status (${last_duration}s)"
+    # Exit with appropriate code
+    if [[ "$health_status" == "unhealthy" ]]; then
+        exit 2
+    fi
+    exit 0
+fi
+
 # Check for existing daemon instance
 if [[ -f "$PID_FILE" ]]; then
     existing_pid=$(cat "$PID_FILE")
@@ -149,7 +206,7 @@ fi
 # Write PID file
 echo $$ > "$PID_FILE"
 
-# Check for claude CLI
+# Check for claude CLI (only needed when actually running the daemon)
 if ! command -v claude &> /dev/null; then
     echo -e "${RED}Error: 'claude' CLI not found in PATH${NC}" >&2
     echo "Install Claude Code CLI: https://claude.ai/code" >&2
@@ -160,6 +217,26 @@ fi
 if [[ -f "./.loom/scripts/rotate-daemon-state.sh" ]] && [[ -f "$STATE_FILE" ]]; then
     echo -e "${BLUE}Rotating previous daemon state...${NC}"
     ./.loom/scripts/rotate-daemon-state.sh 2>/dev/null || true
+fi
+
+# Rotate existing metrics file if present (alongside daemon state rotation)
+# This ensures metrics history is preserved when daemon restarts
+if [[ -f "$METRICS_FILE" ]]; then
+    # Archive metrics with timestamp if there's meaningful data
+    metrics_iterations=$(jq -r '.total_iterations // 0' "$METRICS_FILE" 2>/dev/null || echo "0")
+    if [[ "$metrics_iterations" -gt 0 ]]; then
+        archive_timestamp=$(date +%Y%m%d-%H%M%S)
+        archive_name=".loom/daemon-metrics-${archive_timestamp}.json"
+        cp "$METRICS_FILE" "$archive_name" 2>/dev/null || true
+        echo -e "${BLUE}Archived previous metrics to: $archive_name${NC}"
+
+        # Prune old metrics archives (keep last 10)
+        metrics_archives=$(find .loom -maxdepth 1 -name 'daemon-metrics-*.json' 2>/dev/null | sort -r)
+        archive_count=$(echo "$metrics_archives" | grep -c . || echo "0")
+        if [[ "$archive_count" -gt 10 ]]; then
+            echo "$metrics_archives" | tail -n +11 | xargs rm -f 2>/dev/null || true
+        fi
+    fi
 fi
 
 # Create log directory if needed
@@ -184,9 +261,87 @@ log_header() {
     echo "  Iteration timeout: ${ITERATION_TIMEOUT}s" | tee -a "$LOG_FILE"
     echo "  Max backoff: ${MAX_BACKOFF}s (after ${BACKOFF_THRESHOLD} failures, ${BACKOFF_MULTIPLIER}x multiplier)" | tee -a "$LOG_FILE"
     echo "  PID file: $PID_FILE" | tee -a "$LOG_FILE"
+    echo "  Metrics file: $METRICS_FILE" | tee -a "$LOG_FILE"
     echo "  Stop signal: $STOP_SIGNAL" | tee -a "$LOG_FILE"
     echo "═══════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
+}
+
+# Initialize metrics file for a new daemon session
+init_metrics() {
+    local timestamp
+    timestamp=$(date -Iseconds)
+    cat > "$METRICS_FILE" <<EOF
+{
+  "session_start": "$timestamp",
+  "total_iterations": 0,
+  "successful_iterations": 0,
+  "failed_iterations": 0,
+  "timeout_iterations": 0,
+  "iteration_durations": [],
+  "average_iteration_seconds": 0,
+  "last_iteration": null,
+  "health": {
+    "status": "healthy",
+    "consecutive_failures": 0,
+    "last_success": null
+  }
+}
+EOF
+}
+
+# Update metrics after each iteration
+# Usage: update_metrics <status> <duration> <summary>
+# status: "success", "failure", or "timeout"
+update_metrics() {
+    local status="$1"
+    local duration="$2"
+    local summary="$3"
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    # Initialize metrics file if it doesn't exist
+    if [[ ! -f "$METRICS_FILE" ]]; then
+        init_metrics
+    fi
+
+    # Use jq to update metrics atomically
+    local temp_file
+    temp_file=$(mktemp)
+
+    if jq --arg status "$status" \
+       --arg duration "$duration" \
+       --arg summary "$summary" \
+       --arg timestamp "$timestamp" '
+       .total_iterations += 1 |
+       .last_iteration = {
+           timestamp: $timestamp,
+           duration_seconds: ($duration | tonumber),
+           status: $status,
+           summary: $summary
+       } |
+       if $status == "success" then
+           .successful_iterations += 1 |
+           .health.consecutive_failures = 0 |
+           .health.last_success = $timestamp |
+           .health.status = "healthy"
+       elif $status == "timeout" then
+           .timeout_iterations += 1 |
+           .health.consecutive_failures += 1
+       else
+           .failed_iterations += 1 |
+           .health.consecutive_failures += 1
+       end |
+       .iteration_durations = (.iteration_durations + [($duration | tonumber)])[-100:] |
+       .average_iteration_seconds = (if (.iteration_durations | length) > 0 then ((.iteration_durations | add) / (.iteration_durations | length) | floor) else 0 end) |
+       if .health.consecutive_failures >= 3 then .health.status = "unhealthy" else . end
+    ' "$METRICS_FILE" > "$temp_file" 2>/dev/null; then
+        mv "$temp_file" "$METRICS_FILE"
+    else
+        # jq failed, log warning but don't crash daemon
+        rm -f "$temp_file"
+        log "${YELLOW}Warning: Failed to update metrics file${NC}"
+    fi
 }
 
 # Cleanup function called on exit
@@ -218,6 +373,10 @@ rm -f "$STOP_SIGNAL"
 # Print startup header
 log_header
 
+# Initialize metrics for new session
+init_metrics
+log "Metrics file initialized: $METRICS_FILE"
+
 iteration=0
 consecutive_failures=0
 current_backoff=$POLL_INTERVAL
@@ -234,6 +393,7 @@ while true; do
 
     # Run iteration via Claude
     timestamp=$(date -Iseconds)
+    iteration_start=$(date +%s)
     log "${BLUE}Iteration $iteration: Starting...${NC}"
 
     # Build the command
@@ -241,6 +401,9 @@ while true; do
     if [[ -n "$FORCE_FLAG" ]]; then
         ITERATE_CMD="$ITERATE_CMD $FORCE_FLAG"
     fi
+
+    # Track iteration status for metrics
+    iteration_status="success"
 
     # Capture iteration output with timeout
     # Using timeout command to prevent hung iterations
@@ -256,6 +419,7 @@ while true; do
             elif echo "$output" | grep -qi "error"; then
                 # Extract first error line
                 summary="ERROR: $(echo "$output" | grep -i "error" | head -1 | cut -c1-80)"
+                iteration_status="failure"
             elif echo "$output" | grep -qi "complete\|success\|done"; then
                 summary="completed"
             else
@@ -267,19 +431,28 @@ while true; do
         exit_code=$?
         if [[ $exit_code -eq 124 ]]; then
             summary="TIMEOUT (iteration exceeded ${ITERATION_TIMEOUT}s)"
+            iteration_status="timeout"
             log "${RED}Iteration $iteration: $summary${NC}"
         else
             summary="ERROR (exit code: $exit_code)"
+            iteration_status="failure"
             log "${RED}Iteration $iteration: $summary${NC}"
         fi
     fi
+
+    # Calculate iteration duration
+    iteration_end=$(date +%s)
+    iteration_duration=$((iteration_end - iteration_start))
+
+    # Update metrics with iteration results
+    update_metrics "$iteration_status" "$iteration_duration" "$summary"
 
     # Log the summary and track success/failure for backoff
     if [[ "$summary" == *"SHUTDOWN"* ]]; then
         log "${YELLOW}Iteration $iteration: $summary${NC}"
         break
     elif [[ "$summary" == *"ERROR"* ]] || [[ "$summary" == *"TIMEOUT"* ]]; then
-        log "${RED}Iteration $iteration: $summary${NC}"
+        log "${RED}Iteration $iteration: $summary (${iteration_duration}s)${NC}"
         # Track failure and potentially increase backoff
         consecutive_failures=$((consecutive_failures + 1))
         if [[ $consecutive_failures -ge $BACKOFF_THRESHOLD ]]; then
@@ -294,7 +467,7 @@ while true; do
             fi
         fi
     else
-        log "${GREEN}Iteration $iteration: $summary${NC}"
+        log "${GREEN}Iteration $iteration: $summary (${iteration_duration}s)${NC}"
         # Reset backoff on success
         if [[ $consecutive_failures -gt 0 ]] || [[ $current_backoff -ne $POLL_INTERVAL ]]; then
             consecutive_failures=0
