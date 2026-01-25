@@ -533,6 +533,41 @@ The Loom daemon uses these configuration parameters:
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
 | `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
 
+**Session Reflection Configuration**:
+
+The daemon runs a reflection stage during graceful shutdown to identify improvements and optionally create upstream issues.
+
+```json
+{
+  "reflection": {
+    "enabled": true,              // Enable reflection stage
+    "auto_create_issues": false,  // Require user consent
+    "min_session_duration": 300,  // Skip for sessions < 5 min
+    "upstream_repo": "rjwalters/loom",
+    "categories": ["bug", "enhancement", "documentation"]
+  }
+}
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | true | Enable/disable reflection stage |
+| `auto_create_issues` | false | Auto-create issues without prompting |
+| `min_session_duration` | 300 | Minimum session duration (seconds) to trigger reflection |
+| `upstream_repo` | rjwalters/loom | Repository for improvement issues |
+
+**Manual Reflection**:
+```bash
+# Run reflection manually (e.g., after crash recovery)
+./.loom/scripts/session-reflection.sh
+
+# Preview without creating issues
+./.loom/scripts/session-reflection.sh --dry-run
+
+# Output analysis as JSON
+./.loom/scripts/session-reflection.sh --json
+```
+
 **Daemon State File** (`.loom/daemon-state.json`):
 
 The daemon state file provides comprehensive information for debugging, crash recovery, and system observability.
