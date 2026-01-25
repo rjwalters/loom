@@ -844,6 +844,74 @@ If setup fails, it's usually due to:
 - Branch doesn't exist yet (push at least one commit)
 - GitHub API unreachable (check network/auth)
 
+### Repository Settings
+
+Loom works best with specific repository settings that support the automated workflow. These settings optimize merge behavior and enable auto-merge capabilities.
+
+#### During Installation
+
+The installation script optionally configures repository settings:
+
+**Interactive mode**: Prompts you to configure settings
+```bash
+./scripts/install-loom.sh /path/to/repo
+# Will prompt: Configure repository merge and auto-merge settings? (y/N)
+```
+
+**Non-interactive mode**: Skips repository settings (configure manually)
+```bash
+./scripts/install-loom.sh --yes /path/to/repo
+# Skips settings for automation safety
+```
+
+#### Manual Configuration
+
+Configure repository settings after installation:
+
+```bash
+./scripts/install/setup-repository-settings.sh /path/to/repo
+```
+
+Preview changes without applying (dry-run mode):
+
+```bash
+./scripts/install/setup-repository-settings.sh /path/to/repo --dry-run
+```
+
+Or configure via GitHub Settings:
+1. Go to: `Settings > General` in your repository
+2. Scroll to "Pull Requests" section
+3. Configure merge options as described below
+
+#### Settings Applied
+
+The setup script configures these repository settings:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `allow_merge_commit` | true | Default merge strategy - preserves clear history of PRs |
+| `allow_squash_merge` | false | Disabled - preserves individual commits from agents |
+| `allow_rebase_merge` | false | Disabled - keeps merge commits visible |
+| `delete_branch_on_merge` | true | Auto-cleanup feature branches after merge |
+| `allow_auto_merge` | true | Enables Champion role to auto-merge approved PRs |
+| `allow_update_branch` | true | Suggests keeping branches up-to-date with base |
+
+#### Why These Settings?
+
+- **Merge commits only**: Maintains clear history showing which PRs introduced changes; important for understanding agent work
+- **Delete branches after merge**: Prevents accumulation of stale branches from issue worktrees
+- **Auto-merge enabled**: Required for Champion role to automatically merge approved PRs
+- **Suggest updating branches**: Helps agents keep branches current with main
+
+**Requirements**:
+- Admin permissions on target repository
+- GitHub CLI authenticated
+
+**Troubleshooting**:
+If setup fails, it's usually due to:
+- Lacking admin permissions (ask repo owner)
+- GitHub API unreachable (check network/auth)
+
 ## Troubleshooting
 
 ### Common Issues
