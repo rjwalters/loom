@@ -14,11 +14,15 @@
 # Environment Variables:
 #   LOOM_POLL_INTERVAL - Seconds between iterations (default: 120)
 #   LOOM_ITERATION_TIMEOUT - Max seconds per iteration (default: 300)
+#   LOOM_MAX_BACKOFF - Maximum backoff interval in seconds (default: 1800)
+#   LOOM_BACKOFF_MULTIPLIER - Backoff multiplier on failure (default: 2)
+#   LOOM_BACKOFF_THRESHOLD - Failures before backoff kicks in (default: 3)
 #
 # Features:
 #   - Deterministic loop behavior (no LLM interpretation variability)
 #   - Configurable poll interval via environment variable
 #   - Timeout protection prevents hung iterations
+#   - Exponential backoff on repeated failures (configurable)
 #   - All output logged to .loom/daemon.log
 #   - Graceful shutdown via .loom/stop-daemon signal file
 #   - Session state rotation on startup
@@ -46,6 +50,9 @@ set -euo pipefail
 # Configuration
 POLL_INTERVAL="${LOOM_POLL_INTERVAL:-120}"
 ITERATION_TIMEOUT="${LOOM_ITERATION_TIMEOUT:-300}"
+MAX_BACKOFF="${LOOM_MAX_BACKOFF:-1800}"
+BACKOFF_MULTIPLIER="${LOOM_BACKOFF_MULTIPLIER:-2}"
+BACKOFF_THRESHOLD="${LOOM_BACKOFF_THRESHOLD:-3}"
 LOG_FILE=".loom/daemon.log"
 STATE_FILE=".loom/daemon-state.json"
 STOP_SIGNAL=".loom/stop-daemon"
@@ -103,6 +110,9 @@ while [[ $# -gt 0 ]]; do
             echo "Environment Variables:"
             echo "  LOOM_POLL_INTERVAL      Seconds between iterations (default: 120)"
             echo "  LOOM_ITERATION_TIMEOUT  Max seconds per iteration (default: 300)"
+            echo "  LOOM_MAX_BACKOFF        Maximum backoff interval in seconds (default: 1800)"
+            echo "  LOOM_BACKOFF_MULTIPLIER Backoff multiplier on failure (default: 2)"
+            echo "  LOOM_BACKOFF_THRESHOLD  Failures before backoff kicks in (default: 3)"
             echo ""
             echo "To stop the daemon gracefully:"
             echo "  touch .loom/stop-daemon"
@@ -172,6 +182,7 @@ log_header() {
     echo "  Mode: ${FORCE_FLAG:-Normal}" | tee -a "$LOG_FILE"
     echo "  Poll interval: ${POLL_INTERVAL}s" | tee -a "$LOG_FILE"
     echo "  Iteration timeout: ${ITERATION_TIMEOUT}s" | tee -a "$LOG_FILE"
+    echo "  Max backoff: ${MAX_BACKOFF}s (after ${BACKOFF_THRESHOLD} failures, ${BACKOFF_MULTIPLIER}x multiplier)" | tee -a "$LOG_FILE"
     echo "  PID file: $PID_FILE" | tee -a "$LOG_FILE"
     echo "  Stop signal: $STOP_SIGNAL" | tee -a "$LOG_FILE"
     echo "═══════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
@@ -208,6 +219,8 @@ rm -f "$STOP_SIGNAL"
 log_header
 
 iteration=0
+consecutive_failures=0
+current_backoff=$POLL_INTERVAL
 
 # Main loop
 while true; do
@@ -261,14 +274,33 @@ while true; do
         fi
     fi
 
-    # Log the summary
+    # Log the summary and track success/failure for backoff
     if [[ "$summary" == *"SHUTDOWN"* ]]; then
         log "${YELLOW}Iteration $iteration: $summary${NC}"
         break
     elif [[ "$summary" == *"ERROR"* ]] || [[ "$summary" == *"TIMEOUT"* ]]; then
         log "${RED}Iteration $iteration: $summary${NC}"
+        # Track failure and potentially increase backoff
+        consecutive_failures=$((consecutive_failures + 1))
+        if [[ $consecutive_failures -ge $BACKOFF_THRESHOLD ]]; then
+            # Calculate new backoff (with cap)
+            new_backoff=$((current_backoff * BACKOFF_MULTIPLIER))
+            if [[ $new_backoff -gt $MAX_BACKOFF ]]; then
+                new_backoff=$MAX_BACKOFF
+            fi
+            if [[ $new_backoff -ne $current_backoff ]]; then
+                current_backoff=$new_backoff
+                log "${YELLOW}Backing off to ${current_backoff}s (failure ${consecutive_failures})${NC}"
+            fi
+        fi
     else
         log "${GREEN}Iteration $iteration: $summary${NC}"
+        # Reset backoff on success
+        if [[ $consecutive_failures -gt 0 ]] || [[ $current_backoff -ne $POLL_INTERVAL ]]; then
+            consecutive_failures=0
+            current_backoff=$POLL_INTERVAL
+            log "${GREEN}Backoff reset to ${POLL_INTERVAL}s${NC}"
+        fi
     fi
 
     # Check for stop signal again before sleeping
@@ -277,9 +309,9 @@ while true; do
         break
     fi
 
-    # Sleep before next iteration
-    log "Sleeping ${POLL_INTERVAL}s until next iteration..."
-    sleep "$POLL_INTERVAL"
+    # Sleep before next iteration (using current_backoff which may be elevated)
+    log "Sleeping ${current_backoff}s until next iteration..."
+    sleep "$current_backoff"
 done
 
 log "${GREEN}Daemon loop completed gracefully${NC}"
