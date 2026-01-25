@@ -661,6 +661,113 @@ The daemon state file provides comprehensive information for debugging, crash re
 - `role_failure` - Support role failed to complete
 - `stuck_agent` - Agent detected as stuck
 
+### Shepherd Progress Milestones
+
+Shepherds report progress milestones to `.loom/progress/` for daemon visibility. This enables:
+- Real-time progress monitoring without parsing output files
+- Heartbeat-based stuck detection (more reliable than file timestamps)
+- Phase-level visibility into shepherd activity
+- Better debugging when issues arise
+
+**Progress File** (`.loom/progress/shepherd-{task_id}.json`):
+
+```json
+{
+  "task_id": "a7dc1e0",
+  "issue": 123,
+  "mode": "force-pr",
+  "started_at": "2026-01-25T10:00:00Z",
+  "current_phase": "builder",
+  "last_heartbeat": "2026-01-25T10:15:00Z",
+  "status": "working",
+  "milestones": [
+    {"event": "started", "timestamp": "2026-01-25T10:00:00Z", "data": {"issue": 123, "mode": "force-pr"}},
+    {"event": "phase_entered", "timestamp": "2026-01-25T10:01:00Z", "data": {"phase": "curator"}},
+    {"event": "phase_entered", "timestamp": "2026-01-25T10:05:00Z", "data": {"phase": "builder"}},
+    {"event": "worktree_created", "timestamp": "2026-01-25T10:06:00Z", "data": {"path": ".loom/worktrees/issue-123"}},
+    {"event": "heartbeat", "timestamp": "2026-01-25T10:15:00Z", "data": {"action": "running tests"}}
+  ]
+}
+```
+
+**Milestone Events**:
+
+| Event | When | Data |
+|-------|------|------|
+| `started` | Shepherd begins orchestration | `issue`, `mode` |
+| `phase_entered` | Enters new orchestration phase | `phase` (curator, builder, judge, etc.) |
+| `worktree_created` | Worktree created for issue | `path` |
+| `first_commit` | First commit made in worktree | `sha` |
+| `pr_created` | Pull request created | `pr_number` |
+| `heartbeat` | Periodic during long operations | `action` (description) |
+| `completed` | Orchestration finished | `pr_merged` |
+| `blocked` | Work is blocked | `reason`, `details` |
+| `error` | Encountered an error | `error`, `will_retry` |
+
+**Reporting Milestones**:
+
+Shepherds use the `report-milestone.sh` script:
+
+```bash
+# Report shepherd started
+./.loom/scripts/report-milestone.sh started --task-id abc123 --issue 42 --mode force-pr
+
+# Report phase transition
+./.loom/scripts/report-milestone.sh phase_entered --task-id abc123 --phase builder
+
+# Report heartbeat during long operation
+./.loom/scripts/report-milestone.sh heartbeat --task-id abc123 --action "running tests"
+
+# Report PR created
+./.loom/scripts/report-milestone.sh pr_created --task-id abc123 --pr-number 456
+
+# Report completion
+./.loom/scripts/report-milestone.sh completed --task-id abc123 --pr-merged
+
+# Report error (with retry)
+./.loom/scripts/report-milestone.sh error --task-id abc123 --error "build failed" --will-retry
+```
+
+**Daemon Snapshot Integration**:
+
+The `daemon-snapshot.sh` script includes shepherd progress in its output:
+
+```json
+{
+  "shepherds": {
+    "progress": [
+      {
+        "task_id": "a7dc1e0",
+        "issue": 123,
+        "current_phase": "builder",
+        "last_heartbeat": "2026-01-25T10:15:00Z",
+        "status": "working",
+        "heartbeat_age_seconds": 45,
+        "heartbeat_stale": false
+      }
+    ],
+    "stale_heartbeat_count": 0
+  }
+}
+```
+
+**Stuck Detection with Milestones**:
+
+The `stuck-detection.sh` script uses milestones for more accurate detection:
+
+| Indicator | Threshold | Description |
+|-----------|-----------|-------------|
+| `stale_heartbeat` | 2 minutes | No heartbeat for extended time |
+| `missing_milestone:worktree_created` | 5 minutes | Expected worktree not created |
+| `extended_work` | 30 minutes | Same phase for too long |
+
+**Progress File Cleanup**:
+
+Progress files are automatically cleaned up:
+- On `shepherd-complete` event (completed issues)
+- On `daemon-startup` (stale files from previous session)
+- On `periodic` cleanup (files older than 24 hours)
+
 **Session Rotation**:
 
 When a new daemon session starts, the existing `daemon-state.json` is automatically rotated to preserve session history:

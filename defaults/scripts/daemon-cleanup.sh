@@ -30,6 +30,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || error "Not in a git 
 
 # Paths
 DAEMON_STATE="$REPO_ROOT/.loom/daemon-state.json"
+PROGRESS_DIR="$REPO_ROOT/.loom/progress"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration (can be overridden via environment or daemon-state.json)
@@ -222,11 +223,96 @@ handle_shepherd_complete() {
     fi
   fi
 
+  # Clean up progress file for completed shepherd
+  cleanup_progress_file "$ISSUE_NUMBER"
+
   if [[ "$DRY_RUN" != true ]]; then
     update_cleanup_timestamp "shepherd-complete"
   fi
 
   success "Shepherd complete cleanup finished for issue #$ISSUE_NUMBER"
+}
+
+# Helper: Cleanup progress file for a completed issue
+cleanup_progress_file() {
+  local issue_num="$1"
+
+  if [[ ! -d "$PROGRESS_DIR" ]]; then
+    return
+  fi
+
+  # Find progress file(s) for this issue
+  for progress_file in "$PROGRESS_DIR"/shepherd-*.json; do
+    if [[ -f "$progress_file" ]]; then
+      local file_issue
+      file_issue=$(jq -r '.issue // 0' "$progress_file" 2>/dev/null || echo "0")
+      local file_status
+      file_status=$(jq -r '.status // "working"' "$progress_file" 2>/dev/null || echo "working")
+
+      if [[ "$file_issue" == "$issue_num" ]]; then
+        if [[ "$file_status" == "completed" ]]; then
+          if [[ "$DRY_RUN" == true ]]; then
+            info "[DRY-RUN] Would delete progress file: $(basename "$progress_file")"
+          else
+            rm -f "$progress_file"
+            info "Deleted progress file: $(basename "$progress_file")"
+          fi
+        else
+          info "Progress file for issue #$issue_num has status '$file_status', not cleaning"
+        fi
+      fi
+    fi
+  done
+}
+
+# Helper: Cleanup stale progress files
+cleanup_stale_progress_files() {
+  if [[ ! -d "$PROGRESS_DIR" ]]; then
+    return
+  fi
+
+  local stale_threshold="${LOOM_PROGRESS_STALE_HOURS:-24}"  # 24 hours default
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  info "Cleaning stale progress files (older than ${stale_threshold}h)..."
+
+  for progress_file in "$PROGRESS_DIR"/shepherd-*.json; do
+    if [[ -f "$progress_file" ]]; then
+      local last_heartbeat
+      last_heartbeat=$(jq -r '.last_heartbeat // ""' "$progress_file" 2>/dev/null || echo "")
+      local status
+      status=$(jq -r '.status // "working"' "$progress_file" 2>/dev/null || echo "working")
+
+      # Skip files still being actively worked
+      if [[ "$status" == "working" ]]; then
+        # Check heartbeat freshness
+        if [[ -n "$last_heartbeat" && "$last_heartbeat" != "null" ]]; then
+          local hb_epoch
+          if [[ "$(uname)" == "Darwin" ]]; then
+            hb_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+          else
+            hb_epoch=$(date -d "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+          fi
+
+          local age_hours=$(( (now_epoch - hb_epoch) / 3600 ))
+          if [[ $age_hours -lt $stale_threshold ]]; then
+            continue  # Skip fresh files
+          fi
+        fi
+      fi
+
+      # For completed/errored/blocked files, clean up after threshold
+      if [[ "$status" != "working" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+          info "[DRY-RUN] Would delete stale progress file: $(basename "$progress_file") (status: $status)"
+        else
+          rm -f "$progress_file"
+          info "Deleted stale progress file: $(basename "$progress_file") (status: $status)"
+        fi
+      fi
+    fi
+  done
 }
 
 # Event: daemon-startup
@@ -278,6 +364,9 @@ handle_daemon_startup() {
   else
     "$SCRIPT_DIR/archive-logs.sh" --prune-only --retention-days "$RETENTION_DAYS" 2>/dev/null || true
   fi
+
+  # Cleanup stale progress files from previous session
+  cleanup_stale_progress_files
 
   if [[ "$DRY_RUN" != true ]]; then
     update_cleanup_timestamp "daemon-startup"
@@ -411,6 +500,9 @@ handle_periodic() {
   else
     "$SCRIPT_DIR/archive-logs.sh" --prune-only --retention-days "$RETENTION_DAYS" 2>/dev/null || true
   fi
+
+  # Cleanup stale progress files
+  cleanup_stale_progress_files
 
   if [[ "$DRY_RUN" != true ]]; then
     update_cleanup_timestamp "periodic"

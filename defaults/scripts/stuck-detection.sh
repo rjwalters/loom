@@ -67,6 +67,7 @@ DAEMON_STATE="$LOOM_DIR/daemon-state.json"
 STUCK_CONFIG="$LOOM_DIR/stuck-config.json"
 STUCK_HISTORY="$LOOM_DIR/stuck-history.json"
 INTERVENTIONS_DIR="$LOOM_DIR/interventions"
+PROGRESS_DIR="$LOOM_DIR/progress"
 
 # Default thresholds (in seconds)
 DEFAULT_IDLE_THRESHOLD=600        # 10 minutes without output
@@ -74,6 +75,8 @@ DEFAULT_WORKING_THRESHOLD=1800    # 30 minutes on same issue with no progress
 DEFAULT_LOOP_THRESHOLD=3          # 3 similar error patterns = looping
 DEFAULT_ERROR_SPIKE_THRESHOLD=5   # 5 errors in 5 minutes = error spike
 DEFAULT_COST_THRESHOLD=1000000    # Cost tokens without meaningful output
+DEFAULT_HEARTBEAT_STALE=120       # 2 minutes without heartbeat = stale
+DEFAULT_NO_WORKTREE_THRESHOLD=300 # 5 minutes without worktree creation = warning
 
 # Ensure directories exist
 ensure_dirs() {
@@ -170,12 +173,16 @@ load_config() {
         LOOP_THRESHOLD=$(jq -r '.loop_threshold // 3' "$STUCK_CONFIG")
         ERROR_SPIKE_THRESHOLD=$(jq -r '.error_spike_threshold // 5' "$STUCK_CONFIG")
         INTERVENTION_MODE=$(jq -r '.intervention_mode // "escalate"' "$STUCK_CONFIG")
+        HEARTBEAT_STALE=$(jq -r '.heartbeat_stale // 120' "$STUCK_CONFIG")
+        NO_WORKTREE_THRESHOLD=$(jq -r '.no_worktree_threshold // 300' "$STUCK_CONFIG")
     else
         IDLE_THRESHOLD=$DEFAULT_IDLE_THRESHOLD
         WORKING_THRESHOLD=$DEFAULT_WORKING_THRESHOLD
         LOOP_THRESHOLD=$DEFAULT_LOOP_THRESHOLD
         ERROR_SPIKE_THRESHOLD=$DEFAULT_ERROR_SPIKE_THRESHOLD
         INTERVENTION_MODE="escalate"
+        HEARTBEAT_STALE=$DEFAULT_HEARTBEAT_STALE
+        NO_WORKTREE_THRESHOLD=$DEFAULT_NO_WORKTREE_THRESHOLD
     fi
 }
 
@@ -295,6 +302,111 @@ count_recent_errors() {
     echo "$error_count"
 }
 
+# Read progress file for a shepherd by task_id
+read_progress_by_task() {
+    local task_id="$1"
+    local progress_file="$PROGRESS_DIR/shepherd-${task_id}.json"
+
+    if [[ -f "$progress_file" ]]; then
+        cat "$progress_file" 2>/dev/null
+    else
+        echo "{}"
+    fi
+}
+
+# Find progress file for an agent by matching issue number
+find_progress_for_agent() {
+    local agent_id="$1"
+    local issue="$2"
+
+    if [[ ! -d "$PROGRESS_DIR" ]]; then
+        echo "{}"
+        return
+    fi
+
+    # Look for progress file matching this issue
+    for progress_file in "$PROGRESS_DIR"/shepherd-*.json; do
+        if [[ -f "$progress_file" ]]; then
+            local file_issue
+            file_issue=$(jq -r '.issue // 0' "$progress_file" 2>/dev/null || echo "0")
+            if [[ "$file_issue" == "$issue" ]]; then
+                cat "$progress_file"
+                return
+            fi
+        fi
+    done
+
+    echo "{}"
+}
+
+# Get heartbeat age from progress file
+get_heartbeat_age() {
+    local progress="$1"
+
+    if [[ -z "$progress" ]] || [[ "$progress" == "{}" ]]; then
+        echo "-1"
+        return
+    fi
+
+    local last_heartbeat
+    last_heartbeat=$(echo "$progress" | jq -r '.last_heartbeat // ""')
+
+    if [[ -z "$last_heartbeat" ]] || [[ "$last_heartbeat" == "null" ]]; then
+        echo "-1"
+        return
+    fi
+
+    local now_epoch
+    local hb_epoch
+
+    now_epoch=$(date +%s)
+
+    if [[ "$(uname)" == "Darwin" ]]; then
+        hb_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+    else
+        hb_epoch=$(date -d "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+    fi
+
+    if [[ "$hb_epoch" == "0" ]]; then
+        echo "-1"
+        return
+    fi
+
+    echo $((now_epoch - hb_epoch))
+}
+
+# Check for missing expected milestones
+check_missing_milestones() {
+    local progress="$1"
+    local working_seconds="$2"
+    local missing=()
+
+    if [[ -z "$progress" ]] || [[ "$progress" == "{}" ]]; then
+        # No progress file - can't check milestones
+        echo "[]"
+        return
+    fi
+
+    local milestones
+    milestones=$(echo "$progress" | jq -r '.milestones // []')
+
+    # Check if worktree_created is expected but missing
+    if [[ $working_seconds -gt $NO_WORKTREE_THRESHOLD ]]; then
+        local has_worktree
+        has_worktree=$(echo "$milestones" | jq '[.[] | select(.event == "worktree_created")] | length')
+        if [[ "$has_worktree" == "0" ]]; then
+            missing+=("worktree_created")
+        fi
+    fi
+
+    # Output as JSON array
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        echo "[]"
+    else
+        printf '%s\n' "${missing[@]}" | jq -R . | jq -s .
+    fi
+}
+
 # Check a single agent for stuck indicators
 check_agent() {
     local agent_id="$1"
@@ -309,10 +421,12 @@ check_agent() {
     local issue
     local output_file
     local started
+    local task_id
 
     issue=$(jq -r ".shepherds[\"$agent_id\"].issue // null" "$DAEMON_STATE" 2>/dev/null)
     output_file=$(jq -r ".shepherds[\"$agent_id\"].output_file // null" "$DAEMON_STATE" 2>/dev/null)
     started=$(jq -r ".shepherds[\"$agent_id\"].started // null" "$DAEMON_STATE" 2>/dev/null)
+    task_id=$(jq -r ".shepherds[\"$agent_id\"].task_id // null" "$DAEMON_STATE" 2>/dev/null)
 
     # If no issue assigned, agent is idle - not stuck
     if [[ "$issue" == "null" ]] || [[ -z "$issue" ]]; then
@@ -320,16 +434,38 @@ check_agent() {
         return
     fi
 
+    # Try to read progress file (prefer task_id, fall back to issue match)
+    local progress="{}"
+    if [[ -n "$task_id" ]] && [[ "$task_id" != "null" ]]; then
+        progress=$(read_progress_by_task "$task_id")
+    fi
+    if [[ "$progress" == "{}" ]]; then
+        progress=$(find_progress_for_agent "$agent_id" "$issue")
+    fi
+
     # Calculate metrics
     local idle_seconds
     local working_seconds
     local loop_count
     local error_count
+    local heartbeat_age
+    local missing_milestones
 
-    idle_seconds=$(get_idle_seconds "$output_file")
     working_seconds=$(get_working_seconds "$started")
+
+    # Prefer heartbeat-based idle detection if progress file exists
+    heartbeat_age=$(get_heartbeat_age "$progress")
+    if [[ "$heartbeat_age" -ge 0 ]]; then
+        # Use heartbeat freshness as primary idle indicator
+        idle_seconds=$heartbeat_age
+    else
+        # Fall back to output file timestamp
+        idle_seconds=$(get_idle_seconds "$output_file")
+    fi
+
     loop_count=$(detect_loop_pattern "$output_file")
     error_count=$(count_recent_errors "$output_file")
+    missing_milestones=$(check_missing_milestones "$progress" "$working_seconds")
 
     # Check each stuck indicator
     local stuck=false
@@ -337,10 +473,14 @@ check_agent() {
     local severity="none"
     local suggested_intervention="none"
 
-    # 1. No progress indicator
+    # 1. No progress indicator (prefer heartbeat if available)
     if [[ "$idle_seconds" -ge "$IDLE_THRESHOLD" ]]; then
         stuck=true
-        indicators+=("no_progress:${idle_seconds}s")
+        if [[ "$heartbeat_age" -ge 0 ]]; then
+            indicators+=("stale_heartbeat:${idle_seconds}s")
+        else
+            indicators+=("no_progress:${idle_seconds}s")
+        fi
         severity="warning"
         suggested_intervention="alert"
     fi
@@ -381,12 +521,34 @@ check_agent() {
         fi
     fi
 
+    # 5. Missing expected milestones
+    local missing_count
+    missing_count=$(echo "$missing_milestones" | jq 'length')
+    if [[ "$missing_count" -gt 0 ]]; then
+        stuck=true
+        local missing_list
+        missing_list=$(echo "$missing_milestones" | jq -r 'join(",")')
+        indicators+=("missing_milestone:$missing_list")
+        if [[ "$severity" == "none" ]]; then
+            severity="warning"
+        fi
+        if [[ "$suggested_intervention" == "none" ]]; then
+            suggested_intervention="alert"
+        fi
+    fi
+
     # Build JSON output
     local indicators_json
     if [[ ${#indicators[@]} -eq 0 ]]; then
         indicators_json="[]"
     else
         indicators_json=$(printf '%s\n' "${indicators[@]}" | jq -R . | jq -s .)
+    fi
+
+    # Get current phase from progress if available
+    local current_phase="unknown"
+    if [[ "$progress" != "{}" ]]; then
+        current_phase=$(echo "$progress" | jq -r '.current_phase // "unknown"')
     fi
 
     cat <<EOF
@@ -400,16 +562,20 @@ check_agent() {
   "indicators": $indicators_json,
   "metrics": {
     "idle_seconds": $idle_seconds,
+    "heartbeat_age": $heartbeat_age,
     "working_seconds": $working_seconds,
     "loop_count": $loop_count,
-    "error_count": $error_count
+    "error_count": $error_count,
+    "current_phase": "$current_phase"
   },
   "thresholds": {
     "idle": $IDLE_THRESHOLD,
     "working": $WORKING_THRESHOLD,
     "loop": $LOOP_THRESHOLD,
-    "error_spike": $ERROR_SPIKE_THRESHOLD
+    "error_spike": $ERROR_SPIKE_THRESHOLD,
+    "heartbeat_stale": $HEARTBEAT_STALE
   },
+  "missing_milestones": $missing_milestones,
   "checked_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
