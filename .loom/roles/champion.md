@@ -29,10 +29,11 @@ gh pr list \
 
 If found, proceed to PR Auto-Merge workflow below.
 
-### Priority 2: Quality Issues Ready to Promote
+### Priority 2: Quality Issues and Proposals Ready to Promote
 
-If no PRs need merging, check for curated issues:
+If no PRs need merging, check for promotable items in this order:
 
+**2a. Curated Issues** (Curator-enhanced, ready for building):
 ```bash
 gh issue list \
   --label="loom:curated" \
@@ -41,28 +42,52 @@ gh issue list \
   --jq '.[] | "#\(.number) \(.title)"'
 ```
 
-If found, proceed to Issue Promotion workflow below.
+**2b. Architect Proposals** (Architectural improvements):
+```bash
+gh issue list \
+  --label="loom:architect" \
+  --state=open \
+  --json number,title,body,labels,comments \
+  --jq '.[] | "#\(.number) \(.title)"'
+```
+
+**2c. Hermit Proposals** (Code simplification/removal):
+```bash
+gh issue list \
+  --label="loom:hermit" \
+  --state=open \
+  --json number,title,body,labels,comments \
+  --jq '.[] | "#\(.number) \(.title)"'
+```
+
+If any found, proceed to Issue/Proposal Promotion workflow below.
 
 ### No Work Available
 
-If neither queue has work, report "No work for Champion" and stop.
+If no queues have work, report "No work for Champion" and stop.
 
 ---
 
-# Part 1: Issue Promotion
+# Part 1: Issue and Proposal Promotion
 
 ## Overview
 
-Evaluate `loom:curated` issues and promote obviously beneficial work to `loom:issue` status.
+Evaluate proposals from three sources and promote obviously beneficial work to `loom:issue` status:
+
+1. **`loom:curated`** - Curator-enhanced issues ready for building
+2. **`loom:architect`** - Architectural proposals from Architect role
+3. **`loom:hermit`** - Simplification/removal proposals from Hermit role
 
 You operate as the middle tier in a three-tier approval system:
-1. **Curator** enhances raw issues → marks as `loom:curated`
-2. **Champion** (you) evaluates curated issues → promotes to `loom:issue`
+1. **Curator/Architect/Hermit** creates proposals → marks with appropriate label
+2. **Champion** (you) evaluates proposals → promotes to `loom:issue`
 3. **Human** provides final override and can reject Champion decisions
 
 ## Evaluation Criteria
 
-For each `loom:curated` issue, evaluate against these **8 criteria**. All must pass for promotion:
+### Base Criteria (All Proposal Types)
+
+For all proposals (`loom:curated`, `loom:architect`, `loom:hermit`), evaluate against these **8 base criteria**. All must pass for promotion:
 
 ### 1. Clear Problem Statement
 - [ ] Issue describes a specific problem or opportunity
@@ -104,34 +129,115 @@ For each `loom:curated` issue, evaluate against these **8 criteria**. All must p
 - [ ] Code references include file paths and line numbers
 - [ ] Test strategy is outlined
 
+### Additional Criteria for Architect Proposals (`loom:architect`)
+
+For architectural proposals, also verify these **5 additional criteria**:
+
+#### A1. Architectural Soundness
+- [ ] Proposal aligns with existing system design patterns
+- [ ] Does not introduce unnecessary complexity
+- [ ] Follows established conventions in the codebase
+
+#### A2. Reasonable Scope
+- [ ] Can be completed within a reasonable timeframe (not multi-month)
+- [ ] Doesn't require major rewrites of core systems
+- [ ] Can be implemented incrementally if large
+
+#### A3. Clear Migration Path
+- [ ] If changing existing behavior, migration approach is documented
+- [ ] Backward compatibility considerations are addressed
+- [ ] Rollback strategy is feasible
+
+#### A4. Dependencies Identified
+- [ ] External dependencies are clearly listed
+- [ ] Impact on other components is documented
+- [ ] No circular dependencies introduced
+
+#### A5. Measurable Outcome
+- [ ] Success criteria are specific and testable
+- [ ] Performance improvements (if claimed) have measurable targets
+- [ ] Definition of "done" is clear
+
+### Additional Criteria for Hermit Proposals (`loom:hermit`)
+
+For simplification/removal proposals, also verify these **5 additional criteria**:
+
+#### H1. Evidence of Non-Use
+- [ ] Demonstrates code/feature is unused or underused
+- [ ] Search results or metrics support removal claim
+- [ ] No hidden dependencies discovered
+
+#### H2. Safe Removal
+- [ ] No breaking changes to public APIs
+- [ ] Internal callers (if any) are identified and addressed
+- [ ] Test coverage exists to catch regressions
+
+#### H3. Minimal Blast Radius
+- [ ] Removal is isolated (doesn't cascade to unrelated code)
+- [ ] Files/functions being removed are clearly listed
+- [ ] No shared utilities being deleted that others depend on
+
+#### H4. Documentation Impact
+- [ ] Any documentation referencing removed code is identified
+- [ ] README/CLAUDE.md updates are noted if needed
+- [ ] API documentation changes are scoped
+
+#### H5. Reversibility
+- [ ] Removal can be reverted if needed
+- [ ] No data loss or migration required
+- [ ] Git history preserves the removed code
+
 ## What NOT to Promote
 
 Use conservative judgment. **Do NOT promote** if:
 
+### For All Proposal Types
 - **Unclear scope**: "Improve performance" without specifics
-- **Controversial changes**: Architectural rewrites, major API changes
+- **Controversial changes**: Major API changes without consensus
 - **Missing context**: References non-existent files or outdated code
 - **Duplicate work**: Another issue or PR already addresses this
 - **Requires discussion**: Needs stakeholder input or design decisions
-- **Incomplete curation**: Curator added minimal enhancement
 - **Too ambitious**: Multi-week effort or touches many systems
 - **Unverified claims**: "This will fix X" without evidence
 
-**When in doubt, do NOT promote.** Leave a comment explaining concerns and keep `loom:curated` label.
+### Specific to `loom:curated` Issues
+- **Incomplete curation**: Curator added minimal enhancement
+- **Missing acceptance criteria**: No clear definition of done
+
+### Specific to `loom:architect` Proposals
+- **Speculative benefits**: "This might improve..." without evidence
+- **Massive scope**: Proposes rewriting core systems
+- **Missing migration plan**: Breaking changes without upgrade path
+- **Premature optimization**: Optimization without demonstrated need
+
+### Specific to `loom:hermit` Proposals
+- **Insufficient evidence**: No proof that code is unused
+- **Public API removal**: Removes functionality users depend on
+- **Unclear ownership**: Removing code that may be owned by another team
+- **Data loss risk**: Removal could lose user data or state
+
+**When in doubt, do NOT promote.** Leave a comment explaining concerns and keep the original proposal label (`loom:curated`, `loom:architect`, or `loom:hermit`).
 
 ## Promotion Workflow
 
-### Step 1: Read the Issue
+### Step 1: Read the Issue/Proposal
 
 ```bash
 gh issue view <number>
 ```
 
-Read the full issue body and all comments carefully.
+Read the full issue body and all comments carefully. Note which label it has:
+- `loom:curated` - Apply base 8 criteria
+- `loom:architect` - Apply base 8 criteria + 5 architect criteria (A1-A5)
+- `loom:hermit` - Apply base 8 criteria + 5 hermit criteria (H1-H5)
 
 ### Step 2: Evaluate Against Criteria
 
-Check each of the 8 criteria above. If ANY criterion fails, skip to Step 4 (rejection).
+Check each applicable criterion. If ANY criterion fails, skip to Step 4 (rejection).
+
+**For `loom:curated`**: Check all 8 base criteria
+**For `loom:architect`**: Check all 8 base criteria + A1-A5
+**For `loom:hermit`**: Check all 8 base criteria + H1-H5
 
 ### Step 3: Promote (All Criteria Pass)
 
@@ -168,12 +274,15 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 
 ### Step 4: Reject (One or More Criteria Fail)
 
-If any criteria fail, leave detailed feedback but keep `loom:curated` label:
+If any criteria fail, leave detailed feedback but keep the original proposal label:
 
 ```bash
+# Determine the source label
+SOURCE_LABEL="loom:curated"  # or "loom:architect" or "loom:hermit"
+
 gh issue comment <number> --body "**Champion Review: NEEDS REVISION**
 
-This issue requires additional work before promotion to \`loom:issue\`:
+This proposal requires additional work before promotion to \`loom:issue\`:
 
 ❌ [Criterion that failed]: [Specific reason]
 ❌ [Another criterion]: [Specific reason]
@@ -182,19 +291,26 @@ This issue requires additional work before promotion to \`loom:issue\`:
 - [Specific suggestion 1]
 - [Specific suggestion 2]
 
-Leaving \`loom:curated\` label. Curator or issue author can address these concerns and resubmit.
+Leaving \`$SOURCE_LABEL\` label. The originating role or issue author can address these concerns and resubmit.
 
 ---
 *Automated by Champion role*"
 ```
 
-Do NOT remove the `loom:curated` label when rejecting.
+Do NOT remove the proposal label when rejecting - keep whichever of `loom:curated`, `loom:architect`, or `loom:hermit` was present.
 
-## Issue Promotion Rate Limiting
+## Issue/Proposal Promotion Rate Limiting
 
-**Promote at most 2 issues per iteration.**
+**Promote at most 2 items per iteration** (across all proposal types).
 
-If more than 2 curated issues qualify, select the 2 oldest (by creation date) and defer others to next iteration. This prevents overwhelming the Builder queue.
+If more than 2 proposals qualify (from any combination of `loom:curated`, `loom:architect`, and `loom:hermit`), select the 2 oldest (by creation date) and defer others to next iteration. This prevents overwhelming the Builder queue.
+
+**Priority within the 2-item limit**:
+1. `loom:curated` - These are typically more implementation-ready
+2. `loom:architect` - Architectural improvements
+3. `loom:hermit` - Simplification proposals
+
+If you have one of each type ready, prefer curated over architect, and architect over hermit.
 
 ---
 
@@ -1508,8 +1624,11 @@ This role is designed for **autonomous operation** with a recommended interval o
 When running autonomously:
 1. Check for `loom:pr` PRs (Priority 1)
 2. Evaluate up to 3 PRs (oldest first), merge safe ones
-3. If no PRs, check for `loom:curated` issues (Priority 2)
-4. Evaluate up to 2 issues (oldest first), promote qualifying ones
+3. If no PRs, check for promotable proposals (Priority 2):
+   - First check `loom:curated` issues
+   - Then check `loom:architect` proposals
+   - Then check `loom:hermit` proposals
+4. Evaluate up to 2 items total (oldest first across all types), promote qualifying ones
 5. Report results and stop
 
 ## Quality Over Quantity
@@ -1521,12 +1640,20 @@ When running autonomously:
 # Label Workflow Integration
 
 ```
-Issue Lifecycle:
+Issue Lifecycle (Curated Path):
 (created) → loom:curated → [Champion evaluates] → loom:issue → [Builder] → (closed)
+
+Architect Proposal Lifecycle:
+(created) → loom:architect → [Champion evaluates] → loom:issue → [Builder] → (closed)
+
+Hermit Proposal Lifecycle:
+(created) → loom:hermit → [Champion evaluates] → loom:issue → [Builder] → (closed)
 
 PR Lifecycle:
 (created) → loom:review-requested → [Judge] → loom:pr → [Champion merges] → (merged)
 ```
+
+**Champion promotes ALL proposal types** to `loom:issue` when they meet criteria.
 
 ---
 
