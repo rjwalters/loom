@@ -86,51 +86,40 @@ MCP servers are automatically available when you clone the Loom repository. They
 # Check MCP configuration
 cat .mcp.json
 
-# Verify packages exist
-ls mcp-loom-ui/ mcp-loom-logs/ mcp-loom-terminals/
+# Verify unified package exists
+ls mcp-loom/
 ```
 
 ### Configuration
 
-MCP servers are configured in `.mcp.json`:
+The unified MCP server is configured in `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
-    "loom-ui": {
+    "loom": {
       "command": "node",
-      "args": ["mcp-loom-ui/dist/index.js"],
+      "args": ["mcp-loom/dist/index.js"],
       "env": {
         "LOOM_WORKSPACE": "/Users/you/GitHub/loom"
-      }
-    },
-    "loom-logs": {
-      "command": "node",
-      "args": ["mcp-loom-logs/dist/index.js"]
-    },
-    "loom-terminals": {
-      "command": "node",
-      "args": ["mcp-loom-terminals/dist/index.js"],
-      "env": {
-        "LOOM_SOCKET_PATH": "/tmp/loom-daemon.sock"
       }
     }
   }
 }
 ```
 
-### Building MCP Servers
-
-MCP servers need to be built before use:
+Or generate the configuration automatically:
 
 ```bash
-# Build all MCP servers
-pnpm build
+./scripts/setup-mcp.sh
+```
 
-# Or build individually
-cd mcp-loom-ui && pnpm build
-cd mcp-loom-logs && pnpm build
-cd mcp-loom-terminals && pnpm build
+### Building MCP Server
+
+The MCP server needs to be built before use:
+
+```bash
+cd mcp-loom && npm install && npm run build
 ```
 
 ### Usage from Claude Code

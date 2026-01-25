@@ -1,5 +1,8 @@
 # MCP Loom Logs
 
+> **DEPRECATED**: This package has been consolidated into the unified `mcp-loom` package.
+> Please use `mcp-loom` instead. See [mcp-loom/README.md](../mcp-loom/README.md) for migration instructions.
+
 MCP server for monitoring Loom application logs in real-time.
 
 ## Features
