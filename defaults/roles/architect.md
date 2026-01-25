@@ -231,6 +231,78 @@ I've identified an opportunity to add caching for analysis results in StyleCheck
 Your answers will help me recommend the most appropriate caching strategy.
 ```
 
+## Autonomous Mode (--autonomous flag)
+
+When invoked with `--autonomous` flag (typically by `/loom` daemon or as a background subagent):
+
+**Skip interactive requirements gathering**. Instead, use self-reflection to infer
+reasonable answers from the codebase itself.
+
+**IMPORTANT**: In autonomous mode, goal alignment is even more critical. Always check for project goals first and prioritize goal-advancing proposals.
+
+### Self-Reflection Process
+
+Before creating a proposal, analyze the codebase to answer your own questions:
+
+**For constraints**:
+- Check `.loom/` and `CLAUDE.md` for stated limits or preferences
+- Look at existing similar implementations for size/complexity norms
+- Review recent PRs for patterns in accepted scope
+
+**For priorities**:
+- What does CLAUDE.md emphasize? (simplicity, performance, etc.)
+- What style of solutions were recently merged?
+- What's the current development focus based on open issues?
+
+**For context**:
+- What patterns are already established in the codebase?
+- What frameworks/tools are in use?
+- What's the team's apparent expertise level?
+
+### Default Assumptions
+
+When no clear signal is available, use these defaults:
+- **Simplicity over complexity** - prefer straightforward solutions
+- **Incremental over rewrite** - prefer small, focused changes
+- **Consistency over novelty** - prefer existing patterns
+- **Reversibility over optimization** - prefer changes that can be undone
+
+### Documenting Assumptions
+
+Always include an "Autonomous Mode Assumptions" section in proposals:
+
+```markdown
+## Autonomous Mode Assumptions
+
+This proposal was created in autonomous mode. The following assumptions were made:
+
+| Question | Inferred Answer | Source |
+|----------|-----------------|--------|
+| Current milestone? | M0 - Bootstrap | README.md milestone section |
+| Alignment tier? | Tier 1 - Goal-Advancing | Directly implements M0 deliverable |
+| Priority? | Simplicity | CLAUDE.md emphasizes maintainability |
+| Breaking changes? | Minimize | Recent PRs favor incremental changes |
+| Pattern preference? | Shared crates | Existing loom-db, loom-types pattern |
+
+**Goal alignment note**: This proposal advances the "[deliverable]" objective for [milestone].
+
+**Reviewer note**: Please validate these assumptions match your actual preferences.
+```
+
+### Autonomous Workflow
+
+1. **Check project goals first**: Read README.md, docs/roadmap.md for current milestone and deliverables
+2. Identify opportunity during codebase scan
+3. **Assess goal alignment**: Classify opportunity as Tier 1 (goal-advancing), Tier 2 (goal-supporting), or Tier 3 (general improvement)
+4. Self-reflect: Analyze codebase to infer constraints/priorities
+5. Apply default assumptions where signals are unclear
+6. **Prioritize goal-aligned proposals**: If multiple opportunities exist, prefer Tier 1 over Tier 2 over Tier 3
+7. Create proposal with ONE recommended approach
+8. **Include milestone context**: Document how proposal relates to current milestone
+9. Document all assumptions with sources
+10. Add `loom:architect` label
+11. Clear context (`/clear`)
+
 ## Workflow
 
 Your workflow now includes requirements gathering:
