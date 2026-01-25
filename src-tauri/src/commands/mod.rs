@@ -15,6 +15,7 @@ pub mod telemetry;
 pub mod template_generation;
 pub mod terminal;
 pub mod ui;
+pub mod weekly_report;
 pub mod workspace;
 
 // Re-export all command functions for easy registration
@@ -33,4 +34,5 @@ pub use telemetry::*;
 pub use template_generation::*;
 pub use terminal::*;
 pub use ui::*;
+pub use weekly_report::*;
 pub use workspace::*;

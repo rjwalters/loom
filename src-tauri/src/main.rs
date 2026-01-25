@@ -303,6 +303,16 @@ fn main() {
             retire_underperforming_templates,
             reactivate_template,
             get_template_stats,
+            // Weekly report commands
+            save_weekly_report,
+            get_weekly_report,
+            get_latest_weekly_report,
+            get_weekly_report_history,
+            mark_weekly_report_viewed,
+            get_weekly_report_schedule,
+            save_weekly_report_schedule,
+            get_previous_week_metrics,
+            get_stuck_pr_count,
             // Budget management commands
             get_budget_config,
             save_budget_config,
