@@ -158,10 +158,13 @@ for i in $(seq 0 $((ISSUE_COUNT - 1))); do
   UPDATED_AT=$(echo "$issue" | jq -r '.updatedAt')
 
   # Convert ISO timestamp to epoch (macOS vs Linux compatibility)
+  # IMPORTANT: Use TZ=UTC to correctly parse UTC timestamps (Z suffix)
+  # Without this, macOS date interprets the time as local timezone, causing
+  # negative ages for users west of UTC (e.g., PST shows times as "in the future")
   if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS: Handle different timestamp formats
-    UPDATED_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
-                    date -j -f "%Y-%m-%dT%H:%M:%S" "${UPDATED_AT%Z}" +%s 2>/dev/null || echo "0")
+    # macOS: Handle different timestamp formats with UTC timezone
+    UPDATED_EPOCH=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$UPDATED_AT" +%s 2>/dev/null || \
+                    TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%S" "${UPDATED_AT%Z}" +%s 2>/dev/null || echo "0")
   else
     # Linux
     UPDATED_EPOCH=$(date -d "$UPDATED_AT" +%s 2>/dev/null || echo "0")
