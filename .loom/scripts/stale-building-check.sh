@@ -13,6 +13,11 @@
 # Thresholds (configurable via environment):
 #   STALE_THRESHOLD_HOURS=2    # Hours before issue is considered stale
 #   STALE_WITH_PR_HOURS=24     # Hours before issue with stale PR is flagged
+#
+# Detection cases:
+#   1. no_pr       - Issue has loom:building but no associated PR (recoverable)
+#   2. stale_pr    - Issue has PR but no activity for >24h (flagged, not auto-recovered)
+#   3. blocked_pr  - Issue has PR with loom:changes-requested label (transitions to loom:blocked)
 
 set -euo pipefail
 
@@ -52,7 +57,7 @@ while [[ $# -gt 0 ]]; do
       echo "Detect and recover orphaned issues stuck in loom:building state."
       echo ""
       echo "Options:"
-      echo "  --recover    Reset stale issues to loom:issue state"
+      echo "  --recover    Reset stale issues to loom:issue state (or loom:blocked for blocked PRs)"
       echo "  --json       Output JSON for programmatic use"
       echo "  --verbose    Show detailed progress"
       echo "  --help       Show this help message"
@@ -60,6 +65,14 @@ while [[ $# -gt 0 ]]; do
       echo "Environment variables:"
       echo "  STALE_THRESHOLD_HOURS    Hours before no-PR issue is stale (default: 2)"
       echo "  STALE_WITH_PR_HOURS      Hours before stale-PR issue is flagged (default: 24)"
+      echo ""
+      echo "Detection cases:"
+      echo "  no_pr       Issue has loom:building but no associated PR"
+      echo "              → With --recover: transitions to loom:issue"
+      echo "  stale_pr    Issue has PR but no activity for >24h"
+      echo "              → Flagged only, requires manual review"
+      echo "  blocked_pr  Issue has PR with loom:changes-requested label"
+      echo "              → With --recover: transitions to loom:blocked"
       exit 0
       ;;
     *)
@@ -119,7 +132,8 @@ TOTAL_BUILDING=$(echo "$BUILDING_ISSUES" | jq 'length')
 log_info "Found $TOTAL_BUILDING issues with loom:building label"
 
 # Get all open PRs once (more efficient than per-issue queries)
-OPEN_PRS=$(gh pr list --state open --json number,headRefName,body 2>/dev/null || echo "[]")
+# Include labels to detect blocked PRs (loom:changes-requested)
+OPEN_PRS=$(gh pr list --state open --json number,headRefName,body,labels 2>/dev/null || echo "[]")
 
 # Collect stale issues using a temp file to avoid subshell issues
 STALE_FILE=$(mktemp)
@@ -197,12 +211,52 @@ This issue is now ready to be claimed by another agent."
         '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": false}]' > "$STALE_FILE"
     fi
   else
-    # Has open PR - check if PR is also stale
+    # Has open PR - check various blocked states
     PR_NUMBER=$(echo "$OPEN_PR" | jq -r '.number // empty')
-    if [[ -n "$PR_NUMBER" && $AGE_SECS -gt $STALE_WITH_PR_SECS ]]; then
+
+    # Check if PR is blocked (has loom:changes-requested label)
+    PR_LABELS=$(echo "$OPEN_PR" | jq -r '.labels // [] | .[].name' 2>/dev/null | tr '\n' ' ')
+
+    if echo "$PR_LABELS" | grep -q "loom:changes-requested"; then
+      # PR is blocked - needs changes or has merge conflicts
+      log_warn "#$NUMBER: PR #$PR_NUMBER is blocked (loom:changes-requested)"
+
+      if [[ "$RECOVER" == "true" ]]; then
+        log_info "Transitioning #$NUMBER to blocked state..."
+        gh issue edit "$NUMBER" --remove-label "loom:building" --add-label "loom:blocked"
+
+        # Create comment body explaining the blocked state
+        COMMENT_BODY="🚧 **Issue blocked - PR needs attention**
+
+This issue's PR #$PR_NUMBER has been marked \`loom:changes-requested\`, indicating it's blocked.
+
+**What happened:**
+- PR was reviewed and changes were requested OR has merge conflicts
+- The issue remained in \`loom:building\` state (stale)
+- The stale-building-check script detected this mismatch
+
+**Action taken:**
+- Removed \`loom:building\` label
+- Added \`loom:blocked\` label to reflect actual state
+
+**To unblock:**
+1. Doctor resolves the PR issues (rebases, addresses feedback)
+2. PR transitions to \`loom:review-requested\`
+3. After Judge approval, issue can be closed via PR merge"
+
+        gh issue comment "$NUMBER" --body "$COMMENT_BODY"
+        log_success "Transitioned #$NUMBER to blocked state"
+      fi
+
+      # Add to stale list with blocked_pr reason
+      CURRENT=$(cat "$STALE_FILE")
+      echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "blocked_pr" --arg pr "$PR_NUMBER" \
+        '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": true, "pr_number": ($pr | tonumber)}]' > "$STALE_FILE"
+    elif [[ -n "$PR_NUMBER" && $AGE_SECS -gt $STALE_WITH_PR_SECS ]]; then
+      # PR exists but is stale (no activity)
       log_warn "#$NUMBER: PR #$PR_NUMBER exists but no progress for ${AGE_HOURS}h"
 
-      # Don't auto-recover issues with PRs - they need manual review
+      # Don't auto-recover issues with stale PRs - they need manual review
       CURRENT=$(cat "$STALE_FILE")
       echo "$CURRENT" | jq --arg num "$NUMBER" --arg title "$TITLE" --argjson age "$AGE_HOURS" --arg reason "stale_pr" --arg pr "$PR_NUMBER" \
         '. + [{"number": ($num | tonumber), "title": $title, "age_hours": $age, "reason": $reason, "has_pr": true, "pr_number": ($pr | tonumber)}]' > "$STALE_FILE"
