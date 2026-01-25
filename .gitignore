@@ -37,6 +37,9 @@ Thumbs.db
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
+.loom/daemon-state.json
+.loom/stuck-history.json
+.loom/interventions/
 .loom/worktrees/
 .loom/state.json
 .loom/mcp-command.json
