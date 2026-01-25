@@ -243,7 +243,33 @@ fi
 
 success "Pull request created: $PR_URL"
 
-# Output the PR URL (stdout, so it can be captured by caller)
+# ============================================================================
+# Attempt to merge the PR
+# ============================================================================
+info "Attempting to merge installation PR..."
+
+MERGE_STATUS="manual"
+
+# First try immediate merge (works when no review requirements or 0 approvals)
+if gh pr merge "$PR_URL" --merge --delete-branch 2>/dev/null; then
+  success "Installation PR merged successfully"
+  MERGE_STATUS="merged"
+else
+  # If immediate merge fails, try enabling auto-merge
+  info "Immediate merge not available (branch protection may require reviews)"
+  if gh pr merge "$PR_URL" --auto --merge --delete-branch 2>/dev/null; then
+    success "Auto-merge enabled - PR will merge once requirements are met"
+    MERGE_STATUS="auto"
+  else
+    warning "Could not merge or enable auto-merge - manual merge required"
+    warning "This may be because auto-merge is not enabled on the repository"
+    info "To enable: GitHub Settings > General > Allow auto-merge"
+    MERGE_STATUS="manual"
+  fi
+fi
+
+# Output the PR URL and merge status (stdout, so it can be captured by caller)
+# Format: PR_URL|MERGE_STATUS
 # Use exec to ensure we're writing directly to FD 1 without any buffering issues
 exec 1>&1  # Ensure FD 1 is stdout
-printf "%s" "$PR_URL"
+printf "%s|%s" "$PR_URL" "$MERGE_STATUS"

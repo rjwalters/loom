@@ -601,13 +601,24 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   exit 0
 fi
 
-# Extract just the URL from the output in case there's any extra content
-# This handles cases where gh or other commands leak output to stdout
-PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+# Parse output: PR_URL|MERGE_STATUS
+# Extract the last line containing PR_URL|STATUS format
+LAST_OUTPUT_LINE=$(echo "$PR_URL_RAW" | tail -1)
+PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
+MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
+
+# Validate PR URL - also try to extract from the raw output if parsing failed
+if [[ ! "$PR_URL" =~ ^https://github\.com/ ]]; then
+  # Fallback: try to extract URL from anywhere in the output
+  PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]|]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+fi
 
 if [[ ! "$PR_URL" =~ ^https:// ]]; then
   error "Invalid PR URL returned: $PR_URL"
 fi
+
+# Default merge status if not set
+MERGE_STATUS="${MERGE_STATUS:-manual}"
 
 success "Pull request created"
 echo ""
@@ -629,7 +640,18 @@ echo ""
 success "Loom ${LOOM_VERSION} installed successfully"
 echo ""
 
-info "📦 Pull Request: ${PR_URL}"
+# Show PR status based on merge result
+case "$MERGE_STATUS" in
+  merged)
+    info "✓ Pull Request: ${PR_URL} (merged)"
+    ;;
+  auto)
+    info "⏳ Pull Request: ${PR_URL} (auto-merge enabled)"
+    ;;
+  *)
+    info "📦 Pull Request: ${PR_URL}"
+    ;;
+esac
 echo ""
 
 header "What's Included:"
@@ -640,13 +662,43 @@ echo "  ✅ CLAUDE.md and AGENTS.md documentation"
 echo ""
 
 header "Next Steps:"
-echo "  1. Review and merge the pull request: ${PR_URL}"
-echo "  2. Choose your workflow:"
-echo "     Manual Mode (recommended to start):"
-echo "       cd $TARGET_PATH && claude"
-echo "       Then use /builder, /judge, or other role commands"
-echo "     Tauri App Mode (requires Loom.app - see README):"
-echo "       Download Loom.app from releases, open workspace"
+case "$MERGE_STATUS" in
+  merged)
+    # PR was merged - ready to use immediately
+    echo "  Loom is ready to use! Choose your workflow:"
+    echo ""
+    echo "  Manual Mode (recommended to start):"
+    echo "    cd $TARGET_PATH && claude"
+    echo "    Then use /builder, /judge, or other role commands"
+    echo ""
+    echo "  Tauri App Mode (requires Loom.app - see README):"
+    echo "    Download Loom.app from releases, open workspace"
+    ;;
+  auto)
+    # Auto-merge enabled - PR will merge once requirements are met
+    echo "  The installation PR has auto-merge enabled and will merge"
+    echo "  automatically once branch protection requirements are met."
+    echo ""
+    echo "  Once merged, choose your workflow:"
+    echo ""
+    echo "  Manual Mode (recommended to start):"
+    echo "    cd $TARGET_PATH && claude"
+    echo "    Then use /builder, /judge, or other role commands"
+    echo ""
+    echo "  Tauri App Mode (requires Loom.app - see README):"
+    echo "    Download Loom.app from releases, open workspace"
+    ;;
+  *)
+    # Manual merge required
+    echo "  1. Review and merge the pull request: ${PR_URL}"
+    echo "  2. Choose your workflow:"
+    echo "     Manual Mode (recommended to start):"
+    echo "       cd $TARGET_PATH && claude"
+    echo "       Then use /builder, /judge, or other role commands"
+    echo "     Tauri App Mode (requires Loom.app - see README):"
+    echo "       Download Loom.app from releases, open workspace"
+    ;;
+esac
 echo ""
 
 info "See CLAUDE.md in the target repository for complete usage details."
