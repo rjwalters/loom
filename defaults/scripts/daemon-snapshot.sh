@@ -60,6 +60,10 @@ find_repo_root() {
 
 REPO_ROOT=$(find_repo_root)
 DAEMON_STATE_FILE="$REPO_ROOT/.loom/daemon-state.json"
+PROGRESS_DIR="$REPO_ROOT/.loom/progress"
+
+# Heartbeat staleness threshold in seconds (default: 2 minutes)
+HEARTBEAT_STALE_THRESHOLD="${LOOM_HEARTBEAT_STALE_THRESHOLD:-120}"
 
 show_help() {
     cat <<EOF
@@ -405,6 +409,60 @@ if [[ -n "$SESSION_PERCENT" ]] && [[ "$SESSION_PERCENT" != "null" ]]; then
     fi
 fi
 
+# Read shepherd progress files
+read_shepherd_progress() {
+    local progress_json="[]"
+
+    if [[ -d "$PROGRESS_DIR" ]]; then
+        for progress_file in "$PROGRESS_DIR"/shepherd-*.json; do
+            if [[ -f "$progress_file" ]]; then
+                # Read and validate JSON
+                local content
+                if content=$(cat "$progress_file" 2>/dev/null) && echo "$content" | jq -e . >/dev/null 2>&1; then
+                    # Calculate time since last heartbeat
+                    local last_heartbeat
+                    last_heartbeat=$(echo "$content" | jq -r '.last_heartbeat // ""')
+
+                    local heartbeat_age=-1
+                    local heartbeat_stale=false
+
+                    if [[ -n "$last_heartbeat" && "$last_heartbeat" != "null" ]]; then
+                        local hb_epoch
+                        if [[ "$(uname)" == "Darwin" ]]; then
+                            hb_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+                        else
+                            hb_epoch=$(date -d "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+                        fi
+
+                        if [[ "$hb_epoch" != "0" ]]; then
+                            heartbeat_age=$((NOW_EPOCH - hb_epoch))
+                            if [[ $heartbeat_age -gt $HEARTBEAT_STALE_THRESHOLD ]]; then
+                                heartbeat_stale=true
+                            fi
+                        fi
+                    fi
+
+                    # Add computed fields to progress entry
+                    local enhanced_content
+                    enhanced_content=$(echo "$content" | jq \
+                        --argjson heartbeat_age "$heartbeat_age" \
+                        --argjson heartbeat_stale "$heartbeat_stale" \
+                        '. + {heartbeat_age_seconds: $heartbeat_age, heartbeat_stale: $heartbeat_stale}')
+
+                    progress_json=$(echo "$progress_json" | jq --argjson entry "$enhanced_content" '. + [$entry]')
+                fi
+            fi
+        done
+    fi
+
+    echo "$progress_json"
+}
+
+SHEPHERD_PROGRESS=$(read_shepherd_progress)
+
+# Count stale heartbeats for warnings
+STALE_HEARTBEAT_COUNT=$(echo "$SHEPHERD_PROGRESS" | jq '[.[] | select(.heartbeat_stale == true and .status == "working")] | length')
+
 # Build the final JSON output
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -437,6 +495,8 @@ OUTPUT=$(jq -n \
     --argjson max_shepherds "$MAX_SHEPHERDS" \
     --argjson max_proposals "$MAX_PROPOSALS" \
     --arg issue_strategy "$ISSUE_STRATEGY" \
+    --argjson shepherd_progress "$SHEPHERD_PROGRESS" \
+    --argjson stale_heartbeat_count "$STALE_HEARTBEAT_COUNT" \
     '{
         timestamp: $timestamp,
         pipeline: {
@@ -454,6 +514,10 @@ OUTPUT=$(jq -n \
             changes_requested: $changes_requested,
             ready_to_merge: $ready_to_merge
         },
+        shepherds: {
+            progress: $shepherd_progress,
+            stale_heartbeat_count: $stale_heartbeat_count
+        },
         usage: ($usage + {healthy: $usage_healthy}),
         computed: {
             total_ready: $total_ready,
@@ -467,7 +531,8 @@ OUTPUT=$(jq -n \
             architect_cooldown_ok: $architect_cooldown_ok,
             hermit_cooldown_ok: $hermit_cooldown_ok,
             promotable_proposals: $promotable_proposals,
-            recommended_actions: $recommended_actions
+            recommended_actions: $recommended_actions,
+            stale_heartbeat_count: $stale_heartbeat_count
         },
         config: {
             issue_threshold: $issue_threshold,
