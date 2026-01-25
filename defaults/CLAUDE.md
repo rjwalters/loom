@@ -1146,17 +1146,47 @@ jq '.shepherds["shepherd-1"] = {"issue": null, "idle_since": "'$(date -u +%Y-%m-
 ```
 
 **Work generation not triggering**:
-```bash
-# Check issue count vs threshold
-echo "Ready issues: $(gh issue list --label 'loom:issue' --state open --json number --jq 'length')"
-echo "Threshold: 3 (default)"
 
-# Check cooldown timestamps
+When the pipeline is empty but Architect/Hermit are not being triggered, diagnose with:
+
+```bash
+# 1. Check pipeline state via daemon-snapshot.sh (authoritative source)
+./.loom/scripts/daemon-snapshot.sh --pretty | jq '{
+  ready: .computed.total_ready,
+  needs_work_gen: .computed.needs_work_generation,
+  architect_cooldown_ok: .computed.architect_cooldown_ok,
+  hermit_cooldown_ok: .computed.hermit_cooldown_ok,
+  recommended_actions: .computed.recommended_actions
+}'
+
+# Expected output when pipeline empty and work generation should trigger:
+# {
+#   "ready": 0,
+#   "needs_work_gen": true,
+#   "architect_cooldown_ok": true,
+#   "hermit_cooldown_ok": true,
+#   "recommended_actions": ["trigger_architect", "trigger_hermit", "wait"]
+# }
+
+# 2. Check if triggers have ever fired
 jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
 
-# Check proposal count
-echo "Proposals: $(gh issue list --label 'loom:architect,loom:hermit' --state open --json number --jq 'length')"
+# If both are null with ready=0, work generation never triggered
+
+# 3. Verify proposal counts aren't at max
+echo "Architect proposals: $(gh issue list --label 'loom:architect' --state open --json number --jq 'length')"
+echo "Hermit proposals: $(gh issue list --label 'loom:hermit' --state open --json number --jq 'length')"
+# Max is 2 per role by default
+
+# 4. Force trigger manually (for testing)
+# Run daemon iteration with debug mode to see all decisions:
+/loom iterate --debug
 ```
+
+**Common causes:**
+- **Cooldown not elapsed**: Default is 30 minutes between triggers. Check `last_*_trigger` timestamps.
+- **Proposals at max**: If 2+ architect/hermit proposals exist, new ones won't trigger.
+- **Iteration not acting on recommended_actions**: The daemon iteration must explicitly check for `trigger_architect` and `trigger_hermit` in the snapshot's `recommended_actions` array.
 
 ## MCP Hooks for Programmatic Control
 
