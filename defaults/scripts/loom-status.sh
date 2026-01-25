@@ -305,7 +305,7 @@ output_json() {
     local pending_reviews=$(get_github_counts "loom:review-requested" "pr")
     local ready_to_merge=$(get_github_counts "loom:pr" "pr")
 
-    # Build shepherd status with computed idle times
+    # Build shepherd status with computed idle times and enhanced fields
     local shepherds_json="{"
     local first_shepherd=true
     if [[ -f "$DAEMON_STATE" ]]; then
@@ -313,8 +313,16 @@ output_json() {
             local shepherd_id="shepherd-$i"
             local issue
             local output_file
+            local status
+            local idle_reason
+            local last_phase
+            local pr_number
             issue=$(jq -r ".shepherds[\"$shepherd_id\"].issue // null" "$DAEMON_STATE" 2>/dev/null)
             output_file=$(jq -r ".shepherds[\"$shepherd_id\"].output_file // null" "$DAEMON_STATE" 2>/dev/null)
+            status=$(jq -r ".shepherds[\"$shepherd_id\"].status // \"unknown\"" "$DAEMON_STATE" 2>/dev/null)
+            idle_reason=$(jq -r ".shepherds[\"$shepherd_id\"].idle_reason // null" "$DAEMON_STATE" 2>/dev/null)
+            last_phase=$(jq -r ".shepherds[\"$shepherd_id\"].last_phase // null" "$DAEMON_STATE" 2>/dev/null)
+            pr_number=$(jq -r ".shepherds[\"$shepherd_id\"].pr_number // null" "$DAEMON_STATE" 2>/dev/null)
 
             local idle_seconds=-1
             local idle_display="null"
@@ -331,10 +339,35 @@ output_json() {
             else
                 shepherds_json+=","
             fi
-            shepherds_json+="\"$shepherd_id\":{\"issue\":$issue,\"idle_seconds\":$idle_seconds,\"idle_display\":$idle_display}"
+
+            # Build JSON with optional fields
+            local idle_reason_json="null"
+            local last_phase_json="null"
+            local pr_number_json="null"
+            if [[ "$idle_reason" != "null" ]] && [[ -n "$idle_reason" ]]; then
+                idle_reason_json="\"$idle_reason\""
+            fi
+            if [[ "$last_phase" != "null" ]] && [[ -n "$last_phase" ]]; then
+                last_phase_json="\"$last_phase\""
+            fi
+            if [[ "$pr_number" != "null" ]] && [[ -n "$pr_number" ]]; then
+                pr_number_json="$pr_number"
+            fi
+
+            shepherds_json+="\"$shepherd_id\":{\"issue\":$issue,\"status\":\"$status\",\"idle_seconds\":$idle_seconds,\"idle_display\":$idle_display,\"idle_reason\":$idle_reason_json,\"last_phase\":$last_phase_json,\"pr_number\":$pr_number_json}"
         done
     fi
     shepherds_json+="}"
+
+    # Extract pipeline_state and warnings from daemon state
+    local pipeline_state="{}"
+    local warnings="[]"
+    local iteration=0
+    if [[ -f "$DAEMON_STATE" ]]; then
+        pipeline_state=$(jq -r '.pipeline_state // {}' "$DAEMON_STATE" 2>/dev/null || echo "{}")
+        warnings=$(jq -r '.warnings // []' "$DAEMON_STATE" 2>/dev/null || echo "[]")
+        iteration=$(jq -r '.iteration // 0' "$DAEMON_STATE" 2>/dev/null || echo "0")
+    fi
 
     # Build JSON output
     cat <<EOF
@@ -342,7 +375,8 @@ output_json() {
   "daemon": {
     "running": $daemon_running,
     "shutdown_pending": $shutdown_pending,
-    "state_file": "$DAEMON_STATE"
+    "state_file": "$DAEMON_STATE",
+    "iteration": $iteration
   },
   "github": {
     "ready_issues": $ready_issues,
@@ -354,6 +388,8 @@ output_json() {
     "ready_to_merge": $ready_to_merge
   },
   "shepherds": $shepherds_json,
+  "pipeline_state": $pipeline_state,
+  "warnings": $warnings,
   "daemon_state": $daemon_state
 }
 EOF
@@ -446,10 +482,18 @@ output_formatted() {
             local started
             local output_file
             local idle_since
+            local status
+            local idle_reason
+            local last_phase
+            local pr_number
             issue=$(jq -r ".shepherds[\"$shepherd_id\"].issue // null" "$DAEMON_STATE" 2>/dev/null)
             started=$(jq -r ".shepherds[\"$shepherd_id\"].started // null" "$DAEMON_STATE" 2>/dev/null)
             output_file=$(jq -r ".shepherds[\"$shepherd_id\"].output_file // null" "$DAEMON_STATE" 2>/dev/null)
             idle_since=$(jq -r ".shepherds[\"$shepherd_id\"].idle_since // null" "$DAEMON_STATE" 2>/dev/null)
+            status=$(jq -r ".shepherds[\"$shepherd_id\"].status // \"unknown\"" "$DAEMON_STATE" 2>/dev/null)
+            idle_reason=$(jq -r ".shepherds[\"$shepherd_id\"].idle_reason // null" "$DAEMON_STATE" 2>/dev/null)
+            last_phase=$(jq -r ".shepherds[\"$shepherd_id\"].last_phase // null" "$DAEMON_STATE" 2>/dev/null)
+            pr_number=$(jq -r ".shepherds[\"$shepherd_id\"].pr_number // null" "$DAEMON_STATE" 2>/dev/null)
 
             if [[ "$issue" != "null" ]] && [[ -n "$issue" ]]; then
                 local duration
@@ -459,22 +503,53 @@ output_formatted() {
                 local idle_seconds
                 idle_seconds=$(get_file_idle_seconds "$output_file")
 
+                # Build status details
+                local details=""
+                if [[ "$last_phase" != "null" ]] && [[ -n "$last_phase" ]]; then
+                    details=" [phase: $last_phase]"
+                fi
+                if [[ "$pr_number" != "null" ]] && [[ -n "$pr_number" ]]; then
+                    details="$details [PR #$pr_number]"
+                fi
+
                 if [[ "$idle_seconds" -ge 0 ]]; then
                     local idle_display
                     idle_display=$(format_seconds "$idle_seconds")
-                    echo -e "    ${GREEN}$shepherd_id:${NC} Issue #$issue (${duration}, idle ${idle_display})"
+                    echo -e "    ${GREEN}$shepherd_id:${NC} Issue #$issue (${duration}, idle ${idle_display})$details"
                 else
-                    echo -e "    ${GREEN}$shepherd_id:${NC} Issue #$issue (${duration})"
+                    echo -e "    ${GREEN}$shepherd_id:${NC} Issue #$issue (${duration})$details"
                 fi
             else
-                # Show idle duration for idle shepherds
+                # Show idle duration and reason for idle shepherds
+                local idle_info=""
                 if [[ "$idle_since" != "null" ]] && [[ -n "$idle_since" ]]; then
                     local idle_duration
                     idle_duration=$(format_uptime "$idle_since")
-                    echo -e "    ${GRAY}$shepherd_id:${NC} idle (${idle_duration})"
-                else
-                    echo -e "    ${GRAY}$shepherd_id:${NC} idle"
+                    idle_info="(${idle_duration})"
                 fi
+
+                # Format idle reason if available
+                local reason_display=""
+                if [[ "$idle_reason" != "null" ]] && [[ -n "$idle_reason" ]]; then
+                    case "$idle_reason" in
+                        no_ready_issues) reason_display=" - no ready issues" ;;
+                        at_capacity) reason_display=" - at capacity" ;;
+                        completed_issue) reason_display=" - awaiting next" ;;
+                        rate_limited) reason_display=" - rate limited" ;;
+                        shutdown_signal) reason_display=" - shutdown" ;;
+                        *) reason_display=" - $idle_reason" ;;
+                    esac
+                fi
+
+                # Check for errored or paused status
+                local status_color="${GRAY}"
+                if [[ "$status" == "errored" ]]; then
+                    status_color="${RED}"
+                elif [[ "$status" == "paused" ]]; then
+                    status_color="${YELLOW}"
+                fi
+
+                echo -e "    ${status_color}$shepherd_id:${NC} ${status:-idle} ${idle_info}${reason_display}"
             fi
         done
     else
@@ -488,19 +563,47 @@ output_formatted() {
         for role in architect hermit guide champion; do
             local task_id
             local last_completed
+            local status
+            local last_result
+            local extra_info
             task_id=$(jq -r ".support_roles[\"$role\"].task_id // null" "$DAEMON_STATE" 2>/dev/null)
             last_completed=$(jq -r ".support_roles[\"$role\"].last_completed // null" "$DAEMON_STATE" 2>/dev/null)
+            status=$(jq -r ".support_roles[\"$role\"].status // null" "$DAEMON_STATE" 2>/dev/null)
+            last_result=$(jq -r ".support_roles[\"$role\"].last_result // null" "$DAEMON_STATE" 2>/dev/null)
 
             local role_display
             # Capitalize first letter (works on both macOS and Linux)
             role_display="$(echo "${role:0:1}" | tr '[:lower:]' '[:upper:]')${role:1}"
 
-            if [[ "$task_id" != "null" ]] && [[ -n "$task_id" ]]; then
-                echo -e "    ${GREEN}$role_display:${NC} running"
+            # Build extra info based on role
+            extra_info=""
+            if [[ "$role" == "architect" ]]; then
+                local proposals_created
+                proposals_created=$(jq -r ".support_roles[\"$role\"].proposals_created // 0" "$DAEMON_STATE" 2>/dev/null)
+                if [[ "$proposals_created" != "0" ]] && [[ "$proposals_created" != "null" ]]; then
+                    extra_info=" (proposals: $proposals_created)"
+                fi
+            elif [[ "$role" == "champion" ]]; then
+                local prs_merged
+                prs_merged=$(jq -r ".support_roles[\"$role\"].prs_merged_this_session // 0" "$DAEMON_STATE" 2>/dev/null)
+                if [[ "$prs_merged" != "0" ]] && [[ "$prs_merged" != "null" ]]; then
+                    extra_info=" (merged: $prs_merged)"
+                fi
+            fi
+
+            # Determine display based on status or task_id
+            if [[ "$status" == "running" ]] || { [[ "$task_id" != "null" ]] && [[ -n "$task_id" ]]; }; then
+                echo -e "    ${GREEN}$role_display:${NC} running$extra_info"
+            elif [[ "$status" == "errored" ]]; then
+                echo -e "    ${RED}$role_display:${NC} errored$extra_info"
             else
                 local last_ago
                 last_ago=$(time_ago "$last_completed")
-                echo -e "    ${GRAY}$role_display:${NC} idle (last: $last_ago)"
+                local result_info=""
+                if [[ "$last_result" != "null" ]] && [[ -n "$last_result" ]]; then
+                    result_info=" [$last_result]"
+                fi
+                echo -e "    ${GRAY}$role_display:${NC} idle (last: $last_ago)$result_info$extra_info"
             fi
         done
     else
@@ -513,13 +616,129 @@ output_formatted() {
     if [[ -f "$DAEMON_STATE" ]]; then
         local completed_count
         local prs_merged
+        local iteration
         completed_count=$(jq -r '.completed_issues | length // 0' "$DAEMON_STATE" 2>/dev/null || echo "0")
         prs_merged=$(jq -r '.total_prs_merged // 0' "$DAEMON_STATE" 2>/dev/null || echo "0")
+        iteration=$(jq -r '.iteration // 0' "$DAEMON_STATE" 2>/dev/null || echo "0")
 
+        echo -e "    Iteration: ${BOLD}$iteration${NC}"
         echo -e "    Issues completed: ${BOLD}$completed_count${NC}"
         echo -e "    PRs merged: ${BOLD}$prs_merged${NC}"
     else
         echo -e "    ${GRAY}No session data available${NC}"
+    fi
+    echo ""
+
+    # Pipeline State - Blocked Items
+    echo -e "  ${BOLD}Pipeline Status:${NC}"
+    if [[ -f "$DAEMON_STATE" ]]; then
+        local blocked_count
+        blocked_count=$(jq -r '.pipeline_state.blocked // [] | length' "$DAEMON_STATE" 2>/dev/null || echo "0")
+
+        if [[ "$blocked_count" -gt 0 ]]; then
+            echo -e "    ${RED}Blocked Items: $blocked_count${NC}"
+            # Show each blocked item
+            jq -r '.pipeline_state.blocked[]? | "      \(.type) #\(.number): \(.reason)"' "$DAEMON_STATE" 2>/dev/null | while read -r line; do
+                echo -e "    ${YELLOW}$line${NC}"
+            done
+        else
+            echo -e "    ${GREEN}No blocked items${NC}"
+        fi
+
+        # Show pipeline summary from state file if available
+        local ready_from_state building_from_state review_from_state
+        ready_from_state=$(jq -r '.pipeline_state.ready // [] | length' "$DAEMON_STATE" 2>/dev/null || echo "?")
+        building_from_state=$(jq -r '.pipeline_state.building // [] | length' "$DAEMON_STATE" 2>/dev/null || echo "?")
+        review_from_state=$(jq -r '.pipeline_state.review_requested // [] | length' "$DAEMON_STATE" 2>/dev/null || echo "?")
+
+        if [[ "$ready_from_state" != "?" ]] && [[ "$ready_from_state" != "0" || "$building_from_state" != "0" ]]; then
+            local last_updated
+            last_updated=$(jq -r '.pipeline_state.last_updated // null' "$DAEMON_STATE" 2>/dev/null)
+            if [[ "$last_updated" != "null" ]]; then
+                echo -e "    ${GRAY}Last sync: $(time_ago "$last_updated")${NC}"
+            fi
+        fi
+    else
+        echo -e "    ${GRAY}No pipeline state available${NC}"
+    fi
+    echo ""
+
+    # Recent Warnings
+    echo -e "  ${BOLD}Recent Warnings:${NC}"
+    if [[ -f "$DAEMON_STATE" ]]; then
+        local warning_count
+        warning_count=$(jq -r '.warnings // [] | length' "$DAEMON_STATE" 2>/dev/null || echo "0")
+
+        if [[ "$warning_count" -gt 0 ]]; then
+            # Show last 5 unacknowledged warnings
+            local unack_warnings
+            unack_warnings=$(jq -r '[.warnings // [] | .[] | select(.acknowledged != true)][-5:]' "$DAEMON_STATE" 2>/dev/null)
+            local unack_count
+            unack_count=$(echo "$unack_warnings" | jq -r 'length' 2>/dev/null || echo "0")
+
+            if [[ "$unack_count" -gt 0 ]]; then
+                echo -e "    ${YELLOW}$unack_count unacknowledged warning(s)${NC}"
+                echo "$unack_warnings" | jq -r '.[] | "      [\(.severity)] \(.message) (\(.time | split("T")[1] | split("Z")[0]))"' 2>/dev/null | while read -r line; do
+                    # Color based on severity
+                    if [[ "$line" == *"[error]"* ]]; then
+                        echo -e "    ${RED}$line${NC}"
+                    elif [[ "$line" == *"[warning]"* ]]; then
+                        echo -e "    ${YELLOW}$line${NC}"
+                    else
+                        echo -e "    ${GRAY}$line${NC}"
+                    fi
+                done
+            else
+                echo -e "    ${GREEN}All warnings acknowledged${NC} ($warning_count total)"
+            fi
+        else
+            echo -e "    ${GREEN}No warnings${NC}"
+        fi
+    else
+        echo -e "    ${GRAY}No warning data available${NC}"
+    fi
+    echo ""
+
+    # Stuck Detection Status
+    echo -e "  ${BOLD}Stuck Detection:${NC}"
+    local interventions_dir="$REPO_ROOT/.loom/interventions"
+    local stuck_config="$REPO_ROOT/.loom/stuck-config.json"
+
+    # Count active interventions
+    local intervention_count=0
+    if [[ -d "$interventions_dir" ]]; then
+        intervention_count=$(find "$interventions_dir" -name "*.json" 2>/dev/null | wc -l | tr -d ' ')
+    fi
+
+    if [[ "$intervention_count" -gt 0 ]]; then
+        echo -e "    Status: ${RED}${intervention_count} active intervention(s)${NC}"
+        # Show details of each intervention
+        for intervention_file in "$interventions_dir"/*.json; do
+            if [[ -f "$intervention_file" ]]; then
+                local agent_id
+                local severity
+                local intervention_type
+                agent_id=$(jq -r '.agent_id // "unknown"' "$intervention_file" 2>/dev/null)
+                severity=$(jq -r '.severity // "unknown"' "$intervention_file" 2>/dev/null)
+                intervention_type=$(jq -r '.intervention_type // "unknown"' "$intervention_file" 2>/dev/null)
+                echo -e "      ${YELLOW}$agent_id${NC}: $intervention_type ($severity)"
+            fi
+        done
+    else
+        echo -e "    Status: ${GREEN}All agents healthy${NC}"
+    fi
+
+    # Show configuration
+    if [[ -f "$stuck_config" ]]; then
+        local idle_threshold
+        local working_threshold
+        local intervention_mode
+        idle_threshold=$(jq -r '.idle_threshold // 600' "$stuck_config")
+        working_threshold=$(jq -r '.working_threshold // 1800' "$stuck_config")
+        intervention_mode=$(jq -r '.intervention_mode // "escalate"' "$stuck_config")
+        echo -e "    Config: idle=$((idle_threshold / 60))m, working=$((working_threshold / 60))m, mode=$intervention_mode"
+    else
+        echo -e "    Config: ${GRAY}Using defaults (idle=10m, working=30m, mode=escalate)${NC}"
     fi
     echo ""
 
@@ -556,6 +775,16 @@ output_formatted() {
     fi
     echo -e "      - View daemon state: ${CYAN}cat .loom/daemon-state.json | jq${NC}"
     echo ""
+
+    # Show stuck detection actions if interventions exist
+    if [[ "$intervention_count" -gt 0 ]]; then
+        echo -e "    ${YELLOW}Stuck Agent Actions:${NC}"
+        echo -e "      - View stuck status: ${CYAN}./.loom/scripts/stuck-detection.sh status${NC}"
+        echo -e "      - Clear intervention: ${CYAN}./.loom/scripts/stuck-detection.sh clear <agent-id>${NC}"
+        echo -e "      - Resume agent: ${CYAN}./.loom/scripts/signal.sh clear <agent-id>${NC}"
+        echo -e "      - View history: ${CYAN}./.loom/scripts/stuck-detection.sh history${NC}"
+        echo ""
+    fi
 
     echo -e "${BOLD}${CYAN}=======================================================================${NC}"
     echo ""
