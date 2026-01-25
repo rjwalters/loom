@@ -33,7 +33,6 @@ import {
   getReportHistory,
   getReportSchedule,
   markReportViewed,
-  type ReportHistoryEntry,
   type ReportSchedule,
   saveReportSchedule,
   type WeeklyReport,
@@ -245,7 +244,7 @@ function createNoReportContent(workspacePath: string, modal: ModalBuilder): stri
 /**
  * Create the main report content
  */
-function createReportContent(report: WeeklyReport, workspacePath: string): string {
+function createReportContent(report: WeeklyReport, _workspacePath: string): string {
   return `
     <div class="space-y-6">
       <!-- Header -->
@@ -782,7 +781,7 @@ async function showSettingsView(workspacePath: string, modal: ModalBuilder): Pro
 /**
  * Set up interactive elements in the report view
  */
-function setupInteractiveElements(modal: ModalBuilder, report: WeeklyReport): void {
+function setupInteractiveElements(modal: ModalBuilder, _report: WeeklyReport): void {
   const state = getAppState();
   const workspacePath = state.workspace.getWorkspace();
 
