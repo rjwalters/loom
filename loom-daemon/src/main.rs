@@ -6,6 +6,7 @@ mod health_monitor;
 mod init;
 mod ipc;
 mod metrics_collector;
+mod role_validation;
 mod terminal;
 mod types;
 
@@ -66,6 +67,25 @@ enum Commands {
         /// Output format: table (default), json
         #[arg(long, default_value = "table")]
         format: String,
+    },
+
+    /// Validate role configuration completeness
+    Validate {
+        /// Workspace directory containing .loom/config.json
+        #[arg(value_name = "WORKSPACE", default_value = ".")]
+        workspace: String,
+
+        /// Output format: text (default), json
+        #[arg(long, default_value = "text")]
+        format: String,
+
+        /// Fail with exit code 2 if warnings found (for CI)
+        #[arg(long)]
+        strict: bool,
+
+        /// Show verbose output including configured roles
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -243,9 +263,15 @@ fn setup_logging() -> Result<()> {
     Ok(())
 }
 
-/// Handle CLI commands (init, stats modes)
+/// Handle CLI commands (init, stats, validate modes)
 fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
+        Commands::Validate {
+            workspace,
+            format,
+            strict,
+            verbose,
+        } => handle_validate_command(&workspace, &format, strict, verbose),
         Commands::Stats {
             role,
             issue,
@@ -580,4 +606,77 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!("  Average Cost:       ${:.4}", agent.avg_cost);
     println!("  Average Duration:   {:.1}s", agent.avg_duration_sec);
     println!();
+}
+
+/// Handle the validate subcommand - check role configuration completeness.
+fn handle_validate_command(
+    workspace: &str,
+    format: &str,
+    strict: bool,
+    verbose: bool,
+) -> Result<()> {
+    use role_validation::{format_validation_result, validate_from_file, ValidationMode};
+
+    // Convert workspace path to absolute path
+    let workspace_path = std::path::Path::new(workspace);
+    let absolute_workspace = if workspace_path.is_absolute() {
+        workspace_path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(workspace_path)
+    };
+
+    let config_path = absolute_workspace.join(".loom").join("config.json");
+
+    if !config_path.exists() {
+        if format == "json" {
+            println!(
+                r#"{{"error": "Config file not found: {}"}}"#,
+                config_path.display()
+            );
+        } else {
+            eprintln!("Error: Config file not found: {}", config_path.display());
+            eprintln!("\nMake sure you're in a Loom workspace or specify the path:");
+            eprintln!("  loom-daemon validate /path/to/workspace");
+        }
+        std::process::exit(1);
+    }
+
+    let mode = if strict {
+        ValidationMode::Strict
+    } else {
+        ValidationMode::Warn
+    };
+
+    let result = validate_from_file(&config_path, mode).map_err(|e| anyhow!("{}", e))?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        // Print header
+        if verbose {
+            println!("\nValidating role configuration...");
+            println!("  Config: {}", config_path.display());
+            println!();
+        }
+
+        // Print formatted result
+        let output = format_validation_result(&result, verbose);
+        if !output.is_empty() {
+            print!("{output}");
+        }
+
+        // Print success message if no warnings
+        if result.warnings.is_empty() && result.errors.is_empty() {
+            println!("All role dependencies are satisfied.");
+        }
+    }
+
+    // Determine exit code
+    if !result.errors.is_empty() {
+        std::process::exit(1);
+    } else if !result.warnings.is_empty() && strict {
+        std::process::exit(2);
+    }
+
+    Ok(())
 }
