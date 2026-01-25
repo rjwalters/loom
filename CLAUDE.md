@@ -20,7 +20,7 @@ Loom uses a three-layer orchestration architecture for scalable automation:
 ┌─────────────────────────────────────────────────────────────────┐
 │                    Layer 3: Human Observer                      │
 │  - Watches system health and intervenes when needed             │
-│  - Approves architectural proposals (loom:architect → loom:issue)│
+│  - Overrides Champion on controversial proposals                │
 │  - Handles edge cases and blocked issues                        │
 │  - Provides strategic direction                                 │
 └─────────────────────────────────────────────────────────────────┘
@@ -68,7 +68,7 @@ Loom uses a three-layer orchestration architecture for scalable automation:
 ### Layer Responsibilities
 
 **Layer 3 (Human Observer)**:
-- Approve Architect/Hermit proposals (convert `loom:architect` → `loom:issue`)
+- Override Champion decisions on controversial proposals (Champion handles routine approvals)
 - Monitor system health via daemon-state.json
 - Intervene for blocked issues or stuck agents
 - Provide strategic direction on what to build
@@ -227,14 +227,14 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **When to use**: Code quality assurance, automated reviews
 
 **Champion** (Autonomous 10min, `champion.md`)
-- **Purpose**: Auto-merge approved PRs
-- **Workflow**: Finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
-- **When to use**: Default daemon mode with `--force-pr` (human reviews PR before Champion merges)
-- **Note**: Not used when shepherds run with `--force-merge` (shepherds handle their own merges)
+- **Purpose**: Evaluate proposals and auto-merge approved PRs
+- **Workflow**: Evaluates `loom:curated`, `loom:architect`, `loom:hermit` proposals → promotes to `loom:issue`. Also finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
+- **When to use**: Default daemon mode - handles both proposal promotion and PR merging
+- **Note**: Not needed for PR merging when shepherds run with `--force-merge` (shepherds handle their own merges)
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
-- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated` (human approves → `loom:issue`)
+- **Workflow**: Finds unlabeled issues → adds context → marks as `loom:curated` (Champion evaluates → `loom:issue`)
 - **When to use**: Issue backlog maintenance, quality improvement
 
 **Architect** (Autonomous 15min, `architect.md`)
@@ -302,12 +302,14 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 **Proposal Lifecycle**:
 ```
-(created) → loom:architect → (approved) → loom:issue
-           ↑ Architect       ↑ Human      ↑ Ready for Builder
+(created) → loom:architect → (evaluated) → loom:issue
+           ↑ Architect       ↑ Champion    ↑ Ready for Builder
 
-(created) → loom:hermit → (approved) → loom:issue
-           ↑ Hermit       ↑ Human      ↑ Ready for Builder
+(created) → loom:hermit → (evaluated) → loom:issue
+           ↑ Hermit       ↑ Champion    ↑ Ready for Builder
 ```
+
+**Note**: Champion evaluates proposals from Architect and Hermit roles using the same 8 quality criteria as curated issues. Well-formed proposals are promoted automatically; only ambiguous or controversial proposals require human intervention.
 
 ### Label Definitions
 
@@ -321,9 +323,9 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 - **`loom:pr`**: PR approved by Judge, ready for Champion to auto-merge
 
 **Proposal Labels**:
-- **`loom:architect`**: Architectural proposal awaiting user approval
-- **`loom:hermit`**: Simplification proposal awaiting user approval
-- **`loom:curated`**: Issue enhanced by Curator, awaiting human approval
+- **`loom:architect`**: Architectural proposal awaiting Champion evaluation
+- **`loom:hermit`**: Simplification proposal awaiting Champion evaluation
+- **`loom:curated`**: Issue enhanced by Curator, awaiting Champion evaluation
 
 **Status Labels**:
 - **`loom:blocked`**: Implementation blocked, needs help or clarification
