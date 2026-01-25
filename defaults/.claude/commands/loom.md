@@ -399,10 +399,13 @@ The daemon AUTOMATICALLY spawns shepherds without asking:
 # This happens automatically every iteration - no human approval needed
 def auto_spawn_shepherds():
     active_count = count_active_shepherds()
-    ready_issues = get_ready_issues()  # loom:issue labeled
+    # ready_issues is pre-sorted by daemon-snapshot.sh based on LOOM_ISSUE_STRATEGY:
+    # - loom:urgent issues always come first (highest priority)
+    # - Remaining issues sorted by strategy: fifo (oldest first), lifo (newest first), or priority
+    ready_issues = get_ready_issues()  # loom:issue labeled, priority-sorted
 
     while active_count < MAX_SHEPHERDS and len(ready_issues) > 0:
-        issue = ready_issues.pop(0)
+        issue = ready_issues.pop(0)  # Takes highest priority issue
 
         # Claim immediately
         gh issue edit {issue} --remove-label "loom:issue" --add-label "loom:building"
@@ -906,12 +909,15 @@ return f"ready={len(ready_issues)} building={len(building_issues)} ..."
 def auto_spawn_shepherds():
     """Automatically spawn shepherds - NO human decision required."""
 
-    ready_issues = gh_list_issues_with_label("loom:issue")
+    # daemon-snapshot.sh returns issues pre-sorted by LOOM_ISSUE_STRATEGY:
+    # - loom:urgent issues always first (regardless of strategy)
+    # - Then sorted by: fifo (oldest first), lifo (newest first), or priority
+    ready_issues = gh_list_issues_with_label("loom:issue")  # Pre-sorted by priority
     active_count = count_active_shepherds()
 
     spawned = 0
     while active_count < MAX_SHEPHERDS and len(ready_issues) > 0:
-        issue = ready_issues.pop(0)
+        issue = ready_issues.pop(0)  # Highest priority issue
 
         # Claim immediately (atomic operation)
         gh issue edit {issue} --remove-label "loom:issue" --add-label "loom:building"

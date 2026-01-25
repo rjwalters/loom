@@ -547,6 +547,34 @@ The Loom daemon uses these configuration parameters:
 | `MAX_SHEPHERDS` | 3 | Maximum concurrent shepherd processes |
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
 | `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
+| `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |
+
+**Issue Selection Strategy** (`LOOM_ISSUE_STRATEGY`):
+
+Controls the order in which shepherds pick up issues from the ready queue. The `loom:urgent` label always takes precedence regardless of strategy.
+
+| Strategy | Description |
+|----------|-------------|
+| `fifo` | **Default.** Oldest issues first (FIFO). Prevents starvation where new issues indefinitely deprioritize older ones. |
+| `lifo` | Newest issues first (LIFO). Original GitHub CLI default behavior. |
+| `priority` | Same as `fifo` but explicitly named. Issues with `loom:urgent` label first (oldest to newest), then remaining issues oldest to newest. |
+
+**Priority behavior:**
+- Issues with `loom:urgent` label are **always** processed first, regardless of strategy
+- Within the urgent partition, issues are sorted by age (oldest first)
+- Non-urgent issues are then sorted according to the selected strategy
+
+**Example:**
+```bash
+# Use FIFO (default) - prevents issue starvation
+LOOM_ISSUE_STRATEGY=fifo /loom
+
+# Use LIFO - newest issues first (for fast iteration)
+LOOM_ISSUE_STRATEGY=lifo /loom
+
+# Priority mode - explicit about urgent-first ordering
+LOOM_ISSUE_STRATEGY=priority /loom
+```
 
 **Daemon State File** (`.loom/daemon-state.json`):
 

@@ -37,6 +37,13 @@ MAX_PROPOSALS="${LOOM_MAX_PROPOSALS:-5}"
 ARCHITECT_COOLDOWN="${LOOM_ARCHITECT_COOLDOWN:-1800}"
 HERMIT_COOLDOWN="${LOOM_HERMIT_COOLDOWN:-1800}"
 
+# Issue selection strategy: fifo (default), lifo, priority
+# - fifo: Oldest issues first (FIFO - prevents starvation)
+# - lifo: Newest issues first (LIFO - current GitHub API default)
+# - priority: Sort by loom:urgent first, then by age (oldest first)
+# Note: loom:urgent always takes precedence regardless of strategy
+ISSUE_STRATEGY="${LOOM_ISSUE_STRATEGY:-fifo}"
+
 # Find the repository root (works from any subdirectory)
 find_repo_root() {
     local dir="$PWD"
@@ -84,6 +91,11 @@ ENVIRONMENT VARIABLES:
     LOOM_MAX_PROPOSALS       Maximum pending proposals (default: 5)
     LOOM_ARCHITECT_COOLDOWN  Architect trigger cooldown in seconds (default: 1800)
     LOOM_HERMIT_COOLDOWN     Hermit trigger cooldown in seconds (default: 1800)
+    LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
+                             - fifo: Oldest issues first (prevents starvation)
+                             - lifo: Newest issues first
+                             - priority: loom:urgent first, then oldest
+                             Note: loom:urgent always takes precedence
 
 OUTPUT:
     JSON object with fields:
@@ -144,7 +156,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 # Each query writes to a temp file
 
 # Issues
-gh issue list --label "loom:issue" --state open --json number,title,labels \
+gh issue list --label "loom:issue" --state open --json number,title,labels,createdAt \
     > "$TMPDIR/ready_issues" 2>/dev/null &
 PID_READY=$!
 
@@ -204,7 +216,56 @@ read_json_file() {
     fi
 }
 
-READY_ISSUES=$(read_json_file "$TMPDIR/ready_issues")
+READY_ISSUES_RAW=$(read_json_file "$TMPDIR/ready_issues")
+
+# Sort ready issues based on ISSUE_STRATEGY
+# loom:urgent always takes precedence (sorted first)
+# Then apply the configured strategy to the remaining issues
+sort_issues() {
+    local issues="$1"
+    local strategy="$2"
+
+    # Partition into urgent and non-urgent
+    # Urgent issues are always first, sorted by createdAt (oldest first within urgent)
+    # Non-urgent issues are sorted according to strategy
+
+    case "$strategy" in
+        fifo)
+            # FIFO: Oldest first (ascending by createdAt)
+            # Urgent first (oldest urgent), then non-urgent (oldest first)
+            echo "$issues" | jq '
+                (map(select([.labels[].name] | contains(["loom:urgent"]))) | sort_by(.createdAt)) +
+                (map(select([.labels[].name] | contains(["loom:urgent"]) | not)) | sort_by(.createdAt))
+            '
+            ;;
+        lifo)
+            # LIFO: Newest first (descending by createdAt)
+            # Urgent first (newest urgent), then non-urgent (newest first)
+            echo "$issues" | jq '
+                (map(select([.labels[].name] | contains(["loom:urgent"]))) | sort_by(.createdAt) | reverse) +
+                (map(select([.labels[].name] | contains(["loom:urgent"]) | not)) | sort_by(.createdAt) | reverse)
+            '
+            ;;
+        priority)
+            # Priority: loom:urgent first (oldest), then by age (oldest first)
+            # Same as fifo but explicitly named for clarity
+            echo "$issues" | jq '
+                (map(select([.labels[].name] | contains(["loom:urgent"]))) | sort_by(.createdAt)) +
+                (map(select([.labels[].name] | contains(["loom:urgent"]) | not)) | sort_by(.createdAt))
+            '
+            ;;
+        *)
+            # Unknown strategy, warn and fall back to fifo
+            echo "Warning: Unknown issue strategy '$strategy', falling back to fifo" >&2
+            echo "$issues" | jq '
+                (map(select([.labels[].name] | contains(["loom:urgent"]))) | sort_by(.createdAt)) +
+                (map(select([.labels[].name] | contains(["loom:urgent"]) | not)) | sort_by(.createdAt))
+            '
+            ;;
+    esac
+}
+
+READY_ISSUES=$(sort_issues "$READY_ISSUES_RAW" "$ISSUE_STRATEGY")
 BUILDING_ISSUES=$(read_json_file "$TMPDIR/building_issues")
 ARCHITECT_PROPOSALS=$(read_json_file "$TMPDIR/architect_proposals")
 HERMIT_PROPOSALS=$(read_json_file "$TMPDIR/hermit_proposals")
@@ -375,6 +436,7 @@ OUTPUT=$(jq -n \
     --argjson issue_threshold "$ISSUE_THRESHOLD" \
     --argjson max_shepherds "$MAX_SHEPHERDS" \
     --argjson max_proposals "$MAX_PROPOSALS" \
+    --arg issue_strategy "$ISSUE_STRATEGY" \
     '{
         timestamp: $timestamp,
         pipeline: {
@@ -410,7 +472,8 @@ OUTPUT=$(jq -n \
         config: {
             issue_threshold: $issue_threshold,
             max_shepherds: $max_shepherds,
-            max_proposals: $max_proposals
+            max_proposals: $max_proposals,
+            issue_strategy: $issue_strategy
         }
     }')
 
