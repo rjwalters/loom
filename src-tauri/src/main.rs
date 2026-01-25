@@ -313,6 +313,10 @@ fn main() {
             save_weekly_report_schedule,
             get_previous_week_metrics,
             get_stuck_pr_count,
+            // Budget management commands
+            get_budget_config,
+            save_budget_config,
+            get_costs_by_issue,
         ])
         .run(tauri::generate_context!())
     {
