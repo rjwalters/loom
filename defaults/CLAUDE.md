@@ -209,6 +209,39 @@ touch .loom/stop-daemon
 # 3. Clean up state and exit
 ```
 
+**Shell Script Wrapper** (Alternative to LLM-interpreted loop):
+
+For more deterministic daemon operation, use the shell script wrapper instead of the LLM-interpreted parent loop:
+
+```bash
+# Start daemon with shell wrapper (recommended for production)
+./.loom/scripts/daemon-loop.sh
+
+# Start in force mode
+./.loom/scripts/daemon-loop.sh --force
+
+# Run in background
+nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
+
+# Custom poll interval (default: 120s)
+LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
+
+# Stop daemon gracefully (same as regular daemon)
+touch .loom/stop-daemon
+```
+
+**Why use the shell wrapper?**
+- Deterministic loop behavior (no LLM interpretation variability)
+- Timeout protection prevents hung iterations (default: 5 minutes)
+- Can run in background, screen, or tmux
+- Consistent logging to `.loom/daemon.log`
+- Each iteration is a fresh Claude session (no context accumulation)
+
+**Trade-offs**:
+- Requires `claude` CLI in PATH
+- Slightly higher latency per iteration (CLI startup)
+- No conversation context between iterations (by design)
+
 ## Agent Roles
 
 Loom provides specialized roles for different development tasks. Each role follows specific guidelines and uses GitHub labels for coordination.
