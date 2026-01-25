@@ -5,10 +5,11 @@
 # delegating iteration work to Claude via the /loom iterate command.
 #
 # Usage:
-#   ./.loom/scripts/daemon-loop.sh [--force] [--status] [--health]
+#   ./.loom/scripts/daemon-loop.sh [--force] [--debug] [--status] [--health]
 #
 # Options:
 #   --force    Enable force mode for aggressive autonomous development
+#   --debug    Enable debug mode for verbose subagent troubleshooting
 #   --status   Check if daemon loop is running
 #   --health   Show daemon health status and exit
 #
@@ -83,11 +84,16 @@ fi
 
 # Parse arguments
 FORCE_FLAG=""
+DEBUG_FLAG=""
 SHOW_HEALTH=false
 while [[ $# -gt 0 ]]; do
     case $1 in
         --force|-f)
             FORCE_FLAG="--force"
+            shift
+            ;;
+        --debug|-d)
+            DEBUG_FLAG="--debug"
             shift
             ;;
         --status)
@@ -111,10 +117,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "Usage: $0 [--force] [--status] [--health]"
+            echo "Usage: $0 [--force] [--debug] [--status] [--health]"
             echo ""
             echo "Options:"
             echo "  --force, -f    Enable force mode for aggressive autonomous development"
+            echo "  --debug, -d    Enable debug mode for verbose subagent troubleshooting"
             echo "  --status       Check if daemon loop is running"
             echo "  --health       Show daemon health status and exit"
             echo "  --help, -h     Show this help message"
@@ -250,13 +257,21 @@ log() {
 }
 
 log_header() {
+    local mode_display="Normal"
+    if [[ -n "$FORCE_FLAG" ]] && [[ -n "$DEBUG_FLAG" ]]; then
+        mode_display="Force + Debug"
+    elif [[ -n "$FORCE_FLAG" ]]; then
+        mode_display="Force"
+    elif [[ -n "$DEBUG_FLAG" ]]; then
+        mode_display="Debug"
+    fi
     echo "" | tee -a "$LOG_FILE"
     echo "═══════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo -e "${CYAN}  LOOM DAEMON - SHELL SCRIPT WRAPPER MODE${NC}" | tee -a "$LOG_FILE"
     echo "═══════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  Started: $(date -Iseconds)" | tee -a "$LOG_FILE"
     echo "  PID: $$" | tee -a "$LOG_FILE"
-    echo "  Mode: ${FORCE_FLAG:-Normal}" | tee -a "$LOG_FILE"
+    echo "  Mode: $mode_display" | tee -a "$LOG_FILE"
     echo "  Poll interval: ${POLL_INTERVAL}s" | tee -a "$LOG_FILE"
     echo "  Iteration timeout: ${ITERATION_TIMEOUT}s" | tee -a "$LOG_FILE"
     echo "  Max backoff: ${MAX_BACKOFF}s (after ${BACKOFF_THRESHOLD} failures, ${BACKOFF_MULTIPLIER}x multiplier)" | tee -a "$LOG_FILE"
@@ -400,6 +415,9 @@ while true; do
     ITERATE_CMD="/loom iterate"
     if [[ -n "$FORCE_FLAG" ]]; then
         ITERATE_CMD="$ITERATE_CMD $FORCE_FLAG"
+    fi
+    if [[ -n "$DEBUG_FLAG" ]]; then
+        ITERATE_CMD="$ITERATE_CMD $DEBUG_FLAG"
     fi
 
     # Track iteration status for metrics
