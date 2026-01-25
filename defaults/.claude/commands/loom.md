@@ -226,6 +226,8 @@ When invoked with `iterate`, execute exactly ONE daemon iteration with fresh con
 
 ### Iteration Execution
 
+**CRITICAL**: The iteration MUST use `daemon-snapshot.sh` for state assessment and act on its `recommended_actions`. This ensures deterministic behavior and proper work generation triggering.
+
 ```python
 def loom_iterate(force_mode=False, debug_mode=False):
     """Execute exactly ONE daemon iteration. Called by parent loop."""
@@ -245,10 +247,20 @@ def loom_iterate(force_mode=False, debug_mode=False):
         debug("Shutdown signal detected")
         return "SHUTDOWN_SIGNAL"
 
-    # 3. Assess system state (gh commands)
-    pipeline = assess_pipeline_state()
-    debug(f"Pipeline state: ready={len(pipeline.ready)} building={len(pipeline.building)} review_requested={len(pipeline.review_requested)}")
-    # Returns: ready_issues, building_issues, architect_proposals, etc.
+    # 3. CRITICAL: Get system state via daemon-snapshot.sh
+    # This is the CANONICAL source for all state and recommended actions
+    snapshot = run("./.loom/scripts/daemon-snapshot.sh")
+    snapshot_data = json.loads(snapshot)
+
+    # Extract computed decisions (these are authoritative)
+    recommended_actions = snapshot_data["computed"]["recommended_actions"]
+    ready_count = snapshot_data["computed"]["total_ready"]
+    needs_work_gen = snapshot_data["computed"]["needs_work_generation"]
+    architect_cooldown_ok = snapshot_data["computed"]["architect_cooldown_ok"]
+    hermit_cooldown_ok = snapshot_data["computed"]["hermit_cooldown_ok"]
+
+    debug(f"Pipeline state: ready={ready_count} building={snapshot_data['computed']['total_building']}")
+    debug(f"Recommended actions: {recommended_actions}")
 
     # 4. Check subagent completions (non-blocking TaskOutput)
     completions = check_all_completions(state)
@@ -256,12 +268,25 @@ def loom_iterate(force_mode=False, debug_mode=False):
         for c in completions:
             debug(f"Completion detected: {c.agent_id} issue=#{c.issue} status={c.status}")
 
-    # 5. Auto-spawn shepherds
-    debug(f"Shepherd pool: {format_shepherd_pool(state)}")
-    spawned_shepherds = auto_spawn_shepherds(state, pipeline, debug_mode)
+    # 5. Act on recommended_actions: spawn_shepherds
+    spawned_shepherds = []
+    if "spawn_shepherds" in recommended_actions:
+        debug(f"Shepherd pool: {format_shepherd_pool(state)}")
+        spawned_shepherds = auto_spawn_shepherds(state, snapshot_data, debug_mode)
 
-    # 6. Auto-trigger work generation
-    triggered_generation = auto_generate_work(state, pipeline, force_mode, debug_mode)
+    # 6. CRITICAL: Act on recommended_actions: trigger_architect, trigger_hermit
+    # This is the work generation that keeps the pipeline fed
+    triggered_generation = {"architect": False, "hermit": False}
+
+    if "trigger_architect" in recommended_actions:
+        triggered_generation["architect"] = trigger_architect_role(state, debug_mode)
+
+    if "trigger_hermit" in recommended_actions:
+        triggered_generation["hermit"] = trigger_hermit_role(state, debug_mode)
+
+    # Log work generation even when not triggered (for debugging)
+    if needs_work_gen and not triggered_generation["architect"] and not triggered_generation["hermit"]:
+        debug(f"Work generation needed but not triggered: architect_cooldown_ok={architect_cooldown_ok}, hermit_cooldown_ok={hermit_cooldown_ok}")
 
     # 7. Auto-ensure support roles
     ensured_roles = auto_ensure_support_roles(state, debug_mode)
@@ -282,7 +307,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
     save_daemon_state(state)
 
     # 11. Return compact summary (ONE LINE)
-    summary = format_iteration_summary(pipeline, spawned_shepherds, triggered_generation, stuck_count, recovered_count)
+    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, stuck_count, recovered_count)
     debug(f"Iteration {iteration} completed - {summary}")
     return summary
 ```
@@ -1104,85 +1129,105 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
     return {"spawned": spawned, "failures": spawn_failures}
 ```
 
-### Step 5 Detail: Auto-Generate Work
+### Step 5 Detail: Auto-Generate Work (Trigger Architect/Hermit)
+
+**CRITICAL**: Work generation is the mechanism that keeps the pipeline fed when it's empty.
+When `daemon-snapshot.sh` includes `trigger_architect` or `trigger_hermit` in `recommended_actions`,
+the iteration MUST spawn these roles. Failure to do so results in an idle daemon.
 
 ```python
-def auto_generate_work(debug_mode=False):
-    """Automatically trigger Architect/Hermit - NO human decision required."""
+def trigger_architect_role(state, debug_mode=False):
+    """Trigger Architect role to generate new proposals. Returns True if triggered."""
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    ready_count = count_issues_with_label("loom:issue")
+    debug("Triggering Architect for work generation")
 
-    if ready_count >= ISSUE_THRESHOLD:
-        print(f"  Work generation: skipped (ready={ready_count} >= threshold={ISSUE_THRESHOLD})")
-        debug(f"Work generation skipped: backlog sufficient (ready={ready_count} >= threshold={ISSUE_THRESHOLD})")
-        return
-
-    print(f"  Work generation: backlog low (ready={ready_count} < threshold={ISSUE_THRESHOLD})")
-    debug(f"Work generation triggered: backlog low (ready={ready_count} < threshold={ISSUE_THRESHOLD})")
-
-    # Auto-trigger Architect
-    architect_proposals = count_issues_with_label("loom:architect")
-    architect_elapsed = seconds_since_last_architect_trigger()
-
-    debug(f"Architect evaluation: proposals={architect_proposals} (max={MAX_ARCHITECT_PROPOSALS}), elapsed={architect_elapsed}s (cooldown={ARCHITECT_COOLDOWN}s)")
-
-    if architect_proposals < MAX_ARCHITECT_PROPOSALS and architect_elapsed > ARCHITECT_COOLDOWN:
-        result = Task(
-            description="Architect work generation",
-            prompt="""Execute the architect role by invoking the Skill tool:
+    result = Task(
+        description="Architect work generation",
+        prompt="""Execute the architect role by invoking the Skill tool:
 
 Skill(skill="architect", args="--autonomous")
 
-Complete one work generation iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Architect"):
-            record_support_role("architect", result.task_id, result.output_file)
-            update_last_trigger("architect")
-            print(f"    AUTO-TRIGGERED: Architect (proposals={architect_proposals}, cooldown ok, verified)")
-            debug(f"Architect spawned: task_id={result.task_id}, output={result.output_file}")
-        else:
-            print(f"    AUTO-TRIGGERED: Architect FAILED verification")
-            debug(f"Architect spawn failed verification, not recording task_id")
+Complete one work generation iteration. Create a proposal issue with the loom:architect label.""",
+        run_in_background=True
+    )
+
+    # Verify spawn before recording
+    if verify_task_spawn(result, "Architect"):
+        record_support_role("architect", result.task_id, result.output_file)
+
+        # CRITICAL: Update last_architect_trigger timestamp in state
+        state["last_architect_trigger"] = now()
+        save_daemon_state(state)
+
+        print(f"  AUTO-TRIGGERED: Architect (work generation, verified)")
+        debug(f"Architect spawned: task_id={result.task_id}, output={result.output_file}")
+        return True
     else:
-        reason = f"proposals={architect_proposals}" if architect_proposals >= MAX_ARCHITECT_PROPOSALS else f"cooldown={ARCHITECT_COOLDOWN - architect_elapsed}s remaining"
-        print(f"    Architect: skipped ({reason})")
-        debug(f"Architect skipped: {reason}")
+        print(f"  SPAWN FAILED: Architect verification failed")
+        debug(f"Architect spawn failed verification, not recording task_id")
+        return False
 
-    # Auto-trigger Hermit
-    hermit_proposals = count_issues_with_label("loom:hermit")
-    hermit_elapsed = seconds_since_last_hermit_trigger()
 
-    debug(f"Hermit evaluation: proposals={hermit_proposals} (max={MAX_HERMIT_PROPOSALS}), elapsed={hermit_elapsed}s (cooldown={HERMIT_COOLDOWN}s)")
+def trigger_hermit_role(state, debug_mode=False):
+    """Trigger Hermit role to generate simplification proposals. Returns True if triggered."""
 
-    if hermit_proposals < MAX_HERMIT_PROPOSALS and hermit_elapsed > HERMIT_COOLDOWN:
-        result = Task(
-            description="Hermit simplification proposals",
-            prompt="""Execute the hermit role by invoking the Skill tool:
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    debug("Triggering Hermit for simplification proposals")
+
+    result = Task(
+        description="Hermit simplification proposals",
+        prompt="""Execute the hermit role by invoking the Skill tool:
 
 Skill(skill="hermit")
 
-Complete one simplification analysis iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Hermit"):
-            record_support_role("hermit", result.task_id, result.output_file)
-            update_last_trigger("hermit")
-            print(f"    AUTO-TRIGGERED: Hermit (proposals={hermit_proposals}, cooldown ok, verified)")
-            debug(f"Hermit spawned: task_id={result.task_id}, output={result.output_file}")
-        else:
-            print(f"    AUTO-TRIGGERED: Hermit FAILED verification")
-            debug(f"Hermit spawn failed verification, not recording task_id")
+Complete one simplification analysis iteration. Create a proposal issue with the loom:hermit label.""",
+        run_in_background=True
+    )
+
+    # Verify spawn before recording
+    if verify_task_spawn(result, "Hermit"):
+        record_support_role("hermit", result.task_id, result.output_file)
+
+        # CRITICAL: Update last_hermit_trigger timestamp in state
+        state["last_hermit_trigger"] = now()
+        save_daemon_state(state)
+
+        print(f"  AUTO-TRIGGERED: Hermit (simplification analysis, verified)")
+        debug(f"Hermit spawned: task_id={result.task_id}, output={result.output_file}")
+        return True
     else:
-        reason = f"proposals={hermit_proposals}" if hermit_proposals >= MAX_HERMIT_PROPOSALS else f"cooldown={HERMIT_COOLDOWN - hermit_elapsed}s remaining"
-        print(f"    Hermit: skipped ({reason})")
-        debug(f"Hermit skipped: {reason}")
+        print(f"  SPAWN FAILED: Hermit verification failed")
+        debug(f"Hermit spawn failed verification, not recording task_id")
+        return False
+```
+
+**When work generation triggers:**
+
+The daemon triggers Architect/Hermit when ALL of these conditions are met (checked by `daemon-snapshot.sh`):
+
+| Condition | Threshold | Rationale |
+|-----------|-----------|-----------|
+| `ready_issues < ISSUE_THRESHOLD` | 3 | Pipeline needs more work |
+| `proposals < MAX_PROPOSALS` | 2 | Don't flood with proposals |
+| `cooldown_elapsed > COOLDOWN` | 1800s (30min) | Avoid thrashing |
+
+**Verifying work generation is working:**
+
+```bash
+# Check if work generation has been triggered
+jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
+
+# If both are null with an empty pipeline, work generation is broken
+# Check daemon-snapshot.sh output:
+./.loom/scripts/daemon-snapshot.sh --pretty | jq '.computed.recommended_actions'
+# Should include "trigger_architect" and/or "trigger_hermit" when pipeline is empty
 ```
 
 ### Step 6 Detail: Auto-Ensure Support Roles

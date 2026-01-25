@@ -12,6 +12,71 @@ Detailed configuration and state management for the Loom daemon (Layer 2).
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
 | `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
 | `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |
+| `ARCHITECT_COOLDOWN` | 1800 | Seconds between Architect role triggers (30 min) |
+| `HERMIT_COOLDOWN` | 1800 | Seconds between Hermit role triggers (30 min) |
+| `MAX_ARCHITECT_PROPOSALS` | 2 | Maximum open `loom:architect` proposals before stopping triggers |
+| `MAX_HERMIT_PROPOSALS` | 2 | Maximum open `loom:hermit` proposals before stopping triggers |
+
+## Work Generation
+
+The daemon automatically triggers Architect and Hermit roles when the pipeline is empty. This keeps development flowing without manual intervention.
+
+### When Work Generation Triggers
+
+Work generation (Architect/Hermit) triggers when ALL conditions are met:
+
+| Condition | Threshold | Rationale |
+|-----------|-----------|-----------|
+| `ready_issues < ISSUE_THRESHOLD` | 3 | Pipeline needs more work |
+| `proposals < MAX_*_PROPOSALS` | 2 per role | Don't flood with proposals |
+| `cooldown_elapsed > *_COOLDOWN` | 1800s (30min) | Avoid thrashing |
+
+### Work Generation Flow
+
+```
+Pipeline Check:
+  └── ready_issues < 3?
+      └── YES: Check Architect
+          ├── proposals < 2?
+          ├── cooldown elapsed > 30min?
+          └── ALL YES → Spawn Architect Task
+                └── Architect creates proposal with loom:architect label
+                └── Champion evaluates and promotes to loom:issue (or human approves)
+
+      └── YES: Check Hermit (same conditions)
+          └── Spawn Hermit Task
+                └── Hermit creates proposal with loom:hermit label
+                └── Champion evaluates and promotes to loom:issue (or human approves)
+```
+
+### Verifying Work Generation
+
+Use `daemon-snapshot.sh` to check work generation state:
+
+```bash
+# Check if work generation should trigger
+./.loom/scripts/daemon-snapshot.sh --pretty | jq '{
+  ready: .computed.total_ready,
+  needs_work_gen: .computed.needs_work_generation,
+  architect_cooldown_ok: .computed.architect_cooldown_ok,
+  hermit_cooldown_ok: .computed.hermit_cooldown_ok,
+  recommended_actions: .computed.recommended_actions
+}'
+
+# Check trigger timestamps
+jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
+```
+
+### Forcing Work Generation (Testing)
+
+```bash
+# Reset cooldowns to force immediate trigger
+jq '.last_architect_trigger = "2020-01-01T00:00:00Z" | .last_hermit_trigger = "2020-01-01T00:00:00Z"' \
+  .loom/daemon-state.json > tmp.json && mv tmp.json .loom/daemon-state.json
+
+# Run iteration to trigger
+/loom iterate --debug
+```
 
 ## Issue Selection Strategy
 
