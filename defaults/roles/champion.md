@@ -138,8 +138,12 @@ Check each of the 8 criteria above. If ANY criterion fails, skip to Step 4 (reje
 If all 8 criteria pass, promote the issue:
 
 ```bash
-# Add loom:issue (keep loom:curated as historical context)
+# Remove proposal label and add loom:issue
+# IMPORTANT: Only one proposal label can exist at a time, but check all for robustness
 gh issue edit <number> \
+  --remove-label "loom:curated" \
+  --remove-label "loom:architect" \
+  --remove-label "loom:hermit" \
   --add-label "loom:issue"
 
 # Add promotion comment
