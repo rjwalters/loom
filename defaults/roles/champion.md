@@ -169,9 +169,9 @@ Even in force mode, do NOT auto-promote if:
 - Issue mentions breaking changes without migration plan
 - Issue references external dependencies that need coordination
 
-### Force Mode Safety Guardrails
+### Force Mode Safety Guardrails (Issue Promotion)
 
-Force mode still respects these boundaries:
+Force mode still respects these boundaries for issue promotion:
 
 | Guardrail | Behavior |
 |-----------|----------|
@@ -179,6 +179,40 @@ Force mode still respects these boundaries:
 | Critical file changes | Still flagged in PR review (Judge) |
 | CI failures | PRs still blocked on failing CI |
 | Merge conflicts | Still require Doctor intervention |
+
+### Force Mode PR Merging
+
+**In force mode, Champion also relaxes PR auto-merge criteria** for aggressive autonomous development:
+
+| Criterion | Normal Mode | Force Mode |
+|-----------|-------------|------------|
+| Size limit | ≤ 200 lines | **No limit** (trust Judge review) |
+| Critical files | Block `Cargo.toml`, `package.json`, etc. | **Allow all** (trust Judge review) |
+| Recency | Updated within 24h | Updated within **72h** |
+| CI status | All checks must pass | All checks must pass (unchanged) |
+| Merge conflicts | Block if conflicting | Block if conflicting (unchanged) |
+| Manual override | Respect `loom:manual-merge` | Respect `loom:manual-merge` (unchanged) |
+
+**Rationale**: In force mode, the Judge has already reviewed the PR. Champion's role is to merge quickly, not to second-guess the review. Essential safety checks (CI, conflicts, manual override) remain.
+
+**Force mode PR merge comment**:
+```bash
+gh pr comment "$PR_NUMBER" --body "$(cat <<EOF
+🏆 **[force-mode] Champion Auto-Merge**
+
+This PR has been auto-merged in force mode. Relaxed criteria:
+- Size limit: waived (was $TOTAL_LINES lines)
+- Critical files: waived
+- Trust: Judge review + passing CI
+
+**Merged via squash.** If this was merged in error:
+\`git revert <commit-sha>\`
+
+---
+*Automated by Champion role (force mode)*
+EOF
+)"
+```
 
 ### Exiting Force Mode
 
@@ -604,6 +638,7 @@ echo "PASS: Label check"
 
 ### 2. Size Check
 - [ ] Total lines changed ≤ 200 (additions + deletions)
+- [ ] **Force mode**: Size limit is waived
 
 **Verification command**:
 ```bash
@@ -613,21 +648,28 @@ ADDITIONS=$(echo "$PR_DATA" | jq -r '.additions')
 DELETIONS=$(echo "$PR_DATA" | jq -r '.deletions')
 TOTAL=$((ADDITIONS + DELETIONS))
 
-# Check size limit
-if [ "$TOTAL" -gt 200 ]; then
-  echo "FAIL: Too large ($TOTAL lines, limit is 200)"
-  exit 1
-fi
+# Check force mode
+FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
 
-echo "PASS: Size check ($TOTAL lines)"
+if [ "$FORCE_MODE" = "true" ]; then
+  echo "PASS: Size check waived in force mode ($TOTAL lines)"
+else
+  # Check size limit (normal mode)
+  if [ "$TOTAL" -gt 200 ]; then
+    echo "FAIL: Too large ($TOTAL lines, limit is 200)"
+    exit 1
+  fi
+  echo "PASS: Size check ($TOTAL lines)"
+fi
 ```
 
-**Rationale**: Small PRs are easier to revert if problems arise.
+**Rationale**: Small PRs are easier to revert if problems arise. In force mode, trust Judge review for larger changes.
 
 ### 3. Critical File Exclusion Check
 - [ ] No changes to critical configuration or infrastructure files
+- [ ] **Force mode**: Critical file check is waived (trust Judge review)
 
-**Critical file patterns** (do NOT auto-merge if PR modifies any of these):
+**Critical file patterns** (do NOT auto-merge if PR modifies any of these - normal mode only):
 - `src-tauri/tauri.conf.json` - app configuration
 - `Cargo.toml` - root dependency changes
 - `loom-daemon/Cargo.toml` - daemon dependency changes
@@ -640,36 +682,43 @@ echo "PASS: Size check ($TOTAL lines)"
 
 **Verification command**:
 ```bash
-# Get all changed files
-FILES=$(gh pr view <number> --json files --jq -r '.files[].path')
+# Check force mode first
+FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
 
-# Define critical patterns (extend as needed)
-CRITICAL_PATTERNS=(
-  "src-tauri/tauri.conf.json"
-  "Cargo.toml"
-  "loom-daemon/Cargo.toml"
-  "src-tauri/Cargo.toml"
-  "package.json"
-  "pnpm-lock.yaml"
-  ".github/workflows/"
-  ".sql"
-  "migration"
-)
+if [ "$FORCE_MODE" = "true" ]; then
+  echo "PASS: Critical file check waived in force mode"
+else
+  # Get all changed files (normal mode)
+  FILES=$(gh pr view <number> --json files --jq -r '.files[].path')
 
-# Check each file against patterns
-for file in $FILES; do
-  for pattern in "${CRITICAL_PATTERNS[@]}"; do
-    if [[ "$file" == *"$pattern"* ]]; then
-      echo "FAIL: Critical file modified: $file"
-      exit 1
-    fi
+  # Define critical patterns (extend as needed)
+  CRITICAL_PATTERNS=(
+    "src-tauri/tauri.conf.json"
+    "Cargo.toml"
+    "loom-daemon/Cargo.toml"
+    "src-tauri/Cargo.toml"
+    "package.json"
+    "pnpm-lock.yaml"
+    ".github/workflows/"
+    ".sql"
+    "migration"
+  )
+
+  # Check each file against patterns
+  for file in $FILES; do
+    for pattern in "${CRITICAL_PATTERNS[@]}"; do
+      if [[ "$file" == *"$pattern"* ]]; then
+        echo "FAIL: Critical file modified: $file"
+        exit 1
+      fi
+    done
   done
-done
 
-echo "PASS: No critical files modified"
+  echo "PASS: No critical files modified"
+fi
 ```
 
-**Rationale**: Changes to these files require careful human review due to high impact.
+**Rationale**: Changes to these files require careful human review due to high impact. In force mode, trust Judge review for critical file changes.
 
 ### 4. Merge Conflict Check
 - [ ] PR is mergeable (no conflicts with base branch)
@@ -696,7 +745,8 @@ echo "PASS: No merge conflicts"
 **Rationale**: Conflicting PRs require human resolution before merging
 
 ### 5. Recency Check
-- [ ] PR updated within last 24 hours
+- [ ] PR updated within last 24 hours (normal mode)
+- [ ] **Force mode**: Extended to 72 hours
 
 **Verification command**:
 ```bash
@@ -713,16 +763,24 @@ NOW_TS=$(date +%s)
 # Calculate hours since update
 HOURS_AGO=$(( (NOW_TS - UPDATED_TS) / 3600 ))
 
-# Check if within 24 hours
-if [ "$HOURS_AGO" -gt 24 ]; then
-  echo "FAIL: Stale PR (updated $HOURS_AGO hours ago)"
+# Check force mode for extended window
+FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
+if [ "$FORCE_MODE" = "true" ]; then
+  RECENCY_LIMIT=72
+else
+  RECENCY_LIMIT=24
+fi
+
+# Check if within recency limit
+if [ "$HOURS_AGO" -gt "$RECENCY_LIMIT" ]; then
+  echo "FAIL: Stale PR (updated $HOURS_AGO hours ago, limit is ${RECENCY_LIMIT}h)"
   exit 1
 fi
 
 echo "PASS: Recently updated ($HOURS_AGO hours ago)"
 ```
 
-**Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale.
+**Rationale**: Ensures PR reflects recent state of main branch and hasn't gone stale. In force mode, allows older PRs to merge since aggressive development may queue up PRs faster than they can be merged.
 
 ### 6. CI Status Check
 - [ ] If CI checks exist, all checks must be passing
