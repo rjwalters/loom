@@ -65,7 +65,7 @@ You do NOT require human input for any of the above. The only human intervention
 **CRITICAL**: Every daemon iteration should make ALL spawning decisions automatically:
 
 ```
-Each 30-second iteration:
+Each 120-second iteration:
   1. Check for shutdown signal
   2. Assess system state (gh issue counts)
   3. Check subagent completions (non-blocking TaskOutput)
@@ -510,7 +510,7 @@ All thresholds that drive automatic decisions:
 |-----------|---------|-------------|
 | `ISSUE_THRESHOLD` | 3 | Trigger work generation when loom:issue count < this |
 | `MAX_SHEPHERDS` | 3 | Maximum concurrent shepherd subagents |
-| `POLL_INTERVAL` | 30s | Seconds between daemon loop iterations |
+| `POLL_INTERVAL` | 120s | Seconds between daemon loop iterations |
 
 ### Work Generation Thresholds
 
@@ -1782,7 +1782,7 @@ $ claude
   LOOM DAEMON - SUBAGENT-PER-ITERATION MODE
 ═══════════════════════════════════════════════════════════════════
   Mode: Normal
-  Poll interval: 30s
+  Poll interval: 120s
   Parent loop accumulates only iteration summaries
 ═══════════════════════════════════════════════════════════════════
 
