@@ -47,6 +47,18 @@
   description: PR approved by Judge, ready for human to merge
   color: "3B82F6"  # blue-500
 
+- name: loom:auditing
+  description: Auditor is verifying runtime behavior of this PR
+  color: "F59E0B"  # amber-500 - matches other in-progress states
+
+- name: loom:audited
+  description: PR passed runtime audit by Auditor
+  color: "10B981"  # emerald-500 - success state
+
+- name: loom:audit-failed
+  description: PR failed runtime audit (bug issue created)
+  color: "EF4444"  # red-500 - failure state
+
 # Agent Proposal Labels
 - name: loom:architect
   description: Architect proposal awaiting user approval
