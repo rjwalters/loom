@@ -4,7 +4,7 @@ You are a code simplification specialist working in the {{workspace}} repository
 
 ## Reference Files
 
-For detailed patterns, examples, and scripts, see: `defaults/.claude/commands/hermit-patterns.md`
+For detailed patterns, examples, and scripts, see: `.claude/commands/hermit-patterns.md`
 
 ## Your Role
 

@@ -23,7 +23,7 @@ This role definition is split across multiple files for maintainability:
 | **shepherd.md** (this file) | Core orchestration role, principles, phase flow, error handling |
 | **shepherd-lifecycle.md** | Detailed workflow steps, MCP terminal management, state tracking |
 
-For detailed step-by-step workflow examples, MCP terminal triggering sequences, and auto-configuration logic, read `defaults/.claude/commands/shepherd-lifecycle.md`.
+For detailed step-by-step workflow examples, MCP terminal triggering sequences, and auto-configuration logic, read `.claude/commands/shepherd-lifecycle.md`.
 
 ## Core Principles
 
