@@ -1,13 +1,13 @@
-# MCP Loom Logs Server API Reference
+# MCP Loom Log Tools API Reference
 
-The `mcp-loom-logs` server provides tools for accessing Loom's various log files including daemon logs, Tauri application logs, and individual terminal output logs.
+Log tools for accessing Loom's various log files including daemon logs, Tauri application logs, and individual terminal output logs. These tools are part of the unified `mcp-loom` server.
 
 ## Server Information
 
-- **Name**: `loom-logs`
-- **Version**: `0.1.0`
-- **Package**: `mcp-loom-logs`
-- **Entry Point**: `mcp-loom-logs/src/index.ts`
+- **Name**: `loom` (unified server)
+- **Version**: `0.3.0`
+- **Package**: `mcp-loom`
+- **Source**: `mcp-loom/src/tools/logs.ts`
 
 ## Overview
 
@@ -56,10 +56,10 @@ Plain text containing the last N lines from daemon log, prefixed with header.
 **Example:**
 ```typescript
 // Read last 50 lines
-mcp__loom-logs__tail_daemon_log({ lines: 50 })
+mcp__loom__tail_daemon_log({ lines: 50 })
 
 // Read default 100 lines
-mcp__loom-logs__tail_daemon_log()
+mcp__loom__tail_daemon_log()
 ```
 
 **Use Cases:**
@@ -103,10 +103,10 @@ Plain text containing the last N lines from Tauri log, prefixed with header.
 **Example:**
 ```typescript
 // Read last 200 lines
-mcp__loom-logs__tail_tauri_log({ lines: 200 })
+mcp__loom__tail_tauri_log({ lines: 200 })
 
 // Read default 100 lines
-mcp__loom-logs__tail_tauri_log()
+mcp__loom__tail_tauri_log()
 ```
 
 **Use Cases:**
@@ -154,7 +154,7 @@ No terminal logs found. Terminals may not have been created yet.
 **Example:**
 ```typescript
 // List all terminal logs
-mcp__loom-logs__list_terminal_logs()
+mcp__loom__list_terminal_logs()
 ```
 
 **Use Cases:**
@@ -202,13 +202,13 @@ Ready to assist with your codebase!
 **Example:**
 ```typescript
 // Read last 50 lines from terminal-2
-mcp__loom-logs__tail_terminal_log({
+mcp__loom__tail_terminal_log({
   terminal_id: "terminal-2",
   lines: 50
 })
 
 // Read default 100 lines from terminal-1
-mcp__loom-logs__tail_terminal_log({
+mcp__loom__tail_terminal_log({
   terminal_id: "terminal-1"
 })
 ```
@@ -238,12 +238,12 @@ mcp__loom-logs__tail_terminal_log({
 
 ```typescript
 // 1. List available terminals
-const terminals = await mcp__loom-logs__list_terminal_logs();
+const terminals = await mcp__loom__list_terminal_logs();
 // Should show 8 terminals after default factory reset
 
 // 2. Check each terminal for successful agent launch
 for (const terminalId of ["terminal-2", "terminal-3", "terminal-4", "terminal-5", "terminal-6"]) {
-  const log = await mcp__loom-logs__tail_terminal_log({
+  const log = await mcp__loom__tail_terminal_log({
     terminal_id: terminalId,
     lines: 50
   });
@@ -255,7 +255,7 @@ for (const terminalId of ["terminal-2", "terminal-3", "terminal-4", "terminal-5"
 }
 
 // 3. Check daemon for terminal creation sequence
-const daemonLog = await mcp__loom-logs__tail_daemon_log({ lines: 200 });
+const daemonLog = await mcp__loom__tail_daemon_log({ lines: 200 });
 // Look for CreateTerminal requests and successful responses
 ```
 
@@ -263,15 +263,15 @@ const daemonLog = await mcp__loom-logs__tail_daemon_log({ lines: 200 });
 
 ```typescript
 // 1. Check Tauri log for launch sequence
-const tauriLog = await mcp__loom-logs__tail_tauri_log({ lines: 100 });
+const tauriLog = await mcp__loom__tail_tauri_log({ lines: 100 });
 // Look for [launchAgentInTerminal] and [launchCodexAgent] messages
 
 // 2. Check daemon log for IPC issues
-const daemonLog = await mcp__loom-logs__tail_daemon_log({ lines: 100 });
+const daemonLog = await mcp__loom__tail_daemon_log({ lines: 100 });
 // Look for SendInput requests and responses
 
 // 3. Check specific terminal output
-const terminalLog = await mcp__loom-logs__tail_terminal_log({
+const terminalLog = await mcp__loom__tail_terminal_log({
   terminal_id: "terminal-3",
   lines: 50
 });
@@ -282,19 +282,19 @@ const terminalLog = await mcp__loom-logs__tail_terminal_log({
 
 ```typescript
 // Check daemon is running
-const daemonLog = await mcp__loom-logs__tail_daemon_log({ lines: 10 });
+const daemonLog = await mcp__loom__tail_daemon_log({ lines: 10 });
 if (daemonLog.includes("Log file not found")) {
   // Daemon is not running
 }
 
 // Check Tauri app is running
-const tauriLog = await mcp__loom-logs__tail_tauri_log({ lines: 10 });
+const tauriLog = await mcp__loom__tail_tauri_log({ lines: 10 });
 if (tauriLog.includes("Log file not found")) {
   // Tauri app is not running
 }
 
 // Check terminal count
-const terminals = await mcp__loom-logs__list_terminal_logs();
+const terminals = await mcp__loom__list_terminal_logs();
 // Compare with expected count
 ```
 
@@ -302,7 +302,7 @@ const terminals = await mcp__loom-logs__list_terminal_logs();
 
 ```typescript
 // Get terminal output to see command concatenation
-const terminalLog = await mcp__loom-logs__tail_terminal_log({
+const terminalLog = await mcp__loom__tail_terminal_log({
   terminal_id: "terminal-2",
   lines: 200
 });
@@ -313,7 +313,7 @@ const terminalLog = await mcp__loom-logs__tail_terminal_log({
 // - Missing newlines between commands
 
 // Cross-reference with Tauri log timing
-const tauriLog = await mcp__loom-logs__tail_tauri_log({ lines: 200 });
+const tauriLog = await mcp__loom__tail_tauri_log({ lines: 200 });
 // Check delay between send_terminal_input calls
 ```
 

@@ -212,9 +212,9 @@ Use the MCP tool to select a file:
 
 ```bash
 # Get any source file (exclude tests, build artifacts, generated code)
-mcp__loom-ui__get_random_file
+mcp__loom__get_random_file
 # Or with filters:
-mcp__loom-ui__get_random_file --includePatterns '["src/**/*.ts", "src-tauri/**/*.rs"]' --excludePatterns '["**/*.test.ts", "**/*.spec.ts"]'
+mcp__loom__get_random_file --includePatterns '["src/**/*.ts", "src-tauri/**/*.rs"]' --excludePatterns '["**/*.test.ts", "**/*.spec.ts"]'
 ```
 
 **Recommended filters:**
@@ -456,7 +456,7 @@ Each run randomly picks ONE check from this weighted distribution:
   5. **Large files**: Find files >300 lines that might need splitting
 
 - **30% - Random File Review**:
-  - Pick 1 random file via `mcp__loom-ui__get_random_file`
+  - Pick 1 random file via `mcp__loom__get_random_file`
   - Quick scan (2-3 minutes)
   - Create issue only if high-value
 
@@ -479,7 +479,7 @@ rg "export.*function|export.*class" -n
 # → Found unused function, create issue
 
 # Hermit Terminal 2 (random selection: random-file)
-mcp__loom-ui__get_random_file
+mcp__loom__get_random_file
 cat <file-path>
 # → Found over-engineered class, create issue
 

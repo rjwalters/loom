@@ -98,7 +98,7 @@ This guide helps you diagnose and fix common issues in Loom.
    Press `Ctrl+b d` to detach without killing the session.
 
 4. **Check health status:**
-   Use MCP: `mcp__loom-ui__read_state_file` to see terminal health status.
+   Use MCP: `mcp__loom__read_state_file` to see terminal health status.
 
 ### Agent Won't Launch
 
@@ -108,7 +108,7 @@ This guide helps you diagnose and fix common issues in Loom.
 
 1. **Check console logs:**
    ```bash
-   mcp__loom-ui__read_console_log
+   mcp__loom__read_console_log
    ```
    Look for agent launch errors.
 
@@ -185,7 +185,7 @@ This guide helps you diagnose and fix common issues in Loom.
 
 1. **Check console logs for stuck operations:**
    ```bash
-   mcp__loom-ui__read_console_log
+   mcp__loom__read_console_log
    ```
 
 2. **Manually kill tmux sessions:**
@@ -231,27 +231,27 @@ This guide helps you diagnose and fix common issues in Loom.
 
 ### MCP Servers
 
-Loom provides MCP servers for AI-powered debugging:
+Loom provides a unified MCP server (`mcp-loom`) for AI-powered debugging:
 
-#### UI Server (`mcp-loom-ui`)
-- `mcp__loom-ui__read_console_log` - Read frontend console logs
-- `mcp__loom-ui__read_state_file` - Read application state
-- `mcp__loom-ui__read_config_file` - Read terminal configurations
-- `mcp__loom-ui__trigger_force_start` - Start engine without confirmation
-- `mcp__loom-ui__trigger_factory_reset` - Reset to factory defaults
-- `mcp__loom-ui__get_heartbeat` - Check app health status
+#### UI Tools
+- `mcp__loom__read_console_log` - Read frontend console logs
+- `mcp__loom__read_state_file` - Read application state
+- `mcp__loom__read_config_file` - Read terminal configurations
+- `mcp__loom__trigger_force_start` - Start engine without confirmation
+- `mcp__loom__trigger_factory_reset` - Reset to factory defaults
+- `mcp__loom__get_heartbeat` - Check app health status
 
-#### Logs Server (`mcp-loom-logs`)
-- `mcp__loom-logs__tail_daemon_log` - Read daemon logs
-- `mcp__loom-logs__tail_tauri_log` - Read Tauri app logs
-- `mcp__loom-logs__list_terminal_logs` - List terminal log files
-- `mcp__loom-logs__tail_terminal_log` - Read specific terminal logs
+#### Log Tools
+- `mcp__loom__tail_daemon_log` - Read daemon logs
+- `mcp__loom__tail_tauri_log` - Read Tauri app logs
+- `mcp__loom__list_terminal_logs` - List terminal log files
+- `mcp__loom__tail_terminal_log` - Read specific terminal logs
 
-#### Terminals Server (`mcp-loom-terminals`)
-- `mcp__loom-terminals__list_terminals` - List all terminals
-- `mcp__loom-terminals__get_selected_terminal` - Get primary terminal info
-- `mcp__loom-terminals__get_terminal_output` - Read terminal output
-- `mcp__loom-terminals__send_terminal_input` - Send input to terminal
+#### Terminal Tools
+- `mcp__loom__list_terminals` - List all terminals
+- `mcp__loom__get_selected_terminal` - Get primary terminal info
+- `mcp__loom__get_terminal_output` - Read terminal output
+- `mcp__loom__send_terminal_input` - Send input to terminal
 
 See [MCP Documentation](../mcp/README.md) for full API reference.
 

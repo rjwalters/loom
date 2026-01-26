@@ -187,9 +187,9 @@ fn test_terminal_create() {
 **4. Use MCP (Model Context Protocol) to expose logs and state:**
 ```bash
 # Agent can now programmatically check state
-mcp__loom-ui__read_console_log({ lines: 100 })
-mcp__loom-terminals__list_terminals()
-mcp__loom-logs__read_daemon_log()
+mcp__loom__read_console_log({ lines: 100 })
+mcp__loom__list_terminals()
+mcp__loom__read_daemon_log()
 ```
 
 **When Claude writes the code and can read its own instrumentation:**

@@ -330,7 +330,7 @@ The implementation is complete and ready for testing when the app crash is resol
 1. **Build fresh app**: `pnpm run build && pnpm tauri build --debug --bundles app`
 2. **Start daemon**: `RUST_LOG=info pnpm run daemon:headless`
 3. **Launch app**: `./target/debug/bundle/macos/Loom.app/Contents/MacOS/app --workspace $(pwd)`
-4. **Trigger factory reset**: Use UI or MCP command `mcp__loom-ui__trigger_force_factory_reset`
+4. **Trigger factory reset**: Use UI or MCP command `mcp__loom__trigger_force_factory_reset`
 5. **Verify worktrees created**: `ls -la .loom/worktrees/` should show `terminal-1/` through `terminal-5/`
 6. **Verify role content**: Each `terminal-N/CLAUDE.md` should contain the correct role instructions:
    ```bash
@@ -399,7 +399,7 @@ The implementation is complete and ready for testing when the app crash is resol
 **Code Ready**: Implementation complete and manually tested. Ready for integration testing in live Tauri app.
 
 ## Notes
-- Factory reset was triggered via `mcp__loom-ui__trigger_force_factory_reset`
+- Factory reset was triggered via `mcp__loom__trigger_force_factory_reset`
 - We updated defaults/config.json with new 5-agent team before factory reset
 - App is running at ~/GitHub/loom workspace
 - Workspace hash for this repo: `y69pbe`

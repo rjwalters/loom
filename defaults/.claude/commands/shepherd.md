@@ -116,15 +116,15 @@ Loom uses MCP to control terminals:
 
 ```bash
 # Restart terminal for fresh context
-mcp__loom-terminals__restart_terminal --terminal_id terminal-2
+mcp__loom__restart_terminal --terminal_id terminal-2
 
 # Configure phase-specific prompt
-mcp__loom-terminals__configure_terminal \
+mcp__loom__configure_terminal \
   --terminal_id terminal-2 \
   --interval_prompt "Curate issue #123"
 
 # Trigger immediate execution
-mcp__loom-ui__trigger_run_now --terminalId terminal-2
+mcp__loom__trigger_run_now --terminalId terminal-2
 ```
 
 ## State Persistence

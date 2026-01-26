@@ -494,13 +494,13 @@ Loom supports command-line arguments for headless automation and remote developm
 
 The app will validate the workspace path and automatically load the configuration from `.loom/config.json` if it exists.
 
-### MCP Servers for Testing and Automation
+### MCP Server for Testing and Automation
 
-Loom provides three Model Context Protocol (MCP) servers that enable AI agents like Claude Code to interact with the application programmatically:
+Loom provides a unified MCP (Model Context Protocol) server (`mcp-loom`) that enables AI agents like Claude Code to interact with the application programmatically:
 
-- **[mcp-loom-ui](docs/mcp/loom-ui.md)** - Interact with UI, console logs, and workspace state
-- **[mcp-loom-logs](docs/mcp/loom-logs.md)** - Access daemon, Tauri, and terminal logs
-- **[mcp-loom-terminals](docs/mcp/loom-terminals.md)** - Control terminals via daemon IPC
+- **[Log Tools](docs/mcp/loom-logs.md)** - Access daemon, Tauri, and terminal logs
+- **[UI Tools](docs/mcp/loom-ui.md)** - Interact with UI, console logs, and workspace state
+- **[Terminal Tools](docs/mcp/loom-terminals.md)** - Control terminals via daemon IPC
 
 **Use Cases**:
 - Testing factory reset and agent launches
@@ -510,13 +510,13 @@ Loom provides three Model Context Protocol (MCP) servers that enable AI agents l
 
 **Quick Start**:
 ```bash
-# Build MCP servers
-pnpm build
+# Build MCP server
+cd mcp-loom && npm run build && cd ..
 
 # Configure in .mcp.json (already included)
 # Use from Claude Code:
-mcp__loom-ui__read_console_log({ lines: 100 })
-mcp__loom-terminals__list_terminals()
+mcp__loom__read_console_log({ lines: 100 })
+mcp__loom__list_terminals()
 ```
 
 **Full documentation**: [docs/mcp/README.md](docs/mcp/README.md)

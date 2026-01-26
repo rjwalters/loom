@@ -41,16 +41,16 @@ cargo test --test integration_basic   # Run specific test file
 
 ## MCP Testing and Instrumentation
 
-**Location**: `mcp-loom-ui/`, `mcp-loom-logs/`, `mcp-loom-terminals/`, `.mcp.json`
+**Location**: `mcp-loom/`, `.mcp.json`
 
-Loom provides three MCP (Model Context Protocol) servers that enable AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
+Loom provides a unified MCP (Model Context Protocol) server that enables AI agents (including Claude Code) to inspect and interact with the running app for testing and debugging.
 
-**📖 Full API Documentation**: [docs/mcp/README.md](../mcp/README.md)
+**Full API Documentation**: [docs/mcp/README.md](../mcp/README.md)
 
-**Available Servers**:
-- **[mcp-loom-ui](../mcp/loom-ui.md)** - UI interaction, console logs, workspace state (7 tools)
-- **[mcp-loom-logs](../mcp/loom-logs.md)** - Daemon, Tauri, and terminal logs (4 tools)
-- **[mcp-loom-terminals](../mcp/loom-terminals.md)** - Terminal management and IPC (4 tools)
+**Tool Categories**:
+- **[Log Tools](../mcp/loom-logs.md)** - Daemon, Tauri, and terminal logs (4 tools)
+- **[UI Tools](../mcp/loom-ui.md)** - UI interaction, console logs, workspace state (13 tools)
+- **[Terminal Tools](../mcp/loom-terminals.md)** - Terminal management and IPC (17 tools)
 
 ### Console Logging to File
 
@@ -79,12 +79,12 @@ console.log = (...args: unknown[]) => {
 - Debug output visible without watching DevTools in real-time
 - Full visibility into factory reset and agent launch processes
 
-### MCP Loom UI Server
+### MCP Loom Server
 
-**Package**: `mcp-loom-ui/`
+**Package**: `mcp-loom/`
 **Configuration**: `.mcp.json`
 
-MCP server providing tools for Claude Code to interact with Loom's state and logs:
+Unified MCP server providing tools for Claude Code to interact with Loom's state and logs:
 
 **Available Tools**:
 
@@ -144,13 +144,13 @@ mcp__loom__read_console_log
 mcp__loom__read_state_file
 
 # Check terminal configuration
-mcp__loom-ui__read_config_file
+mcp__loom__read_config_file
 
 # Start engine with existing config (bypasses confirmation for MCP automation)
-mcp__loom-ui__trigger_force_start
+mcp__loom__trigger_force_start
 
 # Reset workspace to defaults (requires separate start command after)
-mcp__loom-ui__trigger_factory_reset
+mcp__loom__trigger_factory_reset
 ```
 
 ### Testing Workspace Start with MCP
@@ -161,12 +161,12 @@ mcp__loom-ui__trigger_factory_reset
 
 1. **Start Engine** (use force_start for MCP automation):
    ```bash
-   mcp__loom-ui__trigger_force_start
+   mcp__loom__trigger_force_start
    ```
 
 2. **Monitor Console Logs**:
    ```bash
-   mcp__loom-ui__read_console_log
+   mcp__loom__read_console_log
    ```
    Look for:
    - `[start-workspace] Killing all loom tmux sessions`
@@ -176,7 +176,7 @@ mcp__loom-ui__trigger_factory_reset
 
 3. **Verify State**:
    ```bash
-   mcp__loom-ui__read_state_file
+   mcp__loom__read_state_file
    ```
    Confirm 7 terminals exist with correct session IDs (no worktree paths yet)
 
@@ -203,10 +203,10 @@ To reset configuration AND start the engine:
 
 ```bash
 # Step 1: Reset config to defaults (does NOT auto-start)
-mcp__loom-ui__trigger_factory_reset
+mcp__loom__trigger_factory_reset
 
 # Step 2: Start engine with reset config
-mcp__loom-ui__trigger_force_start
+mcp__loom__trigger_force_start
 ```
 
 ### Debugging Common Issues
