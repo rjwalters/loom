@@ -227,7 +227,18 @@ spawn_agent() {
     tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "cd '$REPO_ROOT'" C-m
 
     # Build claude command
-    local claude_cmd="claude"
+    # Use claude-wrapper.sh if it exists for resilience, otherwise use claude directly
+    local claude_cmd
+    local wrapper_script="$REPO_ROOT/.loom/scripts/claude-wrapper.sh"
+
+    if [[ -x "$wrapper_script" ]]; then
+        # Use resilient wrapper with environment variables for stop signal detection
+        claude_cmd="LOOM_TERMINAL_ID='$terminal_id' LOOM_WORKSPACE='$REPO_ROOT' '$wrapper_script'"
+    else
+        # Fallback to bare claude if wrapper not found
+        claude_cmd="claude"
+        echo -e "    ${YELLOW}Warning: claude-wrapper.sh not found, using claude directly (no retry logic)${NC}"
+    fi
 
     # Add role if specified
     if [[ -n "$role_file" && "$role_file" != "null" ]]; then
@@ -236,7 +247,7 @@ spawn_agent() {
         if [[ -f "$role_path" ]]; then
             # Use the skill system with /<role> command
             local role_name="${role_file%.md}"
-            claude_cmd="claude -p '/$role_name'"
+            claude_cmd="$claude_cmd -p '/$role_name'"
         else
             echo -e "    ${YELLOW}Warning: Role file not found: $role_file${NC}"
         fi
