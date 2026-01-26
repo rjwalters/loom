@@ -314,8 +314,8 @@ For each phase, the shepherd spawns a Task subagent:
 ### Phase-Specific Direct Execution
 
 Each phase uses an appropriate model based on task complexity:
-- **sonnet**: Curator (structured enhancement), Judge (systematic review)
-- **opus**: Builder (complex implementation), Doctor (nuanced fixes)
+- **sonnet**: Curator (structured enhancement), Doctor (targeted PR fixes)
+- **opus**: Builder (complex implementation), Judge (thorough code review)
 
 **Curator Phase (Task Subagent):**
 ```python
