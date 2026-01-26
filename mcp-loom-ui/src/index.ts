@@ -471,6 +471,204 @@ async function getRandomFile(options?: {
   }
 }
 
+/**
+ * Get health metrics from the health monitoring system
+ */
+async function getHealthMetrics(): Promise<string> {
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+    const healthMetricsPath = join(workspacePath, ".loom", "health-metrics.json");
+
+    await access(healthMetricsPath);
+    const content = await readFile(healthMetricsPath, "utf-8");
+    const metrics = JSON.parse(content);
+
+    // Return a summary with the most recent metrics
+    const latestMetric = metrics.metrics?.[metrics.metrics.length - 1] || null;
+
+    return JSON.stringify(
+      {
+        health_score: metrics.health_score,
+        health_status: metrics.health_status,
+        last_updated: metrics.last_updated,
+        metric_count: metrics.metrics?.length || 0,
+        retention_hours: metrics.retention_hours,
+        latest_metrics: latestMetric,
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return JSON.stringify(
+        {
+          error: "Health metrics file not found. Run health-check.sh --collect to initialize.",
+          health_score: null,
+          health_status: "unknown",
+        },
+        null,
+        2
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get health metrics history for trend analysis
+ */
+async function getHealthHistory(hours = 1): Promise<string> {
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+    const healthMetricsPath = join(workspacePath, ".loom", "health-metrics.json");
+
+    await access(healthMetricsPath);
+    const content = await readFile(healthMetricsPath, "utf-8");
+    const metrics = JSON.parse(content);
+
+    // Filter metrics to requested time range
+    const cutoffTime = new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const filteredMetrics = (metrics.metrics || []).filter(
+      (m: { timestamp: string }) => m.timestamp > cutoffTime
+    );
+
+    return JSON.stringify(
+      {
+        hours_requested: hours,
+        metric_count: filteredMetrics.length,
+        metrics: filteredMetrics,
+        current_score: metrics.health_score,
+        current_status: metrics.health_status,
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return JSON.stringify(
+        {
+          error: "Health metrics file not found",
+          metrics: [],
+        },
+        null,
+        2
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Get active (unacknowledged) alerts
+ */
+async function getActiveAlerts(): Promise<string> {
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+    const alertsPath = join(workspacePath, ".loom", "alerts.json");
+
+    await access(alertsPath);
+    const content = await readFile(alertsPath, "utf-8");
+    const alertsData = JSON.parse(content);
+
+    // Filter to unacknowledged alerts
+    const activeAlerts = (alertsData.alerts || []).filter(
+      (a: { acknowledged: boolean }) => !a.acknowledged
+    );
+
+    return JSON.stringify(
+      {
+        active_count: activeAlerts.length,
+        total_count: alertsData.alerts?.length || 0,
+        alerts: activeAlerts,
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return JSON.stringify(
+        {
+          active_count: 0,
+          total_count: 0,
+          alerts: [],
+          message: "No alerts file found",
+        },
+        null,
+        2
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * Acknowledge an alert by ID
+ */
+async function acknowledgeAlert(alertId: string): Promise<string> {
+  const { writeFile } = await import("node:fs/promises");
+
+  try {
+    const workspacePath = process.env.LOOM_WORKSPACE || join(homedir(), "GitHub", "loom");
+    const alertsPath = join(workspacePath, ".loom", "alerts.json");
+
+    await access(alertsPath);
+    const content = await readFile(alertsPath, "utf-8");
+    const alertsData = JSON.parse(content);
+
+    // Find and acknowledge the alert
+    let found = false;
+    const updatedAlerts = (alertsData.alerts || []).map(
+      (alert: { id: string; acknowledged: boolean; acknowledged_at?: string }) => {
+        if (alert.id === alertId) {
+          found = true;
+          return {
+            ...alert,
+            acknowledged: true,
+            acknowledged_at: new Date().toISOString(),
+          };
+        }
+        return alert;
+      }
+    );
+
+    if (!found) {
+      return JSON.stringify(
+        {
+          success: false,
+          error: `Alert not found: ${alertId}`,
+        },
+        null,
+        2
+      );
+    }
+
+    // Write updated alerts back
+    alertsData.alerts = updatedAlerts;
+    await writeFile(alertsPath, JSON.stringify(alertsData, null, 2));
+
+    return JSON.stringify(
+      {
+        success: true,
+        message: `Alert ${alertId} acknowledged`,
+      },
+      null,
+      2
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return JSON.stringify(
+        {
+          success: false,
+          error: "Alerts file not found",
+        },
+        null,
+        2
+      );
+    }
+    throw error;
+  }
+}
+
 // Create server instance
 const server = new Server(
   {
@@ -635,6 +833,54 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 "Optional glob patterns to exclude in addition to defaults (node_modules, .git, dist, etc.)",
             },
           },
+        },
+      },
+      {
+        name: "get_health_metrics",
+        description:
+          "Get health metrics for the Loom daemon including health score (0-100), status (excellent/good/fair/warning/critical), and latest metric readings. Use this to monitor system health and detect degradation patterns.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "get_health_history",
+        description:
+          "Get historical health metrics for trend analysis. Returns metrics collected over the specified time period. Useful for identifying degradation patterns and throughput trends.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            hours: {
+              type: "number",
+              description: "Number of hours of history to retrieve (default: 1)",
+              default: 1,
+            },
+          },
+        },
+      },
+      {
+        name: "get_active_alerts",
+        description:
+          "Get active (unacknowledged) alerts from the health monitoring system. Returns alerts for stuck agents, high error rates, resource exhaustion, and queue growth.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "acknowledge_alert",
+        description:
+          "Acknowledge an alert by its ID. Acknowledged alerts will no longer appear in the active alerts list but are retained for history.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            alertId: {
+              type: "string",
+              description: "The ID of the alert to acknowledge (e.g., 'alert-stuck-1234567890')",
+            },
+          },
+          required: ["alertId"],
         },
       },
     ],
@@ -809,6 +1055,59 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: "text",
               text: randomFile,
+            },
+          ],
+        };
+      }
+
+      case "get_health_metrics": {
+        const healthMetrics = await getHealthMetrics();
+        return {
+          content: [
+            {
+              type: "text",
+              text: healthMetrics,
+            },
+          ],
+        };
+      }
+
+      case "get_health_history": {
+        const hours = (args?.hours as number) || 1;
+        const healthHistory = await getHealthHistory(hours);
+        return {
+          content: [
+            {
+              type: "text",
+              text: healthHistory,
+            },
+          ],
+        };
+      }
+
+      case "get_active_alerts": {
+        const activeAlerts = await getActiveAlerts();
+        return {
+          content: [
+            {
+              type: "text",
+              text: activeAlerts,
+            },
+          ],
+        };
+      }
+
+      case "acknowledge_alert": {
+        const alertId = args?.alertId as string;
+        if (!alertId) {
+          throw new Error("alertId parameter is required");
+        }
+        const result = await acknowledgeAlert(alertId);
+        return {
+          content: [
+            {
+              type: "text",
+              text: result,
             },
           ],
         };
