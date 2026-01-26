@@ -502,7 +502,7 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
 
 ```python
 def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False, demand_spawned=None):
-    """Automatically keep Guide, Champion, Doctor, and Auditor running."""
+    """Automatically keep Guide, Champion, Doctor, Auditor, and Judge running."""
 
     if demand_spawned is None:
         demand_spawned = {"champion": False, "doctor": False, "judge": False}
