@@ -228,6 +228,62 @@ fi
 
 ---
 
+### Edge Case 14: Follow-on Issue Creation
+
+**Scenario**: Merged PR contains TODOs, FIXMEs, deferred scope sections, or review comments suggesting future work.
+
+**Handling**:
+```bash
+# After merge, scan for follow-on indicators
+# Stage 1: Extract TODO/FIXME from diff with file:line attribution
+TODOS=$(gh pr diff "$PR_NUMBER" | awk '...')  # See champion-pr-merge.md
+
+# Stage 2: Parse PR body for follow-on sections
+FOLLOWON=$(echo "$PR_BODY" | sed -n '/^## Follow-on/,/^## /p')
+
+# Stage 3: Parse review comments for deferred suggestions
+NOTES=$(gh api repos/.../pulls/$PR_NUMBER/comments --jq '...')
+
+# Stage 4: Apply threshold logic
+# - 1+ critical (FIXME/HACK/XXX) -> always create
+# - Explicit follow-on section -> always create
+# - 3+ TODOs -> create consolidated
+# - Otherwise -> skip (too noisy)
+
+# Stage 5: Duplicate detection
+EXISTING=$(gh issue list --search "Follow-on from PR #$PR_NUMBER")
+
+# Stage 6: Create issue with proper linking
+gh issue create --title "Follow-on: Work identified in PR #$PR_NUMBER" --label "$LABEL"
+```
+
+**Decision**: **Create follow-on issue if thresholds met** - captures future work.
+
+**Rationale**: Prevents valuable context about follow-on work from being lost when PRs merge. TODOs in code, deferred scope items, and review suggestions become trackable issues.
+
+**Threshold Logic**:
+
+| Indicator | Threshold | Action |
+|-----------|-----------|--------|
+| Critical patterns (FIXME, HACK, XXX) | 1+ | Always create |
+| Explicit follow-on section | Any | Always create |
+| Standard TODOs | 3+ | Create consolidated |
+| Below threshold | < 3 TODOs, no sections | Skip |
+
+**Force Mode Behavior**:
+- Normal mode: Create with `loom:curated` label (goes to Champion evaluation)
+- Force mode: Create with `loom:issue` label (goes directly to Builder queue)
+
+**Edge Cases Within Follow-on**:
+
+1. **PR with no original issue**: Use PR title instead of issue title for context
+2. **TODO without colon**: Pattern requires `TODO:` not just `TODO` to avoid false positives
+3. **Multi-line TODOs**: Only first line captured, truncated at 200 chars
+4. **Duplicate follow-on issue exists**: Search before creation, skip if found
+5. **Force mode with no daemon state file**: Fall back to `loom:curated` label
+
+---
+
 ## Summary: Edge Case Decision Matrix
 
 | Edge Case | Decision | Action |
@@ -245,6 +301,7 @@ fi
 | Exactly 200 lines | Allow | Limit is inclusive |
 | API rate limit | Error | Comment and continue |
 | Multiple approvals | Allow | Label is source of truth |
+| Follow-on indicators found | Create | If thresholds met |
 
 ---
 

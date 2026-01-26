@@ -434,6 +434,267 @@ All dependencies are now resolved. This issue is ready for implementation.
 done
 ```
 
+### Step 5.5: Create Follow-on Issues
+
+After unblocking dependent issues, scan the merged PR for follow-on work indicators and create consolidated issues.
+
+```bash
+PR_NUMBER=$1
+ORIGINAL_ISSUE=$2  # The issue this PR closed (may be empty)
+
+echo "Scanning PR #$PR_NUMBER for follow-on work indicators..."
+
+# Check force mode for label selection
+FORCE_MODE=$(cat .loom/daemon-state.json 2>/dev/null | jq -r '.force_mode // false')
+
+# ============================================
+# Stage 1: Extract TODO/FIXME from Diff
+# ============================================
+
+# Get PR diff and extract added lines with TODO patterns
+# Parse unified diff to get file:line attribution
+TODOS_RAW=$(gh pr diff "$PR_NUMBER" 2>/dev/null | awk '
+  /^diff --git/ {
+    # Extract filename from diff header
+    split($0, a, " b/")
+    current_file = a[2]
+  }
+  /^@@/ {
+    # Parse hunk header for line number: @@ -old,count +new,count @@
+    match($0, /\+([0-9]+)/, arr)
+    line_num = arr[1]
+    in_hunk = 1
+  }
+  in_hunk && /^\+[^+]/ {
+    # Added line (not the +++ header)
+    if (/\b(TODO|FIXME|HACK|XXX|FUTURE):/) {
+      # Extract the comment text after the pattern
+      line = $0
+      sub(/^\+/, "", line)
+      gsub(/^[ \t]*/, "", line)
+      # Truncate to 200 chars
+      if (length(line) > 200) line = substr(line, 1, 197) "..."
+      print current_file ":" line_num ":" line
+    }
+    line_num++
+  }
+  in_hunk && !/^[+ -@]/ { in_hunk = 0 }
+' | head -20)
+
+# Categorize TODOs by severity
+CRITICAL_TODOS=""
+STANDARD_TODOS=""
+CRITICAL_COUNT=0
+STANDARD_COUNT=0
+
+while IFS= read -r todo_line; do
+  [ -z "$todo_line" ] && continue
+  if echo "$todo_line" | grep -qE '\b(FIXME|HACK|XXX):'; then
+    CRITICAL_TODOS="${CRITICAL_TODOS}${todo_line}"$'\n'
+    CRITICAL_COUNT=$((CRITICAL_COUNT + 1))
+  else
+    STANDARD_TODOS="${STANDARD_TODOS}${todo_line}"$'\n'
+    STANDARD_COUNT=$((STANDARD_COUNT + 1))
+  fi
+done <<< "$TODOS_RAW"
+
+TOTAL_TODOS=$((CRITICAL_COUNT + STANDARD_COUNT))
+echo "Found $TOTAL_TODOS TODOs ($CRITICAL_COUNT critical, $STANDARD_COUNT standard)"
+
+# ============================================
+# Stage 2: Parse PR Body Sections
+# ============================================
+
+PR_BODY=$(gh pr view "$PR_NUMBER" --json body --jq -r '.body // ""')
+
+# Extract follow-on sections (case-insensitive matching)
+FOLLOWON_SECTION=""
+for section_name in "Follow-on Work" "Follow-on" "Out of Scope" "Future Work" "Deferred" "Phase 2" "Phase II"; do
+  # Match section header and capture content until next ## or end
+  extracted=$(echo "$PR_BODY" | sed -n "/^## *${section_name}/I,/^## /p" | sed '1d;$d' | head -20)
+  if [ -n "$extracted" ]; then
+    FOLLOWON_SECTION="${FOLLOWON_SECTION}### ${section_name}"$'\n'"${extracted}"$'\n\n'
+  fi
+done
+
+HAS_FOLLOWON_SECTION=false
+[ -n "$FOLLOWON_SECTION" ] && HAS_FOLLOWON_SECTION=true
+echo "Has explicit follow-on section: $HAS_FOLLOWON_SECTION"
+
+# ============================================
+# Stage 3: Parse Review Comments
+# ============================================
+
+# Get review comments containing deferred work indicators
+REVIEW_NOTES=$(gh api "repos/{owner}/{repo}/pulls/$PR_NUMBER/comments" --jq '
+  .[] |
+  select(.body | test("not blocking|consider for future|technical debt|would be nice|future enhancement|could be improved"; "i")) |
+  "- \(.body | split("\n")[0] | .[0:200])"
+' 2>/dev/null | head -10)
+
+HAS_REVIEW_NOTES=false
+[ -n "$REVIEW_NOTES" ] && HAS_REVIEW_NOTES=true
+echo "Has deferred review notes: $HAS_REVIEW_NOTES"
+
+# ============================================
+# Stage 4: Apply Threshold Logic
+# ============================================
+
+SHOULD_CREATE_ISSUE=false
+
+# Always create if:
+# - 1+ critical patterns (FIXME, HACK, XXX)
+# - Explicit follow-on section in PR
+# - 3+ TODOs total
+
+if [ "$CRITICAL_COUNT" -gt 0 ]; then
+  SHOULD_CREATE_ISSUE=true
+  echo "Creating issue: found $CRITICAL_COUNT critical TODOs"
+elif [ "$HAS_FOLLOWON_SECTION" = true ]; then
+  SHOULD_CREATE_ISSUE=true
+  echo "Creating issue: found explicit follow-on section"
+elif [ "$TOTAL_TODOS" -ge 3 ]; then
+  SHOULD_CREATE_ISSUE=true
+  echo "Creating issue: found $TOTAL_TODOS TODOs (>= 3 threshold)"
+fi
+
+if [ "$SHOULD_CREATE_ISSUE" = false ]; then
+  echo "No follow-on issue needed (below threshold)"
+  exit 0
+fi
+
+# ============================================
+# Stage 5: Duplicate Detection
+# ============================================
+
+# Search for existing follow-on issues from this PR
+EXISTING_ISSUE=$(gh issue list --state open --search "Follow-on from PR #$PR_NUMBER" --json number --jq '.[0].number // empty')
+
+if [ -n "$EXISTING_ISSUE" ]; then
+  echo "Follow-on issue already exists: #$EXISTING_ISSUE - skipping creation"
+  exit 0
+fi
+
+# ============================================
+# Stage 6: Create Follow-on Issue
+# ============================================
+
+# Get original issue title if available
+if [ -n "$ORIGINAL_ISSUE" ]; then
+  ORIGINAL_TITLE=$(gh issue view "$ORIGINAL_ISSUE" --json title --jq -r '.title' 2>/dev/null || echo "")
+  PARENT_REF="Follow-on from PR #$PR_NUMBER which closed #$ORIGINAL_ISSUE"
+  CONTEXT_LINE="**$ORIGINAL_TITLE** was implemented in PR #$PR_NUMBER."
+else
+  PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq -r '.title')
+  PARENT_REF="Follow-on from PR #$PR_NUMBER"
+  CONTEXT_LINE="**$PR_TITLE** was merged in PR #$PR_NUMBER."
+fi
+
+# Build issue body
+ISSUE_BODY="## Parent PR
+
+$PARENT_REF
+
+## Context
+
+$CONTEXT_LINE During implementation/review, the following follow-on work was identified:
+
+"
+
+# Add Code TODOs section if present
+if [ -n "$TODOS_RAW" ]; then
+  ISSUE_BODY="${ISSUE_BODY}## Code TODOs
+
+"
+  # Format each TODO as a checkbox item
+  while IFS= read -r todo_line; do
+    [ -z "$todo_line" ] && continue
+    file_line=$(echo "$todo_line" | cut -d: -f1-2)
+    comment=$(echo "$todo_line" | cut -d: -f3-)
+    ISSUE_BODY="${ISSUE_BODY}- [ ] \`$file_line\` - $comment
+"
+  done <<< "$TODOS_RAW"
+  ISSUE_BODY="${ISSUE_BODY}
+"
+fi
+
+# Add Follow-on sections if present
+if [ -n "$FOLLOWON_SECTION" ]; then
+  ISSUE_BODY="${ISSUE_BODY}## Deferred Scope
+
+$FOLLOWON_SECTION"
+fi
+
+# Add Review Notes if present
+if [ -n "$REVIEW_NOTES" ]; then
+  ISSUE_BODY="${ISSUE_BODY}## Review Notes
+
+$REVIEW_NOTES
+
+"
+fi
+
+# Add acceptance criteria
+ISSUE_BODY="${ISSUE_BODY}## Acceptance Criteria
+
+- [ ] All identified TODOs addressed or converted to separate issues
+- [ ] Deferred scope items implemented or explicitly deferred again
+- [ ] Review suggestions addressed
+
+---
+*Auto-generated by Champion from PR #$PR_NUMBER*"
+
+# Select label based on force mode
+if [ "$FORCE_MODE" = "true" ]; then
+  ISSUE_LABEL="loom:issue"
+  FORCE_MARKER="[force-mode] "
+else
+  ISSUE_LABEL="loom:curated"
+  FORCE_MARKER=""
+fi
+
+# Create the issue
+ISSUE_TITLE="${FORCE_MARKER}Follow-on: Work identified in PR #$PR_NUMBER"
+NEW_ISSUE=$(gh issue create \
+  --title "$ISSUE_TITLE" \
+  --body "$ISSUE_BODY" \
+  --label "$ISSUE_LABEL" \
+  --json number --jq '.number')
+
+if [ -n "$NEW_ISSUE" ]; then
+  echo "Created follow-on issue #$NEW_ISSUE with label $ISSUE_LABEL"
+
+  # Add comment to original PR linking to the follow-on issue
+  gh pr comment "$PR_NUMBER" --body "**Champion: Follow-on Issue Created**
+
+Identified follow-on work during merge:
+- **TODOs**: $TOTAL_TODOS ($CRITICAL_COUNT critical)
+- **Deferred sections**: $HAS_FOLLOWON_SECTION
+- **Review notes**: $HAS_REVIEW_NOTES
+
+Created issue #$NEW_ISSUE to track this work.
+
+---
+*Automated by Champion role*"
+else
+  echo "Failed to create follow-on issue"
+fi
+```
+
+**Threshold Logic Summary**:
+
+| Indicator | Threshold | Action |
+|-----------|-----------|--------|
+| Critical patterns (FIXME, HACK, XXX) | 1+ | Always create |
+| Explicit follow-on section | Any | Always create |
+| Standard TODOs | 3+ | Create consolidated |
+| TODOs with review notes | < 3 TODOs, has notes | Skip (too noisy) |
+| Minimal indicators | < 3 TODOs, no sections | Skip |
+
+**Force Mode Behavior**:
+- Normal mode: Create with `loom:curated` (goes to Champion evaluation queue)
+- Force mode: Create with `loom:issue` (goes directly to Builder queue)
+
 ---
 
 ## PR Rejection Workflow
