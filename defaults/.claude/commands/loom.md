@@ -197,6 +197,8 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
 
 Task subagents receive their prompts as plain text. They must be explicitly instructed to invoke the Skill tool. The prompts in this file use `Skill(skill="...")` notation which the subagent should interpret as a tool call.
 
+**Why Skill tool matters:** Using the Skill tool ensures shepherds run their full lifecycle (Curator -> Builder -> Judge -> Doctor -> Merge). Explicit step-by-step instructions cause shepherds to stop after PR creation, bypassing the Judge phase and leaving PRs stuck at `loom:review-requested`. See "Step 4 Detail: Auto-Spawn Shepherds" below for the correct spawn pattern.
+
 ### Task Spawn Verification
 
 After spawning a Task subagent, you MUST verify the task actually started before recording its task_id in daemon-state.json. This prevents recording invalid task IDs that would cause spurious "completed" detections.
@@ -1202,6 +1204,34 @@ return f"ready={len(ready_issues)} building={len(building_issues)} ..."
 ```
 
 ### Step 4 Detail: Auto-Spawn Shepherds
+
+> **WARNING: Shepherds MUST be invoked via Skill tool for full lifecycle**
+>
+> When spawning shepherds, you must use the Skill tool invocation pattern shown below.
+>
+> **DO NOT** give shepherds explicit step-by-step instructions like:
+> ```python
+> # WRONG - Bypasses Judge phase
+> Task(
+>   prompt="""1. Claim issue
+>   2. Implement feature
+>   3. Create PR
+>   4. Stop"""
+> )
+> ```
+>
+> **Why this fails:** Explicit instructions cause shepherds to stop after PR creation, bypassing the Judge review phase and leaving PRs stuck at `loom:review-requested`.
+>
+> **DO** use the Skill tool pattern:
+> ```python
+> # CORRECT - Full lifecycle
+> Task(
+>   prompt="""Skill(skill="shepherd", args="123 --force-pr")"""
+> )
+> ```
+>
+> **Why this works:** The Skill tool ensures the shepherd follows the complete workflow defined in `shepherd.md`:
+> `Curator -> Builder -> Judge -> Doctor (if needed) -> Merge`
 
 ```python
 def auto_spawn_shepherds(debug_mode=False):
