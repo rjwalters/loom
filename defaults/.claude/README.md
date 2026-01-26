@@ -186,10 +186,12 @@ The Loom Shepherd (or daemon) can spawn subagents for each phase:
 
 ```python
 # Spawn builder subagent with fresh context
+# Note: subagent_type is always "general-purpose" - role selection
+# happens via the slash command in the prompt (e.g., "/builder 123")
 result = Task(
     description="Builder phase for issue #123",
     prompt="/builder 123",
-    subagent_type="loom-builder",
+    subagent_type="general-purpose",
     run_in_background=False
 )
 ```
@@ -205,7 +207,7 @@ result = Task(
 | Feature | Slash Commands | Subagents |
 |---------|----------------|-----------|
 | Context | Shared with main conversation | Isolated, fresh context |
-| Invocation | `/builder 123` | `Task(subagent_type="loom-builder")` |
+| Invocation | `/builder 123` | `Task(subagent_type="general-purpose", prompt="/builder 123")` |
 | Use case | Manual orchestration | Automated orchestration |
 | Visibility | In main conversation | Spawned as separate task |
 
