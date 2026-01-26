@@ -478,6 +478,15 @@ cp "$LOOM_ROOT/scripts/cleanup-branches.sh" ".loom/scripts/cleanup-branches.sh" 
 chmod +x ".loom/scripts/cleanup.sh"
 chmod +x ".loom/scripts/cleanup-branches.sh"
 success "Installed cleanup scripts to .loom/scripts/"
+
+# Install Loom CLI wrapper (./loom)
+if [[ -f "$LOOM_ROOT/defaults/loom" ]]; then
+  info "Installing Loom CLI wrapper..."
+  cp "$LOOM_ROOT/defaults/loom" "./loom" || \
+    error "Failed to copy Loom CLI"
+  chmod +x "./loom"
+  success "Installed ./loom CLI"
+fi
 echo ""
 
 # ============================================================================
