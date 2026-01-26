@@ -76,9 +76,10 @@ The daemon uses a **subagent-per-iteration** architecture to prevent context acc
 │  4. Auto-promote proposals (force mode)    │
 │  5. Spawn shepherds (Task, background)     │
 │  6. Spawn work generation                  │
-│  7. Ensure support roles                   │
-│  8. Save state to JSON                     │
-│  9. Return 1-line summary                  │
+│  7. Demand-based support role spawning     │
+│  8. Interval-based support role spawning   │
+│  9. Save state to JSON                     │
+│  10. Return 1-line summary                 │
 └────────────────────────────────────────────┘
 ```
 
@@ -391,9 +392,15 @@ def loom_iterate(force_mode=False, debug_mode=False):
     if needs_work_gen and not triggered_generation["architect"] and not triggered_generation["hermit"]:
         debug(f"Work generation needed but not triggered: architect_cooldown_ok={architect_cooldown_ok}, hermit_cooldown_ok={hermit_cooldown_ok}")
 
-    # 8. CRITICAL: Act on recommended_actions: trigger support roles
+    # 7.5. Check workflow demand (demand-based spawning)
+    # This spawns roles immediately when work exists, before interval-based checks
+    # daemon-snapshot.sh emits spawn_champion_demand/spawn_doctor_demand when PRs await action
+    demand_spawned = check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode)
+
+    # 8. CRITICAL: Act on recommended_actions: trigger support roles (interval-based)
     # Uses trigger_guide, trigger_champion, trigger_doctor, trigger_auditor from snapshot
-    ensured_roles = auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode)
+    # Pass demand_spawned to skip interval-based checks for roles already spawned
+    ensured_roles = auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode, demand_spawned)
 
     # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
@@ -411,7 +418,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
     save_daemon_state(state)
 
     # 12. Return compact summary (ONE LINE)
-    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, ensured_roles, promoted_count, stuck_count, recovered_count)
+    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, ensured_roles, demand_spawned, promoted_count, stuck_count, recovered_count)
     debug(f"Iteration {iteration} completed - {summary}")
     return summary
 ```
@@ -432,8 +439,10 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `+architect` - Triggered Architect (if triggered)
 - `+hermit` - Triggered Hermit (if triggered)
 - `+guide` - Respawned Guide (if respawned)
-- `+champion` - Respawned Champion (if respawned)
-- `+doctor` - Respawned Doctor (if respawned)
+- `+champion` - Respawned Champion (if respawned, interval-based)
+- `+champion(demand)` - Spawned Champion on-demand (PRs ready to merge)
+- `+doctor` - Respawned Doctor (if respawned, interval-based)
+- `+doctor(demand)` - Spawned Doctor on-demand (PRs need fixes)
 - `+auditor` - Respawned Auditor (if respawned)
 - `promoted=N` - Proposals auto-promoted to loom:issue in force mode (if any)
 - `stuck=N` - Stuck agents detected (if any)
@@ -790,20 +799,54 @@ Complete one simplification analysis iteration.""",
 
 ### Support Role Management (Automatic)
 
-The daemon AUTOMATICALLY ensures Guide, Champion, Doctor, and Auditor keep running.
+The daemon AUTOMATICALLY ensures Guide, Champion, Doctor, and Auditor keep running using a **hybrid approach**:
 
-**CRITICAL**: The iteration MUST use the `trigger_*` recommended actions from `daemon-snapshot.sh`.
-The snapshot calculates when each support role needs respawning based on:
+1. **Demand-based spawning** (immediate response): Spawns Champion/Doctor when work awaits them
+2. **Interval-based spawning** (fallback): Respawns roles periodically to ensure they run
+
+**Demand-Based Spawning (Step 7.5)**
+
+The `daemon-snapshot.sh` script detects workflow demand:
+- `spawn_champion_demand`: PRs with `loom:pr` label and Champion not running
+- `spawn_doctor_demand`: PRs with `loom:changes-requested` label and Doctor not running
+
+This provides faster response times - roles spawn within 1-2 iterations when work exists.
+
+```python
+# Check for demand-based spawning first
+def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode):
+    """Spawn roles immediately when work awaits them."""
+    demand_spawned = {"champion": False, "doctor": False}
+
+    if "spawn_champion_demand" in recommended_actions:
+        pr_count = len(snapshot_data["prs"]["ready_to_merge"])
+        if trigger_support_role("champion", f"Champion (on-demand, {pr_count} PRs)", state, debug_mode):
+            demand_spawned["champion"] = True
+
+    if "spawn_doctor_demand" in recommended_actions:
+        pr_count = len(snapshot_data["prs"]["changes_requested"])
+        if trigger_support_role("doctor", f"Doctor (on-demand, {pr_count} PRs)", state, debug_mode):
+            demand_spawned["doctor"] = True
+
+    return demand_spawned
+```
+
+**Interval-Based Spawning (Step 8)**
+
+Uses `trigger_*` recommended actions from `daemon-snapshot.sh` which calculates:
 - `status != "running"` AND
 - `idle_time > ROLE_INTERVAL` OR `never_run_before`
 
+If a role was already demand-spawned this iteration, skip the interval-based check.
+
 ```python
 # This happens automatically every iteration - uses recommended_actions from snapshot
-def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode):
+def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode, demand_spawned):
     """Automatically keep Guide, Champion, Doctor, and Auditor running.
 
     Uses the trigger_* recommended actions from daemon-snapshot.sh which has
     already calculated idle times and determined which roles need respawning.
+    Skips interval-based spawn if role was already demand-spawned.
     """
     ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False}
 
@@ -811,10 +854,11 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
     if "trigger_guide" in recommended_actions:
         ensured_roles["guide"] = trigger_support_role("guide", "Guide backlog triage", state, debug_mode)
 
-    if "trigger_champion" in recommended_actions:
+    # Skip interval-based if demand-spawned
+    if not demand_spawned.get("champion") and "trigger_champion" in recommended_actions:
         ensured_roles["champion"] = trigger_support_role("champion", "Champion PR merge", state, debug_mode)
 
-    if "trigger_doctor" in recommended_actions:
+    if not demand_spawned.get("doctor") and "trigger_doctor" in recommended_actions:
         ensured_roles["doctor"] = trigger_support_role("doctor", "Doctor PR conflict resolution", state, debug_mode)
 
     if "trigger_auditor" in recommended_actions:
@@ -822,6 +866,12 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
 
     return ensured_roles
 ```
+
+**Why Hybrid Approach?**
+
+- **Demand-based**: Faster response when PRs await action (1-2 iterations vs 10+ minutes)
+- **Interval-based**: Ensures roles run periodically even if labels get stuck
+- **No duplicates**: Interval-based checks skip roles already spawned on-demand
 
 The `trigger_support_role()` helper spawns the role using the Task tool with Skill invocation,
 verifies the spawn succeeded, and records the task in daemon state. See "Step 6 Detail" for
@@ -1490,11 +1540,14 @@ The snapshot calculates when each support role needs respawning based on:
 - `idle_time > ROLE_INTERVAL` OR `never_run_before`
 
 ```python
-def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False):
-    """Automatically keep Guide, Champion, Doctor, and Auditor running.
+def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=False):
+    """Check for workflow demand and spawn roles immediately when work awaits them.
 
-    Uses the trigger_* recommended actions from daemon-snapshot.sh which has
-    already calculated idle times and determined which roles need respawning.
+    daemon-snapshot.sh emits spawn_champion_demand when PRs have loom:pr label and
+    Champion is not running. It emits spawn_doctor_demand when PRs have
+    loom:changes-requested label and Doctor is not running.
+
+    This provides faster response times than interval-based spawning.
 
     Args:
         state: Daemon state dict
@@ -1503,8 +1556,59 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
         debug_mode: Enable debug logging
 
     Returns:
+        Dict of {role_name: True/False} indicating which roles were demand-spawned
+    """
+
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    demand_spawned = {"champion": False, "doctor": False}
+
+    # Champion on-demand: PRs ready to merge
+    if "spawn_champion_demand" in recommended_actions:
+        prs_ready = snapshot_data.get("prs", {}).get("ready_to_merge", [])
+        pr_count = len(prs_ready)
+        debug(f"Champion demand detected: {pr_count} PRs ready to merge")
+
+        if trigger_support_role("champion", f"Champion (on-demand, {pr_count} PRs ready to merge)", state, debug_mode):
+            demand_spawned["champion"] = True
+            print(f"  AUTO-SPAWNED: Champion (on-demand, {pr_count} PRs ready to merge)")
+
+    # Doctor on-demand: PRs need fixes
+    if "spawn_doctor_demand" in recommended_actions:
+        prs_needing_fixes = snapshot_data.get("prs", {}).get("changes_requested", [])
+        pr_count = len(prs_needing_fixes)
+        debug(f"Doctor demand detected: {pr_count} PRs need fixes")
+
+        if trigger_support_role("doctor", f"Doctor (on-demand, {pr_count} PRs need fixes)", state, debug_mode):
+            demand_spawned["doctor"] = True
+            print(f"  AUTO-SPAWNED: Doctor (on-demand, {pr_count} PRs need fixes)")
+
+    return demand_spawned
+
+
+def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False, demand_spawned=None):
+    """Automatically keep Guide, Champion, Doctor, and Auditor running.
+
+    Uses the trigger_* recommended actions from daemon-snapshot.sh which has
+    already calculated idle times and determined which roles need respawning.
+
+    This is interval-based spawning. If demand_spawned indicates a role was
+    already spawned on-demand this iteration, skip the interval-based check.
+
+    Args:
+        state: Daemon state dict
+        snapshot_data: Output from daemon-snapshot.sh
+        recommended_actions: List of recommended actions from snapshot
+        debug_mode: Enable debug logging
+        demand_spawned: Dict of roles already spawned on-demand {"champion": bool, "doctor": bool}
+
+    Returns:
         Dict of {role_name: True/False} indicating which roles were triggered
     """
+    if demand_spawned is None:
+        demand_spawned = {"champion": False, "doctor": False}
 
     def debug(msg):
         if debug_mode:
@@ -1515,8 +1619,9 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
     # Extract support role status from snapshot for logging
     support_roles = snapshot_data.get("support_roles", {})
 
-    debug("Checking support roles via recommended_actions")
+    debug("Checking support roles via recommended_actions (interval-based)")
     debug(f"Recommended actions: {recommended_actions}")
+    debug(f"Demand-spawned: {demand_spawned}")
 
     # Guide - backlog triage
     guide_info = support_roles.get("guide", {})
@@ -1528,24 +1633,28 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
     if "trigger_guide" in recommended_actions:
         ensured_roles["guide"] = trigger_support_role("guide", "Guide backlog triage", state, debug_mode)
 
-    # Champion - PR merging
+    # Champion - PR merging (skip if demand-spawned this iteration)
     champion_info = support_roles.get("champion", {})
     champion_status = champion_info.get("status", "idle")
     champion_idle = champion_info.get("idle_seconds", 0)
 
     debug(f"Champion status: status={champion_status}, idle={champion_idle}s, needs_trigger={champion_info.get('needs_trigger', False)}")
 
-    if "trigger_champion" in recommended_actions:
+    if demand_spawned.get("champion", False):
+        debug("Champion: skipped interval-based (demand-spawned this iteration)")
+    elif "trigger_champion" in recommended_actions:
         ensured_roles["champion"] = trigger_support_role("champion", "Champion PR merge", state, debug_mode)
 
-    # Doctor - PR conflict resolution
+    # Doctor - PR conflict resolution (skip if demand-spawned this iteration)
     doctor_info = support_roles.get("doctor", {})
     doctor_status = doctor_info.get("status", "idle")
     doctor_idle = doctor_info.get("idle_seconds", 0)
 
     debug(f"Doctor status: status={doctor_status}, idle={doctor_idle}s, needs_trigger={doctor_info.get('needs_trigger', False)}")
 
-    if "trigger_doctor" in recommended_actions:
+    if demand_spawned.get("doctor", False):
+        debug("Doctor: skipped interval-based (demand-spawned this iteration)")
+    elif "trigger_doctor" in recommended_actions:
         ensured_roles["doctor"] = trigger_support_role("doctor", "Doctor PR conflict resolution", state, debug_mode)
 
     # Auditor - main branch validation
