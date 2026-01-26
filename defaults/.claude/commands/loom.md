@@ -332,6 +332,16 @@ def loom_iterate(force_mode=False, debug_mode=False):
     iteration = state.get("iteration", 0) + 1
     debug(f"Iteration {iteration} starting at {now()}")
 
+    # 1b. CRITICAL: Reconcile force_mode from argument and state
+    # The argument takes precedence (it's from the current invocation via daemon-loop.sh)
+    # This ensures force_mode works even if state file was corrupted or reset
+    effective_force_mode = force_mode or state.get("force_mode", False)
+    if effective_force_mode and not state.get("force_mode"):
+        # Update state to reflect force_mode from argument (resilience)
+        state["force_mode"] = True
+        debug("Force mode enabled via argument, updating state")
+    debug(f"Force mode: {effective_force_mode} (arg={force_mode}, state={state.get('force_mode', False)})")
+
     # 2. Check shutdown signal
     if exists(".loom/stop-daemon"):
         debug("Shutdown signal detected")
@@ -367,7 +377,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
     # 5. CRITICAL: Act on recommended_actions: promote_proposals (force mode only)
     # This auto-promotes architect/hermit/curated proposals to loom:issue in force mode
     promoted_count = 0
-    if "promote_proposals" in recommended_actions and state.get("force_mode", False):
+    if "promote_proposals" in recommended_actions and effective_force_mode:
         promotable = snapshot_data["computed"]["promotable_proposals"]
         debug(f"Auto-promoting {len(promotable)} proposals in force mode")
         promoted_count = auto_promote_proposals(promotable, state, debug_mode)
@@ -742,7 +752,8 @@ This {proposal_type} proposal has been automatically promoted to `loom:issue` by
 ```
 
 **Important notes:**
-- Only runs when `force_mode` is enabled in daemon state
+- Runs when `force_mode` is enabled (from `--force` argument OR state file)
+- The `--force` argument takes precedence and will update state if needed
 - Skips issues with `loom:blocked` label
 - Adds audit trail comment for transparency
 - Tracks promotions in `state["force_mode_auto_promotions"]` array
