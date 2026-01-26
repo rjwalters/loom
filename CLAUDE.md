@@ -518,6 +518,7 @@ See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 ```bash
 ./.loom/scripts/clean.sh --force        # Clean stale worktrees/branches
 ./.loom/scripts/stale-building-check.sh --recover  # Recover stuck issues
+./.loom/scripts/recover-orphaned-shepherds.sh --recover  # Recover orphaned shepherds after crash
 gh label sync --file .github/labels.yml  # Re-sync labels
 touch .loom/stop-daemon                  # Graceful daemon shutdown
 ```

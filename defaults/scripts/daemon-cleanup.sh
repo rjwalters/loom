@@ -321,6 +321,26 @@ handle_daemon_startup() {
   header "Daemon Startup Cleanup"
   echo ""
 
+  # ===================================================================
+  # ORPHANED SHEPHERD RECOVERY (Critical - run first)
+  # ===================================================================
+  # Detect and recover orphaned shepherds from crashed sessions.
+  # This must run before other cleanup to restore proper state.
+  info "Checking for orphaned shepherds from previous session..."
+  if [[ -x "$SCRIPT_DIR/recover-orphaned-shepherds.sh" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      "$SCRIPT_DIR/recover-orphaned-shepherds.sh" --verbose 2>/dev/null || warning "Orphaned shepherd check found issues"
+    else
+      "$SCRIPT_DIR/recover-orphaned-shepherds.sh" --recover --verbose 2>/dev/null || warning "Orphaned shepherd recovery had issues"
+    fi
+  else
+    warning "recover-orphaned-shepherds.sh not found - skipping orphan recovery"
+  fi
+  echo ""
+
+  # ===================================================================
+  # LOG ARCHIVING
+  # ===================================================================
   # Archive any orphaned task outputs from previous session
   if [[ "$ARCHIVE_LOGS" == "true" ]]; then
     info "Archiving orphaned task outputs..."
@@ -331,6 +351,9 @@ handle_daemon_startup() {
     fi
   fi
 
+  # ===================================================================
+  # PENDING CLEANUP PROCESSING
+  # ===================================================================
   # Process any pending cleanups from previous session
   if [[ -f "$DAEMON_STATE" ]]; then
     local pending=$(jq -r '.cleanup.pendingCleanup // [] | .[]' "$DAEMON_STATE" 2>/dev/null || echo "")
@@ -349,6 +372,9 @@ handle_daemon_startup() {
     fi
   fi
 
+  # ===================================================================
+  # WORKTREE CLEANUP
+  # ===================================================================
   # Run safe worktree cleanup
   info "Cleaning stale worktrees..."
   if [[ "$DRY_RUN" == true ]]; then
@@ -357,6 +383,9 @@ handle_daemon_startup() {
     "$SCRIPT_DIR/safe-worktree-cleanup.sh" 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
   fi
 
+  # ===================================================================
+  # ARCHIVE PRUNING
+  # ===================================================================
   # Prune old archives
   info "Pruning old archives..."
   if [[ "$DRY_RUN" == true ]]; then
@@ -365,6 +394,9 @@ handle_daemon_startup() {
     "$SCRIPT_DIR/archive-logs.sh" --prune-only --retention-days "$RETENTION_DAYS" 2>/dev/null || true
   fi
 
+  # ===================================================================
+  # PROGRESS FILE CLEANUP
+  # ===================================================================
   # Cleanup stale progress files from previous session
   cleanup_stale_progress_files
 

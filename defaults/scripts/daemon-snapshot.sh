@@ -463,6 +463,82 @@ SHEPHERD_PROGRESS=$(read_shepherd_progress)
 # Count stale heartbeats for warnings
 STALE_HEARTBEAT_COUNT=$(echo "$SHEPHERD_PROGRESS" | jq '[.[] | select(.heartbeat_stale == true and .status == "working")] | length')
 
+# Detect orphaned shepherds
+# An orphaned shepherd is:
+# 1. A shepherd in daemon-state with status="working" but the issue has loom:building removed
+# 2. An issue with loom:building that's not tracked in any shepherd's assignment
+# 3. A progress file with stale heartbeat and no corresponding daemon-state entry
+detect_orphaned_shepherds() {
+    local orphaned_json="[]"
+
+    # Get tracked issues from daemon-state
+    local daemon_tracked_issues="[]"
+    local daemon_shepherd_task_ids="[]"
+    if [[ -f "$DAEMON_STATE_FILE" ]]; then
+        daemon_tracked_issues=$(jq '[.shepherds // {} | to_entries[] | select(.value.status == "working") | .value.issue] | map(select(. != null))' "$DAEMON_STATE_FILE" 2>/dev/null || echo "[]")
+        daemon_shepherd_task_ids=$(jq '[.shepherds // {} | to_entries[] | select(.value.status == "working") | .value.task_id] | map(select(. != null))' "$DAEMON_STATE_FILE" 2>/dev/null || echo "[]")
+    fi
+
+    # Check 1: loom:building issues not tracked in daemon-state
+    local building_numbers
+    building_numbers=$(echo "$BUILDING_ISSUES" | jq -r '.[].number')
+    for issue_num in $building_numbers; do
+        [[ -z "$issue_num" ]] && continue
+
+        local is_tracked
+        is_tracked=$(echo "$daemon_tracked_issues" | jq --argjson num "$issue_num" 'any(. == $num)')
+
+        if [[ "$is_tracked" == "false" ]]; then
+            # Check if there's an active progress file for this issue
+            local has_active_progress=false
+            for progress in $(echo "$SHEPHERD_PROGRESS" | jq -c '.[]'); do
+                local p_issue
+                p_issue=$(echo "$progress" | jq -r '.issue')
+                local p_status
+                p_status=$(echo "$progress" | jq -r '.status')
+                local p_stale
+                p_stale=$(echo "$progress" | jq -r '.heartbeat_stale')
+
+                if [[ "$p_issue" == "$issue_num" && "$p_status" == "working" && "$p_stale" == "false" ]]; then
+                    has_active_progress=true
+                    break
+                fi
+            done
+
+            if [[ "$has_active_progress" == "false" ]]; then
+                orphaned_json=$(echo "$orphaned_json" | jq --argjson issue "$issue_num" \
+                    '. + [{type: "untracked_building", issue: $issue, reason: "no_daemon_entry"}]')
+            fi
+        fi
+    done
+
+    # Check 2: Progress files with stale heartbeats
+    for progress in $(echo "$SHEPHERD_PROGRESS" | jq -c '.[] | select(.status == "working" and .heartbeat_stale == true)'); do
+        local task_id
+        task_id=$(echo "$progress" | jq -r '.task_id')
+        local issue
+        issue=$(echo "$progress" | jq -r '.issue')
+        local age
+        age=$(echo "$progress" | jq -r '.heartbeat_age_seconds')
+
+        orphaned_json=$(echo "$orphaned_json" | jq \
+            --arg task_id "$task_id" \
+            --argjson issue "$issue" \
+            --argjson age "$age" \
+            '. + [{type: "stale_heartbeat", task_id: $task_id, issue: $issue, age_seconds: $age, reason: "heartbeat_stale"}]')
+    done
+
+    echo "$orphaned_json"
+}
+
+ORPHANED_SHEPHERDS=$(detect_orphaned_shepherds)
+ORPHANED_COUNT=$(echo "$ORPHANED_SHEPHERDS" | jq 'length')
+
+# Add recover_orphans action if any orphans detected
+if [[ "$ORPHANED_COUNT" -gt 0 ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["recover_orphans"]')
+fi
+
 # Build the final JSON output
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -497,6 +573,8 @@ OUTPUT=$(jq -n \
     --arg issue_strategy "$ISSUE_STRATEGY" \
     --argjson shepherd_progress "$SHEPHERD_PROGRESS" \
     --argjson stale_heartbeat_count "$STALE_HEARTBEAT_COUNT" \
+    --argjson orphaned_shepherds "$ORPHANED_SHEPHERDS" \
+    --argjson orphaned_count "$ORPHANED_COUNT" \
     '{
         timestamp: $timestamp,
         pipeline: {
@@ -516,7 +594,9 @@ OUTPUT=$(jq -n \
         },
         shepherds: {
             progress: $shepherd_progress,
-            stale_heartbeat_count: $stale_heartbeat_count
+            stale_heartbeat_count: $stale_heartbeat_count,
+            orphaned: $orphaned_shepherds,
+            orphaned_count: $orphaned_count
         },
         usage: ($usage + {healthy: $usage_healthy}),
         computed: {
@@ -532,7 +612,8 @@ OUTPUT=$(jq -n \
             hermit_cooldown_ok: $hermit_cooldown_ok,
             promotable_proposals: $promotable_proposals,
             recommended_actions: $recommended_actions,
-            stale_heartbeat_count: $stale_heartbeat_count
+            stale_heartbeat_count: $stale_heartbeat_count,
+            orphaned_count: $orphaned_count
         },
         config: {
             issue_threshold: $issue_threshold,

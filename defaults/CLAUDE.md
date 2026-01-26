@@ -1034,6 +1034,42 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
 
+**Orphaned shepherd recovery (daemon crashes)**:
+
+When a daemon session crashes or is terminated abruptly, shepherds may be left in an orphaned state with stale task IDs and inconsistent labels. The `recover-orphaned-shepherds.sh` script handles this:
+
+```bash
+# Check for orphaned shepherds (dry run)
+./.loom/scripts/recover-orphaned-shepherds.sh
+
+# Show detailed progress
+./.loom/scripts/recover-orphaned-shepherds.sh --verbose
+
+# Actually recover orphaned state
+./.loom/scripts/recover-orphaned-shepherds.sh --recover
+
+# JSON output for automation
+./.loom/scripts/recover-orphaned-shepherds.sh --json
+```
+
+**What it detects**:
+- Stale task IDs in daemon-state.json (tasks that no longer exist)
+- loom:building issues without active shepherds
+- Progress files with stale heartbeats (no activity for >5 minutes)
+- Mismatches between daemon-state and GitHub labels
+
+**What it recovers**:
+- Resets orphaned shepherds to idle state in daemon-state.json
+- Returns orphaned issues from `loom:building` to `loom:issue`
+- Adds recovery comments to affected issues
+- Marks stale progress files as errored
+
+**Automatic recovery on daemon startup**:
+The daemon automatically runs orphaned shepherd recovery during startup via `daemon-cleanup.sh daemon-startup`. This ensures the daemon starts with clean state after a crash.
+
+**Configuration via environment**:
+- `LOOM_HEARTBEAT_STALE_THRESHOLD=300` - Seconds before heartbeat is stale (default: 5 minutes)
+
 ### Stuck Agent Detection
 
 The Loom daemon automatically detects stuck or struggling agents and can trigger interventions.
