@@ -174,19 +174,23 @@ Task(
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
-Skill(skill="shepherd", args="123 --force-pr")
+Skill(skill="shepherd", args="123 --force-merge")
 
 Follow all shepherd workflow steps until the issue is complete or blocked.""",
   run_in_background: true
 ) → Returns task_id and output_file
 ```
 
+**Shepherd Force Mode Flags**:
+- `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
+- `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
+
 **CRITICAL - Correct Tool Invocation**: Task subagents must use the **Skill tool**, NOT CLI commands.
 
 ```
 ✅ CORRECT - Use the Skill tool:
    Skill(skill="guide")
-   Skill(skill="shepherd", args="123 --force-pr")
+   Skill(skill="shepherd", args="123 --force-merge")
 
 ❌ WRONG - These will fail with CLI errors:
    claude --skill=guide
@@ -536,12 +540,18 @@ The daemon AUTOMATICALLY spawns shepherds without asking:
 
 ```python
 # This happens automatically every iteration - no human approval needed
-def auto_spawn_shepherds():
+def auto_spawn_shepherds(state):
     active_count = count_active_shepherds()
     # ready_issues is pre-sorted by daemon-snapshot.sh based on LOOM_ISSUE_STRATEGY:
     # - loom:urgent issues always come first (highest priority)
     # - Remaining issues sorted by strategy: fifo (oldest first), lifo (newest first), or priority
     ready_issues = get_ready_issues()  # loom:issue labeled, priority-sorted
+
+    # Determine shepherd mode based on daemon's force_mode
+    # --force-merge: Full automation including auto-merge after Judge approval
+    # --force-pr: Stops at loom:pr (ready-to-merge), requires Champion for merge
+    force_mode = state.get("force_mode", False)
+    shepherd_flag = "--force-merge" if force_mode else "--force-pr"
 
     while active_count < MAX_SHEPHERDS and len(ready_issues) > 0:
         issue = ready_issues.pop(0)  # Takes highest priority issue
@@ -558,7 +568,7 @@ def auto_spawn_shepherds():
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
-Skill(skill="shepherd", args="{issue} --force-pr")
+Skill(skill="shepherd", args="{issue} {shepherd_flag}")
 
 Follow all shepherd workflow steps until the issue is complete or blocked.""",
             run_in_background=True
@@ -574,7 +584,7 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
         save_shepherd_assignment(issue, result.task_id, result.output_file)
         active_count += 1
 
-        print(f"AUTO-SPAWNED shepherd for issue #{issue} (verified)")
+        print(f"AUTO-SPAWNED shepherd for issue #{issue} ({shepherd_flag}, verified)")
 ```
 
 ### Auto-Promote Proposals (Force Mode Only)
@@ -1204,8 +1214,13 @@ return f"ready={len(ready_issues)} building={len(building_issues)} ..."
 ### Step 4 Detail: Auto-Spawn Shepherds
 
 ```python
-def auto_spawn_shepherds(debug_mode=False):
-    """Automatically spawn shepherds - NO human decision required."""
+def auto_spawn_shepherds(state, debug_mode=False):
+    """Automatically spawn shepherds - NO human decision required.
+
+    Args:
+        state: Daemon state dict (used to check force_mode)
+        debug_mode: Enable debug logging
+    """
 
     def debug(msg):
         if debug_mode:
@@ -1217,7 +1232,14 @@ def auto_spawn_shepherds(debug_mode=False):
     ready_issues = gh_list_issues_with_label("loom:issue")  # Pre-sorted by priority
     active_count = count_active_shepherds()
 
+    # Determine shepherd mode based on daemon's force_mode
+    # --force-merge: Full automation including auto-merge after Judge approval
+    # --force-pr: Stops at loom:pr (ready-to-merge), requires Champion for merge
+    force_mode = state.get("force_mode", False)
+    shepherd_flag = "--force-merge" if force_mode else "--force-pr"
+
     debug(f"Issue selection: {len(ready_issues)} ready issues, {active_count}/{MAX_SHEPHERDS} shepherds active")
+    debug(f"Shepherd mode: {shepherd_flag} (force_mode={force_mode})")
 
     spawned = 0
     spawn_failures = 0
@@ -1244,7 +1266,7 @@ def auto_spawn_shepherds(debug_mode=False):
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
-Skill(skill="shepherd", args="{issue} --force-pr")
+Skill(skill="shepherd", args="{issue} {shepherd_flag}")
 
 Follow all shepherd workflow steps until the issue is complete or blocked.""",
             run_in_background=True
@@ -1268,14 +1290,14 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
         debug(f"Spawning decision: shepherd assigned to #{issue} (verified)")
         debug(f"  Task ID: {result.task_id}")
         debug(f"  Output file: {result.output_file}")
-        debug(f"  Command: /shepherd {issue} --force-pr")
+        debug(f"  Command: /shepherd {issue} {shepherd_flag}")
 
         # Record assignment (only after verification)
         record_shepherd_assignment(issue, result.task_id, result.output_file)
         active_count += 1
         spawned += 1
 
-        print(f"  AUTO-SPAWNED: shepherd for issue #{issue} (verified)")
+        print(f"  AUTO-SPAWNED: shepherd for issue #{issue} ({shepherd_flag}, verified)")
 
     if spawned == 0 and len(ready_issues) == 0:
         print(f"  Shepherds: {active_count}/{MAX_SHEPHERDS} active, no ready issues")
@@ -2086,8 +2108,9 @@ When `/loom --force` is invoked, the daemon enables **force mode** for aggressiv
 
 1. **Auto-Promote Proposals**: Champion automatically promotes `loom:architect` and `loom:hermit` proposals to `loom:issue` without human review
 2. **Auto-Promote Curated Issues**: Champion automatically promotes `loom:curated` issues to `loom:issue`
-3. **Audit Trail**: All auto-promoted items include `[force-mode]` marker in comments
-4. **Safety Guardrails Remain**: No force-push, respect `loom:blocked`, stop on CI failure
+3. **Shepherd Auto-Merge**: Shepherds use `--force-merge` flag, enabling auto-merge after Judge approval (instead of waiting for Champion)
+4. **Audit Trail**: All auto-promoted items include `[force-mode]` marker in comments
+5. **Safety Guardrails Remain**: No force-push, respect `loom:blocked`, stop on CI failure
 
 **Force mode state tracking:**
 
@@ -2162,10 +2185,11 @@ When `/loom --debug` is invoked, the daemon enables **debug mode** for verbose l
 [DEBUG] Shepherd pool: shepherd-1=working(#123) shepherd-2=idle shepherd-3=idle
 [DEBUG] Issue selection: Considering #456 (age: 2h, priority: normal)
 [DEBUG] Issue selection: Skipping #457 (blocked by #400)
+[DEBUG] Shepherd mode: --force-merge (force_mode=true)
 [DEBUG] Spawning decision: shepherd-2 assigned to #456
 [DEBUG]   Task ID: abc123
 [DEBUG]   Output file: /tmp/claude/.../abc123.output
-[DEBUG]   Command: /shepherd 456 --force-pr
+[DEBUG]   Command: /shepherd 456 --force-merge
 [DEBUG] Iteration 5 completed in 1.2s
 ```
 
