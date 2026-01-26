@@ -73,6 +73,30 @@ which claude
 # Install if missing (see Claude Code documentation)
 ```
 
+### API Error: 400 due to tool use concurrency issues
+
+This error occurs when Claude Code's parallel tool execution causes malformed API message structures. See the dedicated guide: [Tool Use Concurrency Errors](./tool-use-concurrency-errors.md)
+
+**Quick recovery**:
+```bash
+# In Claude Code, run:
+/rewind
+```
+
+**Prevention** - Add to `~/.claude/CLAUDE.md`:
+```markdown
+# Force Sequential Tool Execution
+Execute tools sequentially, never in parallel.
+Process one tool call at a time.
+Wait for tool_result before initiating next tool execution.
+```
+
+**Common triggers**:
+- Multiple parallel file operations (Read, Write, Edit)
+- Using print mode (`-p` flag) instead of interactive mode
+- PostToolUse hooks that interfere with message structure
+- Editing files while they're open in an IDE
+
 ### Orphaned issues stuck in loom:building state
 
 When an agent crashes or is cancelled while building, issues can get stuck in `loom:building` state without a PR. Use the stale-building-check script to detect and recover these:
