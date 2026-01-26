@@ -25,9 +25,10 @@ The daemon uses a **subagent-per-iteration** architecture to prevent context acc
 │  4. Auto-promote proposals (force mode)    │
 │  5. Spawn shepherds (Task, background)     │
 │  6. Spawn work generation                  │
-│  7. Ensure support roles                   │
-│  8. Save state to JSON                     │
-│  9. Return 1-line summary                  │
+│  7. Check workflow demand (demand-based)   │
+│  8. Ensure support roles (interval-based)  │
+│  9. Save state to JSON                     │
+│  10. Return 1-line summary                 │
 └────────────────────────────────────────────┘
 ```
 
@@ -74,13 +75,15 @@ Each 120-second iteration:
   5. AUTO-spawn shepherds if ready_issues > 0 and shepherd_slots available
   6. AUTO-trigger Architect if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
   7. AUTO-trigger Hermit if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
-  8. AUTO-ensure Guide is running (respawn if idle > GUIDE_INTERVAL)
-  9. AUTO-ensure Champion is running (respawn if idle > CHAMPION_INTERVAL)
-  10. AUTO-ensure Doctor is running (respawn if idle > DOCTOR_INTERVAL)
-  11. AUTO-ensure Auditor is running (respawn if idle > AUDITOR_INTERVAL)
-  12. Update daemon-state.json
-  13. Report status
-  14. Sleep and repeat
+  8. DEMAND-SPAWN Champion if PRs ready to merge AND Champion not running
+  9. DEMAND-SPAWN Doctor if PRs need fixes AND Doctor not running
+  10. AUTO-ensure Guide is running (respawn if idle > GUIDE_INTERVAL)
+  11. AUTO-ensure Champion is running (interval-based fallback)
+  12. AUTO-ensure Doctor is running (interval-based fallback)
+  13. AUTO-ensure Auditor is running (respawn if idle > AUDITOR_INTERVAL)
+  14. Update daemon-state.json
+  15. Report status
+  16. Sleep and repeat
 ```
 
 **NO MANUAL INTERVENTION** means:
@@ -330,8 +333,13 @@ def loom_iterate(force_mode=False, debug_mode=False):
     if needs_work_gen and not triggered_generation["architect"] and not triggered_generation["hermit"]:
         debug(f"Work generation needed but not triggered: architect_cooldown_ok={architect_cooldown_ok}, hermit_cooldown_ok={hermit_cooldown_ok}")
 
-    # 8. Auto-ensure support roles
-    ensured_roles = auto_ensure_support_roles(state, debug_mode)
+    # 7.5. Check workflow demand (demand-based spawning)
+    # This spawns roles immediately when work exists, before interval-based checks
+    demand_spawned = check_workflow_demand(state, snapshot_data, debug_mode)
+
+    # 8. Auto-ensure support roles (interval-based fallback)
+    # Pass demand_spawned to skip interval-based checks for roles already spawned
+    ensured_roles = auto_ensure_support_roles(state, debug_mode, demand_spawned)
 
     # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
@@ -349,7 +357,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
     save_daemon_state(state)
 
     # 12. Return compact summary (ONE LINE)
-    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, promoted_count, stuck_count, recovered_count)
+    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, demand_spawned, promoted_count, stuck_count, recovered_count)
     debug(f"Iteration {iteration} completed - {summary}")
     return summary
 ```
@@ -370,8 +378,10 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `+architect` - Triggered Architect (if triggered)
 - `+hermit` - Triggered Hermit (if triggered)
 - `+guide` - Respawned Guide (if respawned)
-- `+champion` - Respawned Champion (if respawned)
-- `+doctor` - Respawned Doctor (if respawned)
+- `+champion` - Respawned Champion (if respawned, interval-based)
+- `+champion(demand)` - Spawned Champion on-demand (PRs ready to merge)
+- `+doctor` - Respawned Doctor (if respawned, interval-based)
+- `+doctor(demand)` - Spawned Doctor on-demand (PRs need fixes)
 - `+auditor` - Respawned Auditor (if respawned)
 - `promoted=N` - Proposals auto-promoted to loom:issue in force mode (if any)
 - `stuck=N` - Stuck agents detected (if any)
@@ -387,6 +397,8 @@ ready=0 building=1 shepherds=1/3 +architect +hermit
 ready=2 building=2 shepherds=2/3 stuck=1
 ready=2 building=2 shepherds=2/3 spawn-fail=1
 ready=3 building=0 shepherds=0/3 promoted=3
+ready=2 building=1 shepherds=1/3 +champion(demand) prs-merge=2
+ready=1 building=2 shepherds=2/3 +doctor(demand) prs-fixes=1
 SHUTDOWN_SIGNAL
 ```
 
@@ -1425,17 +1437,28 @@ jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
 # Should include "trigger_architect" and/or "trigger_hermit" when pipeline is empty
 ```
 
-### Step 6 Detail: Auto-Ensure Support Roles
+### Step 8 Detail: Auto-Ensure Support Roles (Interval-Based)
 
 ```python
-def auto_ensure_support_roles(debug_mode=False):
-    """Automatically keep Guide, Champion, and Doctor running - NO human decision required."""
+def auto_ensure_support_roles(debug_mode=False, demand_spawned=None):
+    """Automatically keep Guide, Champion, Doctor, and Auditor running - NO human decision required.
+
+    This is interval-based spawning that ensures roles run periodically.
+    If demand_spawned indicates a role was already spawned this iteration,
+    skip the interval-based check for that role.
+
+    Args:
+        debug_mode: Enable debug logging
+        demand_spawned: Dict of roles already spawned on-demand {"champion": bool, "doctor": bool}
+    """
+    if demand_spawned is None:
+        demand_spawned = {"champion": False, "doctor": False}
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    debug("Checking support roles: Guide, Champion, Doctor")
+    debug("Checking support roles (interval-based): Guide, Champion, Doctor, Auditor")
 
     # Guide - backlog triage
     guide_running = is_support_role_running("guide")
@@ -1468,64 +1491,74 @@ Complete one triage iteration.""",
         print(f"  Guide: running (idle {guide_idle}s)")
 
     # Champion - PR merging
-    champion_running = is_support_role_running("champion")
-    champion_idle = get_support_role_idle_time("champion")
+    # Skip if already spawned on-demand this iteration
+    if demand_spawned.get("champion", False):
+        debug("Champion: skipped (demand-spawned this iteration)")
+        print(f"  Champion: skipped (demand-spawned this iteration)")
+    else:
+        champion_running = is_support_role_running("champion")
+        champion_idle = get_support_role_idle_time("champion")
 
-    debug(f"Champion status: running={champion_running}, idle={champion_idle}s (interval={CHAMPION_INTERVAL}s)")
+        debug(f"Champion status: running={champion_running}, idle={champion_idle}s (interval={CHAMPION_INTERVAL}s)")
 
-    if not champion_running or champion_idle > CHAMPION_INTERVAL:
-        result = Task(
-            description="Champion PR merge",
-            prompt="""You must invoke the Skill tool to execute the champion role.
+        if not champion_running or champion_idle > CHAMPION_INTERVAL:
+            result = Task(
+                description="Champion PR merge",
+                prompt="""You must invoke the Skill tool to execute the champion role.
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
 
 Skill(skill="champion")
 
 Complete one PR evaluation and merge iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Champion"):
-            record_support_role("champion", result.task_id, result.output_file)
-            reason = "not running" if not champion_running else f"idle {champion_idle}s > {CHAMPION_INTERVAL}s"
-            print(f"  AUTO-SPAWNED: Champion ({reason}, verified)")
-            debug(f"Champion spawned: task_id={result.task_id}, output={result.output_file}")
+                run_in_background=True
+            )
+            # Verify spawn before recording
+            if verify_task_spawn(result, "Champion"):
+                record_support_role("champion", result.task_id, result.output_file)
+                reason = "not running" if not champion_running else f"idle {champion_idle}s > {CHAMPION_INTERVAL}s"
+                print(f"  AUTO-SPAWNED: Champion ({reason}, verified)")
+                debug(f"Champion spawned: task_id={result.task_id}, output={result.output_file}")
+            else:
+                print(f"  SPAWN FAILED: Champion - verification failed")
+                debug(f"Champion spawn failed verification, not recording task_id")
         else:
-            print(f"  SPAWN FAILED: Champion - verification failed")
-            debug(f"Champion spawn failed verification, not recording task_id")
-    else:
-        print(f"  Champion: running (idle {champion_idle}s)")
+            print(f"  Champion: running (idle {champion_idle}s)")
 
     # Doctor - PR conflict resolution
-    doctor_running = is_support_role_running("doctor")
-    doctor_idle = get_support_role_idle_time("doctor")
+    # Skip if already spawned on-demand this iteration
+    if demand_spawned.get("doctor", False):
+        debug("Doctor: skipped (demand-spawned this iteration)")
+        print(f"  Doctor: skipped (demand-spawned this iteration)")
+    else:
+        doctor_running = is_support_role_running("doctor")
+        doctor_idle = get_support_role_idle_time("doctor")
 
-    debug(f"Doctor status: running={doctor_running}, idle={doctor_idle}s (interval={DOCTOR_INTERVAL}s)")
+        debug(f"Doctor status: running={doctor_running}, idle={doctor_idle}s (interval={DOCTOR_INTERVAL}s)")
 
-    if not doctor_running or doctor_idle > DOCTOR_INTERVAL:
-        result = Task(
-            description="Doctor PR conflict resolution",
-            prompt="""You must invoke the Skill tool to execute the doctor role.
+        if not doctor_running or doctor_idle > DOCTOR_INTERVAL:
+            result = Task(
+                description="Doctor PR conflict resolution",
+                prompt="""You must invoke the Skill tool to execute the doctor role.
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
 
 Skill(skill="doctor")
 
 Complete one PR conflict resolution iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Doctor"):
-            record_support_role("doctor", result.task_id, result.output_file)
-            reason = "not running" if not doctor_running else f"idle {doctor_idle}s > {DOCTOR_INTERVAL}s"
-            print(f"  AUTO-SPAWNED: Doctor ({reason}, verified)")
-            debug(f"Doctor spawned: task_id={result.task_id}, output={result.output_file}")
+                run_in_background=True
+            )
+            # Verify spawn before recording
+            if verify_task_spawn(result, "Doctor"):
+                record_support_role("doctor", result.task_id, result.output_file)
+                reason = "not running" if not doctor_running else f"idle {doctor_idle}s > {DOCTOR_INTERVAL}s"
+                print(f"  AUTO-SPAWNED: Doctor ({reason}, verified)")
+                debug(f"Doctor spawned: task_id={result.task_id}, output={result.output_file}")
+            else:
+                print(f"  SPAWN FAILED: Doctor - verification failed")
+                debug(f"Doctor spawn failed verification, not recording task_id")
         else:
-            print(f"  SPAWN FAILED: Doctor - verification failed")
-            debug(f"Doctor spawn failed verification, not recording task_id")
-    else:
-        print(f"  Doctor: running (idle {doctor_idle}s)")
+            print(f"  Doctor: running (idle {doctor_idle}s)")
 
     # Auditor - main branch validation (runs every 10 min)
     auditor_running = is_support_role_running("auditor")
@@ -1556,6 +1589,131 @@ Complete one main branch validation iteration.""",
             debug(f"Auditor spawn failed verification, not recording task_id")
     else:
         print(f"  Auditor: running (idle {auditor_idle}s)")
+```
+
+### Step 7.5 Detail: Check Workflow Demand (Demand-Based Spawning)
+
+In addition to interval-based support role spawning (Step 8), the daemon checks for pending workflow work and spawns roles immediately when needed. This provides faster response times than waiting for interval-based triggers.
+
+**Demand-based spawning runs BEFORE interval-based spawning** and takes priority when work exists.
+
+```python
+def check_workflow_demand(state, snapshot_data, debug_mode=False):
+    """Check if any role should be spawned based on pending work.
+
+    This provides faster response than interval-based spawning when
+    PRs are waiting for action. Demand-based spawns are triggered
+    immediately when work exists, rather than waiting for the role's
+    interval to elapse.
+
+    Returns dict of roles spawned on-demand: {"champion": bool, "doctor": bool}
+    """
+
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    demand_spawned = {"champion": False, "doctor": False}
+    recommended_actions = snapshot_data["computed"]["recommended_actions"]
+    prs_ready_to_merge = snapshot_data["computed"]["prs_ready_to_merge"]
+    prs_needing_fixes = snapshot_data["computed"]["prs_needing_fixes"]
+
+    debug(f"Workflow demand check: ready_to_merge={prs_ready_to_merge}, needing_fixes={prs_needing_fixes}")
+
+    # Spawn Champion on-demand if PRs are ready to merge
+    if "spawn_champion_demand" in recommended_actions:
+        champion_running = is_support_role_running("champion")
+        debug(f"Champion demand: PRs ready={prs_ready_to_merge}, running={champion_running}")
+
+        if not champion_running:
+            result = Task(
+                description="Champion PR merge (on-demand)",
+                prompt="""You must invoke the Skill tool to execute the champion role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
+
+Skill(skill="champion")
+
+Complete one PR evaluation and merge iteration.""",
+                run_in_background=True
+            )
+            # Verify spawn before recording
+            if verify_task_spawn(result, "Champion"):
+                record_support_role("champion", result.task_id, result.output_file)
+                print(f"  AUTO-SPAWNED: Champion (on-demand, {prs_ready_to_merge} PRs ready to merge, verified)")
+                debug(f"Champion demand-spawned: task_id={result.task_id}")
+                demand_spawned["champion"] = True
+            else:
+                print(f"  SPAWN FAILED: Champion (on-demand) - verification failed")
+        else:
+            debug(f"Champion already running, skipping demand spawn")
+
+    # Spawn Doctor on-demand if PRs need fixes
+    if "spawn_doctor_demand" in recommended_actions:
+        doctor_running = is_support_role_running("doctor")
+        debug(f"Doctor demand: PRs needing fixes={prs_needing_fixes}, running={doctor_running}")
+
+        if not doctor_running:
+            result = Task(
+                description="Doctor PR conflict resolution (on-demand)",
+                prompt="""You must invoke the Skill tool to execute the doctor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
+
+Skill(skill="doctor")
+
+Complete one PR conflict resolution iteration.""",
+                run_in_background=True
+            )
+            # Verify spawn before recording
+            if verify_task_spawn(result, "Doctor"):
+                record_support_role("doctor", result.task_id, result.output_file)
+                print(f"  AUTO-SPAWNED: Doctor (on-demand, {prs_needing_fixes} PRs need fixes, verified)")
+                debug(f"Doctor demand-spawned: task_id={result.task_id}")
+                demand_spawned["doctor"] = True
+            else:
+                print(f"  SPAWN FAILED: Doctor (on-demand) - verification failed")
+        else:
+            debug(f"Doctor already running, skipping demand spawn")
+
+    return demand_spawned
+```
+
+**When demand-based spawning triggers:**
+
+| Role | Trigger Condition | Benefit |
+|------|-------------------|---------|
+| Champion | PRs with `loom:pr` label exist AND Champion not running | PRs merge immediately instead of waiting up to 10 minutes |
+| Doctor | PRs with `loom:changes-requested` label exist AND Doctor not running | PR fixes start immediately instead of waiting up to 5 minutes |
+
+**Relationship with interval-based spawning:**
+
+The daemon uses BOTH demand-based and interval-based spawning as a hybrid approach:
+
+1. **Demand-based (Step 7.5)** - Fast response when work appears (runs first)
+2. **Interval-based (Step 8)** - Guaranteed coverage even if labels get stuck (fallback)
+
+If demand-based spawning already spawned a role, the interval-based check for that role is skipped (prevents duplicate spawns).
+
+**Example daemon output with demand-based spawning:**
+
+```
+═══════════════════════════════════════════════════════════════════
+  DAEMON ITERATION 5
+═══════════════════════════════════════════════════════════════════
+
+  Workflow Demand Check:
+    PRs ready to merge: 2 (#120, #121)
+      → AUTO-SPAWNED: Champion (on-demand, 2 PRs ready to merge, verified)
+
+    PRs needing fixes: 0
+      → Doctor: not needed (no pending work)
+
+  Support Role Status (interval-based):
+    Guide: running (idle 120s)
+    Champion: skipped (demand-spawned this iteration)
+    Doctor: running (idle 45s)
+    Auditor: running (idle 300s)
 ```
 
 ### Graceful Shutdown

@@ -491,14 +491,32 @@ if [[ $BUILDING_COUNT -gt 0 ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["check_stuck"]')
 fi
 
-# Action: trigger support roles when idle > interval
+# Action: demand-based spawning (spawn roles immediately when work exists)
+# These take priority over interval-based triggers for faster response
+CHAMPION_DEMAND="false"
+DOCTOR_DEMAND="false"
+
+# Spawn Champion on-demand if PRs are ready to merge and Champion not running
+if [[ "$MERGE_COUNT" -gt 0 ]] && [[ "$CHAMPION_STATUS" != "running" ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["spawn_champion_demand"]')
+    CHAMPION_DEMAND="true"
+fi
+
+# Spawn Doctor on-demand if PRs need fixes and Doctor not running
+if [[ "$CHANGES_COUNT" -gt 0 ]] && [[ "$DOCTOR_STATUS" != "running" ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["spawn_doctor_demand"]')
+    DOCTOR_DEMAND="true"
+fi
+
+# Action: trigger support roles when idle > interval (interval-based fallback)
+# Skip interval-based trigger if demand-based trigger will handle it
 if [[ "$GUIDE_NEEDS_TRIGGER" == "true" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_guide"]')
 fi
-if [[ "$CHAMPION_NEEDS_TRIGGER" == "true" ]]; then
+if [[ "$CHAMPION_NEEDS_TRIGGER" == "true" ]] && [[ "$CHAMPION_DEMAND" == "false" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_champion"]')
 fi
-if [[ "$DOCTOR_NEEDS_TRIGGER" == "true" ]]; then
+if [[ "$DOCTOR_NEEDS_TRIGGER" == "true" ]] && [[ "$DOCTOR_DEMAND" == "false" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_doctor"]')
 fi
 if [[ "$AUDITOR_NEEDS_TRIGGER" == "true" ]]; then
@@ -710,6 +728,11 @@ OUTPUT=$(jq -n \
     --arg auditor_status "$AUDITOR_STATUS" \
     --argjson orphaned_shepherds "$ORPHANED_SHEPHERDS" \
     --argjson orphaned_count "$ORPHANED_COUNT" \
+    --argjson champion_demand "$CHAMPION_DEMAND" \
+    --argjson doctor_demand "$DOCTOR_DEMAND" \
+    --argjson review_requested_count "$REVIEW_COUNT" \
+    --argjson changes_requested_count "$CHANGES_COUNT" \
+    --argjson ready_to_merge_count "$MERGE_COUNT" \
     '{
         timestamp: $timestamp,
         pipeline: {
@@ -744,13 +767,15 @@ OUTPUT=$(jq -n \
                 status: $champion_status,
                 idle_seconds: $champion_idle_seconds,
                 interval: $champion_interval,
-                needs_trigger: $champion_needs_trigger
+                needs_trigger: $champion_needs_trigger,
+                demand_trigger: $champion_demand
             },
             doctor: {
                 status: $doctor_status,
                 idle_seconds: $doctor_idle_seconds,
                 interval: $doctor_interval,
-                needs_trigger: $doctor_needs_trigger
+                needs_trigger: $doctor_needs_trigger,
+                demand_trigger: $doctor_demand
             },
             auditor: {
                 status: $auditor_status,
@@ -774,7 +799,12 @@ OUTPUT=$(jq -n \
             promotable_proposals: $promotable_proposals,
             recommended_actions: $recommended_actions,
             stale_heartbeat_count: $stale_heartbeat_count,
-            orphaned_count: $orphaned_count
+            orphaned_count: $orphaned_count,
+            prs_awaiting_review: $review_requested_count,
+            prs_needing_fixes: $changes_requested_count,
+            prs_ready_to_merge: $ready_to_merge_count,
+            champion_demand: $champion_demand,
+            doctor_demand: $doctor_demand
         },
         config: {
             issue_threshold: $issue_threshold,
