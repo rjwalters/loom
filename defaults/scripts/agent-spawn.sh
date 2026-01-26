@@ -153,8 +153,8 @@ check_tmux() {
         local major minor
         major=$(echo "$version" | cut -d. -f1)
         minor=$(echo "$version" | cut -d. -f2)
-        if [[ "$major" -lt 2 ]] && [[ "$minor" -lt 8 ]]; then
-            log_warn "tmux version $version may not support all features (recommend >= 2.0)"
+        if [[ "$major" -lt 1 ]] || { [[ "$major" -eq 1 ]] && [[ "$minor" -lt 8 ]]; }; then
+            log_warn "tmux version $version may not support all features (recommend >= 1.8)"
         fi
     fi
 
