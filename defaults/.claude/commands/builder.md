@@ -891,6 +891,91 @@ gh issue edit 100 --remove-label "loom:issue" --add-label "loom:building"
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why
 
+## Test Output: Truncate for Token Efficiency
+
+**IMPORTANT**: When running tests, truncate verbose output to conserve tokens in long-running sessions.
+
+### Why Truncate?
+
+Test output can easily exceed 10,000+ lines, consuming significant context:
+- Full test suites dump every passing test
+- Stack traces repeat for related failures
+- Coverage reports add thousands of lines
+- This wastes tokens and pollutes context for subsequent work
+
+### Truncation Strategies
+
+**Option 1: Failures + Summary Only (Recommended)**
+
+```bash
+# Run tests, capture only failures and summary
+pnpm test 2>&1 | grep -E "(FAIL|PASS|Error|✓|✗|Summary|Tests:)" | head -100
+
+# Or use test runner's built-in options
+pnpm test --reporter=dot          # Minimal output (dots for pass/fail)
+pnpm test --silent                # Suppress console.log from tests
+pnpm test --onlyFailures          # Re-run only failed tests
+```
+
+**Option 2: Tail for Summary**
+
+```bash
+# Get just the final summary
+pnpm test 2>&1 | tail -30
+```
+
+**Option 3: Head + Tail**
+
+```bash
+# First 20 lines (test start) + last 30 lines (summary)
+pnpm test 2>&1 | (head -20; echo "... [truncated] ..."; tail -30)
+```
+
+**Option 4: Grep for Failures**
+
+```bash
+# Show only failing tests and their immediate context
+pnpm test 2>&1 | grep -A 5 -B 2 "FAIL\|Error\|✗"
+```
+
+### When Full Output Is Needed
+
+Sometimes you need full output for debugging:
+- First run after major changes (to see all failures)
+- Investigating intermittent failures
+- Understanding test coverage gaps
+
+In these cases, run full output but don't include it all in your response. Instead:
+1. Run the full test suite
+2. Analyze the output
+3. Report only relevant failures in your response
+4. Include actionable summary, not raw dumps
+
+### Example: Good Test Reporting
+
+**Instead of dumping 500 lines of output:**
+
+```
+❌ Test Results: 3 failures
+
+1. `src/lib/state.test.ts` - "should update terminal config"
+   - Expected: { name: "Builder" }
+   - Received: undefined
+   - Likely cause: Missing null check in updateTerminal()
+
+2. `src/lib/worktree.test.ts` - "should create worktree"
+   - Error: ENOENT: no such file or directory
+   - Likely cause: Test cleanup not running
+
+3. `src/main.test.ts` - "should initialize app"
+   - Timeout after 5000ms
+   - Likely cause: Async setup not awaited
+
+Summary: 47 passed, 3 failed, 50 total
+```
+
+This gives you all the information needed to fix issues without wasting tokens on verbose output.
+
 ## Finding Work: Priority System
 
 Workers use a three-level priority system to determine which issues to work on:
