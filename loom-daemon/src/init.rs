@@ -788,104 +788,6 @@ fn force_merge_dir_with_report(
 const LOOM_SECTION_START: &str = "<!-- BEGIN LOOM ORCHESTRATION -->";
 const LOOM_SECTION_END: &str = "<!-- END LOOM ORCHESTRATION -->";
 
-/// Check if content appears to be project-specific (not just Loom template)
-///
-/// Returns true if the content contains substantive project documentation
-/// beyond just the Loom boilerplate.
-fn has_project_specific_content(content: &str) -> bool {
-    let trimmed = content.trim();
-
-    // Empty or very short content is not project-specific
-    if trimmed.is_empty() || trimmed.len() < 20 {
-        return false;
-    }
-
-    // If it has our section markers, check for content outside the Loom section
-    if content.contains(LOOM_SECTION_START) && content.contains(LOOM_SECTION_END) {
-        if let (Some(start_idx), Some(end_idx)) =
-            (content.find(LOOM_SECTION_START), content.find(LOOM_SECTION_END))
-        {
-            let before_loom = content[..start_idx].trim();
-            let after_end = end_idx + LOOM_SECTION_END.len();
-            let after_loom = if after_end < content.len() {
-                content[after_end..].trim()
-            } else {
-                ""
-            };
-
-            // Has project content if there's meaningful content before or after the Loom section
-            return (!before_loom.is_empty() && before_loom.len() > 20)
-                || (!after_loom.is_empty() && after_loom.len() > 20);
-        }
-    }
-
-    // Check for indicators that this is NOT just the Loom template
-    // The Loom template starts with "# Loom Orchestration - Repository Guide"
-    let is_loom_template = content.contains("# Loom Orchestration - Repository Guide")
-        || content.contains("This repository uses **Loom** for AI-powered development");
-
-    if !is_loom_template {
-        // Definitely project-specific if it doesn't have Loom template markers
-        return true;
-    }
-
-    // Check if there's content BEFORE the Loom header that looks project-specific
-    if let Some(loom_header_idx) = content.find("# Loom Orchestration") {
-        let before_header = content[..loom_header_idx].trim();
-        if !before_header.is_empty() && before_header.len() > 50 {
-            return true;
-        }
-    }
-
-    false
-}
-
-/// Extract project-specific content from existing CLAUDE.md
-///
-/// If the file uses section markers, extracts content outside the Loom section.
-/// Otherwise, if it's clearly project-specific content, returns all of it.
-fn extract_project_content(content: &str) -> Option<String> {
-    // First, check if we have section markers
-    if let (Some(start), Some(end)) =
-        (content.find(LOOM_SECTION_START), content.find(LOOM_SECTION_END))
-    {
-        // Extract content before the Loom section
-        let before = content[..start].trim();
-        // Extract content after the Loom section (after the end marker)
-        let after_end = end + LOOM_SECTION_END.len();
-        let after = if after_end < content.len() {
-            content[after_end..].trim()
-        } else {
-            ""
-        };
-
-        let mut project_content = String::new();
-        if !before.is_empty() {
-            project_content.push_str(before);
-        }
-        if !after.is_empty() {
-            if !project_content.is_empty() {
-                project_content.push_str("\n\n");
-            }
-            project_content.push_str(after);
-        }
-
-        if !project_content.is_empty() {
-            return Some(project_content);
-        }
-    }
-
-    // No section markers - check if the whole file is project-specific
-    if has_project_specific_content(content) {
-        // Check if it's pure project content (no Loom template at all)
-        if !content.contains("# Loom Orchestration - Repository Guide") {
-            return Some(content.trim().to_string());
-        }
-    }
-
-    None
-}
-
 /// Wrap Loom content in section markers
 fn wrap_loom_content(content: &str) -> String {
     format!("{}\n{}\n{}", LOOM_SECTION_START, content.trim(), LOOM_SECTION_END)
@@ -902,9 +804,10 @@ fn wrap_loom_content(content: &str) -> String {
 ///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
 ///
 /// **CLAUDE.md Preservation**:
-/// - If existing CLAUDE.md has project-specific content, it is preserved above the Loom section
+/// - If existing CLAUDE.md has Loom section markers, only the marked section is replaced
+/// - If existing CLAUDE.md has no markers, Loom section is appended at the end
 /// - Loom content is wrapped in `<!-- BEGIN LOOM ORCHESTRATION -->` markers
-/// - On reinstall, only the Loom section is updated; project content is kept
+/// - All existing content is preserved exactly as-is
 ///
 /// Custom files (files in workspace that don't exist in defaults) are always preserved.
 #[allow(clippy::too_many_lines)]
@@ -985,9 +888,10 @@ fn setup_repository_scaffolding(
     // This file contains template variables that need to be substituted
     //
     // CLAUDE.md Preservation Logic:
-    // - If existing CLAUDE.md has project-specific content, preserve it above the Loom section
+    // - If existing CLAUDE.md has section markers, replace only the marked section
+    // - If existing CLAUDE.md has no markers, append Loom section at the end
     // - Loom content is wrapped in section markers for future updates
-    // - On reinstall, only the Loom section is updated; project content is kept
+    // - All existing content is preserved exactly as-is
     let claude_md_src = defaults_path.join(".loom").join("CLAUDE.md");
     let claude_md_dst = workspace_path.join("CLAUDE.md");
 
@@ -1031,19 +935,12 @@ fn setup_repository_scaffolding(
 
                     format!("{}{}{}", before.trim_end(), wrapped_loom, after)
                 } else {
-                    // Malformed markers - just use the new content
-                    wrapped_loom
+                    // Malformed markers - append at end
+                    format!("{}\n\n{}", existing_content.trim(), wrapped_loom)
                 }
-            } else if let Some(project_content) = extract_project_content(&existing_content) {
-                // Has project content without markers - preserve it above Loom section
-                format!("{project_content}\n\n{wrapped_loom}")
-            } else if force {
-                // No project content and force mode - replace entirely
-                wrapped_loom
             } else {
-                // No project content but not force mode - preserve existing
-                report.preserved.push("CLAUDE.md".to_string());
-                existing_content
+                // No markers exist - append Loom section at end
+                format!("{}\n\n{}", existing_content.trim(), wrapped_loom)
             }
         } else {
             // New file - just use wrapped Loom content
@@ -1753,101 +1650,6 @@ mod tests {
     }
 
     #[test]
-    fn test_has_project_specific_content_empty() {
-        assert!(!has_project_specific_content(""));
-        assert!(!has_project_specific_content("   "));
-    }
-
-    #[test]
-    fn test_has_project_specific_content_loom_only() {
-        let loom_only = r#"# Loom Orchestration - Repository Guide
-
-This repository uses **Loom** for AI-powered development orchestration.
-
-## What is Loom?
-
-Loom is a multi-terminal desktop application..."#;
-
-        assert!(!has_project_specific_content(loom_only));
-    }
-
-    #[test]
-    fn test_has_project_specific_content_project_only() {
-        let project_only = r#"# My Project
-
-This is my awesome Rust project for doing amazing things.
-
-## Setup
-
-Run `cargo build` to build the project."#;
-
-        assert!(has_project_specific_content(project_only));
-    }
-
-    #[test]
-    fn test_has_project_specific_content_with_markers() {
-        let with_markers = format!(
-            r#"# My Project
-
-This is project-specific content.
-
-{}
-# Loom Orchestration - Repository Guide
-...Loom content...
-{}"#,
-            LOOM_SECTION_START, LOOM_SECTION_END
-        );
-
-        assert!(has_project_specific_content(&with_markers));
-    }
-
-    #[test]
-    fn test_extract_project_content_no_markers_loom_only() {
-        let loom_only = r#"# Loom Orchestration - Repository Guide
-
-This repository uses **Loom** for AI-powered development."#;
-
-        assert!(extract_project_content(loom_only).is_none());
-    }
-
-    #[test]
-    fn test_extract_project_content_no_markers_project_only() {
-        let project_only = r#"# My Project
-
-This is my project documentation."#;
-
-        let result = extract_project_content(project_only);
-        assert!(result.is_some());
-        assert!(result.unwrap().contains("My Project"));
-    }
-
-    #[test]
-    fn test_extract_project_content_with_markers() {
-        let with_markers = format!(
-            r#"# My Project
-
-Project-specific content here.
-
-{}
-# Loom Orchestration
-Loom content here
-{}
-
-More project content after."#,
-            LOOM_SECTION_START, LOOM_SECTION_END
-        );
-
-        let result = extract_project_content(&with_markers);
-        assert!(result.is_some());
-        let extracted = result.unwrap();
-        assert!(extracted.contains("My Project"));
-        assert!(extracted.contains("Project-specific content"));
-        assert!(extracted.contains("More project content after"));
-        assert!(!extracted.contains("Loom Orchestration"));
-        assert!(!extracted.contains(LOOM_SECTION_START));
-    }
-
-    #[test]
     fn test_wrap_loom_content() {
         let content = "# Loom Orchestration\n\nLoom content here.";
         let wrapped = wrap_loom_content(content);
@@ -1909,7 +1711,7 @@ More project content after."#,
         )
         .unwrap();
 
-        // Create existing CLAUDE.md with project-specific content
+        // Create existing CLAUDE.md with project-specific content (no markers)
         fs::write(
             workspace.join("CLAUDE.md"),
             r#"# My Awesome Project
@@ -1922,11 +1724,11 @@ Run `cargo run` to start."#,
         )
         .unwrap();
 
-        // Run setup with force=true
+        // Run setup - Loom section should be appended at end
         let mut report = InitReport::default();
-        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
-        // Verify project content was preserved above Loom section
+        // Verify existing content was preserved and Loom section appended
         let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
         assert!(content.contains("My Awesome Project"));
         assert!(content.contains("amazing things with Rust"));
@@ -1934,10 +1736,73 @@ Run `cargo run` to start."#,
         assert!(content.contains(LOOM_SECTION_END));
         assert!(content.contains("Loom Orchestration"));
 
-        // Project content should come BEFORE Loom section
+        // Project content should come BEFORE Loom section (appended at end)
         let project_pos = content.find("My Awesome Project").unwrap();
         let loom_pos = content.find(LOOM_SECTION_START).unwrap();
         assert!(project_pos < loom_pos);
+
+        // No duplicate content
+        assert_eq!(content.matches("My Awesome Project").count(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_claude_md_append_when_no_markers() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with CLAUDE.md template
+        fs::create_dir_all(defaults.join(".loom")).unwrap();
+        fs::write(
+            defaults.join(".loom").join("CLAUDE.md"),
+            "# Loom Orchestration - Repository Guide\n\nLoom content here.",
+        )
+        .unwrap();
+
+        // Create existing CLAUDE.md WITHOUT markers (e.g., from previous install or manual creation)
+        fs::write(
+            workspace.join("CLAUDE.md"),
+            r#"# Lean Genius Project
+
+Formal mathematics in Lean 4.
+
+## Docker Build Safety
+
+WARNING: Never run `lake build` inside Docker - causes memory corruption.
+
+## Custom Agents
+
+- Erdos: Mathematical proof orchestrator
+- Aristotle: Automated theorem prover"#,
+        )
+        .unwrap();
+
+        // Run setup
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, true, &mut report).unwrap();
+
+        // Verify existing content was preserved at top
+        let content = fs::read_to_string(workspace.join("CLAUDE.md")).unwrap();
+        assert!(content.contains("Lean Genius Project"));
+        assert!(content.contains("Docker Build Safety"));
+        assert!(content.contains("Custom Agents"));
+
+        // Verify Loom section was appended at end with markers
+        assert!(content.contains(LOOM_SECTION_START));
+        assert!(content.contains(LOOM_SECTION_END));
+        assert!(content.contains("Loom Orchestration"));
+
+        // Verify order: project content comes BEFORE Loom section
+        let project_pos = content.find("Lean Genius Project").unwrap();
+        let loom_pos = content.find(LOOM_SECTION_START).unwrap();
+        assert!(project_pos < loom_pos);
+
+        // Verify no duplicate content or mangling
+        assert_eq!(content.matches("Lean Genius Project").count(), 1);
     }
 
     #[test]
