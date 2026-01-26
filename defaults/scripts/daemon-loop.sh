@@ -392,6 +392,58 @@ log_header
 init_metrics
 log "Metrics file initialized: $METRICS_FILE"
 
+# Initialize daemon state file with force_mode flag
+# This allows other roles (especially Champion) to detect force mode
+init_daemon_state() {
+    local timestamp
+    timestamp=$(date -Iseconds)
+    local force_mode_value="false"
+    if [[ -n "$FORCE_FLAG" ]]; then
+        force_mode_value="true"
+    fi
+
+    # If state file exists, update force_mode; otherwise create new state
+    if [[ -f "$STATE_FILE" ]]; then
+        local temp_file
+        temp_file=$(mktemp)
+        if jq --arg force_mode "$force_mode_value" \
+              --arg started_at "$timestamp" \
+              '.force_mode = ($force_mode == "true") | .started_at = $started_at | .running = true | .iteration = 0' \
+              "$STATE_FILE" > "$temp_file" 2>/dev/null; then
+            mv "$temp_file" "$STATE_FILE"
+        else
+            rm -f "$temp_file"
+            # Fall back to creating new state file
+            create_fresh_state "$force_mode_value" "$timestamp"
+        fi
+    else
+        create_fresh_state "$force_mode_value" "$timestamp"
+    fi
+}
+
+# Create a fresh daemon state file
+create_fresh_state() {
+    local force_mode_value="$1"
+    local timestamp="$2"
+    cat > "$STATE_FILE" <<EOF
+{
+  "started_at": "$timestamp",
+  "last_poll": null,
+  "running": true,
+  "iteration": 0,
+  "force_mode": $force_mode_value,
+  "shepherds": {},
+  "completed_issues": [],
+  "total_prs_merged": 0
+}
+EOF
+}
+
+init_daemon_state
+if [[ -n "$FORCE_FLAG" ]]; then
+    log "${YELLOW}Force mode enabled - stored in daemon-state.json${NC}"
+fi
+
 iteration=0
 consecutive_failures=0
 current_backoff=$POLL_INTERVAL
