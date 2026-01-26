@@ -404,9 +404,7 @@ graph TB
     MCP --> Tmux
 
     style CC fill:#f48fb1
-    style UI fill:#c5cae9
-    style Logs fill:#bbdefb
-    style Terms fill:#b3e5fc
+    style MCP fill:#c5cae9
     style Frontend fill:#fff9c4
     style Daemon fill:#c8e6c9
     style Tmux fill:#a5d6a7
