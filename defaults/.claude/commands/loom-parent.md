@@ -23,6 +23,41 @@ In parent mode, you do MINIMAL work:
 
 The iteration subagent handles ALL orchestration logic. You just spawn it.
 
+## Execution Modes
+
+The daemon automatically detects and uses the best available execution backend:
+
+| Mode | Priority | Detection | Description |
+|------|----------|-----------|-------------|
+| `mcp` | 1 (highest) | MCP tools available | Delegate to Tauri-managed terminals |
+| `tmux` | 2 | `tmux -L loom has-session` | Delegate to tmux-backed agent sessions |
+| `direct` | 3 (default) | Fallback | Spawn Task subagents directly |
+
+**Mode Selection Flow:**
+```
+IF Tauri app running (MCP heartbeat responds):
+    MODE = "mcp"      <- Best: Full UI integration
+ELIF tmux pool running (loom start has been run):
+    MODE = "tmux"     <- Good: Persistent, inspectable terminals
+ELSE:
+    MODE = "direct"   <- Fallback: Task subagents (opaque but functional)
+```
+
+**tmux Mode Benefits:**
+- Persistent terminals that survive daemon restarts
+- Inspectable via `loom attach shepherd-1`
+- Lower overhead than spawning new Task subagents
+- Output visible via `loom logs shepherd-1`
+
+**To enable tmux mode:**
+```bash
+# Start the tmux agent pool
+./loom start
+
+# Then run the daemon (will auto-detect tmux mode)
+/loom
+```
+
 ## Core Principles
 
 ### Fully Autonomous Operation
@@ -277,11 +312,21 @@ def parent_loop(force_mode=False, debug_mode=False):
     debug_flag = "--debug" if debug_mode else ""
     flags = f"{force_flag} {debug_flag}".strip()
 
+    # Detect execution mode for banner
+    execution_mode = detect_execution_mode(debug_mode)
+
     print("=" * 60)
     print("  LOOM DAEMON - SUBAGENT-PER-ITERATION MODE")
     print("=" * 60)
-    print(f"  Mode: {'FORCE' if force_mode else 'Normal'}")
+    print(f"  Force mode: {'ENABLED' if force_mode else 'disabled'}")
     print(f"  Debug: {'ENABLED' if debug_mode else 'disabled'}")
+    print(f"  Execution backend: {execution_mode.upper()}")
+    if execution_mode == "tmux":
+        print("    -> Using tmux agent pool (loom attach to inspect)")
+    elif execution_mode == "mcp":
+        print("    -> Using Tauri-managed terminals")
+    else:
+        print("    -> Using Task subagents (start 'loom start' for tmux mode)")
     print(f"  Poll interval: {POLL_INTERVAL}s")
     print("  Parent loop accumulates only iteration summaries")
     print("=" * 60)
@@ -446,19 +491,24 @@ For detailed state file format, see `loom-reference.md`.
 
 ## Example Session
 
+**With tmux pool (recommended):**
 ```
+$ ./loom start         # First, start the tmux agent pool
 $ claude
 > /loom
 
 ====================================================================
   LOOM DAEMON - SUBAGENT-PER-ITERATION MODE
 ====================================================================
-  Mode: Normal
+  Force mode: disabled
+  Debug: disabled
+  Execution backend: TMUX
+    -> Using tmux agent pool (loom attach to inspect)
   Poll interval: 120s
   Parent loop accumulates only iteration summaries
 ====================================================================
 
-Iteration 1: ready=5 building=0 shepherds=3/3 +shepherd=#1010 +shepherd=#1011 +shepherd=#1012 +guide +champion
+Iteration 1: mode=tmux ready=5 building=0 shepherds=3/3 +shepherd=#1010 +shepherd=#1011 +shepherd=#1012
 Iteration 2: ready=2 building=3 shepherds=3/3
 Iteration 3: ready=2 building=3 shepherds=3/3
 Iteration 4: ready=2 building=3 shepherds=3/3 pr=#1015
@@ -470,7 +520,27 @@ Graceful shutdown initiated...
   Cleanup complete
 ```
 
-**Notice**: Parent loop only shows compact summaries (~50-100 chars each).
+**Without tmux pool (direct mode fallback):**
+```
+$ claude
+> /loom
+
+====================================================================
+  LOOM DAEMON - SUBAGENT-PER-ITERATION MODE
+====================================================================
+  Force mode: disabled
+  Debug: disabled
+  Execution backend: DIRECT
+    -> Using Task subagents (start 'loom start' for tmux mode)
+  Poll interval: 120s
+  Parent loop accumulates only iteration summaries
+====================================================================
+
+Iteration 1: mode=direct ready=5 building=0 shepherds=3/3 +shepherd=#1010 +shepherd=#1011 +shepherd=#1012
+...
+```
+
+**Notice**: Parent loop only shows compact summaries (~50-100 chars each). The execution mode is shown on the first iteration only.
 
 ## Context Clearing
 

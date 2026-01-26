@@ -72,6 +72,9 @@ PROGRESS_DIR="$REPO_ROOT/.loom/progress"
 # Heartbeat staleness threshold in seconds (default: 2 minutes)
 HEARTBEAT_STALE_THRESHOLD="${LOOM_HEARTBEAT_STALE_THRESHOLD:-120}"
 
+# tmux socket name for agent pool
+TMUX_SOCKET="${LOOM_TMUX_SOCKET:-loom}"
+
 show_help() {
     cat <<EOF
 daemon-snapshot.sh - Consolidated daemon state snapshot
@@ -120,7 +123,8 @@ OUTPUT:
     - proposals: Proposal issue lists
     - prs: PR state lists
     - usage: Session usage from claude-monitor (if available)
-    - computed: Pre-computed decision values
+    - tmux_pool: tmux agent pool status (if available)
+    - computed: Pre-computed decision values (includes execution_mode)
     - config: Current threshold configuration
 
 EXAMPLE OUTPUT:
@@ -135,9 +139,16 @@ EXAMPLE OUTPUT:
         "hermit": [],
         "curated": []
       },
+      "tmux_pool": {
+        "available": true,
+        "sessions": ["loom-shepherd-1", "loom-shepherd-2"],
+        "shepherd_count": 2,
+        "execution_mode": "tmux"
+      },
       "computed": {
         "total_ready": 1,
         "needs_work_generation": false,
+        "execution_mode": "tmux",
         "recommended_actions": ["spawn_shepherds"]
       }
     }
@@ -631,6 +642,60 @@ read_shepherd_progress() {
 
 SHEPHERD_PROGRESS=$(read_shepherd_progress)
 
+# Detect tmux agent pool status
+detect_tmux_pool() {
+    local pool_json='{"available": false, "sessions": [], "shepherd_count": 0, "total_count": 0, "execution_mode": "direct"}'
+
+    # Check if tmux server is running with loom socket
+    if tmux -L "$TMUX_SOCKET" has-session 2>/dev/null; then
+        local sessions
+        sessions=$(tmux -L "$TMUX_SOCKET" list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+        if [[ -n "$sessions" ]]; then
+            local session_array="[]"
+            local shepherd_count=0
+            local total_count=0
+
+            while IFS= read -r session; do
+                if [[ -n "$session" ]]; then
+                    session_array=$(echo "$session_array" | jq --arg s "$session" '. + [$s]')
+                    ((total_count++))
+                    if [[ "$session" == *"shepherd"* ]]; then
+                        ((shepherd_count++))
+                    fi
+                fi
+            done <<< "$sessions"
+
+            # Determine execution mode
+            local exec_mode="direct"
+            if [[ $shepherd_count -gt 0 ]]; then
+                exec_mode="tmux"
+            fi
+
+            pool_json=$(jq -n \
+                --argjson available "true" \
+                --argjson sessions "$session_array" \
+                --argjson shepherd_count "$shepherd_count" \
+                --argjson total_count "$total_count" \
+                --arg execution_mode "$exec_mode" \
+                '{
+                    available: $available,
+                    sessions: $sessions,
+                    shepherd_count: $shepherd_count,
+                    total_count: $total_count,
+                    execution_mode: $execution_mode
+                }')
+        fi
+    fi
+
+    echo "$pool_json"
+}
+
+TMUX_POOL=$(detect_tmux_pool)
+TMUX_AVAILABLE=$(echo "$TMUX_POOL" | jq -r '.available')
+TMUX_SHEPHERD_COUNT=$(echo "$TMUX_POOL" | jq -r '.shepherd_count')
+TMUX_EXECUTION_MODE=$(echo "$TMUX_POOL" | jq -r '.execution_mode')
+
 # Count stale heartbeats for warnings
 STALE_HEARTBEAT_COUNT=$(echo "$SHEPHERD_PROGRESS" | jq '[.[] | select(.heartbeat_stale == true and .status == "working")] | length')
 
@@ -772,6 +837,10 @@ OUTPUT=$(jq -n \
     --argjson review_requested_count "$REVIEW_COUNT" \
     --argjson changes_requested_count "$CHANGES_COUNT" \
     --argjson ready_to_merge_count "$MERGE_COUNT" \
+    --argjson tmux_pool "$TMUX_POOL" \
+    --argjson tmux_available "$TMUX_AVAILABLE" \
+    --argjson tmux_shepherd_count "$TMUX_SHEPHERD_COUNT" \
+    --arg tmux_execution_mode "$TMUX_EXECUTION_MODE" \
     '{
         timestamp: $timestamp,
         pipeline: {
@@ -831,6 +900,7 @@ OUTPUT=$(jq -n \
             }
         },
         usage: ($usage + {healthy: $usage_healthy}),
+        tmux_pool: $tmux_pool,
         computed: {
             total_ready: $total_ready,
             total_building: $total_building,
@@ -851,7 +921,10 @@ OUTPUT=$(jq -n \
             prs_ready_to_merge: $ready_to_merge_count,
             champion_demand: $champion_demand,
             doctor_demand: $doctor_demand,
-            judge_demand: $judge_demand
+            judge_demand: $judge_demand,
+            execution_mode: $tmux_execution_mode,
+            tmux_available: $tmux_available,
+            tmux_shepherd_count: $tmux_shepherd_count
         },
         config: {
             issue_threshold: $issue_threshold,
