@@ -575,7 +575,7 @@ collect_metrics() {
 
     metrics_json=$(echo "$metrics_json" | jq --argjson cutoff "$cutoff_epoch" '
         .metrics = [.metrics[] | select(
-            (.timestamp | sub("Z$"; "+00:00") | fromdateiso8601) > $cutoff
+            (.timestamp | fromdateiso8601) > $cutoff
         )]
     ')
 
@@ -827,7 +827,7 @@ show_history() {
     local filtered
     filtered=$(echo "$metrics_json" | jq --argjson cutoff "$cutoff_epoch" '
         .metrics = [.metrics[] | select(
-            (.timestamp | sub("Z$"; "+00:00") | fromdateiso8601) > $cutoff
+            (.timestamp | fromdateiso8601) > $cutoff
         )]
     ')
 
