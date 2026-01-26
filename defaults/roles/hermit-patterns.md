@@ -1,0 +1,1 @@
+../.claude/commands/hermit-patterns.md
