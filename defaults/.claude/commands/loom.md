@@ -300,6 +300,12 @@ def loom_iterate(force_mode=False, debug_mode=False):
         for c in completions:
             debug(f"Completion detected: {c.agent_id} issue=#{c.issue} status={c.status}")
 
+    # 4b. Check support role completions (Guide, Champion, Doctor, Auditor)
+    # This updates their status from "running" to "idle" and sets last_completed
+    completed_support_roles = check_support_role_completions(state, debug_mode)
+    if completed_support_roles:
+        debug(f"Support roles completed: {completed_support_roles}")
+
     # 5. CRITICAL: Act on recommended_actions: promote_proposals (force mode only)
     # This auto-promotes architect/hermit/curated proposals to loom:issue in force mode
     promoted_count = 0
@@ -328,8 +334,9 @@ def loom_iterate(force_mode=False, debug_mode=False):
     if needs_work_gen and not triggered_generation["architect"] and not triggered_generation["hermit"]:
         debug(f"Work generation needed but not triggered: architect_cooldown_ok={architect_cooldown_ok}, hermit_cooldown_ok={hermit_cooldown_ok}")
 
-    # 8. Auto-ensure support roles
-    ensured_roles = auto_ensure_support_roles(state, debug_mode)
+    # 8. CRITICAL: Act on recommended_actions: trigger support roles
+    # Uses trigger_guide, trigger_champion, trigger_doctor, trigger_auditor from snapshot
+    ensured_roles = auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode)
 
     # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
@@ -347,7 +354,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
     save_daemon_state(state)
 
     # 12. Return compact summary (ONE LINE)
-    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, promoted_count, stuck_count, recovered_count)
+    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, ensured_roles, promoted_count, stuck_count, recovered_count)
     debug(f"Iteration {iteration} completed - {summary}")
     return summary
 ```
@@ -720,65 +727,42 @@ Complete one simplification analysis iteration.""",
 
 ### Support Role Management (Automatic)
 
-The daemon AUTOMATICALLY ensures Guide, Champion, and Doctor keep running:
+The daemon AUTOMATICALLY ensures Guide, Champion, Doctor, and Auditor keep running.
+
+**CRITICAL**: The iteration MUST use the `trigger_*` recommended actions from `daemon-snapshot.sh`.
+The snapshot calculates when each support role needs respawning based on:
+- `status != "running"` AND
+- `idle_time > ROLE_INTERVAL` OR `never_run_before`
 
 ```python
-# This happens automatically every iteration
-def auto_ensure_support_roles():
-    # Guide - backlog triage (runs every 15 min)
-    if not guide_is_running() or guide_idle_time() > GUIDE_INTERVAL:
-        result = Task(
-            description="Guide backlog triage",
-            prompt="""You must invoke the Skill tool to execute the guide role.
+# This happens automatically every iteration - uses recommended_actions from snapshot
+def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode):
+    """Automatically keep Guide, Champion, Doctor, and Auditor running.
 
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
+    Uses the trigger_* recommended actions from daemon-snapshot.sh which has
+    already calculated idle times and determined which roles need respawning.
+    """
+    ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False}
 
-Skill(skill="guide")
+    # Act on recommended actions from daemon-snapshot.sh
+    if "trigger_guide" in recommended_actions:
+        ensured_roles["guide"] = trigger_support_role("guide", "Guide backlog triage", state, debug_mode)
 
-Complete one triage iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Guide"):
-            record_support_role("guide", result.task_id, result.output_file)
-            print("AUTO-SPAWNED Guide (verified)")
+    if "trigger_champion" in recommended_actions:
+        ensured_roles["champion"] = trigger_support_role("champion", "Champion PR merge", state, debug_mode)
 
-    # Champion - PR merging (runs every 10 min)
-    if not champion_is_running() or champion_idle_time() > CHAMPION_INTERVAL:
-        result = Task(
-            description="Champion PR merge",
-            prompt="""You must invoke the Skill tool to execute the champion role.
+    if "trigger_doctor" in recommended_actions:
+        ensured_roles["doctor"] = trigger_support_role("doctor", "Doctor PR conflict resolution", state, debug_mode)
 
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
+    if "trigger_auditor" in recommended_actions:
+        ensured_roles["auditor"] = trigger_support_role("auditor", "Auditor main branch validation", state, debug_mode)
 
-Skill(skill="champion")
-
-Complete one PR evaluation and merge iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Champion"):
-            record_support_role("champion", result.task_id, result.output_file)
-            print("AUTO-SPAWNED Champion (verified)")
-
-    # Doctor - PR conflict resolution (runs every 5 min)
-    if not doctor_is_running() or doctor_idle_time() > DOCTOR_INTERVAL:
-        result = Task(
-            description="Doctor PR conflict resolution",
-            prompt="""You must invoke the Skill tool to execute the doctor role.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
-
-Skill(skill="doctor")
-
-Complete one PR conflict resolution iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Doctor"):
-            record_support_role("doctor", result.task_id, result.output_file)
-            print("AUTO-SPAWNED Doctor (verified)")
+    return ensured_roles
 ```
+
+The `trigger_support_role()` helper spawns the role using the Task tool with Skill invocation,
+verifies the spawn succeeded, and records the task in daemon state. See "Step 6 Detail" for
+the full implementation.
 
 ### Checking Subagent Status (Non-blocking)
 
@@ -1397,135 +1381,247 @@ jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
 
 ### Step 6 Detail: Auto-Ensure Support Roles
 
+**CRITICAL**: The iteration MUST act on the `trigger_*` recommended actions from `daemon-snapshot.sh`.
+The snapshot calculates when each support role needs respawning based on:
+- `status != "running"` AND
+- `idle_time > ROLE_INTERVAL` OR `never_run_before`
+
 ```python
-def auto_ensure_support_roles(debug_mode=False):
-    """Automatically keep Guide, Champion, and Doctor running - NO human decision required."""
+def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False):
+    """Automatically keep Guide, Champion, Doctor, and Auditor running.
+
+    Uses the trigger_* recommended actions from daemon-snapshot.sh which has
+    already calculated idle times and determined which roles need respawning.
+
+    Args:
+        state: Daemon state dict
+        snapshot_data: Output from daemon-snapshot.sh
+        recommended_actions: List of recommended actions from snapshot
+        debug_mode: Enable debug logging
+
+    Returns:
+        Dict of {role_name: True/False} indicating which roles were triggered
+    """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    debug("Checking support roles: Guide, Champion, Doctor")
+    ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False}
+
+    # Extract support role status from snapshot for logging
+    support_roles = snapshot_data.get("support_roles", {})
+
+    debug("Checking support roles via recommended_actions")
+    debug(f"Recommended actions: {recommended_actions}")
 
     # Guide - backlog triage
-    guide_running = is_support_role_running("guide")
-    guide_idle = get_support_role_idle_time("guide")
+    guide_info = support_roles.get("guide", {})
+    guide_status = guide_info.get("status", "idle")
+    guide_idle = guide_info.get("idle_seconds", 0)
 
-    debug(f"Guide status: running={guide_running}, idle={guide_idle}s (interval={GUIDE_INTERVAL}s)")
+    debug(f"Guide status: status={guide_status}, idle={guide_idle}s, needs_trigger={guide_info.get('needs_trigger', False)}")
 
-    if not guide_running or guide_idle > GUIDE_INTERVAL:
-        result = Task(
-            description="Guide backlog triage",
-            prompt="""You must invoke the Skill tool to execute the guide role.
+    if "trigger_guide" in recommended_actions:
+        ensured_roles["guide"] = trigger_support_role("guide", "Guide backlog triage", state, debug_mode)
+
+    # Champion - PR merging
+    champion_info = support_roles.get("champion", {})
+    champion_status = champion_info.get("status", "idle")
+    champion_idle = champion_info.get("idle_seconds", 0)
+
+    debug(f"Champion status: status={champion_status}, idle={champion_idle}s, needs_trigger={champion_info.get('needs_trigger', False)}")
+
+    if "trigger_champion" in recommended_actions:
+        ensured_roles["champion"] = trigger_support_role("champion", "Champion PR merge", state, debug_mode)
+
+    # Doctor - PR conflict resolution
+    doctor_info = support_roles.get("doctor", {})
+    doctor_status = doctor_info.get("status", "idle")
+    doctor_idle = doctor_info.get("idle_seconds", 0)
+
+    debug(f"Doctor status: status={doctor_status}, idle={doctor_idle}s, needs_trigger={doctor_info.get('needs_trigger', False)}")
+
+    if "trigger_doctor" in recommended_actions:
+        ensured_roles["doctor"] = trigger_support_role("doctor", "Doctor PR conflict resolution", state, debug_mode)
+
+    # Auditor - main branch validation
+    auditor_info = support_roles.get("auditor", {})
+    auditor_status = auditor_info.get("status", "idle")
+    auditor_idle = auditor_info.get("idle_seconds", 0)
+
+    debug(f"Auditor status: status={auditor_status}, idle={auditor_idle}s, needs_trigger={auditor_info.get('needs_trigger', False)}")
+
+    if "trigger_auditor" in recommended_actions:
+        ensured_roles["auditor"] = trigger_support_role("auditor", "Auditor main branch validation", state, debug_mode)
+
+    return ensured_roles
+
+
+def trigger_support_role(role_name, description, state, debug_mode=False):
+    """Spawn a support role using Task tool with Skill invocation.
+
+    Args:
+        role_name: Name of the role (guide, champion, doctor, auditor)
+        description: Human-readable description for logging
+        state: Daemon state dict to record the spawn
+        debug_mode: Enable debug logging
+
+    Returns:
+        True if spawn verified and recorded, False otherwise
+    """
+
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    role_prompts = {
+        "guide": """You must invoke the Skill tool to execute the guide role.
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
 
 Skill(skill="guide")
 
 Complete one triage iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Guide"):
-            record_support_role("guide", result.task_id, result.output_file)
-            reason = "not running" if not guide_running else f"idle {guide_idle}s > {GUIDE_INTERVAL}s"
-            print(f"  AUTO-SPAWNED: Guide ({reason}, verified)")
-            debug(f"Guide spawned: task_id={result.task_id}, output={result.output_file}")
-        else:
-            print(f"  SPAWN FAILED: Guide - verification failed")
-            debug(f"Guide spawn failed verification, not recording task_id")
-    else:
-        print(f"  Guide: running (idle {guide_idle}s)")
 
-    # Champion - PR merging
-    champion_running = is_support_role_running("champion")
-    champion_idle = get_support_role_idle_time("champion")
-
-    debug(f"Champion status: running={champion_running}, idle={champion_idle}s (interval={CHAMPION_INTERVAL}s)")
-
-    if not champion_running or champion_idle > CHAMPION_INTERVAL:
-        result = Task(
-            description="Champion PR merge",
-            prompt="""You must invoke the Skill tool to execute the champion role.
+        "champion": """You must invoke the Skill tool to execute the champion role.
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
 
 Skill(skill="champion")
 
 Complete one PR evaluation and merge iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Champion"):
-            record_support_role("champion", result.task_id, result.output_file)
-            reason = "not running" if not champion_running else f"idle {champion_idle}s > {CHAMPION_INTERVAL}s"
-            print(f"  AUTO-SPAWNED: Champion ({reason}, verified)")
-            debug(f"Champion spawned: task_id={result.task_id}, output={result.output_file}")
-        else:
-            print(f"  SPAWN FAILED: Champion - verification failed")
-            debug(f"Champion spawn failed verification, not recording task_id")
-    else:
-        print(f"  Champion: running (idle {champion_idle}s)")
 
-    # Doctor - PR conflict resolution
-    doctor_running = is_support_role_running("doctor")
-    doctor_idle = get_support_role_idle_time("doctor")
-
-    debug(f"Doctor status: running={doctor_running}, idle={doctor_idle}s (interval={DOCTOR_INTERVAL}s)")
-
-    if not doctor_running or doctor_idle > DOCTOR_INTERVAL:
-        result = Task(
-            description="Doctor PR conflict resolution",
-            prompt="""You must invoke the Skill tool to execute the doctor role.
+        "doctor": """You must invoke the Skill tool to execute the doctor role.
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
 
 Skill(skill="doctor")
 
 Complete one PR conflict resolution iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Doctor"):
-            record_support_role("doctor", result.task_id, result.output_file)
-            reason = "not running" if not doctor_running else f"idle {doctor_idle}s > {DOCTOR_INTERVAL}s"
-            print(f"  AUTO-SPAWNED: Doctor ({reason}, verified)")
-            debug(f"Doctor spawned: task_id={result.task_id}, output={result.output_file}")
-        else:
-            print(f"  SPAWN FAILED: Doctor - verification failed")
-            debug(f"Doctor spawn failed verification, not recording task_id")
-    else:
-        print(f"  Doctor: running (idle {doctor_idle}s)")
 
-    # Auditor - main branch validation (runs every 10 min)
-    auditor_running = is_support_role_running("auditor")
-    auditor_idle = get_support_role_idle_time("auditor")
-
-    debug(f"Auditor status: running={auditor_running}, idle={auditor_idle}s (interval={AUDITOR_INTERVAL}s)")
-
-    if not auditor_running or auditor_idle > AUDITOR_INTERVAL:
-        result = Task(
-            description="Auditor main branch validation",
-            prompt="""You must invoke the Skill tool to execute the auditor role.
+        "auditor": """You must invoke the Skill tool to execute the auditor role.
 
 IMPORTANT: Do NOT use CLI commands like 'claude --skill=auditor'. Use the Skill tool:
 
 Skill(skill="auditor")
 
-Complete one main branch validation iteration.""",
-            run_in_background=True
-        )
-        # Verify spawn before recording
-        if verify_task_spawn(result, "Auditor"):
-            record_support_role("auditor", result.task_id, result.output_file)
-            reason = "not running" if not auditor_running else f"idle {auditor_idle}s > {AUDITOR_INTERVAL}s"
-            print(f"  AUTO-SPAWNED: Auditor ({reason}, verified)")
-            debug(f"Auditor spawned: task_id={result.task_id}, output={result.output_file}")
-        else:
-            print(f"  SPAWN FAILED: Auditor - verification failed")
-            debug(f"Auditor spawn failed verification, not recording task_id")
+Complete one main branch validation iteration."""
+    }
+
+    prompt = role_prompts.get(role_name)
+    if not prompt:
+        debug(f"Unknown role: {role_name}")
+        return False
+
+    result = Task(
+        description=description,
+        prompt=prompt,
+        run_in_background=True
+    )
+
+    # Verify spawn before recording
+    if verify_task_spawn(result, role_name.capitalize()):
+        record_support_role(role_name, result.task_id, result.output_file, state)
+        print(f"  AUTO-SPAWNED: {role_name.capitalize()} (verified)")
+        debug(f"{role_name.capitalize()} spawned: task_id={result.task_id}, output={result.output_file}")
+        return True
     else:
-        print(f"  Auditor: running (idle {auditor_idle}s)")
+        print(f"  SPAWN FAILED: {role_name.capitalize()} - verification failed")
+        debug(f"{role_name.capitalize()} spawn failed verification, not recording task_id")
+        return False
+
+
+def record_support_role(role_name, task_id, output_file, state):
+    """Record support role spawn in daemon state.
+
+    Args:
+        role_name: Name of the role (guide, champion, doctor, auditor)
+        task_id: Task ID from Task() spawn
+        output_file: Path to task output file
+        state: Daemon state dict to update
+    """
+    if "support_roles" not in state:
+        state["support_roles"] = {}
+
+    if role_name not in state["support_roles"]:
+        state["support_roles"][role_name] = {}
+
+    now_iso = now()  # ISO 8601 timestamp
+
+    state["support_roles"][role_name].update({
+        "task_id": task_id,
+        "output_file": output_file,
+        "started_at": now_iso,
+        "status": "running",
+        "last_spawn": now_iso
+    })
+
+
+def check_support_role_completions(state, debug_mode=False):
+    """Check if any support roles have completed and update their state.
+
+    This should be called during each iteration to detect when support roles
+    finish their work and transition them to "idle" status with updated
+    last_completed timestamps.
+
+    Args:
+        state: Daemon state dict
+        debug_mode: Enable debug logging
+
+    Returns:
+        List of role names that completed this iteration
+    """
+
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    completed_roles = []
+
+    if "support_roles" not in state:
+        return completed_roles
+
+    now_iso = now()  # ISO 8601 timestamp
+
+    for role_name, role_info in state["support_roles"].items():
+        # Skip roles that aren't running
+        if role_info.get("status") != "running":
+            continue
+
+        task_id = role_info.get("task_id")
+        if not task_id:
+            continue
+
+        try:
+            # Non-blocking check for completion
+            check = TaskOutput(task_id=task_id, block=False, timeout=1000)
+
+            if check.status == "completed":
+                # Role completed - update state
+                role_info["status"] = "idle"
+                role_info["last_completed"] = now_iso
+                role_info["task_id"] = None  # Clear task ID
+                role_info["output_file"] = None
+
+                completed_roles.append(role_name)
+                debug(f"{role_name.capitalize()} completed (task {task_id})")
+
+            elif check.status == "failed":
+                # Role failed - mark as idle so it can be respawned
+                role_info["status"] = "idle"
+                role_info["last_completed"] = now_iso
+                role_info["last_error"] = "task_failed"
+                role_info["task_id"] = None
+                role_info["output_file"] = None
+
+                debug(f"{role_name.capitalize()} failed (task {task_id})")
+
+        except Exception as e:
+            debug(f"Error checking {role_name} status: {e}")
+            # On error, assume still running - don't change state
+
+    return completed_roles
 ```
 
 ### Graceful Shutdown
