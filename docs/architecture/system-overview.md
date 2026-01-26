@@ -387,10 +387,8 @@ graph TB
         CC[Claude Code Session]
     end
 
-    subgraph "MCP Servers"
-        UI[mcp-loom-ui<br/>State & Logs]
-        Logs[mcp-loom-logs<br/>Log Files]
-        Terms[mcp-loom-terminals<br/>Terminal Mgmt]
+    subgraph "MCP Server"
+        MCP[mcp-loom<br/>Unified Server]
     end
 
     subgraph "Loom App"
@@ -399,19 +397,14 @@ graph TB
         Tmux[tmux Sessions<br/>/tmp/loom-*.out]
     end
 
-    CC --> UI
-    CC --> Logs
-    CC --> Terms
+    CC --> MCP
 
-    UI --> Frontend
-    Logs --> Daemon
-    Logs --> Tmux
-    Terms --> Daemon
+    MCP --> Frontend
+    MCP --> Daemon
+    MCP --> Tmux
 
     style CC fill:#f48fb1
-    style UI fill:#c5cae9
-    style Logs fill:#bbdefb
-    style Terms fill:#b3e5fc
+    style MCP fill:#c5cae9
     style Frontend fill:#fff9c4
     style Daemon fill:#c8e6c9
     style Tmux fill:#a5d6a7
@@ -490,10 +483,7 @@ loom/
 │   ├── api/                      # API reference
 │   └── architecture/             # Architecture diagrams
 │
-└── mcp-*/                        # MCP server packages
-    ├── mcp-loom-ui/
-    ├── mcp-loom-logs/
-    └── mcp-loom-terminals/
+└── mcp-loom/                     # Unified MCP server package
 ```
 
 ## Key Design Patterns

@@ -1,13 +1,13 @@
-# MCP Loom Terminals Server API Reference
+# MCP Loom Terminal Tools API Reference
 
-The `mcp-loom-terminals` server provides tools for interacting with Loom terminal sessions via the daemon IPC interface and terminal output logs.
+Terminal tools for interacting with Loom terminal sessions via the daemon IPC interface and terminal output logs. These tools are part of the unified `mcp-loom` server.
 
 ## Server Information
 
-- **Name**: `loom-terminals`
-- **Version**: `0.1.0`
-- **Package**: `mcp-loom-terminals`
-- **Entry Point**: `mcp-loom-terminals/src/index.ts`
+- **Name**: `loom` (unified server)
+- **Version**: `0.3.0`
+- **Package**: `mcp-loom`
+- **Source**: `mcp-loom/src/tools/terminals.ts`
 
 ## Overview
 
@@ -77,7 +77,7 @@ No active terminals found. Either Loom hasn't been started yet, or all terminals
 **Example:**
 ```typescript
 // List all terminals
-mcp__loom-terminals__list_terminals()
+mcp__loom__list_terminals()
 ```
 
 **Use Cases:**
@@ -126,13 +126,13 @@ Welcome! I'm Claude Code, ready to help with your codebase.
 **Example:**
 ```typescript
 // Read last 50 lines from terminal-2
-mcp__loom-terminals__get_terminal_output({
+mcp__loom__get_terminal_output({
   terminal_id: "terminal-2",
   lines: 50
 })
 
 // Read default 100 lines
-mcp__loom-terminals__get_terminal_output({
+mcp__loom__get_terminal_output({
   terminal_id: "terminal-1"
 })
 ```
@@ -144,7 +144,7 @@ mcp__loom-terminals__get_terminal_output({
 - Verifying terminal is responsive
 - Reading agent responses
 
-**Note:** This reads from `/tmp/loom-{terminal_id}.out` files, which are the same files accessed by `mcp-loom-logs`.
+**Note:** This reads from `/tmp/loom-{terminal_id}.out` files, which are the same files accessed by the log tools.
 
 ---
 
@@ -200,10 +200,10 @@ No terminal is currently selected in Loom.
 **Example:**
 ```typescript
 // Get selected terminal with default 50 lines of output
-mcp__loom-terminals__get_selected_terminal()
+mcp__loom__get_selected_terminal()
 
 // Get selected terminal with 100 lines of output
-mcp__loom-terminals__get_selected_terminal({ lines: 100 })
+mcp__loom__get_selected_terminal({ lines: 100 })
 ```
 
 **Use Cases:**
@@ -258,19 +258,19 @@ Input sent successfully
 **Example:**
 ```typescript
 // Send a command with Enter
-mcp__loom-terminals__send_terminal_input({
+mcp__loom__send_terminal_input({
   terminal_id: "terminal-1",
   input: "git status\n"
 })
 
 // Send Ctrl+C to interrupt
-mcp__loom-terminals__send_terminal_input({
+mcp__loom__send_terminal_input({
   terminal_id: "terminal-2",
   input: "\u0003"
 })
 
 // Send multi-line input
-mcp__loom-terminals__send_terminal_input({
+mcp__loom__send_terminal_input({
   terminal_id: "terminal-3",
   input: "cat <<EOF\nHello\nWorld\nEOF\n"
 })
@@ -329,7 +329,7 @@ MCP command 'start_autonomous_mode' written but no acknowledgment received after
 **Example:**
 ```typescript
 // Start autonomous mode for all terminals
-mcp__loom-terminals__start_autonomous_mode()
+mcp__loom__start_autonomous_mode()
 ```
 
 **Use Cases:**
@@ -382,7 +382,7 @@ MCP command 'stop_autonomous_mode' written but no acknowledgment received after 
 **Example:**
 ```typescript
 // Stop autonomous mode
-mcp__loom-terminals__stop_autonomous_mode()
+mcp__loom__stop_autonomous_mode()
 ```
 
 **Use Cases:**
@@ -437,7 +437,7 @@ MCP command 'launch_interval:terminal-2' acknowledged but execution failed...
 **Example:**
 ```typescript
 // Trigger interval prompt for terminal-2
-mcp__loom-terminals__launch_interval({
+mcp__loom__launch_interval({
   terminal_id: "terminal-2"
 })
 ```
@@ -449,7 +449,7 @@ mcp__loom-terminals__launch_interval({
 - On-demand agent activation
 - Integration testing
 
-**Note:** This is similar to `trigger_run_now` in `mcp-loom-ui` but available in the terminals server for convenience.
+**Note:** This is similar to `trigger_run_now` in the UI tools but available in the terminals tools for convenience.
 
 ---
 
@@ -477,11 +477,11 @@ mcp__loom-terminals__launch_interval({
 
 ```typescript
 // 1. List all terminals to find IDs
-const terminals = await mcp__loom-terminals__list_terminals();
+const terminals = await mcp__loom__list_terminals();
 // Parse output to extract terminal IDs
 
 // 2. Send a command to a specific terminal
-await mcp__loom-terminals__send_terminal_input({
+await mcp__loom__send_terminal_input({
   terminal_id: "terminal-2",
   input: "gh issue list --state=open\n"
 });
@@ -490,7 +490,7 @@ await mcp__loom-terminals__send_terminal_input({
 await new Promise(resolve => setTimeout(resolve, 2000));
 
 // 4. Read terminal output to see results
-const output = await mcp__loom-terminals__get_terminal_output({
+const output = await mcp__loom__get_terminal_output({
   terminal_id: "terminal-2",
   lines: 50
 });
@@ -500,12 +500,12 @@ const output = await mcp__loom-terminals__get_terminal_output({
 
 ```typescript
 // 1. Get currently selected terminal
-const selected = await mcp__loom-terminals__get_selected_terminal();
+const selected = await mcp__loom__get_selected_terminal();
 // Parse to find terminal ID
 
 // 2. Periodically check output
 setInterval(async () => {
-  const output = await mcp__loom-terminals__get_terminal_output({
+  const output = await mcp__loom__get_terminal_output({
     terminal_id: selectedId,
     lines: 20
   });
@@ -518,7 +518,7 @@ setInterval(async () => {
 
 ```typescript
 // 1. Send initial prompt
-await mcp__loom-terminals__send_terminal_input({
+await mcp__loom__send_terminal_input({
   terminal_id: "terminal-1",
   input: "Please list all TODO comments in the codebase\n"
 });
@@ -527,13 +527,13 @@ await mcp__loom-terminals__send_terminal_input({
 await new Promise(resolve => setTimeout(resolve, 3000));
 
 // 3. Read response
-const response = await mcp__loom-terminals__get_terminal_output({
+const response = await mcp__loom__get_terminal_output({
   terminal_id: "terminal-1",
   lines: 50
 });
 
 // 4. Send follow-up
-await mcp__loom-terminals__send_terminal_input({
+await mcp__loom__send_terminal_input({
   terminal_id: "terminal-1",
   input: "Now create a GitHub issue for the highest priority TODO\n"
 });
@@ -543,13 +543,13 @@ await mcp__loom-terminals__send_terminal_input({
 
 ```typescript
 // Stop a runaway agent or process
-await mcp__loom-terminals__send_terminal_input({
+await mcp__loom__send_terminal_input({
   terminal_id: "terminal-3",
   input: "\u0003"  // Ctrl+C
 });
 
 // Verify it stopped
-const output = await mcp__loom-terminals__get_terminal_output({
+const output = await mcp__loom__get_terminal_output({
   terminal_id: "terminal-3",
   lines: 10
 });
@@ -560,12 +560,12 @@ const output = await mcp__loom-terminals__get_terminal_output({
 
 ```typescript
 // 1. List terminals to check they exist
-const terminals = await mcp__loom-terminals__list_terminals();
+const terminals = await mcp__loom__list_terminals();
 // Should show all expected terminals
 
 // 2. Check each terminal's output for successful launch
 for (const terminalId of ["terminal-2", "terminal-3", "terminal-4"]) {
-  const output = await mcp__loom-terminals__get_terminal_output({
+  const output = await mcp__loom__get_terminal_output({
     terminal_id: terminalId,
     lines: 30
   });

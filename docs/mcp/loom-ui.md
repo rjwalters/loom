@@ -1,13 +1,13 @@
-# MCP Loom UI Server API Reference
+# MCP Loom UI Tools API Reference
 
-The `mcp-loom-ui` server provides tools for interacting with the Loom application's UI layer, console logs, and workspace state.
+UI tools for interacting with the Loom application's UI layer, console logs, and workspace state. These tools are part of the unified `mcp-loom` server.
 
 ## Server Information
 
-- **Name**: `loom-ui`
-- **Version**: `0.1.0`
-- **Package**: `mcp-loom-ui`
-- **Entry Point**: `mcp-loom-ui/src/index.ts`
+- **Name**: `loom` (unified server)
+- **Version**: `0.3.0`
+- **Package**: `mcp-loom`
+- **Source**: `mcp-loom/src/tools/ui.ts`
 
 ## Overview
 
@@ -52,10 +52,10 @@ Plain text containing the last N lines from `~/.loom/console.log`.
 **Example:**
 ```typescript
 // Read last 50 lines
-mcp__loom-ui__read_console_log({ lines: 50 })
+mcp__loom__read_console_log({ lines: 50 })
 
 // Read default 100 lines
-mcp__loom-ui__read_console_log()
+mcp__loom__read_console_log()
 ```
 
 **Use Cases:**
@@ -103,7 +103,7 @@ JSON string containing the workspace state.
 **Example:**
 ```typescript
 // Read state file
-mcp__loom-ui__read_state_file()
+mcp__loom__read_state_file()
 ```
 
 **Use Cases:**
@@ -156,7 +156,7 @@ JSON string containing the workspace configuration.
 **Example:**
 ```typescript
 // Read config file
-mcp__loom-ui__read_config_file()
+mcp__loom__read_config_file()
 ```
 
 **Use Cases:**
@@ -211,7 +211,7 @@ JSON object with heartbeat information.
 **Example:**
 ```typescript
 // Check if app is running
-mcp__loom-ui__get_heartbeat()
+mcp__loom__get_heartbeat()
 ```
 
 **Use Cases:**
@@ -263,20 +263,20 @@ Absolute path to a randomly selected file from the workspace.
 **Example:**
 ```typescript
 // Get any random file (default behavior)
-mcp__loom-ui__get_random_file()
+mcp__loom__get_random_file()
 
 // Get random TypeScript file from src/
-mcp__loom-ui__get_random_file({
+mcp__loom__get_random_file({
   includePatterns: ["src/**/*.ts"]
 })
 
 // Get random file, excluding test files
-mcp__loom-ui__get_random_file({
+mcp__loom__get_random_file({
   excludePatterns: ["**/*.test.ts", "**/*.spec.ts"]
 })
 
 // Get random Rust file
-mcp__loom-ui__get_random_file({
+mcp__loom__get_random_file({
   includePatterns: ["**/*.rs"]
 })
 ```
@@ -333,7 +333,7 @@ Status message indicating the command was written to the MCP command file.
 **Example:**
 ```typescript
 // Start engine with existing config (shows confirmation)
-mcp__loom-ui__trigger_start()
+mcp__loom__trigger_start()
 ```
 
 **Use Cases:**
@@ -371,7 +371,7 @@ Same as `trigger_start` but:
 **Example:**
 ```typescript
 // Start engine without confirmation (automated testing)
-mcp__loom-ui__trigger_force_start()
+mcp__loom__trigger_force_start()
 ```
 
 **Use Cases:**
@@ -404,10 +404,10 @@ Status message indicating the command was written to the MCP command file.
 **Two-Step Reset Workflow:**
 ```typescript
 // Step 1: Reset config to defaults
-mcp__loom-ui__trigger_factory_reset()
+mcp__loom__trigger_factory_reset()
 
 // Step 2: Start engine with new config
-mcp__loom-ui__trigger_force_start()
+mcp__loom__trigger_force_start()
 ```
 
 **Error Conditions:**
@@ -418,7 +418,7 @@ mcp__loom-ui__trigger_force_start()
 **Example:**
 ```typescript
 // Reset to factory defaults (shows confirmation)
-mcp__loom-ui__trigger_factory_reset()
+mcp__loom__trigger_factory_reset()
 ```
 
 **Use Cases:**
@@ -455,21 +455,21 @@ mcp__loom-ui__trigger_factory_reset()
 
 ```typescript
 // 1. Check app is running
-const heartbeat = await mcp__loom-ui__get_heartbeat();
+const heartbeat = await mcp__loom__get_heartbeat();
 // Verify status is "healthy" or "active"
 
 // 2. Trigger factory reset
-await mcp__loom-ui__trigger_factory_reset();
+await mcp__loom__trigger_factory_reset();
 
 // 3. Trigger start without confirmation
-await mcp__loom-ui__trigger_force_start();
+await mcp__loom__trigger_force_start();
 
 // 4. Monitor console logs
-const logs = await mcp__loom-ui__read_console_log({ lines: 200 });
+const logs = await mcp__loom__read_console_log({ lines: 200 });
 // Look for agent launch messages
 
 // 5. Verify state
-const state = await mcp__loom-ui__read_state_file();
+const state = await mcp__loom__read_state_file();
 // Check all terminals created with correct IDs
 ```
 
@@ -477,15 +477,15 @@ const state = await mcp__loom-ui__read_state_file();
 
 ```typescript
 // 1. Read recent console logs
-const logs = await mcp__loom-ui__read_console_log({ lines: 100 });
+const logs = await mcp__loom__read_console_log({ lines: 100 });
 // Look for errors or warnings
 
 // 2. Check terminal state
-const state = await mcp__loom-ui__read_state_file();
+const state = await mcp__loom__read_state_file();
 // Verify terminals have worktreePath set
 
 // 3. Check configuration
-const config = await mcp__loom-ui__read_config_file();
+const config = await mcp__loom__read_config_file();
 // Verify role files and worker types
 ```
 
@@ -493,13 +493,13 @@ const config = await mcp__loom-ui__read_config_file();
 
 ```typescript
 // Check if app is responsive
-const heartbeat = await mcp__loom-ui__get_heartbeat();
+const heartbeat = await mcp__loom__get_heartbeat();
 
 if (heartbeat.status === "not_running") {
   // App needs to be started
 } else if (heartbeat.status === "stale") {
   // App may have frozen - check logs
-  const logs = await mcp__loom-ui__read_console_log();
+  const logs = await mcp__loom__read_console_log();
 }
 ```
 

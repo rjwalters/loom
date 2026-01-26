@@ -697,11 +697,11 @@ Health check.
 
 ## MCP Server APIs
 
-Loom provides three MCP servers for AI-powered testing and debugging. See [MCP Documentation](../mcp/README.md) for complete API reference.
+Loom provides a unified MCP server (`mcp-loom`) for AI-powered testing and debugging. See [MCP Documentation](../mcp/README.md) for complete API reference.
 
 ### Quick Reference
 
-**mcp-loom-ui:**
+**UI Tools:**
 - `read_console_log` - Frontend console logs
 - `read_state_file` - Application state
 - `read_config_file` - Terminal configurations
@@ -709,13 +709,13 @@ Loom provides three MCP servers for AI-powered testing and debugging. See [MCP D
 - `trigger_factory_reset` - Reset to defaults
 - `get_heartbeat` - Health status
 
-**mcp-loom-logs:**
+**Log Tools:**
 - `tail_daemon_log` - Daemon logs
 - `tail_tauri_log` - Tauri logs
 - `list_terminal_logs` - List terminal logs
 - `tail_terminal_log` - Terminal-specific logs
 
-**mcp-loom-terminals:**
+**Terminal Tools:**
 - `list_terminals` - All terminals
 - `get_selected_terminal` - Primary terminal
 - `get_terminal_output` - Terminal output

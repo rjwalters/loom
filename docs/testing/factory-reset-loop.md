@@ -15,10 +15,10 @@ This document describes the comprehensive testing procedure for validating Loom'
 
 ### Required Tools
 
-- **MCP Servers**: Three MCP servers provide comprehensive observability
-  - `mcp-loom-ui`: UI interaction and state inspection
-  - `mcp-loom-logs`: Log file monitoring (daemon, Tauri, terminal output)
-  - `mcp-loom-terminals`: Direct terminal IPC control
+- **MCP Server**: Unified `mcp-loom` server provides comprehensive observability
+  - UI tools: UI interaction and state inspection
+  - Log tools: Log file monitoring (daemon, Tauri, terminal output)
+  - Terminal tools: Direct terminal IPC control
 
 - **Logging Infrastructure**: Structured JSON logs for debugging
   - Frontend console: `~/.loom/console.log`
@@ -47,27 +47,22 @@ pnpm install
    cat .mcp.json
    ```
 
-   Expected output should show three MCP servers configured:
-   - `loom-ui`: UI interaction and state inspection
-   - `loom-logs`: Log file monitoring
-   - `loom-terminals`: Terminal IPC control
+   Expected output should show the unified `loom` MCP server configured.
 
 2. **Test MCP Server Availability** (from Claude Code or MCP client):
    ```bash
    # Test if MCP commands are available
-   mcp__loom-ui__get_heartbeat
+   mcp__loom__get_heartbeat
    ```
 
-   If this returns a heartbeat response, MCP servers are connected.
+   If this returns a heartbeat response, the MCP server is connected.
 
 **If MCP Connection Fails**:
 
-1. **Ensure MCP servers are built**:
+1. **Ensure the MCP server is built**:
    ```bash
-   # Build all MCP servers
-   cd mcp-loom-ui && pnpm install && pnpm build && cd ..
-   cd mcp-loom-logs && pnpm install && pnpm build && cd ..
-   cd mcp-loom-terminals && pnpm install && pnpm build && cd ..
+   # Build the unified MCP server
+   cd mcp-loom && npm install && npm run build && cd ..
    ```
 
 2. **Restart Claude Code** to reload MCP configuration:
@@ -112,7 +107,7 @@ echo '{"command": "trigger_factory_reset", "timestamp": "'$(date -u +%Y-%m-%dT%H
 
 **Troubleshooting MCP stdio connection:**
 
-If `mcp__loom-ui__*` commands show "No such tool available", check:
+If `mcp__loom__*` commands show "No such tool available", check:
 
 1. **Verify Claude Code loaded MCP config**: MCP servers are only loaded when Claude Code starts
    ```bash
@@ -256,13 +251,13 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 3. **Monitor Startup Logs** (via MCP)
    ```bash
    # Watch daemon logs for startup sequence
-   mcp__loom-logs__tail_daemon_log --lines=50
+   mcp__loom__tail_daemon_log --lines=50
 
    # Watch Tauri logs for app initialization
-   mcp__loom-logs__tail_tauri_log --lines=50
+   mcp__loom__tail_tauri_log --lines=50
 
    # Watch console logs for frontend initialization
-   mcp__loom-ui__read_console_log
+   mcp__loom__read_console_log
    ```
 
 3. **Wait for App Launch**
@@ -300,7 +295,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
    **Method B: MCP Tool** (if MCP servers connected):
    ```bash
    # Use force_start to bypass confirmation dialog
-   mcp__loom-ui__trigger_force_start
+   mcp__loom__trigger_force_start
    ```
 
 2. **Monitor Console Logs** (real-time)
@@ -313,7 +308,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 
    **Method B: MCP Tool** (if available):
    ```bash
-   mcp__loom-ui__read_console_log
+   mcp__loom__read_console_log
    ```
 
    **Expected log sequence**:
@@ -338,7 +333,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 
    **Method B: MCP Tool** (if available):
    ```bash
-   mcp__loom-ui__read_state_file
+   mcp__loom__read_state_file
    ```
 
    **Expected state**:
@@ -370,7 +365,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 
    **Method B: MCP Tool** (if available):
    ```bash
-   mcp__loom-terminals__list_terminals
+   mcp__loom__list_terminals
    ```
 
    **Expected output**:
@@ -390,7 +385,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 5. **Check Terminal Output** (for each terminal)
    ```bash
    # Check terminal-1 output
-   mcp__loom-logs__tail_terminal_log --terminal-id=terminal-1 --lines=50
+   mcp__loom__tail_terminal_log --terminal-id=terminal-1 --lines=50
 
    # Repeat for terminal-2 through terminal-7
    ```
@@ -435,7 +430,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 
    **Method B: MCP Tool** (if available):
    ```bash
-   mcp__loom-ui__trigger_factory_reset
+   mcp__loom__trigger_factory_reset
    ```
 
    **Expected log sequence**:
@@ -467,9 +462,9 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 
    **Method B: MCP Tools** (if available):
    ```bash
-   mcp__loom-ui__read_state_file
-   mcp__loom-terminals__list_terminals
-   mcp__loom-logs__tail_daemon_log --lines=50
+   mcp__loom__read_state_file
+   mcp__loom__list_terminals
+   mcp__loom__tail_daemon_log --lines=50
    ```
 
 3. **Restart Workspace**
@@ -486,7 +481,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 
    **Method B: MCP Tool** (if available):
    ```bash
-   mcp__loom-ui__trigger_force_start
+   mcp__loom__trigger_force_start
    ```
 
 4. **Repeat Phase 3 Verification**
@@ -515,7 +510,7 @@ If `mcp__loom-ui__*` commands show "No such tool available", check:
 ps aux | grep Loom | grep workspace || echo "⚠ WARNING: No workspace argument"
 
 # Check console logs for workspace selection
-mcp__loom-ui__read_console_log | grep workspace
+mcp__loom__read_console_log | grep workspace
 ```
 
 **Fix**: Always use the provided pnpm scripts that include workspace argument:
@@ -539,10 +534,10 @@ pnpm app:preview
 **Debug Steps**:
 ```bash
 # Check for existing sessions
-mcp__loom-terminals__list_terminals
+mcp__loom__list_terminals
 
 # Check daemon logs for kill_all_loom_sessions calls
-mcp__loom-logs__tail_daemon_log --lines=100 | grep "kill.*session"
+mcp__loom__tail_daemon_log --lines=100 | grep "kill.*session"
 
 # Manual cleanup if needed
 tmux -L loom kill-server
@@ -559,10 +554,10 @@ tmux -L loom kill-server
 **Debug Steps**:
 ```bash
 # Check terminal output for errors
-mcp__loom-logs__tail_terminal_log --terminal-id=terminal-1 --lines=100
+mcp__loom__tail_terminal_log --terminal-id=terminal-1 --lines=100
 
 # Check console logs for agent launcher errors
-mcp__loom-ui__read_console_log | grep "launchAgent"
+mcp__loom__read_console_log | grep "launchAgent"
 
 # Verify Claude Code is installed
 which claude
@@ -581,13 +576,13 @@ which claude
 **Debug Steps**:
 ```bash
 # Check terminal output for prompt timing
-mcp__loom-logs__tail_terminal_log --terminal-id=terminal-1 --lines=100
+mcp__loom__tail_terminal_log --terminal-id=terminal-1 --lines=100
 
 # Check console logs for send_terminal_input calls
-mcp__loom-ui__read_console_log | grep "send_terminal_input"
+mcp__loom__read_console_log | grep "send_terminal_input"
 
 # Check daemon logs for IPC operations
-mcp__loom-logs__tail_daemon_log --lines=100 | grep "SendTerminalInput"
+mcp__loom__tail_daemon_log --lines=100 | grep "SendTerminalInput"
 ```
 
 **Fix**: Adjust retry delays in `src/lib/agent-launcher.ts`
@@ -601,10 +596,10 @@ mcp__loom-logs__tail_daemon_log --lines=100 | grep "SendTerminalInput"
 **Debug Steps**:
 ```bash
 # Check if clearMissingSessionError is being called
-mcp__loom-ui__read_console_log | grep "clearMissingSession"
+mcp__loom__read_console_log | grep "clearMissingSession"
 
 # Check terminal state for missingSession flag
-mcp__loom-ui__read_state_file | grep "missingSession"
+mcp__loom__read_state_file | grep "missingSession"
 ```
 
 **Fix**: Verify `clearMissingSessionError()` is called in `renderPrimaryTerminal()` when `hasMissingSession` is false
@@ -723,10 +718,10 @@ echo "✓ Ready for MCP-based testing"
 echo ""
 
 echo "=== Manual Steps Required ==="
-echo "1. Use MCP to trigger: mcp__loom-ui__trigger_force_start"
-echo "2. Monitor logs via: mcp__loom-ui__read_console_log"
-echo "3. Verify state via: mcp__loom-ui__read_state_file"
-echo "4. Trigger reset via: mcp__loom-ui__trigger_factory_reset"
+echo "1. Use MCP to trigger: mcp__loom__trigger_force_start"
+echo "2. Monitor logs via: mcp__loom__read_console_log"
+echo "3. Verify state via: mcp__loom__read_state_file"
+echo "4. Trigger reset via: mcp__loom__trigger_factory_reset"
 echo "5. Repeat steps 1-3"
 ```
 

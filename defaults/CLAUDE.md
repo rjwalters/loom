@@ -1355,11 +1355,19 @@ The dashboard displays:
 
 ## MCP Hooks for Programmatic Control
 
-Loom provides MCP (Model Context Protocol) servers that allow Claude Code to programmatically control the Loom application. This enables automation, testing, and advanced workflows.
+Loom provides a unified MCP (Model Context Protocol) server that allows Claude Code to programmatically control the Loom application. This enables automation, testing, and advanced workflows.
 
-### Available MCP Servers
+### Unified MCP Server
 
-**loom-terminals** - Terminal management via daemon socket:
+All Loom MCP tools are provided through a single `mcp-loom` package, which consolidates log monitoring, terminal management, and UI control tools.
+
+**Log Tools:**
+- `tail_daemon_log` - Tail daemon log file
+- `tail_tauri_log` - Tail Tauri application log
+- `list_terminal_logs` - List available terminal output logs
+- `tail_terminal_log` - Tail a specific terminal's output log
+
+**Terminal Tools:**
 - `list_terminals` - List all active terminal sessions
 - `get_terminal_output` - Get recent output from a terminal
 - `get_selected_terminal` - Get info about the currently selected terminal
@@ -1373,9 +1381,12 @@ Loom provides MCP (Model Context Protocol) servers that allow Claude Code to pro
 - `check_tmux_server_health` - Check tmux server status
 - `get_tmux_server_info` - Get tmux server details
 - `toggle_tmux_verbose_logging` - Enable tmux debug logging
+- `start_autonomous_mode` - Start autonomous mode for all terminals
+- `stop_autonomous_mode` - Stop autonomous mode
+- `launch_interval` - Manually trigger interval prompt
 - `get_agent_metrics` - Get agent performance metrics for self-aware behavior
 
-**loom-ui** - UI control via file-based IPC:
+**UI Tools:**
 - `read_console_log` - Read browser console logs
 - `read_state_file` - Read workspace state
 - `read_config_file` - Read workspace config
@@ -1398,22 +1409,25 @@ Loom provides MCP (Model Context Protocol) servers that allow Claude Code to pro
 
 ```bash
 # Create a terminal with specific role
-mcp__loom-terminals__create_terminal --name "Builder" --role "builder"
+mcp__loom__create_terminal --name "Builder" --role "builder"
 
 # Configure autonomous operation
-mcp__loom-terminals__configure_terminal \
+mcp__loom__configure_terminal \
   --terminal_id terminal-1 \
   --target_interval 300000 \
   --interval_prompt "Check for new issues"
 
 # Trigger immediate autonomous run
-mcp__loom-ui__trigger_run_now --terminalId terminal-1
+mcp__loom__trigger_run_now --terminalId terminal-1
 
 # Stop all terminals
-mcp__loom-ui__stop_engine
+mcp__loom__stop_engine
 
 # Get comprehensive state
-mcp__loom-ui__get_ui_state
+mcp__loom__get_ui_state
+
+# View logs
+mcp__loom__tail_daemon_log --lines 50
 ```
 
 ### Agent Performance Metrics
@@ -1426,16 +1440,16 @@ Agents can query their own performance metrics to make informed decisions. This 
 **Via MCP Tool**:
 ```bash
 # Get overall metrics summary
-mcp__loom-terminals__get_agent_metrics --command summary --period week
+mcp__loom__get_agent_metrics --command summary --period week
 
 # Get effectiveness metrics for a specific role
-mcp__loom-terminals__get_agent_metrics --command effectiveness --role builder
+mcp__loom__get_agent_metrics --command effectiveness --role builder
 
 # Get cost breakdown for a specific issue
-mcp__loom-terminals__get_agent_metrics --command costs --issue 123
+mcp__loom__get_agent_metrics --command costs --issue 123
 
 # Get velocity trends
-mcp__loom-terminals__get_agent_metrics --command velocity
+mcp__loom__get_agent_metrics --command velocity
 ```
 
 **Via CLI Script**:
@@ -1470,27 +1484,26 @@ fi
 
 ### MCP Server Configuration
 
-Add these MCP servers to your Claude Code configuration:
+Add the unified Loom MCP server to your Claude Code configuration:
 
 ```json
 {
   "mcpServers": {
-    "loom-terminals": {
+    "loom": {
       "command": "node",
-      "args": ["/path/to/loom/mcp-loom-terminals/dist/index.js"],
-      "env": {
-        "LOOM_WORKSPACE": "/path/to/your/workspace"
-      }
-    },
-    "loom-ui": {
-      "command": "node",
-      "args": ["/path/to/loom/mcp-loom-ui/dist/index.js"],
+      "args": ["/path/to/loom/mcp-loom/dist/index.js"],
       "env": {
         "LOOM_WORKSPACE": "/path/to/your/workspace"
       }
     }
   }
 }
+```
+
+Or run the setup script to generate `.mcp.json` automatically:
+
+```bash
+./scripts/setup-mcp.sh
 ```
 
 ## Resources

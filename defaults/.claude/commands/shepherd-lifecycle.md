@@ -210,7 +210,7 @@ Before triggering, identify which terminal runs which role:
 
 ```bash
 # List all terminals
-mcp__loom-terminals__list_terminals
+mcp__loom__list_terminals
 
 # Returns terminal IDs and their configurations
 # Example output:
@@ -225,7 +225,7 @@ Before triggering a role, restart the terminal to clear context:
 
 ```bash
 # Restart terminal to clear context
-mcp__loom-terminals__restart_terminal --terminal_id terminal-2
+mcp__loom__restart_terminal --terminal_id terminal-2
 ```
 
 ### Configure Phase-Specific Prompt
@@ -234,7 +234,7 @@ Set the interval prompt to focus on the specific issue:
 
 ```bash
 # Configure with issue-specific prompt
-mcp__loom-terminals__configure_terminal \
+mcp__loom__configure_terminal \
   --terminal_id terminal-2 \
   --interval_prompt "Curate issue #123. Follow .loom/roles/curator.md"
 ```
@@ -245,7 +245,7 @@ Execute the role immediately:
 
 ```bash
 # Trigger immediate run
-mcp__loom-ui__trigger_run_now --terminalId terminal-2
+mcp__loom__trigger_run_now --terminalId terminal-2
 ```
 
 ### Full Trigger Sequence (MCP Mode)
@@ -254,15 +254,15 @@ For each phase, execute this sequence:
 
 ```bash
 # 1. Restart for fresh context
-mcp__loom-terminals__restart_terminal --terminal_id <terminal-id>
+mcp__loom__restart_terminal --terminal_id <terminal-id>
 
 # 2. Configure with phase-specific prompt
-mcp__loom-terminals__configure_terminal \
+mcp__loom__configure_terminal \
   --terminal_id <terminal-id> \
   --interval_prompt "<Role> for issue #<N>. <specific instructions>"
 
 # 3. Trigger immediate execution
-mcp__loom-ui__trigger_run_now --terminalId <terminal-id>
+mcp__loom__trigger_run_now --terminalId <terminal-id>
 ```
 
 ## Waiting for Completion
@@ -317,7 +317,7 @@ fi
 Optionally check terminal output for completion signals:
 
 ```bash
-output=$(mcp__loom-terminals__get_terminal_output --terminal_id terminal-2 --lines 100)
+output=$(mcp__loom__get_terminal_output --terminal_id terminal-2 --lines 100)
 
 if echo "$output" | grep -q "Role Assumed: Curator"; then
   echo "Curator completed its iteration"
@@ -401,13 +401,13 @@ if [ "$PHASE" = "curator" ]; then
   CURATOR_TERMINAL="terminal-2"  # or lookup from config
 
   # Restart and configure
-  mcp__loom-terminals__restart_terminal --terminal_id $CURATOR_TERMINAL
-  mcp__loom-terminals__configure_terminal \
+  mcp__loom__restart_terminal --terminal_id $CURATOR_TERMINAL
+  mcp__loom__configure_terminal \
     --terminal_id $CURATOR_TERMINAL \
     --interval_prompt "Curate issue #$ISSUE_NUMBER. Add implementation details and acceptance criteria."
 
   # Trigger
-  mcp__loom-ui__trigger_run_now --terminalId $CURATOR_TERMINAL
+  mcp__loom__trigger_run_now --terminalId $CURATOR_TERMINAL
 
   # Wait for completion
   while true; do
@@ -463,12 +463,12 @@ fi
 if [ "$PHASE" = "builder" ]; then
   BUILDER_TERMINAL="terminal-3"
 
-  mcp__loom-terminals__restart_terminal --terminal_id $BUILDER_TERMINAL
-  mcp__loom-terminals__configure_terminal \
+  mcp__loom__restart_terminal --terminal_id $BUILDER_TERMINAL
+  mcp__loom__configure_terminal \
     --terminal_id $BUILDER_TERMINAL \
     --interval_prompt "Build issue #$ISSUE_NUMBER. Create worktree, implement, test, create PR."
 
-  mcp__loom-ui__trigger_run_now --terminalId $BUILDER_TERMINAL
+  mcp__loom__trigger_run_now --terminalId $BUILDER_TERMINAL
 
   # Wait for PR creation
   while true; do
@@ -491,12 +491,12 @@ fi
 if [ "$PHASE" = "judge" ]; then
   JUDGE_TERMINAL="terminal-1"
 
-  mcp__loom-terminals__restart_terminal --terminal_id $JUDGE_TERMINAL
-  mcp__loom-terminals__configure_terminal \
+  mcp__loom__restart_terminal --terminal_id $JUDGE_TERMINAL
+  mcp__loom__configure_terminal \
     --terminal_id $JUDGE_TERMINAL \
     --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
-  mcp__loom-ui__trigger_run_now --terminalId $JUDGE_TERMINAL
+  mcp__loom__trigger_run_now --terminalId $JUDGE_TERMINAL
 
   # Wait for review completion
   # Note: Judge uses label-based reviews (comment + label change), not GitHub's
@@ -526,12 +526,12 @@ DOCTOR_ITERATION=0
 while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS ]; do
   DOCTOR_TERMINAL="terminal-4"  # or lookup
 
-  mcp__loom-terminals__restart_terminal --terminal_id $DOCTOR_TERMINAL
-  mcp__loom-terminals__configure_terminal \
+  mcp__loom__restart_terminal --terminal_id $DOCTOR_TERMINAL
+  mcp__loom__configure_terminal \
     --terminal_id $DOCTOR_TERMINAL \
     --interval_prompt "Address review feedback on PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
 
-  mcp__loom-ui__trigger_run_now --terminalId $DOCTOR_TERMINAL
+  mcp__loom__trigger_run_now --terminalId $DOCTOR_TERMINAL
 
   # Wait for Doctor to complete and re-trigger Judge
   while true; do
@@ -650,7 +650,7 @@ if [ "$PHASE" = "gate2" ]; then
     # Trigger Champion or wait for human merge
     CHAMPION_TERMINAL="terminal-5"  # if exists
 
-    mcp__loom-ui__trigger_run_now --terminalId $CHAMPION_TERMINAL
+    mcp__loom__trigger_run_now --terminalId $CHAMPION_TERMINAL
 
     # Wait for merge
     TIMEOUT=1800  # 30 minutes
@@ -720,7 +720,7 @@ For MCP Mode orchestration, you need these terminals configured:
 You can discover terminal configurations with:
 
 ```bash
-mcp__loom-ui__get_ui_state
+mcp__loom__get_ui_state
 ```
 
 **Note**: In Direct Mode, terminal configuration is not required. The orchestrator spawns Task subagents for each role phase.
@@ -743,7 +743,7 @@ Before each phase, check if the required terminal exists:
 
 ```bash
 # Check for a terminal with specific role
-TERMINALS=$(mcp__loom-terminals__list_terminals)
+TERMINALS=$(mcp__loom__list_terminals)
 BUILDER_TERMINAL=$(echo "$TERMINALS" | jq -r '.[] | select(.roleConfig.roleFile == "builder.md") | .id' | head -1)
 
 if [ -z "$BUILDER_TERMINAL" ]; then
@@ -775,7 +775,7 @@ INTERVAL=$(echo "$ROLE_JSON" | jq -r '.defaultInterval')          # 0
 
 ```bash
 # Create the terminal with role defaults
-mcp__loom-terminals__create_terminal \
+mcp__loom__create_terminal \
   --name "$ROLE_NAME" \
   --role "builder"
 ```
@@ -784,10 +784,10 @@ mcp__loom-terminals__create_terminal \
 
 ```bash
 # Get the new terminal ID (will be terminal-N based on nextAgentNumber)
-NEW_TERMINAL_ID=$(mcp__loom-terminals__list_terminals | jq -r '.[-1].id')
+NEW_TERMINAL_ID=$(mcp__loom__list_terminals | jq -r '.[-1].id')
 
 # Configure with role-specific settings
-mcp__loom-terminals__configure_terminal \
+mcp__loom__configure_terminal \
   --terminal_id "$NEW_TERMINAL_ID" \
   --target_interval "$INTERVAL" \
   --role_file "builder.md"
@@ -848,15 +848,15 @@ auto_configure_terminal() {
   local INTERVAL=$(echo "$ROLE_JSON" | jq -r '.defaultInterval // 0')
 
   # Create terminal
-  mcp__loom-terminals__create_terminal \
+  mcp__loom__create_terminal \
     --name "$ROLE_NAME" \
     --role "$ROLE_KEY"
 
   # Get newly created terminal ID
-  local NEW_TERMINAL_ID=$(mcp__loom-terminals__list_terminals | jq -r '.[-1].id')
+  local NEW_TERMINAL_ID=$(mcp__loom__list_terminals | jq -r '.[-1].id')
 
   # Configure role settings
-  mcp__loom-terminals__configure_terminal \
+  mcp__loom__configure_terminal \
     --terminal_id "$NEW_TERMINAL_ID" \
     --target_interval "$INTERVAL" \
     --role_file "${ROLE_KEY}.md"
@@ -876,7 +876,7 @@ Before triggering each phase, check and auto-configure:
 # Example: Builder phase with auto-configuration
 if [ "$PHASE" = "builder" ]; then
   # Find existing Builder terminal
-  BUILDER_TERMINAL=$(mcp__loom-terminals__list_terminals | \
+  BUILDER_TERMINAL=$(mcp__loom__list_terminals | \
     jq -r '.[] | select(.roleConfig.roleFile == "builder.md") | .id' | head -1)
 
   # Auto-configure if missing and in force mode
@@ -890,11 +890,11 @@ if [ "$PHASE" = "builder" ]; then
   fi
 
   # Now proceed with the phase using $BUILDER_TERMINAL
-  mcp__loom-terminals__restart_terminal --terminal_id "$BUILDER_TERMINAL"
-  mcp__loom-terminals__configure_terminal \
+  mcp__loom__restart_terminal --terminal_id "$BUILDER_TERMINAL"
+  mcp__loom__configure_terminal \
     --terminal_id "$BUILDER_TERMINAL" \
     --interval_prompt "Build issue #$ISSUE_NUMBER"
-  mcp__loom-ui__trigger_run_now --terminalId "$BUILDER_TERMINAL"
+  mcp__loom__trigger_run_now --terminalId "$BUILDER_TERMINAL"
 fi
 ```
 

@@ -117,7 +117,7 @@ At orchestration start, detect which mode to use:
 
 ```bash
 # Attempt MCP call to detect Loom Tauri app
-if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
+if mcp__loom__get_ui_state >/dev/null 2>&1; then
   MODE="mcp"
   echo "MCP Mode: Loom app detected, will delegate to role terminals"
 else
@@ -339,7 +339,7 @@ gh issue comment $ISSUE_NUMBER --body "Orchestration paused: Issue is blocked. C
 The shepherd automatically selects the appropriate execution mode:
 
 ```bash
-if mcp__loom-ui__get_ui_state >/dev/null 2>&1; then
+if mcp__loom__get_ui_state >/dev/null 2>&1; then
   MODE="mcp"
 else
   MODE="direct"

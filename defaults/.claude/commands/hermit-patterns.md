@@ -401,7 +401,7 @@ rg "export.*function|export.*class" -n
 # -> Found unused function, create issue
 
 # Hermit Terminal 2 (random selection: random-file)
-mcp__loom-ui__get_random_file
+mcp__loom__get_random_file
 cat <file-path>
 # -> Found over-engineered class, create issue
 

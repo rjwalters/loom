@@ -54,18 +54,18 @@ cat << 'EOF'
    Use the two-terminal approach with Loom's MCP terminal tools:
 
    1. Start daemon in terminal-1:
-      mcp__loom-terminals__send_terminal_input \
+      mcp__loom__send_terminal_input \
         --terminal-id=terminal-1 \
         --input="cd ~/GitHub/loom && pnpm daemon:dev\n"
 
    2. Start Tauri in terminal-2 (after 5 seconds):
-      mcp__loom-terminals__send_terminal_input \
+      mcp__loom__send_terminal_input \
         --terminal-id=terminal-2 \
         --input="cd ~/GitHub/loom && pnpm tauri dev\n"
 
    3. Monitor both terminals:
-      mcp__loom-terminals__get_terminal_output --terminal-id=terminal-1
-      mcp__loom-terminals__get_terminal_output --terminal-2
+      mcp__loom__get_terminal_output --terminal-id=terminal-1
+      mcp__loom__get_terminal_output --terminal-2
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EOF

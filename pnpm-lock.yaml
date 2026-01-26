@@ -114,54 +114,6 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
-  mcp-loom-logs:
-    dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: ^1.25.3
-        version: 1.25.3(hono@4.11.5)(zod@4.3.6)
-    devDependencies:
-      '@types/node':
-        specifier: ^22.18.10
-        version: 22.18.10
-      typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
-
-  mcp-loom-terminals:
-    dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: ^1.25.3
-        version: 1.25.3(hono@4.11.5)(zod@4.3.6)
-      strip-ansi:
-        specifier: ^7.1.2
-        version: 7.1.2
-    devDependencies:
-      '@types/node':
-        specifier: ^22.18.10
-        version: 22.18.10
-      typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
-
-  mcp-loom-ui:
-    dependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: ^1.25.3
-        version: 1.25.3(hono@4.11.5)(zod@4.3.6)
-      fast-glob:
-        specifier: ^3.3.2
-        version: 3.3.3
-      ignore:
-        specifier: ^6.0.2
-        version: 6.0.2
-    devDependencies:
-      '@types/node':
-        specifier: ^22.18.10
-        version: 22.18.10
-      typescript:
-        specifier: ^5.9.3
-        version: 5.9.3
-
 packages:
 
   '@alloc/quick-lru@5.2.0':
