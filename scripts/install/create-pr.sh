@@ -250,14 +250,15 @@ info "Attempting to merge installation PR..."
 
 MERGE_STATUS="manual"
 
-# First try immediate merge (works when no review requirements or 0 approvals)
-if gh pr merge "$PR_URL" --merge --delete-branch 2>/dev/null; then
+# First try immediate squash merge (works when no review requirements or 0 approvals)
+# Note: We use --squash because Loom's repository settings disable merge commits
+if gh pr merge "$PR_URL" --squash --delete-branch 2>/dev/null; then
   success "Installation PR merged successfully"
   MERGE_STATUS="merged"
 else
   # If immediate merge fails, try enabling auto-merge
   info "Immediate merge not available (branch protection may require reviews)"
-  if gh pr merge "$PR_URL" --auto --merge --delete-branch 2>/dev/null; then
+  if gh pr merge "$PR_URL" --auto --squash --delete-branch 2>/dev/null; then
     success "Auto-merge enabled - PR will merge once requirements are met"
     MERGE_STATUS="auto"
   else
