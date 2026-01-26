@@ -1312,7 +1312,7 @@ LOOM_STUCK_AGENT_THRESHOLD=10        # Minutes without heartbeat
 LOOM_ERROR_RATE_THRESHOLD=20         # % error rate threshold
 ```
 
-Or via `defaults/config.json`:
+Or via `.loom/config.json`:
 
 ```json
 {

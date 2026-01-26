@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The Vite-powered frontend lives in `src/` with feature modules under `src/lib/` and colocated Vitest specs (`*.test.ts`). Tauri glue code and native bindings reside in `src-tauri/`, while the Rust daemon runs from `loom-daemon/`. Runtime defaults and role templates sit in `defaults/` and `.loom/roles/`; automation helpers live in `scripts/`, and production bundles emit to `dist/`.
+Role templates and runtime configuration live in `.loom/roles/`. Custom roles can be created in this directory and will be available in both the CLI (via `/my-role`) and the Tauri App terminal settings.
 
 ## Build, Test, and Development Commands
 - `pnpm app:dev` boots the daemon then Tauri for an end-to-end local session.
@@ -54,4 +54,4 @@ If a previous agent abandoned work on an issue, you can resume seamlessly:
 The script is **non-interactive** and automatically reuses existing branches, making it safe for AI agents to resume abandoned work without user intervention.
 
 ## Daemon & Configuration Notes
-Agent role prompts live under `.loom/roles/`; keep Markdown and any sibling JSON metadata in sync. Workspace overrides persist in `~/.loom/`, so mention reset steps (`Help → Daemon Status → Yes`) when altering stateful behavior. Document new environment variables or defaults under `defaults/` before requesting review.
+Agent role prompts live under `.loom/roles/`; keep Markdown and any sibling JSON metadata in sync. Workspace overrides persist in `~/.loom/`, so mention reset steps (`Help → Daemon Status → Yes`) when altering stateful behavior.
