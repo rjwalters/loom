@@ -40,6 +40,8 @@ Thumbs.db
 .loom/daemon-state.json
 .loom/[0-9][0-9]-daemon-state.json
 .loom/stuck-history.json
+.loom/alerts.json
+.loom/health-metrics.json
 .loom/interventions/
 .loom/worktrees/
 .loom/state.json

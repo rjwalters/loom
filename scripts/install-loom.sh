@@ -543,8 +543,16 @@ header "Step 5b: Configure Repository Settings"
 echo ""
 
 if [[ "$NON_INTERACTIVE" == "true" ]]; then
-  info "Non-interactive mode: Skipping repository settings"
-  info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+  # In non-interactive mode, apply repository settings automatically
+  # This is needed for auto-merge to work on the installation PR
+  info "Applying repository settings (required for auto-merge)..."
+  if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+    echo ""
+  else
+    echo ""
+    warning "Failed to configure repository settings (may require admin permissions)"
+    info "Auto-merge may not be available for the installation PR"
+  fi
 else
   echo ""
   read -p "Configure repository merge and auto-merge settings? (y/N) " -n 1 -r
