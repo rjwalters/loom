@@ -90,10 +90,14 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
 - `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
 - `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
 
-**CRITICAL - Correct Tool Invocation**: Task subagents must use the **Skill tool**, NOT CLI commands.
+**CRITICAL - Correct Tool Invocation**: Daemon-spawned subagents must use the **Skill tool**, NOT CLI commands.
+
+> **Scope**: This Skill-in-Task pattern applies to **daemon→shepherd** and **daemon→support role**
+> invocations only. Shepherds themselves use plain `Task` subagents with slash-command prompts
+> for phase delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
 
 ```
-CORRECT - Use the Skill tool:
+CORRECT - Use the Skill tool (daemon spawning shepherds/support roles):
    Skill(skill="guide")
    Skill(skill="shepherd", args="123 --force-merge")
 

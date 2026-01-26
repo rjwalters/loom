@@ -216,7 +216,7 @@ fi
 
 > **WARNING: Shepherds MUST be invoked via Skill tool for full lifecycle**
 >
-> When spawning shepherds, you must use the Skill tool invocation pattern shown below.
+> When the daemon spawns shepherds, you must use the Skill tool invocation pattern shown below.
 >
 > **DO NOT** give shepherds explicit step-by-step instructions.
 >
@@ -227,7 +227,11 @@ fi
 > )
 > ```
 >
-> The Skill tool ensures the shepherd follows the complete workflow: Curator -> Builder -> Judge -> Doctor (if needed) -> Merge
+> The Skill tool ensures the shepherd gets its full role prompt expanded so it can follow the complete workflow: Curator -> Builder -> Judge -> Doctor (if needed) -> Merge.
+>
+> **Note**: This Skill-in-Task pattern applies to **daemon→shepherd** invocations only.
+> Shepherds themselves use plain `Task` subagents with slash-command prompts for phase
+> delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
 
 ```python
 def auto_spawn_shepherds(state, snapshot_data, debug_mode=False):
