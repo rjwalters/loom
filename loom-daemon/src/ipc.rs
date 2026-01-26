@@ -1,4 +1,5 @@
 use crate::activity::{ActivityDb, AgentInput, AgentOutput, InputContext, InputType};
+use crate::errors::DaemonError;
 use crate::git_parser;
 use crate::git_utils;
 use crate::github_parser::parse_github_events;
@@ -128,9 +129,7 @@ fn handle_request(
             match tm.create_terminal(&config_id, name, working_dir, role.as_ref(), instance_number)
             {
                 Ok(id) => Response::TerminalCreated { id },
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -149,9 +148,7 @@ fn handle_request(
                 .expect("Terminal manager mutex poisoned");
             match tm.destroy_terminal(&id) {
                 Ok(()) => Response::Success,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -214,9 +211,7 @@ fn handle_request(
                     input_id,
                     before_commit,
                 },
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -379,9 +374,7 @@ fn handle_request(
                     );
                     Response::TerminalOutput { output, byte_count }
                 }
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -391,9 +384,7 @@ fn handle_request(
                 .expect("Terminal manager mutex poisoned");
             match tm.resize_terminal(&id, cols, rows) {
                 Ok(()) => Response::Success,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -403,9 +394,7 @@ fn handle_request(
                 .expect("Terminal manager mutex poisoned");
             match tm.has_tmux_session(&id) {
                 Ok(has_session) => Response::SessionHealth { has_session },
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -423,9 +412,7 @@ fn handle_request(
                 .expect("Terminal manager mutex poisoned");
             match tm.attach_to_session(&id, session_name) {
                 Ok(()) => Response::Success,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -435,9 +422,7 @@ fn handle_request(
                 .expect("Terminal manager mutex poisoned");
             match tm.kill_session(&session_name) {
                 Ok(()) => Response::Success,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -447,9 +432,7 @@ fn handle_request(
                 .expect("Terminal manager mutex poisoned");
             match tm.set_worktree_path(&id, &worktree_path) {
                 Ok(()) => Response::Success,
-                Err(e) => Response::Error {
-                    message: e.to_string(),
-                },
+                Err(e) => Response::StructuredError(DaemonError::from(e)),
             }
         }
 
@@ -459,15 +442,14 @@ fn handle_request(
                     Ok(entries) => Response::TerminalActivity { entries },
                     Err(e) => {
                         log::error!("Failed to get terminal activity: {e}");
-                        Response::Error {
-                            message: format!("Failed to get activity: {e}"),
-                        }
+                        Response::StructuredError(DaemonError::activity_query_failed(
+                            "get terminal activity",
+                            &e.to_string(),
+                        ))
                     }
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -492,15 +474,14 @@ fn handle_request(
                         },
                         Err(e) => {
                             log::error!("Failed to record prompt changes: {e}");
-                            Response::Error {
-                                message: format!("Failed to record changes: {e}"),
-                            }
+                            Response::StructuredError(DaemonError::activity_query_failed(
+                                "record prompt changes",
+                                &e.to_string(),
+                            ))
                         }
                     }
                 } else {
-                    Response::Error {
-                        message: "Database lock failed".to_string(),
-                    }
+                    Response::StructuredError(DaemonError::activity_db_locked())
                 }
             } else {
                 // No changes detected or not a git repo
@@ -539,14 +520,13 @@ fn handle_request(
                     stale_threshold_secs,
                 ) {
                     Ok(result) => Response::ClaimResult(result),
-                    Err(e) => Response::Error {
-                        message: format!("Failed to claim issue: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "claim issue",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -561,19 +541,23 @@ fn handle_request(
                         if released {
                             Response::Success
                         } else {
-                            Response::Error {
-                                message: "Claim not found or not owned".to_string(),
-                            }
+                            Response::StructuredError(
+                                DaemonError::new(
+                                    crate::errors::ErrorDomain::Activity,
+                                    crate::errors::ErrorCode::ACTIVITY_QUERY_FAILED,
+                                    "Claim not found or not owned",
+                                )
+                                .recoverable(false),
+                            )
                         }
                     }
-                    Err(e) => Response::Error {
-                        message: format!("Failed to release claim: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "release claim",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -588,19 +572,23 @@ fn handle_request(
                         if updated {
                             Response::Success
                         } else {
-                            Response::Error {
-                                message: "Claim not found or not owned".to_string(),
-                            }
+                            Response::StructuredError(
+                                DaemonError::new(
+                                    crate::errors::ErrorDomain::Activity,
+                                    crate::errors::ErrorCode::ACTIVITY_QUERY_FAILED,
+                                    "Claim not found or not owned",
+                                )
+                                .recoverable(false),
+                            )
                         }
                     }
-                    Err(e) => Response::Error {
-                        message: format!("Failed to update heartbeat: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "update heartbeat",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -608,14 +596,13 @@ fn handle_request(
             if let Ok(db) = activity_db.lock() {
                 match db.get_claim(number, claim_type) {
                     Ok(claim) => Response::Claim(claim),
-                    Err(e) => Response::Error {
-                        message: format!("Failed to get claim: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "get claim",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -623,14 +610,13 @@ fn handle_request(
             if let Ok(db) = activity_db.lock() {
                 match db.get_claims_by_terminal(&terminal_id) {
                     Ok(claims) => Response::Claims(claims),
-                    Err(e) => Response::Error {
-                        message: format!("Failed to get terminal claims: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "get terminal claims",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -638,14 +624,13 @@ fn handle_request(
             if let Ok(db) = activity_db.lock() {
                 match db.get_all_claims() {
                     Ok(claims) => Response::Claims(claims),
-                    Err(e) => Response::Error {
-                        message: format!("Failed to get all claims: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "get all claims",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -656,14 +641,13 @@ fn handle_request(
                 let threshold = stale_threshold_secs.unwrap_or(3600);
                 match db.get_claims_summary(threshold) {
                     Ok(summary) => Response::ClaimsSummary(summary),
-                    Err(e) => Response::Error {
-                        message: format!("Failed to get claims summary: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "get claims summary",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -674,14 +658,13 @@ fn handle_request(
                 let threshold = stale_threshold_secs.unwrap_or(3600);
                 match db.release_stale_claims(threshold) {
                     Ok(count) => Response::ClaimsReleased { count },
-                    Err(e) => Response::Error {
-                        message: format!("Failed to release stale claims: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "release stale claims",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 
@@ -689,14 +672,13 @@ fn handle_request(
             if let Ok(db) = activity_db.lock() {
                 match db.release_terminal_claims(&terminal_id) {
                     Ok(count) => Response::ClaimsReleased { count },
-                    Err(e) => Response::Error {
-                        message: format!("Failed to release terminal claims: {e}"),
-                    },
+                    Err(e) => Response::StructuredError(DaemonError::activity_query_failed(
+                        "release terminal claims",
+                        &e.to_string(),
+                    )),
                 }
             } else {
-                Response::Error {
-                    message: "Database lock failed".to_string(),
-                }
+                Response::StructuredError(DaemonError::activity_db_locked())
             }
         }
 

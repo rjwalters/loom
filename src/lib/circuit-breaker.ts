@@ -10,9 +10,21 @@
  * - OPEN: Failure threshold exceeded, calls fail immediately
  * - HALF_OPEN: Recovery testing, limited calls allowed to probe daemon health
  *
+ * Integration with Structured Errors (Issue #1171):
+ * - The circuit breaker integrates with DaemonError for smart failure handling
+ * - Systemic errors (tmux server down, IPC failures) trip the circuit
+ * - Localized errors (single terminal missing) are recorded but don't trip
+ *
  * @see health-monitor.ts for integration with daemon health checks
+ * @see daemon-errors.ts for structured error types
  */
 
+import {
+  type DaemonError,
+  DaemonErrorException,
+  extractDaemonError,
+  shouldTripCircuitBreaker,
+} from "./daemon-errors";
 import { Logger } from "./logger";
 
 const logger = Logger.forComponent("circuit-breaker");
@@ -142,6 +154,96 @@ export class CircuitBreaker {
       this.recordFailure();
       throw error;
     }
+  }
+
+  /**
+   * Execute an operation with structured error handling (Issue #1171)
+   *
+   * This method extends `execute` with intelligent handling of DaemonError:
+   * - Checks if the result is a structured error response
+   * - Only trips the circuit for systemic errors (not localized ones)
+   * - Throws DaemonErrorException for structured errors
+   *
+   * @param operation - Async operation that may return a DaemonError in its response
+   * @returns Promise resolving to operation result
+   * @throws CircuitOpenError if circuit is open
+   * @throws DaemonErrorException if operation returns a structured error
+   * @throws Original error if operation fails
+   */
+  async executeWithStructuredErrors<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.canAttempt()) {
+      this.emitEvent({ type: "rejected", state: this.state });
+      throw new CircuitOpenError(this.config.name, this.state);
+    }
+
+    try {
+      const result = await operation();
+
+      // Check if result is a structured error
+      const daemonError = extractDaemonError(result);
+      if (daemonError) {
+        // Only trip circuit for systemic errors
+        if (shouldTripCircuitBreaker(daemonError)) {
+          this.recordFailure();
+          logger.warn("Structured error tripped circuit breaker", {
+            domain: daemonError.domain,
+            code: daemonError.code,
+            recoverable: daemonError.recoverable,
+          });
+        } else if (!daemonError.recoverable) {
+          // Non-systemic, non-recoverable errors don't affect circuit
+          // but we still log them
+          logger.info("Non-systemic error (circuit unaffected)", {
+            domain: daemonError.domain,
+            code: daemonError.code,
+          });
+          this.recordSuccess(); // Operation worked, just returned an error state
+        } else {
+          // Recoverable localized errors
+          this.recordSuccess();
+        }
+
+        throw new DaemonErrorException(daemonError);
+      }
+
+      this.recordSuccess();
+      return result;
+    } catch (error) {
+      // Re-throw DaemonErrorException without recording another failure
+      if (error instanceof DaemonErrorException) {
+        throw error;
+      }
+
+      this.recordFailure();
+      throw error;
+    }
+  }
+
+  /**
+   * Record a structured error for circuit breaker consideration
+   *
+   * This method allows external code to report DaemonErrors to the circuit
+   * breaker without wrapping the operation in execute().
+   *
+   * @param error - The daemon error to consider
+   * @returns true if the error tripped the circuit, false otherwise
+   */
+  recordDaemonError(error: DaemonError): boolean {
+    if (shouldTripCircuitBreaker(error)) {
+      this.recordFailure();
+      logger.warn("Daemon error recorded as circuit failure", {
+        domain: error.domain,
+        code: error.code,
+      });
+      return true;
+    }
+
+    logger.info("Daemon error not counted as circuit failure", {
+      domain: error.domain,
+      code: error.code,
+      recoverable: error.recoverable,
+    });
+    return false;
   }
 
   /**
