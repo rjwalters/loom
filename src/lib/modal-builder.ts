@@ -213,6 +213,14 @@ export class ModalBuilder {
   }
 
   /**
+   * Clear all footer buttons
+   */
+  clearFooterButtons(): this {
+    this.footerButtons = [];
+    return this;
+  }
+
+  /**
    * Build and append footer with buttons
    */
   private buildFooter(): void {

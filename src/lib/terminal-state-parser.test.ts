@@ -305,6 +305,75 @@ I was implementing this feature.
     });
   });
 
+  describe("Claude wrapper states", () => {
+    it("should detect wrapper starting", () => {
+      const output = `
+[2026-01-24 10:00:00] [INFO] Claude wrapper starting
+[2026-01-24 10:00:00] [INFO] Arguments: --dangerously-skip-permissions
+[2026-01-24 10:00:00] [INFO] Running pre-flight checks...
+`;
+      const state = parseTerminalState(output);
+
+      expect(state.type).toBe("claude-code");
+      expect(state.status).toBe("wrapper-starting");
+    });
+
+    it("should detect wrapper pre-flight checks", () => {
+      const output = `
+[INFO] Running pre-flight checks...
+[INFO] Claude CLI found: /usr/local/bin/claude
+`;
+      const state = parseTerminalState(output);
+
+      expect(state.type).toBe("claude-code");
+      expect(state.status).toBe("wrapper-starting");
+    });
+
+    it("should detect wrapper in retry/backoff mode", () => {
+      const output = `
+[2026-01-24 10:05:00] [WARN] Claude CLI exited with code 1
+[2026-01-24 10:05:00] [INFO] Detected transient error pattern: No messages returned
+[2026-01-24 10:05:00] [WARN] Transient error detected. Waiting 2m 0s before retry...
+`;
+      const state = parseTerminalState(output);
+
+      expect(state.type).toBe("claude-code");
+      expect(state.status).toBe("wrapper-retrying");
+    });
+
+    it("should detect wrapper max retries exceeded", () => {
+      const output = `
+[2026-01-24 10:15:00] [WARN] Transient error detected. Waiting 30m 0s before retry...
+[2026-01-24 10:45:00] [ERROR] Max retries (5) exceeded
+[2026-01-24 10:45:00] [ERROR] Last error: No messages returned from API
+`;
+      const state = parseTerminalState(output);
+
+      expect(state.type).toBe("claude-code");
+      expect(state.status).toBe("wrapper-failed");
+    });
+
+    it("wrapper states should take priority over Claude working patterns", () => {
+      const output = `
+I'll help you with that.
+[INFO] Running pre-flight checks...
+Let me get started.
+`;
+      const state = parseTerminalState(output);
+
+      expect(state.type).toBe("claude-code");
+      expect(state.status).toBe("wrapper-starting");
+    });
+
+    it("should detect wrapper retrying with different backoff messages", () => {
+      const output = "[WARN] Waiting 1m 0s before retry...";
+      const state = parseTerminalState(output);
+
+      expect(state.type).toBe("claude-code");
+      expect(state.status).toBe("wrapper-retrying");
+    });
+  });
+
   describe("Real-world scenarios", () => {
     it("should detect Claude Code after agent launch", () => {
       const output = `

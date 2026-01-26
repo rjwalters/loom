@@ -56,6 +56,10 @@
   description: Hermit removal/simplification proposal awaiting user approval
   color: "9333EA"  # purple (violet-600)
 
+- name: loom:auditor
+  description: Bug discovered by Auditor during main branch validation
+  color: "d93f0b"  # red - indicates runtime/build issue
+
 - name: loom:curated
   description: Enhanced by Curator, awaiting human approval
   color: "10B981"  # emerald-500
@@ -72,3 +76,25 @@
 - name: loom:abort
   description: Signal to abort shepherd for this issue (returns to loom:issue)
   color: "F97316"  # orange-500 - warning/signal color
+
+# Epic Labels
+- name: loom:epic
+  description: Multi-phase epic proposal (decomposes into implementation issues)
+  color: "7C3AED"  # violet-600 - distinguishes from regular proposals
+
+- name: loom:epic-phase
+  description: Issue is part of an epic phase (references parent epic)
+  color: "8B5CF6"  # violet-500 - lighter variant for child issues
+
+# Tier Labels (Goal Alignment)
+- name: tier:goal-advancing
+  description: Directly implements a milestone deliverable or unblocks goal work
+  color: "0E8A16"  # green - highest priority
+
+- name: tier:goal-supporting
+  description: Infrastructure, testing, or docs for milestone features
+  color: "FBCA04"  # yellow - medium priority
+
+- name: tier:maintenance
+  description: Cleanup, refactoring, or improvements not tied to current goals
+  color: "D4C5F9"  # purple - lower priority

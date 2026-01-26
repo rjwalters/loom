@@ -13,12 +13,11 @@
 #
 #   What this script does:
 #     1. Validates target repository (must be a Git repo)
-#     2. Creates tracking issue in target repository
-#     3. Creates installation worktree (.loom/worktrees/issue-XXX)
-#     4. Initializes Loom configuration (copies defaults to .loom/)
-#     5. Syncs GitHub labels for Loom workflow
-#     6. Configures branch protection rules (interactive mode only)
-#     7. Creates pull request with loom:review-requested label
+#     2. Creates installation worktree (.loom/worktrees/loom-installation)
+#     3. Initializes Loom configuration (copies defaults to .loom/)
+#     4. Syncs GitHub labels for Loom workflow
+#     5. Configures branch protection rules (interactive mode only)
+#     6. Creates pull request with loom:review-requested label
 #
 #   Requirements:
 #     - Target must be a Git repository
@@ -91,18 +90,6 @@ cleanup_on_error() {
   if [[ $exit_code -ne 0 ]]; then
     echo ""
     warning "Installation failed at step: ${CURRENT_STEP:-unknown}"
-
-    if [[ -n "${ISSUE_NUMBER:-}" ]]; then
-      info "Cleaning up tracking issue #${ISSUE_NUMBER}..."
-      cd "$TARGET_PATH" 2>/dev/null || true
-      # Detect repo for gh commands (best effort, ignore errors in cleanup)
-      CLEANUP_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
-      if [[ -n "$CLEANUP_REPO" ]] && [[ "$CLEANUP_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-        gh issue close "${ISSUE_NUMBER}" -R "$CLEANUP_REPO" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
-      else
-        gh issue close "${ISSUE_NUMBER}" --comment "Installation failed during setup. Please retry." 2>/dev/null || true
-      fi
-    fi
 
     if [[ -n "${WORKTREE_PATH:-}" ]] && [[ -d "${TARGET_PATH}/${WORKTREE_PATH}" ]]; then
       info "Cleaning up worktree: ${WORKTREE_PATH}..."
@@ -391,38 +378,17 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 2: Create Tracking Issue
-# ============================================================================
-CURRENT_STEP="Create Issue"
-header "Step 2: Creating Tracking Issue"
-echo ""
-
-if [[ ! -x "$LOOM_ROOT/scripts/install/create-issue.sh" ]]; then
-  error "Installation script not found: create-issue.sh"
-fi
-
-ISSUE_NUMBER=$("$LOOM_ROOT/scripts/install/create-issue.sh" "$TARGET_PATH") || \
-  error "Failed to create tracking issue"
-
-if [[ ! "$ISSUE_NUMBER" =~ ^[0-9]+$ ]]; then
-  error "Invalid issue number returned: $ISSUE_NUMBER"
-fi
-
-info "Tracking issue: #${ISSUE_NUMBER}"
-echo ""
-
-# ============================================================================
-# STEP 3: Create Installation Worktree
+# STEP 2: Create Installation Worktree
 # ============================================================================
 CURRENT_STEP="Create Worktree"
-header "Step 3: Creating Installation Worktree"
+header "Step 2: Creating Installation Worktree"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/create-worktree.sh" ]]; then
   error "Installation script not found: create-worktree.sh"
 fi
 
-WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH" "$ISSUE_NUMBER") || \
+WORKTREE_OUTPUT=$("$LOOM_ROOT/scripts/install/create-worktree.sh" "$TARGET_PATH") || \
   error "Failed to create worktree"
 
 # Parse output: WORKTREE_PATH|BRANCH_NAME|BASE_BRANCH
@@ -445,10 +411,10 @@ info "Base branch: $BASE_BRANCH"
 echo ""
 
 # ============================================================================
-# STEP 4: Initialize Loom Configuration
+# STEP 3: Initialize Loom Configuration
 # ============================================================================
 CURRENT_STEP="Initialize Loom"
-header "Step 4: Initializing Loom Configuration"
+header "Step 3: Initializing Loom Configuration"
 echo ""
 
 # Check if loom-daemon is built
@@ -511,14 +477,14 @@ cp "$LOOM_ROOT/scripts/cleanup-branches.sh" ".loom/scripts/cleanup-branches.sh" 
   error "Failed to copy cleanup-branches.sh"
 chmod +x ".loom/scripts/cleanup.sh"
 chmod +x ".loom/scripts/cleanup-branches.sh"
-success "✓ Installed cleanup scripts to .loom/scripts/"
+success "Installed cleanup scripts to .loom/scripts/"
 echo ""
 
 # ============================================================================
-# STEP 5: Sync GitHub Labels
+# STEP 4: Sync GitHub Labels
 # ============================================================================
 CURRENT_STEP="Sync Labels"
-header "Step 5: Syncing GitHub Labels"
+header "Step 4: Syncing GitHub Labels"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/sync-labels.sh" ]]; then
@@ -530,28 +496,11 @@ fi
 
 echo ""
 
-# Now that labels are synced, ensure the tracking issue has the loom:building label
-info "Ensuring tracking issue has loom:building label..."
-cd "$TARGET_PATH"
-# Detect the target repository from git remote
-TARGET_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
-if [[ -n "$TARGET_REPO" ]] && [[ "$TARGET_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-  if gh issue edit "$ISSUE_NUMBER" -R "$TARGET_REPO" --add-label "loom:building" >/dev/null 2>&1; then
-    success "Added loom:building label to issue #${ISSUE_NUMBER}"
-  else
-    warning "Could not add loom:building label to issue #${ISSUE_NUMBER}"
-  fi
-else
-  warning "Could not detect repository for label update"
-fi
-
-echo ""
-
 # ============================================================================
-# STEP 6: Configure Branch Protection
+# STEP 5: Configure Branch Protection
 # ============================================================================
 CURRENT_STEP="Configure Branch Protection"
-header "Step 6: Configure Branch Protection"
+header "Step 5: Configure Branch Protection"
 echo ""
 
 # Detect default branch
@@ -587,17 +536,56 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 7: Create Pull Request
+# STEP 5b: Configure Repository Settings
+# ============================================================================
+CURRENT_STEP="Configure Repository Settings"
+header "Step 5b: Configure Repository Settings"
+echo ""
+
+if [[ "$NON_INTERACTIVE" == "true" ]]; then
+  # In non-interactive mode, apply repository settings automatically
+  # This is needed for auto-merge to work on the installation PR
+  info "Applying repository settings (required for auto-merge)..."
+  if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+    echo ""
+  else
+    echo ""
+    warning "Failed to configure repository settings (may require admin permissions)"
+    info "Auto-merge may not be available for the installation PR"
+  fi
+else
+  echo ""
+  read -p "Configure repository merge and auto-merge settings? (y/N) " -n 1 -r
+  echo ""
+  if [[ $REPLY =~ ^[Yy]$ ]]; then
+    info "Applying repository settings..."
+    if "$LOOM_ROOT/scripts/install/setup-repository-settings.sh" "$TARGET_PATH"; then
+      echo ""
+    else
+      echo ""
+      warning "Failed to configure repository settings (may require admin permissions)"
+      info "You can configure manually via GitHub Settings > General"
+    fi
+  else
+    info "Skipping repository settings"
+    info "To configure later, run: $LOOM_ROOT/scripts/install/setup-repository-settings.sh $TARGET_PATH"
+  fi
+fi
+
+echo ""
+
+# ============================================================================
+# STEP 6: Create Pull Request
 # ============================================================================
 CURRENT_STEP="Create PR"
-header "Step 7: Creating Pull Request"
+header "Step 6: Creating Pull Request"
 echo ""
 
 if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
   error "Installation script not found: create-pr.sh"
 fi
 
-PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$ISSUE_NUMBER" "$BASE_BRANCH") || \
+PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$BASE_BRANCH") || \
   error "Failed to create pull request"
 
 # Check if installation was already complete (no changes needed)
@@ -605,17 +593,8 @@ PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_P
 if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   info "Loom is already installed - cleaning up..."
 
-  # Close the tracking issue
-  cd "$TARGET_PATH"
-  # Detect the target repository from git remote
-  TARGET_REPO=$(git config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || echo "")
-  if [[ -n "$TARGET_REPO" ]] && [[ "$TARGET_REPO" =~ ^[^/]+/[^/]+$ ]]; then
-    gh issue close "${ISSUE_NUMBER}" -R "$TARGET_REPO" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
-  else
-    gh issue close "${ISSUE_NUMBER}" --comment "Loom is already installed. No changes needed." 2>/dev/null || true
-  fi
-
   # Remove the worktree
+  cd "$TARGET_PATH"
   git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
   git branch -D "${BRANCH_NAME}" 2>/dev/null || true
 
@@ -630,13 +609,24 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   exit 0
 fi
 
-# Extract just the URL from the output in case there's any extra content
-# This handles cases where gh or other commands leak output to stdout
-PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+# Parse output: PR_URL|MERGE_STATUS
+# Extract the last line containing PR_URL|STATUS format
+LAST_OUTPUT_LINE=$(echo "$PR_URL_RAW" | tail -1)
+PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
+MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
+
+# Validate PR URL - also try to extract from the raw output if parsing failed
+if [[ ! "$PR_URL" =~ ^https://github\.com/ ]]; then
+  # Fallback: try to extract URL from anywhere in the output
+  PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]|]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+fi
 
 if [[ ! "$PR_URL" =~ ^https:// ]]; then
   error "Invalid PR URL returned: $PR_URL"
 fi
+
+# Default merge status if not set
+MERGE_STATUS="${MERGE_STATUS:-manual}"
 
 success "Pull request created"
 echo ""
@@ -658,8 +648,18 @@ echo ""
 success "Loom ${LOOM_VERSION} installed successfully"
 echo ""
 
-info "📋 Tracking Issue: #${ISSUE_NUMBER}"
-info "📦 Pull Request: ${PR_URL}"
+# Show PR status based on merge result
+case "$MERGE_STATUS" in
+  merged)
+    info "✓ Pull Request: ${PR_URL} (merged)"
+    ;;
+  auto)
+    info "⏳ Pull Request: ${PR_URL} (auto-merge enabled)"
+    ;;
+  *)
+    info "📦 Pull Request: ${PR_URL}"
+    ;;
+esac
 echo ""
 
 header "What's Included:"
@@ -670,13 +670,43 @@ echo "  ✅ CLAUDE.md and AGENTS.md documentation"
 echo ""
 
 header "Next Steps:"
-echo "  1. Review and merge the pull request: ${PR_URL}"
-echo "  2. Choose your workflow:"
-echo "     Manual Mode (recommended to start):"
-echo "       cd $TARGET_PATH && claude"
-echo "       Then use /builder, /judge, or other role commands"
-echo "     Tauri App Mode (requires Loom.app - see README):"
-echo "       Download Loom.app from releases, open workspace"
+case "$MERGE_STATUS" in
+  merged)
+    # PR was merged - ready to use immediately
+    echo "  Loom is ready to use! Choose your workflow:"
+    echo ""
+    echo "  Manual Mode (recommended to start):"
+    echo "    cd $TARGET_PATH && claude"
+    echo "    Then use /builder, /judge, or other role commands"
+    echo ""
+    echo "  Tauri App Mode (requires Loom.app - see README):"
+    echo "    Download Loom.app from releases, open workspace"
+    ;;
+  auto)
+    # Auto-merge enabled - PR will merge once requirements are met
+    echo "  The installation PR has auto-merge enabled and will merge"
+    echo "  automatically once branch protection requirements are met."
+    echo ""
+    echo "  Once merged, choose your workflow:"
+    echo ""
+    echo "  Manual Mode (recommended to start):"
+    echo "    cd $TARGET_PATH && claude"
+    echo "    Then use /builder, /judge, or other role commands"
+    echo ""
+    echo "  Tauri App Mode (requires Loom.app - see README):"
+    echo "    Download Loom.app from releases, open workspace"
+    ;;
+  *)
+    # Manual merge required
+    echo "  1. Review and merge the pull request: ${PR_URL}"
+    echo "  2. Choose your workflow:"
+    echo "     Manual Mode (recommended to start):"
+    echo "       cd $TARGET_PATH && claude"
+    echo "       Then use /builder, /judge, or other role commands"
+    echo "     Tauri App Mode (requires Loom.app - see README):"
+    echo "       Download Loom.app from releases, open workspace"
+    ;;
+esac
 echo ""
 
 info "See CLAUDE.md in the target repository for complete usage details."

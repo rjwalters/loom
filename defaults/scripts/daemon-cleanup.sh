@@ -7,6 +7,7 @@
 #   daemon-startup                   - Cleanup stale artifacts from previous session
 #   daemon-shutdown                  - Archive logs and cleanup before exit
 #   periodic                         - Conservative periodic cleanup
+#   prune-sessions                   - Prune old daemon state session archives
 
 set -euo pipefail
 
@@ -29,6 +30,7 @@ REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || error "Not in a git 
 
 # Paths
 DAEMON_STATE="$REPO_ROOT/.loom/daemon-state.json"
+PROGRESS_DIR="$REPO_ROOT/.loom/progress"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Configuration (can be overridden via environment or daemon-state.json)
@@ -51,6 +53,7 @@ Events:
   daemon-startup              Cleanup stale artifacts from previous session
   daemon-shutdown             Archive logs and cleanup before exit
   periodic                    Conservative periodic cleanup
+  prune-sessions              Prune old daemon state session archives
 
 Options:
   --dry-run                   Show what would be cleaned
@@ -220,11 +223,96 @@ handle_shepherd_complete() {
     fi
   fi
 
+  # Clean up progress file for completed shepherd
+  cleanup_progress_file "$ISSUE_NUMBER"
+
   if [[ "$DRY_RUN" != true ]]; then
     update_cleanup_timestamp "shepherd-complete"
   fi
 
   success "Shepherd complete cleanup finished for issue #$ISSUE_NUMBER"
+}
+
+# Helper: Cleanup progress file for a completed issue
+cleanup_progress_file() {
+  local issue_num="$1"
+
+  if [[ ! -d "$PROGRESS_DIR" ]]; then
+    return
+  fi
+
+  # Find progress file(s) for this issue
+  for progress_file in "$PROGRESS_DIR"/shepherd-*.json; do
+    if [[ -f "$progress_file" ]]; then
+      local file_issue
+      file_issue=$(jq -r '.issue // 0' "$progress_file" 2>/dev/null || echo "0")
+      local file_status
+      file_status=$(jq -r '.status // "working"' "$progress_file" 2>/dev/null || echo "working")
+
+      if [[ "$file_issue" == "$issue_num" ]]; then
+        if [[ "$file_status" == "completed" ]]; then
+          if [[ "$DRY_RUN" == true ]]; then
+            info "[DRY-RUN] Would delete progress file: $(basename "$progress_file")"
+          else
+            rm -f "$progress_file"
+            info "Deleted progress file: $(basename "$progress_file")"
+          fi
+        else
+          info "Progress file for issue #$issue_num has status '$file_status', not cleaning"
+        fi
+      fi
+    fi
+  done
+}
+
+# Helper: Cleanup stale progress files
+cleanup_stale_progress_files() {
+  if [[ ! -d "$PROGRESS_DIR" ]]; then
+    return
+  fi
+
+  local stale_threshold="${LOOM_PROGRESS_STALE_HOURS:-24}"  # 24 hours default
+  local now_epoch
+  now_epoch=$(date +%s)
+
+  info "Cleaning stale progress files (older than ${stale_threshold}h)..."
+
+  for progress_file in "$PROGRESS_DIR"/shepherd-*.json; do
+    if [[ -f "$progress_file" ]]; then
+      local last_heartbeat
+      last_heartbeat=$(jq -r '.last_heartbeat // ""' "$progress_file" 2>/dev/null || echo "")
+      local status
+      status=$(jq -r '.status // "working"' "$progress_file" 2>/dev/null || echo "working")
+
+      # Skip files still being actively worked
+      if [[ "$status" == "working" ]]; then
+        # Check heartbeat freshness
+        if [[ -n "$last_heartbeat" && "$last_heartbeat" != "null" ]]; then
+          local hb_epoch
+          if [[ "$(uname)" == "Darwin" ]]; then
+            hb_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+          else
+            hb_epoch=$(date -d "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+          fi
+
+          local age_hours=$(( (now_epoch - hb_epoch) / 3600 ))
+          if [[ $age_hours -lt $stale_threshold ]]; then
+            continue  # Skip fresh files
+          fi
+        fi
+      fi
+
+      # For completed/errored/blocked files, clean up after threshold
+      if [[ "$status" != "working" ]]; then
+        if [[ "$DRY_RUN" == true ]]; then
+          info "[DRY-RUN] Would delete stale progress file: $(basename "$progress_file") (status: $status)"
+        else
+          rm -f "$progress_file"
+          info "Deleted stale progress file: $(basename "$progress_file") (status: $status)"
+        fi
+      fi
+    fi
+  done
 }
 
 # Event: daemon-startup
@@ -233,6 +321,26 @@ handle_daemon_startup() {
   header "Daemon Startup Cleanup"
   echo ""
 
+  # ===================================================================
+  # ORPHANED SHEPHERD RECOVERY (Critical - run first)
+  # ===================================================================
+  # Detect and recover orphaned shepherds from crashed sessions.
+  # This must run before other cleanup to restore proper state.
+  info "Checking for orphaned shepherds from previous session..."
+  if [[ -x "$SCRIPT_DIR/recover-orphaned-shepherds.sh" ]]; then
+    if [[ "$DRY_RUN" == true ]]; then
+      "$SCRIPT_DIR/recover-orphaned-shepherds.sh" --verbose 2>/dev/null || warning "Orphaned shepherd check found issues"
+    else
+      "$SCRIPT_DIR/recover-orphaned-shepherds.sh" --recover --verbose 2>/dev/null || warning "Orphaned shepherd recovery had issues"
+    fi
+  else
+    warning "recover-orphaned-shepherds.sh not found - skipping orphan recovery"
+  fi
+  echo ""
+
+  # ===================================================================
+  # LOG ARCHIVING
+  # ===================================================================
   # Archive any orphaned task outputs from previous session
   if [[ "$ARCHIVE_LOGS" == "true" ]]; then
     info "Archiving orphaned task outputs..."
@@ -243,6 +351,9 @@ handle_daemon_startup() {
     fi
   fi
 
+  # ===================================================================
+  # PENDING CLEANUP PROCESSING
+  # ===================================================================
   # Process any pending cleanups from previous session
   if [[ -f "$DAEMON_STATE" ]]; then
     local pending=$(jq -r '.cleanup.pendingCleanup // [] | .[]' "$DAEMON_STATE" 2>/dev/null || echo "")
@@ -261,6 +372,9 @@ handle_daemon_startup() {
     fi
   fi
 
+  # ===================================================================
+  # WORKTREE CLEANUP
+  # ===================================================================
   # Run safe worktree cleanup
   info "Cleaning stale worktrees..."
   if [[ "$DRY_RUN" == true ]]; then
@@ -269,6 +383,9 @@ handle_daemon_startup() {
     "$SCRIPT_DIR/safe-worktree-cleanup.sh" 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
   fi
 
+  # ===================================================================
+  # ARCHIVE PRUNING
+  # ===================================================================
   # Prune old archives
   info "Pruning old archives..."
   if [[ "$DRY_RUN" == true ]]; then
@@ -276,6 +393,12 @@ handle_daemon_startup() {
   else
     "$SCRIPT_DIR/archive-logs.sh" --prune-only --retention-days "$RETENTION_DAYS" 2>/dev/null || true
   fi
+
+  # ===================================================================
+  # PROGRESS FILE CLEANUP
+  # ===================================================================
+  # Cleanup stale progress files from previous session
+  cleanup_stale_progress_files
 
   if [[ "$DRY_RUN" != true ]]; then
     update_cleanup_timestamp "daemon-startup"
@@ -308,6 +431,65 @@ handle_daemon_shutdown() {
   fi
 
   success "Daemon shutdown cleanup complete"
+}
+
+# Event: prune-sessions
+# Prune old daemon state session archives
+handle_prune_sessions() {
+  header "Prune Session Archives"
+  echo ""
+
+  local max_sessions="${LOOM_MAX_ARCHIVED_SESSIONS:-10}"
+
+  # Find all archived session files
+  local archives
+  archives=$(find "$REPO_ROOT/.loom" -maxdepth 1 -name '[0-9][0-9]-daemon-state.json' 2>/dev/null | sort || echo "")
+
+  if [[ -z "$archives" ]]; then
+    info "No archived sessions found"
+    return
+  fi
+
+  local archive_count
+  archive_count=$(echo "$archives" | wc -l | tr -d ' ')
+
+  info "Found $archive_count archived session(s) (max: $max_sessions)"
+
+  # Calculate how many to delete
+  local to_delete=$((archive_count - max_sessions))
+
+  if [[ $to_delete -le 0 ]]; then
+    info "No pruning needed (under limit)"
+    return
+  fi
+
+  info "Pruning $to_delete oldest session(s)..."
+
+  # Delete oldest archives
+  local deleted=0
+  for archive in $archives; do
+    if [[ $deleted -ge $to_delete ]]; then
+      break
+    fi
+
+    local basename
+    basename=$(basename "$archive")
+
+    if [[ "$DRY_RUN" == true ]]; then
+      info "[DRY-RUN] Would delete: $basename"
+    else
+      rm -f "$archive"
+      info "Deleted: $basename"
+    fi
+
+    ((deleted++))
+  done
+
+  if [[ "$DRY_RUN" != true ]]; then
+    update_cleanup_timestamp "prune-sessions"
+  fi
+
+  success "Session pruning complete"
 }
 
 # Event: periodic
@@ -351,6 +533,9 @@ handle_periodic() {
     "$SCRIPT_DIR/archive-logs.sh" --prune-only --retention-days "$RETENTION_DAYS" 2>/dev/null || true
   fi
 
+  # Cleanup stale progress files
+  cleanup_stale_progress_files
+
   if [[ "$DRY_RUN" != true ]]; then
     update_cleanup_timestamp "periodic"
   fi
@@ -372,7 +557,10 @@ case "$EVENT" in
   periodic)
     handle_periodic
     ;;
+  prune-sessions)
+    handle_prune_sessions
+    ;;
   *)
-    error "Unknown event: $EVENT\nValid events: shepherd-complete, daemon-startup, daemon-shutdown, periodic"
+    error "Unknown event: $EVENT\nValid events: shepherd-complete, daemon-startup, daemon-shutdown, periodic, prune-sessions"
     ;;
 esac

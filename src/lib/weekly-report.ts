@@ -18,7 +18,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   type AgentMetrics,
-  formatChangePercent,
   formatCurrency,
   formatCycleTime,
   formatNumber,
@@ -32,11 +31,7 @@ import {
   type TrendDirection,
   type VelocitySummary,
 } from "./agent-metrics";
-import {
-  type CorrelationInsight,
-  type CorrelationSummary,
-  runCorrelationAnalysis,
-} from "./correlation-analysis";
+import { type CorrelationSummary, runCorrelationAnalysis } from "./correlation-analysis";
 import { Logger } from "./logger";
 
 const logger = Logger.forComponent("weekly-report");
@@ -847,7 +842,7 @@ export async function startReportScheduler(
         const weekStart = getLastMonday(now).toISOString().split("T")[0];
 
         if (latest && latest.week_start === weekStart) {
-          logger.debug("Report already exists for this week, skipping");
+          logger.info("Report already exists for this week, skipping");
           return;
         }
 
@@ -1025,7 +1020,7 @@ export function exportReportAsHtml(report: WeeklyReport): string {
     .replace(/^- (.*)$/gm, "<li>$1</li>")
     .replace(/^---$/gm, "<hr>")
     .replace(/\n\n/g, "</p><p>")
-    .replace(/^\|(.+)\|$/gm, (match, content) => {
+    .replace(/^\|(.+)\|$/gm, (_match, content) => {
       const cells = content.split("|").map((c: string) => `<td>${c.trim()}</td>`);
       return `<tr>${cells.join("")}</tr>`;
     });

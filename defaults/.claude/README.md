@@ -7,6 +7,7 @@ This directory contains Claude Code configuration for the Loom project.
 - **`settings.json`**: Team-wide permissions and settings (committed to git)
 - **`settings.local.json`**: Personal preferences (gitignored, create if needed)
 - **`../.mcp.json`**: MCP server configuration (at project root, committed to git)
+- **`agents/`**: Custom subagent definitions for Loom roles (see below)
 
 ## Pre-approved Commands
 
@@ -100,7 +101,7 @@ Interact with the Loom application UI and state:
 
 ## Slash Commands
 
-The `commands/` directory contains slash commands that invoke Loom roles. Each command instructs Claude to assume a specific role defined in `.loom/roles/`.
+The `commands/` directory contains slash commands that define Loom roles. Each command file contains the complete role definition - there's no indirection to separate role files.
 
 ### Available Commands
 
@@ -123,10 +124,10 @@ The `commands/` directory contains slash commands that invoke Loom roles. Each c
 /judge      # Assume Judge role, review a PR with loom:review-requested
 ```
 
-Each slash command tells Claude to:
-1. Read the role definition from `.loom/roles/<role>.md`
-2. Follow the role's workflow guidelines
-3. Complete ONE iteration of the role's task
+Each slash command contains the complete role definition, including:
+1. The role's purpose and responsibilities
+2. Workflow guidelines and label transitions
+3. Instructions for completing ONE iteration of the role's task
 
 ### Agent Roles in Workflow
 
@@ -146,11 +147,72 @@ The roles work together following the label-based workflow:
 
 To create a custom slash command:
 
-1. Create `.claude/commands/your-command.md`
-2. Reference a role file or write custom instructions
+1. Create `.claude/commands/your-command.md` with the complete role definition
+2. Include role purpose, workflow guidelines, and iteration instructions
 3. Use it with `/your-command`
 
-See `.loom/roles/README.md` for creating custom role definitions.
+**Note**: `.loom/roles/` contains symlinks to `.claude/commands/` for Tauri App compatibility. The single source of truth for all role definitions is `.claude/commands/`.
+
+## Custom Subagents
+
+The `agents/` directory contains custom subagent definitions for Loom roles. These subagents can be used with Claude Code's Task tool for spawning role-specific agents with fresh context.
+
+### Available Subagents
+
+| Subagent | Model | Purpose |
+|----------|-------|---------|
+| `loom-shepherd` | sonnet | Single-issue lifecycle orchestration (Layer 1) |
+| `loom-daemon` | sonnet | System orchestration, work generation (Layer 2) |
+| `loom-builder` | opus | Implement features and fixes |
+| `loom-judge` | opus | Review pull requests |
+| `loom-curator` | sonnet | Enhance and organize issues |
+| `loom-doctor` | sonnet | Fix bugs and address PR feedback |
+| `loom-champion` | sonnet | Evaluate proposals, auto-merge PRs |
+| `loom-architect` | opus | Create architectural proposals |
+| `loom-hermit` | sonnet | Identify simplification opportunities |
+| `loom-guide` | sonnet | Prioritize and triage issues |
+| `loom-auditor` | sonnet | Verify runtime behavior of built software |
+
+### How Subagents Work
+
+Subagents are specialized AI assistants that run in their own context window. Each has:
+- Custom system prompt referencing the role definition in `.loom/roles/`
+- Specific tool access appropriate for the role
+- Model selection optimized for the task complexity
+
+**Using Subagents with Task**:
+
+The Loom Shepherd (or daemon) can spawn subagents for each phase:
+
+```python
+# Spawn builder subagent with fresh context
+# Note: subagent_type is always "general-purpose" - role selection
+# happens via the slash command in the prompt (e.g., "/builder 123")
+result = Task(
+    description="Builder phase for issue #123",
+    prompt="/builder 123",
+    subagent_type="general-purpose",
+    run_in_background=False
+)
+```
+
+**Benefits**:
+- **Fresh context**: Each subagent starts clean, avoiding context pollution
+- **Role isolation**: Subagents focus on their specific task
+- **Cost control**: Use faster/cheaper models for simpler roles (sonnet vs opus)
+- **Better observability**: Clear which role is running
+
+### Subagents vs Slash Commands
+
+| Feature | Slash Commands | Subagents |
+|---------|----------------|-----------|
+| Context | Shared with main conversation | Isolated, fresh context |
+| Invocation | `/builder 123` | `Task(subagent_type="general-purpose", prompt="/builder 123")` |
+| Use case | Manual orchestration | Automated orchestration |
+| Visibility | In main conversation | Spawned as separate task |
+
+**Use slash commands** for manual orchestration mode where you want direct control.
+**Use subagents** for automated orchestration where shepherds coordinate roles with fresh context per phase.
 
 ## Documentation
 

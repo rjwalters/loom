@@ -158,7 +158,31 @@ Launch the Loom desktop application for automated orchestration with visual term
 
 Run the Loom daemon for fully autonomous system orchestration.
 
-**Setup**:
+**Two options for running the daemon:**
+
+| Option | Command | Best For |
+|--------|---------|----------|
+| **Shell Wrapper** (recommended) | `./.loom/scripts/daemon-loop.sh` | Production, long-running sessions |
+| **LLM-interpreted** | `/loom` | Development, debugging, testing |
+
+**Option A: Shell Wrapper (Recommended for Production)**
+
+```bash
+# Start daemon with shell wrapper
+./.loom/scripts/daemon-loop.sh
+
+# Start in force mode
+./.loom/scripts/daemon-loop.sh --force
+
+# Run in background
+nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
+
+# Custom poll interval (default: 120s)
+LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
+```
+
+**Option B: LLM-interpreted (For Development/Testing)**
+
 ```bash
 # Start the daemon (runs continuously)
 /loom
@@ -172,6 +196,8 @@ Run the Loom daemon for fully autonomous system orchestration.
 # 3. Spawn shepherds for ready issues
 # 4. Ensure Guide and Champion keep running
 ```
+
+**Note**: The `/loom` command relies on the LLM correctly implementing the two-tier architecture (parent loop spawning iteration subagents). While this generally works, the shell wrapper provides more deterministic behavior for production use.
 
 **Force Mode** (`--force`):
 
@@ -208,6 +234,18 @@ touch .loom/stop-daemon
 # 2. Wait for active shepherds to complete (max 5 min)
 # 3. Clean up state and exit
 ```
+
+**Why use the shell wrapper?**
+- **Deterministic loop behavior**: No LLM interpretation variability
+- **Timeout protection**: Prevents hung iterations (default: 5 minutes)
+- **Background operation**: Can run in background, screen, or tmux
+- **Consistent logging**: Logs to `.loom/daemon.log`
+- **Context isolation**: Each iteration is a fresh Claude session (no context accumulation)
+
+**Trade-offs of shell wrapper**:
+- Requires `claude` CLI in PATH
+- Slightly higher latency per iteration (CLI startup)
+- No conversation context between iterations (by design - this is a feature for long-running operation)
 
 ## Agent Roles
 
@@ -273,6 +311,11 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Workflow**: Plain shell environment for custom tasks
 - **When to use**: Ad-hoc tasks, debugging, manual operations
 
+**Auditor** (Autonomous 10min, `auditor.md`)
+- **Purpose**: Validate main branch build and runtime
+- **Workflow**: Pulls main → builds → tests → runs → creates bug issues if problems found
+- **When to use**: Continuous integration health monitoring
+
 ### Role Definitions
 
 Full role definitions with detailed guidelines are available in:
@@ -286,6 +329,7 @@ Full role definitions with detailed guidelines are available in:
 - `.loom/roles/architect.md` - Architectural proposals
 - `.loom/roles/hermit.md` - Code simplification
 - `.loom/roles/guide.md` - Issue triage and prioritization
+- `.loom/roles/auditor.md` - Main branch validation
 
 ## Label-Based Workflow
 
@@ -318,9 +362,12 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 (created) → loom:hermit → (evaluated) → loom:issue
            ↑ Hermit       ↑ Champion    ↑ Ready for Builder
+
+(created) → loom:auditor → (evaluated) → loom:issue
+           ↑ Auditor       ↑ Champion    ↑ Ready for Builder
 ```
 
-**Note**: Champion evaluates proposals from Architect and Hermit roles using the same 8 quality criteria as curated issues. Well-formed proposals are promoted automatically; only ambiguous or controversial proposals require human intervention.
+**Note**: Champion evaluates proposals from Architect, Hermit, and Auditor roles using the same 8 quality criteria as curated issues. Well-formed proposals are promoted automatically; only ambiguous or controversial proposals require human intervention.
 
 ### Label Definitions
 
@@ -336,6 +383,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 **Proposal Labels**:
 - **`loom:architect`**: Architectural proposal awaiting Champion evaluation
 - **`loom:hermit`**: Simplification proposal awaiting Champion evaluation
+- **`loom:auditor`**: Bug discovered by Auditor during main branch validation
 - **`loom:curated`**: Issue enhanced by Curator, awaiting Champion evaluation
 
 **Status Labels**:
@@ -532,6 +580,69 @@ The Loom daemon uses these configuration parameters:
 | `MAX_SHEPHERDS` | 3 | Maximum concurrent shepherd processes |
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
 | `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
+| `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |
+
+**Issue Selection Strategy** (`LOOM_ISSUE_STRATEGY`):
+
+Controls the order in which shepherds pick up issues from the ready queue. The `loom:urgent` label always takes precedence regardless of strategy.
+
+| Strategy | Description |
+|----------|-------------|
+| `fifo` | **Default.** Oldest issues first (FIFO). Prevents starvation where new issues indefinitely deprioritize older ones. |
+| `lifo` | Newest issues first (LIFO). Original GitHub CLI default behavior. |
+| `priority` | Same as `fifo` but explicitly named. Issues with `loom:urgent` label first (oldest to newest), then remaining issues oldest to newest. |
+
+**Priority behavior:**
+- Issues with `loom:urgent` label are **always** processed first, regardless of strategy
+- Within the urgent partition, issues are sorted by age (oldest first)
+- Non-urgent issues are then sorted according to the selected strategy
+
+**Example:**
+```bash
+# Use FIFO (default) - prevents issue starvation
+LOOM_ISSUE_STRATEGY=fifo /loom
+
+# Use LIFO - newest issues first (for fast iteration)
+LOOM_ISSUE_STRATEGY=lifo /loom
+
+# Priority mode - explicit about urgent-first ordering
+LOOM_ISSUE_STRATEGY=priority /loom
+```
+
+**Session Reflection Configuration**:
+
+The daemon runs a reflection stage during graceful shutdown to identify improvements and optionally create upstream issues.
+
+```json
+{
+  "reflection": {
+    "enabled": true,              // Enable reflection stage
+    "auto_create_issues": false,  // Require user consent
+    "min_session_duration": 300,  // Skip for sessions < 5 min
+    "upstream_repo": "rjwalters/loom",
+    "categories": ["bug", "enhancement", "documentation"]
+  }
+}
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | true | Enable/disable reflection stage |
+| `auto_create_issues` | false | Auto-create issues without prompting |
+| `min_session_duration` | 300 | Minimum session duration (seconds) to trigger reflection |
+| `upstream_repo` | rjwalters/loom | Repository for improvement issues |
+
+**Manual Reflection**:
+```bash
+# Run reflection manually (e.g., after crash recovery)
+./.loom/scripts/session-reflection.sh
+
+# Preview without creating issues
+./.loom/scripts/session-reflection.sh --dry-run
+
+# Output analysis as JSON
+./.loom/scripts/session-reflection.sh --json
+```
 
 **Daemon State File** (`.loom/daemon-state.json`):
 
@@ -628,6 +739,32 @@ The daemon state file provides comprehensive information for debugging, crash re
 | terminal-guide | guide.md | Backlog triage (always running) |
 | terminal-champion | champion.md | Auto-merge (always running) |
 
+### Model Selection Strategy
+
+Loom uses different AI models optimized for each role's task complexity. Model preferences are defined in each role's JSON metadata file via the `suggestedModel` field.
+
+**Model assignments by role**:
+
+| Role | Model | Rationale |
+|------|-------|-----------|
+| Loom Daemon | `sonnet` | Iteration logic is complex - needs reliable instruction following |
+| Shepherd | `sonnet` | Orchestration is systematic with clear state transitions |
+| Builder | `opus` | Complex implementation requires deep reasoning |
+| Judge | `opus` | Code review needs thorough understanding |
+| Curator | `sonnet` | Issue enhancement is structured |
+| Doctor | `sonnet` | PR fixes are usually targeted and scoped |
+| Architect | `opus` | System design requires sophisticated thinking |
+| Hermit | `sonnet` | Code removal analysis is pattern-based |
+| Champion | `sonnet` | Proposal evaluation has clear criteria |
+| Guide | `sonnet` | Triage is systematic |
+| Driver | `sonnet` | General-purpose default |
+
+**Valid model values**: `haiku`, `sonnet`, `opus`
+
+- **haiku**: Fast, cheap - for simple status checks and monitoring
+- **sonnet**: Balanced - for structured tasks with clear criteria
+- **opus**: Most capable - for complex reasoning and implementation
+
 ### Custom Roles
 
 Create custom roles by adding files to `.loom/roles/`:
@@ -648,6 +785,7 @@ cat > .loom/roles/my-role.json <<EOF
 {
   "name": "My Custom Role",
   "description": "Brief description",
+  "suggestedModel": "sonnet",
   "defaultInterval": 300000,
   "defaultIntervalPrompt": "Continue working",
   "autonomousRecommended": false,
@@ -721,9 +859,99 @@ If setup fails, it's usually due to:
 - Branch doesn't exist yet (push at least one commit)
 - GitHub API unreachable (check network/auth)
 
+### Repository Settings
+
+Loom works best with specific repository settings that support the automated workflow. These settings optimize merge behavior and enable auto-merge capabilities.
+
+#### During Installation
+
+The installation script optionally configures repository settings:
+
+**Interactive mode**: Prompts you to configure settings
+```bash
+./scripts/install-loom.sh /path/to/repo
+# Will prompt: Configure repository merge and auto-merge settings? (y/N)
+```
+
+**Non-interactive mode**: Skips repository settings (configure manually)
+```bash
+./scripts/install-loom.sh --yes /path/to/repo
+# Skips settings for automation safety
+```
+
+#### Manual Configuration
+
+Configure repository settings after installation:
+
+```bash
+./scripts/install/setup-repository-settings.sh /path/to/repo
+```
+
+Preview changes without applying (dry-run mode):
+
+```bash
+./scripts/install/setup-repository-settings.sh /path/to/repo --dry-run
+```
+
+Or configure via GitHub Settings:
+1. Go to: `Settings > General` in your repository
+2. Scroll to "Pull Requests" section
+3. Configure merge options as described below
+
+#### Settings Applied
+
+The setup script configures these repository settings:
+
+| Setting | Value | Why |
+|---------|-------|-----|
+| `allow_merge_commit` | false | Disabled - use squash merge instead |
+| `allow_squash_merge` | true | Default merge strategy - flattens PR to single commit |
+| `allow_rebase_merge` | false | Disabled - use squash merge instead |
+| `delete_branch_on_merge` | true | Auto-cleanup feature branches after merge |
+| `allow_auto_merge` | true | Enables Champion role to auto-merge approved PRs |
+| `allow_update_branch` | true | Suggests keeping branches up-to-date with base |
+
+#### Why These Settings?
+
+- **Squash merge only**: Flattens each PR into a single commit for clean history; each issue becomes one atomic commit on main
+- **Delete branches after merge**: Prevents accumulation of stale branches from issue worktrees
+- **Auto-merge enabled**: Required for Champion role to automatically merge approved PRs
+- **Suggest updating branches**: Helps agents keep branches current with main
+
+**Requirements**:
+- Admin permissions on target repository
+- GitHub CLI authenticated
+
+**Troubleshooting**:
+If setup fails, it's usually due to:
+- Lacking admin permissions (ask repo owner)
+- GitHub API unreachable (check network/auth)
+
 ## Troubleshooting
 
 ### Common Issues
+
+**'main already used by worktree' error during PR merge**:
+
+When running `gh pr merge` from a worktree, you may see this error:
+```
+fatal: 'main' is already used by worktree at '/path/to/repo'
+```
+
+This is **expected behavior**, not a failure. The merge succeeds on GitHub, but git cannot switch to `main` locally because another worktree has it checked out.
+
+**Solution**: Verify merge success via GitHub API instead of exit code:
+```bash
+# After gh pr merge, check the actual state:
+PR_STATE=$(gh pr view <PR_NUMBER> --json state --jq '.state')
+if [ "$PR_STATE" = "MERGED" ]; then
+  echo "Merge succeeded (local checkout error can be ignored)"
+fi
+```
+
+The Shepherd and Champion roles handle this automatically by verifying PR state via the GitHub API rather than relying on `gh pr merge` exit codes.
+
+---
 
 **Cleaning Up Stale Worktrees and Branches**:
 
@@ -820,6 +1048,42 @@ When an agent crashes or is cancelled while building, issues can get stuck in `l
 - Checks if there's an associated PR (by branch name or body reference)
 - Issues without PRs older than threshold are flagged/recovered
 - Issues with stale PRs are flagged but not auto-recovered (need manual review)
+
+**Orphaned shepherd recovery (daemon crashes)**:
+
+When a daemon session crashes or is terminated abruptly, shepherds may be left in an orphaned state with stale task IDs and inconsistent labels. The `recover-orphaned-shepherds.sh` script handles this:
+
+```bash
+# Check for orphaned shepherds (dry run)
+./.loom/scripts/recover-orphaned-shepherds.sh
+
+# Show detailed progress
+./.loom/scripts/recover-orphaned-shepherds.sh --verbose
+
+# Actually recover orphaned state
+./.loom/scripts/recover-orphaned-shepherds.sh --recover
+
+# JSON output for automation
+./.loom/scripts/recover-orphaned-shepherds.sh --json
+```
+
+**What it detects**:
+- Stale task IDs in daemon-state.json (tasks that no longer exist)
+- loom:building issues without active shepherds
+- Progress files with stale heartbeats (no activity for >5 minutes)
+- Mismatches between daemon-state and GitHub labels
+
+**What it recovers**:
+- Resets orphaned shepherds to idle state in daemon-state.json
+- Returns orphaned issues from `loom:building` to `loom:issue`
+- Adds recovery comments to affected issues
+- Marks stale progress files as errored
+
+**Automatic recovery on daemon startup**:
+The daemon automatically runs orphaned shepherd recovery during startup via `daemon-cleanup.sh daemon-startup`. This ensures the daemon starts with clean state after a crash.
+
+**Configuration via environment**:
+- `LOOM_HEARTBEAT_STALE_THRESHOLD=300` - Seconds before heartbeat is stale (default: 5 minutes)
 
 ### Stuck Agent Detection
 
@@ -933,17 +1197,161 @@ jq '.shepherds["shepherd-1"] = {"issue": null, "idle_since": "'$(date -u +%Y-%m-
 ```
 
 **Work generation not triggering**:
-```bash
-# Check issue count vs threshold
-echo "Ready issues: $(gh issue list --label 'loom:issue' --state open --json number --jq 'length')"
-echo "Threshold: 3 (default)"
 
-# Check cooldown timestamps
+When the pipeline is empty but Architect/Hermit are not being triggered, diagnose with:
+
+```bash
+# 1. Check pipeline state via daemon-snapshot.sh (authoritative source)
+./.loom/scripts/daemon-snapshot.sh --pretty | jq '{
+  ready: .computed.total_ready,
+  needs_work_gen: .computed.needs_work_generation,
+  architect_cooldown_ok: .computed.architect_cooldown_ok,
+  hermit_cooldown_ok: .computed.hermit_cooldown_ok,
+  recommended_actions: .computed.recommended_actions
+}'
+
+# Expected output when pipeline empty and work generation should trigger:
+# {
+#   "ready": 0,
+#   "needs_work_gen": true,
+#   "architect_cooldown_ok": true,
+#   "hermit_cooldown_ok": true,
+#   "recommended_actions": ["trigger_architect", "trigger_hermit", "wait"]
+# }
+
+# 2. Check if triggers have ever fired
 jq '.last_architect_trigger, .last_hermit_trigger' .loom/daemon-state.json
 
-# Check proposal count
-echo "Proposals: $(gh issue list --label 'loom:architect,loom:hermit' --state open --json number --jq 'length')"
+# If both are null with ready=0, work generation never triggered
+
+# 3. Verify proposal counts aren't at max
+echo "Architect proposals: $(gh issue list --label 'loom:architect' --state open --json number --jq 'length')"
+echo "Hermit proposals: $(gh issue list --label 'loom:hermit' --state open --json number --jq 'length')"
+# Max is 2 per role by default
+
+# 4. Force trigger manually (for testing)
+# Run daemon iteration with debug mode to see all decisions:
+/loom iterate --debug
 ```
+
+**Common causes:**
+- **Cooldown not elapsed**: Default is 30 minutes between triggers. Check `last_*_trigger` timestamps.
+- **Proposals at max**: If 2+ architect/hermit proposals exist, new ones won't trigger.
+- **Iteration not acting on recommended_actions**: The daemon iteration must explicitly check for `trigger_architect` and `trigger_hermit` in the snapshot's `recommended_actions` array.
+
+## Health Monitoring
+
+Loom provides proactive health monitoring for extended unattended autonomous operation. The health system tracks throughput, latency, error rates, and resource usage to detect degradation patterns before they become critical.
+
+### Health Score
+
+The health score (0-100) is computed from multiple factors:
+- **Throughput trend** - Declining throughput reduces score
+- **Queue depth trend** - Growing queues reduce score
+- **Error rate** - Increasing errors reduce score
+- **Resource availability** - Near capacity limits reduce score
+- **Stuck agents** - Agents without heartbeats reduce score
+
+Score ranges:
+| Range | Status | Description |
+|-------|--------|-------------|
+| 90-100 | Excellent | System operating optimally |
+| 70-89 | Good | Normal operation, minor issues |
+| 50-69 | Fair | Some degradation detected |
+| 30-49 | Warning | Significant issues, attention needed |
+| 0-29 | Critical | Immediate intervention required |
+
+### Health Monitoring CLI
+
+```bash
+# View current health status
+./.loom/scripts/health-check.sh
+
+# JSON output for automation
+./.loom/scripts/health-check.sh --json
+
+# Collect and store metrics (called by daemon)
+./.loom/scripts/health-check.sh --collect
+
+# View alerts
+./.loom/scripts/health-check.sh --alerts
+
+# Acknowledge an alert
+./.loom/scripts/health-check.sh --acknowledge <alert-id>
+
+# View metric history (last 4 hours)
+./.loom/scripts/health-check.sh --history 4
+```
+
+### Alert Types
+
+| Alert Type | Description | Severity |
+|------------|-------------|----------|
+| `stuck_agents` | Agents without recent heartbeats | warning/critical |
+| `high_error_rate` | Consecutive iteration failures | warning/critical |
+| `resource_exhaustion` | Session budget near limits | warning/critical |
+| `queue_growth` | Ready queue growing without progress | warning |
+| `throughput_decline` | Significant throughput drop | warning |
+
+### Health Files
+
+| File | Purpose |
+|------|---------|
+| `.loom/health-metrics.json` | Historical health metrics (24-hour retention) |
+| `.loom/alerts.json` | Active and acknowledged alerts |
+
+### Configuration
+
+Health monitoring thresholds can be configured via environment variables:
+
+```bash
+LOOM_HEALTH_RETENTION_HOURS=24       # Metric retention period
+LOOM_THROUGHPUT_DECLINE_THRESHOLD=50 # % decline to trigger alert
+LOOM_QUEUE_GROWTH_THRESHOLD=5        # Queue growth count threshold
+LOOM_STUCK_AGENT_THRESHOLD=10        # Minutes without heartbeat
+LOOM_ERROR_RATE_THRESHOLD=20         # % error rate threshold
+```
+
+Or via `.loom/config.json`:
+
+```json
+{
+  "health_monitoring": {
+    "enabled": true,
+    "collect_interval_minutes": 5,
+    "retention_hours": 24,
+    "thresholds": {
+      "throughput_decline_percent": 50,
+      "queue_growth_count": 5,
+      "stuck_agent_minutes": 10,
+      "error_rate_percent": 20
+    }
+  }
+}
+```
+
+### MCP Health Tools
+
+The following MCP tools are available for health monitoring:
+
+| Tool | Description |
+|------|-------------|
+| `get_health_metrics` | Get current health score and latest metrics |
+| `get_health_history` | Get historical metrics for trend analysis |
+| `get_active_alerts` | Get unacknowledged alerts |
+| `acknowledge_alert` | Acknowledge an alert by ID |
+
+### UI Health Dashboard
+
+Access the Health Dashboard via:
+- Menu: View > Health Dashboard
+- Keyboard: Cmd+H (macOS) / Ctrl+H (Windows/Linux)
+
+The dashboard displays:
+- Health score gauge with status indicator
+- Current metrics grid (throughput, queues, errors, resources)
+- Active alerts with acknowledge button
+- Historical trends with sparkline visualizations
 
 ## MCP Hooks for Programmatic Control
 
@@ -988,6 +1396,10 @@ All Loom MCP tools are provided through a single `mcp-loom` package, which conso
 - `trigger_force_start` - Start engine without confirmation
 - `trigger_factory_reset` - Reset workspace with confirmation
 - `trigger_force_factory_reset` - Reset workspace without confirmation
+- `get_health_metrics` - Get health score and latest metrics
+- `get_health_history` - Get historical metrics for trend analysis
+- `get_active_alerts` - Get unacknowledged alerts
+- `acknowledge_alert` - Acknowledge an alert by ID
 - `trigger_restart_terminal` - Restart a specific terminal
 - `stop_engine` - Stop all terminals and clean up
 - `trigger_run_now` - Execute interval prompt immediately

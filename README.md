@@ -68,6 +68,24 @@ pnpm app:dev
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for complete development setup and guidelines.
 
+### Bootstrap a New Project
+
+Create a new Loom-powered project from a natural language description:
+
+```bash
+# In the Loom repository
+/imagine a CLI tool for managing dotfiles across machines
+```
+
+The `/imagine` command will:
+1. Ask clarifying questions about your project (tech stack, target users, etc.)
+2. Suggest memorable project names
+3. Create a local git repo and GitHub repository
+4. Install Loom orchestration automatically
+5. Seed initial README.md and ROADMAP.md
+
+Your new project will be ready for autonomous development with `/loom`.
+
 ### Repository Maintenance
 
 Two convenience scripts are available at the repository root:

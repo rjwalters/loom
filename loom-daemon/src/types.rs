@@ -1,4 +1,5 @@
-use crate::activity::{ActivityEntry, ClaimResult, ClaimsSummary, ClaimType, IssueClaim};
+use crate::activity::{ActivityEntry, ClaimResult, ClaimType, ClaimsSummary, IssueClaim};
+use crate::errors::DaemonError;
 use serde::{Deserialize, Serialize};
 
 pub type TerminalId = String;
@@ -169,9 +170,14 @@ pub enum Response {
         count: usize,
     },
     Success,
+    /// Legacy error response (deprecated, use `StructuredError` for new code)
+    /// Kept for backwards compatibility with existing frontends
     Error {
         message: String,
     },
+    /// Structured error response with typed domains (Issue #1171)
+    /// Provides rich error information for smart error handling
+    StructuredError(DaemonError),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

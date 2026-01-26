@@ -37,6 +37,12 @@ Thumbs.db
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
+.loom/daemon-state.json
+.loom/[0-9][0-9]-daemon-state.json
+.loom/stuck-history.json
+.loom/alerts.json
+.loom/health-metrics.json
+.loom/interventions/
 .loom/worktrees/
 .loom/state.json
 .loom/mcp-command.json
@@ -44,6 +50,7 @@ Thumbs.db
 .loom/claims/
 .loom/signals/
 .loom/status/
+.loom/progress/
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)
