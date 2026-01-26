@@ -42,6 +42,7 @@ GUIDE_INTERVAL="${LOOM_GUIDE_INTERVAL:-900}"        # 15 minutes default
 CHAMPION_INTERVAL="${LOOM_CHAMPION_INTERVAL:-600}"  # 10 minutes default
 DOCTOR_INTERVAL="${LOOM_DOCTOR_INTERVAL:-300}"      # 5 minutes default
 AUDITOR_INTERVAL="${LOOM_AUDITOR_INTERVAL:-600}"    # 10 minutes default
+JUDGE_INTERVAL="${LOOM_JUDGE_INTERVAL:-300}"        # 5 minutes default
 
 # Issue selection strategy: fifo (default), lifo, priority
 # - fifo: Oldest issues first (FIFO - prevents starvation)
@@ -105,6 +106,7 @@ ENVIRONMENT VARIABLES:
     LOOM_CHAMPION_INTERVAL   Champion re-trigger interval in seconds (default: 600)
     LOOM_DOCTOR_INTERVAL     Doctor re-trigger interval in seconds (default: 300)
     LOOM_AUDITOR_INTERVAL    Auditor re-trigger interval in seconds (default: 600)
+    LOOM_JUDGE_INTERVAL      Judge re-trigger interval in seconds (default: 300)
     LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
                              - fifo: Oldest issues first (prevents starvation)
                              - lifo: Newest issues first
@@ -314,6 +316,8 @@ DOCTOR_LAST_COMPLETED=""
 DOCTOR_STATUS="idle"
 AUDITOR_LAST_COMPLETED=""
 AUDITOR_STATUS="idle"
+JUDGE_LAST_COMPLETED=""
+JUDGE_STATUS="idle"
 
 if [[ -f "$DAEMON_STATE_FILE" ]]; then
     # Count active shepherds (those with status="working")
@@ -330,6 +334,8 @@ if [[ -f "$DAEMON_STATE_FILE" ]]; then
     DOCTOR_STATUS=$(jq -r '.support_roles.doctor.status // "idle"' "$DAEMON_STATE_FILE" 2>/dev/null || echo "idle")
     AUDITOR_LAST_COMPLETED=$(jq -r '.support_roles.auditor.last_completed // ""' "$DAEMON_STATE_FILE" 2>/dev/null || echo "")
     AUDITOR_STATUS=$(jq -r '.support_roles.auditor.status // "idle"' "$DAEMON_STATE_FILE" 2>/dev/null || echo "idle")
+    JUDGE_LAST_COMPLETED=$(jq -r '.support_roles.judge.last_completed // ""' "$DAEMON_STATE_FILE" 2>/dev/null || echo "")
+    JUDGE_STATUS=$(jq -r '.support_roles.judge.status // "idle"' "$DAEMON_STATE_FILE" 2>/dev/null || echo "idle")
 fi
 
 # Calculate counts
@@ -462,6 +468,24 @@ elif [[ "$AUDITOR_STATUS" != "running" ]]; then
     AUDITOR_NEEDS_TRIGGER="true"
 fi
 
+JUDGE_IDLE_SECONDS=0
+JUDGE_NEEDS_TRIGGER="false"
+if [[ -n "$JUDGE_LAST_COMPLETED" && "$JUDGE_LAST_COMPLETED" != "null" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+        JUDGE_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$JUDGE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+    else
+        JUDGE_EPOCH=$(date -d "$JUDGE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+    fi
+    if [[ "$JUDGE_EPOCH" != "0" ]]; then
+        JUDGE_IDLE_SECONDS=$((NOW_EPOCH - JUDGE_EPOCH))
+        if [[ "$JUDGE_STATUS" != "running" ]] && [[ $JUDGE_IDLE_SECONDS -gt $JUDGE_INTERVAL ]]; then
+            JUDGE_NEEDS_TRIGGER="true"
+        fi
+    fi
+elif [[ "$JUDGE_STATUS" != "running" ]]; then
+    JUDGE_NEEDS_TRIGGER="true"
+fi
+
 # Build recommended actions array
 ACTIONS="[]"
 
@@ -495,6 +519,7 @@ fi
 # These take priority over interval-based triggers for faster response
 CHAMPION_DEMAND="false"
 DOCTOR_DEMAND="false"
+JUDGE_DEMAND="false"
 
 # Spawn Champion on-demand if PRs are ready to merge and Champion not running
 if [[ "$MERGE_COUNT" -gt 0 ]] && [[ "$CHAMPION_STATUS" != "running" ]]; then
@@ -506,6 +531,12 @@ fi
 if [[ "$CHANGES_COUNT" -gt 0 ]] && [[ "$DOCTOR_STATUS" != "running" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["spawn_doctor_demand"]')
     DOCTOR_DEMAND="true"
+fi
+
+# Spawn Judge on-demand if PRs need review and Judge not running
+if [[ "$REVIEW_COUNT" -gt 0 ]] && [[ "$JUDGE_STATUS" != "running" ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["spawn_judge_demand"]')
+    JUDGE_DEMAND="true"
 fi
 
 # Action: trigger support roles when idle > interval (interval-based fallback)
@@ -521,6 +552,9 @@ if [[ "$DOCTOR_NEEDS_TRIGGER" == "true" ]] && [[ "$DOCTOR_DEMAND" == "false" ]];
 fi
 if [[ "$AUDITOR_NEEDS_TRIGGER" == "true" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_auditor"]')
+fi
+if [[ "$JUDGE_NEEDS_TRIGGER" == "true" ]] && [[ "$JUDGE_DEMAND" == "false" ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_judge"]')
 fi
 
 # Action: wait (if nothing else to do)
@@ -730,6 +764,11 @@ OUTPUT=$(jq -n \
     --argjson orphaned_count "$ORPHANED_COUNT" \
     --argjson champion_demand "$CHAMPION_DEMAND" \
     --argjson doctor_demand "$DOCTOR_DEMAND" \
+    --argjson judge_idle_seconds "$JUDGE_IDLE_SECONDS" \
+    --argjson judge_interval "$JUDGE_INTERVAL" \
+    --argjson judge_needs_trigger "$JUDGE_NEEDS_TRIGGER" \
+    --arg judge_status "$JUDGE_STATUS" \
+    --argjson judge_demand "$JUDGE_DEMAND" \
     --argjson review_requested_count "$REVIEW_COUNT" \
     --argjson changes_requested_count "$CHANGES_COUNT" \
     --argjson ready_to_merge_count "$MERGE_COUNT" \
@@ -782,6 +821,13 @@ OUTPUT=$(jq -n \
                 idle_seconds: $auditor_idle_seconds,
                 interval: $auditor_interval,
                 needs_trigger: $auditor_needs_trigger
+            },
+            judge: {
+                status: $judge_status,
+                idle_seconds: $judge_idle_seconds,
+                interval: $judge_interval,
+                needs_trigger: $judge_needs_trigger,
+                demand_trigger: $judge_demand
             }
         },
         usage: ($usage + {healthy: $usage_healthy}),
@@ -804,7 +850,8 @@ OUTPUT=$(jq -n \
             prs_needing_fixes: $changes_requested_count,
             prs_ready_to_merge: $ready_to_merge_count,
             champion_demand: $champion_demand,
-            doctor_demand: $doctor_demand
+            doctor_demand: $doctor_demand,
+            judge_demand: $judge_demand
         },
         config: {
             issue_threshold: $issue_threshold,

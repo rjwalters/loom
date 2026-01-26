@@ -20,6 +20,7 @@ Detailed configuration and state management for the Loom daemon (Layer 2).
 | `CHAMPION_INTERVAL` | 600 | Seconds between Champion role re-triggers (10 min) |
 | `DOCTOR_INTERVAL` | 300 | Seconds between Doctor role re-triggers (5 min) |
 | `AUDITOR_INTERVAL` | 600 | Seconds between Auditor role re-triggers (10 min) |
+| `JUDGE_INTERVAL` | 300 | Seconds between Judge role re-triggers (5 min) |
 
 ## Work Generation
 
@@ -257,3 +258,4 @@ Archived sessions include a `session_summary` field with final statistics:
 | terminal-champion | champion.md | Auto-merge (always running) |
 | terminal-doctor | doctor.md | PR conflict resolution (always running) |
 | terminal-auditor | auditor.md | Main branch validation (always running) |
+| terminal-judge | judge.md | PR review (always running) |

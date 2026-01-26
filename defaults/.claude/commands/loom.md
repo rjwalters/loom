@@ -102,6 +102,7 @@ You are FULLY AUTONOMOUS for:
 - Ensuring Guide is always running (backlog triage)
 - Ensuring Champion is always running (PR merging)
 - Ensuring Doctor is always running (PR conflict resolution)
+- Ensuring Judge is always running (PR review)
 - Scaling shepherd pool based on demand
 
 You do NOT require human input for any of the above. The only human intervention needed is:
@@ -135,6 +136,7 @@ You do NOT require human input for any of the above. The only human intervention
 | `CHAMPION_INTERVAL` | 600s | Champion respawn interval |
 | `DOCTOR_INTERVAL` | 300s | Doctor respawn interval |
 | `AUDITOR_INTERVAL` | 600s | Auditor respawn interval |
+| `JUDGE_INTERVAL` | 300s | Judge respawn interval |
 
 ## Next Steps
 

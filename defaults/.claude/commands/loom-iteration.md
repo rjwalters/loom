@@ -154,6 +154,8 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `+doctor` - Respawned Doctor (if respawned, interval-based)
 - `+doctor(demand)` - Spawned Doctor on-demand (PRs need fixes)
 - `+auditor` - Respawned Auditor (if respawned)
+- `+judge` - Respawned Judge (if respawned, interval-based)
+- `+judge(demand)` - Spawned Judge on-demand (PRs need review)
 - `promoted=N` - Proposals auto-promoted to loom:issue in force mode (if any)
 - `stuck=N` - Stuck agents detected (if any)
 - `completed=#N` - Issue completed this iteration (if any)
@@ -461,7 +463,7 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    demand_spawned = {"champion": False, "doctor": False}
+    demand_spawned = {"champion": False, "doctor": False, "judge": False}
 
     # Champion on-demand: PRs ready to merge
     if "spawn_champion_demand" in recommended_actions:
@@ -483,6 +485,16 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
             demand_spawned["doctor"] = True
             print(f"  AUTO-SPAWNED: Doctor (on-demand, {pr_count} PRs need fixes)")
 
+    # Judge on-demand: PRs need review
+    if "spawn_judge_demand" in recommended_actions:
+        prs_needing_review = snapshot_data.get("prs", {}).get("review_requested", [])
+        pr_count = len(prs_needing_review)
+        debug(f"Judge demand detected: {pr_count} PRs need review")
+
+        if trigger_support_role(state, "judge", f"Judge (on-demand, {pr_count} PRs)", debug_mode):
+            demand_spawned["judge"] = True
+            print(f"  AUTO-SPAWNED: Judge (on-demand, {pr_count} PRs need review)")
+
     return demand_spawned
 ```
 
@@ -490,16 +502,16 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
 
 ```python
 def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False, demand_spawned=None):
-    """Automatically keep Guide, Champion, Doctor, and Auditor running."""
+    """Automatically keep Guide, Champion, Doctor, Auditor, and Judge running."""
 
     if demand_spawned is None:
-        demand_spawned = {"champion": False, "doctor": False}
+        demand_spawned = {"champion": False, "doctor": False, "judge": False}
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False}
+    ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False, "judge": False}
 
     debug("Checking support roles via recommended_actions (interval-based)")
     debug(f"Recommended actions: {recommended_actions}")
@@ -520,6 +532,10 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
     # Auditor - main branch validation
     if "trigger_auditor" in recommended_actions:
         ensured_roles["auditor"] = trigger_support_role(state, "auditor", "Auditor main branch validation", debug_mode)
+
+    # Judge - PR review (skip if demand-spawned this iteration)
+    if not demand_spawned.get("judge") and "trigger_judge" in recommended_actions:
+        ensured_roles["judge"] = trigger_support_role(state, "judge", "Judge PR review", debug_mode)
 
     return ensured_roles
 
@@ -562,7 +578,15 @@ IMPORTANT: Do NOT use CLI commands like 'claude --skill=auditor'. Use the Skill 
 
 Skill(skill="auditor")
 
-Complete one main branch validation iteration."""
+Complete one main branch validation iteration.""",
+
+        "judge": """You must invoke the Skill tool to execute the judge role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=judge'. Use the Skill tool:
+
+Skill(skill="judge")
+
+Complete one PR review iteration."""
     }
 
     prompt = role_prompts.get(role_name)
