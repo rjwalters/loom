@@ -170,7 +170,9 @@ In Manual Orchestration Mode, use the **Task tool with `run_in_background: true`
 ```
 Task(
   subagent_type: "general-purpose",
-  prompt: """Execute the shepherd workflow by invoking the Skill tool:
+  prompt: """You must invoke the Skill tool to execute the shepherd workflow.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
 Skill(skill="shepherd", args="123 --force-pr")
 
@@ -179,7 +181,21 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
 ) → Returns task_id and output_file
 ```
 
-**IMPORTANT**: Task subagents don't automatically interpret slash commands (like `/shepherd`) as Skill invocations. They see the prompt as plain text. You MUST explicitly instruct the subagent to use the Skill tool with `Skill(skill="...", args="...")` syntax.
+**CRITICAL - Correct Tool Invocation**: Task subagents must use the **Skill tool**, NOT CLI commands.
+
+```
+✅ CORRECT - Use the Skill tool:
+   Skill(skill="guide")
+   Skill(skill="shepherd", args="123 --force-pr")
+
+❌ WRONG - These will fail with CLI errors:
+   claude --skill=guide
+   claude --role guide
+   /guide
+   bash("claude --skill=guide")
+```
+
+Task subagents receive their prompts as plain text. They must be explicitly instructed to invoke the Skill tool. The prompts in this file use `Skill(skill="...")` notation which the subagent should interpret as a tool call.
 
 ### Task Spawn Verification
 
@@ -206,6 +222,18 @@ def verify_task_spawn(result, description="task"):
         # If we get here without exception, task exists
         # Status can be "running", "completed", or "failed"
         if check.status in ["running", "completed"]:
+            # Check output for CLI error patterns that indicate misuse
+            if check.output:
+                cli_error_patterns = [
+                    "error: unknown option",
+                    "Did you mean",
+                    "unrecognized command",
+                    "command not found"
+                ]
+                for pattern in cli_error_patterns:
+                    if pattern in check.output:
+                        print(f"  SPAWN FAILED: {description} - CLI error detected: {pattern}")
+                        return False
             return True
         elif check.status == "failed":
             print(f"  SPAWN FAILED: {description} - task immediately failed")
@@ -221,6 +249,7 @@ def verify_task_spawn(result, description="task"):
 - Task() can return a task_id even when the underlying spawn fails
 - Recording invalid task_ids pollutes daemon-state.json
 - Invalid task_ids cause `TaskOutput` to report "completed" spuriously
+- CLI error patterns (like "error: unknown option") indicate the subagent misinterpreted the prompt
 - This leads to incorrect shepherd completion detection and state corruption
 
 ## Iteration Mode (`/loom iterate`)
@@ -525,7 +554,9 @@ def auto_spawn_shepherds():
         # because Task subagents don't automatically interpret slash commands.
         result = Task(
             description=f"Shepherd issue #{issue}",
-            prompt=f"""Execute the shepherd workflow by invoking the Skill tool:
+            prompt=f"""You must invoke the Skill tool to execute the shepherd workflow.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
 Skill(skill="shepherd", args="{issue} --force-pr")
 
@@ -652,7 +683,9 @@ def auto_generate_work():
         if architect_cooldown_ok() and architect_proposals < 2:
             result = Task(
                 description="Architect work generation",
-                prompt="""Execute the architect role by invoking the Skill tool:
+                prompt="""You must invoke the Skill tool to execute the architect role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=architect'. Use the Skill tool:
 
 Skill(skill="architect", args="--autonomous")
 
@@ -669,7 +702,9 @@ Complete one work generation iteration.""",
         if hermit_cooldown_ok() and hermit_proposals < 2:
             result = Task(
                 description="Hermit simplification proposals",
-                prompt="""Execute the hermit role by invoking the Skill tool:
+                prompt="""You must invoke the Skill tool to execute the hermit role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=hermit'. Use the Skill tool:
 
 Skill(skill="hermit")
 
@@ -694,7 +729,9 @@ def auto_ensure_support_roles():
     if not guide_is_running() or guide_idle_time() > GUIDE_INTERVAL:
         result = Task(
             description="Guide backlog triage",
-            prompt="""Execute the guide role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the guide role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
 
 Skill(skill="guide")
 
@@ -710,7 +747,9 @@ Complete one triage iteration.""",
     if not champion_is_running() or champion_idle_time() > CHAMPION_INTERVAL:
         result = Task(
             description="Champion PR merge",
-            prompt="""Execute the champion role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the champion role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
 
 Skill(skill="champion")
 
@@ -726,7 +765,9 @@ Complete one PR evaluation and merge iteration.""",
     if not doctor_is_running() or doctor_idle_time() > DOCTOR_INTERVAL:
         result = Task(
             description="Doctor PR conflict resolution",
-            prompt="""Execute the doctor role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the doctor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
 
 Skill(skill="doctor")
 
@@ -1199,7 +1240,9 @@ def auto_spawn_shepherds(debug_mode=False):
         # because Task subagents don't automatically interpret slash commands.
         result = Task(
             description=f"Shepherd issue #{issue}",
-            prompt=f"""Execute the shepherd workflow by invoking the Skill tool:
+            prompt=f"""You must invoke the Skill tool to execute the shepherd workflow.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
 Skill(skill="shepherd", args="{issue} --force-pr")
 
@@ -1265,7 +1308,9 @@ def trigger_architect_role(state, debug_mode=False):
 
     result = Task(
         description="Architect work generation",
-        prompt="""Execute the architect role by invoking the Skill tool:
+        prompt="""You must invoke the Skill tool to execute the architect role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=architect'. Use the Skill tool:
 
 Skill(skill="architect", args="--autonomous")
 
@@ -1301,7 +1346,9 @@ def trigger_hermit_role(state, debug_mode=False):
 
     result = Task(
         description="Hermit simplification proposals",
-        prompt="""Execute the hermit role by invoking the Skill tool:
+        prompt="""You must invoke the Skill tool to execute the hermit role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=hermit'. Use the Skill tool:
 
 Skill(skill="hermit")
 
@@ -1369,7 +1416,9 @@ def auto_ensure_support_roles(debug_mode=False):
     if not guide_running or guide_idle > GUIDE_INTERVAL:
         result = Task(
             description="Guide backlog triage",
-            prompt="""Execute the guide role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the guide role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
 
 Skill(skill="guide")
 
@@ -1397,7 +1446,9 @@ Complete one triage iteration.""",
     if not champion_running or champion_idle > CHAMPION_INTERVAL:
         result = Task(
             description="Champion PR merge",
-            prompt="""Execute the champion role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the champion role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
 
 Skill(skill="champion")
 
@@ -1425,7 +1476,9 @@ Complete one PR evaluation and merge iteration.""",
     if not doctor_running or doctor_idle > DOCTOR_INTERVAL:
         result = Task(
             description="Doctor PR conflict resolution",
-            prompt="""Execute the doctor role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the doctor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
 
 Skill(skill="doctor")
 
@@ -1453,7 +1506,9 @@ Complete one PR conflict resolution iteration.""",
     if not auditor_running or auditor_idle > AUDITOR_INTERVAL:
         result = Task(
             description="Auditor main branch validation",
-            prompt="""Execute the auditor role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the auditor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=auditor'. Use the Skill tool:
 
 Skill(skill="auditor")
 
