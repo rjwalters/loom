@@ -8,6 +8,7 @@
 #   status    Display agent pool state
 #   stop      Graceful shutdown
 #   attach    Open live tmux session
+#   send      Send command to agent session
 #   scale     Dynamic agent scaling
 #   logs      Tail agent output
 #   help      Show help
@@ -138,6 +139,15 @@ case "${1:-help}" in
             exit 1
         fi
         ;;
+    send)
+        shift
+        if [[ -f "$CLI_DIR/loom-send.sh" ]]; then
+            exec "$CLI_DIR/loom-send.sh" "$@"
+        else
+            echo -e "${RED}Error: loom-send.sh not found${NC}" >&2
+            exit 1
+        fi
+        ;;
     help|--help|-h)
         shift || true
         if [[ -f "$CLI_DIR/loom-help.sh" ]]; then
@@ -155,6 +165,7 @@ COMMANDS:
     status    Display agent pool state and work queues
     stop      Graceful shutdown (or --force to kill immediately)
     attach    Open live tmux session for an agent
+    send      Send command to agent session
     scale     Dynamic agent scaling
     logs      Tail agent output
     help      Show this help message
@@ -165,6 +176,7 @@ EXAMPLES:
     ./loom status                 Show current state
     ./loom status --json          Machine-readable status
     ./loom attach shepherd-1      Connect to agent terminal
+    ./loom send shepherd-1 "/shepherd 123"  Send command to agent
     ./loom stop                   Graceful shutdown
     ./loom stop --force           Force kill all sessions
     ./loom stop shepherd-1        Stop single agent

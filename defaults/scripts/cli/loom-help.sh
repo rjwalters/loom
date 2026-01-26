@@ -72,6 +72,7 @@ ${YELLOW}COMMANDS:${NC}
     ${GREEN}status${NC}    Display agent pool state and work queues
     ${GREEN}stop${NC}      Graceful shutdown (or --force to kill immediately)
     ${GREEN}attach${NC}    Open live tmux session for an agent
+    ${GREEN}send${NC}      Send command to agent session
     ${GREEN}scale${NC}     Dynamic agent scaling
     ${GREEN}logs${NC}      Tail agent output
     ${GREEN}help${NC}      Show this help message
@@ -86,6 +87,9 @@ ${YELLOW}QUICK START:${NC}
     ${GRAY}# View an agent's terminal${NC}
     ./loom attach shepherd-1
 
+    ${GRAY}# Send a command to an agent${NC}
+    ./loom send shepherd-1 "/shepherd 123 --force-pr"
+
     ${GRAY}# View logs${NC}
     ./loom logs shepherd-1
 
@@ -98,6 +102,7 @@ ${YELLOW}EXAMPLES:${NC}
     ./loom status                 Show current state
     ./loom status --json          Machine-readable status
     ./loom attach shepherd-1      Connect to agent terminal
+    ./loom send shepherd-1 "/shepherd 123"  Send command to agent
     ./loom stop                   Graceful shutdown
     ./loom stop --force           Force kill all sessions
     ./loom stop shepherd-1        Stop single agent
@@ -198,13 +203,21 @@ show_command_help() {
                 exit 1
             fi
             ;;
+        send)
+            if [[ -n "$CLI_DIR" && -f "$CLI_DIR/loom-send.sh" ]]; then
+                exec "$CLI_DIR/loom-send.sh" --help
+            else
+                echo -e "${RED}Error: send command not installed${NC}"
+                exit 1
+            fi
+            ;;
         help)
             show_main_help
             ;;
         *)
             echo -e "${RED}Error: Unknown command '$command'${NC}"
             echo ""
-            echo "Available commands: start, status, stop, attach, scale, logs, help"
+            echo "Available commands: start, status, stop, attach, send, scale, logs, help"
             exit 1
             ;;
     esac
