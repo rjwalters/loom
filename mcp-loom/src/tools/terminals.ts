@@ -38,6 +38,25 @@ import type {
 const execAsync = promisify(exec);
 
 /**
+ * Extract error message from daemon error responses.
+ * Handles both legacy Error and new StructuredError (Issue #1171) formats.
+ */
+function extractDaemonErrorMessage(response: {
+  type: string;
+  payload?: unknown;
+  message?: string;
+}): string | null {
+  if (response.type === "Error") {
+    return response.message || "Unknown error";
+  }
+  if (response.type === "StructuredError") {
+    const payload = response.payload as { message?: string } | undefined;
+    return payload?.message || "Unknown structured error";
+  }
+  return null;
+}
+
+/**
  * List all active terminals from the daemon
  */
 async function listTerminals(): Promise<Terminal[]> {
@@ -298,11 +317,9 @@ async function createTerminal(config: CreateTerminalConfig): Promise<{
       };
     }
 
-    if (response.type === "Error") {
-      return {
-        success: false,
-        error: response.message || "Unknown error creating terminal",
-      };
+    const errorMsg = extractDaemonErrorMessage(response);
+    if (errorMsg) {
+      return { success: false, error: errorMsg };
     }
 
     return {
@@ -336,11 +353,9 @@ async function deleteTerminal(terminalId: string): Promise<{
       return { success: true };
     }
 
-    if (response.type === "Error") {
-      return {
-        success: false,
-        error: response.message || "Unknown error deleting terminal",
-      };
+    const errorMsg = extractDaemonErrorMessage(response);
+    if (errorMsg) {
+      return { success: false, error: errorMsg };
     }
 
     return {
@@ -408,11 +423,9 @@ async function restartTerminal(terminalId: string): Promise<{
       };
     }
 
-    if (response.type === "Error") {
-      return {
-        success: false,
-        error: response.message || "Unknown error recreating terminal",
-      };
+    const errorMsg = extractDaemonErrorMessage(response);
+    if (errorMsg) {
+      return { success: false, error: errorMsg };
     }
 
     return {

@@ -1,4 +1,5 @@
 mod activity;
+mod errors;
 mod git_parser;
 mod git_utils;
 mod github_parser;
@@ -650,10 +651,7 @@ fn handle_validate_command(
 
     if !config_path.exists() {
         if format == "json" {
-            println!(
-                r#"{{"error": "Config file not found: {}"}}"#,
-                config_path.display()
-            );
+            println!(r#"{{"error": "Config file not found: {}"}}"#, config_path.display());
         } else {
             eprintln!("Error: Config file not found: {}", config_path.display());
             eprintln!("\nMake sure you're in a Loom workspace or specify the path:");
