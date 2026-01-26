@@ -213,6 +213,14 @@ When orchestrating issue #N, follow this progression:
 
 ### Direct Mode Role Execution Pattern
 
+> **IMPORTANT**: In Direct Mode, always use `Task` subagents for phase delegation.
+> Do NOT use the `Skill` tool — it expands the role prompt into your conversation,
+> replacing your orchestration context. Only `Task` preserves your control flow.
+>
+> The `Skill` tool is used by the *daemon* to invoke *shepherds* (so the shepherd
+> gets its full role prompt expanded). Shepherds themselves use plain `Task` subagents
+> with slash-command prompts for phase delegation.
+
 For each phase, the shepherd spawns a Task subagent:
 
 1. **Announce the phase**: `"Starting [Role] phase..."`
