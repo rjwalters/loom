@@ -306,6 +306,11 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Workflow**: Plain shell environment for custom tasks
 - **When to use**: Ad-hoc tasks, debugging, manual operations
 
+**Auditor** (Autonomous 10min, `auditor.md`)
+- **Purpose**: Validate main branch build and runtime
+- **Workflow**: Pulls main → builds → tests → runs → creates bug issues if problems found
+- **When to use**: Continuous integration health monitoring
+
 ### Role Definitions
 
 Full role definitions with detailed guidelines are available in:
@@ -319,6 +324,7 @@ Full role definitions with detailed guidelines are available in:
 - `.loom/roles/architect.md` - Architectural proposals
 - `.loom/roles/hermit.md` - Code simplification
 - `.loom/roles/guide.md` - Issue triage and prioritization
+- `.loom/roles/auditor.md` - Main branch validation
 
 ## Label-Based Workflow
 
