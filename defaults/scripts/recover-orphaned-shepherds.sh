@@ -345,7 +345,8 @@ check_untracked_building() {
     fi
 
     # Find untracked building issues
-    echo "$building_issues" | jq -c '.[]' | while IFS= read -r issue_json; do
+    # Note: Using here-string pattern to avoid subshell (pipe creates subshell that loses variable updates)
+    while IFS= read -r issue_json; do
         [[ -z "$issue_json" ]] && continue
 
         local issue_num
@@ -396,7 +397,7 @@ check_untracked_building() {
         else
             log_verbose "  OK: tracked in daemon-state"
         fi
-    done
+    done <<< "$(echo "$building_issues" | jq -c '.[]')"
 }
 
 # Check progress files for stale heartbeats
