@@ -13,14 +13,14 @@ Arguments provided: `{{ARGUMENTS}}`
 ```
 IF arguments contain "iterate":
     -> Execute ITERATION MODE
-    -> Read and follow: defaults/.claude/commands/loom-iteration.md
+    -> Read and follow: .claude/commands/loom-iteration.md
     -> Run exactly ONE iteration with fresh context
     -> Return a compact 1-line summary and EXIT
     -> DO NOT loop, DO NOT spawn iteration subagents
 
 ELSE (no "iterate" in arguments, e.g., "/loom" or "/loom --force"):
     -> Execute PARENT LOOP MODE
-    -> Read and follow: defaults/.claude/commands/loom-parent.md
+    -> Read and follow: .claude/commands/loom-parent.md
     -> Run the THIN parent loop
     -> Spawn iteration subagents via Task() for each iteration
     -> Continue until shutdown signal
@@ -50,8 +50,8 @@ ELSE (no "iterate" in arguments, e.g., "/loom" or "/loom --force"):
 
 Before proceeding, check the arguments: `{{ARGUMENTS}}`
 
-- Contains "iterate"? -> Read `defaults/.claude/commands/loom-iteration.md` and execute iteration mode
-- No "iterate"? -> Read `defaults/.claude/commands/loom-parent.md` and execute parent loop mode
+- Contains "iterate"? -> Read `.claude/commands/loom-iteration.md` and execute iteration mode
+- No "iterate"? -> Read `.claude/commands/loom-parent.md` and execute parent loop mode
 
 ## Two-Tier Architecture Overview
 
@@ -141,12 +141,12 @@ You do NOT require human input for any of the above. The only human intervention
 Based on the arguments `{{ARGUMENTS}}`:
 
 1. **Read the appropriate mode file:**
-   - For parent mode: Read `defaults/.claude/commands/loom-parent.md`
-   - For iteration mode: Read `defaults/.claude/commands/loom-iteration.md`
+   - For parent mode: Read `.claude/commands/loom-parent.md`
+   - For iteration mode: Read `.claude/commands/loom-iteration.md`
 
 2. **Follow the instructions in that file** to execute the daemon
 
-3. **For reference documentation:** See `defaults/.claude/commands/loom-reference.md`
+3. **For reference documentation:** See `.claude/commands/loom-reference.md`
 
 ## Terminal Probe Protocol
 

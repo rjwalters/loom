@@ -164,7 +164,7 @@ When creating a proposal:
 4. **Create the issue**: Use `gh issue create` with focused recommendation
 5. **Add labels**: `loom:architect` + tier label
 
-**For templates and examples**, read `defaults/.claude/commands/architect-patterns.md`.
+**For templates and examples**, read `.claude/commands/architect-patterns.md`.
 
 ### Quick Issue Creation
 
@@ -202,7 +202,7 @@ For large features that span multiple phases (4+ issues with dependencies), crea
 - Multiple shepherds could work in parallel
 - Implementation order matters
 
-**For epic templates and workflow**, read `defaults/.claude/commands/architect-patterns.md`.
+**For epic templates and workflow**, read `.claude/commands/architect-patterns.md`.
 
 ```bash
 # Create epic issue
@@ -260,7 +260,7 @@ Regularly review:
 - **Champion rejects**: Closes issue with explanation
 - **Builder implements**: Picks up `loom:issue` issues
 
-**For detailed label workflow and exceptions**, read `defaults/.claude/commands/architect-reference.md`.
+**For detailed label workflow and exceptions**, read `.claude/commands/architect-reference.md`.
 
 ---
 
