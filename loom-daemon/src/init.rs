@@ -974,13 +974,27 @@ fn setup_repository_scaffolding(
         report,
     )?;
 
-    // Copy .claude/ directory (merge mode preserves custom commands)
-    copy_directory(
-        &defaults_path.join(".claude"),
-        &workspace_path.join(".claude"),
-        ".claude",
-        report,
-    )?;
+    // Copy .claude/ directory - always update default commands, preserve custom commands
+    // - Fresh install: copy all from defaults
+    // - Reinstall: always force-merge (update defaults, preserve custom)
+    //
+    // This ensures command updates from loom propagate to target repos while
+    // preserving any custom commands the project has added.
+    // Consistent with .loom/roles/ and .loom/scripts/ behavior.
+    let claude_src = defaults_path.join(".claude");
+    let claude_dst = workspace_path.join(".claude");
+    if claude_src.exists() {
+        if claude_dst.exists() {
+            // Reinstall: always force-merge to update default commands
+            // Custom commands (files not in defaults) are preserved
+            force_merge_dir_with_report(&claude_src, &claude_dst, ".claude", report)
+                .map_err(|e| format!("Failed to force-merge .claude directory: {e}"))?;
+        } else {
+            // Fresh install: copy all
+            copy_dir_with_report(&claude_src, &claude_dst, ".claude", report)
+                .map_err(|e| format!("Failed to copy .claude directory: {e}"))?;
+        }
+    }
 
     // Copy .codex/ directory
     copy_directory(
@@ -1339,7 +1353,7 @@ mod tests {
         )
         .unwrap();
 
-        // Run setup with force=false (merge mode)
+        // Run setup with force=false (merge mode for .codex/.github, but .claude/ always force-merges)
         let mut report = InitReport::default();
         setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
 
@@ -1354,10 +1368,11 @@ mod tests {
                 .unwrap();
         assert_eq!(custom_content, "my custom command");
 
-        // Verify loom.md was NOT overwritten (preserved)
+        // Verify loom.md was UPDATED with new content (default file)
+        // .claude/ always force-merges on reinstall to propagate command updates
         let loom_content =
             fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
-        assert_eq!(loom_content, "custom loom command");
+        assert_eq!(loom_content, "loom command from defaults");
 
         // Verify builder.md was added (new file)
         assert!(workspace
@@ -1477,6 +1492,85 @@ mod tests {
         assert!(report
             .preserved
             .contains(&".loom/roles/custom-role.md".to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_claude_commands_always_updated_on_reinstall() {
+        // .claude/ commands should always be force-merged on reinstall (without --force flag)
+        // This ensures command updates propagate while custom commands are preserved
+        // Mirrors test_roles_always_updated_on_reinstall but for .claude/ directory
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with .claude commands
+        fs::create_dir_all(defaults.join(".claude").join("commands")).unwrap();
+        fs::write(
+            defaults.join(".claude").join("commands").join("loom.md"),
+            "loom command v2 with bug fix",
+        )
+        .unwrap();
+        fs::write(
+            defaults.join(".claude").join("commands").join("builder.md"),
+            "builder command v2",
+        )
+        .unwrap();
+
+        // Create existing .claude directory in workspace (simulates previous install)
+        fs::create_dir_all(workspace.join(".claude").join("commands")).unwrap();
+        fs::write(
+            workspace.join(".claude").join("commands").join("loom.md"),
+            "loom command v1 with bug",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("my-custom.md"),
+            "my project-specific command",
+        )
+        .unwrap();
+
+        // Run setup WITHOUT force flag (simulates normal reinstall)
+        let mut report = InitReport::default();
+        setup_repository_scaffolding(workspace, &defaults, false, &mut report).unwrap();
+
+        // Verify: loom.md was UPDATED (default command updated with bug fix)
+        let loom_content =
+            fs::read_to_string(workspace.join(".claude").join("commands").join("loom.md")).unwrap();
+        assert_eq!(loom_content, "loom command v2 with bug fix");
+
+        // Verify: builder.md was ADDED (new default command)
+        let builder_content =
+            fs::read_to_string(workspace.join(".claude").join("commands").join("builder.md"))
+                .unwrap();
+        assert_eq!(builder_content, "builder command v2");
+
+        // Verify: my-custom.md was PRESERVED (custom command not in defaults)
+        let custom_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("my-custom.md"),
+        )
+        .unwrap();
+        assert_eq!(custom_content, "my project-specific command");
+
+        // Verify report reflects the changes
+        assert!(report
+            .updated
+            .contains(&".claude/commands/loom.md".to_string()));
+        assert!(report
+            .added
+            .contains(&".claude/commands/builder.md".to_string()));
+        assert!(report
+            .preserved
+            .contains(&".claude/commands/my-custom.md".to_string()));
     }
 
     #[test]
