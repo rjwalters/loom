@@ -357,9 +357,12 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 
 (created) → loom:hermit → (evaluated) → loom:issue
            ↑ Hermit       ↑ Champion    ↑ Ready for Builder
+
+(created) → loom:auditor → (evaluated) → loom:issue
+           ↑ Auditor       ↑ Champion    ↑ Ready for Builder
 ```
 
-**Note**: Champion evaluates proposals from Architect and Hermit roles using the same 8 quality criteria as curated issues. Well-formed proposals are promoted automatically; only ambiguous or controversial proposals require human intervention.
+**Note**: Champion evaluates proposals from Architect, Hermit, and Auditor roles using the same 8 quality criteria as curated issues. Well-formed proposals are promoted automatically; only ambiguous or controversial proposals require human intervention.
 
 ### Label Definitions
 
@@ -375,6 +378,7 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 **Proposal Labels**:
 - **`loom:architect`**: Architectural proposal awaiting Champion evaluation
 - **`loom:hermit`**: Simplification proposal awaiting Champion evaluation
+- **`loom:auditor`**: Bug discovered by Auditor during main branch validation
 - **`loom:curated`**: Issue enhanced by Curator, awaiting Champion evaluation
 
 **Status Labels**:

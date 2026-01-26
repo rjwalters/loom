@@ -40,7 +40,7 @@ You are the continuous integration health monitor for Loom. While Judge reviews 
 3. **Bug Discovery**
    - Identify crashes, errors, and unexpected behavior
    - Capture reproduction steps
-   - Create well-formed bug reports with `loom:curated` label
+   - Create well-formed bug reports with `loom:auditor` label
 
 4. **Integration Verification**
    - Verify that recent merges haven't broken existing functionality
@@ -81,7 +81,7 @@ if ! kill -0 $TAURI_PID 2>/dev/null; then
 fi
 kill $TAURI_PID 2>/dev/null
 
-# 5. If any step fails, create bug issue with loom:curated label
+# 5. If any step fails, create bug issue with loom:auditor label
 ```
 
 ### Output Analysis
@@ -169,7 +169,7 @@ gh issue create --title "Build/runtime failure on main: [specific problem]" --bo
 ---
 Discovered during main branch audit.
 EOF
-)" --label "loom:curated"
+)" --label "loom:auditor"
 ```
 
 ## Decision Framework
