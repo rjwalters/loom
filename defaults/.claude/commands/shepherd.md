@@ -255,10 +255,12 @@ mcp__loom-ui__trigger_run_now --terminalId terminal-2
 **Direct Mode (Task Subagent Execution):**
 ```python
 # Spawn Curator phase as a Task subagent with fresh context
+# Use sonnet for curation (structured enhancement work)
 result = Task(
     description=f"Curator phase for issue #{issue_number}",
     prompt=f"/curator {issue_number}",
     subagent_type="general-purpose",
+    model="sonnet",  # Cost-optimized for structured tasks
     run_in_background=False
 )
 # Task completes when subagent finishes - poll labels to verify
@@ -271,6 +273,33 @@ Each phase spawns as a separate Task subagent because:
 - **Cognitive clarity**: Role-specific focus without accumulated noise from previous phases
 - **Consistency**: Same fresh-context benefits as MCP Mode terminals
 - **Isolation**: Phase failures don't corrupt the shepherd's orchestration state
+- **Token optimization**: Each subagent uses the appropriate model for the task complexity
+
+### Token Optimization Strategy
+
+Long-running shepherds can accumulate significant token costs. To optimize:
+
+**1. Phase-Specific Models**
+
+Use cheaper models for simpler phases, reserving opus for complex work:
+
+| Phase | Model | Rationale |
+|-------|-------|-----------|
+| Curator | `sonnet` | Structured enhancement with clear criteria |
+| Builder | `opus` | Complex implementation requires deep reasoning |
+| Judge | `opus` | Thorough code review needs nuanced understanding |
+| Doctor | `sonnet` | PR fixes are usually targeted and scoped |
+
+**2. Fresh Context Per Phase**
+
+Each phase starts fresh via Task subagents, preventing context accumulation:
+- No bloat from previous phase outputs
+- No accumulated conversation history
+- Each subagent receives only what it needs
+
+**3. Truncate Verbose Output**
+
+When spawning phases, avoid including verbose test output in context. Builder and Doctor roles should truncate test output to failures + summary (see their role guidelines).
 
 ### Direct Mode Role Execution Pattern
 
@@ -284,13 +313,19 @@ For each phase, the shepherd spawns a Task subagent:
 
 ### Phase-Specific Direct Execution
 
+Each phase uses an appropriate model based on task complexity:
+- **sonnet**: Curator (structured enhancement), Judge (systematic review)
+- **opus**: Builder (complex implementation), Doctor (nuanced fixes)
+
 **Curator Phase (Task Subagent):**
 ```python
 # Spawn curator subagent with fresh context
+# Use sonnet - curation is structured enhancement work
 result = Task(
     description=f"Curate issue #{issue_number} - add implementation details and acceptance criteria",
     prompt=f"/curator {issue_number}",
     subagent_type="general-purpose",
+    model="sonnet",
     run_in_background=False
 )
 
@@ -302,10 +337,12 @@ assert "loom:curated" in labels or "loom:issue" in labels
 **Builder Phase (Task Subagent):**
 ```python
 # Spawn builder subagent with fresh context
+# Use opus - implementation requires deep reasoning
 result = Task(
     description=f"Build issue #{issue_number} - implement feature and create PR",
     prompt=f"/builder {issue_number}",
     subagent_type="general-purpose",
+    model="opus",
     run_in_background=False
 )
 
@@ -317,10 +354,12 @@ assert pr_number is not None
 **Judge Phase (Task Subagent):**
 ```python
 # Spawn judge subagent with fresh context
+# Use opus - thorough code review needs deep understanding
 result = Task(
     description=f"Review PR #{pr_number} for issue #{issue_number}",
     prompt=f"/judge {pr_number}",
     subagent_type="general-purpose",
+    model="opus",
     run_in_background=False
 )
 
@@ -335,10 +374,12 @@ elif "loom:changes-requested" in labels:
 **Doctor Phase (Task Subagent):**
 ```python
 # Spawn doctor subagent with fresh context
+# Use sonnet - PR fixes are usually targeted and scoped
 result = Task(
     description=f"Address review feedback on PR #{pr_number} for issue #{issue_number}",
     prompt=f"/doctor {pr_number}",
     subagent_type="general-purpose",
+    model="sonnet",
     run_in_background=False
 )
 
@@ -349,18 +390,19 @@ assert "loom:review-requested" in labels
 
 ### Complete Direct Mode Example
 
-Here's the full orchestration flow using Task subagents:
+Here's the full orchestration flow using Task subagents with phase-specific models:
 
 ```python
 # Shepherd orchestrating issue #123 in Direct Mode
 issue_number = 123
 
-# Phase 1: Curator
+# Phase 1: Curator (sonnet - structured enhancement)
 print(f"📋 Starting Curator phase for issue #{issue_number}...")
 Task(
     description=f"Curator phase for #{issue_number}",
     prompt=f"/curator {issue_number}",
     subagent_type="general-purpose",
+    model="sonnet",
     run_in_background=False
 )
 print("✅ Curator phase complete")
@@ -369,28 +411,30 @@ print("✅ Curator phase complete")
 if force_mode:
     gh_issue_edit(issue_number, "--add-label 'loom:issue'")
 
-# Phase 2: Builder
+# Phase 2: Builder (opus - complex implementation)
 print(f"📋 Starting Builder phase for issue #{issue_number}...")
 Task(
     description=f"Builder phase for #{issue_number}",
     prompt=f"/builder {issue_number}",
     subagent_type="general-purpose",
+    model="opus",
     run_in_background=False
 )
 pr_number = get_pr_for_issue(issue_number)
 print(f"✅ Builder phase complete - PR #{pr_number} created")
 
-# Phase 3: Judge
+# Phase 3: Judge (opus - thorough code review)
 print(f"📋 Starting Judge phase for PR #{pr_number}...")
 Task(
     description=f"Judge phase for PR #{pr_number}",
     prompt=f"/judge {pr_number}",
     subagent_type="general-purpose",
+    model="opus",
     run_in_background=False
 )
 print("✅ Judge phase complete")
 
-# Continue with Doctor loop and merge as needed...
+# Continue with Doctor loop (sonnet) and merge as needed...
 ```
 
 ### When to Use Each Mode
@@ -494,16 +538,21 @@ mcp__loom-ui__trigger_run_now --terminalId <terminal-id>
 
 ### Direct Mode Alternative
 
-In Direct Mode, skip the MCP calls and spawn the role as a Task subagent:
+In Direct Mode, skip the MCP calls and spawn the role as a Task subagent with the appropriate model:
 
 ```python
 # Instead of triggering a terminal, spawn a Task subagent with fresh context
+# Select model based on role complexity:
+# - sonnet: curator, doctor (structured tasks)
+# - opus: builder, judge (complex reasoning)
+
 print(f"📋 Spawning [Role] phase as Task subagent...")
 
 result = Task(
     description=f"[Role] phase for issue #{issue_number}",
     prompt=f"/[role] {issue_number}",
     subagent_type="general-purpose",
+    model="sonnet",  # or "opus" for builder/judge
     run_in_background=False
 )
 
@@ -514,7 +563,7 @@ result = Task(
 print("✅ [Role] phase complete")
 ```
 
-This ensures each phase has fresh context, matching the isolation benefits of MCP Mode.
+This ensures each phase has fresh context and uses cost-appropriate models, matching the isolation benefits of MCP Mode while optimizing token usage.
 
 ## Waiting for Completion
 
