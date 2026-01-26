@@ -22,11 +22,12 @@ The daemon uses a **subagent-per-iteration** architecture to prevent context acc
 │  1. Read .loom/daemon-state.json           │
 │  2. Assess system (gh commands)            │
 │  3. Check completions (TaskOutput)         │
-│  4. Spawn shepherds (Task, background)     │
-│  5. Spawn work generation                  │
-│  6. Ensure support roles                   │
-│  7. Save state to JSON                     │
-│  8. Return 1-line summary                  │
+│  4. Auto-promote proposals (force mode)    │
+│  5. Spawn shepherds (Task, background)     │
+│  6. Spawn work generation                  │
+│  7. Ensure support roles                   │
+│  8. Save state to JSON                     │
+│  9. Return 1-line summary                  │
 └────────────────────────────────────────────┘
 ```
 
@@ -54,7 +55,7 @@ You are FULLY AUTONOMOUS for:
 - Scaling shepherd pool based on demand
 
 You do NOT require human input for any of the above. The only human intervention needed is:
-- Approving proposals (loom:architect/loom:hermit -> loom:issue)
+- Approving proposals (loom:architect/loom:hermit -> loom:issue) - **bypassed in force mode**
 - Handling loom:blocked issues
 - Strategic direction changes
 
@@ -69,16 +70,17 @@ Each 120-second iteration:
   1. Check for shutdown signal
   2. Assess system state (gh issue counts)
   3. Check subagent completions (non-blocking TaskOutput)
-  4. AUTO-spawn shepherds if ready_issues > 0 and shepherd_slots available
-  5. AUTO-trigger Architect if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
-  6. AUTO-trigger Hermit if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
-  7. AUTO-ensure Guide is running (respawn if idle > GUIDE_INTERVAL)
-  8. AUTO-ensure Champion is running (respawn if idle > CHAMPION_INTERVAL)
-  9. AUTO-ensure Doctor is running (respawn if idle > DOCTOR_INTERVAL)
-  10. AUTO-ensure Auditor is running (respawn if idle > AUDITOR_INTERVAL)
-  11. Update daemon-state.json
-  12. Report status
-  13. Sleep and repeat
+  4. AUTO-promote proposals if force_mode and proposals exist
+  5. AUTO-spawn shepherds if ready_issues > 0 and shepherd_slots available
+  6. AUTO-trigger Architect if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
+  7. AUTO-trigger Hermit if ready_issues < ISSUE_THRESHOLD and cooldown elapsed
+  8. AUTO-ensure Guide is running (respawn if idle > GUIDE_INTERVAL)
+  9. AUTO-ensure Champion is running (respawn if idle > CHAMPION_INTERVAL)
+  10. AUTO-ensure Doctor is running (respawn if idle > DOCTOR_INTERVAL)
+  11. AUTO-ensure Auditor is running (respawn if idle > AUDITOR_INTERVAL)
+  12. Update daemon-state.json
+  13. Report status
+  14. Sleep and repeat
 ```
 
 **NO MANUAL INTERVENTION** means:
@@ -168,7 +170,9 @@ In Manual Orchestration Mode, use the **Task tool with `run_in_background: true`
 ```
 Task(
   subagent_type: "general-purpose",
-  prompt: """Execute the shepherd workflow by invoking the Skill tool:
+  prompt: """You must invoke the Skill tool to execute the shepherd workflow.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
 Skill(skill="shepherd", args="123 --force-pr")
 
@@ -177,7 +181,21 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
 ) → Returns task_id and output_file
 ```
 
-**IMPORTANT**: Task subagents don't automatically interpret slash commands (like `/shepherd`) as Skill invocations. They see the prompt as plain text. You MUST explicitly instruct the subagent to use the Skill tool with `Skill(skill="...", args="...")` syntax.
+**CRITICAL - Correct Tool Invocation**: Task subagents must use the **Skill tool**, NOT CLI commands.
+
+```
+✅ CORRECT - Use the Skill tool:
+   Skill(skill="guide")
+   Skill(skill="shepherd", args="123 --force-pr")
+
+❌ WRONG - These will fail with CLI errors:
+   claude --skill=guide
+   claude --role guide
+   /guide
+   bash("claude --skill=guide")
+```
+
+Task subagents receive their prompts as plain text. They must be explicitly instructed to invoke the Skill tool. The prompts in this file use `Skill(skill="...")` notation which the subagent should interpret as a tool call.
 
 ### Task Spawn Verification
 
@@ -204,6 +222,18 @@ def verify_task_spawn(result, description="task"):
         # If we get here without exception, task exists
         # Status can be "running", "completed", or "failed"
         if check.status in ["running", "completed"]:
+            # Check output for CLI error patterns that indicate misuse
+            if check.output:
+                cli_error_patterns = [
+                    "error: unknown option",
+                    "Did you mean",
+                    "unrecognized command",
+                    "command not found"
+                ]
+                for pattern in cli_error_patterns:
+                    if pattern in check.output:
+                        print(f"  SPAWN FAILED: {description} - CLI error detected: {pattern}")
+                        return False
             return True
         elif check.status == "failed":
             print(f"  SPAWN FAILED: {description} - task immediately failed")
@@ -219,6 +249,7 @@ def verify_task_spawn(result, description="task"):
 - Task() can return a task_id even when the underlying spawn fails
 - Recording invalid task_ids pollutes daemon-state.json
 - Invalid task_ids cause `TaskOutput` to report "completed" spuriously
+- CLI error patterns (like "error: unknown option") indicate the subagent misinterpreted the prompt
 - This leads to incorrect shepherd completion detection and state corruption
 
 ## Iteration Mode (`/loom iterate`)
@@ -269,13 +300,21 @@ def loom_iterate(force_mode=False, debug_mode=False):
         for c in completions:
             debug(f"Completion detected: {c.agent_id} issue=#{c.issue} status={c.status}")
 
-    # 5. Act on recommended_actions: spawn_shepherds
+    # 5. CRITICAL: Act on recommended_actions: promote_proposals (force mode only)
+    # This auto-promotes architect/hermit/curated proposals to loom:issue in force mode
+    promoted_count = 0
+    if "promote_proposals" in recommended_actions and state.get("force_mode", False):
+        promotable = snapshot_data["computed"]["promotable_proposals"]
+        debug(f"Auto-promoting {len(promotable)} proposals in force mode")
+        promoted_count = auto_promote_proposals(promotable, state, debug_mode)
+
+    # 6. Act on recommended_actions: spawn_shepherds
     spawned_shepherds = []
     if "spawn_shepherds" in recommended_actions:
         debug(f"Shepherd pool: {format_shepherd_pool(state)}")
         spawned_shepherds = auto_spawn_shepherds(state, snapshot_data, debug_mode)
 
-    # 6. CRITICAL: Act on recommended_actions: trigger_architect, trigger_hermit
+    # 7. CRITICAL: Act on recommended_actions: trigger_architect, trigger_hermit
     # This is the work generation that keeps the pipeline fed
     triggered_generation = {"architect": False, "hermit": False}
 
@@ -289,26 +328,26 @@ def loom_iterate(force_mode=False, debug_mode=False):
     if needs_work_gen and not triggered_generation["architect"] and not triggered_generation["hermit"]:
         debug(f"Work generation needed but not triggered: architect_cooldown_ok={architect_cooldown_ok}, hermit_cooldown_ok={hermit_cooldown_ok}")
 
-    # 7. Auto-ensure support roles
+    # 8. Auto-ensure support roles
     ensured_roles = auto_ensure_support_roles(state, debug_mode)
 
-    # 8. Stuck detection
+    # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
 
-    # 9. Stale building detection (every 10 iterations)
+    # 10. Stale building detection (every 10 iterations)
     recovered_count = 0
     if state.get("iteration", 0) % 10 == 0:
         debug("Running stale building check (every 10 iterations)")
         recovered_count = check_stale_building(state, debug_mode)
 
-    # 10. Save state to JSON
+    # 11. Save state to JSON
     state["iteration"] = state.get("iteration", 0) + 1
     state["last_poll"] = now()
     state["debug_mode"] = debug_mode  # Track debug mode in state
     save_daemon_state(state)
 
-    # 11. Return compact summary (ONE LINE)
-    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, stuck_count, recovered_count)
+    # 12. Return compact summary (ONE LINE)
+    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, promoted_count, stuck_count, recovered_count)
     debug(f"Iteration {iteration} completed - {summary}")
     return summary
 ```
@@ -332,6 +371,7 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `+champion` - Respawned Champion (if respawned)
 - `+doctor` - Respawned Doctor (if respawned)
 - `+auditor` - Respawned Auditor (if respawned)
+- `promoted=N` - Proposals auto-promoted to loom:issue in force mode (if any)
 - `stuck=N` - Stuck agents detected (if any)
 - `completed=#N` - Issue completed this iteration (if any)
 - `recovered=N` - Stale building issues recovered (if any)
@@ -344,6 +384,7 @@ ready=3 building=3 shepherds=3/3 +shepherd=#456 completed=#123
 ready=0 building=1 shepherds=1/3 +architect +hermit
 ready=2 building=2 shepherds=2/3 stuck=1
 ready=2 building=2 shepherds=2/3 spawn-fail=1
+ready=3 building=0 shepherds=0/3 promoted=3
 SHUTDOWN_SIGNAL
 ```
 
@@ -458,31 +499,35 @@ DAEMON ITERATION:
 ├── 4. CHECK SUBAGENT COMPLETIONS (non-blocking)
 │   └── For each active shepherd/role: TaskOutput with block=false
 │
-├── 5. AUTO-SPAWN SHEPHERDS (no human decision)
+├── 5. AUTO-PROMOTE PROPOSALS (force mode only)
+│   └── if force_mode AND promotable_proposals > 0:
+│       └── for each proposal: promote to loom:issue with audit comment
+│
+├── 6. AUTO-SPAWN SHEPHERDS (no human decision)
 │   └── while active_shepherds < MAX_SHEPHERDS AND ready_issues > 0:
 │       └── spawn_shepherd_for_next_ready_issue()
 │
-├── 6. AUTO-TRIGGER WORK GENERATION (no human decision)
+├── 7. AUTO-TRIGGER WORK GENERATION (no human decision)
 │   ├── if ready_issues < ISSUE_THRESHOLD:
 │   │   ├── if architect_cooldown_elapsed AND architect_proposals < MAX:
 │   │   │   └── spawn_architect()
 │   │   └── if hermit_cooldown_elapsed AND hermit_proposals < MAX:
 │   │       └── spawn_hermit()
-│   └── (Proposals feed pipeline when humans approve them)
+│   └── (Proposals feed pipeline when humans approve them, or auto-promoted in force mode)
 │
-├── 7. AUTO-ENSURE SUPPORT ROLES (no human decision)
+├── 8. AUTO-ENSURE SUPPORT ROLES (no human decision)
 │   ├── if guide_not_running OR guide_idle > GUIDE_INTERVAL:
 │   │   └── spawn_guide()
 │   └── if champion_not_running OR champion_idle > CHAMPION_INTERVAL:
 │       └── spawn_champion()
 │
-├── 8. SAVE STATE
+├── 9. SAVE STATE
 │   └── Update .loom/daemon-state.json
 │
-├── 9. REPORT STATUS
-│   └── Print status report (include session usage if available)
+├── 10. REPORT STATUS
+│    └── Print status report (include session usage if available)
 │
-└── 10. SLEEP(POLL_INTERVAL) and repeat
+└── 11. SLEEP(POLL_INTERVAL) and repeat
 ```
 
 ### Spawning Shepherd Subagents (Automatic)
@@ -509,7 +554,9 @@ def auto_spawn_shepherds():
         # because Task subagents don't automatically interpret slash commands.
         result = Task(
             description=f"Shepherd issue #{issue}",
-            prompt=f"""Execute the shepherd workflow by invoking the Skill tool:
+            prompt=f"""You must invoke the Skill tool to execute the shepherd workflow.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
 Skill(skill="shepherd", args="{issue} --force-pr")
 
@@ -530,6 +577,97 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
         print(f"AUTO-SPAWNED shepherd for issue #{issue} (verified)")
 ```
 
+### Auto-Promote Proposals (Force Mode Only)
+
+In force mode (`/loom --force`), the daemon AUTOMATICALLY promotes proposals to `loom:issue` without human approval:
+
+```python
+def auto_promote_proposals(promotable_issues, state, debug_mode=False):
+    """Auto-promote proposals to loom:issue in force mode.
+
+    Args:
+        promotable_issues: List of issue numbers to promote
+        state: Daemon state dict
+        debug_mode: Enable debug logging
+
+    Returns:
+        Number of successfully promoted issues
+    """
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    promoted = 0
+
+    for issue_num in promotable_issues:
+        try:
+            # Get current labels to determine which to remove
+            issue_data = run(f"gh issue view {issue_num} --json labels --jq '.labels[].name'")
+            labels = issue_data.strip().split('\n')
+
+            # Determine which proposal label to remove
+            remove_label = None
+            proposal_type = None
+            if "loom:architect" in labels:
+                remove_label = "loom:architect"
+                proposal_type = "architect"
+            elif "loom:hermit" in labels:
+                remove_label = "loom:hermit"
+                proposal_type = "hermit"
+            elif "loom:curated" in labels:
+                remove_label = "loom:curated"
+                proposal_type = "curated"
+            else:
+                debug(f"Issue #{issue_num} has no promotable label, skipping")
+                continue
+
+            # Skip if blocked
+            if "loom:blocked" in labels:
+                debug(f"Issue #{issue_num} is blocked, skipping promotion")
+                continue
+
+            # Promote: remove proposal label, add loom:issue
+            run(f"gh issue edit {issue_num} --remove-label '{remove_label}' --add-label 'loom:issue'")
+
+            # Add audit trail comment
+            timestamp = now()
+            run(f"""gh issue comment {issue_num} --body '**[force-mode] Daemon Auto-Promotion**
+
+This {proposal_type} proposal has been automatically promoted to `loom:issue` by the Loom daemon running in force mode.
+
+**Ready for Builder** - A shepherd will claim this issue in the next iteration.
+
+**Force mode enabled**: Champion evaluation bypassed for aggressive autonomous development.
+
+---
+*Automated by Loom daemon (force mode) at {timestamp}*'""")
+
+            # Track in daemon state
+            if "force_mode_auto_promotions" not in state:
+                state["force_mode_auto_promotions"] = []
+
+            state["force_mode_auto_promotions"].append({
+                "issue": issue_num,
+                "type": proposal_type,
+                "time": timestamp
+            })
+
+            promoted += 1
+            debug(f"Promoted #{issue_num} ({proposal_type} -> loom:issue)")
+
+        except Exception as e:
+            debug(f"Failed to promote #{issue_num}: {e}")
+            continue
+
+    return promoted
+```
+
+**Important notes:**
+- Only runs when `force_mode` is enabled in daemon state
+- Skips issues with `loom:blocked` label
+- Adds audit trail comment for transparency
+- Tracks promotions in `state["force_mode_auto_promotions"]` array
+
 ### Work Generation (Automatic)
 
 The daemon AUTOMATICALLY triggers Architect/Hermit when backlog is low:
@@ -545,7 +683,9 @@ def auto_generate_work():
         if architect_cooldown_ok() and architect_proposals < 2:
             result = Task(
                 description="Architect work generation",
-                prompt="""Execute the architect role by invoking the Skill tool:
+                prompt="""You must invoke the Skill tool to execute the architect role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=architect'. Use the Skill tool:
 
 Skill(skill="architect", args="--autonomous")
 
@@ -562,7 +702,9 @@ Complete one work generation iteration.""",
         if hermit_cooldown_ok() and hermit_proposals < 2:
             result = Task(
                 description="Hermit simplification proposals",
-                prompt="""Execute the hermit role by invoking the Skill tool:
+                prompt="""You must invoke the Skill tool to execute the hermit role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=hermit'. Use the Skill tool:
 
 Skill(skill="hermit")
 
@@ -587,7 +729,9 @@ def auto_ensure_support_roles():
     if not guide_is_running() or guide_idle_time() > GUIDE_INTERVAL:
         result = Task(
             description="Guide backlog triage",
-            prompt="""Execute the guide role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the guide role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
 
 Skill(skill="guide")
 
@@ -603,7 +747,9 @@ Complete one triage iteration.""",
     if not champion_is_running() or champion_idle_time() > CHAMPION_INTERVAL:
         result = Task(
             description="Champion PR merge",
-            prompt="""Execute the champion role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the champion role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
 
 Skill(skill="champion")
 
@@ -619,7 +765,9 @@ Complete one PR evaluation and merge iteration.""",
     if not doctor_is_running() or doctor_idle_time() > DOCTOR_INTERVAL:
         result = Task(
             description="Doctor PR conflict resolution",
-            prompt="""Execute the doctor role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the doctor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
 
 Skill(skill="doctor")
 
@@ -718,11 +866,15 @@ AUDITOR:
   THEN spawn_auditor()  ← AUTOMATIC
 ```
 
-**Human only intervenes for**:
+**Human only intervenes for** (in normal mode):
 - Approving proposals: `loom:architect` → `loom:issue`
 - Approving proposals: `loom:hermit` → `loom:issue`
 - Handling blocked: `loom:blocked` issues
 - Strategic direction changes
+
+**In force mode** (`/loom --force`):
+- Proposals are auto-promoted to `loom:issue` by the daemon
+- Only `loom:blocked` issues require human intervention
 
 ## Startup Validation
 
@@ -1088,7 +1240,9 @@ def auto_spawn_shepherds(debug_mode=False):
         # because Task subagents don't automatically interpret slash commands.
         result = Task(
             description=f"Shepherd issue #{issue}",
-            prompt=f"""Execute the shepherd workflow by invoking the Skill tool:
+            prompt=f"""You must invoke the Skill tool to execute the shepherd workflow.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
 
 Skill(skill="shepherd", args="{issue} --force-pr")
 
@@ -1154,7 +1308,9 @@ def trigger_architect_role(state, debug_mode=False):
 
     result = Task(
         description="Architect work generation",
-        prompt="""Execute the architect role by invoking the Skill tool:
+        prompt="""You must invoke the Skill tool to execute the architect role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=architect'. Use the Skill tool:
 
 Skill(skill="architect", args="--autonomous")
 
@@ -1190,7 +1346,9 @@ def trigger_hermit_role(state, debug_mode=False):
 
     result = Task(
         description="Hermit simplification proposals",
-        prompt="""Execute the hermit role by invoking the Skill tool:
+        prompt="""You must invoke the Skill tool to execute the hermit role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=hermit'. Use the Skill tool:
 
 Skill(skill="hermit")
 
@@ -1258,7 +1416,9 @@ def auto_ensure_support_roles(debug_mode=False):
     if not guide_running or guide_idle > GUIDE_INTERVAL:
         result = Task(
             description="Guide backlog triage",
-            prompt="""Execute the guide role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the guide role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
 
 Skill(skill="guide")
 
@@ -1286,7 +1446,9 @@ Complete one triage iteration.""",
     if not champion_running or champion_idle > CHAMPION_INTERVAL:
         result = Task(
             description="Champion PR merge",
-            prompt="""Execute the champion role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the champion role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
 
 Skill(skill="champion")
 
@@ -1314,7 +1476,9 @@ Complete one PR evaluation and merge iteration.""",
     if not doctor_running or doctor_idle > DOCTOR_INTERVAL:
         result = Task(
             description="Doctor PR conflict resolution",
-            prompt="""Execute the doctor role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the doctor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
 
 Skill(skill="doctor")
 
@@ -1342,7 +1506,9 @@ Complete one PR conflict resolution iteration.""",
     if not auditor_running or auditor_idle > AUDITOR_INTERVAL:
         result = Task(
             description="Auditor main branch validation",
-            prompt="""Execute the auditor role by invoking the Skill tool:
+            prompt="""You must invoke the Skill tool to execute the auditor role.
+
+IMPORTANT: Do NOT use CLI commands like 'claude --skill=auditor'. Use the Skill tool:
 
 Skill(skill="auditor")
 

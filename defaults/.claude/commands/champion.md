@@ -250,6 +250,115 @@ You operate as the middle tier in a three-tier approval system:
 2. **Champion** (you) evaluates all proposals → promotes qualifying ones to `loom:issue`
 3. **Human** provides final override and can reject Champion decisions
 
+## Goal Discovery and Tier-Aware Prioritization
+
+**CRITICAL**: Before evaluating proposals, always check project goals and current backlog balance. This ensures Champion prioritizes work that advances project milestones.
+
+### Goal Discovery
+
+Run goal discovery at the START of each promotion cycle:
+
+```bash
+# ALWAYS run goal discovery before evaluating proposals
+discover_project_goals() {
+  echo "=== Project Goals Discovery ==="
+
+  # 1. Check README for milestones
+  if [ -f README.md ]; then
+    echo "Current milestone from README:"
+    grep -i "milestone\|current:\|target:" README.md | head -5
+  fi
+
+  # 2. Check roadmap
+  if [ -f docs/roadmap.md ] || [ -f ROADMAP.md ]; then
+    echo "Roadmap deliverables:"
+    grep -E "^- \[.\]|^## M[0-9]" docs/roadmap.md ROADMAP.md 2>/dev/null | head -10
+  fi
+
+  # 3. Check for urgent/high-priority goal-advancing issues
+  echo "Current goal-advancing work:"
+  gh issue list --label="tier:goal-advancing" --state=open --limit=5
+  gh issue list --label="loom:urgent" --state=open --limit=5
+
+  # 4. Summary
+  echo "Prioritize promoting proposals that advance these goals"
+}
+
+# Run goal discovery
+discover_project_goals
+```
+
+### Backlog Balance Check
+
+Before promoting new issues, check the current backlog distribution:
+
+```bash
+check_backlog_balance() {
+  echo "=== Backlog Tier Balance ==="
+
+  # Count issues by tier
+  tier1=$(gh issue list --label="tier:goal-advancing" --state=open --json number --jq 'length')
+  tier2=$(gh issue list --label="tier:goal-supporting" --state=open --json number --jq 'length')
+  tier3=$(gh issue list --label="tier:maintenance" --state=open --json number --jq 'length')
+  unlabeled=$(gh issue list --label="loom:issue" --state=open --json number,labels \
+    --jq '[.[] | select([.labels[].name] | any(startswith("tier:")) | not)] | length')
+
+  total=$((tier1 + tier2 + tier3 + unlabeled))
+
+  echo "Tier 1 (goal-advancing): $tier1"
+  echo "Tier 2 (goal-supporting): $tier2"
+  echo "Tier 3 (maintenance):     $tier3"
+  echo "Unlabeled:                $unlabeled"
+  echo "Total ready issues:       $total"
+
+  # Promotion guidance based on balance
+  if [ "$tier1" -eq 0 ]; then
+    echo ""
+    echo "RECOMMENDATION: Prioritize promoting Tier 1 (goal-advancing) proposals."
+  fi
+
+  if [ "$tier3" -gt "$tier1" ] && [ "$tier3" -gt 5 ]; then
+    echo ""
+    echo "WARNING: More maintenance issues than goal-advancing issues."
+    echo "RECOMMENDATION: Be selective about promoting Tier 3 issues."
+  fi
+}
+
+# Run the check
+check_backlog_balance
+```
+
+### Tier-Aware Promotion Priority
+
+When multiple proposals are available for promotion, prioritize by tier:
+
+1. **Tier 1 (goal-advancing)**: Promote first - these directly advance the current milestone
+2. **Tier 2 (goal-supporting)**: Promote second - these enable goal work
+3. **Tier 3 (maintenance)**: Promote last - only if backlog has room
+
+**Rate Limiting by Tier**:
+- Tier 1: Promote all qualifying proposals (no limit)
+- Tier 2: Promote up to 2 per iteration
+- Tier 3: Promote only 1 per iteration, and only if fewer than 5 Tier 3 issues already in backlog
+
+### Assigning Tier Labels During Promotion
+
+**IMPORTANT**: When promoting proposals that lack tier labels, assess and add the appropriate tier:
+
+| Tier | Label | Criteria |
+|------|-------|----------|
+| Tier 1 | `tier:goal-advancing` | Directly implements milestone deliverable or unblocks goal work |
+| Tier 2 | `tier:goal-supporting` | Infrastructure, testing, or docs for milestone features |
+| Tier 3 | `tier:maintenance` | Cleanup, refactoring, or improvements not tied to goals |
+
+```bash
+# When promoting, include the tier label
+gh issue edit <number> \
+  --remove-label "loom:curated" \
+  --add-label "loom:issue" \
+  --add-label "tier:goal-advancing"  # or tier:goal-supporting, tier:maintenance
+```
+
 ## Evaluation Criteria
 
 For each proposal issue (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`), evaluate against these **8 criteria**. All must pass for promotion:
@@ -327,17 +436,27 @@ Check each of the 8 criteria above. If ANY criterion fails, skip to Step 4 (reje
 
 If all 8 criteria pass, promote the issue:
 
+**Step 3a: Determine Tier**
+
+Assess the issue's alignment with current project goals:
+- **Tier 1 (goal-advancing)**: Directly implements milestone deliverable or unblocks goal work
+- **Tier 2 (goal-supporting)**: Infrastructure, testing, or docs for milestone features
+- **Tier 3 (maintenance)**: Cleanup, refactoring, or improvements not tied to current goals
+
+**Step 3b: Promote with Tier Label**
+
 ```bash
-# Remove proposal label and add loom:issue
+# Remove proposal label, add loom:issue AND the appropriate tier label
 # IMPORTANT: Only one proposal label can exist at a time, but check all for robustness
 gh issue edit <number> \
   --remove-label "loom:curated" \
   --remove-label "loom:architect" \
   --remove-label "loom:hermit" \
   --remove-label "loom:auditor" \
-  --add-label "loom:issue"
+  --add-label "loom:issue" \
+  --add-label "tier:goal-advancing"  # OR tier:goal-supporting OR tier:maintenance
 
-# Add promotion comment
+# Add promotion comment with tier rationale
 gh issue comment <number> --body "**Champion Review: APPROVED**
 
 This issue has been evaluated and promoted to \`loom:issue\` status. All quality criteria passed:
@@ -350,6 +469,8 @@ This issue has been evaluated and promoted to \`loom:issue\` status. All quality
 ✅ Quality standards
 ✅ Risk assessment
 ✅ Completeness
+
+**Goal Alignment**: [Tier 1/2/3] - [Brief explanation of why this tier]
 
 **Ready for Builder to claim.**
 

@@ -139,6 +139,8 @@ While all of these are valid improvements, they may not be what the project need
 
 ### Discovering Project Goals
 
+**CRITICAL**: Run goal discovery at the START of every autonomous scan. This ensures proposals align with current project priorities.
+
 Before scanning for opportunities, check these files for stated goals and milestones:
 
 1. **README.md** - Often contains project overview and current focus
@@ -148,13 +150,37 @@ Before scanning for opportunities, check these files for stated goals and milest
 5. **Open issues with milestone labels** - Current sprint/milestone work
 
 ```bash
-# Check for roadmap files
+# ALWAYS run goal discovery before creating proposals
+discover_project_goals() {
+  echo "=== Project Goals Discovery ==="
+
+  # 1. Check README for milestones
+  if [ -f README.md ]; then
+    echo "Current milestone from README:"
+    grep -i "milestone\|current:\|target:" README.md | head -5
+  fi
+
+  # 2. Check roadmap
+  if [ -f docs/roadmap.md ] || [ -f ROADMAP.md ]; then
+    echo "Roadmap deliverables:"
+    grep -E "^- \[.\]|^## M[0-9]" docs/roadmap.md ROADMAP.md 2>/dev/null | head -10
+  fi
+
+  # 3. Check for urgent/high-priority goal-advancing issues
+  echo "Current goal-advancing work:"
+  gh issue list --label="tier:goal-advancing" --state=open --limit=5
+  gh issue list --label="loom:urgent" --state=open --limit=5
+
+  # 4. Summary
+  echo "Goal-advancing proposals should target these areas"
+}
+
+# Run goal discovery
+discover_project_goals
+
+# Additional checks
 ls -la README.md docs/roadmap.md docs/milestones/ 2>/dev/null
-
-# Look for milestone definitions in README
 grep -i "milestone\|deliverable\|goal\|phase" README.md | head -20
-
-# Check for milestone labels on issues
 gh issue list --label="milestone:*" --state=open --limit=10
 ```
 
@@ -278,16 +304,86 @@ This proposal was created in autonomous mode. The following assumptions were mad
 ### Autonomous Workflow
 
 1. **Check project goals first**: Read README.md, docs/roadmap.md for current milestone and deliverables
-2. Identify opportunity during codebase scan
-3. **Assess goal alignment**: Classify opportunity as Tier 1 (goal-advancing), Tier 2 (goal-supporting), or Tier 3 (general improvement)
-4. Self-reflect: Analyze codebase to infer constraints/priorities
-5. Apply default assumptions where signals are unclear
-6. **Prioritize goal-aligned proposals**: If multiple opportunities exist, prefer Tier 1 over Tier 2 over Tier 3
-7. Create proposal with ONE recommended approach
-8. **Include milestone context**: Document how proposal relates to current milestone
-9. Document all assumptions with sources
-10. Add `loom:architect` label
-11. Clear context (`/clear`)
+2. **Check backlog balance**: Run `check_backlog_balance` to see tier distribution (see below)
+3. Identify opportunity during codebase scan
+4. **Assess goal alignment**: Classify opportunity as Tier 1 (goal-advancing), Tier 2 (goal-supporting), or Tier 3 (general improvement)
+5. Self-reflect: Analyze codebase to infer constraints/priorities
+6. Apply default assumptions where signals are unclear
+7. **Prioritize goal-aligned proposals**: If multiple opportunities exist, prefer Tier 1 over Tier 2 over Tier 3
+8. Create proposal with ONE recommended approach
+9. **Include milestone context**: Document how proposal relates to current milestone
+10. **Add tier label**: Apply appropriate `tier:*` label based on goal alignment
+11. Document all assumptions with sources
+12. Add `loom:architect` label
+13. Clear context (`/clear`)
+
+### Tier Labeling
+
+**IMPORTANT**: Always apply tier labels to new proposals. This enables the Guide to prioritize effectively.
+
+| Tier | Label | When to Apply |
+|------|-------|---------------|
+| Tier 1 | `tier:goal-advancing` | Directly implements milestone deliverable or unblocks goal work |
+| Tier 2 | `tier:goal-supporting` | Infrastructure, testing, or docs for milestone features |
+| Tier 3 | `tier:maintenance` | Cleanup, refactoring, or improvements not tied to goals |
+
+```bash
+# After creating a proposal, add the appropriate tier label
+gh issue edit <number> --add-label "loom:architect"
+
+# AND add the tier label based on goal alignment
+gh issue edit <number> --add-label "tier:goal-advancing"     # Tier 1
+# OR
+gh issue edit <number> --add-label "tier:goal-supporting"    # Tier 2
+# OR
+gh issue edit <number> --add-label "tier:maintenance"        # Tier 3
+```
+
+### Backlog Balance Check
+
+**Run this before creating proposals** to ensure the backlog has healthy distribution.
+
+```bash
+check_backlog_balance() {
+  echo "=== Backlog Tier Balance ==="
+
+  # Count issues by tier
+  tier1=$(gh issue list --label="tier:goal-advancing" --state=open --json number --jq 'length')
+  tier2=$(gh issue list --label="tier:goal-supporting" --state=open --json number --jq 'length')
+  tier3=$(gh issue list --label="tier:maintenance" --state=open --json number --jq 'length')
+  unlabeled=$(gh issue list --label="loom:issue" --state=open --json number,labels \
+    --jq '[.[] | select([.labels[].name] | any(startswith("tier:")) | not)] | length')
+
+  total=$((tier1 + tier2 + tier3 + unlabeled))
+
+  echo "Tier 1 (goal-advancing): $tier1"
+  echo "Tier 2 (goal-supporting): $tier2"
+  echo "Tier 3 (maintenance):     $tier3"
+  echo "Unlabeled:                $unlabeled"
+  echo "Total ready issues:       $total"
+
+  # Check balance
+  if [ "$tier1" -eq 0 ] && [ "$total" -gt 3 ]; then
+    echo ""
+    echo "WARNING: No goal-advancing issues in backlog!"
+    echo "RECOMMENDATION: Prioritize creating Tier 1 proposals that advance current milestone."
+  fi
+
+  if [ "$tier3" -gt "$tier1" ] && [ "$tier3" -gt 5 ]; then
+    echo ""
+    echo "WARNING: More maintenance issues than goal-advancing issues."
+    echo "RECOMMENDATION: Focus on goal-aligned proposals before adding more maintenance work."
+  fi
+}
+
+# Run the check
+check_backlog_balance
+```
+
+**Interpretation**:
+- **Healthy**: Tier 1 >= Tier 3, and at least 1-2 goal-advancing issues available
+- **Warning**: No goal-advancing issues, or maintenance dominates
+- **Action**: If unhealthy, focus proposals on Tier 1 opportunities
 
 ## Workflow
 
