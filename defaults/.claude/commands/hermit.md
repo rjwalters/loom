@@ -440,6 +440,128 @@ $ wc -l src/components/Button.tsx
 # → SKIP: Not worth the effort for 20 line reduction
 ```
 
+## Goal-Aligned Simplification Priority
+
+**CRITICAL**: Before creating simplification proposals, always check for project goals and roadmap. Even simplification work should align with project priorities.
+
+### Goal Discovery
+
+Run goal discovery at the START of every autonomous scan to ensure simplification efforts align with project priorities:
+
+```bash
+# ALWAYS run goal discovery before creating proposals
+discover_project_goals() {
+  echo "=== Project Goals Discovery ==="
+
+  # 1. Check README for milestones
+  if [ -f README.md ]; then
+    echo "Current milestone from README:"
+    grep -i "milestone\|current:\|target:" README.md | head -5
+  fi
+
+  # 2. Check roadmap
+  if [ -f docs/roadmap.md ] || [ -f ROADMAP.md ]; then
+    echo "Roadmap deliverables:"
+    grep -E "^- \[.\]|^## M[0-9]" docs/roadmap.md ROADMAP.md 2>/dev/null | head -10
+  fi
+
+  # 3. Check for urgent/high-priority goal-advancing issues
+  echo "Current goal-advancing work:"
+  gh issue list --label="tier:goal-advancing" --state=open --limit=5
+  gh issue list --label="loom:urgent" --state=open --limit=5
+
+  # 4. Summary
+  echo "Simplification proposals should support these focus areas"
+}
+
+# Run goal discovery
+discover_project_goals
+```
+
+### Simplification Priority Tiers
+
+**Tier 1 - Goal-Advancing**: Simplifications that directly benefit current milestone work
+- Remove bloat blocking or complicating active goal work
+- Simplify code that milestone features will build upon
+- Remove dead code from areas being actively developed
+
+**Tier 2 - Goal-Supporting**: Simplifications that support goal work indirectly
+- Remove unused test utilities that slow CI for milestone features
+- Simplify infrastructure that milestone work depends on
+
+**Tier 3 - General Maintenance**: Simplifications not tied to current goals
+- General code cleanup and refactoring
+- Remove old unused features
+- Clean up technical debt in dormant areas
+
+### Tier Labeling
+
+**IMPORTANT**: Always apply tier labels to new proposals. This enables the Guide to prioritize effectively.
+
+| Tier | Label | When to Apply |
+|------|-------|---------------|
+| Tier 1 | `tier:goal-advancing` | Simplification directly benefits current milestone work |
+| Tier 2 | `tier:goal-supporting` | Simplification supports infrastructure for milestone features |
+| Tier 3 | `tier:maintenance` | General cleanup not tied to current goals |
+
+```bash
+# After creating a proposal, add the appropriate tier label
+gh issue edit <number> --add-label "loom:hermit"
+
+# AND add the tier label based on goal alignment
+gh issue edit <number> --add-label "tier:goal-advancing"     # Tier 1
+# OR
+gh issue edit <number> --add-label "tier:goal-supporting"    # Tier 2
+# OR
+gh issue edit <number> --add-label "tier:maintenance"        # Tier 3
+```
+
+### Backlog Balance Check
+
+**Run this before creating proposals** to ensure the backlog has healthy distribution.
+
+```bash
+check_backlog_balance() {
+  echo "=== Backlog Tier Balance ==="
+
+  # Count issues by tier
+  tier1=$(gh issue list --label="tier:goal-advancing" --state=open --json number --jq 'length')
+  tier2=$(gh issue list --label="tier:goal-supporting" --state=open --json number --jq 'length')
+  tier3=$(gh issue list --label="tier:maintenance" --state=open --json number --jq 'length')
+  unlabeled=$(gh issue list --label="loom:issue" --state=open --json number,labels \
+    --jq '[.[] | select([.labels[].name] | any(startswith("tier:")) | not)] | length')
+
+  total=$((tier1 + tier2 + tier3 + unlabeled))
+
+  echo "Tier 1 (goal-advancing): $tier1"
+  echo "Tier 2 (goal-supporting): $tier2"
+  echo "Tier 3 (maintenance):     $tier3"
+  echo "Unlabeled:                $unlabeled"
+  echo "Total ready issues:       $total"
+
+  # Check balance
+  if [ "$tier1" -eq 0 ] && [ "$total" -gt 3 ]; then
+    echo ""
+    echo "WARNING: No goal-advancing issues in backlog!"
+    echo "RECOMMENDATION: Prioritize simplifications that support current milestone work."
+  fi
+
+  if [ "$tier3" -gt "$tier1" ] && [ "$tier3" -gt 5 ]; then
+    echo ""
+    echo "WARNING: More maintenance issues than goal-advancing issues."
+    echo "RECOMMENDATION: Focus on simplifications that directly benefit active work."
+  fi
+}
+
+# Run the check
+check_backlog_balance
+```
+
+**Interpretation**:
+- **Healthy**: Tier 1 >= Tier 3, and at least 1-2 goal-advancing issues available
+- **Warning**: No goal-advancing issues, or maintenance dominates
+- **Action**: If unhealthy, focus simplification proposals on Tier 1 opportunities
+
 ### Integration with Autonomous Mode
 
 When running autonomously (every 15 minutes), each Hermit run should **randomly select ONE check** to perform. This prevents duplicate issues when multiple Hermits run in parallel.

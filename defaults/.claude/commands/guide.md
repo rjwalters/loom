@@ -82,7 +82,130 @@ gh issue list --label "loom:urgent" --state open
 
 ## Priority Assessment
 
-For each `loom:issue` issue, consider:
+### Goal Discovery First
+
+**CRITICAL**: Before prioritizing issues, always check for project goals and roadmap. Priorities should align with current milestone objectives.
+
+```bash
+# ALWAYS run goal discovery before prioritizing
+discover_project_goals() {
+  echo "=== Project Goals Discovery ==="
+
+  # 1. Check README for milestones
+  if [ -f README.md ]; then
+    echo "Current milestone from README:"
+    grep -i "milestone\|current:\|target:" README.md | head -5
+  fi
+
+  # 2. Check roadmap
+  if [ -f docs/roadmap.md ] || [ -f ROADMAP.md ]; then
+    echo "Roadmap deliverables:"
+    grep -E "^- \[.\]|^## M[0-9]" docs/roadmap.md ROADMAP.md 2>/dev/null | head -10
+  fi
+
+  # 3. Summary
+  echo "Urgent issues should advance these goals when possible"
+}
+
+# Run goal discovery
+discover_project_goals
+```
+
+### Tier-Aware Prioritization
+
+Issues should have tier labels indicating their alignment with project goals. Use tiers as a **primary sorting criterion**:
+
+| Tier | Label | Priority Consideration |
+|------|-------|------------------------|
+| Tier 1 | `tier:goal-advancing` | **Highest** - Directly implements milestone deliverables |
+| Tier 2 | `tier:goal-supporting` | **Medium** - Enables or supports milestone work |
+| Tier 3 | `tier:maintenance` | **Lower** - General improvements not tied to goals |
+
+**Urgent Priority Order** (when applying `loom:urgent`):
+1. Tier 1 issues that are blocking other goal work
+2. Tier 1 issues that advance critical path deliverables
+3. Tier 2 issues that unblock multiple Tier 1 issues
+4. Security issues (any tier)
+5. Critical bugs affecting users (any tier)
+
+```bash
+# Find issues by tier
+gh issue list --label="loom:issue" --label="tier:goal-advancing" --state=open
+gh issue list --label="loom:issue" --label="tier:goal-supporting" --state=open
+gh issue list --label="loom:issue" --label="tier:maintenance" --state=open
+
+# Find unlabeled issues (need tier assignment)
+gh issue list --label="loom:issue" --state=open --json number,labels \
+  --jq '.[] | select([.labels[].name] | any(startswith("tier:")) | not) | "#\(.number)"'
+```
+
+### Backlog Balance Check
+
+Monitor the tier distribution to ensure a healthy backlog:
+
+```bash
+check_backlog_balance() {
+  echo "=== Backlog Tier Balance ==="
+
+  # Count issues by tier
+  tier1=$(gh issue list --label="tier:goal-advancing" --state=open --json number --jq 'length')
+  tier2=$(gh issue list --label="tier:goal-supporting" --state=open --json number --jq 'length')
+  tier3=$(gh issue list --label="tier:maintenance" --state=open --json number --jq 'length')
+  unlabeled=$(gh issue list --label="loom:issue" --state=open --json number,labels \
+    --jq '[.[] | select([.labels[].name] | any(startswith("tier:")) | not)] | length')
+
+  total=$((tier1 + tier2 + tier3 + unlabeled))
+
+  echo "Tier 1 (goal-advancing): $tier1"
+  echo "Tier 2 (goal-supporting): $tier2"
+  echo "Tier 3 (maintenance):     $tier3"
+  echo "Unlabeled:                $unlabeled"
+  echo "Total ready issues:       $total"
+
+  # Health assessment
+  if [ "$tier1" -eq 0 ] && [ "$total" -gt 3 ]; then
+    echo ""
+    echo "WARNING: No goal-advancing issues in backlog!"
+    echo "ACTION: Review proposals and promote goal-advancing work."
+  fi
+
+  if [ "$tier3" -gt "$tier1" ] && [ "$tier3" -gt 5 ]; then
+    echo ""
+    echo "WARNING: Maintenance work exceeds goal-advancing work."
+    echo "ACTION: Consider deferring new Tier 3 promotions."
+  fi
+
+  if [ "$unlabeled" -gt 3 ]; then
+    echo ""
+    echo "WARNING: $unlabeled issues need tier labels."
+    echo "ACTION: Review and assign tier labels to unlabeled issues."
+  fi
+}
+
+# Run the check
+check_backlog_balance
+```
+
+### Assigning Missing Tier Labels
+
+When you find issues without tier labels, assess and add them:
+
+```bash
+# For each unlabeled issue, determine its tier
+gh issue view <number>
+
+# Assess:
+# - Does it directly implement a milestone deliverable? → tier:goal-advancing
+# - Does it support milestone work (infra, testing, docs)? → tier:goal-supporting
+# - Is it general cleanup/improvement? → tier:maintenance
+
+# Add the tier label
+gh issue edit <number> --add-label "tier:goal-advancing"  # or other tier
+```
+
+### Traditional Priority Criteria
+
+For each `loom:issue` issue, also consider these traditional factors:
 
 1. **Strategic Impact**
    - Aligns with product vision?
