@@ -41,6 +41,7 @@ HERMIT_COOLDOWN="${LOOM_HERMIT_COOLDOWN:-1800}"
 GUIDE_INTERVAL="${LOOM_GUIDE_INTERVAL:-900}"        # 15 minutes default
 CHAMPION_INTERVAL="${LOOM_CHAMPION_INTERVAL:-600}"  # 10 minutes default
 DOCTOR_INTERVAL="${LOOM_DOCTOR_INTERVAL:-300}"      # 5 minutes default
+AUDITOR_INTERVAL="${LOOM_AUDITOR_INTERVAL:-600}"    # 10 minutes default
 
 # Issue selection strategy: fifo (default), lifo, priority
 # - fifo: Oldest issues first (FIFO - prevents starvation)
@@ -103,6 +104,7 @@ ENVIRONMENT VARIABLES:
     LOOM_GUIDE_INTERVAL      Guide re-trigger interval in seconds (default: 900)
     LOOM_CHAMPION_INTERVAL   Champion re-trigger interval in seconds (default: 600)
     LOOM_DOCTOR_INTERVAL     Doctor re-trigger interval in seconds (default: 300)
+    LOOM_AUDITOR_INTERVAL    Auditor re-trigger interval in seconds (default: 600)
     LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
                              - fifo: Oldest issues first (prevents starvation)
                              - lifo: Newest issues first
@@ -310,6 +312,8 @@ CHAMPION_LAST_COMPLETED=""
 CHAMPION_STATUS="idle"
 DOCTOR_LAST_COMPLETED=""
 DOCTOR_STATUS="idle"
+AUDITOR_LAST_COMPLETED=""
+AUDITOR_STATUS="idle"
 
 if [[ -f "$DAEMON_STATE_FILE" ]]; then
     # Count active shepherds (those with status="working")
@@ -324,6 +328,8 @@ if [[ -f "$DAEMON_STATE_FILE" ]]; then
     CHAMPION_STATUS=$(jq -r '.support_roles.champion.status // "idle"' "$DAEMON_STATE_FILE" 2>/dev/null || echo "idle")
     DOCTOR_LAST_COMPLETED=$(jq -r '.support_roles.doctor.last_completed // ""' "$DAEMON_STATE_FILE" 2>/dev/null || echo "")
     DOCTOR_STATUS=$(jq -r '.support_roles.doctor.status // "idle"' "$DAEMON_STATE_FILE" 2>/dev/null || echo "idle")
+    AUDITOR_LAST_COMPLETED=$(jq -r '.support_roles.auditor.last_completed // ""' "$DAEMON_STATE_FILE" 2>/dev/null || echo "")
+    AUDITOR_STATUS=$(jq -r '.support_roles.auditor.status // "idle"' "$DAEMON_STATE_FILE" 2>/dev/null || echo "idle")
 fi
 
 # Calculate counts
@@ -438,6 +444,24 @@ elif [[ "$DOCTOR_STATUS" != "running" ]]; then
     DOCTOR_NEEDS_TRIGGER="true"
 fi
 
+AUDITOR_IDLE_SECONDS=0
+AUDITOR_NEEDS_TRIGGER="false"
+if [[ -n "$AUDITOR_LAST_COMPLETED" && "$AUDITOR_LAST_COMPLETED" != "null" ]]; then
+    if [[ "$(uname)" == "Darwin" ]]; then
+        AUDITOR_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$AUDITOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+    else
+        AUDITOR_EPOCH=$(date -d "$AUDITOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+    fi
+    if [[ "$AUDITOR_EPOCH" != "0" ]]; then
+        AUDITOR_IDLE_SECONDS=$((NOW_EPOCH - AUDITOR_EPOCH))
+        if [[ "$AUDITOR_STATUS" != "running" ]] && [[ $AUDITOR_IDLE_SECONDS -gt $AUDITOR_INTERVAL ]]; then
+            AUDITOR_NEEDS_TRIGGER="true"
+        fi
+    fi
+elif [[ "$AUDITOR_STATUS" != "running" ]]; then
+    AUDITOR_NEEDS_TRIGGER="true"
+fi
+
 # Build recommended actions array
 ACTIONS="[]"
 
@@ -476,6 +500,9 @@ if [[ "$CHAMPION_NEEDS_TRIGGER" == "true" ]]; then
 fi
 if [[ "$DOCTOR_NEEDS_TRIGGER" == "true" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_doctor"]')
+fi
+if [[ "$AUDITOR_NEEDS_TRIGGER" == "true" ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["trigger_auditor"]')
 fi
 
 # Action: wait (if nothing else to do)
@@ -677,6 +704,10 @@ OUTPUT=$(jq -n \
     --argjson doctor_interval "$DOCTOR_INTERVAL" \
     --argjson doctor_needs_trigger "$DOCTOR_NEEDS_TRIGGER" \
     --arg doctor_status "$DOCTOR_STATUS" \
+    --argjson auditor_idle_seconds "$AUDITOR_IDLE_SECONDS" \
+    --argjson auditor_interval "$AUDITOR_INTERVAL" \
+    --argjson auditor_needs_trigger "$AUDITOR_NEEDS_TRIGGER" \
+    --arg auditor_status "$AUDITOR_STATUS" \
     --argjson orphaned_shepherds "$ORPHANED_SHEPHERDS" \
     --argjson orphaned_count "$ORPHANED_COUNT" \
     '{
@@ -720,6 +751,12 @@ OUTPUT=$(jq -n \
                 idle_seconds: $doctor_idle_seconds,
                 interval: $doctor_interval,
                 needs_trigger: $doctor_needs_trigger
+            },
+            auditor: {
+                status: $auditor_status,
+                idle_seconds: $auditor_idle_seconds,
+                interval: $auditor_interval,
+                needs_trigger: $auditor_needs_trigger
             }
         },
         usage: ($usage + {healthy: $usage_healthy}),

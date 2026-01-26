@@ -75,9 +75,10 @@ Each 120-second iteration:
   7. AUTO-ensure Guide is running (respawn if idle > GUIDE_INTERVAL)
   8. AUTO-ensure Champion is running (respawn if idle > CHAMPION_INTERVAL)
   9. AUTO-ensure Doctor is running (respawn if idle > DOCTOR_INTERVAL)
-  10. Update daemon-state.json
-  11. Report status
-  12. Sleep and repeat
+  10. AUTO-ensure Auditor is running (respawn if idle > AUDITOR_INTERVAL)
+  11. Update daemon-state.json
+  12. Report status
+  13. Sleep and repeat
 ```
 
 **NO MANUAL INTERVENTION** means:
@@ -330,6 +331,7 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `+guide` - Respawned Guide (if respawned)
 - `+champion` - Respawned Champion (if respawned)
 - `+doctor` - Respawned Doctor (if respawned)
+- `+auditor` - Respawned Auditor (if respawned)
 - `stuck=N` - Stuck agents detected (if any)
 - `completed=#N` - Issue completed this iteration (if any)
 - `recovered=N` - Stale building issues recovered (if any)
@@ -676,6 +678,7 @@ All thresholds that drive automatic decisions:
 | `GUIDE_INTERVAL` | 900s | Respawn if: not running OR idle > interval |
 | `CHAMPION_INTERVAL` | 600s | Respawn if: not running OR idle > interval |
 | `DOCTOR_INTERVAL` | 300s | Respawn if: not running OR idle > interval |
+| `AUDITOR_INTERVAL` | 600s | Respawn if: not running OR idle > interval |
 
 ### Decision Matrix
 
@@ -709,6 +712,10 @@ CHAMPION:
 DOCTOR:
   IF not_running OR idle_time > DOCTOR_INTERVAL
   THEN spawn_doctor()  ← AUTOMATIC
+
+AUDITOR:
+  IF not_running OR idle_time > AUDITOR_INTERVAL
+  THEN spawn_auditor()  ← AUTOMATIC
 ```
 
 **Human only intervenes for**:
@@ -1325,6 +1332,34 @@ Complete one PR conflict resolution iteration.""",
             debug(f"Doctor spawn failed verification, not recording task_id")
     else:
         print(f"  Doctor: running (idle {doctor_idle}s)")
+
+    # Auditor - main branch validation (runs every 10 min)
+    auditor_running = is_support_role_running("auditor")
+    auditor_idle = get_support_role_idle_time("auditor")
+
+    debug(f"Auditor status: running={auditor_running}, idle={auditor_idle}s (interval={AUDITOR_INTERVAL}s)")
+
+    if not auditor_running or auditor_idle > AUDITOR_INTERVAL:
+        result = Task(
+            description="Auditor main branch validation",
+            prompt="""Execute the auditor role by invoking the Skill tool:
+
+Skill(skill="auditor")
+
+Complete one main branch validation iteration.""",
+            run_in_background=True
+        )
+        # Verify spawn before recording
+        if verify_task_spawn(result, "Auditor"):
+            record_support_role("auditor", result.task_id, result.output_file)
+            reason = "not running" if not auditor_running else f"idle {auditor_idle}s > {AUDITOR_INTERVAL}s"
+            print(f"  AUTO-SPAWNED: Auditor ({reason}, verified)")
+            debug(f"Auditor spawned: task_id={result.task_id}, output={result.output_file}")
+        else:
+            print(f"  SPAWN FAILED: Auditor - verification failed")
+            debug(f"Auditor spawn failed verification, not recording task_id")
+    else:
+        print(f"  Auditor: running (idle {auditor_idle}s)")
 ```
 
 ### Graceful Shutdown

@@ -16,6 +16,10 @@ Detailed configuration and state management for the Loom daemon (Layer 2).
 | `HERMIT_COOLDOWN` | 1800 | Seconds between Hermit role triggers (30 min) |
 | `MAX_ARCHITECT_PROPOSALS` | 2 | Maximum open `loom:architect` proposals before stopping triggers |
 | `MAX_HERMIT_PROPOSALS` | 2 | Maximum open `loom:hermit` proposals before stopping triggers |
+| `GUIDE_INTERVAL` | 900 | Seconds between Guide role re-triggers (15 min) |
+| `CHAMPION_INTERVAL` | 600 | Seconds between Champion role re-triggers (10 min) |
+| `DOCTOR_INTERVAL` | 300 | Seconds between Doctor role re-triggers (5 min) |
+| `AUDITOR_INTERVAL` | 600 | Seconds between Auditor role re-triggers (10 min) |
 
 ## Work Generation
 
@@ -252,3 +256,4 @@ Archived sessions include a `session_summary` field with final statistics:
 | terminal-guide | guide.md | Backlog triage (always running) |
 | terminal-champion | champion.md | Auto-merge (always running) |
 | terminal-doctor | doctor.md | PR conflict resolution (always running) |
+| terminal-auditor | auditor.md | Main branch validation (always running) |

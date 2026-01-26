@@ -104,7 +104,7 @@ Launch the Loom desktop application for automated orchestration:
 | Doctor | `doctor.md` | Fix bugs and address PR feedback | Manual |
 | Guide | `guide.md` | Prioritize and triage issues | Autonomous 15min |
 | Driver | `driver.md` | Direct command execution | Manual |
-| Auditor | `auditor.md` | Verify runtime behavior of built software | Autonomous 10min |
+| Auditor | `auditor.md` | Validate main branch build and runtime | Autonomous 10min |
 
 Full role definitions: `.loom/roles/*.md`
 
@@ -469,6 +469,7 @@ Archived sessions include a `session_summary` field with final statistics:
 | terminal-guide | guide.md | Backlog triage (always running) |
 | terminal-champion | champion.md | Auto-merge (always running) |
 | terminal-doctor | doctor.md | PR conflict resolution (always running) |
+| terminal-auditor | auditor.md | Main branch validation (always running) |
 
 ### Custom Roles
 
