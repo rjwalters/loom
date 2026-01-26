@@ -190,6 +190,22 @@ if [[ "$SHOW_HEALTH" == true ]]; then
     echo "Iterations: $total_iterations (${success_rate}% success)"
     echo "Avg duration: ${avg_duration}s"
     echo "Last iteration: $last_status (${last_duration}s)"
+
+    # Show health monitoring metrics if available
+    if [[ -f ".loom/health-metrics.json" ]]; then
+        health_score=$(jq -r '.health_score // "?"' .loom/health-metrics.json 2>/dev/null || echo "?")
+        health_monitor_status=$(jq -r '.health_status // "?"' .loom/health-metrics.json 2>/dev/null || echo "?")
+        echo "Health score: ${health_score}/100 (${health_monitor_status})"
+    fi
+
+    # Show unacknowledged alerts if any
+    if [[ -f ".loom/alerts.json" ]]; then
+        unack_count=$(jq -r '[.alerts[] | select(.acknowledged == false)] | length' .loom/alerts.json 2>/dev/null || echo "0")
+        if [[ "$unack_count" -gt 0 ]]; then
+            echo "Alerts: $unack_count unacknowledged"
+        fi
+    fi
+
     # Exit with appropriate code
     if [[ "$health_status" == "unhealthy" ]]; then
         exit 2
@@ -516,6 +532,11 @@ while true; do
 
     # Update metrics with iteration results
     update_metrics "$iteration_status" "$iteration_duration" "$summary"
+
+    # Collect health metrics (proactive monitoring)
+    if [[ -x "./.loom/scripts/health-check.sh" ]]; then
+        ./.loom/scripts/health-check.sh --collect >> "$LOG_FILE" 2>&1 || true
+    fi
 
     # Log the summary and track success/failure for backoff
     if [[ "$summary" == *"SHUTDOWN"* ]]; then

@@ -94,6 +94,10 @@ pub fn build_menu<R: tauri::Runtime>(
         .id("show_activity_playback")
         .accelerator("CmdOrCtrl+P")
         .build(handle)?;
+    let show_health_dashboard = MenuItemBuilder::new("Health Dashboard")
+        .id("show_health_dashboard")
+        .accelerator("CmdOrCtrl+H")
+        .build(handle)?;
     let show_metrics = MenuItemBuilder::new("Telemetry")
         .id("show_metrics")
         .accelerator("CmdOrCtrl+Shift+M")
@@ -112,6 +116,7 @@ pub fn build_menu<R: tauri::Runtime>(
         .item(&show_prompt_library)
         .item(&show_comparative_analysis)
         .item(&show_activity_playback)
+        .item(&show_health_dashboard)
         .item(&show_metrics)
         .separator()
         .fullscreen()
@@ -230,6 +235,11 @@ pub fn handle_menu_event<R: tauri::Runtime>(
         "show_agent_metrics" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("show-agent-metrics", ());
+            }
+        }
+        "show_health_dashboard" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.emit("show-health-dashboard", ());
             }
         }
         "show_metrics" => {
