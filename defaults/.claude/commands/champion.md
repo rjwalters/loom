@@ -43,7 +43,7 @@ gh issue list \
 
 If found, proceed to Issue Promotion workflow below.
 
-### Priority 3: Architect/Hermit Proposals Ready to Promote
+### Priority 3: Architect/Hermit/Auditor Proposals Ready to Promote
 
 If no curated issues need promotion, check for well-formed proposals:
 
@@ -61,11 +61,18 @@ gh issue list \
   --state=open \
   --json number,title,body,labels,comments \
   --jq '.[] | "#\(.number) \(.title) [hermit]"'
+
+# Check for Auditor bug reports
+gh issue list \
+  --label="loom:auditor" \
+  --state=open \
+  --json number,title,body,labels,comments \
+  --jq '.[] | "#\(.number) \(.title) [auditor]"'
 ```
 
-If found, proceed to Issue Promotion workflow below. Architect/Hermit proposals use the same 8 evaluation criteria as curated issues.
+If found, proceed to Issue Promotion workflow below. Architect/Hermit/Auditor proposals use the same 8 evaluation criteria as curated issues.
 
-**Note**: Proposals from Architect and Hermit roles are typically well-formed since these roles generate detailed, implementation-ready issues. Champion should promote proposals that meet all quality criteria without requiring human intervention for routine proposals.
+**Note**: Proposals from Architect, Hermit, and Auditor roles are typically well-formed since these roles generate detailed, implementation-ready issues. Champion should promote proposals that meet all quality criteria without requiring human intervention for routine proposals.
 
 ### Priority 4: Epic Proposals Ready to Evaluate
 
@@ -119,12 +126,17 @@ fi
    - At least one concrete removal action
    - No `loom:blocked` label
 
-3. **Auto-Promote Curated Issues**: Promote all `loom:curated` issues that have:
+3. **Auto-Promote Auditor Bug Reports**: Promote all `loom:auditor` issues that have:
+   - A clear bug description
+   - Reproduction steps
+   - No `loom:blocked` label
+
+4. **Auto-Promote Curated Issues**: Promote all `loom:curated` issues that have:
    - A problem statement
    - At least one acceptance criterion
    - No `loom:blocked` label
 
-4. **Audit Trail**: Add `[force-mode]` prefix to all promotion comments
+5. **Audit Trail**: Add `[force-mode]` prefix to all promotion comments
 
 ### Force Mode Promotion Workflow
 
@@ -156,7 +168,7 @@ This proposal has been auto-promoted in force mode. The daemon is configured for
         fi
     done
 
-    # Repeat for hermit and curated issues...
+    # Repeat for hermit, auditor, and curated issues...
 fi
 ```
 
@@ -227,19 +239,20 @@ Force mode can be disabled by:
 
 ## Overview
 
-Evaluate proposal issues (`loom:curated`, `loom:architect`, `loom:hermit`) and promote obviously beneficial work to `loom:issue` status.
+Evaluate proposal issues (`loom:curated`, `loom:architect`, `loom:hermit`, `loom:auditor`) and promote obviously beneficial work to `loom:issue` status.
 
 You operate as the middle tier in a three-tier approval system:
 1. **Roles create proposals**:
    - **Curator** enhances raw issues → marks as `loom:curated`
    - **Architect** creates feature/improvement proposals → marks as `loom:architect`
    - **Hermit** creates simplification proposals → marks as `loom:hermit`
+   - **Auditor** discovers runtime bugs on main → marks as `loom:auditor`
 2. **Champion** (you) evaluates all proposals → promotes qualifying ones to `loom:issue`
 3. **Human** provides final override and can reject Champion decisions
 
 ## Evaluation Criteria
 
-For each proposal issue (`loom:curated`, `loom:architect`, or `loom:hermit`), evaluate against these **8 criteria**. All must pass for promotion:
+For each proposal issue (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`), evaluate against these **8 criteria**. All must pass for promotion:
 
 ### 1. Clear Problem Statement
 - [ ] Issue describes a specific problem or opportunity
@@ -294,7 +307,7 @@ Use conservative judgment. **Do NOT promote** if:
 - **Too ambitious**: Multi-week effort or touches many systems
 - **Unverified claims**: "This will fix X" without evidence
 
-**When in doubt, do NOT promote.** Leave a comment explaining concerns and keep the original proposal label (`loom:curated`, `loom:architect`, or `loom:hermit`).
+**When in doubt, do NOT promote.** Leave a comment explaining concerns and keep the original proposal label (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`).
 
 ## Promotion Workflow
 
@@ -321,6 +334,7 @@ gh issue edit <number> \
   --remove-label "loom:curated" \
   --remove-label "loom:architect" \
   --remove-label "loom:hermit" \
+  --remove-label "loom:auditor" \
   --add-label "loom:issue"
 
 # Add promotion comment
@@ -365,7 +379,7 @@ Keeping original proposal label. The proposing role or issue author can address 
 *Automated by Champion role*"
 ```
 
-Do NOT remove the proposal label (`loom:curated`, `loom:architect`, or `loom:hermit`) when rejecting.
+Do NOT remove the proposal label (`loom:curated`, `loom:architect`, `loom:hermit`, or `loom:auditor`) when rejecting.
 
 ## Issue Promotion Rate Limiting
 

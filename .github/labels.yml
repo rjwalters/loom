@@ -56,6 +56,10 @@
   description: Hermit removal/simplification proposal awaiting user approval
   color: "9333EA"  # purple (violet-600)
 
+- name: loom:auditor
+  description: Bug discovered by Auditor during main branch validation
+  color: "d93f0b"  # red - indicates runtime/build issue
+
 - name: loom:curated
   description: Enhanced by Curator, awaiting human approval
   color: "10B981"  # emerald-500

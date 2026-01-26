@@ -131,8 +131,8 @@ Agents coordinate through GitHub labels. See `.github/labels.yml` for full defin
 
 **Proposal Lifecycle**:
 ```
-(created) → loom:architect/loom:hermit → (evaluated) → loom:issue
-           ↑ Architect/Hermit            ↑ Champion    ↑ Ready for Builder
+(created) → loom:architect/loom:hermit/loom:auditor → (evaluated) → loom:issue
+           ↑ Architect/Hermit/Auditor                 ↑ Champion    ↑ Ready for Builder
 ```
 
 **Epic Lifecycle**: `loom:epic` → Champion creates phased `loom:architect` + `loom:epic-phase` issues.
