@@ -158,7 +158,31 @@ Launch the Loom desktop application for automated orchestration with visual term
 
 Run the Loom daemon for fully autonomous system orchestration.
 
-**Setup**:
+**Two options for running the daemon:**
+
+| Option | Command | Best For |
+|--------|---------|----------|
+| **Shell Wrapper** (recommended) | `./.loom/scripts/daemon-loop.sh` | Production, long-running sessions |
+| **LLM-interpreted** | `/loom` | Development, debugging, testing |
+
+**Option A: Shell Wrapper (Recommended for Production)**
+
+```bash
+# Start daemon with shell wrapper
+./.loom/scripts/daemon-loop.sh
+
+# Start in force mode
+./.loom/scripts/daemon-loop.sh --force
+
+# Run in background
+nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
+
+# Custom poll interval (default: 120s)
+LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
+```
+
+**Option B: LLM-interpreted (For Development/Testing)**
+
 ```bash
 # Start the daemon (runs continuously)
 /loom
@@ -172,6 +196,8 @@ Run the Loom daemon for fully autonomous system orchestration.
 # 3. Spawn shepherds for ready issues
 # 4. Ensure Guide and Champion keep running
 ```
+
+**Note**: The `/loom` command relies on the LLM correctly implementing the two-tier architecture (parent loop spawning iteration subagents). While this generally works, the shell wrapper provides more deterministic behavior for production use.
 
 **Force Mode** (`--force`):
 
@@ -209,38 +235,17 @@ touch .loom/stop-daemon
 # 3. Clean up state and exit
 ```
 
-**Shell Script Wrapper** (Alternative to LLM-interpreted loop):
-
-For more deterministic daemon operation, use the shell script wrapper instead of the LLM-interpreted parent loop:
-
-```bash
-# Start daemon with shell wrapper (recommended for production)
-./.loom/scripts/daemon-loop.sh
-
-# Start in force mode
-./.loom/scripts/daemon-loop.sh --force
-
-# Run in background
-nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
-
-# Custom poll interval (default: 120s)
-LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
-
-# Stop daemon gracefully (same as regular daemon)
-touch .loom/stop-daemon
-```
-
 **Why use the shell wrapper?**
-- Deterministic loop behavior (no LLM interpretation variability)
-- Timeout protection prevents hung iterations (default: 5 minutes)
-- Can run in background, screen, or tmux
-- Consistent logging to `.loom/daemon.log`
-- Each iteration is a fresh Claude session (no context accumulation)
+- **Deterministic loop behavior**: No LLM interpretation variability
+- **Timeout protection**: Prevents hung iterations (default: 5 minutes)
+- **Background operation**: Can run in background, screen, or tmux
+- **Consistent logging**: Logs to `.loom/daemon.log`
+- **Context isolation**: Each iteration is a fresh Claude session (no context accumulation)
 
-**Trade-offs**:
+**Trade-offs of shell wrapper**:
 - Requires `claude` CLI in PATH
 - Slightly higher latency per iteration (CLI startup)
-- No conversation context between iterations (by design)
+- No conversation context between iterations (by design - this is a feature for long-running operation)
 
 ## Agent Roles
 
