@@ -420,7 +420,7 @@ GUIDE_IDLE_SECONDS=0
 GUIDE_NEEDS_TRIGGER="false"
 if [[ -n "$GUIDE_LAST_COMPLETED" && "$GUIDE_LAST_COMPLETED" != "null" ]]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-        GUIDE_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$GUIDE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+        GUIDE_EPOCH=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$GUIDE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     else
         GUIDE_EPOCH=$(date -d "$GUIDE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     fi
@@ -440,7 +440,7 @@ CHAMPION_IDLE_SECONDS=0
 CHAMPION_NEEDS_TRIGGER="false"
 if [[ -n "$CHAMPION_LAST_COMPLETED" && "$CHAMPION_LAST_COMPLETED" != "null" ]]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-        CHAMPION_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CHAMPION_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+        CHAMPION_EPOCH=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$CHAMPION_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     else
         CHAMPION_EPOCH=$(date -d "$CHAMPION_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     fi
@@ -458,7 +458,7 @@ DOCTOR_IDLE_SECONDS=0
 DOCTOR_NEEDS_TRIGGER="false"
 if [[ -n "$DOCTOR_LAST_COMPLETED" && "$DOCTOR_LAST_COMPLETED" != "null" ]]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-        DOCTOR_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$DOCTOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+        DOCTOR_EPOCH=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$DOCTOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     else
         DOCTOR_EPOCH=$(date -d "$DOCTOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     fi
@@ -476,7 +476,7 @@ AUDITOR_IDLE_SECONDS=0
 AUDITOR_NEEDS_TRIGGER="false"
 if [[ -n "$AUDITOR_LAST_COMPLETED" && "$AUDITOR_LAST_COMPLETED" != "null" ]]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-        AUDITOR_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$AUDITOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+        AUDITOR_EPOCH=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$AUDITOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     else
         AUDITOR_EPOCH=$(date -d "$AUDITOR_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     fi
@@ -494,7 +494,7 @@ JUDGE_IDLE_SECONDS=0
 JUDGE_NEEDS_TRIGGER="false"
 if [[ -n "$JUDGE_LAST_COMPLETED" && "$JUDGE_LAST_COMPLETED" != "null" ]]; then
     if [[ "$(uname)" == "Darwin" ]]; then
-        JUDGE_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$JUDGE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
+        JUDGE_EPOCH=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$JUDGE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     else
         JUDGE_EPOCH=$(date -d "$JUDGE_LAST_COMPLETED" "+%s" 2>/dev/null || echo "0")
     fi
@@ -662,7 +662,7 @@ read_shepherd_progress() {
                     if [[ -n "$last_heartbeat" && "$last_heartbeat" != "null" ]]; then
                         local hb_epoch
                         if [[ "$(uname)" == "Darwin" ]]; then
-                            hb_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+                            hb_epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
                         else
                             hb_epoch=$(date -d "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
                         fi
