@@ -381,6 +381,7 @@ mark_completed() {
 main() {
     local role=""
     local demand_mode=false
+    # shellcheck disable=SC2034  # Parsed from --check-only flag, reserved for future use
     local check_only=false
     local check_all=false
     local json_output=false
@@ -396,6 +397,7 @@ main() {
                 shift
                 ;;
             --check-only)
+                # shellcheck disable=SC2034  # Reserved for future use
                 check_only=true
                 shift
                 ;;

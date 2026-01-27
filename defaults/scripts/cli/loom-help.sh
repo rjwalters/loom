@@ -38,6 +38,7 @@ if [[ -n "$REPO_ROOT" ]]; then
 fi
 
 # ANSI colors
+# shellcheck disable=SC2034  # Color palette - not all colors used in every script
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'

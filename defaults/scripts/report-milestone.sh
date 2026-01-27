@@ -431,11 +431,10 @@ handle_event() {
     ensure_progress_dir
 
     local data="{}"
-    local result
 
     case "$EVENT" in
         started)
-            result=$(init_progress_file "$TASK_ID" "$ISSUE" "$MODE")
+            init_progress_file "$TASK_ID" "$ISSUE" "$MODE"
             if [[ "$QUIET" != "true" ]]; then
                 echo -e "${GREEN}Started tracking shepherd $TASK_ID for issue #$ISSUE${NC}"
             fi

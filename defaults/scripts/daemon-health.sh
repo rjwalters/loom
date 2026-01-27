@@ -23,6 +23,7 @@
 set -euo pipefail
 
 # Colors for output (disabled if stdout is not a terminal)
+# shellcheck disable=SC2034  # Color palette - not all colors used in every script
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -499,8 +500,6 @@ format_numbers() {
 # ============================
 # MAIN EXECUTION
 # ============================
-
-NOW_EPOCH=$(now_epoch)
 
 # ---- 1. Validate state file ----
 STATE_FILE_STATUS="ok"

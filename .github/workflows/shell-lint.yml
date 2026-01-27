@@ -1,0 +1,37 @@
+name: Shell Script Linting
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'defaults/scripts/**/*.sh'
+      - '.shellcheckrc'
+      - '.github/workflows/shell-lint.yml'
+  pull_request:
+    paths:
+      - 'defaults/scripts/**/*.sh'
+      - '.shellcheckrc'
+      - '.github/workflows/shell-lint.yml'
+
+jobs:
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck v0.10.0
+        run: |
+          SHELLCHECK_VERSION="v0.10.0"
+          wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJv
+          sudo cp "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/bin/shellcheck
+          sudo chmod +x /usr/bin/shellcheck
+          shellcheck --version
+
+      - name: Run shellcheck
+        run: |
+          echo "Linting all shell scripts in defaults/scripts/..."
+          find defaults/scripts -type f -name "*.sh" -print0 | \
+            xargs -0 shellcheck --severity=warning --format=gcc
+          echo "All shell scripts passed shellcheck."
