@@ -299,29 +299,33 @@ fi
 
 ## Auto-Spawn Shepherds
 
-> **WARNING: Shepherds MUST be invoked via Skill tool for full lifecycle**
+> **CRITICAL: Use slash commands directly in Task prompts**
 >
-> When the daemon spawns shepherds, you must use the Skill tool invocation pattern shown below.
+> When spawning roles via Task subagents, use the slash command directly as the prompt.
 >
-> **DO NOT** give shepherds explicit step-by-step instructions.
->
-> **DO** use the Skill tool pattern:
+> **CORRECT** - Slash command is the entire prompt:
 > ```python
 > Task(
->   prompt="""Skill(skill="shepherd", args="123 --force-pr")"""
+>     description="Shepherd issue #123",
+>     prompt="/shepherd 123 --force-pr",
+>     run_in_background=True
 > )
 > ```
 >
-> The Skill tool ensures the shepherd gets its full role prompt expanded so it can follow the complete workflow: Curator -> Builder -> Judge -> Doctor (if needed) -> Merge.
+> **WRONG** - Telling subagent to call Skill (expands role into subagent context):
+> ```python
+> Task(
+>     prompt="""Skill(skill="shepherd", args="123 --force-pr")"""  # DON'T DO THIS
+> )
+> ```
 >
-> **Note**: This Skill-in-Task pattern applies to **daemon→shepherd** invocations only.
-> Shepherds themselves use plain `Task` subagents with slash-command prompts for phase
-> delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
+> **Why**: Claude Code executes slash commands natively. Telling a subagent to "call Skill"
+> causes it to invoke Skill itself, expanding the role prompt into its own context window
+> instead of running the role. This wastes context and causes spawn failures.
 >
-> **Support roles** (guide, champion, doctor, auditor, judge) and **work generation roles**
-> (architect, hermit) use a **direct role file reference** pattern instead of Skill indirection.
-> This avoids the Task+Skill indirection failure in direct mode. See `trigger_support_role()`
-> and issue #1359 for details.
+> This pattern applies to ALL role spawning: shepherds, architect, hermit, guide, champion,
+> doctor, auditor, and judge. The Skill tool is only for the parent daemon invoking iteration
+> subagents (parent → iteration), not for iteration subagents invoking roles.
 
 ```python
 def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False):
@@ -452,21 +456,21 @@ def dispatch_shepherd_tmux(issue, shepherd_flag, idle_shepherds, state, debug_mo
 
 
 def dispatch_shepherd_direct(issue, shepherd_flag, debug_mode=False):
-    """Dispatch shepherd as a Task subagent (direct mode)."""
+    """Dispatch shepherd as a Task subagent (direct mode).
+
+    Uses slash command directly as prompt - Claude Code executes /shepherd natively.
+    This avoids the Skill-in-Task anti-pattern that expands role prompts into subagent context.
+    """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
+    # Use slash command directly - Claude Code executes this natively
+    # DO NOT use Skill() in the prompt - it expands the role into the subagent's context
     result = Task(
         description=f"Shepherd issue #{issue}",
-        prompt=f"""You must invoke the Skill tool to execute the shepherd workflow.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
-
-Skill(skill="shepherd", args="{issue} {shepherd_flag}")
-
-Follow all shepherd workflow steps until the issue is complete or blocked.""",
+        prompt=f"/shepherd {issue} {shepherd_flag}",
         run_in_background=True
     )
 
@@ -652,8 +656,7 @@ This {proposal_type} proposal has been automatically promoted to `loom:issue` by
 def trigger_architect_role(state, debug_mode=False):
     """Trigger Architect role to generate new proposals. Returns True if triggered.
 
-    Uses direct role file reference instead of Skill indirection to avoid
-    the Task+Skill pattern failure in direct mode. See issue #1359.
+    Uses slash command directly - Claude Code executes /architect natively.
     """
 
     def debug(msg):
@@ -662,15 +665,10 @@ def trigger_architect_role(state, debug_mode=False):
 
     debug("Triggering Architect for work generation")
 
+    # Use slash command directly - Claude Code executes this natively
     result = Task(
         description="Architect work generation",
-        prompt="""Execute the architect role for one work generation iteration.
-
-Read the role instructions from .claude/commands/architect.md and follow them exactly.
-Complete one work generation iteration. Create a proposal issue with the loom:architect label.
-
-IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
-Read the role file directly and execute the instructions.""",
+        prompt="/architect --autonomous",
         run_in_background=True
     )
 
@@ -698,8 +696,7 @@ Read the role file directly and execute the instructions.""",
 def trigger_hermit_role(state, debug_mode=False):
     """Trigger Hermit role to generate simplification proposals. Returns True if triggered.
 
-    Uses direct role file reference instead of Skill indirection to avoid
-    the Task+Skill pattern failure in direct mode. See issue #1359.
+    Uses slash command directly - Claude Code executes /hermit natively.
     """
 
     def debug(msg):
@@ -708,15 +705,10 @@ def trigger_hermit_role(state, debug_mode=False):
 
     debug("Triggering Hermit for simplification proposals")
 
+    # Use slash command directly - Claude Code executes this natively
     result = Task(
         description="Hermit simplification proposals",
-        prompt="""Execute the hermit role for one simplification analysis iteration.
-
-Read the role instructions from .claude/commands/hermit.md and follow them exactly.
-Complete one simplification analysis iteration. Create a proposal issue with the loom:hermit label.
-
-IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
-Read the role file directly and execute the instructions.""",
+        prompt="/hermit",
         run_in_background=True
     )
 
@@ -831,60 +823,30 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
 
 
 def trigger_support_role(state, role_name, description, debug_mode=False):
-    """Spawn a support role using Task tool with direct role file reference.
+    """Spawn a support role using Task tool with direct slash command.
 
-    Support roles are spawned by reading their role file directly, NOT via
-    the Skill tool. This avoids the Task+Skill indirection problem where
-    the subagent interprets 'invoke the Skill tool' as a direct instruction,
-    expanding the role prompt into its own context instead of spawning a
-    background Task. See issue #1359 for details.
-
-    The subagent reads the role file and executes the instructions directly,
-    which is simpler and more reliable than the Skill indirection pattern.
+    Uses slash command directly - Claude Code executes /role natively.
+    This avoids the Skill-in-Task anti-pattern that expands role prompts into subagent context.
     """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    # Map role names to their command files and task descriptions
-    role_configs = {
-        "guide": {
-            "file": ".claude/commands/guide.md",
-            "task": "Complete one triage iteration."
-        },
-        "champion": {
-            "file": ".claude/commands/champion.md",
-            "task": "Complete one PR evaluation and merge iteration."
-        },
-        "doctor": {
-            "file": ".claude/commands/doctor.md",
-            "task": "Complete one PR conflict resolution iteration."
-        },
-        "auditor": {
-            "file": ".claude/commands/auditor.md",
-            "task": "Complete one main branch validation iteration."
-        },
-        "judge": {
-            "file": ".claude/commands/judge.md",
-            "task": "Complete one PR review iteration."
-        }
+    # Use slash commands directly - Claude Code executes these natively
+    # DO NOT use Skill() in prompts - it expands the role into the subagent's context
+    role_prompts = {
+        "guide": "/guide",
+        "champion": "/champion",
+        "doctor": "/doctor",
+        "auditor": "/auditor",
+        "judge": "/judge"
     }
 
-    config = role_configs.get(role_name)
-    if not config:
+    prompt = role_prompts.get(role_name)
+    if not prompt:
         debug(f"Unknown role: {role_name}")
         return False
-
-    role_file = config["file"]
-    task_desc = config["task"]
-
-    prompt = f"""Execute the {role_name} role for one iteration.
-
-Read the role instructions from {role_file} and follow them exactly. {task_desc}
-
-IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
-Read the role file directly and execute the instructions."""
 
     result = Task(
         description=description,

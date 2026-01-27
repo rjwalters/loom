@@ -103,54 +103,47 @@ else
 fi
 ```
 
-### Parallelism via Subagents
+### Subagent Delegation Pattern
 
-Use the **Task tool with `run_in_background: true`** to spawn parallel shepherd subagents:
+The parent loop uses the **Skill tool** to spawn iteration subagents:
 
+```python
+# Parent spawns iteration subagent (uses Skill so iteration gets its role prompt)
+Skill(skill="loom-iteration", args="--force --debug")
 ```
+
+**Why Skill for parent→iteration**: The parent wants the iteration subagent to receive
+its full role prompt (`loom-iteration.md`) so it can execute the complete iteration logic.
+
+**Iteration→role spawning** (shepherds, support roles) happens in `loom-iteration.md` and
+uses **direct slash commands**, NOT Skill:
+
+```python
+# Iteration spawns shepherd (uses slash command - Claude Code executes natively)
 Task(
-  subagent_type: "general-purpose",
-  prompt: """You must invoke the Skill tool to execute the shepherd workflow.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
-
-Skill(skill="shepherd", args="123 --force-merge")
-
-Follow all shepherd workflow steps until the issue is complete or blocked.""",
-  run_in_background: true
-) -> Returns task_id and output_file
+    description="Shepherd issue #123",
+    prompt="/shepherd 123 --force-pr",
+    run_in_background=True
+)
 ```
+
+**Why slash commands for iteration→roles**: Claude Code executes slash commands natively.
+Using `Skill()` in a Task prompt causes the subagent to expand the role prompt into its
+own context, wasting tokens and failing to actually run the role. See `loom-iteration.md`
+for the complete role spawning implementation.
 
 **Shepherd Force Mode Flags**:
 - `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
 - `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
 
-**CRITICAL - Correct Tool Invocation**: Daemon-spawned subagents use different dispatch patterns depending on the role type.
+**Tool Invocation Summary**:
 
-> **Shepherds** use the Skill-in-Task pattern because they need the full shepherd lifecycle prompt
-> expanded via the Skill tool. Shepherds themselves use plain `Task` subagents with slash-command
-> prompts for phase delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
->
-> **Support roles and work generation roles** (guide, champion, doctor, auditor, judge, architect,
-> hermit) use **direct role file references** instead of Skill indirection. This avoids the
-> Task+Skill indirection failure where the subagent interprets "invoke the Skill tool" as a
-> direct instruction to itself, expanding the role prompt into its own context instead of spawning
-> a background Task. See issue #1359 for details.
-
-```
-SHEPHERD DISPATCH - Use the Skill tool (daemon spawning shepherds):
-   Skill(skill="shepherd", args="123 --force-merge")
-
-SUPPORT ROLE DISPATCH - Use direct role file reference (daemon spawning support roles):
-   Task(prompt="Read .claude/commands/guide.md and follow the instructions...")
-   Task(prompt="Read .claude/commands/champion.md and follow the instructions...")
-
-WRONG - These will fail with CLI errors:
-   claude --skill=guide
-   claude --role guide
-   /guide
-   bash("claude --skill=guide")
-```
+| Delegation | Pattern | Reason |
+|------------|---------|--------|
+| parent → iteration | `Skill(skill="loom-iteration")` | Need iteration's full role prompt |
+| iteration → shepherd | `Task(prompt="/shepherd N")` | Slash command executes natively |
+| iteration → support role | `Task(prompt="/guide")` | Slash command executes natively |
+| shepherd → builder | `Task(prompt="/builder N")` | Slash command executes natively |
 
 ### Task Spawn Verification
 
@@ -328,7 +321,7 @@ def start_daemon(force_mode=False, debug_mode=False):
             return
 
     # 5. Run startup cleanup
-    run("./.loom/scripts/daemon-cleanup.sh daemon-startup")
+    run("./scripts/daemon-cleanup.sh daemon-startup")
 
     # 6. Save initial state
     save_daemon_state(state)
@@ -462,7 +455,7 @@ def graceful_shutdown():
     # Cleanup signals and state
     rm(".loom/stop-shepherds")
     rm(".loom/stop-daemon")
-    run("./.loom/scripts/daemon-cleanup.sh daemon-shutdown")
+    run("./scripts/daemon-cleanup.sh daemon-shutdown")
     state["running"] = False
     state["stopped_at"] = now()
     save_daemon_state()
