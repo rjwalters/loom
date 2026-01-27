@@ -300,6 +300,24 @@ check_daemon_state_tasks() {
             continue
         fi
 
+        # Check task ID format: must be exactly 7 lowercase hex characters
+        if [[ ! "$task_id" =~ ^[a-f0-9]{7}$ ]]; then
+            log_warn "  ORPHANED: $shepherd_id has invalid task_id format '$task_id' (expected 7 hex chars)"
+
+            add_orphaned "invalid_task_id" "$(jq -n \
+                --arg shepherd_id "$shepherd_id" \
+                --arg task_id "$task_id" \
+                --argjson issue "$issue" \
+                --arg reason "invalid_task_id_format" \
+                '{shepherd_id: $shepherd_id, task_id: $task_id, issue: $issue, reason: $reason}')"
+
+            # Recover if requested
+            if [[ "$RECOVER" == "true" ]]; then
+                recover_shepherd "$shepherd_id" "$issue" "$task_id" "invalid_task_id_format"
+            fi
+            continue
+        fi
+
         # Check if task exists
         if ! check_task_exists "$task_id" "$output_file"; then
             log_warn "  ORPHANED: $shepherd_id has stale task_id $task_id"
