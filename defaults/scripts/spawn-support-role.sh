@@ -2,8 +2,8 @@
 # spawn-support-role.sh - Deterministic support role spawn logic
 #
 # This script encapsulates the decision logic for spawning support roles
-# (Guide, Champion, Doctor, Auditor, Judge) in the daemon. It replaces
-# LLM-interpreted pseudocode with deterministic bash logic.
+# (Guide, Champion, Doctor, Auditor, Judge, Architect, Hermit) in the daemon.
+# It replaces LLM-interpreted pseudocode with deterministic bash logic.
 #
 # The script does NOT spawn roles itself - it evaluates whether a role
 # should be spawned and updates daemon-state.json accordingly. The actual
@@ -18,7 +18,7 @@
 #   spawn-support-role.sh --help
 #
 # Options:
-#   <role>            Role name: guide, champion, doctor, auditor, judge
+#   <role>            Role name: guide, champion, doctor, auditor, judge, architect, hermit
 #   --demand          Demand-based spawn (skip interval check)
 #   --check-only      Only check if spawn is needed, don't modify state
 #   --check-all       Check all support roles and output combined result
@@ -38,6 +38,8 @@
 #   LOOM_DOCTOR_INTERVAL     Doctor re-trigger interval in seconds (default: 300)
 #   LOOM_AUDITOR_INTERVAL    Auditor re-trigger interval in seconds (default: 600)
 #   LOOM_JUDGE_INTERVAL      Judge re-trigger interval in seconds (default: 300)
+#   LOOM_ARCHITECT_COOLDOWN  Architect re-trigger interval in seconds (default: 1800)
+#   LOOM_HERMIT_COOLDOWN     Hermit re-trigger interval in seconds (default: 1800)
 #
 # Examples:
 #   # Check if Guide should be spawned (interval-based)
@@ -80,9 +82,11 @@ CHAMPION_INTERVAL="${LOOM_CHAMPION_INTERVAL:-600}"  # 10 minutes
 DOCTOR_INTERVAL="${LOOM_DOCTOR_INTERVAL:-300}"      # 5 minutes
 AUDITOR_INTERVAL="${LOOM_AUDITOR_INTERVAL:-600}"    # 10 minutes
 JUDGE_INTERVAL="${LOOM_JUDGE_INTERVAL:-300}"        # 5 minutes
+ARCHITECT_INTERVAL="${LOOM_ARCHITECT_COOLDOWN:-1800}"  # 30 minutes
+HERMIT_INTERVAL="${LOOM_HERMIT_COOLDOWN:-1800}"        # 30 minutes
 
 # Valid roles
-VALID_ROLES=("guide" "champion" "doctor" "auditor" "judge")
+VALID_ROLES=("guide" "champion" "doctor" "auditor" "judge" "architect" "hermit")
 
 show_help() {
     cat <<'EOF'
@@ -101,6 +105,8 @@ ROLES:
     doctor      PR conflict resolution (interval: 5 min)
     auditor     Main branch validation (interval: 10 min)
     judge       PR review (interval: 5 min)
+    architect   Work generation / architectural proposals (cooldown: 30 min)
+    hermit      Simplification proposals (cooldown: 30 min)
 
 OPTIONS:
     --demand        Demand-based spawn (skip interval check)
@@ -122,6 +128,8 @@ ENVIRONMENT VARIABLES:
     LOOM_DOCTOR_INTERVAL     (default: 300)
     LOOM_AUDITOR_INTERVAL    (default: 600)
     LOOM_JUDGE_INTERVAL      (default: 300)
+    LOOM_ARCHITECT_COOLDOWN  (default: 1800)
+    LOOM_HERMIT_COOLDOWN     (default: 1800)
 EOF
 }
 
@@ -129,12 +137,14 @@ EOF
 get_interval() {
     local role="$1"
     case "$role" in
-        guide)    echo "$GUIDE_INTERVAL" ;;
-        champion) echo "$CHAMPION_INTERVAL" ;;
-        doctor)   echo "$DOCTOR_INTERVAL" ;;
-        auditor)  echo "$AUDITOR_INTERVAL" ;;
-        judge)    echo "$JUDGE_INTERVAL" ;;
-        *)        echo "0" ;;
+        guide)     echo "$GUIDE_INTERVAL" ;;
+        champion)  echo "$CHAMPION_INTERVAL" ;;
+        doctor)    echo "$DOCTOR_INTERVAL" ;;
+        auditor)   echo "$AUDITOR_INTERVAL" ;;
+        judge)     echo "$JUDGE_INTERVAL" ;;
+        architect) echo "$ARCHITECT_INTERVAL" ;;
+        hermit)    echo "$HERMIT_INTERVAL" ;;
+        *)         echo "0" ;;
     esac
 }
 
