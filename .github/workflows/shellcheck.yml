@@ -1,0 +1,39 @@
+name: Shell Script Linting
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.loom/scripts/**/*.sh'
+      - '.shellcheckrc'
+      - '.github/workflows/shellcheck.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.loom/scripts/**/*.sh'
+      - '.shellcheckrc'
+      - '.github/workflows/shellcheck.yml'
+
+jobs:
+  shellcheck:
+    name: Shellcheck Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck
+        run: |
+          echo "Running shellcheck on all shell scripts in .loom/scripts/"
+          find .loom/scripts -type f -name "*.sh" -print0 | \
+            xargs -0 shellcheck --severity=warning --shell=bash
+
+      - name: Verify all scripts passed
+        run: |
+          echo "✅ All shell scripts passed shellcheck validation"

@@ -1,0 +1,18 @@
+# Shellcheck configuration for Loom repository
+#
+# Target bash 3.2 for macOS compatibility
+# See: https://github.com/koalaman/shellcheck/wiki/SC1090
+
+# Specify shell dialect
+shell=bash
+
+# Disable specific rules that don't apply to our use case
+
+# SC1090: Can't follow non-constant source
+# We use dynamic sourcing patterns (e.g., source "${SCRIPT_DIR}/common.sh")
+# which shellcheck can't statically analyze
+disable=SC1090
+
+# SC1091: Not following: file not found
+# Similar to SC1090 - we source files that may not exist at check time
+disable=SC1091
