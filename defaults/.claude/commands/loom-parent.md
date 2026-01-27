@@ -514,9 +514,19 @@ The daemon maintains state in `.loom/daemon-state.json`:
   "shepherds": { ... },
   "support_roles": { ... },
   "pipeline_state": { ... },
-  "warnings": [ ... ]
+  "warnings": [ ... ],
+  "spawn_retry_queue": {
+    "123": {
+      "failures": 2,
+      "last_attempt": "2026-01-23T11:25:00Z",
+      "last_error": "verification_failed"
+    }
+  }
 }
 ```
+
+**spawn_retry_queue**: Tracks spawn failures per issue to prevent infinite retry loops.
+After `MAX_SPAWN_FAILURES` (3) consecutive failures, the issue is marked as `loom:blocked`.
 
 For detailed state file format, see `loom-reference.md`.
 

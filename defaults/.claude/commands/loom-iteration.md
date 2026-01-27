@@ -188,11 +188,17 @@ def loom_iterate(force_mode=False, debug_mode=False):
     # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
 
-    # 10. Stale building detection (every 10 iterations)
+    # 10. Orphan recovery (every 5 iterations) - catches crashed shepherds mid-session
     recovered_count = 0
+    if state.get("iteration", 0) % 5 == 0:
+        debug("Running orphan recovery check (every 5 iterations)")
+        recovered_count = check_orphaned_shepherds(state, debug_mode)
+
+    # 10b. Stale building detection (every 10 iterations) - catches issues without PRs
     if state.get("iteration", 0) % 10 == 0:
         debug("Running stale building check (every 10 iterations)")
-        recovered_count = check_stale_building(state, debug_mode)
+        stale_recovered = check_stale_building(state, debug_mode)
+        recovered_count += stale_recovered
 
     # 11. Save state to JSON
     state["iteration"] = state.get("iteration", 0) + 1
@@ -328,8 +334,15 @@ fi
 > subagents (parent → iteration), not for iteration subagents invoking roles.
 
 ```python
+# Maximum spawn failures before marking an issue as blocked
+MAX_SPAWN_FAILURES = 3
+
 def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False):
-    """Automatically spawn shepherds using the appropriate execution backend."""
+    """Automatically spawn shepherds using the appropriate execution backend.
+
+    Tracks spawn failures per issue. After MAX_SPAWN_FAILURES consecutive failures,
+    the issue is marked as loom:blocked to prevent infinite retry loops.
+    """
 
     def debug(msg):
         if debug_mode:
@@ -341,6 +354,10 @@ def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False)
     ready_issues = snapshot_data["pipeline"]["ready_issues"]
     active_count = count_active_shepherds(state)
     max_shepherds = snapshot_data["config"]["max_shepherds"]
+
+    # Initialize retry queue in state if not present
+    if "spawn_retry_queue" not in state:
+        state["spawn_retry_queue"] = {}
 
     # Determine shepherd mode based on daemon's force_mode
     force_mode = state.get("force_mode", False)
@@ -368,8 +385,17 @@ def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False)
 
     while active_count < max_shepherds and len(ready_issues) > 0:
         issue = ready_issues.pop(0)["number"]
+        issue_key = str(issue)
 
-        debug(f"Issue selection: Claiming #{issue}")
+        # Check retry queue for this issue
+        retry_info = state["spawn_retry_queue"].get(issue_key, {"failures": 0, "last_attempt": None})
+
+        # Skip issues that have exceeded max failures (they should already be blocked)
+        if retry_info["failures"] >= MAX_SPAWN_FAILURES:
+            debug(f"Issue #{issue} exceeded max spawn failures ({MAX_SPAWN_FAILURES}), should be blocked")
+            continue
+
+        debug(f"Issue selection: Claiming #{issue} (prior failures={retry_info['failures']})")
 
         # Claim immediately (atomic operation)
         run(f"gh issue edit {issue} --remove-label 'loom:issue' --add-label 'loom:building'")
@@ -384,10 +410,35 @@ def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False)
 
         # Verify spawn succeeded
         if not result.get("success"):
-            debug(f"Spawn failed for #{issue}: {result.get('error', 'unknown')}, reverting labels")
-            run(f"gh issue edit {issue} --remove-label 'loom:building' --add-label 'loom:issue'")
+            error_msg = result.get('error', 'unknown')
+            debug(f"Spawn failed for #{issue}: {error_msg}")
+
+            # Track failure in retry queue
+            retry_info["failures"] += 1
+            retry_info["last_attempt"] = now()
+            retry_info["last_error"] = error_msg
+            state["spawn_retry_queue"][issue_key] = retry_info
+
+            if retry_info["failures"] >= MAX_SPAWN_FAILURES:
+                # Mark as blocked after max failures
+                debug(f"Issue #{issue} reached max spawn failures ({MAX_SPAWN_FAILURES}), marking as blocked")
+                run(f"gh issue edit {issue} --remove-label 'loom:building' --add-label 'loom:blocked'")
+                comment = f"**[daemon] Spawn Failed**\\n\\nThis issue has been marked as blocked after {MAX_SPAWN_FAILURES} consecutive spawn failures.\\n\\nLast error: `{error_msg}`\\n\\nA human or the Doctor role may need to investigate and unblock this issue."
+                run(f"gh issue comment {issue} --body '{comment}'")
+                print(f"  BLOCKED: #{issue} (spawn failed {MAX_SPAWN_FAILURES}x)")
+            else:
+                # Revert to loom:issue for retry
+                debug(f"Reverting #{issue} to loom:issue for retry (failures={retry_info['failures']})")
+                run(f"gh issue edit {issue} --remove-label 'loom:building' --add-label 'loom:issue'")
+
             spawn_failures += 1
+            save_daemon_state(state)
             continue
+
+        # Spawn succeeded - clear retry queue for this issue
+        if issue_key in state["spawn_retry_queue"]:
+            del state["spawn_retry_queue"][issue_key]
+            save_daemon_state(state)
 
         debug(f"Spawning decision: shepherd assigned to #{issue} (verified)")
 
@@ -997,6 +1048,46 @@ def check_stale_building(state, debug_mode=False):
             print(f"  RECOVERED: #{issue['number']} (stale {issue['age_hours']}h, no PR)")
 
         return len(recovered)
+
+    return 0
+```
+
+### Orphan Recovery (In-Session)
+
+```python
+def check_orphaned_shepherds(state, debug_mode=False):
+    """Detect and recover orphaned shepherds from crashes mid-session.
+
+    This runs every 5 iterations (not just at startup) to catch:
+    - Shepherds with stale task IDs (tasks that no longer exist)
+    - loom:building issues without active shepherds
+    - Progress files with stale heartbeats
+    """
+
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    debug("Running in-session orphan recovery check")
+
+    result = run("./.loom/scripts/recover-orphaned-shepherds.sh --recover --json")
+
+    if result.exit_code == 0:
+        try:
+            data = json.loads(result.stdout)
+            recovered_issues = data.get("recovered_issues", [])
+            recovered_shepherds = data.get("recovered_shepherds", [])
+
+            for issue in recovered_issues:
+                print(f"  RECOVERED: #{issue} (orphaned - no active shepherd)")
+
+            for shepherd_id in recovered_shepherds:
+                debug(f"Reset orphaned shepherd: {shepherd_id}")
+
+            return len(recovered_issues)
+        except Exception as e:
+            debug(f"Failed to parse orphan recovery result: {e}")
+            return 0
 
     return 0
 ```
