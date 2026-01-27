@@ -148,10 +148,39 @@ WRONG - These will fail with CLI errors:
 After spawning a Task subagent, you MUST verify the task actually started before recording its task_id in daemon-state.json.
 
 ```python
+def validate_task_id(task_id):
+    """Validate that a task_id matches the expected format from the Task tool.
+
+    Real Task tool task IDs are 7-character lowercase hexadecimal strings (e.g., 'a7dc1e0', 'abeb2e8').
+    Fabricated task IDs typically look like 'auditor-1769471216' or 'champion-12345'.
+
+    Returns True if valid, False if fabricated or malformed.
+    """
+    if not task_id or not isinstance(task_id, str):
+        return False
+
+    # Real task IDs are 7-char hex strings
+    import re
+    return bool(re.match(r'^[a-f0-9]{7}$', task_id))
+
+
 def verify_task_spawn(result, description="task"):
-    """Verify a Task spawn succeeded by checking TaskOutput immediately."""
+    """Verify a Task spawn succeeded by checking TaskOutput immediately.
+
+    Validates both that the task started AND that the task_id is a real
+    Task tool ID (not a fabricated string like 'auditor-1769471216').
+    """
     if not result or not result.task_id:
         print(f"  SPAWN FAILED: {description} - no task_id returned")
+        return False
+
+    # Validate task_id format BEFORE attempting TaskOutput check
+    # This catches fabricated IDs like "auditor-1769471216" that the LLM
+    # may generate instead of actually invoking the Task tool
+    if not validate_task_id(result.task_id):
+        print(f"  SPAWN FAILED: {description} - invalid task_id format: '{result.task_id}'")
+        print(f"    Expected 7-char hex UUID (e.g., 'a7dc1e0'), got fabricated string")
+        print(f"    This usually means the Task tool was not actually invoked")
         return False
 
     try:
