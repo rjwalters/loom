@@ -278,18 +278,17 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
 
   # Check if Loom is installed (has .loom directory)
   if [[ -d "$TARGET_PATH/.loom" ]]; then
-    info "Running uninstall-loom.sh to clean existing installation..."
+    info "Running local uninstall to clean existing installation..."
 
     # Build uninstall flags from current flags
-    UNINSTALL_FLAGS=""
+    # Always use --local so removal happens in working directory (not a worktree)
+    # This way the install worktree captures both removals and additions in one PR
+    UNINSTALL_FLAGS="--local"
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
-      UNINSTALL_FLAGS="--yes"
-    fi
-    if [[ "$FORCE_OVERWRITE" == "true" ]]; then
-      UNINSTALL_FLAGS="$UNINSTALL_FLAGS --force"
+      UNINSTALL_FLAGS="$UNINSTALL_FLAGS --yes"
     fi
 
-    # Run uninstall script
+    # Run uninstall script in local mode
     "$LOOM_ROOT/scripts/uninstall-loom.sh" $UNINSTALL_FLAGS "$TARGET_PATH" || \
       error "Clean install failed - uninstall step encountered an error"
 

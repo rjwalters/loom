@@ -14,6 +14,9 @@
 #   Force auto-merge (create PR and auto-merge):
 #     ./scripts/uninstall-loom.sh --force /path/to/target-repo
 #
+#   Local mode (remove files in working directory, no worktree/PR):
+#     ./scripts/uninstall-loom.sh --yes --local /path/to/target-repo
+#
 #   What this script does:
 #     1. Validates target repository (must be a Git repo with Loom installed)
 #     2. Creates uninstall worktree (.loom/worktrees/loom-uninstall)
@@ -31,6 +34,7 @@ set -euo pipefail
 # Parse command line arguments
 NON_INTERACTIVE=false
 FORCE_AUTO_MERGE=false
+LOCAL_MODE=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -43,12 +47,17 @@ while [[ $# -gt 0 ]]; do
       FORCE_AUTO_MERGE=true
       shift
       ;;
+    -l|--local)
+      LOCAL_MODE=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
       echo "Options:"
       echo "  -y, --yes    Non-interactive mode (preserve unknown files)"
       echo "  -f, --force  Auto-merge the uninstall PR after creation"
+      echo "  -l, --local  Remove files in working directory (no worktree, no PR)"
       echo "  -h, --help   Show this help message"
       exit 0
       ;;
@@ -124,6 +133,7 @@ fi
 # Export for sub-scripts
 export NON_INTERACTIVE
 export FORCE_AUTO_MERGE
+export LOCAL_MODE
 
 # Resolve target to absolute path
 TARGET_PATH="$(cd "$TARGET_PATH" 2>/dev/null && pwd)" || \
@@ -178,17 +188,19 @@ if is_loom_source_repo "$TARGET_PATH"; then
 fi
 success "Not the Loom source repository"
 
-# Check if gh CLI is available
-if ! command -v gh &> /dev/null; then
-  error "GitHub CLI (gh) is not installed. Install from: https://cli.github.com/"
-fi
-success "GitHub CLI (gh) available"
+# Check if gh CLI is available (not needed for local mode)
+if [[ "$LOCAL_MODE" != "true" ]]; then
+  if ! command -v gh &> /dev/null; then
+    error "GitHub CLI (gh) is not installed. Install from: https://cli.github.com/"
+  fi
+  success "GitHub CLI (gh) available"
 
-# Check if gh is authenticated
-if ! gh auth status &> /dev/null; then
-  error "GitHub CLI is not authenticated. Run: gh auth login"
+  # Check if gh is authenticated
+  if ! gh auth status &> /dev/null; then
+    error "GitHub CLI is not authenticated. Run: gh auth login"
+  fi
+  success "GitHub CLI authenticated"
 fi
-success "GitHub CLI authenticated"
 
 echo ""
 
@@ -477,95 +489,101 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 4: Create Uninstall Worktree
+# STEP 4: Create Uninstall Worktree (skipped in local mode)
 # ============================================================================
-CURRENT_STEP="Create Worktree"
-header "Step 4: Creating Uninstall Worktree"
-echo ""
+if [[ "$LOCAL_MODE" != "true" ]]; then
+  CURRENT_STEP="Create Worktree"
+  header "Step 4: Creating Uninstall Worktree"
+  echo ""
 
-# Reuse the create-worktree.sh script, but override the branch name
-# We need to temporarily override the default branch name
-cd "$TARGET_PATH"
+  # Reuse the create-worktree.sh script, but override the branch name
+  # We need to temporarily override the default branch name
+  cd "$TARGET_PATH"
 
-# Ensure .loom/worktrees directory exists
-mkdir -p .loom/worktrees
+  # Ensure .loom/worktrees directory exists
+  mkdir -p .loom/worktrees
 
-WORKTREE_PATH=".loom/worktrees/loom-uninstall"
-BASE_BRANCH_NAME="loom/uninstall"
+  WORKTREE_PATH=".loom/worktrees/loom-uninstall"
+  BASE_BRANCH_NAME="loom/uninstall"
 
-# Detect the default branch
-DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "")
+  # Detect the default branch
+  DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "")
 
-if [[ -n "$DEFAULT_BRANCH" ]]; then
-  git fetch origin --prune 2>/dev/null || true
-  if ! git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
-    DEFAULT_BRANCH=""
+  if [[ -n "$DEFAULT_BRANCH" ]]; then
+    git fetch origin --prune 2>/dev/null || true
+    if ! git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+      DEFAULT_BRANCH=""
+    fi
   fi
-fi
 
-if [[ -z "$DEFAULT_BRANCH" ]]; then
-  if git show-ref --verify --quiet refs/remotes/origin/main; then
-    DEFAULT_BRANCH="main"
-  elif git show-ref --verify --quiet refs/remotes/origin/master; then
-    DEFAULT_BRANCH="master"
+  if [[ -z "$DEFAULT_BRANCH" ]]; then
+    if git show-ref --verify --quiet refs/remotes/origin/main; then
+      DEFAULT_BRANCH="main"
+    elif git show-ref --verify --quiet refs/remotes/origin/master; then
+      DEFAULT_BRANCH="master"
+    fi
   fi
-fi
 
-if [[ -z "$DEFAULT_BRANCH" ]]; then
-  if git show-ref --verify --quiet refs/heads/main; then
-    DEFAULT_BRANCH="main"
-  elif git show-ref --verify --quiet refs/heads/master; then
-    DEFAULT_BRANCH="master"
+  if [[ -z "$DEFAULT_BRANCH" ]]; then
+    if git show-ref --verify --quiet refs/heads/main; then
+      DEFAULT_BRANCH="main"
+    elif git show-ref --verify --quiet refs/heads/master; then
+      DEFAULT_BRANCH="master"
+    else
+      DEFAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    fi
+  fi
+
+  # Fetch latest
+  info "Fetching latest changes from origin/${DEFAULT_BRANCH}..."
+  git fetch origin "${DEFAULT_BRANCH}" 2>/dev/null || true
+
+  # Determine base branch ref
+  if git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+    BASE_BRANCH="origin/${DEFAULT_BRANCH}"
+  elif git show-ref --verify --quiet "refs/heads/${DEFAULT_BRANCH}"; then
+    BASE_BRANCH="${DEFAULT_BRANCH}"
   else
-    DEFAULT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    BASE_BRANCH="HEAD"
   fi
-fi
 
-# Fetch latest
-info "Fetching latest changes from origin/${DEFAULT_BRANCH}..."
-git fetch origin "${DEFAULT_BRANCH}" 2>/dev/null || true
+  # Clean up any existing worktree
+  if [[ -d "$WORKTREE_PATH" ]]; then
+    info "Removing existing worktree: $WORKTREE_PATH"
+    git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
+  fi
 
-# Determine base branch ref
-if git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
-  BASE_BRANCH="origin/${DEFAULT_BRANCH}"
-elif git show-ref --verify --quiet "refs/heads/${DEFAULT_BRANCH}"; then
-  BASE_BRANCH="${DEFAULT_BRANCH}"
+  # Find available branch name
+  BRANCH_NAME="$BASE_BRANCH_NAME"
+  SUFFIX=2
+
+  while true; do
+    if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+      git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
+    fi
+
+    if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$BASE_BRANCH" 2>&1; then
+      break
+    fi
+
+    info "Branch '$BRANCH_NAME' already exists, trying alternative..."
+    BRANCH_NAME="${BASE_BRANCH_NAME}-${SUFFIX}"
+    SUFFIX=$((SUFFIX + 1))
+
+    if [[ $SUFFIX -gt 10 ]]; then
+      error "Could not find available branch name after 10 attempts"
+    fi
+  done
+
+  success "Worktree created: $WORKTREE_PATH"
+  info "Branch: $BRANCH_NAME"
+  info "Base: $DEFAULT_BRANCH"
+  echo ""
 else
-  BASE_BRANCH="HEAD"
+  # Local mode: operate directly on working directory
+  info "Local mode: operating directly on working directory"
+  echo ""
 fi
-
-# Clean up any existing worktree
-if [[ -d "$WORKTREE_PATH" ]]; then
-  info "Removing existing worktree: $WORKTREE_PATH"
-  git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
-fi
-
-# Find available branch name
-BRANCH_NAME="$BASE_BRANCH_NAME"
-SUFFIX=2
-
-while true; do
-  if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
-    git branch -D "$BRANCH_NAME" >/dev/null 2>&1 || true
-  fi
-
-  if git worktree add -b "$BRANCH_NAME" "$WORKTREE_PATH" "$BASE_BRANCH" 2>&1; then
-    break
-  fi
-
-  info "Branch '$BRANCH_NAME' already exists, trying alternative..."
-  BRANCH_NAME="${BASE_BRANCH_NAME}-${SUFFIX}"
-  SUFFIX=$((SUFFIX + 1))
-
-  if [[ $SUFFIX -gt 10 ]]; then
-    error "Could not find available branch name after 10 attempts"
-  fi
-done
-
-success "Worktree created: $WORKTREE_PATH"
-info "Branch: $BRANCH_NAME"
-info "Base: $DEFAULT_BRANCH"
-echo ""
 
 # ============================================================================
 # STEP 5: Remove Loom Files
@@ -574,7 +592,11 @@ CURRENT_STEP="Remove Files"
 header "Step 5: Removing Loom Files"
 echo ""
 
-WORKTREE_ABS="$TARGET_PATH/$WORKTREE_PATH"
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  WORKTREE_ABS="$TARGET_PATH"
+else
+  WORKTREE_ABS="$TARGET_PATH/$WORKTREE_PATH"
+fi
 cd "$WORKTREE_ABS"
 
 REMOVED_COUNT=0
@@ -731,29 +753,69 @@ done
 echo ""
 
 # ============================================================================
-# STEP 8: Create PR
+# STEP 8: Create PR (skipped in local mode)
 # ============================================================================
-CURRENT_STEP="Create PR"
-header "Step 8: Creating Pull Request"
-echo ""
+if [[ "$LOCAL_MODE" == "true" ]]; then
+  # Local mode: stage changes but don't commit or create PR
+  CURRENT_STEP="Local Complete"
+  header "Step 8: Local Mode Complete"
+  echo ""
 
-# Build the PR description with removal summary
-REMOVED_SUMMARY=""
-for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
-  REMOVED_SUMMARY="${REMOVED_SUMMARY}\n- \`${item}\`"
-done
+  cd "$TARGET_PATH"
+  git add -A
 
-# Extract version from the target repo's installed Loom if possible
-INSTALLED_VERSION="unknown"
-if [[ -f "$WORKTREE_ABS/.loom/config.json" ]] 2>/dev/null; then
-  INSTALLED_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$WORKTREE_ABS/.loom/config.json" 2>/dev/null | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/"//' || echo "unknown")
-fi
+  if git diff --staged --quiet; then
+    info "No changes detected - Loom files may have already been removed"
+    trap - EXIT SIGINT SIGTERM
+    echo ""
+    success "No changes needed - Loom appears to already be removed"
+    exit 0
+  fi
 
-# Set environment variables for create-pr.sh
-export LOOM_VERSION="${INSTALLED_VERSION}"
-export LOOM_COMMIT="uninstall"
+  # Disable error trap - we completed successfully
+  trap - EXIT SIGINT SIGTERM
 
-export COMMIT_MSG="Remove Loom orchestration framework
+  echo ""
+  success "Loom files removed from working directory"
+  info "Changes are staged but not committed (caller will handle commit)"
+  echo ""
+
+  info "Removed ${#REMOVED_LIST[@]} items:"
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    echo "  - $item"
+  done
+
+  if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+    PRESERVED_COUNT=$(( ${#UNKNOWN_FILES[@]} - ${#REMOVE_UNKNOWN_FILES[@]} ))
+    if [[ $PRESERVED_COUNT -gt 0 ]]; then
+      echo ""
+      info "$PRESERVED_COUNT unknown files were preserved"
+    fi
+  fi
+
+  echo ""
+else
+  CURRENT_STEP="Create PR"
+  header "Step 8: Creating Pull Request"
+  echo ""
+
+  # Build the PR description with removal summary
+  REMOVED_SUMMARY=""
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    REMOVED_SUMMARY="${REMOVED_SUMMARY}\n- \`${item}\`"
+  done
+
+  # Extract version from the target repo's installed Loom if possible
+  INSTALLED_VERSION="unknown"
+  if [[ -f "$WORKTREE_ABS/.loom/config.json" ]] 2>/dev/null; then
+    INSTALLED_VERSION=$(grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' "$WORKTREE_ABS/.loom/config.json" 2>/dev/null | head -1 | sed 's/.*"version"[[:space:]]*:[[:space:]]*"//;s/"//' || echo "unknown")
+  fi
+
+  # Set environment variables for create-pr.sh
+  export LOOM_VERSION="${INSTALLED_VERSION}"
+  export LOOM_COMMIT="uninstall"
+
+  export COMMIT_MSG="Remove Loom orchestration framework
 
 Removes Loom configuration, roles, scripts, and tooling:
 - .loom/ directory (configuration, roles, scripts)
@@ -764,73 +826,73 @@ Removes Loom configuration, roles, scripts, and tooling:
 - .gitignore Loom patterns
 - Runtime artifacts (state files, logs)"
 
-export PR_TITLE="Remove Loom orchestration framework"
+  export PR_TITLE="Remove Loom orchestration framework"
 
-# Build the PR body
-PR_BODY_TEXT="## Loom Uninstallation
+  # Build the PR body
+  PR_BODY_TEXT="## Loom Uninstallation
 
 This PR removes Loom orchestration framework from the repository.
 
 ## What's Removed
 "
 
-# Add removed files list
-for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
-  PR_BODY_TEXT="${PR_BODY_TEXT}
+  # Add removed files list
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    PR_BODY_TEXT="${PR_BODY_TEXT}
 - \`${item}\`"
-done
+  done
 
-PR_BODY_TEXT="${PR_BODY_TEXT}
+  PR_BODY_TEXT="${PR_BODY_TEXT}
 
 ## Unknown Files
 "
 
-# Add unknown files section
-if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
-  if [[ ${#REMOVE_UNKNOWN_FILES[@]} -gt 0 ]]; then
-    PR_BODY_TEXT="${PR_BODY_TEXT}
+  # Add unknown files section
+  if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+    if [[ ${#REMOVE_UNKNOWN_FILES[@]} -gt 0 ]]; then
+      PR_BODY_TEXT="${PR_BODY_TEXT}
 The following non-standard files were also removed (user-approved):"
-    for f in "${REMOVE_UNKNOWN_FILES[@]}"; do
-      PR_BODY_TEXT="${PR_BODY_TEXT}
-- \`$f\`"
-    done
-  fi
-
-  PRESERVED_UNKNOWN=()
-  for f in "${UNKNOWN_FILES[@]}"; do
-    is_removed=false
-    for r in ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}; do
-      if [[ "$f" == "$r" ]]; then
-        is_removed=true
-        break
-      fi
-    done
-    if [[ "$is_removed" == "false" ]]; then
-      PRESERVED_UNKNOWN+=("$f")
-    fi
-  done
-
-  if [[ ${#PRESERVED_UNKNOWN[@]} -gt 0 ]]; then
-    if [[ ${#PRESERVED_UNKNOWN[@]} -le 20 ]]; then
-      PR_BODY_TEXT="${PR_BODY_TEXT}
-
-The following non-standard files were preserved:"
-      for f in "${PRESERVED_UNKNOWN[@]}"; do
+      for f in "${REMOVE_UNKNOWN_FILES[@]}"; do
         PR_BODY_TEXT="${PR_BODY_TEXT}
 - \`$f\`"
       done
-    else
-      PR_BODY_TEXT="${PR_BODY_TEXT}
+    fi
+
+    PRESERVED_UNKNOWN=()
+    for f in "${UNKNOWN_FILES[@]}"; do
+      is_removed=false
+      for r in ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}; do
+        if [[ "$f" == "$r" ]]; then
+          is_removed=true
+          break
+        fi
+      done
+      if [[ "$is_removed" == "false" ]]; then
+        PRESERVED_UNKNOWN+=("$f")
+      fi
+    done
+
+    if [[ ${#PRESERVED_UNKNOWN[@]} -gt 0 ]]; then
+      if [[ ${#PRESERVED_UNKNOWN[@]} -le 20 ]]; then
+        PR_BODY_TEXT="${PR_BODY_TEXT}
+
+The following non-standard files were preserved:"
+        for f in "${PRESERVED_UNKNOWN[@]}"; do
+          PR_BODY_TEXT="${PR_BODY_TEXT}
+- \`$f\`"
+        done
+      else
+        PR_BODY_TEXT="${PR_BODY_TEXT}
 
 ${#PRESERVED_UNKNOWN[@]} non-standard files were preserved (too many to list individually)."
+      fi
     fi
-  fi
-else
-  PR_BODY_TEXT="${PR_BODY_TEXT}
+  else
+    PR_BODY_TEXT="${PR_BODY_TEXT}
 No unknown files detected."
-fi
+  fi
 
-PR_BODY_TEXT="${PR_BODY_TEXT}
+  PR_BODY_TEXT="${PR_BODY_TEXT}
 
 ## Post-Merge Steps
 
@@ -841,103 +903,104 @@ After merging this PR:
 ---
 Generated by [Loom](https://github.com/rjwalters/loom) uninstall"
 
-export PR_BODY="$PR_BODY_TEXT"
+  export PR_BODY="$PR_BODY_TEXT"
 
-# Check if there are actual changes to commit
-cd "$WORKTREE_ABS"
-git add -A
+  # Check if there are actual changes to commit
+  cd "$WORKTREE_ABS"
+  git add -A
 
-if git diff --staged --quiet; then
-  info "No changes detected - Loom files may have already been removed"
+  if git diff --staged --quiet; then
+    info "No changes detected - Loom files may have already been removed"
 
-  # Clean up worktree
-  cd "$TARGET_PATH"
-  git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
-  git branch -D "$BRANCH_NAME" 2>/dev/null || true
+    # Clean up worktree
+    cd "$TARGET_PATH"
+    git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
+    git branch -D "$BRANCH_NAME" 2>/dev/null || true
 
-  trap - EXIT SIGINT SIGTERM
+    trap - EXIT SIGINT SIGTERM
+    echo ""
+    success "No changes needed - Loom appears to already be removed"
+    exit 0
+  fi
+
+  # Use create-pr.sh to handle commit, push, and PR creation
+  if [[ -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
+    TARGET_BRANCH="${DEFAULT_BRANCH#origin/}"
+
+    PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$WORKTREE_ABS" "$TARGET_BRANCH") || \
+      error "Failed to create pull request"
+
+    # Parse output: PR_URL|MERGE_STATUS
+    LAST_OUTPUT_LINE=$(echo "$PR_URL_RAW" | tail -1)
+    PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
+    MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
+
+    # Validate PR URL
+    if [[ ! "$PR_URL" =~ ^https://github\.com/ ]]; then
+      PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]|]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+    fi
+
+    if [[ ! "$PR_URL" =~ ^https:// ]]; then
+      error "Invalid PR URL returned: $PR_URL"
+    fi
+
+    MERGE_STATUS="${MERGE_STATUS:-manual}"
+  else
+    error "create-pr.sh not found at $LOOM_ROOT/scripts/install/create-pr.sh"
+  fi
+
   echo ""
-  success "No changes needed - Loom appears to already be removed"
-  exit 0
-fi
 
-# Use create-pr.sh to handle commit, push, and PR creation
-if [[ -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
-  TARGET_BRANCH="${DEFAULT_BRANCH#origin/}"
+  # ============================================================================
+  # Complete
+  # ============================================================================
+  CURRENT_STEP="Complete"
 
-  PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$WORKTREE_ABS" "$TARGET_BRANCH") || \
-    error "Failed to create pull request"
+  # Disable error trap - we completed successfully
+  trap - EXIT SIGINT SIGTERM
 
-  # Parse output: PR_URL|MERGE_STATUS
-  LAST_OUTPUT_LINE=$(echo "$PR_URL_RAW" | tail -1)
-  PR_URL=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f1)
-  MERGE_STATUS=$(echo "$LAST_OUTPUT_LINE" | cut -d'|' -f2)
+  echo ""
+  header "╔═══════════════════════════════════════════════════════════╗"
+  header "║              Loom Uninstall Complete                      ║"
+  header "╚═══════════════════════════════════════════════════════════╝"
+  echo ""
 
-  # Validate PR URL
-  if [[ ! "$PR_URL" =~ ^https://github\.com/ ]]; then
-    PR_URL=$(echo "$PR_URL_RAW" | grep -oE 'https://github\.com/[^[:space:]|]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+  case "$MERGE_STATUS" in
+    merged)
+      success "Loom has been removed from the repository"
+      info "Pull request: $PR_URL (merged)"
+      ;;
+    auto)
+      success "Uninstall PR created with auto-merge enabled"
+      info "Pull request: $PR_URL (auto-merge enabled)"
+      ;;
+    *)
+      success "Uninstall PR created"
+      info "Pull request: $PR_URL"
+      echo ""
+      info "Review and merge the PR to complete the uninstall."
+      ;;
+  esac
+
+  echo ""
+
+  info "Removed ${#REMOVED_LIST[@]} items:"
+  for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
+    echo "  - $item"
+  done
+
+  if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
+    PRESERVED_COUNT=$(( ${#UNKNOWN_FILES[@]} - ${#REMOVE_UNKNOWN_FILES[@]} ))
+    if [[ $PRESERVED_COUNT -gt 0 ]]; then
+      echo ""
+      info "$PRESERVED_COUNT unknown files were preserved"
+    fi
   fi
 
-  if [[ ! "$PR_URL" =~ ^https:// ]]; then
-    error "Invalid PR URL returned: $PR_URL"
-  fi
-
-  MERGE_STATUS="${MERGE_STATUS:-manual}"
-else
-  error "create-pr.sh not found at $LOOM_ROOT/scripts/install/create-pr.sh"
+  echo ""
+  header "Post-Merge Steps:"
+  echo "  1. Remove loom:* labels (optional):"
+  echo "     gh label list | grep 'loom:' | awk '{print \$1}' | xargs -I{} gh label delete {} --yes"
+  echo "  2. Remove Loom branch protection rules (optional)"
+  echo ""
 fi
-
-echo ""
-
-# ============================================================================
-# Complete
-# ============================================================================
-CURRENT_STEP="Complete"
-
-# Disable error trap - we completed successfully
-trap - EXIT SIGINT SIGTERM
-
-echo ""
-header "╔═══════════════════════════════════════════════════════════╗"
-header "║              Loom Uninstall Complete                      ║"
-header "╚═══════════════════════════════════════════════════════════╝"
-echo ""
-
-case "$MERGE_STATUS" in
-  merged)
-    success "Loom has been removed from the repository"
-    info "Pull request: $PR_URL (merged)"
-    ;;
-  auto)
-    success "Uninstall PR created with auto-merge enabled"
-    info "Pull request: $PR_URL (auto-merge enabled)"
-    ;;
-  *)
-    success "Uninstall PR created"
-    info "Pull request: $PR_URL"
-    echo ""
-    info "Review and merge the PR to complete the uninstall."
-    ;;
-esac
-
-echo ""
-
-info "Removed ${#REMOVED_LIST[@]} items:"
-for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
-  echo "  - $item"
-done
-
-if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
-  PRESERVED_COUNT=$(( ${#UNKNOWN_FILES[@]} - ${#REMOVE_UNKNOWN_FILES[@]} ))
-  if [[ $PRESERVED_COUNT -gt 0 ]]; then
-    echo ""
-    info "$PRESERVED_COUNT unknown files were preserved"
-  fi
-fi
-
-echo ""
-header "Post-Merge Steps:"
-echo "  1. Remove loom:* labels (optional):"
-echo "     gh label list | grep 'loom:' | awk '{print \$1}' | xargs -I{} gh label delete {} --yes"
-echo "  2. Remove Loom branch protection rules (optional)"
-echo ""

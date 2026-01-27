@@ -422,10 +422,10 @@ case "$METHOD" in
       echo ""
     fi
 
-    # Handle --clean: run uninstall first, then fresh install
+    # Handle --clean: run local uninstall first, then fresh install
     if [[ "$FORCE_FLAG" == "--clean" ]]; then
-      info "Running uninstall before fresh install..."
-      "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes "$TARGET_PATH" || \
+      info "Running local uninstall before fresh install..."
+      "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
         error "Uninstall failed - aborting clean install"
       echo ""
       info "Uninstall complete, proceeding with fresh install..."
