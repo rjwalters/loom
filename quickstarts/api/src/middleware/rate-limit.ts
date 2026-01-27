@@ -16,16 +16,24 @@ const DEFAULT_CONFIG: RateLimitConfig = {
  * Rate limiter using Cloudflare KV for distributed state
  * Falls back to allowing requests if KV is unavailable
  */
-export const rateLimiter: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+export const rateLimiter: MiddlewareHandler<{ Bindings: Env }> = async (
+  c,
+  next,
+) => {
   const config = DEFAULT_CONFIG;
-  const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || "unknown";
+  const ip =
+    c.req.header("CF-Connecting-IP") ||
+    c.req.header("X-Forwarded-For") ||
+    "unknown";
   const key = `ratelimit:${ip}`;
   const now = Date.now();
   const windowStart = now - config.windowMs;
 
   try {
     // Get current rate limit data from KV
-    const data = await c.env.KV.get(key, "json") as { requests: number[]; } | null;
+    const data = (await c.env.KV.get(key, "json")) as {
+      requests: number[];
+    } | null;
     const requests = data?.requests?.filter((t) => t > windowStart) || [];
 
     if (requests.length >= config.maxRequests) {
@@ -44,7 +52,10 @@ export const rateLimiter: MiddlewareHandler<{ Bindings: Env }> = async (c, next)
 
     // Add rate limit headers
     c.header("X-RateLimit-Limit", config.maxRequests.toString());
-    c.header("X-RateLimit-Remaining", (config.maxRequests - requests.length).toString());
+    c.header(
+      "X-RateLimit-Remaining",
+      (config.maxRequests - requests.length).toString(),
+    );
     c.header("X-RateLimit-Reset", (now + config.windowMs).toString());
   } catch (err) {
     if (err instanceof HTTPException) throw err;

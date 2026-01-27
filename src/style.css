@@ -40,7 +40,7 @@
 
 /* Instant background color change for terminal header */
 #terminal-header {
-  transition: none !important;
+  transition: none;
 }
 
 /* Drag and drop styles */

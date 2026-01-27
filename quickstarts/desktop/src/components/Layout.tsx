@@ -1,5 +1,5 @@
+import { FileText, Home, Settings } from "lucide-react";
 import { Link, useLocation } from "react-router-dom";
-import { Home, FileText, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -36,7 +36,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
                   "flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors",
                   isActive
                     ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+                    : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
                 )}
               >
                 <item.icon className="h-4 w-4" />

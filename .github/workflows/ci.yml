@@ -19,9 +19,7 @@ jobs:
           node-version: "20"
           cache: "pnpm"
       - run: pnpm install --frozen-lockfile
-      - run: pnpm lint
-      - run: pnpm format --check
-      # Biome doesn't format Rust, so skip pnpm format:rust check here
+      - run: pnpm biome ci src e2e defaults
 
   frontend-typecheck:
     name: TypeScript Type Checking

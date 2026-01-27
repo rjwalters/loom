@@ -1,4 +1,10 @@
-import { createContext, useContext, useEffect, useState, useCallback } from "react";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+} from "react";
 
 type Theme = "light" | "dark" | "system";
 
@@ -26,7 +32,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   });
 
   const [resolvedTheme, setResolvedTheme] = useState<"light" | "dark">(() =>
-    theme === "system" ? getSystemTheme() : theme
+    theme === "system" ? getSystemTheme() : theme,
   );
 
   useEffect(() => {

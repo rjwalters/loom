@@ -60,22 +60,26 @@ function getSessionIdFromCookie(request: Request): string | null {
     cookieHeader.split(";").map((c) => {
       const [key, ...val] = c.trim().split("=");
       return [key, val.join("=")];
-    })
+    }),
   );
   return cookies[SESSION_COOKIE_NAME] || null;
 }
 
 // Password hashing using PBKDF2 (edge-compatible, more secure than plain SHA-256)
-async function hashPassword(password: string, salt?: string): Promise<{ hash: string; salt: string }> {
+async function hashPassword(
+  password: string,
+  salt?: string,
+): Promise<{ hash: string; salt: string }> {
   const encoder = new TextEncoder();
-  const passwordSalt = salt || btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+  const passwordSalt =
+    salt || btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
 
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     encoder.encode(password),
     "PBKDF2",
     false,
-    ["deriveBits"]
+    ["deriveBits"],
   );
 
   const derivedBits = await crypto.subtle.deriveBits(
@@ -86,7 +90,7 @@ async function hashPassword(password: string, salt?: string): Promise<{ hash: st
       hash: "SHA-256",
     },
     keyMaterial,
-    256
+    256,
   );
 
   const hash = btoa(String.fromCharCode(...new Uint8Array(derivedBits)));
@@ -114,9 +118,7 @@ async function createSession(env: Env, userId: string): Promise<string> {
   const sessionId = crypto.randomUUID();
   const expiresAt = new Date(Date.now() + SESSION_DURATION_MS).toISOString();
 
-  await env.DB.prepare(
-    "INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)"
-  )
+  await env.DB.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
     .bind(sessionId, userId, expiresAt)
     .run();
 
@@ -137,9 +139,7 @@ async function getSessionUser(env: Env, sessionId: string): Promise<User | null>
 }
 
 async function deleteSession(env: Env, sessionId: string): Promise<void> {
-  await env.DB.prepare("DELETE FROM sessions WHERE id = ?")
-    .bind(sessionId)
-    .run();
+  await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
 }
 
 async function refreshSession(env: Env, sessionId: string): Promise<void> {
@@ -163,7 +163,7 @@ async function getAuthenticatedUser(env: Env, request: Request): Promise<User | 
 
 // Auth handlers
 async function handleLogin(env: Env, request: Request): Promise<Response> {
-  const body = await request.json() as { email?: string; password?: string };
+  const body = (await request.json()) as { email?: string; password?: string };
   const { email, password } = body;
 
   if (!email || !password) {
@@ -171,7 +171,7 @@ async function handleLogin(env: Env, request: Request): Promise<Response> {
   }
 
   const user = await env.DB.prepare(
-    "SELECT id, email, name, password_hash, created_at FROM users WHERE email = ?"
+    "SELECT id, email, name, password_hash, created_at FROM users WHERE email = ?",
   )
     .bind(email)
     .first<User & { password_hash: string }>();
@@ -188,11 +188,9 @@ async function handleLogin(env: Env, request: Request): Promise<Response> {
   const sessionId = await createSession(env, user.id);
   const maxAge = Math.floor(SESSION_DURATION_MS / 1000);
 
-  return json(
-    { user: { id: user.id, email: user.email, name: user.name } },
-    200,
-    { "Set-Cookie": setSessionCookie(sessionId, maxAge) }
-  );
+  return json({ user: { id: user.id, email: user.email, name: user.name } }, 200, {
+    "Set-Cookie": setSessionCookie(sessionId, maxAge),
+  });
 }
 
 async function handleLogout(env: Env, request: Request): Promise<Response> {
@@ -202,15 +200,11 @@ async function handleLogout(env: Env, request: Request): Promise<Response> {
     await deleteSession(env, sessionId);
   }
 
-  return json(
-    { success: true },
-    200,
-    { "Set-Cookie": clearSessionCookie() }
-  );
+  return json({ success: true }, 200, { "Set-Cookie": clearSessionCookie() });
 }
 
 async function handleRegister(env: Env, request: Request): Promise<Response> {
-  const body = await request.json() as { email?: string; name?: string; password?: string };
+  const body = (await request.json()) as { email?: string; name?: string; password?: string };
   const { email, name, password } = body;
 
   if (!email || !name || !password) {
@@ -225,9 +219,7 @@ async function handleRegister(env: Env, request: Request): Promise<Response> {
   const { hash: passwordHash } = await hashPassword(password);
 
   try {
-    await env.DB.prepare(
-      "INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)"
-    )
+    await env.DB.prepare("INSERT INTO users (id, email, name, password_hash) VALUES (?, ?, ?, ?)")
       .bind(id, email, name, passwordHash)
       .run();
 
@@ -235,11 +227,9 @@ async function handleRegister(env: Env, request: Request): Promise<Response> {
     const sessionId = await createSession(env, id);
     const maxAge = Math.floor(SESSION_DURATION_MS / 1000);
 
-    return json(
-      { user: { id, email, name } },
-      201,
-      { "Set-Cookie": setSessionCookie(sessionId, maxAge) }
-    );
+    return json({ user: { id, email, name } }, 201, {
+      "Set-Cookie": setSessionCookie(sessionId, maxAge),
+    });
   } catch (e) {
     if ((e as Error).message.includes("UNIQUE constraint failed")) {
       return error("Email already exists", 409);
@@ -258,11 +248,7 @@ async function handleGetMe(env: Env, request: Request): Promise<Response> {
   const user = await getSessionUser(env, sessionId);
 
   if (!user) {
-    return json(
-      { error: "Session expired" },
-      401,
-      { "Set-Cookie": clearSessionCookie() }
-    );
+    return json({ error: "Session expired" }, 401, { "Set-Cookie": clearSessionCookie() });
   }
 
   // Refresh session on activity
@@ -281,21 +267,15 @@ async function handleRefreshSession(env: Env, request: Request): Promise<Respons
   const user = await getSessionUser(env, sessionId);
 
   if (!user) {
-    return json(
-      { error: "Session expired" },
-      401,
-      { "Set-Cookie": clearSessionCookie() }
-    );
+    return json({ error: "Session expired" }, 401, { "Set-Cookie": clearSessionCookie() });
   }
 
   await refreshSession(env, sessionId);
   const maxAge = Math.floor(SESSION_DURATION_MS / 1000);
 
-  return json(
-    { user, expiresAt: new Date(Date.now() + SESSION_DURATION_MS).toISOString() },
-    200,
-    { "Set-Cookie": setSessionCookie(sessionId, maxAge) }
-  );
+  return json({ user, expiresAt: new Date(Date.now() + SESSION_DURATION_MS).toISOString() }, 200, {
+    "Set-Cookie": setSessionCookie(sessionId, maxAge),
+  });
 }
 
 // Route handlers

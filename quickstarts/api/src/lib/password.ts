@@ -3,18 +3,19 @@
  */
 export async function hashPassword(
   password: string,
-  salt?: string
+  salt?: string,
 ): Promise<{ hash: string; salt: string }> {
   const encoder = new TextEncoder();
   const passwordSalt =
-    salt || btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+    salt ||
+    btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
 
   const keyMaterial = await crypto.subtle.importKey(
     "raw",
     encoder.encode(password),
     "PBKDF2",
     false,
-    ["deriveBits"]
+    ["deriveBits"],
   );
 
   const derivedBits = await crypto.subtle.deriveBits(
@@ -25,7 +26,7 @@ export async function hashPassword(
       hash: "SHA-256",
     },
     keyMaterial,
-    256
+    256,
   );
 
   const hash = btoa(String.fromCharCode(...new Uint8Array(derivedBits)));
@@ -37,7 +38,7 @@ export async function hashPassword(
  */
 export async function verifyPassword(
   password: string,
-  storedHash: string
+  storedHash: string,
 ): Promise<boolean> {
   const [salt, expectedHash] = storedHash.split(":");
   if (!salt || !expectedHash) return false;

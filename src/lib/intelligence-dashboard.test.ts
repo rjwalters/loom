@@ -2,14 +2,14 @@
  * Tests for Intelligence Dashboard
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as agentMetrics from "./agent-metrics";
 import {
-  showIntelligenceDashboard,
   closeIntelligenceDashboard,
   isDashboardVisible,
+  showIntelligenceDashboard,
 } from "./intelligence-dashboard";
-import * as agentMetrics from "./agent-metrics";
-import { setAppState, AppState } from "./state";
+import { AppState, setAppState } from "./state";
 
 // Mock localStorage before any imports that might use it
 const localStorageMock = {
@@ -39,7 +39,9 @@ vi.mock("./agent-metrics", () => ({
   getRoleDisplayName: vi.fn((r) => r.charAt(0).toUpperCase() + r.slice(1)),
   getSuccessRateColor: vi.fn(() => "text-green-600"),
   getTrendColor: vi.fn(() => "text-green-600"),
-  getTrendIcon: vi.fn((t) => (t === "improving" ? "\u2191" : t === "declining" ? "\u2193" : "\u2192")),
+  getTrendIcon: vi.fn((t) =>
+    t === "improving" ? "\u2191" : t === "declining" ? "\u2193" : "\u2192"
+  ),
 }));
 
 vi.mock("./logger", () => ({

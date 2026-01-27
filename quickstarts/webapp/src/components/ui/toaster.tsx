@@ -46,7 +46,7 @@ export function Toaster({ children }: { children?: React.ReactNode }) {
               "group pointer-events-auto relative flex w-full items-center justify-between space-x-4 overflow-hidden rounded-md border p-6 pr-8 shadow-lg transition-all",
               t.variant === "destructive"
                 ? "border-destructive bg-destructive text-destructive-foreground"
-                : "border bg-background text-foreground"
+                : "border bg-background text-foreground",
             )}
             onOpenChange={(open) => {
               if (!open) removeToast(t.id);
@@ -55,13 +55,20 @@ export function Toaster({ children }: { children?: React.ReactNode }) {
             <div className="grid gap-1">
               <Toast.Title className="text-sm font-semibold">{t.title}</Toast.Title>
               {t.description && (
-                <Toast.Description className="text-sm opacity-90">{t.description}</Toast.Description>
+                <Toast.Description className="text-sm opacity-90">
+                  {t.description}
+                </Toast.Description>
               )}
             </div>
             <Toast.Close className="absolute right-2 top-2 rounded-md p-1 text-foreground/50 opacity-0 transition-opacity hover:text-foreground focus:opacity-100 focus:outline-none focus:ring-2 group-hover:opacity-100">
               <span className="sr-only">Close</span>
               <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M6 18L18 6M6 6l12 12"
+                />
               </svg>
             </Toast.Close>
           </Toast.Root>

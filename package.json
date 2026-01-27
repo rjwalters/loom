@@ -96,7 +96,13 @@
     "vitest": "^4.0.18"
   },
   "lint-staged": {
-    "*.{ts,tsx,js,jsx,json}": [
+    "src/**/*.{ts,tsx,js,jsx,json}": [
+      "biome check --write"
+    ],
+    "e2e/**/*.{ts,tsx}": [
+      "biome check --write"
+    ],
+    "defaults/**/*.json": [
       "biome check --write"
     ],
     "*.rs": [

@@ -1,14 +1,14 @@
-import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
+import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { HTTPException } from "hono/http-exception";
-import type { Env, User } from "../types";
 import { requireAuth, requireRole } from "../middleware/auth";
-import {
-  UserSchema,
-  UserListSchema,
-  UpdateUserSchema,
-  UserParamsSchema,
-} from "../schemas/user";
 import { ErrorSchema } from "../schemas/auth";
+import {
+  UpdateUserSchema,
+  UserListSchema,
+  UserParamsSchema,
+  UserSchema,
+} from "../schemas/user";
+import type { Env, User } from "../types";
 
 export const userRoutes = new OpenAPIHono<{ Bindings: Env }>();
 
@@ -56,9 +56,9 @@ userRoutes.openapi(listUsersRoute, requireRole("admin"), async (c) => {
       count: number;
     }>(),
     c.env.DB.prepare(
-      "SELECT id, email, name, role, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?"
+      "SELECT id, email, name, role, created_at, updated_at FROM users ORDER BY created_at DESC LIMIT ? OFFSET ?",
     )
-      .bind(parseInt(limit), parseInt(offset))
+      .bind(parseInt(limit, 10), parseInt(offset, 10))
       .all<User>(),
   ]);
 
@@ -108,7 +108,7 @@ userRoutes.openapi(getUserRoute, async (c) => {
   }
 
   const user = await c.env.DB.prepare(
-    "SELECT id, email, name, role, created_at, updated_at FROM users WHERE id = ?"
+    "SELECT id, email, name, role, created_at, updated_at FROM users WHERE id = ?",
   )
     .bind(id)
     .first<User>();
@@ -195,14 +195,12 @@ userRoutes.openapi(updateUserRoute, async (c) => {
   fields.push("updated_at = datetime('now')");
   values.push(id);
 
-  await c.env.DB.prepare(
-    `UPDATE users SET ${fields.join(", ")} WHERE id = ?`
-  )
+  await c.env.DB.prepare(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`)
     .bind(...values)
     .run();
 
   const user = await c.env.DB.prepare(
-    "SELECT id, email, name, role, created_at, updated_at FROM users WHERE id = ?"
+    "SELECT id, email, name, role, created_at, updated_at FROM users WHERE id = ?",
   )
     .bind(id)
     .first<User>();

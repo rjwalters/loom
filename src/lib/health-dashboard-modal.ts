@@ -6,9 +6,9 @@
  * for extended unattended autonomous operation.
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import { ModalBuilder } from "./modal-builder";
 import { getAppState } from "./state";
-import { invoke } from "@tauri-apps/api/core";
 
 // Types for health metrics
 interface HealthMetrics {
@@ -457,10 +457,26 @@ function createHistoryContent(history: HealthHistory): string {
         ? `
       <!-- Trend Sparklines -->
       <div class="mb-6 grid grid-cols-2 gap-4">
-        ${createSparklineCard("Throughput", history.metrics.map((m) => m.throughput?.issues_per_hour ?? 0), "issues/hr")}
-        ${createSparklineCard("Queue Depth", history.metrics.map((m) => m.queue_depths?.ready ?? 0), "ready")}
-        ${createSparklineCard("Success Rate", history.metrics.map((m) => m.error_rates?.success_rate ?? 100), "%")}
-        ${createSparklineCard("Stuck Agents", history.metrics.map((m) => m.error_rates?.stuck_agents ?? 0), "agents")}
+        ${createSparklineCard(
+          "Throughput",
+          history.metrics.map((m) => m.throughput?.issues_per_hour ?? 0),
+          "issues/hr"
+        )}
+        ${createSparklineCard(
+          "Queue Depth",
+          history.metrics.map((m) => m.queue_depths?.ready ?? 0),
+          "ready"
+        )}
+        ${createSparklineCard(
+          "Success Rate",
+          history.metrics.map((m) => m.error_rates?.success_rate ?? 100),
+          "%"
+        )}
+        ${createSparklineCard(
+          "Stuck Agents",
+          history.metrics.map((m) => m.error_rates?.stuck_agents ?? 0),
+          "agents"
+        )}
       </div>
 
       <!-- History Table -->

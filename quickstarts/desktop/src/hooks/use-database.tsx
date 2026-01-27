@@ -1,5 +1,11 @@
-import { createContext, useContext, useEffect, useState, useCallback } from "react";
 import Database from "@tauri-apps/plugin-sql";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+} from "react";
 
 interface Note {
   id: number;
@@ -19,7 +25,9 @@ interface DatabaseContextValue {
   refreshNotes: () => Promise<void>;
 }
 
-const DatabaseContext = createContext<DatabaseContextValue | undefined>(undefined);
+const DatabaseContext = createContext<DatabaseContextValue | undefined>(
+  undefined,
+);
 
 export function DatabaseProvider({ children }: { children: React.ReactNode }) {
   const [db, setDb] = useState<Database | null>(null);
@@ -48,7 +56,7 @@ export function DatabaseProvider({ children }: { children: React.ReactNode }) {
 
         // Load initial notes
         const result = await database.select<Note[]>(
-          "SELECT * FROM notes ORDER BY updated_at DESC"
+          "SELECT * FROM notes ORDER BY updated_at DESC",
         );
         setNotes(result);
       } catch (e) {
@@ -65,7 +73,7 @@ export function DatabaseProvider({ children }: { children: React.ReactNode }) {
     if (!db) return;
     try {
       const result = await db.select<Note[]>(
-        "SELECT * FROM notes ORDER BY updated_at DESC"
+        "SELECT * FROM notes ORDER BY updated_at DESC",
       );
       setNotes(result);
     } catch (e) {
@@ -79,18 +87,18 @@ export function DatabaseProvider({ children }: { children: React.ReactNode }) {
 
       const result = await db.execute(
         "INSERT INTO notes (title, content) VALUES (?, ?)",
-        [title, content]
+        [title, content],
       );
 
       const newNote = await db.select<Note[]>(
         "SELECT * FROM notes WHERE id = ?",
-        [result.lastInsertId]
+        [result.lastInsertId],
       );
 
       await refreshNotes();
       return newNote[0];
     },
-    [db, refreshNotes]
+    [db, refreshNotes],
   );
 
   const updateNote = useCallback(
@@ -99,12 +107,12 @@ export function DatabaseProvider({ children }: { children: React.ReactNode }) {
 
       await db.execute(
         "UPDATE notes SET title = ?, content = ?, updated_at = datetime('now') WHERE id = ?",
-        [title, content, id]
+        [title, content, id],
       );
 
       await refreshNotes();
     },
-    [db, refreshNotes]
+    [db, refreshNotes],
   );
 
   const deleteNote = useCallback(
@@ -114,7 +122,7 @@ export function DatabaseProvider({ children }: { children: React.ReactNode }) {
       await db.execute("DELETE FROM notes WHERE id = ?", [id]);
       await refreshNotes();
     },
-    [db, refreshNotes]
+    [db, refreshNotes],
   );
 
   return (

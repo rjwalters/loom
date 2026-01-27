@@ -1,14 +1,14 @@
-import { OpenAPIHono, createRoute } from "@hono/zod-openapi";
+import { createRoute, OpenAPIHono } from "@hono/zod-openapi";
 import { HTTPException } from "hono/http-exception";
-import type { Env, User } from "../types";
 import { createJwt } from "../lib/jwt";
 import { hashPassword, verifyPassword } from "../lib/password";
 import {
-  LoginSchema,
-  RegisterSchema,
   AuthResponseSchema,
   ErrorSchema,
+  LoginSchema,
+  RegisterSchema,
 } from "../schemas/auth";
+import type { Env, User } from "../types";
 
 export const authRoutes = new OpenAPIHono<{ Bindings: Env }>();
 
@@ -64,7 +64,7 @@ authRoutes.openapi(registerRoute, async (c) => {
 
   try {
     await c.env.DB.prepare(
-      "INSERT INTO users (id, email, name, password_hash, role) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO users (id, email, name, password_hash, role) VALUES (?, ?, ?, ?, ?)",
     )
       .bind(id, email, name, passwordHash, "user")
       .run();
@@ -73,11 +73,11 @@ authRoutes.openapi(registerRoute, async (c) => {
     const accessToken = await createJwt(
       { sub: id, email, role: "user" },
       c.env.JWT_SECRET,
-      c.env.JWT_EXPIRES_IN
+      c.env.JWT_EXPIRES_IN,
     );
 
     const expiresAt = new Date(
-      Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN)
+      Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN),
     ).toISOString();
 
     return c.json(
@@ -86,7 +86,7 @@ authRoutes.openapi(registerRoute, async (c) => {
         accessToken,
         expiresAt,
       },
-      201
+      201,
     );
   } catch (e) {
     if ((e as Error).message.includes("UNIQUE constraint failed")) {
@@ -135,7 +135,7 @@ authRoutes.openapi(loginRoute, async (c) => {
   const { email, password } = c.req.valid("json");
 
   const user = await c.env.DB.prepare(
-    "SELECT id, email, name, password_hash, role FROM users WHERE email = ?"
+    "SELECT id, email, name, password_hash, role FROM users WHERE email = ?",
   )
     .bind(email)
     .first<User & { password_hash: string }>();
@@ -153,11 +153,11 @@ authRoutes.openapi(loginRoute, async (c) => {
   const accessToken = await createJwt(
     { sub: user.id, email: user.email, role: user.role },
     c.env.JWT_SECRET,
-    c.env.JWT_EXPIRES_IN
+    c.env.JWT_EXPIRES_IN,
   );
 
   const expiresAt = new Date(
-    Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN)
+    Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN),
   ).toISOString();
 
   return c.json({
@@ -212,11 +212,11 @@ authRoutes.openapi(refreshRoute, async (c) => {
     const accessToken = await createJwt(
       { sub: payload.sub, email: payload.email, role: payload.role },
       c.env.JWT_SECRET,
-      c.env.JWT_EXPIRES_IN
+      c.env.JWT_EXPIRES_IN,
     );
 
     const expiresAt = new Date(
-      Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN)
+      Date.now() + parseExpirationMs(c.env.JWT_EXPIRES_IN),
     ).toISOString();
 
     return c.json({

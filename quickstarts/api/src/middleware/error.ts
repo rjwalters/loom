@@ -22,7 +22,7 @@ export const errorHandler: ErrorHandler = (err, c) => {
           message: e.message,
         })),
       },
-      400
+      400,
     );
   }
 
@@ -33,7 +33,7 @@ export const errorHandler: ErrorHandler = (err, c) => {
         error: err.message,
         message: err.message,
       },
-      err.status
+      err.status,
     );
   }
 
@@ -43,6 +43,6 @@ export const errorHandler: ErrorHandler = (err, c) => {
       error: "Internal Server Error",
       message: "An unexpected error occurred",
     },
-    500
+    500,
   );
 };

@@ -32,8 +32,7 @@ export const MCP_COMMAND_FILE = join(LOOM_DIR, "mcp-command.json");
 export const MCP_ACK_FILE = join(LOOM_DIR, "mcp-ack.json");
 
 /** Daemon socket path (can be overridden via LOOM_SOCKET_PATH env var) */
-export const SOCKET_PATH =
-  process.env.LOOM_SOCKET_PATH || join(LOOM_DIR, "loom-daemon.sock");
+export const SOCKET_PATH = process.env.LOOM_SOCKET_PATH || join(LOOM_DIR, "loom-daemon.sock");
 
 /**
  * Get the workspace path from environment or default

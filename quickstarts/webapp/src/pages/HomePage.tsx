@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
-import { useAuth } from "@/hooks/use-auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useAuth } from "@/hooks/use-auth";
 
 export function HomePage() {
   const { user } = useAuth();
@@ -9,12 +9,10 @@ export function HomePage() {
   return (
     <div className="flex flex-col items-center justify-center space-y-8 py-12">
       <div className="text-center space-y-4">
-        <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">
-          Loom Quickstart Webapp
-        </h1>
+        <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">Loom Quickstart Webapp</h1>
         <p className="max-w-[600px] text-lg text-muted-foreground">
-          A modern web application template with Cloudflare Workers, Vite, React, Tailwind CSS,
-          and shadcn/ui. Pre-configured with authentication, theming, and D1 database.
+          A modern web application template with Cloudflare Workers, Vite, React, Tailwind CSS, and
+          shadcn/ui. Pre-configured with authentication, theming, and D1 database.
         </p>
       </div>
 

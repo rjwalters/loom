@@ -1,5 +1,5 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.2.6/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.3.12/schema.json",
   "vcs": {
     "enabled": true,
     "clientKind": "git",
@@ -8,7 +8,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["**", "!**/src-tauri/gen"]
+    "includes": ["**", "!**/src-tauri/gen", "!**/*.css"]
   },
   "formatter": {
     "enabled": true,
@@ -97,6 +97,13 @@
     "formatter": {
       "enabled": true,
       "indentWidth": 2
+    }
+  },
+  "css": {
+    "parser": {
+      "cssModules": false,
+      "allowWrongLineComments": true,
+      "tailwindDirectives": true
     }
   }
 }

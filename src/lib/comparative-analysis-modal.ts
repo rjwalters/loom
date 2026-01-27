@@ -19,12 +19,11 @@
  */
 
 import {
+  addVariant,
   analyzeExperiment,
   cancelExperiment,
   concludeExperiment,
   createExperiment,
-  addVariant,
-  startExperiment,
   type Experiment,
   type ExperimentAnalysis,
   type ExperimentStatus,
@@ -43,6 +42,7 @@ import {
   getStatusColor,
   getVariants,
   isSignificant,
+  startExperiment,
   type TargetDirection,
   type TargetMetric,
   type Variant,
@@ -234,7 +234,10 @@ function createListContent(summary: ExperimentsSummary, experiments: Experiment[
       ${
         experiments.length > 0
           ? experiments.map(createExperimentRow).join("")
-          : createEmptyState("No experiments found", "Create your first A/B experiment to start comparing approaches.")
+          : createEmptyState(
+              "No experiments found",
+              "Create your first A/B experiment to start comparing approaches."
+            )
       }
     </div>
   `;
@@ -364,12 +367,16 @@ function createDetailContent(
     </div>
 
     <!-- Experiment Info -->
-    ${experiment.hypothesis ? `
+    ${
+      experiment.hypothesis
+        ? `
     <div class="mb-6 p-4 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
       <div class="text-xs font-medium text-blue-600 dark:text-blue-400 uppercase mb-1">Hypothesis</div>
       <p class="text-gray-700 dark:text-gray-300">${escapeHtml(experiment.hypothesis)}</p>
     </div>
-    ` : ""}
+    `
+        : ""
+    }
 
     <!-- Analysis Summary -->
     ${createAnalysisSummary(analysis, experiment)}
@@ -975,8 +982,7 @@ async function handleCreateExperiment(modal: ModalBuilder, workspacePath: string
   const variants: Array<{ name: string; description: string | null; config: string | null }> = [];
 
   variantInputs.forEach((input) => {
-    const variantName =
-      input.querySelector<HTMLInputElement>(".variant-name")?.value.trim() ?? "";
+    const variantName = input.querySelector<HTMLInputElement>(".variant-name")?.value.trim() ?? "";
     const variantDesc =
       input.querySelector<HTMLInputElement>(".variant-description")?.value.trim() || null;
     const variantConfig =
