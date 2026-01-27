@@ -148,7 +148,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
         for c in completions:
             debug(f"Completion detected: {c.agent_id} issue=#{c.issue} status={c.status}")
 
-    # 4b. Check support role completions (Guide, Champion, Doctor, Auditor)
+    # 4b. Check support role completions (all 7 roles: Guide, Champion, Doctor, Auditor, Judge, Architect, Hermit)
     completed_support_roles = check_support_role_completions(state, debug_mode)
     if completed_support_roles:
         debug(f"Support roles completed: {completed_support_roles}")
@@ -166,24 +166,23 @@ def loom_iterate(force_mode=False, debug_mode=False):
         debug(f"Shepherd pool: {format_shepherd_pool(state)}")
         spawned_shepherds = auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode)
 
-    # 7. CRITICAL: Act on recommended_actions: trigger_architect, trigger_hermit
-    triggered_generation = {"architect": False, "hermit": False}
+    # 7. Check workflow demand (demand-based spawning for champion/doctor/judge)
+    demand_spawned = check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode)
 
-    if "trigger_architect" in recommended_actions:
-        triggered_generation["architect"] = trigger_architect_role(state, debug_mode)
+    # 8. CRITICAL: Act on recommended_actions: trigger ALL support roles (interval-based)
+    # This now includes architect and hermit alongside guide, champion, doctor, auditor, judge.
+    # All 7 roles use the unified spawn-support-role.sh infrastructure.
+    ensured_roles = auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode, demand_spawned)
 
-    if "trigger_hermit" in recommended_actions:
-        triggered_generation["hermit"] = trigger_hermit_role(state, debug_mode)
+    # Extract work generation results from ensured_roles (for summary formatting)
+    triggered_generation = {
+        "architect": ensured_roles.get("architect", False),
+        "hermit": ensured_roles.get("hermit", False)
+    }
 
     # Log work generation even when not triggered (for debugging)
     if needs_work_gen and not triggered_generation["architect"] and not triggered_generation["hermit"]:
         debug(f"Work generation needed but not triggered: architect_cooldown_ok={architect_cooldown_ok}, hermit_cooldown_ok={hermit_cooldown_ok}")
-
-    # 7.5. Check workflow demand (demand-based spawning)
-    demand_spawned = check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode)
-
-    # 8. CRITICAL: Act on recommended_actions: trigger support roles (interval-based)
-    ensured_roles = auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode, demand_spawned)
 
     # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
@@ -703,86 +702,13 @@ This {proposal_type} proposal has been automatically promoted to `loom:issue` by
 
 **CRITICAL**: Work generation keeps the pipeline fed. When `daemon-snapshot.sh` includes `trigger_architect` or `trigger_hermit` in `recommended_actions`, the iteration MUST spawn these roles.
 
-```python
-def trigger_architect_role(state, debug_mode=False):
-    """Trigger Architect role to generate new proposals. Returns True if triggered.
-
-    Uses slash command directly - Claude Code executes /architect natively.
-    """
-
-    def debug(msg):
-        if debug_mode:
-            print(f"[DEBUG] {msg}")
-
-    debug("Triggering Architect for work generation")
-
-    # Use slash command directly - Claude Code executes this natively
-    result = Task(
-        description="Architect work generation",
-        prompt="/architect --autonomous",
-        run_in_background=True
-    )
-
-    if not verify_task_spawn(result, "Architect"):
-        print(f"  SPAWN FAILED: Architect verification failed")
-        return False
-
-    # Validate task_id format to catch fabricated IDs
-    if not validate_task_id(result.task_id):
-        print(f"  SPAWN FAILED: Architect - fabricated task_id: '{result.task_id}'")
-        return False
-
-    try:
-        record_support_role(state, "architect", result.task_id, result.output_file)
-    except ValueError as e:
-        print(f"  SPAWN FAILED: Architect - {e}")
-        return False
-
-    state["last_architect_trigger"] = now()
-    save_daemon_state(state)
-    print(f"  AUTO-TRIGGERED: Architect (work generation, verified, task_id={result.task_id})")
-    return True
-
-
-def trigger_hermit_role(state, debug_mode=False):
-    """Trigger Hermit role to generate simplification proposals. Returns True if triggered.
-
-    Uses slash command directly - Claude Code executes /hermit natively.
-    """
-
-    def debug(msg):
-        if debug_mode:
-            print(f"[DEBUG] {msg}")
-
-    debug("Triggering Hermit for simplification proposals")
-
-    # Use slash command directly - Claude Code executes this natively
-    result = Task(
-        description="Hermit simplification proposals",
-        prompt="/hermit",
-        run_in_background=True
-    )
-
-    if not verify_task_spawn(result, "Hermit"):
-        print(f"  SPAWN FAILED: Hermit verification failed")
-        return False
-
-    # Validate task_id format to catch fabricated IDs
-    if not validate_task_id(result.task_id):
-        print(f"  SPAWN FAILED: Hermit - fabricated task_id: '{result.task_id}'")
-        return False
-
-    try:
-        record_support_role(state, "hermit", result.task_id, result.output_file)
-    except ValueError as e:
-        print(f"  SPAWN FAILED: Hermit - {e}")
-        return False
-
-    state["last_hermit_trigger"] = now()
-    save_daemon_state(state)
-    print(f"  AUTO-TRIGGERED: Hermit (simplification analysis, verified, task_id={result.task_id})")
-    return True
-```
+**Note**: `trigger_architect_role()` and `trigger_hermit_role()` have been removed. Architect and
+hermit now use the unified `trigger_support_role()` function (same as guide, champion, doctor,
+auditor, and judge). This eliminates separate state management paths and ensures all support roles
+use `spawn-support-role.sh` for deterministic state management. The top-level
+`last_architect_trigger` and `last_hermit_trigger` fields in daemon-state.json are no longer
+written; cooldown is now tracked via `support_roles.architect.last_completed` and
+`support_roles.hermit.last_completed`.
 
 ## Deterministic Support Role Spawning
 
@@ -892,10 +818,13 @@ Uses `spawn-support-role.sh` (without `--demand`) for interval-based spawn decis
 
 ```python
 def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False, demand_spawned=None):
-    """Automatically keep Guide, Champion, Doctor, Auditor, and Judge running.
+    """Automatically keep Guide, Champion, Doctor, Auditor, Judge, Architect, and Hermit running.
 
     Uses spawn-support-role.sh for deterministic interval checking. The script
     handles all interval math, idempotency, and fabricated task_id detection.
+
+    Architect and hermit are managed here alongside the other support roles,
+    using the same spawn-support-role.sh infrastructure for unified state management.
     """
 
     if demand_spawned is None:
@@ -905,19 +834,22 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False, "judge": False}
+    ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False, "judge": False, "architect": False, "hermit": False}
 
     debug("Checking support roles via spawn-support-role.sh (interval-based)")
     debug(f"Recommended actions: {recommended_actions}")
     debug(f"Demand-spawned: {demand_spawned}")
 
     # Define which roles to check and their trigger actions
+    # Architect and hermit use trigger_architect/trigger_hermit actions from daemon-snapshot.sh
     role_checks = [
         ("guide", "trigger_guide", "Guide backlog triage", False),
         ("champion", "trigger_champion", "Champion PR merge", demand_spawned.get("champion", False)),
         ("doctor", "trigger_doctor", "Doctor PR conflict resolution", demand_spawned.get("doctor", False)),
         ("auditor", "trigger_auditor", "Auditor main branch validation", False),
         ("judge", "trigger_judge", "Judge PR review", demand_spawned.get("judge", False)),
+        ("architect", "trigger_architect", "Architect work generation", False),
+        ("hermit", "trigger_hermit", "Hermit simplification proposals", False),
     ]
 
     for role_name, trigger_action, description, already_spawned in role_checks:
@@ -968,7 +900,9 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
         "champion": "/champion",
         "doctor": "/doctor",
         "auditor": "/auditor",
-        "judge": "/judge"
+        "judge": "/judge",
+        "architect": "/architect --autonomous",
+        "hermit": "/hermit"
     }
 
     prompt = role_prompts.get(role_name)
