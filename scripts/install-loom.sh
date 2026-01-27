@@ -334,6 +334,14 @@ export LOOM_VERSION
 export LOOM_COMMIT
 export LOOM_ROOT
 
+# Export FORCE_AUTO_MERGE for create-pr.sh
+# When --force is passed, also enable auto-merge on the installation PR
+if [[ "$FORCE_OVERWRITE" == "true" ]]; then
+  export FORCE_AUTO_MERGE=true
+else
+  export FORCE_AUTO_MERGE=false
+fi
+
 # Verify installation scripts directory exists
 if [[ ! -d "$LOOM_ROOT/scripts/install" ]]; then
   error "Installation scripts directory not found: $LOOM_ROOT/scripts/install"
