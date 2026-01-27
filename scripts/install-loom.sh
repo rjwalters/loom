@@ -563,6 +563,23 @@ fi
 echo ""
 
 # ============================================================================
+# STEP 4b: Build MCP Server and Generate Configuration
+# ============================================================================
+CURRENT_STEP="MCP Setup"
+header "Step 4b: MCP Server Setup"
+echo ""
+
+info "Building unified MCP server..."
+if "$LOOM_ROOT/scripts/setup-mcp.sh"; then
+  success "MCP server configured"
+else
+  warning "MCP setup failed - MCP tools will not be available"
+  info "Run manually later: $LOOM_ROOT/scripts/setup-mcp.sh"
+fi
+
+echo ""
+
+# ============================================================================
 # STEP 5: Configure Branch Protection
 # ============================================================================
 CURRENT_STEP="Configure Branch Protection"
