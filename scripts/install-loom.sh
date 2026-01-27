@@ -33,6 +33,7 @@ set -euo pipefail
 # Parse command line arguments
 NON_INTERACTIVE=false
 FORCE_OVERWRITE=false
+CLEAN_FIRST=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -44,6 +45,20 @@ while [[ $# -gt 0 ]]; do
     -f|--force)
       FORCE_OVERWRITE=true
       shift
+      ;;
+    --clean)
+      CLEAN_FIRST=true
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: $0 [OPTIONS] /path/to/target-repo"
+      echo ""
+      echo "Options:"
+      echo "  -y, --yes     Non-interactive mode"
+      echo "  -f, --force   Force overwrite existing files and enable auto-merge"
+      echo "  --clean       Run uninstall first, then fresh install (combines both operations)"
+      echo "  -h, --help    Show this help message"
+      exit 0
       ;;
     *)
       TARGET_PATH="$1"
@@ -252,6 +267,39 @@ if [[ -n "$MAIN_WORKTREE" ]] && [[ "$TARGET_PATH" != "$MAIN_WORKTREE" ]]; then
   warning "Target path is inside a worktree: $TARGET_PATH"
   info "Resolving to main repository root: $MAIN_WORKTREE"
   TARGET_PATH="$MAIN_WORKTREE"
+fi
+
+# ============================================================================
+# PRE-INSTALLATION: Clean existing installation if --clean flag was passed
+# ============================================================================
+if [[ "$CLEAN_FIRST" == "true" ]]; then
+  header "Pre-Installation: Running Uninstall"
+  echo ""
+
+  # Check if Loom is installed (has .loom directory)
+  if [[ -d "$TARGET_PATH/.loom" ]]; then
+    info "Running uninstall-loom.sh to clean existing installation..."
+
+    # Build uninstall flags from current flags
+    UNINSTALL_FLAGS=""
+    if [[ "$NON_INTERACTIVE" == "true" ]]; then
+      UNINSTALL_FLAGS="--yes"
+    fi
+    if [[ "$FORCE_OVERWRITE" == "true" ]]; then
+      UNINSTALL_FLAGS="$UNINSTALL_FLAGS --force"
+    fi
+
+    # Run uninstall script
+    "$LOOM_ROOT/scripts/uninstall-loom.sh" $UNINSTALL_FLAGS "$TARGET_PATH" || \
+      error "Clean install failed - uninstall step encountered an error"
+
+    echo ""
+    success "Uninstall complete - proceeding with fresh installation"
+    echo ""
+  else
+    info "No existing Loom installation detected - proceeding with fresh install"
+    echo ""
+  fi
 fi
 
 echo ""
