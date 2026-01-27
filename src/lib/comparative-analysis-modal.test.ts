@@ -7,7 +7,7 @@
  * @see Issue #1113 - Add Comparative Analysis UI for experiments
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import * as abTesting from "./ab-testing";
 
 // Mock the ab-testing module

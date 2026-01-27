@@ -237,9 +237,7 @@ export async function getSuccessFactorsForRole(
  * @param workspacePath - Path to the workspace
  * @returns Analysis summary with insights
  */
-export async function runCorrelationAnalysis(
-  workspacePath: string
-): Promise<CorrelationSummary> {
+export async function runCorrelationAnalysis(workspacePath: string): Promise<CorrelationSummary> {
   try {
     return await invoke<CorrelationSummary>("run_correlation_analysis", {
       workspacePath,

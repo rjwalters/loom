@@ -735,8 +735,8 @@ async function showSettingsView(workspacePath: string, modal: ModalBuilder): Pro
 
         const newSchedule: ReportSchedule = {
           enabled: enabled ?? true,
-          dayOfWeek: isNaN(dayOfWeek) ? 1 : dayOfWeek,
-          hourOfDay: isNaN(hourOfDay) ? 9 : hourOfDay,
+          dayOfWeek: Number.isNaN(dayOfWeek) ? 1 : dayOfWeek,
+          hourOfDay: Number.isNaN(hourOfDay) ? 9 : hourOfDay,
           timezoneOffset: new Date().getTimezoneOffset(),
         };
 

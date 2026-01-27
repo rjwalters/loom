@@ -1,7 +1,10 @@
 {
-  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
-  "organizeImports": {
-    "enabled": true
+  "$schema": "https://biomejs.dev/schemas/2.3.12/schema.json",
+  "root": false,
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
   },
   "linter": {
     "enabled": true,
@@ -15,6 +18,6 @@
     "indentWidth": 2
   },
   "files": {
-    "ignore": ["dist/", "node_modules/", ".wrangler/"]
+    "ignoreUnknown": false
   }
 }

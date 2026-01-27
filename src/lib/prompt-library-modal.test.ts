@@ -290,9 +290,7 @@ describe("date formatting", () => {
       const diffYesterday = Math.floor(
         (now.getTime() - yesterday.getTime()) / (1000 * 60 * 60 * 24)
       );
-      const diffLastWeek = Math.floor(
-        (now.getTime() - lastWeek.getTime()) / (1000 * 60 * 60 * 24)
-      );
+      const diffLastWeek = Math.floor((now.getTime() - lastWeek.getTime()) / (1000 * 60 * 60 * 24));
 
       expect(diffYesterday).toBe(1);
       expect(diffLastWeek).toBe(7);

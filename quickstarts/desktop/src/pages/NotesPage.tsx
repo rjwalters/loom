@@ -1,10 +1,10 @@
+import { Edit2, Plus, Save, Trash2, X } from "lucide-react";
 import { useState } from "react";
-import { Plus, Trash2, Edit2, Save, X } from "lucide-react";
-import { useDatabase } from "@/hooks/use-database";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { useToast } from "@/components/ui/toaster";
+import { useDatabase } from "@/hooks/use-database";
 
 export function NotesPage() {
   const { notes, isLoading, error, createNote, updateNote, deleteNote } =
@@ -41,7 +41,10 @@ export function NotesPage() {
     try {
       await updateNote(editingId, editTitle, editContent);
       setEditingId(null);
-      toast({ title: "Note saved", description: "Your changes have been saved." });
+      toast({
+        title: "Note saved",
+        description: "Your changes have been saved.",
+      });
     } catch (e) {
       toast({
         title: "Error",
@@ -54,7 +57,10 @@ export function NotesPage() {
   const handleDelete = async (id: number) => {
     try {
       await deleteNote(id);
-      toast({ title: "Note deleted", description: "The note has been removed." });
+      toast({
+        title: "Note deleted",
+        description: "The note has been removed.",
+      });
     } catch (e) {
       toast({
         title: "Error",

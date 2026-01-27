@@ -1,10 +1,16 @@
-import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
-import { useTheme } from "@/hooks/use-theme";
-import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { ExternalLink, Folder } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import { useTheme } from "@/hooks/use-theme";
 
 export function SettingsPage() {
   const { theme, setTheme, resolvedTheme } = useTheme();
@@ -87,7 +93,12 @@ export function SettingsPage() {
                 <code className="flex-1 rounded-md bg-muted px-3 py-2 text-sm font-mono overflow-x-auto">
                   {appDataDir || "Loading..."}
                 </code>
-                <Button variant="outline" size="icon" onClick={openAppDataDir} disabled={!appDataDir}>
+                <Button
+                  variant="outline"
+                  size="icon"
+                  onClick={openAppDataDir}
+                  disabled={!appDataDir}
+                >
                   <Folder className="h-4 w-4" />
                 </Button>
               </div>

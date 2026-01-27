@@ -6,7 +6,7 @@ import type { JwtPayload } from "../types";
 export async function createJwt(
   payload: Omit<JwtPayload, "iat" | "exp">,
   secret: string,
-  expiresIn: string
+  expiresIn: string,
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const exp = now + parseExpiration(expiresIn);
@@ -30,7 +30,10 @@ export async function createJwt(
 /**
  * Verify and decode a JWT token
  */
-export async function verifyJwt(token: string, secret: string): Promise<JwtPayload> {
+export async function verifyJwt(
+  token: string,
+  secret: string,
+): Promise<JwtPayload> {
   const parts = token.split(".");
   if (parts.length !== 3) {
     throw new Error("Invalid token format");
@@ -70,7 +73,7 @@ async function sign(data: string, secret: string): Promise<string> {
     keyData,
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"]
+    ["sign"],
   );
 
   const signature = await crypto.subtle.sign("HMAC", key, dataBuffer);

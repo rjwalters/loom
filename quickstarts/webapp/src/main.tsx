@@ -1,9 +1,9 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
-import { ThemeProvider } from "@/hooks/use-theme";
-import { AuthProvider } from "@/hooks/use-auth";
 import { Toaster } from "@/components/ui/toaster";
+import { AuthProvider } from "@/hooks/use-auth";
+import { ThemeProvider } from "@/hooks/use-theme";
 import App from "./App";
 import "./styles/globals.css";
 
@@ -20,5 +20,5 @@ createRoot(root).render(
         </AuthProvider>
       </ThemeProvider>
     </BrowserRouter>
-  </StrictMode>
+  </StrictMode>,
 );

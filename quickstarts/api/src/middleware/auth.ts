@@ -1,7 +1,7 @@
 import type { MiddlewareHandler } from "hono";
 import { HTTPException } from "hono/http-exception";
-import type { Env, JwtPayload } from "../types";
 import { verifyJwt } from "../lib/jwt";
+import type { Env, JwtPayload } from "../types";
 
 declare module "hono" {
   interface ContextVariableMap {
@@ -12,11 +12,16 @@ declare module "hono" {
 /**
  * Authentication middleware - validates JWT token
  */
-export const requireAuth: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+export const requireAuth: MiddlewareHandler<{ Bindings: Env }> = async (
+  c,
+  next,
+) => {
   const authHeader = c.req.header("Authorization");
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    throw new HTTPException(401, { message: "Missing or invalid authorization header" });
+    throw new HTTPException(401, {
+      message: "Missing or invalid authorization header",
+    });
   }
 
   const token = authHeader.substring(7);
@@ -54,7 +59,10 @@ export const requireRole = (
 /**
  * Optional auth - sets user if token present, continues otherwise
  */
-export const optionalAuth: MiddlewareHandler<{ Bindings: Env }> = async (c, next) => {
+export const optionalAuth: MiddlewareHandler<{ Bindings: Env }> = async (
+  c,
+  next,
+) => {
   const authHeader = c.req.header("Authorization");
 
   if (authHeader?.startsWith("Bearer ")) {

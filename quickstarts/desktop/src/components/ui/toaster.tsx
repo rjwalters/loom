@@ -1,6 +1,6 @@
-import * as React from "react";
 import * as ToastPrimitive from "@radix-ui/react-toast";
 import { X } from "lucide-react";
+import * as React from "react";
 import { cn } from "@/lib/utils";
 
 interface Toast {
@@ -15,7 +15,7 @@ interface ToastContextValue {
 }
 
 const ToastContext = React.createContext<ToastContextValue | undefined>(
-  undefined
+  undefined,
 );
 
 export function useToast() {
@@ -48,7 +48,7 @@ export function Toaster() {
               "group pointer-events-auto relative flex w-full items-center justify-between space-x-4 overflow-hidden rounded-md border p-6 pr-8 shadow-lg transition-all",
               t.variant === "destructive"
                 ? "border-destructive bg-destructive text-destructive-foreground"
-                : "border-border bg-background text-foreground"
+                : "border-border bg-background text-foreground",
             )}
             onOpenChange={(open) => {
               if (!open) removeToast(t.id);

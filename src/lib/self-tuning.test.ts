@@ -45,7 +45,7 @@ describe("self-tuning", () => {
     });
 
     it("formats unknown units with two decimals", () => {
-      expect(formatParameterValue(3.14159, "unknown")).toBe("3.14");
+      expect(formatParameterValue(Math.PI, "unknown")).toBe("3.14");
     });
   });
 

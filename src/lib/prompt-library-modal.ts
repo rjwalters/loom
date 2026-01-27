@@ -6,24 +6,24 @@
  * Templates can be copied for reuse or viewed in detail with metrics.
  */
 
+import { Logger } from "./logger";
 import { ModalBuilder } from "./modal-builder";
 import { getAppState } from "./state";
 import {
+  calculateTemplateHealth,
+  describeTemplate,
+  formatSuccessRate,
+  formatTemplate,
+  getCategoryBadgeClass,
+  getHealthColorClass,
+  getHealthRating,
+  getSuccessRateColorClass,
+  getTemplateStats,
+  getTemplates,
   type PromptTemplate,
   type TemplateStats,
-  getTemplates,
-  getTemplateStats,
-  formatSuccessRate,
-  getSuccessRateColorClass,
-  getCategoryBadgeClass,
-  calculateTemplateHealth,
-  getHealthRating,
-  getHealthColorClass,
-  describeTemplate,
-  formatTemplate,
 } from "./template-generation";
 import { showToast } from "./toast";
-import { Logger } from "./logger";
 
 const logger = Logger.forComponent("prompt-library-modal");
 
@@ -658,7 +658,7 @@ function showTemplateDetailsModal(template: PromptTemplate): void {
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
           ${createStatCard("Success Rate", formatSuccessRate(template.success_rate), `${template.success_count} successes, ${template.failure_count} failures`, getSuccessRateColorClass(template.success_rate))}
           ${createStatCard("Times Used", String(template.times_used), "Total instantiations")}
-          ${createStatCard("Source Patterns", String(template.source_pattern_count), formatSuccessRate(template.source_success_rate) + " source success")}
+          ${createStatCard("Source Patterns", String(template.source_pattern_count), `${formatSuccessRate(template.source_success_rate)} source success`)}
           ${createStatCard("Retirement Threshold", formatSuccessRate(template.retirement_threshold), "Min success to stay active")}
         </div>
       </div>
@@ -714,7 +714,7 @@ function capitalizeFirst(str: string): string {
  */
 function truncateText(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
-  return text.slice(0, maxLength - 3) + "...";
+  return `${text.slice(0, maxLength - 3)}...`;
 }
 
 /**

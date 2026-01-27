@@ -33,9 +33,9 @@ import {
   type TrendDirection,
   type VelocitySummary,
 } from "./agent-metrics";
+import { Logger } from "./logger";
 import { ModalBuilder } from "./modal-builder";
 import { getAppState } from "./state";
-import { Logger } from "./logger";
 
 const logger = Logger.forComponent("intelligence-dashboard");
 
@@ -298,9 +298,11 @@ function createAgentStatusSection(terminals: TerminalStatus[]): string {
     .slice(0, 8) // Show max 8 agents
     .map((terminal) => {
       const statusColors = {
-        active: "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-green-300 dark:border-green-700",
+        active:
+          "bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 border-green-300 dark:border-green-700",
         idle: "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 border-gray-300 dark:border-gray-600",
-        error: "bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 border-red-300 dark:border-red-700",
+        error:
+          "bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 border-red-300 dark:border-red-700",
       };
 
       const statusDots = {
@@ -336,12 +338,16 @@ function createAgentStatusSection(terminals: TerminalStatus[]): string {
             <span class="w-2 h-2 rounded-full bg-gray-400"></span>
             <span class="text-gray-600 dark:text-gray-400">${idleCount} idle</span>
           </span>
-          ${errorCount > 0 ? `
+          ${
+            errorCount > 0
+              ? `
             <span class="flex items-center gap-1">
               <span class="w-2 h-2 rounded-full bg-red-500"></span>
               <span class="text-red-600 dark:text-red-400">${errorCount} error</span>
             </span>
-          ` : ""}
+          `
+              : ""
+          }
         </div>
       </div>
       <div class="flex flex-wrap gap-2">

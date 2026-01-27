@@ -1,10 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
-import App from "./App";
-import { ThemeProvider } from "@/hooks/use-theme";
-import { DatabaseProvider } from "@/hooks/use-database";
 import { Toaster } from "@/components/ui/toaster";
+import { DatabaseProvider } from "@/hooks/use-database";
+import { ThemeProvider } from "@/hooks/use-theme";
+import App from "./App";
 import "./styles/globals.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
@@ -17,5 +17,5 @@ ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
         </DatabaseProvider>
       </ThemeProvider>
     </BrowserRouter>
-  </React.StrictMode>
+  </React.StrictMode>,
 );

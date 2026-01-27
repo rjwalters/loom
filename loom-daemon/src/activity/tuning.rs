@@ -396,7 +396,8 @@ pub fn get_tunable_parameters(conn: &Connection) -> rusqlite::Result<Vec<Tunable
 
     let rows = stmt.query_map([], |row| {
         let updated_at_str: String = row.get(8)?;
-        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
+            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
         Ok(TunableParameter {
             name: row.get(0)?,
@@ -546,7 +547,8 @@ fn map_proposal(row: &rusqlite::Row<'_>) -> rusqlite::Result<TuningProposal> {
         status: ProposalStatus::from_str(&status_str).unwrap_or(ProposalStatus::Pending),
         confidence: row.get(8)?,
         requires_approval: row.get(9)?,
-        created_at: DateTime::parse_from_rfc3339(&created_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
+        created_at: DateTime::parse_from_rfc3339(&created_at_str)
+            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
         applied_at: applied_at_str.and_then(|s| {
             DateTime::parse_from_rfc3339(&s)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -664,7 +666,8 @@ pub fn get_effectiveness_history(
     let rows = stmt.query_map(params![days_str], |row| {
         let timestamp_str: String = row.get(0)?;
         Ok(EffectivenessSnapshot {
-            timestamp: DateTime::parse_from_rfc3339(&timestamp_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
+            timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
             success_rate: row.get(1)?,
             avg_cycle_time_hours: row.get(2)?,
             avg_cost_per_task: row.get(3)?,
@@ -701,7 +704,8 @@ pub fn get_parameter_history(
             proposal_id: row.get(4)?,
             changed_by: row.get(5)?,
             reason: row.get(6)?,
-            timestamp: DateTime::parse_from_rfc3339(&timestamp_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
+            timestamp: DateTime::parse_from_rfc3339(&timestamp_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc)),
         })
     })?;
 
@@ -937,9 +941,7 @@ fn analyze_parameter(
         evidence: format!(
             "Success trend: {:.2}%, Recent success rate: {:.2}%",
             success_trend * 100.0,
-            snapshots
-                .first()
-                .map_or(0.0, |s| s.success_rate * 100.0)
+            snapshots.first().map_or(0.0, |s| s.success_rate * 100.0)
         ),
         status,
         confidence,
@@ -982,7 +984,8 @@ pub fn check_for_rollbacks(conn: &Connection, config: &TuningConfig) -> rusqlite
 
     // Get effectiveness before and after each proposal was applied
     for (proposal_id, param_name, old_value, applied_at_str) in recent_applied {
-        let applied_at = DateTime::parse_from_rfc3339(&applied_at_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+        let applied_at = DateTime::parse_from_rfc3339(&applied_at_str)
+            .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
         // Get success rate before the change
         let before_rate: Option<f64> = conn

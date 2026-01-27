@@ -1504,7 +1504,7 @@ export async function handleTerminalTool(
       return [
         {
           type: "text",
-          text: `${header}${filterInfo ? filterInfo + "\n\n" : "\n"}${output}`,
+          text: `${header}${filterInfo ? `${filterInfo}\n\n` : "\n"}${output}`,
         },
       ];
     }
