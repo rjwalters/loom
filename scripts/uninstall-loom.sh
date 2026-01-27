@@ -476,7 +476,11 @@ fi
 if [[ "$NON_INTERACTIVE" != "true" ]]; then
   TOTAL_REMOVALS=$(( ${#REMOVE_FILES[@]} + ${#REMOVE_UNKNOWN_FILES[@]} + ${#SMART_REMOVE_FILES[@]} ))
   echo ""
-  warning "This will modify $TOTAL_REMOVALS files in a new branch and create a PR."
+  if [[ "$LOCAL_MODE" == "true" ]]; then
+    warning "This will modify $TOTAL_REMOVALS files in the working directory."
+  else
+    warning "This will modify $TOTAL_REMOVALS files in a new branch and create a PR."
+  fi
   read -r -p "Proceed with uninstall? [y/N] " -n 1 PROCEED
   echo ""
   if [[ ! $PROCEED =~ ^[Yy]$ ]]; then
