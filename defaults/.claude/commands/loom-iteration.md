@@ -469,6 +469,12 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
     if not verify_task_spawn(result, f"shepherd for #{issue}"):
         return {"success": False, "error": "verification_failed"}
 
+    # Double-check task_id format to catch fabricated IDs
+    # Real Task tool IDs are 7-char hex (e.g., 'a7dc1e0'), not 'shepherd-123456'
+    if not validate_task_id(result.task_id):
+        debug(f"Task ID format invalid: '{result.task_id}' - Task tool may not have been invoked")
+        return {"success": False, "error": f"invalid_task_id_format: {result.task_id}"}
+
     return {
         "success": True,
         "task_id": result.task_id,
@@ -488,6 +494,79 @@ def record_shepherd_assignment_tmux(state, issue, tmux_session):
         "tmux_session": tmux_session,
         "started": now(),
         "execution_mode": "tmux"
+    }
+    save_daemon_state(state)
+
+
+def validate_task_id(task_id):
+    """Validate that a task_id matches the expected format from the Task tool.
+
+    Real Task tool task IDs are 7-character lowercase hexadecimal strings (e.g., 'a7dc1e0', 'abeb2e8').
+    Fabricated task IDs typically look like 'auditor-1769471216' or 'champion-12345'.
+
+    Returns True if valid, False if fabricated or malformed.
+    """
+    if not task_id or not isinstance(task_id, str):
+        return False
+
+    # Real task IDs are 7-char hex strings
+    import re
+    return bool(re.match(r'^[a-f0-9]{7}$', task_id))
+
+
+def record_support_role(state, role_name, task_id, output_file):
+    """Record support role assignment in daemon state with task_id validation.
+
+    Validates the task_id format before recording to prevent fabricated IDs
+    (e.g., 'auditor-1769471216') from being stored in daemon-state.json.
+    Only real Task tool IDs (7-char hex UUIDs like 'a7dc1e0') are accepted.
+    """
+    # Validate task_id format before recording
+    if not validate_task_id(task_id):
+        raise ValueError(
+            f"Invalid task_id format for {role_name}: '{task_id}' "
+            f"(expected 7-char hex UUID like 'a7dc1e0', got fabricated string). "
+            f"The Task tool was likely not actually invoked."
+        )
+
+    if "support_roles" not in state:
+        state["support_roles"] = {}
+
+    state["support_roles"][role_name] = {
+        "status": "running",
+        "task_id": task_id,
+        "output_file": output_file,
+        "started_at": now()
+    }
+    save_daemon_state(state)
+
+
+def record_shepherd_assignment(state, issue, task_id, output_file):
+    """Record shepherd assignment for direct mode with task_id validation.
+
+    Validates the task_id format before recording to prevent fabricated IDs
+    from being stored in daemon-state.json.
+    """
+    # Validate task_id format before recording
+    if not validate_task_id(task_id):
+        raise ValueError(
+            f"Invalid task_id format for shepherd (issue #{issue}): '{task_id}' "
+            f"(expected 7-char hex UUID like 'a7dc1e0', got fabricated string). "
+            f"The Task tool was likely not actually invoked."
+        )
+
+    if "shepherds" not in state:
+        state["shepherds"] = {}
+
+    # Find next available shepherd slot
+    shepherd_id = find_next_shepherd_id(state)
+    state["shepherds"][shepherd_id] = {
+        "status": "working",
+        "issue": issue,
+        "task_id": task_id,
+        "output_file": output_file,
+        "started": now(),
+        "execution_mode": "direct"
     }
     save_daemon_state(state)
 ```
@@ -586,15 +665,25 @@ Complete one work generation iteration. Create a proposal issue with the loom:ar
         run_in_background=True
     )
 
-    if verify_task_spawn(result, "Architect"):
-        record_support_role(state, "architect", result.task_id, result.output_file)
-        state["last_architect_trigger"] = now()
-        save_daemon_state(state)
-        print(f"  AUTO-TRIGGERED: Architect (work generation, verified)")
-        return True
-    else:
+    if not verify_task_spawn(result, "Architect"):
         print(f"  SPAWN FAILED: Architect verification failed")
         return False
+
+    # Validate task_id format to catch fabricated IDs
+    if not validate_task_id(result.task_id):
+        print(f"  SPAWN FAILED: Architect - fabricated task_id: '{result.task_id}'")
+        return False
+
+    try:
+        record_support_role(state, "architect", result.task_id, result.output_file)
+    except ValueError as e:
+        print(f"  SPAWN FAILED: Architect - {e}")
+        return False
+
+    state["last_architect_trigger"] = now()
+    save_daemon_state(state)
+    print(f"  AUTO-TRIGGERED: Architect (work generation, verified, task_id={result.task_id})")
+    return True
 
 
 def trigger_hermit_role(state, debug_mode=False):
@@ -618,15 +707,25 @@ Complete one simplification analysis iteration. Create a proposal issue with the
         run_in_background=True
     )
 
-    if verify_task_spawn(result, "Hermit"):
-        record_support_role(state, "hermit", result.task_id, result.output_file)
-        state["last_hermit_trigger"] = now()
-        save_daemon_state(state)
-        print(f"  AUTO-TRIGGERED: Hermit (simplification analysis, verified)")
-        return True
-    else:
+    if not verify_task_spawn(result, "Hermit"):
         print(f"  SPAWN FAILED: Hermit verification failed")
         return False
+
+    # Validate task_id format to catch fabricated IDs
+    if not validate_task_id(result.task_id):
+        print(f"  SPAWN FAILED: Hermit - fabricated task_id: '{result.task_id}'")
+        return False
+
+    try:
+        record_support_role(state, "hermit", result.task_id, result.output_file)
+    except ValueError as e:
+        print(f"  SPAWN FAILED: Hermit - {e}")
+        return False
+
+    state["last_hermit_trigger"] = now()
+    save_daemon_state(state)
+    print(f"  AUTO-TRIGGERED: Hermit (simplification analysis, verified, task_id={result.task_id})")
+    return True
 ```
 
 ## Workflow Demand (Demand-Based Spawning)
@@ -778,13 +877,26 @@ Complete one PR review iteration."""
         run_in_background=True
     )
 
-    if verify_task_spawn(result, role_name.capitalize()):
-        record_support_role(state, role_name, result.task_id, result.output_file)
-        print(f"  AUTO-SPAWNED: {role_name.capitalize()} (verified)")
-        return True
-    else:
+    if not verify_task_spawn(result, role_name.capitalize()):
         print(f"  SPAWN FAILED: {role_name.capitalize()} - verification failed")
         return False
+
+    # Validate task_id format to catch fabricated IDs (e.g., 'auditor-1769471216')
+    # Real Task tool IDs are 7-char hex strings (e.g., 'a7dc1e0')
+    if not validate_task_id(result.task_id):
+        print(f"  SPAWN FAILED: {role_name.capitalize()} - fabricated task_id: '{result.task_id}'")
+        print(f"    Expected 7-char hex UUID, got non-Task-tool string")
+        print(f"    The Task tool was likely not actually invoked")
+        return False
+
+    try:
+        record_support_role(state, role_name, result.task_id, result.output_file)
+    except ValueError as e:
+        print(f"  SPAWN FAILED: {role_name.capitalize()} - {e}")
+        return False
+
+    print(f"  AUTO-SPAWNED: {role_name.capitalize()} (verified, task_id={result.task_id})")
+    return True
 ```
 
 ## Check Support Role Completions
@@ -811,6 +923,19 @@ def check_support_role_completions(state, debug_mode=False):
 
         task_id = role_info.get("task_id")
         if not task_id:
+            continue
+
+        # Detect fabricated task IDs already in state (from previous buggy iterations)
+        # Real Task tool IDs are 7-char hex (e.g., 'a7dc1e0'), not 'auditor-1769471216'
+        if not validate_task_id(task_id):
+            debug(f"WARNING: {role_name.capitalize()} has fabricated task_id in state: '{task_id}'")
+            debug(f"  Resetting {role_name} to idle (task was never actually spawned)")
+            role_info["status"] = "idle"
+            role_info["last_completed"] = now_iso
+            role_info["last_error"] = f"fabricated_task_id: {task_id}"
+            role_info["task_id"] = None
+            role_info["output_file"] = None
+            completed_roles.append(role_name)
             continue
 
         try:
