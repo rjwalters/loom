@@ -409,15 +409,15 @@ pub fn initialize_workspace(
     let roles_src = defaults.join("roles");
     let roles_dst = loom_path.join("roles");
     if roles_src.exists() {
-        if !is_reinstall {
-            // Fresh install: copy all
-            copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
-                .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
-        } else {
+        if is_reinstall {
             // Reinstall: always force-merge to update default roles
             // Custom roles (files not in defaults) are preserved
             force_merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
                 .map_err(|e| format!("Failed to force-merge roles directory: {e}"))?;
+        } else {
+            // Fresh install: copy all
+            copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
+                .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
         }
     }
 
@@ -426,15 +426,15 @@ pub fn initialize_workspace(
     let scripts_src = defaults.join("scripts");
     let scripts_dst = loom_path.join("scripts");
     if scripts_src.exists() {
-        if !is_reinstall {
-            // Fresh install: copy all
-            copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
-                .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
-        } else {
+        if is_reinstall {
             // Reinstall: always force-merge to update default scripts
             // Custom scripts (files not in defaults) are preserved
             force_merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
                 .map_err(|e| format!("Failed to force-merge scripts directory: {e}"))?;
+        } else {
+            // Fresh install: copy all
+            copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
+                .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
         }
     }
 
@@ -1812,13 +1812,13 @@ mod tests {
         // Create existing CLAUDE.md with project-specific content (no markers)
         fs::write(
             workspace.join("CLAUDE.md"),
-            r#"# My Awesome Project
+            r"# My Awesome Project
 
 This project does amazing things with Rust.
 
 ## Getting Started
 
-Run `cargo run` to start."#,
+Run `cargo run` to start.",
         )
         .unwrap();
 
@@ -1864,7 +1864,7 @@ Run `cargo run` to start."#,
         // Create existing CLAUDE.md WITHOUT markers (e.g., from previous install or manual creation)
         fs::write(
             workspace.join("CLAUDE.md"),
-            r#"# Lean Genius Project
+            r"# Lean Genius Project
 
 Formal mathematics in Lean 4.
 
@@ -1875,7 +1875,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
 ## Custom Agents
 
 - Erdos: Mathematical proof orchestrator
-- Aristotle: Automated theorem prover"#,
+- Aristotle: Automated theorem prover",
         )
         .unwrap();
 
@@ -1923,7 +1923,7 @@ WARNING: Never run `lake build` inside Docker - causes memory corruption.
 
         // Create existing CLAUDE.md with markers (previous install)
         let existing = format!(
-            r#"# My Project
+            r"# My Project
 
 Project docs here.
 
@@ -1931,7 +1931,7 @@ Project docs here.
 # Loom Orchestration - Repository Guide
 
 Old Loom content v1.0.
-{}"#,
+{}",
             LOOM_SECTION_START, LOOM_SECTION_END
         );
         fs::write(workspace.join("CLAUDE.md"), existing).unwrap();
