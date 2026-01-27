@@ -733,13 +733,52 @@ def trigger_hermit_role(state, debug_mode=False):
     return True
 ```
 
+## Deterministic Support Role Spawning
+
+Support role spawning uses the deterministic `spawn-support-role.sh` script for all
+spawn decisions and state management. This eliminates LLM interpretation variability
+and ensures reliable support role operation in direct mode.
+
+### spawn-support-role.sh
+
+The script handles:
+- **Interval checking**: Whether enough time has elapsed since last completion
+- **Idempotency**: Never spawns if role already running with valid task_id
+- **Demand mode**: Immediate spawn when `--demand` flag passed (skips interval)
+- **State management**: `--mark-running` and `--mark-completed` for atomic state updates
+- **Fabricated ID detection**: Resets roles stuck with invalid task IDs
+
+```bash
+# Check if a role should be spawned (interval-based)
+./.loom/scripts/spawn-support-role.sh guide --json
+# {"should_spawn":true,"reason":"interval_elapsed","role":"guide",...}
+
+# Check if a role should be spawned (demand-based, skips interval)
+./.loom/scripts/spawn-support-role.sh champion --demand --json
+# {"should_spawn":true,"reason":"demand","role":"champion"}
+
+# Check all roles at once
+./.loom/scripts/spawn-support-role.sh --check-all --json
+# {"roles":[...],"any_should_spawn":true}
+
+# After successful Task spawn, mark role as running
+./.loom/scripts/spawn-support-role.sh --mark-running champion --task-id a7dc1e0
+
+# After task completion, mark role as idle
+./.loom/scripts/spawn-support-role.sh --mark-completed champion
+```
+
 ## Workflow Demand (Demand-Based Spawning)
 
-The daemon spawns Champion/Doctor immediately when work awaits them, providing faster response than interval-based spawning:
+The daemon spawns Champion/Doctor/Judge immediately when work awaits them, providing faster response than interval-based spawning. Uses `spawn-support-role.sh --demand` to skip interval checks:
 
 ```python
 def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=False):
-    """Spawn roles immediately when work awaits them."""
+    """Spawn roles immediately when work awaits them.
+
+    Uses spawn-support-role.sh with --demand flag for deterministic spawn decisions.
+    The script checks idempotency (not already running) even in demand mode.
+    """
 
     def debug(msg):
         if debug_mode:
@@ -753,9 +792,15 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
         pr_count = len(prs_ready)
         debug(f"Champion demand detected: {pr_count} PRs ready to merge")
 
-        if trigger_support_role(state, "champion", f"Champion (on-demand, {pr_count} PRs)", debug_mode):
-            demand_spawned["champion"] = True
-            print(f"  AUTO-SPAWNED: Champion (on-demand, {pr_count} PRs ready to merge)")
+        # Use deterministic script to check if spawn is allowed
+        check = run("./.loom/scripts/spawn-support-role.sh champion --demand --json")
+        check_data = json.loads(check)
+        if check_data["should_spawn"]:
+            if trigger_support_role(state, "champion", f"Champion (on-demand, {pr_count} PRs)", debug_mode):
+                demand_spawned["champion"] = True
+                print(f"  AUTO-SPAWNED: Champion (on-demand, {pr_count} PRs ready to merge)")
+        else:
+            debug(f"Champion demand skipped: {check_data['reason']}")
 
     # Doctor on-demand: PRs need fixes
     if "spawn_doctor_demand" in recommended_actions:
@@ -763,9 +808,14 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
         pr_count = len(prs_needing_fixes)
         debug(f"Doctor demand detected: {pr_count} PRs need fixes")
 
-        if trigger_support_role(state, "doctor", f"Doctor (on-demand, {pr_count} PRs)", debug_mode):
-            demand_spawned["doctor"] = True
-            print(f"  AUTO-SPAWNED: Doctor (on-demand, {pr_count} PRs need fixes)")
+        check = run("./.loom/scripts/spawn-support-role.sh doctor --demand --json")
+        check_data = json.loads(check)
+        if check_data["should_spawn"]:
+            if trigger_support_role(state, "doctor", f"Doctor (on-demand, {pr_count} PRs)", debug_mode):
+                demand_spawned["doctor"] = True
+                print(f"  AUTO-SPAWNED: Doctor (on-demand, {pr_count} PRs need fixes)")
+        else:
+            debug(f"Doctor demand skipped: {check_data['reason']}")
 
     # Judge on-demand: PRs need review
     if "spawn_judge_demand" in recommended_actions:
@@ -773,18 +823,29 @@ def check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode=
         pr_count = len(prs_needing_review)
         debug(f"Judge demand detected: {pr_count} PRs need review")
 
-        if trigger_support_role(state, "judge", f"Judge (on-demand, {pr_count} PRs)", debug_mode):
-            demand_spawned["judge"] = True
-            print(f"  AUTO-SPAWNED: Judge (on-demand, {pr_count} PRs need review)")
+        check = run("./.loom/scripts/spawn-support-role.sh judge --demand --json")
+        check_data = json.loads(check)
+        if check_data["should_spawn"]:
+            if trigger_support_role(state, "judge", f"Judge (on-demand, {pr_count} PRs)", debug_mode):
+                demand_spawned["judge"] = True
+                print(f"  AUTO-SPAWNED: Judge (on-demand, {pr_count} PRs need review)")
+        else:
+            debug(f"Judge demand skipped: {check_data['reason']}")
 
     return demand_spawned
 ```
 
 ## Auto-Ensure Support Roles (Interval-Based)
 
+Uses `spawn-support-role.sh` (without `--demand`) for interval-based spawn decisions:
+
 ```python
 def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_mode=False, demand_spawned=None):
-    """Automatically keep Guide, Champion, Doctor, Auditor, and Judge running."""
+    """Automatically keep Guide, Champion, Doctor, Auditor, and Judge running.
+
+    Uses spawn-support-role.sh for deterministic interval checking. The script
+    handles all interval math, idempotency, and fabricated task_id detection.
+    """
 
     if demand_spawned is None:
         demand_spawned = {"champion": False, "doctor": False, "judge": False}
@@ -795,29 +856,42 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
 
     ensured_roles = {"guide": False, "champion": False, "doctor": False, "auditor": False, "judge": False}
 
-    debug("Checking support roles via recommended_actions (interval-based)")
+    debug("Checking support roles via spawn-support-role.sh (interval-based)")
     debug(f"Recommended actions: {recommended_actions}")
     debug(f"Demand-spawned: {demand_spawned}")
 
-    # Guide - backlog triage
-    if "trigger_guide" in recommended_actions:
-        ensured_roles["guide"] = trigger_support_role(state, "guide", "Guide backlog triage", debug_mode)
+    # Define which roles to check and their trigger actions
+    role_checks = [
+        ("guide", "trigger_guide", "Guide backlog triage", False),
+        ("champion", "trigger_champion", "Champion PR merge", demand_spawned.get("champion", False)),
+        ("doctor", "trigger_doctor", "Doctor PR conflict resolution", demand_spawned.get("doctor", False)),
+        ("auditor", "trigger_auditor", "Auditor main branch validation", False),
+        ("judge", "trigger_judge", "Judge PR review", demand_spawned.get("judge", False)),
+    ]
 
-    # Champion - PR merging (skip if demand-spawned this iteration)
-    if not demand_spawned.get("champion") and "trigger_champion" in recommended_actions:
-        ensured_roles["champion"] = trigger_support_role(state, "champion", "Champion PR merge", debug_mode)
+    for role_name, trigger_action, description, already_spawned in role_checks:
+        # Skip if demand already spawned this role
+        if already_spawned:
+            debug(f"Skipping {role_name}: already demand-spawned this iteration")
+            continue
 
-    # Doctor - PR conflict resolution (skip if demand-spawned this iteration)
-    if not demand_spawned.get("doctor") and "trigger_doctor" in recommended_actions:
-        ensured_roles["doctor"] = trigger_support_role(state, "doctor", "Doctor PR conflict resolution", debug_mode)
+        # Skip if not in recommended actions
+        if trigger_action not in recommended_actions:
+            continue
 
-    # Auditor - main branch validation
-    if "trigger_auditor" in recommended_actions:
-        ensured_roles["auditor"] = trigger_support_role(state, "auditor", "Auditor main branch validation", debug_mode)
+        # Use deterministic script to check if spawn is needed
+        check = run(f"./.loom/scripts/spawn-support-role.sh {role_name} --json")
+        try:
+            check_data = json.loads(check)
+        except Exception:
+            debug(f"Failed to parse spawn-support-role.sh output for {role_name}")
+            continue
 
-    # Judge - PR review (skip if demand-spawned this iteration)
-    if not demand_spawned.get("judge") and "trigger_judge" in recommended_actions:
-        ensured_roles["judge"] = trigger_support_role(state, "judge", "Judge PR review", debug_mode)
+        if check_data["should_spawn"]:
+            debug(f"{role_name}: spawn needed ({check_data['reason']})")
+            ensured_roles[role_name] = trigger_support_role(state, role_name, description, debug_mode)
+        else:
+            debug(f"{role_name}: spawn not needed ({check_data['reason']})")
 
     return ensured_roles
 
@@ -827,6 +901,9 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
 
     Uses slash command directly - Claude Code executes /role natively.
     This avoids the Skill-in-Task anti-pattern that expands role prompts into subagent context.
+
+    After successful spawn, uses spawn-support-role.sh --mark-running to
+    record the task_id in daemon-state.json atomically.
     """
 
     def debug(msg):
@@ -866,11 +943,19 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
         print(f"    The Task tool was likely not actually invoked")
         return False
 
-    try:
-        record_support_role(state, role_name, result.task_id, result.output_file)
-    except ValueError as e:
-        print(f"  SPAWN FAILED: {role_name.capitalize()} - {e}")
-        return False
+    # Use deterministic script to record state atomically
+    mark_result = run(f"./.loom/scripts/spawn-support-role.sh --mark-running {role_name} --task-id {result.task_id}")
+    debug(f"State update: {mark_result.strip()}")
+
+    # Also update in-memory state for consistency within this iteration
+    if "support_roles" not in state:
+        state["support_roles"] = {}
+    state["support_roles"][role_name] = {
+        "status": "running",
+        "task_id": result.task_id,
+        "output_file": result.output_file,
+        "started_at": now()
+    }
 
     print(f"  AUTO-SPAWNED: {role_name.capitalize()} (verified, task_id={result.task_id})")
     return True
@@ -878,9 +963,15 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
 
 ## Check Support Role Completions
 
+Uses `spawn-support-role.sh --mark-completed` for atomic state transitions:
+
 ```python
 def check_support_role_completions(state, debug_mode=False):
-    """Check if any support roles have completed and update their state."""
+    """Check if any support roles have completed and update their state.
+
+    Uses spawn-support-role.sh --mark-completed for atomic state updates
+    when a role transitions from running to idle.
+    """
 
     def debug(msg):
         if debug_mode:
@@ -907,6 +998,9 @@ def check_support_role_completions(state, debug_mode=False):
         if not validate_task_id(task_id):
             debug(f"WARNING: {role_name.capitalize()} has fabricated task_id in state: '{task_id}'")
             debug(f"  Resetting {role_name} to idle (task was never actually spawned)")
+            # Use deterministic script for atomic state update
+            run(f"./.loom/scripts/spawn-support-role.sh --mark-completed {role_name}")
+            # Update in-memory state
             role_info["status"] = "idle"
             role_info["last_completed"] = now_iso
             role_info["last_error"] = f"fabricated_task_id: {task_id}"
@@ -920,6 +1014,9 @@ def check_support_role_completions(state, debug_mode=False):
             check = TaskOutput(task_id=task_id, block=False, timeout=1000)
 
             if check.status == "completed":
+                # Use deterministic script for atomic state update
+                run(f"./.loom/scripts/spawn-support-role.sh --mark-completed {role_name}")
+                # Update in-memory state
                 role_info["status"] = "idle"
                 role_info["last_completed"] = now_iso
                 role_info["task_id"] = None
@@ -929,6 +1026,9 @@ def check_support_role_completions(state, debug_mode=False):
                 debug(f"{role_name.capitalize()} completed (task {task_id})")
 
             elif check.status == "failed":
+                # Use deterministic script for atomic state update
+                run(f"./.loom/scripts/spawn-support-role.sh --mark-completed {role_name}")
+                # Update in-memory state
                 role_info["status"] = "idle"
                 role_info["last_completed"] = now_iso
                 role_info["last_error"] = "task_failed"
