@@ -23,6 +23,22 @@ In parent mode, you do MINIMAL work:
 
 The iteration subagent handles ALL orchestration logic. You just spawn it.
 
+## Script Infrastructure
+
+The daemon relies on deterministic bash scripts for critical operations. These scripts ensure consistent behavior and proper error handling:
+
+| Script | Purpose |
+|--------|---------|
+| `daemon-snapshot.sh` | Pipeline state assessment (replaces 10+ gh commands) |
+| `validate-daemon-state.sh` | Validates state file, catches fabricated task IDs |
+| `check-completions.sh` | Detects task completions and silent failures |
+| `spawn-shepherd-direct.sh` | Atomic shepherd spawning with rollback |
+| `spawn-support-role.sh` | Support role spawning with interval checking |
+| `stale-building-check.sh` | Recovers orphaned loom:building issues |
+| `recover-orphaned-shepherds.sh` | Recovers from daemon crashes |
+
+See `loom-iteration.md` for how these scripts are used in each iteration.
+
 ## Execution Modes
 
 The daemon automatically detects and uses the best available execution backend:

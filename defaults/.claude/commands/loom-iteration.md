@@ -10,19 +10,34 @@ You are the Layer 2 Loom Daemon running in ITERATION MODE in the {{workspace}} r
 
 In iteration mode, you:
 1. Load state from JSON
-2. Check shutdown signal
-3. Detect execution mode (mcp > tmux > direct)
-4. Assess system state via `daemon-snapshot.sh`
-5. Check subagent completions
-6. Auto-promote proposals (if force mode)
-7. Spawn shepherds for ready issues (using appropriate dispatch method)
-8. Trigger work generation
-9. Ensure support roles
-10. Detect stuck agents
-11. Save state to JSON
-12. **Return a compact 1-line summary and EXIT**
+2. **Validate state via `validate-daemon-state.sh`** (catches corrupted/fabricated IDs)
+3. Check shutdown signal
+4. Detect execution mode (mcp > tmux > direct)
+5. Assess system state via `daemon-snapshot.sh`
+6. **Check subagent completions via `check-completions.sh`** (detects silent failures)
+7. Auto-promote proposals (if force mode)
+8. Spawn shepherds for ready issues (using appropriate dispatch method)
+9. Trigger work generation
+10. Ensure support roles
+11. Detect stuck agents
+12. Save state to JSON
+13. **Return a compact 1-line summary and EXIT**
 
 **CRITICAL**: After completing the iteration, return ONLY the summary line. Do NOT loop. Do NOT spawn iteration subagents. The parent loop handles repetition.
+
+## Script Infrastructure
+
+The iteration relies on deterministic bash scripts for key operations:
+
+| Script | Purpose | When Called |
+|--------|---------|-------------|
+| `daemon-snapshot.sh` | Pipeline state assessment | Every iteration (step 5) |
+| `validate-daemon-state.sh` | State validation, task ID format checking | Every iteration (step 2) |
+| `check-completions.sh` | Task completion detection, silent failure recovery | Every iteration (step 6) |
+| `spawn-shepherd-direct.sh` | Atomic shepherd spawning with rollback | When spawning shepherds in direct mode |
+| `spawn-support-role.sh` | Support role spawning with interval checking | When triggering support roles |
+
+These scripts ensure deterministic behavior and proper error handling that would be difficult to achieve with LLM-interpreted pseudocode.
 
 ## Execution Mode Detection
 
@@ -106,6 +121,15 @@ def loom_iterate(force_mode=False, debug_mode=False):
     iteration = state.get("iteration", 0) + 1
     debug(f"Iteration {iteration} starting at {now()}")
 
+    # 1b. Validate state file to catch corruption and fabricated task IDs
+    # This catches issues like 'auditor-1769471216' before they cause problems
+    validation_result = run("./.loom/scripts/validate-daemon-state.sh --fix --json")
+    validation = json.loads(validation_result)
+    if not validation.get("valid"):
+        debug(f"State validation: {validation.get('error_count', 0)} errors fixed")
+        # Reload state after fixes
+        state = load_daemon_state(".loom/daemon-state.json")
+
     # 1b. Reconcile force_mode from argument and state
     # The argument takes precedence (it comes from the current daemon invocation)
     effective_force_mode = force_mode or state.get("force_mode", False)
@@ -142,16 +166,32 @@ def loom_iterate(force_mode=False, debug_mode=False):
     debug(f"Pipeline state: ready={ready_count} building={snapshot_data['computed']['total_building']}")
     debug(f"Recommended actions: {recommended_actions}")
 
-    # 4. Check subagent completions (non-blocking TaskOutput)
-    completions = check_all_completions(state)
-    if debug_mode and completions:
-        for c in completions:
-            debug(f"Completion detected: {c.agent_id} issue=#{c.issue} status={c.status}")
+    # 4. Check subagent completions via check-completions.sh (detects silent failures)
+    # This script checks task output files and progress files for completion markers,
+    # and detects orphaned issues (loom:building but no active task)
+    completions_result = run("./.loom/scripts/check-completions.sh --json")
+    completions_data = json.loads(completions_result)
 
-    # 4b. Check support role completions (Guide, Champion, Doctor, Auditor)
-    completed_support_roles = check_support_role_completions(state, debug_mode)
-    if completed_support_roles:
-        debug(f"Support roles completed: {completed_support_roles}")
+    # Log completion status
+    if completions_data["summary"]["completed_count"] > 0:
+        for entry in completions_data.get("completed", []):
+            debug(f"Completion detected: {entry}")
+
+    # Handle silent failures (issues left in loom:building after task exit)
+    if completions_data["summary"]["errored_count"] > 0:
+        debug(f"Silent failures detected: {completions_data['summary']['errored_count']}")
+        # Run recovery
+        run("./.loom/scripts/check-completions.sh --recover")
+
+    # 4b. Update state based on completions
+    completed_support_roles = completions_data.get("completed", [])
+    for entry in completed_support_roles:
+        if entry.startswith("support:"):
+            role_name = entry.split(":")[1]
+            if "support_roles" in state and role_name in state["support_roles"]:
+                state["support_roles"][role_name]["status"] = "idle"
+                state["support_roles"][role_name]["last_completed"] = now()
+                debug(f"Support role {role_name} completed")
 
     # 5. CRITICAL: Act on recommended_actions: promote_proposals (force mode only)
     promoted_count = 0
@@ -452,12 +492,32 @@ def dispatch_shepherd_tmux(issue, shepherd_flag, idle_shepherds, state, debug_mo
 
 
 def dispatch_shepherd_direct(issue, shepherd_flag, debug_mode=False):
-    """Dispatch shepherd as a Task subagent (direct mode)."""
+    """Dispatch shepherd as a Task subagent (direct mode).
+
+    Uses spawn-shepherd-direct.sh for atomic claim + worktree creation,
+    then spawns the Task and validates the returned task_id.
+    """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
+    # Step 1: Use spawn-shepherd-direct.sh for atomic preparation
+    # This handles: claim issue -> create worktree -> prepare spawn command
+    prep_result = run(f"./.loom/scripts/spawn-shepherd-direct.sh --issue {issue} {shepherd_flag}")
+    prep_data = json.loads(prep_result)
+
+    if not prep_data.get("success"):
+        debug(f"Shepherd preparation failed: {prep_data.get('error')}")
+        return {"success": False, "error": prep_data.get("error", "preparation_failed")}
+
+    spawn_command = prep_data["spawn_command"]
+    rollback_actions = prep_data.get("rollback_on_failure", [])
+
+    debug(f"Spawn prepared: {spawn_command}")
+    debug(f"Rollback actions: {rollback_actions}")
+
+    # Step 2: Spawn the Task subagent
     result = Task(
         description=f"Shepherd issue #{issue}",
         prompt=f"""You must invoke the Skill tool to execute the shepherd workflow.
@@ -470,20 +530,38 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
         run_in_background=True
     )
 
-    # Verify the task actually started before recording
+    # Step 3: Verify the task actually started
     if not verify_task_spawn(result, f"shepherd for #{issue}"):
+        # Rollback: unclaim issue, remove worktree
+        for action in rollback_actions:
+            action_type = action.split(":")[0]
+            action_arg = action.split(":")[1] if ":" in action else ""
+            if action_type == "unclaim":
+                run(f"gh issue edit {action_arg} --remove-label 'loom:building' --add-label 'loom:issue'")
+            elif action_type == "remove_worktree":
+                run(f"git worktree remove .loom/worktrees/{action_arg} --force 2>/dev/null || true")
         return {"success": False, "error": "verification_failed"}
 
-    # Double-check task_id format to catch fabricated IDs
+    # Step 4: Validate task_id format (catches fabricated IDs)
     # Real Task tool IDs are 7-char hex (e.g., 'a7dc1e0'), not 'shepherd-123456'
     if not validate_task_id(result.task_id):
         debug(f"Task ID format invalid: '{result.task_id}' - Task tool may not have been invoked")
+        # Rollback
+        for action in rollback_actions:
+            action_type = action.split(":")[0]
+            action_arg = action.split(":")[1] if ":" in action else ""
+            if action_type == "unclaim":
+                run(f"gh issue edit {action_arg} --remove-label 'loom:building' --add-label 'loom:issue'")
+            elif action_type == "remove_worktree":
+                run(f"git worktree remove .loom/worktrees/{action_arg} --force 2>/dev/null || true")
         return {"success": False, "error": f"invalid_task_id_format: {result.task_id}"}
 
     return {
         "success": True,
         "task_id": result.task_id,
-        "output_file": result.output_file
+        "output_file": result.output_file,
+        "worktree_path": prep_data.get("worktree_path"),
+        "branch": prep_data.get("branch")
     }
 
 
@@ -831,23 +909,34 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
 
 
 def trigger_support_role(state, role_name, description, debug_mode=False):
-    """Spawn a support role using Task tool with direct role file reference.
+    """Spawn a support role using Task tool with cooldown/interval checking.
 
+    Uses spawn-support-role.sh to check cooldown/interval before spawning.
     Support roles are spawned by reading their role file directly, NOT via
-    the Skill tool. This avoids the Task+Skill indirection problem where
-    the subagent interprets 'invoke the Skill tool' as a direct instruction,
-    expanding the role prompt into its own context instead of spawning a
-    background Task. See issue #1359 for details.
-
-    The subagent reads the role file and executes the instructions directly,
-    which is simpler and more reliable than the Skill indirection pattern.
+    the Skill tool. See issue #1359 for details.
     """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    # Map role names to their command files and task descriptions
+    # Step 1: Check if spawning is appropriate via spawn-support-role.sh
+    # This handles interval/cooldown checking
+    spawn_check = run(f"./.loom/scripts/spawn-support-role.sh --role {role_name} --interval --json")
+    spawn_data = json.loads(spawn_check)
+
+    if not spawn_data.get("success"):
+        error = spawn_data.get("error", "unknown")
+        if error == "cooldown_not_elapsed":
+            remaining = spawn_data.get("remaining_seconds", 0)
+            debug(f"{role_name.capitalize()} cooldown not elapsed ({remaining}s remaining)")
+        elif error == "role_already_running":
+            debug(f"{role_name.capitalize()} already running")
+        else:
+            debug(f"{role_name.capitalize()} spawn check failed: {error}")
+        return False
+
+    # Step 2: Map role names to their command files
     role_configs = {
         "guide": {
             "file": ".claude/commands/guide.md",
@@ -886,17 +975,19 @@ Read the role instructions from {role_file} and follow them exactly. {task_desc}
 IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
 Read the role file directly and execute the instructions."""
 
+    # Step 3: Spawn the Task
     result = Task(
         description=description,
         prompt=prompt,
         run_in_background=True
     )
 
+    # Step 4: Verify the task actually started
     if not verify_task_spawn(result, role_name.capitalize()):
         print(f"  SPAWN FAILED: {role_name.capitalize()} - verification failed")
         return False
 
-    # Validate task_id format to catch fabricated IDs (e.g., 'auditor-1769471216')
+    # Step 5: Validate task_id format to catch fabricated IDs (e.g., 'auditor-1769471216')
     # Real Task tool IDs are 7-char hex strings (e.g., 'a7dc1e0')
     if not validate_task_id(result.task_id):
         print(f"  SPAWN FAILED: {role_name.capitalize()} - fabricated task_id: '{result.task_id}'")
@@ -904,6 +995,7 @@ Read the role file directly and execute the instructions."""
         print(f"    The Task tool was likely not actually invoked")
         return False
 
+    # Step 6: Record in state
     try:
         record_support_role(state, role_name, result.task_id, result.output_file)
     except ValueError as e:
