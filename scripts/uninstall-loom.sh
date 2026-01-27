@@ -198,6 +198,7 @@ header "Step 2: Building File Removal Manifest"
 echo ""
 
 # Arrays to track what will be removed
+# Note: Use ${arr[@]+"${arr[@]}"} pattern for empty array safety with set -u on bash 3.2
 REMOVE_FILES=()        # Files to definitely remove
 REMOVE_DIRS=()         # Directories to remove if empty after file removal
 UNKNOWN_FILES=()       # Files in Loom directories that don't match known patterns
@@ -277,7 +278,7 @@ if [[ -d "$TARGET_PATH/.loom/roles" ]]; then
     md_file=".loom/roles/${base_name}.md"
     if [[ -f "$TARGET_PATH/$md_file" ]]; then
       # Add if not already in the list
-      if ! printf '%s\n' "${REMOVE_FILES[@]}" | grep -q "^${md_file}$" 2>/dev/null; then
+      if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${md_file}$" 2>/dev/null; then
         REMOVE_FILES+=("$md_file")
       fi
     fi
@@ -294,7 +295,7 @@ RUNTIME_ARTIFACTS=(
 
 for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
   if [[ -f "$TARGET_PATH/$artifact" ]]; then
-    if ! printf '%s\n' "${REMOVE_FILES[@]}" | grep -q "^${artifact}$" 2>/dev/null; then
+    if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${artifact}$" 2>/dev/null; then
       REMOVE_FILES+=("$artifact")
     fi
   fi
@@ -304,7 +305,7 @@ done
 for f in "$TARGET_PATH/.loom/"*-daemon-state.json; do
   [[ -f "$f" ]] || continue
   rel_f="${f#$TARGET_PATH/}"
-  if ! printf '%s\n' "${REMOVE_FILES[@]}" | grep -q "^${rel_f}$" 2>/dev/null; then
+  if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
     REMOVE_FILES+=("$rel_f")
   fi
 done
@@ -313,7 +314,7 @@ done
 for f in "$TARGET_PATH/.loom/"*.log; do
   [[ -f "$f" ]] || continue
   rel_f="${f#$TARGET_PATH/}"
-  if ! printf '%s\n' "${REMOVE_FILES[@]}" | grep -q "^${rel_f}$" 2>/dev/null; then
+  if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
     REMOVE_FILES+=("$rel_f")
   fi
 done
@@ -322,7 +323,7 @@ done
 for f in "$TARGET_PATH/.loom/"*.sock; do
   [[ -f "$f" ]] || continue
   rel_f="${f#$TARGET_PATH/}"
-  if ! printf '%s\n' "${REMOVE_FILES[@]}" | grep -q "^${rel_f}$" 2>/dev/null; then
+  if ! printf '%s\n' ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} | grep -q "^${rel_f}$" 2>/dev/null; then
     REMOVE_FILES+=("$rel_f")
   fi
 done
@@ -343,8 +344,9 @@ if [[ -f "$TARGET_PATH/.gitignore" ]]; then
   SMART_REMOVE_FILES+=(".gitignore")
 fi
 
-# 6. Detect unknown files in Loom directories
-LOOM_DIRS=(".loom" ".claude/commands" ".claude/agents")
+# 6. Detect unknown files in Loom-installed directories
+# Only scan directories that the install process creates — NOT runtime dirs like worktrees/
+LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands" ".claude/agents")
 
 for loom_dir in "${LOOM_DIRS[@]}"; do
   if [[ ! -d "$TARGET_PATH/$loom_dir" ]]; then
@@ -356,7 +358,7 @@ for loom_dir in "${LOOM_DIRS[@]}"; do
 
     # Check if this file is in our removal list or known defaults
     is_known=false
-    for known in "${REMOVE_FILES[@]}" "${KNOWN_DEFAULTS[@]}"; do
+    for known in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"} ${KNOWN_DEFAULTS[@]+"${KNOWN_DEFAULTS[@]}"}; do
       if [[ "$rel_file" == "$known" ]]; then
         is_known=true
         break
@@ -434,10 +436,14 @@ fi
 REMOVE_UNKNOWN_FILES=()
 if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
   if [[ "$NON_INTERACTIVE" == "true" ]]; then
-    info "Unknown files in Loom directories (preserved in non-interactive mode):"
-    for f in "${UNKNOWN_FILES[@]}"; do
-      echo "  - $f (preserved)"
-    done
+    if [[ ${#UNKNOWN_FILES[@]} -le 20 ]]; then
+      info "Unknown files in Loom directories (preserved in non-interactive mode):"
+      for f in "${UNKNOWN_FILES[@]}"; do
+        echo "  - $f (preserved)"
+      done
+    else
+      info "${#UNKNOWN_FILES[@]} unknown files in Loom directories (preserved in non-interactive mode)"
+    fi
   else
     info "Found files in Loom directories that are not standard Loom files:"
     echo ""
@@ -573,7 +579,7 @@ REMOVED_COUNT=0
 REMOVED_LIST=()
 
 # Remove known Loom files
-for file in "${REMOVE_FILES[@]}"; do
+for file in ${REMOVE_FILES[@]+"${REMOVE_FILES[@]}"}; do
   if [[ -f "$WORKTREE_ABS/$file" ]]; then
     rm -f "$WORKTREE_ABS/$file"
     REMOVED_LIST+=("$file")
@@ -582,7 +588,7 @@ for file in "${REMOVE_FILES[@]}"; do
 done
 
 # Remove user-approved unknown files
-for file in "${REMOVE_UNKNOWN_FILES[@]}"; do
+for file in ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}; do
   if [[ -f "$WORKTREE_ABS/$file" ]]; then
     rm -f "$WORKTREE_ABS/$file"
     REMOVED_LIST+=("$file")
@@ -731,7 +737,7 @@ echo ""
 
 # Build the PR description with removal summary
 REMOVED_SUMMARY=""
-for item in "${REMOVED_LIST[@]}"; do
+for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
   REMOVED_SUMMARY="${REMOVED_SUMMARY}\n- \`${item}\`"
 done
 
@@ -767,7 +773,7 @@ This PR removes Loom orchestration framework from the repository.
 "
 
 # Add removed files list
-for item in "${REMOVED_LIST[@]}"; do
+for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
   PR_BODY_TEXT="${PR_BODY_TEXT}
 - \`${item}\`"
 done
@@ -791,7 +797,7 @@ The following non-standard files were also removed (user-approved):"
   PRESERVED_UNKNOWN=()
   for f in "${UNKNOWN_FILES[@]}"; do
     is_removed=false
-    for r in "${REMOVE_UNKNOWN_FILES[@]}"; do
+    for r in ${REMOVE_UNKNOWN_FILES[@]+"${REMOVE_UNKNOWN_FILES[@]}"}; do
       if [[ "$f" == "$r" ]]; then
         is_removed=true
         break
@@ -803,13 +809,19 @@ The following non-standard files were also removed (user-approved):"
   done
 
   if [[ ${#PRESERVED_UNKNOWN[@]} -gt 0 ]]; then
-    PR_BODY_TEXT="${PR_BODY_TEXT}
+    if [[ ${#PRESERVED_UNKNOWN[@]} -le 20 ]]; then
+      PR_BODY_TEXT="${PR_BODY_TEXT}
 
 The following non-standard files were preserved:"
-    for f in "${PRESERVED_UNKNOWN[@]}"; do
-      PR_BODY_TEXT="${PR_BODY_TEXT}
+      for f in "${PRESERVED_UNKNOWN[@]}"; do
+        PR_BODY_TEXT="${PR_BODY_TEXT}
 - \`$f\`"
-    done
+      done
+    else
+      PR_BODY_TEXT="${PR_BODY_TEXT}
+
+${#PRESERVED_UNKNOWN[@]} non-standard files were preserved (too many to list individually)."
+    fi
   fi
 else
   PR_BODY_TEXT="${PR_BODY_TEXT}
@@ -909,7 +921,7 @@ esac
 echo ""
 
 info "Removed ${#REMOVED_LIST[@]} items:"
-for item in "${REMOVED_LIST[@]}"; do
+for item in ${REMOVED_LIST[@]+"${REMOVED_LIST[@]}"}; do
   echo "  - $item"
 done
 
