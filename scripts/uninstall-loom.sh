@@ -112,7 +112,9 @@ cleanup_on_error() {
   fi
 }
 
-trap cleanup_on_error EXIT SIGINT SIGTERM
+trap cleanup_on_error EXIT
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
 
 # Validate arguments
 if [[ -z "$TARGET_PATH" ]]; then
