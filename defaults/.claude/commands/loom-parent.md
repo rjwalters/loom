@@ -125,16 +125,25 @@ Follow all shepherd workflow steps until the issue is complete or blocked.""",
 - `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
 - `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
 
-**CRITICAL - Correct Tool Invocation**: Daemon-spawned subagents must use the **Skill tool**, NOT CLI commands.
+**CRITICAL - Correct Tool Invocation**: Daemon-spawned subagents use different dispatch patterns depending on the role type.
 
-> **Scope**: This Skill-in-Task pattern applies to **daemon→shepherd** and **daemon→support role**
-> invocations only. Shepherds themselves use plain `Task` subagents with slash-command prompts
-> for phase delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
+> **Shepherds** use the Skill-in-Task pattern because they need the full shepherd lifecycle prompt
+> expanded via the Skill tool. Shepherds themselves use plain `Task` subagents with slash-command
+> prompts for phase delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
+>
+> **Support roles and work generation roles** (guide, champion, doctor, auditor, judge, architect,
+> hermit) use **direct role file references** instead of Skill indirection. This avoids the
+> Task+Skill indirection failure where the subagent interprets "invoke the Skill tool" as a
+> direct instruction to itself, expanding the role prompt into its own context instead of spawning
+> a background Task. See issue #1359 for details.
 
 ```
-CORRECT - Use the Skill tool (daemon spawning shepherds/support roles):
-   Skill(skill="guide")
+SHEPHERD DISPATCH - Use the Skill tool (daemon spawning shepherds):
    Skill(skill="shepherd", args="123 --force-merge")
+
+SUPPORT ROLE DISPATCH - Use direct role file reference (daemon spawning support roles):
+   Task(prompt="Read .claude/commands/guide.md and follow the instructions...")
+   Task(prompt="Read .claude/commands/champion.md and follow the instructions...")
 
 WRONG - These will fail with CLI errors:
    claude --skill=guide
