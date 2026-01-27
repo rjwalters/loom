@@ -312,13 +312,24 @@ if is_loom_source_repo "$TARGET_PATH"; then
 elif [[ -d "$TARGET_PATH/.loom" ]]; then
   warning "Loom appears to be already installed in this repository"
   echo ""
-  read -r -p "Reinstall and overwrite existing configuration? [y/N] " -n 1 REPLY
+  echo "1. Clean install (uninstall first, then fresh install)"
+  echo "2. Overwrite existing configuration"
+  echo "3. Cancel"
   echo ""
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    info "Installation cancelled"
-    exit 0
-  fi
-  FORCE_FLAG="--force"
+  read -r -p "Choose option [1/2/3]: " -n 1 REINSTALL_CHOICE
+  echo ""
+  case "$REINSTALL_CHOICE" in
+    1)
+      FORCE_FLAG="--clean"
+      ;;
+    2)
+      FORCE_FLAG="--force"
+      ;;
+    *)
+      info "Installation cancelled"
+      exit 0
+      ;;
+  esac
   SELF_INSTALL=false
 else
   FORCE_FLAG=""
@@ -411,9 +422,20 @@ case "$METHOD" in
       echo ""
     fi
 
-    # Run loom-daemon init
-    "$LOOM_ROOT/target/release/loom-daemon" init $FORCE_FLAG "$TARGET_PATH" || \
-      error "Installation failed"
+    # Handle --clean: run uninstall first, then fresh install
+    if [[ "$FORCE_FLAG" == "--clean" ]]; then
+      info "Running uninstall before fresh install..."
+      "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes "$TARGET_PATH" || \
+        error "Uninstall failed - aborting clean install"
+      echo ""
+      info "Uninstall complete, proceeding with fresh install..."
+      "$LOOM_ROOT/target/release/loom-daemon" init "$TARGET_PATH" || \
+        error "Installation failed"
+    else
+      # Run loom-daemon init
+      "$LOOM_ROOT/target/release/loom-daemon" init $FORCE_FLAG "$TARGET_PATH" || \
+        error "Installation failed"
+    fi
 
     echo ""
     success "Quick installation complete!"
@@ -459,7 +481,7 @@ case "$METHOD" in
     echo ""
 
     # Run the full installation workflow
-    exec "$LOOM_ROOT/scripts/install-loom.sh" "$TARGET_PATH"
+    exec "$LOOM_ROOT/scripts/install-loom.sh" $FORCE_FLAG "$TARGET_PATH"
     ;;
 esac
 
