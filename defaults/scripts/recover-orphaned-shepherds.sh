@@ -76,7 +76,6 @@ PROGRESS_DIR="$REPO_ROOT/.loom/progress"
 
 # Configuration
 HEARTBEAT_STALE_THRESHOLD="${LOOM_HEARTBEAT_STALE_THRESHOLD:-300}"  # 5 minutes default
-TASK_ID_VERIFY_TIMEOUT="${LOOM_TASK_VERIFY_TIMEOUT:-5000}"  # 5 seconds default
 
 # Show help
 show_help() {

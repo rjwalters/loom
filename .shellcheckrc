@@ -1,0 +1,22 @@
+# Shellcheck configuration for Loom shell scripts
+# See: https://github.com/koalaman/shellcheck/wiki/Directive
+
+# Target bash for macOS compatibility (bash 3.2+)
+shell=bash
+
+# SC1090: Can't follow non-constant source
+#   Many scripts dynamically source files based on runtime paths.
+#   shellcheck cannot resolve these, so we disable globally.
+disable=SC1090
+
+# SC1091: Not following sourced file (file not found or not specified)
+#   Related to SC1090 -- sourced scripts may not be available at lint time.
+disable=SC1091
+
+# SC2155: Declare and assign separately to avoid masking return values
+#   This is a pervasive pattern across all scripts (77+ occurrences).
+#   The pattern `local var=$(cmd)` masks the return value of cmd, but
+#   in this codebase return values from these assignments are never
+#   checked, so the risk is negligible. Fixing all instances would be
+#   a large mechanical refactor with no practical benefit.
+disable=SC2155
