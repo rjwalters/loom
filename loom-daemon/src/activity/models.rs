@@ -511,9 +511,7 @@ pub struct IssueClaim {
 #[serde(rename_all = "camelCase")]
 pub enum ClaimResult {
     /// Successfully claimed
-    Success {
-        claim_id: i64,
-    },
+    Success { claim_id: i64 },
     /// Already claimed by another terminal
     AlreadyClaimed {
         terminal_id: String,

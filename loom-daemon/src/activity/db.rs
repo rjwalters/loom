@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use super::models::{
     ActivityEntry, AgentInput, AgentMetric, AgentOutput, BudgetConfig, BudgetPeriod, BudgetStatus,
-    ClaimResult, ClaimType, CostByIssue, CostByPr, CostByRole, CostSummary, InputContext, InputType,
-    IssueClaim, PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent,
+    ClaimResult, ClaimType, CostByIssue, CostByPr, CostByRole, CostSummary, InputContext,
+    InputType, IssueClaim, PrReworkStats, ProductivitySummary, PromptChanges, PromptGitHubEvent,
     PromptSuccessStats, QualityMetrics, RunwayProjection, TokenUsage,
 };
 use super::schema::init_schema;
@@ -1031,9 +1031,11 @@ impl ActivityDb {
                     )
                 })?;
 
-                let created_at = DateTime::parse_from_rfc3339(&created_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+                let created_at = DateTime::parse_from_rfc3339(&created_str)
+                    .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
-                let updated_at = DateTime::parse_from_rfc3339(&updated_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+                let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                    .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
                 Ok(BudgetConfig {
                     id: row.get(0)?,
@@ -1077,9 +1079,11 @@ impl ActivityDb {
                 )
             })?;
 
-            let created_at = DateTime::parse_from_rfc3339(&created_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
-            let updated_at = DateTime::parse_from_rfc3339(&updated_str).map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map_or_else(|_| Utc::now(), |dt| dt.with_timezone(&Utc));
 
             Ok(BudgetConfig {
                 id: row.get(0)?,
@@ -1394,7 +1398,6 @@ impl ActivityDb {
         agent_role: Option<&str>,
         stale_threshold_secs: Option<i64>,
     ) -> Result<ClaimResult> {
-
         let now = Utc::now();
         let claim_type_str = claim_type.as_str();
         let stale_threshold = stale_threshold_secs.unwrap_or(3600); // Default 1 hour
@@ -1540,11 +1543,7 @@ impl ActivityDb {
     }
 
     /// Get a specific claim if it exists.
-    pub fn get_claim(
-        &self,
-        number: i32,
-        claim_type: ClaimType,
-    ) -> Result<Option<IssueClaim>> {
+    pub fn get_claim(&self, number: i32, claim_type: ClaimType) -> Result<Option<IssueClaim>> {
         use super::models::{ClaimType, IssueClaim};
 
         let claim_type_str = claim_type.as_str();
@@ -1788,26 +1787,31 @@ impl ActivityDb {
     ///
     /// This is used when a terminal is destroyed or restarted.
     pub fn release_terminal_claims(&self, terminal_id: &str) -> Result<usize> {
-        let rows = self.conn.execute(
-            r"DELETE FROM issue_claims WHERE terminal_id = ?1",
-            params![terminal_id],
-        )?;
+        let rows = self
+            .conn
+            .execute(r"DELETE FROM issue_claims WHERE terminal_id = ?1", params![terminal_id])?;
 
         Ok(rows)
     }
 
     /// Get a summary of all claims for visibility.
-    pub fn get_claims_summary(&self, stale_threshold_secs: i64) -> Result<super::models::ClaimsSummary> {
+    pub fn get_claims_summary(
+        &self,
+        stale_threshold_secs: i64,
+    ) -> Result<super::models::ClaimsSummary> {
         use super::models::ClaimsSummary;
 
         let all_claims = self.get_all_claims()?;
         let stale_claims = self.get_stale_claims(stale_threshold_secs)?;
 
         let mut by_type = std::collections::HashMap::new();
-        let mut by_terminal: std::collections::HashMap<String, Vec<i32>> = std::collections::HashMap::new();
+        let mut by_terminal: std::collections::HashMap<String, Vec<i32>> =
+            std::collections::HashMap::new();
 
         for claim in &all_claims {
-            *by_type.entry(claim.claim_type.as_str().to_string()).or_insert(0) += 1;
+            *by_type
+                .entry(claim.claim_type.as_str().to_string())
+                .or_insert(0) += 1;
             by_terminal
                 .entry(claim.terminal_id.clone())
                 .or_default()
@@ -3599,7 +3603,14 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
         let db = ActivityDb::new(temp_file.path().to_path_buf())?;
 
         // Claim an issue
-        let result = db.claim_issue(123, ClaimType::Issue, "terminal-1", Some("loom:building"), Some("builder"), None)?;
+        let result = db.claim_issue(
+            123,
+            ClaimType::Issue,
+            "terminal-1",
+            Some("loom:building"),
+            Some("builder"),
+            None,
+        )?;
 
         match result {
             ClaimResult::Success { claim_id } => {
@@ -3661,10 +3672,13 @@ test result: FAILED. 9 passed; 1 failed; 0 ignored
         )?;
 
         // Now claim with stale threshold of 1 hour - should reclaim
-        let result2 = db.claim_issue(123, ClaimType::Issue, "terminal-2", None, None, Some(3600))?;
+        let result2 =
+            db.claim_issue(123, ClaimType::Issue, "terminal-2", None, None, Some(3600))?;
 
         match result2 {
-            ClaimResult::Reclaimed { previous_terminal, .. } => {
+            ClaimResult::Reclaimed {
+                previous_terminal, ..
+            } => {
                 assert_eq!(previous_terminal, "terminal-1");
             }
             _ => panic!("Expected ClaimResult::Reclaimed"),

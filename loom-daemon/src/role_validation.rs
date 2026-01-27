@@ -236,10 +236,7 @@ pub fn format_validation_result(result: &ValidationResult, verbose: bool) -> Str
     let mut output = String::new();
 
     if verbose {
-        output.push_str(&format!(
-            "Configured roles: {}\n",
-            result.configured_roles.join(", ")
-        ));
+        output.push_str(&format!("Configured roles: {}\n", result.configured_roles.join(", ")));
     }
 
     if !result.warnings.is_empty() {

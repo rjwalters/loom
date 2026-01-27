@@ -3913,9 +3913,7 @@ pub fn get_activity_timeline(
     let mut where_parts: Vec<String> = Vec::new();
 
     if let Some(issue) = issue_number {
-        where_parts.push(format!(
-            "(a.issue_number = {issue} OR pg.issue_number = {issue})"
-        ));
+        where_parts.push(format!("(a.issue_number = {issue} OR pg.issue_number = {issue})"));
     }
 
     if let Some(pr) = pr_number {
@@ -3944,9 +3942,7 @@ pub fn get_activity_timeline(
         format!("WHERE {}", where_parts.join(" AND "))
     };
 
-    let query = format!(
-        "{base_query} {where_clause} ORDER BY a.timestamp DESC LIMIT {limit_val}"
-    );
+    let query = format!("{base_query} {where_clause} ORDER BY a.timestamp DESC LIMIT {limit_val}");
 
     let mut stmt = conn
         .prepare(&query)

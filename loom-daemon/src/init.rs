@@ -1546,9 +1546,13 @@ mod tests {
         assert_eq!(loom_content, "loom command v2 with bug fix");
 
         // Verify: builder.md was ADDED (new default command)
-        let builder_content =
-            fs::read_to_string(workspace.join(".claude").join("commands").join("builder.md"))
-                .unwrap();
+        let builder_content = fs::read_to_string(
+            workspace
+                .join(".claude")
+                .join("commands")
+                .join("builder.md"),
+        )
+        .unwrap();
         assert_eq!(builder_content, "builder command v2");
 
         // Verify: my-custom.md was PRESERVED (custom command not in defaults)

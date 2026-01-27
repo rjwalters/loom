@@ -89,4 +89,4 @@ pub use tuning::{
 
 // Issue claim registry types (Issue #1159)
 // Used for reliable work distribution and crash recovery
-pub use models::{ClaimResult, ClaimsSummary, ClaimType, IssueClaim};
+pub use models::{ClaimResult, ClaimType, ClaimsSummary, IssueClaim};
