@@ -261,12 +261,19 @@ handle_daemon_startup() {
     fi
   fi
 
-  # Run safe worktree cleanup
+  # Run worktree cleanup using unified clean.sh
+  # Uses --force to prevent interactive prompts during autonomous operation
+  # Uses --worktrees-only to avoid side effects (branch/tmux cleanup) during startup
   info "Cleaning stale worktrees..."
+  local clean_script="$REPO_ROOT/.loom/scripts/clean.sh"
+  if [[ ! -x "$clean_script" ]]; then
+    # Fallback for Loom repository itself (not an installed target repo)
+    clean_script="$REPO_ROOT/defaults/scripts/clean.sh"
+  fi
   if [[ "$DRY_RUN" == true ]]; then
-    "$SCRIPT_DIR/safe-worktree-cleanup.sh" --dry-run 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
+    "$clean_script" --force --worktrees-only --dry-run 2>/dev/null || warning "clean.sh not found"
   else
-    "$SCRIPT_DIR/safe-worktree-cleanup.sh" 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
+    "$clean_script" --force --worktrees-only 2>/dev/null || warning "clean.sh not found"
   fi
 
   # Prune old archives
