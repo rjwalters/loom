@@ -449,13 +449,13 @@ The daemon integrates with cleanup scripts to manage task artifacts and worktree
 
 ```bash
 # Archive task outputs to .loom/logs/{date}/
-./scripts/archive-logs.sh [--dry-run] [--retention-days N]
+./.loom/scripts/archive-logs.sh [--dry-run] [--retention-days N]
 
 # Safe worktree cleanup (only MERGED PRs)
-./scripts/safe-worktree-cleanup.sh [--dry-run] [--grace-period N]
+./.loom/scripts/safe-worktree-cleanup.sh [--dry-run] [--grace-period N]
 
 # Event-driven daemon cleanup
-./scripts/daemon-cleanup.sh <event> [options]
+./.loom/scripts/daemon-cleanup.sh <event> [options]
 ```
 
 ### Cleanup Configuration
