@@ -103,45 +103,47 @@ else
 fi
 ```
 
-### Parallelism via Subagents
+### Subagent Delegation Pattern
 
-Use the **Task tool with `run_in_background: true`** to spawn parallel shepherd subagents:
+The parent loop uses the **Skill tool** to spawn iteration subagents:
 
+```python
+# Parent spawns iteration subagent (uses Skill so iteration gets its role prompt)
+Skill(skill="loom-iteration", args="--force --debug")
 ```
+
+**Why Skill for parent→iteration**: The parent wants the iteration subagent to receive
+its full role prompt (`loom-iteration.md`) so it can execute the complete iteration logic.
+
+**Iteration→role spawning** (shepherds, support roles) happens in `loom-iteration.md` and
+uses **direct slash commands**, NOT Skill:
+
+```python
+# Iteration spawns shepherd (uses slash command - Claude Code executes natively)
 Task(
-  subagent_type: "general-purpose",
-  prompt: """You must invoke the Skill tool to execute the shepherd workflow.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=shepherd'. Use the Skill tool:
-
-Skill(skill="shepherd", args="123 --force-merge")
-
-Follow all shepherd workflow steps until the issue is complete or blocked.""",
-  run_in_background: true
-) -> Returns task_id and output_file
+    description="Shepherd issue #123",
+    prompt="/shepherd 123 --force-pr",
+    run_in_background=True
+)
 ```
+
+**Why slash commands for iteration→roles**: Claude Code executes slash commands natively.
+Using `Skill()` in a Task prompt causes the subagent to expand the role prompt into its
+own context, wasting tokens and failing to actually run the role. See `loom-iteration.md`
+for the complete role spawning implementation.
 
 **Shepherd Force Mode Flags**:
 - `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
 - `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
 
-**CRITICAL - Correct Tool Invocation**: Daemon-spawned subagents must use the **Skill tool**, NOT CLI commands.
+**Tool Invocation Summary**:
 
-> **Scope**: This Skill-in-Task pattern applies to **daemon→shepherd** and **daemon→support role**
-> invocations only. Shepherds themselves use plain `Task` subagents with slash-command prompts
-> for phase delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
-
-```
-CORRECT - Use the Skill tool (daemon spawning shepherds/support roles):
-   Skill(skill="guide")
-   Skill(skill="shepherd", args="123 --force-merge")
-
-WRONG - These will fail with CLI errors:
-   claude --skill=guide
-   claude --role guide
-   /guide
-   bash("claude --skill=guide")
-```
+| Delegation | Pattern | Reason |
+|------------|---------|--------|
+| parent → iteration | `Skill(skill="loom-iteration")` | Need iteration's full role prompt |
+| iteration → shepherd | `Task(prompt="/shepherd N")` | Slash command executes natively |
+| iteration → support role | `Task(prompt="/guide")` | Slash command executes natively |
+| shepherd → builder | `Task(prompt="/builder N")` | Slash command executes natively |
 
 ### Task Spawn Verification
 
