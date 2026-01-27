@@ -60,6 +60,10 @@
   description: Bug discovered by Auditor during main branch validation
   color: "d93f0b"  # red - indicates runtime/build issue
 
+- name: loom:auditor-capability-request
+  description: Auditor capability request for enhanced validation tooling
+  color: "6366F1"  # indigo-500 - indicates meta/tooling request
+
 - name: loom:curated
   description: Enhanced by Curator, awaiting human approval
   color: "10B981"  # emerald-500

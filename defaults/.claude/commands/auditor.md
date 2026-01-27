@@ -49,22 +49,61 @@ You are the continuous integration health monitor for Loom. While Judge reviews 
 
 ## Workflow
 
+### CI-Aware Validation
+
+**Before running redundant build/test, check if CI already validated the commit.**
+
+This saves time and resources by leveraging existing CI infrastructure:
+
+```bash
+# Step 0: Check CI status before doing redundant work
+./.loom/scripts/check-ci-status.sh --quiet
+CI_STATUS=$?
+
+case $CI_STATUS in
+    0)  # CI passed
+        echo "CI passed - skipping build/test, focusing on runtime validation"
+        SKIP_BUILD_TEST=true
+        ;;
+    1)  # CI failed
+        echo "CI failed - investigating failures"
+        # Analyze CI failures and create/update bug issue
+        ./.loom/scripts/check-ci-status.sh  # Full output for analysis
+        SKIP_BUILD_TEST=false
+        ;;
+    2)  # CI pending
+        echo "CI still running - proceeding with local validation"
+        SKIP_BUILD_TEST=false
+        ;;
+    *)  # Unknown/error
+        echo "Could not determine CI status - proceeding with full validation"
+        SKIP_BUILD_TEST=false
+        ;;
+esac
+```
+
+### Standard Validation Workflow
+
 ```bash
 # 1. Switch to main branch and pull latest
 git checkout main
 git pull origin main
 
-# 2. Build the project
-pnpm install && pnpm build
-# OR: cargo build --release
-# OR: make build
+# 2. Build the project (skip if CI already passed)
+if [[ "$SKIP_BUILD_TEST" != "true" ]]; then
+    pnpm install && pnpm build
+    # OR: cargo build --release
+    # OR: make build
+fi
 
-# 3. Run tests
-pnpm test
-# OR: cargo test
-# OR: make test
+# 3. Run tests (skip if CI already passed)
+if [[ "$SKIP_BUILD_TEST" != "true" ]]; then
+    pnpm test
+    # OR: cargo test
+    # OR: make test
+fi
 
-# 4. Run the application and verify startup
+# 4. Run the application and verify startup (always do this - CI doesn't cover it)
 # For CLI tools:
 ./target/release/my-cli --help 2>&1 | head -100
 
@@ -83,6 +122,22 @@ kill $TAURI_PID 2>/dev/null
 
 # 5. If any step fails, create bug issue with loom:auditor label
 ```
+
+### When CI Status Helps
+
+| CI Status | Auditor Action |
+|-----------|----------------|
+| **Passed** | Skip build/test, focus on runtime validation only |
+| **Failed** | Analyze failure, create bug issue if not already tracked |
+| **Pending** | Run full local validation (CI hasn't finished) |
+| **Unknown** | Run full local validation (can't determine status) |
+
+### Benefits of CI-Aware Validation
+
+- **Avoids duplicate work**: Don't rebuild what CI already validated
+- **Faster iterations**: Focus time on what CI doesn't cover (runtime behavior)
+- **Better resource utilization**: Save compute resources for novel validation
+- **Immediate failure analysis**: When CI fails, Auditor can analyze and create issues
 
 ### Output Analysis
 
@@ -170,6 +225,135 @@ gh issue create --title "Build/runtime failure on main: [specific problem]" --bo
 Discovered during main branch audit.
 EOF
 )" --label "loom:auditor"
+```
+
+## Capability Gap Detection
+
+**When you identify something you cannot validate, document it as a capability request.**
+
+This creates a feedback loop where the Auditor helps improve its own effectiveness over time. The capability request system allows you to request specific tooling when validation gaps are identified.
+
+### When to Create Capability Requests
+
+Create a capability request when you:
+- Attempt to validate something but lack the tools/access
+- Identify a gap in your validation coverage
+- Discover a validation need that would improve quality
+
+### Avoiding Duplicate Capability Requests
+
+Before creating a new capability request:
+
+```bash
+# Check for existing capability requests
+gh issue list --state open --label "loom:auditor-capability-request" --json number,title --jq '.[] | "#\(.number): \(.title)"'
+
+# Search for similar requests
+gh issue list --state open --label "loom:auditor-capability-request" --search "screenshot" --json number,title
+```
+
+If a similar request exists, add a comment instead of creating a duplicate.
+
+### Creating Capability Requests
+
+When you identify a validation gap, create a detailed capability request:
+
+```bash
+gh issue create --title "Auditor Capability Request: [specific capability needed]" --body "$(cat <<'EOF'
+## What I Attempted to Validate
+
+[Describe what you were trying to validate]
+
+Example: UI renders correctly on main branch after PR #123 merge
+
+## Capability Gap
+
+What specific tools, access, or capabilities are missing:
+
+- [Specific tool/access needed]
+- [Another missing capability]
+- [etc.]
+
+## Impact Level
+
+[Choose one: Critical | High | Medium | Low]
+
+- **Critical**: Cannot detect important failure modes
+- **High**: Significant validation gaps exist
+- **Medium**: Some validation reduced, but workarounds exist
+- **Low**: Nice to have, minimal impact on validation
+
+## Current Workaround
+
+[How this gap is currently handled, if at all]
+
+Example: Manual review required, cannot be automated
+
+## Recommended Enhancement
+
+[Specific suggestion for addressing this capability gap]
+
+Example: Integrate visual regression testing (Percy.io, Applitools, or custom baseline comparison)
+
+## Additional Context
+
+- Related PR: [if applicable]
+- Similar request: [if applicable]
+
+---
+*Auto-generated by Auditor during validation iteration*
+EOF
+)" --label "loom:auditor-capability-request,loom:architect"
+```
+
+### Example Capability Requests
+
+**Visual Regression Detection:**
+```
+Title: Auditor Capability Request: Screenshot baseline comparison
+Gap: Cannot detect visual regressions - no screenshot capture or comparison tooling
+Impact: Medium - UI changes go unvalidated
+Recommended: Integrate Playwright screenshot capture with baseline storage
+```
+
+**Performance Monitoring:**
+```
+Title: Auditor Capability Request: Startup time metrics tracking
+Gap: Cannot detect performance regressions - no metrics baseline
+Impact: Low - Performance issues may go unnoticed
+Recommended: Add startup time capture and historical comparison
+```
+
+### Capability Request Workflow
+
+```
+Auditor identifies gap → Creates capability request → Architect evaluates
+                                                              ↓
+                                                    Creates implementation issue
+                                                              ↓
+                                                    Builder implements capability
+                                                              ↓
+                                                    Auditor uses new capability
+```
+
+### Including Gaps in Validation Reports
+
+When reporting validation results, include any identified capability gaps:
+
+```
+## Auditor Validation Report
+
+**Commit**: abc123
+**Build**: ✅ Success
+**Tests**: ✅ 440 passed
+**CLI Startup**: ✅ Loads files correctly
+
+**Capability Gaps Identified**:
+- ⚠️ Cannot verify UI renders correctly (no screenshot capability)
+- ⚠️ Cannot verify recent merge #129 didn't cause visual regression
+- ⚠️ Cannot measure startup time regression
+
+**Capability Requests Created**: #1234, #1235
 ```
 
 ## Decision Framework
