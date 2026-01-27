@@ -388,6 +388,39 @@ fi
 echo ""
 
 # ============================================================================
+# VERSION CHECK: Skip if already installed at target version
+# ============================================================================
+if [[ -f "$TARGET_PATH/.loom/version.json" ]]; then
+  INSTALLED_VERSION=$(grep -o '"loom_version"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    "$TARGET_PATH/.loom/version.json" 2>/dev/null | \
+    sed 's/.*"loom_version"[[:space:]]*:[[:space:]]*"//;s/"//')
+  INSTALLED_COMMIT=$(grep -o '"loom_commit"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    "$TARGET_PATH/.loom/version.json" 2>/dev/null | \
+    sed 's/.*"loom_commit"[[:space:]]*:[[:space:]]*"//;s/"//')
+
+  if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]] && \
+     [[ "$INSTALLED_COMMIT" == "$LOOM_COMMIT" ]]; then
+
+    if [[ "$FORCE_OVERWRITE" != "true" ]]; then
+      # Disable error trap - this is a successful exit
+      trap - EXIT SIGINT SIGTERM
+
+      echo ""
+      success "Loom ${LOOM_VERSION} (${LOOM_COMMIT}) is already installed"
+      echo ""
+      info "No installation needed - already at target version."
+      info "To force reinstallation: $0 --force $TARGET_PATH"
+      echo ""
+      exit 0
+    else
+      warning "Force mode enabled - reinstalling despite matching version"
+    fi
+  else
+    info "Version change detected: ${INSTALLED_VERSION:-unknown}@${INSTALLED_COMMIT:-unknown} -> ${LOOM_VERSION}@${LOOM_COMMIT}"
+  fi
+fi
+
+# ============================================================================
 # STEP 2: Create Installation Worktree
 # ============================================================================
 CURRENT_STEP="Create Worktree"

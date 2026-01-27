@@ -290,6 +290,7 @@ fi
 # 3. Add runtime artifacts
 RUNTIME_ARTIFACTS=(
   ".loom/state.json"
+  ".loom/version.json"
   ".loom/daemon-state.json"
   ".loom/config.json"
   ".loom/stop-daemon"
@@ -666,6 +667,7 @@ if [[ -f "$WORKTREE_ABS/.gitignore" ]]; then
   # Loom-specific patterns to remove (exact matches)
   LOOM_PATTERNS=(
     ".loom/state.json"
+    ".loom/version.json"
     ".loom/worktrees/"
     ".loom/*.log"
     ".loom/*.sock"

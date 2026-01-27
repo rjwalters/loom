@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use chrono::Local;
+use serde_json::json;
 
 /// Report of files affected during initialization
 ///
@@ -79,6 +80,30 @@ impl LoomMetadata {
             install_date: Local::now().format("%Y-%m-%d").to_string(),
         }
     }
+}
+
+/// Write version.json to track installed Loom version
+///
+/// Creates `.loom/version.json` with the current Loom version, commit hash,
+/// and installation timestamp. This file is used by the install script to
+/// detect whether Loom is already installed at the target version, enabling
+/// idempotent installations that skip redundant PR creation.
+fn write_version_file(loom_path: &Path, metadata: &LoomMetadata) -> Result<(), String> {
+    let version_data = json!({
+        "loom_version": metadata.version.as_deref().unwrap_or("unknown"),
+        "loom_commit": metadata.commit.as_deref().unwrap_or("unknown"),
+        "installed_at": Local::now().to_rfc3339(),
+        "installation_mode": "full"
+    });
+
+    let version_path = loom_path.join("version.json");
+    let content = serde_json::to_string_pretty(&version_data)
+        .map_err(|e| format!("Failed to serialize version.json: {e}"))?;
+
+    fs::write(&version_path, format!("{content}\n"))
+        .map_err(|e| format!("Failed to write version.json: {e}"))?;
+
+    Ok(())
 }
 
 /// Extract repository owner and name from git remote URL
@@ -457,6 +482,10 @@ pub fn initialize_workspace(
 
     // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
     setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
+
+    // Write version.json to track installed version (enables idempotent installs)
+    let loom_metadata = LoomMetadata::from_env();
+    write_version_file(&loom_path, &loom_metadata)?;
 
     Ok(report)
 }
@@ -1059,6 +1088,7 @@ fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     // Ephemeral files that should be ignored
     let ephemeral_patterns = [
         ".loom/state.json",
+        ".loom/version.json",
         ".loom/worktrees/",
         ".loom/*.log",
         ".loom/*.sock",
@@ -1953,6 +1983,91 @@ Old Loom content v1.0.
             content.matches(LOOM_SECTION_END).count(),
             1,
             "Should have exactly one end marker"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_write_version_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let loom_path = temp_dir.path().join(".loom");
+        fs::create_dir_all(&loom_path).unwrap();
+
+        let metadata = LoomMetadata {
+            version: Some("1.0.0".to_string()),
+            commit: Some("abc1234".to_string()),
+            install_date: "2026-01-26".to_string(),
+        };
+
+        write_version_file(&loom_path, &metadata).unwrap();
+
+        let version_path = loom_path.join("version.json");
+        assert!(version_path.exists());
+
+        let content = fs::read_to_string(&version_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(parsed["loom_version"], "1.0.0");
+        assert_eq!(parsed["loom_commit"], "abc1234");
+        assert_eq!(parsed["installation_mode"], "full");
+        assert!(parsed["installed_at"].is_string());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_version_file_created_during_init() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create minimal defaults
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+
+        // Set env vars for version tracking
+        std::env::set_var("LOOM_VERSION", "2.0.0");
+        std::env::set_var("LOOM_COMMIT", "def5678");
+
+        let result = initialize_workspace(
+            workspace.to_str().unwrap(),
+            defaults.to_str().unwrap(),
+            false,
+        );
+
+        assert!(result.is_ok());
+
+        // Verify version.json was created
+        let version_path = workspace.join(".loom").join("version.json");
+        assert!(version_path.exists());
+
+        let content = fs::read_to_string(&version_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["loom_version"], "2.0.0");
+        assert_eq!(parsed["loom_commit"], "def5678");
+
+        // Clean up
+        std::env::remove_var("LOOM_VERSION");
+        std::env::remove_var("LOOM_COMMIT");
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_gitignore_includes_version_json() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+
+        // Create empty .gitignore
+        fs::write(workspace.join(".gitignore"), "").unwrap();
+
+        update_gitignore(workspace).unwrap();
+
+        let content = fs::read_to_string(workspace.join(".gitignore")).unwrap();
+        assert!(
+            content.contains(".loom/version.json"),
+            "gitignore should include .loom/version.json"
         );
     }
 }
