@@ -24,10 +24,15 @@
 set -euo pipefail
 
 # Colors for output (only used with --pretty)
+# shellcheck disable=SC2034
 RED='\033[0;31m'
+# shellcheck disable=SC2034
 GREEN='\033[0;32m'
+# shellcheck disable=SC2034
 YELLOW='\033[1;33m'
+# shellcheck disable=SC2034
 BLUE='\033[0;34m'
+# shellcheck disable=SC2034
 NC='\033[0m' # No Color
 
 # Default configuration thresholds
@@ -734,10 +739,8 @@ detect_orphaned_shepherds() {
 
     # Get tracked issues from daemon-state
     local daemon_tracked_issues="[]"
-    local daemon_shepherd_task_ids="[]"
     if [[ -f "$DAEMON_STATE_FILE" ]]; then
         daemon_tracked_issues=$(jq '[.shepherds // {} | to_entries[] | select(.value.status == "working") | .value.issue] | map(select(. != null))' "$DAEMON_STATE_FILE" 2>/dev/null || echo "[]")
-        daemon_shepherd_task_ids=$(jq '[.shepherds // {} | to_entries[] | select(.value.status == "working") | .value.task_id] | map(select(. != null))' "$DAEMON_STATE_FILE" 2>/dev/null || echo "[]")
     fi
 
     # Check 1: loom:building issues not tracked in daemon-state
