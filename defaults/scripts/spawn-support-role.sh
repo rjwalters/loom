@@ -1,72 +1,63 @@
-#!/usr/bin/env bash
-# spawn-support-role.sh - Spawn support roles with interval checking and validation
+#!/bin/bash
+# spawn-support-role.sh - Deterministic support role spawn logic
 #
-# This script handles spawning support roles (champion, judge, doctor, guide,
-# auditor, architect, hermit) with proper cooldown/interval checking.
+# This script encapsulates the decision logic for spawning support roles
+# (Guide, Champion, Doctor, Auditor, Judge) in the daemon. It replaces
+# LLM-interpreted pseudocode with deterministic bash logic.
 #
-# IMPORTANT: This script does NOT spawn the actual Task subagent. It validates
-# that spawning is appropriate and outputs a spawn command that the calling
-# LLM context must execute.
+# The script does NOT spawn roles itself - it evaluates whether a role
+# should be spawned and updates daemon-state.json accordingly. The actual
+# spawning (Task subagent, tmux session, or MCP) is handled by the caller
+# (the iteration subagent or daemon-loop.sh).
 #
 # Usage:
-#   ./spawn-support-role.sh --role <name> [--demand|--interval]
-#   ./spawn-support-role.sh --role champion --demand
-#   ./spawn-support-role.sh --role judge --interval
+#   spawn-support-role.sh <role> [--demand] [--check-only] [--json]
+#   spawn-support-role.sh --check-all [--json]
+#   spawn-support-role.sh --mark-running <role> --task-id <id>
+#   spawn-support-role.sh --mark-completed <role>
+#   spawn-support-role.sh --help
 #
-# Exit codes:
-#   0 - Success (role ready to spawn)
-#   1 - Role already running
-#   2 - Cooldown not elapsed
-#   3 - Invalid role name
-#   4 - Invalid arguments
+# Options:
+#   <role>            Role name: guide, champion, doctor, auditor, judge
+#   --demand          Demand-based spawn (skip interval check)
+#   --check-only      Only check if spawn is needed, don't modify state
+#   --check-all       Check all support roles and output combined result
+#   --mark-running    Mark a role as running with the given task_id
+#   --mark-completed  Mark a role as completed (transition to idle)
+#   --json            Output JSON instead of human-readable text
+#   --help            Show this help message
 #
-# Output (JSON):
-#   {
-#     "success": true,
-#     "role": "champion",
-#     "mode": "demand",
-#     "spawn_command": "/champion",
-#     "task_id_pattern": "^[a-f0-9]{7}$"
-#   }
+# Exit Codes:
+#   0 - Role should be spawned (or state updated successfully)
+#   1 - Role should NOT be spawned (already running, interval not elapsed)
+#   2 - Error (invalid role, missing state file, etc.)
+#
+# Environment Variables:
+#   LOOM_GUIDE_INTERVAL      Guide re-trigger interval in seconds (default: 900)
+#   LOOM_CHAMPION_INTERVAL   Champion re-trigger interval in seconds (default: 600)
+#   LOOM_DOCTOR_INTERVAL     Doctor re-trigger interval in seconds (default: 300)
+#   LOOM_AUDITOR_INTERVAL    Auditor re-trigger interval in seconds (default: 600)
+#   LOOM_JUDGE_INTERVAL      Judge re-trigger interval in seconds (default: 300)
+#
+# Examples:
+#   # Check if Guide should be spawned (interval-based)
+#   spawn-support-role.sh guide
+#
+#   # Check if Champion should be spawned on-demand
+#   spawn-support-role.sh champion --demand
+#
+#   # Check all roles and get JSON output
+#   spawn-support-role.sh --check-all --json
+#
+#   # Mark role as running after successful Task spawn
+#   spawn-support-role.sh --mark-running champion --task-id a7dc1e0
+#
+#   # Mark role as completed
+#   spawn-support-role.sh --mark-completed champion
 
 set -euo pipefail
 
-# ANSI color codes
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Role intervals (in seconds)
-# Using simple variables for bash 3.x compatibility (macOS default)
-INTERVAL_guide="${LOOM_GUIDE_INTERVAL:-900}"
-INTERVAL_champion="${LOOM_CHAMPION_INTERVAL:-600}"
-INTERVAL_doctor="${LOOM_DOCTOR_INTERVAL:-300}"
-INTERVAL_auditor="${LOOM_AUDITOR_INTERVAL:-600}"
-INTERVAL_judge="${LOOM_JUDGE_INTERVAL:-300}"
-INTERVAL_architect="${LOOM_ARCHITECT_COOLDOWN:-1800}"
-INTERVAL_hermit="${LOOM_HERMIT_COOLDOWN:-1800}"
-
-# All valid roles
-VALID_ROLES="guide|champion|doctor|auditor|judge|architect|hermit"
-
-# Get interval for a role (bash 3.x compatible)
-get_role_interval_value() {
-    local role="$1"
-    case "$role" in
-        guide) echo "$INTERVAL_guide" ;;
-        champion) echo "$INTERVAL_champion" ;;
-        doctor) echo "$INTERVAL_doctor" ;;
-        auditor) echo "$INTERVAL_auditor" ;;
-        judge) echo "$INTERVAL_judge" ;;
-        architect) echo "$INTERVAL_architect" ;;
-        hermit) echo "$INTERVAL_hermit" ;;
-        *) echo "300" ;;  # Default 5 minutes
-    esac
-}
-
-# Find the repository root
+# Find the repository root (works from any subdirectory)
 find_repo_root() {
     local dir="$PWD"
     while [[ "$dir" != "/" ]]; do
@@ -83,232 +74,440 @@ find_repo_root() {
 REPO_ROOT=$(find_repo_root)
 STATE_FILE="$REPO_ROOT/.loom/daemon-state.json"
 
-# Parse arguments
-ROLE=""
-MODE="interval"  # Default to interval-based
-DRY_RUN=false
-FORCE=false
-VERBOSE=false
+# Default intervals (in seconds)
+GUIDE_INTERVAL="${LOOM_GUIDE_INTERVAL:-900}"        # 15 minutes
+CHAMPION_INTERVAL="${LOOM_CHAMPION_INTERVAL:-600}"  # 10 minutes
+DOCTOR_INTERVAL="${LOOM_DOCTOR_INTERVAL:-300}"      # 5 minutes
+AUDITOR_INTERVAL="${LOOM_AUDITOR_INTERVAL:-600}"    # 10 minutes
+JUDGE_INTERVAL="${LOOM_JUDGE_INTERVAL:-300}"        # 5 minutes
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --role|-r)
-            ROLE="$2"
-            shift 2
-            ;;
-        --demand|-d)
-            MODE="demand"
-            shift
-            ;;
-        --interval|-i)
-            MODE="interval"
-            shift
-            ;;
-        --force)
-            FORCE=true
-            shift
-            ;;
-        --dry-run)
-            DRY_RUN=true
-            shift
-            ;;
-        --verbose|-v)
-            VERBOSE=true
-            shift
-            ;;
-        --help|-h)
-            cat <<EOF
-Usage: $0 --role <name> [OPTIONS]
+# Valid roles
+VALID_ROLES=("guide" "champion" "doctor" "auditor" "judge")
 
-Spawn support role with interval/cooldown checking.
+show_help() {
+    cat <<'EOF'
+spawn-support-role.sh - Deterministic support role spawn logic
 
-Required:
-  --role, -r <name>    Role name (guide, champion, doctor, auditor, judge, architect, hermit)
+USAGE:
+    spawn-support-role.sh <role> [--demand] [--check-only] [--json]
+    spawn-support-role.sh --check-all [--json]
+    spawn-support-role.sh --mark-running <role> --task-id <id>
+    spawn-support-role.sh --mark-completed <role>
+    spawn-support-role.sh --help
 
-Options:
-  --demand, -d         Spawn on-demand (skip interval check)
-  --interval, -i       Spawn if interval elapsed (default)
-  --force              Spawn even if already running
-  --dry-run            Validate without spawning
-  --verbose            Show detailed progress
-  --help               Show this help message
+ROLES:
+    guide       Backlog triage (interval: 15 min)
+    champion    PR merging and proposal evaluation (interval: 10 min)
+    doctor      PR conflict resolution (interval: 5 min)
+    auditor     Main branch validation (interval: 10 min)
+    judge       PR review (interval: 5 min)
 
-Role intervals (configurable via environment):
-  guide:     ${LOOM_GUIDE_INTERVAL:-900}s (LOOM_GUIDE_INTERVAL)
-  champion:  ${LOOM_CHAMPION_INTERVAL:-600}s (LOOM_CHAMPION_INTERVAL)
-  doctor:    ${LOOM_DOCTOR_INTERVAL:-300}s (LOOM_DOCTOR_INTERVAL)
-  auditor:   ${LOOM_AUDITOR_INTERVAL:-600}s (LOOM_AUDITOR_INTERVAL)
-  judge:     ${LOOM_JUDGE_INTERVAL:-300}s (LOOM_JUDGE_INTERVAL)
-  architect: ${LOOM_ARCHITECT_COOLDOWN:-1800}s (LOOM_ARCHITECT_COOLDOWN)
-  hermit:    ${LOOM_HERMIT_COOLDOWN:-1800}s (LOOM_HERMIT_COOLDOWN)
+OPTIONS:
+    --demand        Demand-based spawn (skip interval check)
+    --check-only    Only check if spawn is needed, don't modify state
+    --check-all     Check all roles and output combined result
+    --mark-running  Mark a role as running with a task_id
+    --mark-completed Mark a role as completed (transition to idle)
+    --json          Output JSON format
+    --help          Show this help message
 
-Exit codes:
-  0 - Success (role ready to spawn)
-  1 - Role already running
-  2 - Cooldown not elapsed
-  3 - Invalid role name
-  4 - Invalid arguments
+EXIT CODES:
+    0 - Role should be spawned (or state updated)
+    1 - Role should NOT be spawned
+    2 - Error
 
-Examples:
-  $0 --role champion --demand     # Spawn champion on-demand
-  $0 --role judge --interval      # Spawn judge if interval elapsed
-  $0 --role architect             # Check cooldown before spawning
-  $0 --role guide --dry-run       # Check if would spawn
+ENVIRONMENT VARIABLES:
+    LOOM_GUIDE_INTERVAL      (default: 900)
+    LOOM_CHAMPION_INTERVAL   (default: 600)
+    LOOM_DOCTOR_INTERVAL     (default: 300)
+    LOOM_AUDITOR_INTERVAL    (default: 600)
+    LOOM_JUDGE_INTERVAL      (default: 300)
 EOF
-            exit 0
-            ;;
-        *)
-            echo '{"success": false, "error": "unknown_option", "option": "'"$1"'"}'
-            exit 4
-            ;;
-    esac
-done
+}
 
-# Validate required arguments
-if [[ -z "$ROLE" ]]; then
-    echo '{"success": false, "error": "missing_role"}'
-    exit 4
-fi
+# Get the interval for a role
+get_interval() {
+    local role="$1"
+    case "$role" in
+        guide)    echo "$GUIDE_INTERVAL" ;;
+        champion) echo "$CHAMPION_INTERVAL" ;;
+        doctor)   echo "$DOCTOR_INTERVAL" ;;
+        auditor)  echo "$AUDITOR_INTERVAL" ;;
+        judge)    echo "$JUDGE_INTERVAL" ;;
+        *)        echo "0" ;;
+    esac
+}
 
 # Validate role name
-if ! [[ "$ROLE" =~ ^($VALID_ROLES)$ ]]; then
-    echo '{"success": false, "error": "invalid_role", "role": "'"$ROLE"'", "valid_roles": "'"$VALID_ROLES"'"}'
-    exit 3
-fi
-
-log_verbose() {
-    if [[ "$VERBOSE" == "true" ]]; then
-        echo "[DEBUG] $*" >&2
-    fi
-}
-
-# Get current timestamp
-get_timestamp() {
-    date -u +"%Y-%m-%dT%H:%M:%SZ"
-}
-
-# Get epoch from ISO timestamp
-iso_to_epoch() {
-    local iso="$1"
-    if [[ "$(uname)" == "Darwin" ]]; then
-        date -j -f "%Y-%m-%dT%H:%M:%SZ" "$iso" "+%s" 2>/dev/null || echo "0"
-    else
-        date -d "$iso" "+%s" 2>/dev/null || echo "0"
-    fi
-}
-
-NOW_EPOCH=$(date +%s)
-
-# Wrapper function for getting role interval
-get_role_interval() {
+validate_role() {
     local role="$1"
-    get_role_interval_value "$role"
+    for valid in "${VALID_ROLES[@]}"; do
+        if [[ "$role" == "$valid" ]]; then
+            return 0
+        fi
+    done
+    return 1
 }
 
-COOLDOWN=$(get_role_interval "$ROLE")
-log_verbose "Role: $ROLE, Cooldown: ${COOLDOWN}s, Mode: $MODE"
-
-# Load state if it exists
-if [[ -f "$STATE_FILE" ]]; then
-    STATE=$(cat "$STATE_FILE")
-else
-    STATE='{}'
-fi
-
-# Check if role is already running
-log_verbose "Checking if role is already running..."
-ROLE_STATUS=$(echo "$STATE" | jq -r ".support_roles[\"$ROLE\"].status // \"idle\"")
-ROLE_TASK_ID=$(echo "$STATE" | jq -r ".support_roles[\"$ROLE\"].task_id // empty")
-
-if [[ "$ROLE_STATUS" == "running" && -n "$ROLE_TASK_ID" && "$FORCE" != "true" ]]; then
-    # Role is already running - check if we should skip
-    if [[ "$MODE" == "interval" ]]; then
-        echo '{
-  "success": false,
-  "error": "role_already_running",
-  "role": "'"$ROLE"'",
-  "task_id": "'"$ROLE_TASK_ID"'",
-  "message": "Role is already running. Use --force to spawn anyway."
-}'
-        exit 1
+# Validate task_id format (7-char hex)
+validate_task_id() {
+    local task_id="$1"
+    if [[ -z "$task_id" ]]; then
+        return 1
     fi
-    # Demand mode - continue even if running
-    log_verbose "Role running but demand mode - continuing"
-fi
+    # Real Task tool IDs are 7-char lowercase hex strings
+    if [[ "$task_id" =~ ^[a-f0-9]{7}$ ]]; then
+        return 0
+    fi
+    return 1
+}
 
-# Check cooldown for interval-based spawning
-if [[ "$MODE" == "interval" && "$FORCE" != "true" ]]; then
-    log_verbose "Checking cooldown..."
+# Convert ISO timestamp (UTC) to epoch seconds (cross-platform)
+iso_to_epoch() {
+    local timestamp="$1"
+    if [[ -z "$timestamp" || "$timestamp" == "null" ]]; then
+        echo "0"
+        return
+    fi
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS: date -j -f interprets as local time, so we must set TZ=UTC
+        TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$timestamp" "+%s" 2>/dev/null || echo "0"
+    else
+        # Linux: date -d handles ISO 8601 with timezone suffix natively
+        date -d "$timestamp" "+%s" 2>/dev/null || echo "0"
+    fi
+}
 
-    # Get last completed time
-    LAST_COMPLETED=$(echo "$STATE" | jq -r ".support_roles[\"$ROLE\"].last_completed // empty")
+# Check if a role should be spawned
+# Returns: JSON object with decision and reason
+check_role() {
+    local role="$1"
+    local demand_mode="${2:-false}"
+    local now_epoch
+    now_epoch=$(date +%s)
 
-    # For work generation roles, also check the specific trigger timestamp
-    if [[ "$ROLE" == "architect" ]]; then
-        LAST_TRIGGER=$(echo "$STATE" | jq -r '.last_architect_trigger // empty')
-        if [[ -n "$LAST_TRIGGER" ]]; then
-            LAST_COMPLETED="$LAST_TRIGGER"
-        fi
-    elif [[ "$ROLE" == "hermit" ]]; then
-        LAST_TRIGGER=$(echo "$STATE" | jq -r '.last_hermit_trigger // empty')
-        if [[ -n "$LAST_TRIGGER" ]]; then
-            LAST_COMPLETED="$LAST_TRIGGER"
-        fi
+    # Ensure state file exists
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo '{"should_spawn":true,"reason":"no_state_file","role":"'"$role"'"}'
+        return 0
     fi
 
-    if [[ -n "$LAST_COMPLETED" ]]; then
-        LAST_EPOCH=$(iso_to_epoch "$LAST_COMPLETED")
-        ELAPSED=$((NOW_EPOCH - LAST_EPOCH))
-        log_verbose "Last completed: $LAST_COMPLETED, Elapsed: ${ELAPSED}s, Cooldown: ${COOLDOWN}s"
+    # Read role status from state
+    local status
+    status=$(jq -r ".support_roles.${role}.status // \"idle\"" "$STATE_FILE" 2>/dev/null || echo "idle")
 
-        if [[ $ELAPSED -lt $COOLDOWN ]]; then
-            REMAINING=$((COOLDOWN - ELAPSED))
-            echo '{
-  "success": false,
-  "error": "cooldown_not_elapsed",
-  "role": "'"$ROLE"'",
-  "elapsed_seconds": '"$ELAPSED"',
-  "cooldown_seconds": '"$COOLDOWN"',
-  "remaining_seconds": '"$REMAINING"',
-  "message": "Cooldown not elapsed. Wait '"$REMAINING"'s or use --demand."
-}'
+    # Check if already running - never spawn duplicates
+    if [[ "$status" == "running" ]]; then
+        local task_id
+        task_id=$(jq -r ".support_roles.${role}.task_id // \"\"" "$STATE_FILE" 2>/dev/null || echo "")
+
+        # Validate the task_id - if fabricated, treat as idle
+        if [[ -n "$task_id" && "$task_id" != "null" ]]; then
+            if validate_task_id "$task_id"; then
+                echo '{"should_spawn":false,"reason":"already_running","role":"'"$role"'","task_id":"'"$task_id"'"}'
+                return 1
+            else
+                # Fabricated task_id - treat as idle
+                echo '{"should_spawn":true,"reason":"fabricated_task_id","role":"'"$role"'","stale_task_id":"'"$task_id"'"}'
+                return 0
+            fi
+        fi
+        # Running but no task_id - something is wrong, allow spawn
+        echo '{"should_spawn":true,"reason":"running_no_task_id","role":"'"$role"'"}'
+        return 0
+    fi
+
+    # In demand mode, skip interval check
+    if [[ "$demand_mode" == "true" ]]; then
+        echo '{"should_spawn":true,"reason":"demand","role":"'"$role"'"}'
+        return 0
+    fi
+
+    # Check interval
+    local interval
+    interval=$(get_interval "$role")
+
+    local last_completed
+    last_completed=$(jq -r ".support_roles.${role}.last_completed // \"\"" "$STATE_FILE" 2>/dev/null || echo "")
+
+    if [[ -z "$last_completed" || "$last_completed" == "null" ]]; then
+        # Never completed - needs trigger
+        echo '{"should_spawn":true,"reason":"never_run","role":"'"$role"'"}'
+        return 0
+    fi
+
+    local last_epoch
+    last_epoch=$(iso_to_epoch "$last_completed")
+
+    if [[ "$last_epoch" == "0" ]]; then
+        # Invalid timestamp - needs trigger
+        echo '{"should_spawn":true,"reason":"invalid_timestamp","role":"'"$role"'"}'
+        return 0
+    fi
+
+    local elapsed=$((now_epoch - last_epoch))
+
+    if [[ $elapsed -gt $interval ]]; then
+        echo '{"should_spawn":true,"reason":"interval_elapsed","role":"'"$role"'","elapsed_seconds":'"$elapsed"',"interval_seconds":'"$interval"'}'
+        return 0
+    fi
+
+    local remaining=$((interval - elapsed))
+    echo '{"should_spawn":false,"reason":"interval_not_elapsed","role":"'"$role"'","elapsed_seconds":'"$elapsed"',"interval_seconds":'"$interval"',"remaining_seconds":'"$remaining"'}'
+    return 1
+}
+
+# Check all roles and output combined result
+check_all_roles() {
+    local json_output="${1:-false}"
+    local results="[]"
+    local any_should_spawn=false
+
+    for role in "${VALID_ROLES[@]}"; do
+        local result
+        result=$(check_role "$role" "false") && true || true
+
+        local should_spawn
+        should_spawn=$(echo "$result" | jq -r '.should_spawn')
+
+        if [[ "$should_spawn" == "true" ]]; then
+            any_should_spawn=true
+        fi
+
+        results=$(echo "$results" | jq --argjson entry "$result" '. + [$entry]')
+    done
+
+    if [[ "$json_output" == "true" ]]; then
+        jq -n \
+            --argjson results "$results" \
+            --argjson any_should_spawn "$any_should_spawn" \
+            '{roles: $results, any_should_spawn: $any_should_spawn}'
+    else
+        for role in "${VALID_ROLES[@]}"; do
+            local entry
+            entry=$(echo "$results" | jq -r ".[] | select(.role == \"$role\")")
+            local should_spawn reason
+            should_spawn=$(echo "$entry" | jq -r '.should_spawn')
+            reason=$(echo "$entry" | jq -r '.reason')
+
+            if [[ "$should_spawn" == "true" ]]; then
+                echo "  $role: SPAWN ($reason)"
+            else
+                local remaining
+                remaining=$(echo "$entry" | jq -r '.remaining_seconds // "n/a"')
+                echo "  $role: SKIP ($reason, ${remaining}s remaining)"
+            fi
+        done
+    fi
+
+    if [[ "$any_should_spawn" == "true" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Mark a role as running in daemon-state.json
+mark_running() {
+    local role="$1"
+    local task_id="$2"
+    local now_iso
+    now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Validate task_id format
+    if ! validate_task_id "$task_id"; then
+        echo "Error: Invalid task_id format: '$task_id' (expected 7-char hex like 'a7dc1e0')" >&2
+        return 2
+    fi
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "Error: State file not found: $STATE_FILE" >&2
+        return 2
+    fi
+
+    # Atomic update using temp file
+    local temp_file
+    temp_file=$(mktemp)
+    if jq --arg role "$role" \
+          --arg task_id "$task_id" \
+          --arg started_at "$now_iso" \
+          '.support_roles[$role] = (.support_roles[$role] // {}) + {
+              status: "running",
+              task_id: $task_id,
+              started_at: $started_at
+          }' "$STATE_FILE" > "$temp_file" 2>/dev/null; then
+        mv "$temp_file" "$STATE_FILE"
+        echo "Marked $role as running (task_id=$task_id)"
+        return 0
+    else
+        rm -f "$temp_file"
+        echo "Error: Failed to update state file" >&2
+        return 2
+    fi
+}
+
+# Mark a role as completed in daemon-state.json
+mark_completed() {
+    local role="$1"
+    local now_iso
+    now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "Error: State file not found: $STATE_FILE" >&2
+        return 2
+    fi
+
+    # Atomic update using temp file
+    local temp_file
+    temp_file=$(mktemp)
+    if jq --arg role "$role" \
+          --arg last_completed "$now_iso" \
+          '.support_roles[$role] = (.support_roles[$role] // {}) + {
+              status: "idle",
+              task_id: null,
+              output_file: null,
+              last_completed: $last_completed
+          }' "$STATE_FILE" > "$temp_file" 2>/dev/null; then
+        mv "$temp_file" "$STATE_FILE"
+        echo "Marked $role as completed"
+        return 0
+    else
+        rm -f "$temp_file"
+        echo "Error: Failed to update state file" >&2
+        return 2
+    fi
+}
+
+# Main entry point
+main() {
+    local role=""
+    local demand_mode=false
+    local check_only=false
+    local check_all=false
+    local json_output=false
+    local mark_running_mode=false
+    local mark_completed_mode=false
+    local task_id=""
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --demand)
+                demand_mode=true
+                shift
+                ;;
+            --check-only)
+                check_only=true
+                shift
+                ;;
+            --check-all)
+                check_all=true
+                shift
+                ;;
+            --json)
+                json_output=true
+                shift
+                ;;
+            --mark-running)
+                mark_running_mode=true
+                role="$2"
+                shift 2
+                ;;
+            --mark-completed)
+                mark_completed_mode=true
+                role="$2"
+                shift 2
+                ;;
+            --task-id)
+                task_id="$2"
+                shift 2
+                ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                exit 2
+                ;;
+            *)
+                if [[ -z "$role" ]]; then
+                    role="$1"
+                else
+                    echo "Unexpected argument: $1" >&2
+                    exit 2
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Handle --check-all
+    if [[ "$check_all" == "true" ]]; then
+        check_all_roles "$json_output" && exit 0 || exit $?
+    fi
+
+    # Handle --mark-running
+    if [[ "$mark_running_mode" == "true" ]]; then
+        if [[ -z "$role" ]]; then
+            echo "Error: --mark-running requires a role name" >&2
             exit 2
         fi
+        if ! validate_role "$role"; then
+            echo "Error: Invalid role: $role" >&2
+            exit 2
+        fi
+        if [[ -z "$task_id" ]]; then
+            echo "Error: --mark-running requires --task-id" >&2
+            exit 2
+        fi
+        mark_running "$role" "$task_id"
+        exit $?
     fi
-fi
 
-# Dry run exits here
-if [[ "$DRY_RUN" == "true" ]]; then
-    echo '{
-  "success": true,
-  "dry_run": true,
-  "role": "'"$ROLE"'",
-  "mode": "'"$MODE"'",
-  "cooldown_seconds": '"$COOLDOWN"',
-  "would_spawn": true,
-  "spawn_command": "/'"$ROLE"'"
-}'
-    exit 0
-fi
+    # Handle --mark-completed
+    if [[ "$mark_completed_mode" == "true" ]]; then
+        if [[ -z "$role" ]]; then
+            echo "Error: --mark-completed requires a role name" >&2
+            exit 2
+        fi
+        if ! validate_role "$role"; then
+            echo "Error: Invalid role: $role" >&2
+            exit 2
+        fi
+        mark_completed "$role"
+        exit $?
+    fi
 
-# Generate spawn command
-SPAWN_COMMAND="/$ROLE"
+    # Handle role check (default mode)
+    if [[ -z "$role" ]]; then
+        echo "Error: No role specified" >&2
+        echo "Usage: spawn-support-role.sh <role> [--demand] [--check-only] [--json]" >&2
+        exit 2
+    fi
 
-# Output success JSON
-echo '{
-  "success": true,
-  "role": "'"$ROLE"'",
-  "mode": "'"$MODE"'",
-  "cooldown_seconds": '"$COOLDOWN"',
-  "spawn_command": "'"$SPAWN_COMMAND"'",
-  "task_id_pattern": "^[a-f0-9]{7}$",
-  "timestamp": "'"$(get_timestamp)"'",
-  "instructions": {
-    "step1": "Execute spawn_command via Task(prompt=spawn_command, run_in_background=True)",
-    "step2": "Validate returned task_id matches task_id_pattern",
-    "step3": "Record in daemon-state.json: support_roles[role] = {status: running, task_id: ..., started_at: ...}",
-    "step4": "For architect/hermit, also update last_<role>_trigger timestamp"
-  }
-}'
+    if ! validate_role "$role"; then
+        echo "Error: Invalid role: $role (valid: ${VALID_ROLES[*]})" >&2
+        exit 2
+    fi
 
-exit 0
+    local result exit_code
+    result=$(check_role "$role" "$demand_mode") && exit_code=0 || exit_code=$?
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "$result"
+    else
+        local should_spawn reason
+        should_spawn=$(echo "$result" | jq -r '.should_spawn')
+        reason=$(echo "$result" | jq -r '.reason')
+
+        if [[ "$should_spawn" == "true" ]]; then
+            echo "SPAWN $role ($reason)"
+        else
+            echo "SKIP $role ($reason)"
+        fi
+    fi
+
+    exit $exit_code
+}
+
+main "$@"
