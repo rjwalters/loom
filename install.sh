@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+# Handle Ctrl-C and SIGTERM during interactive prompts
+trap 'echo ""; echo -e "\033[0;34mℹ Installation cancelled\033[0m"; exit 130' SIGINT
+trap 'exit 143' SIGTERM
+
 # ANSI color codes
 RED='\033[0;31m'
 GREEN='\033[0;32m'
