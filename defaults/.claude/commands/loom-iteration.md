@@ -713,17 +713,22 @@ written; cooldown is now tracked via `support_roles.architect.last_completed` an
 ## Deterministic Support Role Spawning
 
 Support role spawning uses the deterministic `spawn-support-role.sh` script for all
-spawn decisions and state management. This eliminates LLM interpretation variability
-and ensures reliable support role operation in direct mode.
+spawn decisions. The script is read-only (pure decision function) and does not modify
+daemon-state.json. State management is handled in-memory by the iteration subagent,
+which is the sole writer of daemon-state.json. This eliminates both LLM interpretation
+variability and race conditions between concurrent writers.
 
 ### spawn-support-role.sh
 
-The script handles:
+The script is a **pure decision function** (read-only) that handles:
 - **Interval checking**: Whether enough time has elapsed since last completion
 - **Idempotency**: Never spawns if role already running with valid task_id
 - **Demand mode**: Immediate spawn when `--demand` flag passed (skips interval)
-- **State management**: `--mark-running` and `--mark-completed` for atomic state updates
-- **Fabricated ID detection**: Resets roles stuck with invalid task IDs
+- **Fabricated ID detection**: Detects roles stuck with invalid task IDs
+
+**State management** (marking roles as running/completed) is handled entirely by the
+iteration subagent in-memory. The iteration subagent is the sole writer of
+daemon-state.json, which eliminates race conditions between concurrent writers.
 
 ```bash
 # Check if a role should be spawned (interval-based)
@@ -737,12 +742,6 @@ The script handles:
 # Check all roles at once
 ./.loom/scripts/spawn-support-role.sh --check-all --json
 # {"roles":[...],"any_should_spawn":true}
-
-# After successful Task spawn, mark role as running
-./.loom/scripts/spawn-support-role.sh --mark-running champion --task-id a7dc1e0
-
-# After task completion, mark role as idle
-./.loom/scripts/spawn-support-role.sh --mark-completed champion
 ```
 
 ## Workflow Demand (Demand-Based Spawning)
@@ -885,8 +884,10 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
     Uses slash command directly - Claude Code executes /role natively.
     This avoids the Skill-in-Task anti-pattern that expands role prompts into subagent context.
 
-    After successful spawn, uses spawn-support-role.sh --mark-running to
-    record the task_id in daemon-state.json atomically.
+    After successful spawn, updates in-memory state only. The iteration subagent
+    is the sole writer of daemon-state.json - state is saved once at the end of
+    the iteration via save_daemon_state(state). This eliminates race conditions
+    between the iteration subagent and spawn-support-role.sh.
     """
 
     def debug(msg):
@@ -928,11 +929,9 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
         print(f"    The Task tool was likely not actually invoked")
         return False
 
-    # Use deterministic script to record state atomically
-    mark_result = run(f"./.loom/scripts/spawn-support-role.sh --mark-running {role_name} --task-id {result.task_id}")
-    debug(f"State update: {mark_result.strip()}")
-
-    # Also update in-memory state for consistency within this iteration
+    # Update in-memory state only - iteration writes state file once at end
+    # This eliminates the race condition where spawn-support-role.sh --mark-running
+    # would write to daemon-state.json concurrently with the iteration subagent
     if "support_roles" not in state:
         state["support_roles"] = {}
     state["support_roles"][role_name] = {
@@ -942,20 +941,24 @@ def trigger_support_role(state, role_name, description, debug_mode=False):
         "started_at": now()
     }
 
+    debug(f"State update: {role_name} marked running in-memory (task_id={result.task_id})")
     print(f"  AUTO-SPAWNED: {role_name.capitalize()} (verified, task_id={result.task_id})")
     return True
 ```
 
 ## Check Support Role Completions
 
-Uses `spawn-support-role.sh --mark-completed` for atomic state transitions:
+Updates in-memory state when support roles complete. The iteration subagent is the
+sole writer of daemon-state.json, so all state transitions happen in-memory and
+are persisted in the single `save_daemon_state(state)` call at the end of the iteration.
 
 ```python
 def check_support_role_completions(state, debug_mode=False):
-    """Check if any support roles have completed and update their state.
+    """Check if any support roles have completed and update their in-memory state.
 
-    Uses spawn-support-role.sh --mark-completed for atomic state updates
-    when a role transitions from running to idle.
+    All state updates happen in-memory only. The iteration subagent writes
+    daemon-state.json once at the end of the iteration, eliminating race
+    conditions between concurrent writers.
     """
 
     def debug(msg):
@@ -983,9 +986,7 @@ def check_support_role_completions(state, debug_mode=False):
         if not validate_task_id(task_id):
             debug(f"WARNING: {role_name.capitalize()} has fabricated task_id in state: '{task_id}'")
             debug(f"  Resetting {role_name} to idle (task was never actually spawned)")
-            # Use deterministic script for atomic state update
-            run(f"./.loom/scripts/spawn-support-role.sh --mark-completed {role_name}")
-            # Update in-memory state
+            # Update in-memory state only - written at end of iteration
             role_info["status"] = "idle"
             role_info["last_completed"] = now_iso
             role_info["last_error"] = f"fabricated_task_id: {task_id}"
@@ -999,9 +1000,7 @@ def check_support_role_completions(state, debug_mode=False):
             check = TaskOutput(task_id=task_id, block=False, timeout=1000)
 
             if check.status == "completed":
-                # Use deterministic script for atomic state update
-                run(f"./.loom/scripts/spawn-support-role.sh --mark-completed {role_name}")
-                # Update in-memory state
+                # Update in-memory state only - written at end of iteration
                 role_info["status"] = "idle"
                 role_info["last_completed"] = now_iso
                 role_info["task_id"] = None
@@ -1011,9 +1010,7 @@ def check_support_role_completions(state, debug_mode=False):
                 debug(f"{role_name.capitalize()} completed (task {task_id})")
 
             elif check.status == "failed":
-                # Use deterministic script for atomic state update
-                run(f"./.loom/scripts/spawn-support-role.sh --mark-completed {role_name}")
-                # Update in-memory state
+                # Update in-memory state only - written at end of iteration
                 role_info["status"] = "idle"
                 role_info["last_completed"] = now_iso
                 role_info["last_error"] = "task_failed"

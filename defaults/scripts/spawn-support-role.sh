@@ -1,20 +1,19 @@
 #!/bin/bash
-# spawn-support-role.sh - Deterministic support role spawn logic
+# spawn-support-role.sh - Deterministic support role spawn decision logic
 #
 # This script encapsulates the decision logic for spawning support roles
 # (Guide, Champion, Doctor, Auditor, Judge, Architect, Hermit) in the daemon.
 # It replaces LLM-interpreted pseudocode with deterministic bash logic.
 #
-# The script does NOT spawn roles itself - it evaluates whether a role
-# should be spawned and updates daemon-state.json accordingly. The actual
-# spawning (Task subagent, tmux session, or MCP) is handled by the caller
-# (the iteration subagent or daemon-loop.sh).
+# This script is a PURE DECISION FUNCTION - it is read-only and does NOT
+# modify daemon-state.json. All state management (marking roles as running
+# or completed) is handled by the iteration subagent, which is the sole
+# writer of daemon-state.json. This eliminates race conditions between
+# concurrent writers.
 #
 # Usage:
 #   spawn-support-role.sh <role> [--demand] [--check-only] [--json]
 #   spawn-support-role.sh --check-all [--json]
-#   spawn-support-role.sh --mark-running <role> --task-id <id>
-#   spawn-support-role.sh --mark-completed <role>
 #   spawn-support-role.sh --help
 #
 # Options:
@@ -22,13 +21,11 @@
 #   --demand          Demand-based spawn (skip interval check)
 #   --check-only      Only check if spawn is needed, don't modify state
 #   --check-all       Check all support roles and output combined result
-#   --mark-running    Mark a role as running with the given task_id
-#   --mark-completed  Mark a role as completed (transition to idle)
 #   --json            Output JSON instead of human-readable text
 #   --help            Show this help message
 #
 # Exit Codes:
-#   0 - Role should be spawned (or state updated successfully)
+#   0 - Role should be spawned
 #   1 - Role should NOT be spawned (already running, interval not elapsed)
 #   2 - Error (invalid role, missing state file, etc.)
 #
@@ -50,12 +47,6 @@
 #
 #   # Check all roles and get JSON output
 #   spawn-support-role.sh --check-all --json
-#
-#   # Mark role as running after successful Task spawn
-#   spawn-support-role.sh --mark-running champion --task-id a7dc1e0
-#
-#   # Mark role as completed
-#   spawn-support-role.sh --mark-completed champion
 
 set -euo pipefail
 
@@ -90,13 +81,15 @@ VALID_ROLES=("guide" "champion" "doctor" "auditor" "judge" "architect" "hermit")
 
 show_help() {
     cat <<'EOF'
-spawn-support-role.sh - Deterministic support role spawn logic
+spawn-support-role.sh - Deterministic support role spawn decision logic
+
+This script is a PURE DECISION FUNCTION - it is read-only and does NOT
+modify daemon-state.json. State management is handled by the iteration
+subagent (the sole writer of daemon-state.json).
 
 USAGE:
     spawn-support-role.sh <role> [--demand] [--check-only] [--json]
     spawn-support-role.sh --check-all [--json]
-    spawn-support-role.sh --mark-running <role> --task-id <id>
-    spawn-support-role.sh --mark-completed <role>
     spawn-support-role.sh --help
 
 ROLES:
@@ -112,13 +105,11 @@ OPTIONS:
     --demand        Demand-based spawn (skip interval check)
     --check-only    Only check if spawn is needed, don't modify state
     --check-all     Check all roles and output combined result
-    --mark-running  Mark a role as running with a task_id
-    --mark-completed Mark a role as completed (transition to idle)
     --json          Output JSON format
     --help          Show this help message
 
 EXIT CODES:
-    0 - Role should be spawned (or state updated)
+    0 - Role should be spawned
     1 - Role should NOT be spawned
     2 - Error
 
@@ -316,77 +307,6 @@ check_all_roles() {
     return 1
 }
 
-# Mark a role as running in daemon-state.json
-mark_running() {
-    local role="$1"
-    local task_id="$2"
-    local now_iso
-    now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    # Validate task_id format
-    if ! validate_task_id "$task_id"; then
-        echo "Error: Invalid task_id format: '$task_id' (expected 7-char hex like 'a7dc1e0')" >&2
-        return 2
-    fi
-
-    if [[ ! -f "$STATE_FILE" ]]; then
-        echo "Error: State file not found: $STATE_FILE" >&2
-        return 2
-    fi
-
-    # Atomic update using temp file
-    local temp_file
-    temp_file=$(mktemp)
-    if jq --arg role "$role" \
-          --arg task_id "$task_id" \
-          --arg started_at "$now_iso" \
-          '.support_roles[$role] = (.support_roles[$role] // {}) + {
-              status: "running",
-              task_id: $task_id,
-              started_at: $started_at
-          }' "$STATE_FILE" > "$temp_file" 2>/dev/null; then
-        mv "$temp_file" "$STATE_FILE"
-        echo "Marked $role as running (task_id=$task_id)"
-        return 0
-    else
-        rm -f "$temp_file"
-        echo "Error: Failed to update state file" >&2
-        return 2
-    fi
-}
-
-# Mark a role as completed in daemon-state.json
-mark_completed() {
-    local role="$1"
-    local now_iso
-    now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    if [[ ! -f "$STATE_FILE" ]]; then
-        echo "Error: State file not found: $STATE_FILE" >&2
-        return 2
-    fi
-
-    # Atomic update using temp file
-    local temp_file
-    temp_file=$(mktemp)
-    if jq --arg role "$role" \
-          --arg last_completed "$now_iso" \
-          '.support_roles[$role] = (.support_roles[$role] // {}) + {
-              status: "idle",
-              task_id: null,
-              output_file: null,
-              last_completed: $last_completed
-          }' "$STATE_FILE" > "$temp_file" 2>/dev/null; then
-        mv "$temp_file" "$STATE_FILE"
-        echo "Marked $role as completed"
-        return 0
-    else
-        rm -f "$temp_file"
-        echo "Error: Failed to update state file" >&2
-        return 2
-    fi
-}
-
 # Main entry point
 main() {
     local role=""
@@ -395,9 +315,6 @@ main() {
     local check_only=false
     local check_all=false
     local json_output=false
-    local mark_running_mode=false
-    local mark_completed_mode=false
-    local task_id=""
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -418,20 +335,6 @@ main() {
             --json)
                 json_output=true
                 shift
-                ;;
-            --mark-running)
-                mark_running_mode=true
-                role="$2"
-                shift 2
-                ;;
-            --mark-completed)
-                mark_completed_mode=true
-                role="$2"
-                shift 2
-                ;;
-            --task-id)
-                task_id="$2"
-                shift 2
                 ;;
             --help|-h)
                 show_help
@@ -456,38 +359,6 @@ main() {
     # Handle --check-all
     if [[ "$check_all" == "true" ]]; then
         check_all_roles "$json_output" && exit 0 || exit $?
-    fi
-
-    # Handle --mark-running
-    if [[ "$mark_running_mode" == "true" ]]; then
-        if [[ -z "$role" ]]; then
-            echo "Error: --mark-running requires a role name" >&2
-            exit 2
-        fi
-        if ! validate_role "$role"; then
-            echo "Error: Invalid role: $role" >&2
-            exit 2
-        fi
-        if [[ -z "$task_id" ]]; then
-            echo "Error: --mark-running requires --task-id" >&2
-            exit 2
-        fi
-        mark_running "$role" "$task_id"
-        exit $?
-    fi
-
-    # Handle --mark-completed
-    if [[ "$mark_completed_mode" == "true" ]]; then
-        if [[ -z "$role" ]]; then
-            echo "Error: --mark-completed requires a role name" >&2
-            exit 2
-        fi
-        if ! validate_role "$role"; then
-            echo "Error: Invalid role: $role" >&2
-            exit 2
-        fi
-        mark_completed "$role"
-        exit $?
     fi
 
     # Handle role check (default mode)
