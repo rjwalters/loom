@@ -317,6 +317,11 @@ fi
 > **Note**: This Skill-in-Task pattern applies to **daemon→shepherd** invocations only.
 > Shepherds themselves use plain `Task` subagents with slash-command prompts for phase
 > delegation (e.g., `Task(prompt="/builder 123")`). See `shepherd.md` for details.
+>
+> **Support roles** (guide, champion, doctor, auditor, judge) and **work generation roles**
+> (architect, hermit) use a **direct role file reference** pattern instead of Skill indirection.
+> This avoids the Task+Skill indirection failure in direct mode. See `trigger_support_role()`
+> and issue #1359 for details.
 
 ```python
 def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False):
@@ -645,7 +650,11 @@ This {proposal_type} proposal has been automatically promoted to `loom:issue` by
 
 ```python
 def trigger_architect_role(state, debug_mode=False):
-    """Trigger Architect role to generate new proposals. Returns True if triggered."""
+    """Trigger Architect role to generate new proposals. Returns True if triggered.
+
+    Uses direct role file reference instead of Skill indirection to avoid
+    the Task+Skill pattern failure in direct mode. See issue #1359.
+    """
 
     def debug(msg):
         if debug_mode:
@@ -655,13 +664,13 @@ def trigger_architect_role(state, debug_mode=False):
 
     result = Task(
         description="Architect work generation",
-        prompt="""You must invoke the Skill tool to execute the architect role.
+        prompt="""Execute the architect role for one work generation iteration.
 
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=architect'. Use the Skill tool:
+Read the role instructions from .claude/commands/architect.md and follow them exactly.
+Complete one work generation iteration. Create a proposal issue with the loom:architect label.
 
-Skill(skill="architect", args="--autonomous")
-
-Complete one work generation iteration. Create a proposal issue with the loom:architect label.""",
+IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
+Read the role file directly and execute the instructions.""",
         run_in_background=True
     )
 
@@ -687,7 +696,11 @@ Complete one work generation iteration. Create a proposal issue with the loom:ar
 
 
 def trigger_hermit_role(state, debug_mode=False):
-    """Trigger Hermit role to generate simplification proposals. Returns True if triggered."""
+    """Trigger Hermit role to generate simplification proposals. Returns True if triggered.
+
+    Uses direct role file reference instead of Skill indirection to avoid
+    the Task+Skill pattern failure in direct mode. See issue #1359.
+    """
 
     def debug(msg):
         if debug_mode:
@@ -697,13 +710,13 @@ def trigger_hermit_role(state, debug_mode=False):
 
     result = Task(
         description="Hermit simplification proposals",
-        prompt="""You must invoke the Skill tool to execute the hermit role.
+        prompt="""Execute the hermit role for one simplification analysis iteration.
 
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=hermit'. Use the Skill tool:
+Read the role instructions from .claude/commands/hermit.md and follow them exactly.
+Complete one simplification analysis iteration. Create a proposal issue with the loom:hermit label.
 
-Skill(skill="hermit")
-
-Complete one simplification analysis iteration. Create a proposal issue with the loom:hermit label.""",
+IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
+Read the role file directly and execute the instructions.""",
         run_in_background=True
     )
 
@@ -818,58 +831,60 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
 
 
 def trigger_support_role(state, role_name, description, debug_mode=False):
-    """Spawn a support role using Task tool with Skill invocation."""
+    """Spawn a support role using Task tool with direct role file reference.
+
+    Support roles are spawned by reading their role file directly, NOT via
+    the Skill tool. This avoids the Task+Skill indirection problem where
+    the subagent interprets 'invoke the Skill tool' as a direct instruction,
+    expanding the role prompt into its own context instead of spawning a
+    background Task. See issue #1359 for details.
+
+    The subagent reads the role file and executes the instructions directly,
+    which is simpler and more reliable than the Skill indirection pattern.
+    """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    role_prompts = {
-        "guide": """You must invoke the Skill tool to execute the guide role.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=guide'. Use the Skill tool:
-
-Skill(skill="guide")
-
-Complete one triage iteration.""",
-
-        "champion": """You must invoke the Skill tool to execute the champion role.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=champion'. Use the Skill tool:
-
-Skill(skill="champion")
-
-Complete one PR evaluation and merge iteration.""",
-
-        "doctor": """You must invoke the Skill tool to execute the doctor role.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=doctor'. Use the Skill tool:
-
-Skill(skill="doctor")
-
-Complete one PR conflict resolution iteration.""",
-
-        "auditor": """You must invoke the Skill tool to execute the auditor role.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=auditor'. Use the Skill tool:
-
-Skill(skill="auditor")
-
-Complete one main branch validation iteration.""",
-
-        "judge": """You must invoke the Skill tool to execute the judge role.
-
-IMPORTANT: Do NOT use CLI commands like 'claude --skill=judge'. Use the Skill tool:
-
-Skill(skill="judge")
-
-Complete one PR review iteration."""
+    # Map role names to their command files and task descriptions
+    role_configs = {
+        "guide": {
+            "file": ".claude/commands/guide.md",
+            "task": "Complete one triage iteration."
+        },
+        "champion": {
+            "file": ".claude/commands/champion.md",
+            "task": "Complete one PR evaluation and merge iteration."
+        },
+        "doctor": {
+            "file": ".claude/commands/doctor.md",
+            "task": "Complete one PR conflict resolution iteration."
+        },
+        "auditor": {
+            "file": ".claude/commands/auditor.md",
+            "task": "Complete one main branch validation iteration."
+        },
+        "judge": {
+            "file": ".claude/commands/judge.md",
+            "task": "Complete one PR review iteration."
+        }
     }
 
-    prompt = role_prompts.get(role_name)
-    if not prompt:
+    config = role_configs.get(role_name)
+    if not config:
         debug(f"Unknown role: {role_name}")
         return False
+
+    role_file = config["file"]
+    task_desc = config["task"]
+
+    prompt = f"""Execute the {role_name} role for one iteration.
+
+Read the role instructions from {role_file} and follow them exactly. {task_desc}
+
+IMPORTANT: You are already in the correct role context. Do NOT use the Skill tool.
+Read the role file directly and execute the instructions."""
 
     result = Task(
         description=description,
