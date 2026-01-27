@@ -319,7 +319,7 @@ def start_daemon(force_mode=False, debug_mode=False):
             return
 
     # 5. Run startup cleanup
-    run("./scripts/daemon-cleanup.sh daemon-startup")
+    run("./.loom/scripts/daemon-cleanup.sh daemon-startup")
 
     # 6. Save initial state
     save_daemon_state(state)
@@ -453,7 +453,7 @@ def graceful_shutdown():
     # Cleanup signals and state
     rm(".loom/stop-shepherds")
     rm(".loom/stop-daemon")
-    run("./scripts/daemon-cleanup.sh daemon-shutdown")
+    run("./.loom/scripts/daemon-cleanup.sh daemon-shutdown")
     state["running"] = False
     state["stopped_at"] = now()
     save_daemon_state()
