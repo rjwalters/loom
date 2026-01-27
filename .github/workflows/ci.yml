@@ -21,6 +21,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm format --check
+      # Biome doesn't format Rust, so skip pnpm format:rust check here
 
   frontend-typecheck:
     name: TypeScript Type Checking
@@ -51,6 +52,7 @@ jobs:
           cache: "pnpm"
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:unit
+      # Vitest unit tests only, no Rust tests needed here
 
   backend-lint:
     name: Rust Linting
@@ -66,6 +68,11 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
+      - name: Build daemon binary (required for Tauri app)
+        run: |
+          cargo build --package loom-daemon --release
+          # Create platform-specific symlink expected by Tauri
+          ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   backend-tests:
@@ -79,6 +86,11 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libappindicator3-dev patchelf
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build daemon binary (required for Tauri app)
+        run: |
+          cargo build --package loom-daemon --release
+          # Create platform-specific symlink expected by Tauri
+          ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
       - run: cargo test --workspace
 
   backend-build:
@@ -92,4 +104,9 @@ jobs:
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libappindicator3-dev patchelf
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Build daemon binary (required for Tauri app)
+        run: |
+          cargo build --package loom-daemon --release
+          # Create platform-specific symlink expected by Tauri
+          ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
       - run: cargo check --workspace --all-targets
