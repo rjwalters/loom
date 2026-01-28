@@ -465,17 +465,25 @@ run_phase() {
 
 # ─── Get PR for issue ─────────────────────────────────────────────────────────
 
+# Find a PR for an issue, trying multiple linking patterns
+# Usage: get_pr_for_issue <issue> [state]
+# state: open (default), closed, or all
 get_pr_for_issue() {
     local issue="$1"
+    local state="${2:-open}"
     local pr
-    # Try to find PR that references this issue
-    pr=$(gh pr list --search "Closes #${issue}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
 
-    if [[ -z "$pr" || "$pr" == "null" ]]; then
-        # Also try searching by branch name
-        pr=$(gh pr list --head "feature/issue-${issue}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
-    fi
+    # Try multiple linking patterns (search body for these phrases)
+    for pattern in "Closes #${issue}" "Fixes #${issue}" "Resolves #${issue}"; do
+        pr=$(gh pr list --search "$pattern" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
+        if [[ -n "$pr" && "$pr" != "null" ]]; then
+            echo "$pr"
+            return 0
+        fi
+    done
 
+    # Fallback: search by branch name
+    pr=$(gh pr list --head "feature/issue-${issue}" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
     echo "$pr"
 }
 
@@ -607,82 +615,114 @@ main() {
         exit 0
     fi
 
-    # ─── PHASE 3: Builder ─────────────────────────────────────────────────────
+    # ─── Stage Detection: Check for existing PRs ─────────────────────────────
 
-    log_phase "PHASE 3: BUILDER"
-
-    if check_shutdown; then
-        handle_shutdown "builder"
-    fi
-
-    # Report phase
-    if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
-        "$REPO_ROOT/.loom/scripts/report-milestone.sh" phase_entered \
-            --task-id "$TASK_ID" \
-            --phase "builder" \
-            --quiet || true
-    fi
-
-    # Claim the issue
-    remove_label "$ISSUE" "loom:issue"
-    add_label "$ISSUE" "loom:building"
-
-    # Create worktree
+    # Check if a PR already exists for this issue before starting the builder phase.
+    # This handles cases where:
+    #   - Shepherd was interrupted and restarted after builder completed
+    #   - PR was created manually
+    #   - Previous shepherd run failed after PR creation
+    local existing_pr=""
     local worktree_path="$REPO_ROOT/.loom/worktrees/issue-${ISSUE}"
-    if [[ ! -d "$worktree_path" ]]; then
-        log_info "Creating worktree..."
-        "$REPO_ROOT/.loom/scripts/worktree.sh" "$ISSUE" >/dev/null 2>&1 || {
-            log_error "Failed to create worktree"
-            fail_with_reason "builder" "failed to create worktree"
-        }
 
-        # Report worktree created
+    existing_pr=$(get_pr_for_issue "$ISSUE")
+    if [[ -n "$existing_pr" && "$existing_pr" != "null" ]]; then
+        log_info "Existing PR #$existing_pr found for issue #$ISSUE"
+        log_info "Skipping builder phase, proceeding to judge"
+
+        # Report milestone for existing PR
         if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
-            "$REPO_ROOT/.loom/scripts/report-milestone.sh" worktree_created \
+            "$REPO_ROOT/.loom/scripts/report-milestone.sh" pr_created \
                 --task-id "$TASK_ID" \
-                --path "$worktree_path" \
+                --pr-number "$existing_pr" \
                 --quiet || true
         fi
+
+        # Ensure issue has loom:building label (may not have it if PR was created manually)
+        if ! has_label "$ISSUE" "loom:building"; then
+            remove_label "$ISSUE" "loom:issue"
+            add_label "$ISSUE" "loom:building"
+        fi
+
+        completed_phases+=("Builder (skipped - PR #$existing_pr exists)")
+        pr_number="$existing_pr"
+    else
+        # ─── PHASE 3: Builder ─────────────────────────────────────────────────────
+
+        log_phase "PHASE 3: BUILDER"
+
+        if check_shutdown; then
+            handle_shutdown "builder"
+        fi
+
+        # Report phase
+        if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
+            "$REPO_ROOT/.loom/scripts/report-milestone.sh" phase_entered \
+                --task-id "$TASK_ID" \
+                --phase "builder" \
+                --quiet || true
+        fi
+
+        # Claim the issue
+        remove_label "$ISSUE" "loom:issue"
+        add_label "$ISSUE" "loom:building"
+
+        # Create worktree
+        if [[ ! -d "$worktree_path" ]]; then
+            log_info "Creating worktree..."
+            "$REPO_ROOT/.loom/scripts/worktree.sh" "$ISSUE" >/dev/null 2>&1 || {
+                log_error "Failed to create worktree"
+                fail_with_reason "builder" "failed to create worktree"
+            }
+
+            # Report worktree created
+            if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
+                "$REPO_ROOT/.loom/scripts/report-milestone.sh" worktree_created \
+                    --task-id "$TASK_ID" \
+                    --path "$worktree_path" \
+                    --quiet || true
+            fi
+        fi
+
+        local builder_exit=0
+        run_phase "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
+            --phase "builder" \
+            --worktree "$worktree_path" \
+            --args "$ISSUE" || builder_exit=$?
+
+        if [[ $builder_exit -eq 3 ]]; then
+            # Revert claim on shutdown
+            remove_label "$ISSUE" "loom:building"
+            add_label "$ISSUE" "loom:issue"
+            handle_shutdown "builder"
+        fi
+
+        # Validate builder phase
+        if ! "$REPO_ROOT/.loom/scripts/validate-phase.sh" builder "$ISSUE" \
+            --worktree "$worktree_path" \
+            --task-id "$TASK_ID"; then
+            log_error "Builder phase validation failed"
+            fail_with_reason "builder" "validation failed"
+        fi
+
+        # Get PR number
+        pr_number=$(get_pr_for_issue "$ISSUE")
+        if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
+            log_error "Could not find PR for issue #$ISSUE"
+            fail_with_reason "builder" "could not find PR for issue"
+        fi
+
+        # Report PR created
+        if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
+            "$REPO_ROOT/.loom/scripts/report-milestone.sh" pr_created \
+                --task-id "$TASK_ID" \
+                --pr-number "$pr_number" \
+                --quiet || true
+        fi
+
+        completed_phases+=("Builder (PR #$pr_number)")
+        log_success "Builder phase complete - PR #$pr_number created"
     fi
-
-    local builder_exit=0
-    run_phase "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
-        --phase "builder" \
-        --worktree "$worktree_path" \
-        --args "$ISSUE" || builder_exit=$?
-
-    if [[ $builder_exit -eq 3 ]]; then
-        # Revert claim on shutdown
-        remove_label "$ISSUE" "loom:building"
-        add_label "$ISSUE" "loom:issue"
-        handle_shutdown "builder"
-    fi
-
-    # Validate builder phase
-    if ! "$REPO_ROOT/.loom/scripts/validate-phase.sh" builder "$ISSUE" \
-        --worktree "$worktree_path" \
-        --task-id "$TASK_ID"; then
-        log_error "Builder phase validation failed"
-        fail_with_reason "builder" "validation failed"
-    fi
-
-    # Get PR number
-    pr_number=$(get_pr_for_issue "$ISSUE")
-    if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
-        log_error "Could not find PR for issue #$ISSUE"
-        fail_with_reason "builder" "could not find PR for issue"
-    fi
-
-    # Report PR created
-    if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
-        "$REPO_ROOT/.loom/scripts/report-milestone.sh" pr_created \
-            --task-id "$TASK_ID" \
-            --pr-number "$pr_number" \
-            --quiet || true
-    fi
-
-    completed_phases+=("Builder (PR #$pr_number)")
-    log_success "Builder phase complete - PR #$pr_number created"
 
     # ─── PHASE 4/5: Judge/Doctor Loop ─────────────────────────────────────────
 
