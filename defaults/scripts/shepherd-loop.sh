@@ -30,7 +30,7 @@
 #   LOOM_JUDGE_TIMEOUT       Seconds for judge phase (default: 900)
 #   LOOM_DOCTOR_TIMEOUT      Seconds for doctor phase (default: 900)
 #   LOOM_DOCTOR_MAX_RETRIES  Maximum doctor retry attempts (default: 3)
-#   LOOM_POLL_INTERVAL       Seconds between completion checks (default: 15)
+#   LOOM_POLL_INTERVAL       Seconds between completion checks (default: 5)
 #
 # Example:
 #   # Shepherd issue 42 (creates PR without waiting, default)
@@ -51,7 +51,7 @@ BUILDER_TIMEOUT="${LOOM_BUILDER_TIMEOUT:-1800}"
 JUDGE_TIMEOUT="${LOOM_JUDGE_TIMEOUT:-900}"
 DOCTOR_TIMEOUT="${LOOM_DOCTOR_TIMEOUT:-900}"
 DOCTOR_MAX_RETRIES="${LOOM_DOCTOR_MAX_RETRIES:-3}"
-POLL_INTERVAL="${LOOM_POLL_INTERVAL:-15}"
+POLL_INTERVAL="${LOOM_POLL_INTERVAL:-5}"
 
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
@@ -163,7 +163,7 @@ ${YELLOW}ENVIRONMENT:${NC}
     LOOM_JUDGE_TIMEOUT       Seconds for judge phase (default: 900)
     LOOM_DOCTOR_TIMEOUT      Seconds for doctor phase (default: 900)
     LOOM_DOCTOR_MAX_RETRIES  Maximum doctor retry attempts (default: 3)
-    LOOM_POLL_INTERVAL       Seconds between completion checks (default: 15)
+    LOOM_POLL_INTERVAL       Seconds between completion checks (default: 5)
 
 ${YELLOW}EXAMPLES:${NC}
     # Create PR without waiting (default behavior)
