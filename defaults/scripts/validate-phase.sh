@@ -204,8 +204,10 @@ validate_builder() {
     fi
 
     # Check if a PR already exists for this issue
+    # Use branch-based lookup (deterministic) instead of search API (has indexing lag)
+    # Branch name follows convention from worktree.sh: feature/issue-<number>
     local pr
-    pr=$(gh pr list --search "Closes #${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+    pr=$(gh pr list --head "feature/issue-${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
 
     if [[ -n "$pr" && "$pr" != "null" ]]; then
         # Check for loom:review-requested label
