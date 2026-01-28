@@ -436,9 +436,8 @@ EOF
     # Enter mid-processing can cause issues. If the command wasn't consumed, the
     # session will show no processing indicators and we log a warning.
     local verify_elapsed=0
-    local verify_max=10
+    local verify_max=5
     local command_processed=false
-    log_info "Verifying command was processed..."
 
     sleep 3  # Grace period: Claude needs time to parse skill and load context
 
@@ -452,7 +451,6 @@ EOF
         # - Tool use indicators
         if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
             command_processed=true
-            log_info "Command processing confirmed after $((verify_elapsed + 3))s"
             break
         fi
 
@@ -460,6 +458,7 @@ EOF
         verify_elapsed=$((verify_elapsed + 1))
     done
 
+    # Only warn if we truly couldn't confirm processing after all attempts
     if [[ "$command_processed" != "true" ]]; then
         log_warn "Could not confirm command processing within $((verify_max + 3))s (agent may still be starting)"
     fi
