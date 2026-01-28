@@ -428,13 +428,16 @@ EOF
     # Verify the command was actually processed.
     # Claude Code renders the ❯ prompt character as part of its TUI layout BEFORE
     # the input handler is ready, so we may have sent the command too early.
-    # Poll for processing indicators and re-send Enter if the command appears stuck.
+    # Wait briefly for processing to begin, then check if command appears stuck.
     local verify_elapsed=0
-    local verify_max=8
+    local verify_max=5
     local command_processed=false
-    log_info "Verifying command was processed..."
+    local resend_count=0
+    local max_resends=2
 
-    sleep 2  # Initial wait for processing to begin
+    # Initial wait for processing to begin - Claude Code typically starts
+    # processing within 2-3 seconds if the command was received
+    sleep 3
 
     while [[ $verify_elapsed -lt $verify_max ]]; do
         local pane_content
@@ -444,24 +447,32 @@ EOF
         # - Spinner characters (Claude thinking)
         # - Progress/status text
         # - Tool use indicators
+        # - The command text is no longer visible (it was consumed)
         if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
             command_processed=true
-            log_info "Command processing confirmed after $((verify_elapsed + 2))s"
             break
         fi
 
-        # If the slash command text is still visible at the prompt, it wasn't consumed
-        if echo "$pane_content" | grep -qF "$role_cmd"; then
-            log_warn "Command still at prompt (attempt $((verify_elapsed + 1))), re-sending Enter..."
+        # If the slash command text is no longer visible, assume it was consumed
+        if ! echo "$pane_content" | grep -qF "$role_cmd"; then
+            command_processed=true
+            break
+        fi
+
+        # Command text is still visible - it may not have been consumed yet.
+        # Try re-sending Enter a limited number of times (silently).
+        if [[ $resend_count -lt $max_resends ]]; then
             tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-m
+            resend_count=$((resend_count + 1))
         fi
 
         sleep 1
         verify_elapsed=$((verify_elapsed + 1))
     done
 
+    # Only warn if we truly couldn't confirm processing after all attempts
     if [[ "$command_processed" != "true" ]]; then
-        log_warn "Could not confirm command processing within $((verify_max + 2))s (agent may still be starting)"
+        log_warn "Could not confirm command processing within $((verify_max + 3))s (agent may still be starting)"
     fi
 
     log_success "Agent spawned successfully"
