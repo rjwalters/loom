@@ -44,7 +44,6 @@ GRACE_PERIOD=600  # 10 minutes in seconds (for --safe mode)
 WORKTREES_ONLY=false
 BRANCHES_ONLY=false
 TMUX_ONLY=false
-LABELS_ONLY=false
 
 # State file for tracking cleanup (used in --safe mode)
 DAEMON_STATE="$REPO_ROOT/.loom/daemon-state.json"
@@ -84,10 +83,6 @@ while [[ $# -gt 0 ]]; do
       TMUX_ONLY=true
       shift
       ;;
-    --labels-only|--labels)
-      LABELS_ONLY=true
-      shift
-      ;;
     --help|-h)
       cat <<EOF
 Loom Unified Cleanup - Restore repository to clean state
@@ -101,17 +96,15 @@ Options:
   --safe                 Safe mode: only remove worktrees with MERGED PRs,
                          check for uncommitted changes, apply grace period
   --grace-period N       Seconds to wait after PR merge (default: 600, requires --safe)
-  --worktrees-only       Only clean worktrees (skip branches, tmux, and labels)
-  --branches-only        Only clean branches (skip worktrees, tmux, and labels)
-  --tmux-only            Only clean tmux sessions (skip worktrees, branches, and labels)
-  --labels-only          Only clean workflow labels on closed issues
+  --worktrees-only       Only clean worktrees (skip branches and tmux)
+  --branches-only        Only clean branches (skip worktrees and tmux)
+  --tmux-only            Only clean tmux sessions (skip worktrees and branches)
   -h, --help             Show this help message
 
 Standard cleanup:
   - Stale worktrees (for closed issues)
   - Merged local branches for closed issues
   - Loom tmux sessions (loom-*)
-  - Workflow labels on closed issues (loom:building, loom:curated, etc.)
 
 Deep cleanup (--deep):
   - All of the above, plus:
@@ -132,7 +125,6 @@ Examples:
   ./.loom/scripts/clean.sh --safe --force      # Safe mode, non-interactive
   ./.loom/scripts/clean.sh --worktrees-only    # Just worktrees
   ./.loom/scripts/clean.sh --branches-only     # Just branches
-  ./.loom/scripts/clean.sh --labels-only       # Just workflow labels on closed issues
 
 Backwards Compatibility:
   This script is called by cleanup.sh and safe-worktree-cleanup.sh
@@ -311,12 +303,11 @@ header "========================================"
 echo ""
 
 # Show what will be cleaned
-if [[ "$WORKTREES_ONLY" == false && "$BRANCHES_ONLY" == false && "$TMUX_ONLY" == false && "$LABELS_ONLY" == false ]]; then
+if [[ "$WORKTREES_ONLY" == false && "$BRANCHES_ONLY" == false && "$TMUX_ONLY" == false ]]; then
   info "Cleanup targets:"
   echo "  - Orphaned worktrees (git worktree prune)"
   echo "  - Local branches for closed issues"
   echo "  - Loom tmux sessions (loom-*)"
-  echo "  - Workflow labels on closed issues"
 
   if [[ "$SAFE_MODE" == true ]]; then
     echo ""
@@ -374,14 +365,13 @@ skipped_uncommitted=0
 cleaned_branches=0
 kept_branches=0
 killed_tmux=0
-cleaned_labels=0
 errors=0
 
 # =============================================================================
 # CLEANUP: Worktrees
 # =============================================================================
 
-if [[ "$BRANCHES_ONLY" == false && "$TMUX_ONLY" == false && "$LABELS_ONLY" == false ]]; then
+if [[ "$BRANCHES_ONLY" == false && "$TMUX_ONLY" == false ]]; then
   header "Cleaning Worktrees"
   echo ""
 
@@ -538,7 +528,7 @@ fi
 # CLEANUP: Branches
 # =============================================================================
 
-if [[ "$WORKTREES_ONLY" == false && "$TMUX_ONLY" == false && "$LABELS_ONLY" == false ]]; then
+if [[ "$WORKTREES_ONLY" == false && "$TMUX_ONLY" == false ]]; then
   header "Cleaning Merged Branches"
   echo ""
 
@@ -593,7 +583,7 @@ fi
 # CLEANUP: Tmux Sessions
 # =============================================================================
 
-if [[ "$WORKTREES_ONLY" == false && "$BRANCHES_ONLY" == false && "$LABELS_ONLY" == false ]]; then
+if [[ "$WORKTREES_ONLY" == false && "$BRANCHES_ONLY" == false ]]; then
   header "Cleaning Loom Tmux Sessions"
   echo ""
 
@@ -619,47 +609,6 @@ if [[ "$WORKTREES_ONLY" == false && "$BRANCHES_ONLY" == false && "$LABELS_ONLY" 
     fi
   else
     success "No Loom tmux sessions found"
-  fi
-
-  echo ""
-fi
-
-# =============================================================================
-# CLEANUP: Workflow Labels on Closed Issues
-# =============================================================================
-
-if [[ "$WORKTREES_ONLY" == false && "$BRANCHES_ONLY" == false && "$TMUX_ONLY" == false ]]; then
-  header "Cleaning Workflow Labels on Closed Issues"
-  echo ""
-
-  # Define workflow labels to remove from closed issues
-  WORKFLOW_LABELS=("loom:building" "loom:issue" "loom:curated" "loom:curating" "loom:treating" "loom:blocked")
-
-  # Check each workflow label for closed issues
-  for label in "${WORKFLOW_LABELS[@]}"; do
-    # Find closed issues with this label
-    closed_with_label=$(gh issue list --state closed --label "$label" --json number --jq '.[].number' 2>/dev/null || true)
-
-    if [[ -n "$closed_with_label" ]]; then
-      for issue_num in $closed_with_label; do
-        if [[ "$DRY_RUN" == true ]]; then
-          info "Would remove '$label' from closed issue #$issue_num"
-          ((cleaned_labels++)) || true
-        else
-          if gh issue edit "$issue_num" --remove-label "$label" 2>/dev/null; then
-            success "Removed '$label' from closed issue #$issue_num"
-            ((cleaned_labels++)) || true
-          else
-            warning "Failed to remove '$label' from issue #$issue_num"
-            ((errors++)) || true
-          fi
-        fi
-      done
-    fi
-  done
-
-  if [[ "$cleaned_labels" -eq 0 ]]; then
-    success "No workflow labels to clean on closed issues"
   fi
 
   echo ""
@@ -740,14 +689,6 @@ if [[ "$killed_tmux" -gt 0 ]]; then
     echo "  Would kill: $killed_tmux tmux session(s)"
   else
     echo "  Killed: $killed_tmux tmux session(s)"
-  fi
-fi
-
-if [[ "$cleaned_labels" -gt 0 ]]; then
-  if [[ "$DRY_RUN" == true ]]; then
-    echo "  Would clean: $cleaned_labels workflow label(s)"
-  else
-    echo "  Cleaned: $cleaned_labels workflow label(s)"
   fi
 fi
 
