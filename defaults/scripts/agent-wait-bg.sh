@@ -106,7 +106,7 @@ check_and_resolve_prompts() {
     pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
 
     if [[ -z "$pane_content" ]]; then
-        return
+        return 1
     fi
 
     # Detect Claude Code plan mode approval prompt.
@@ -119,7 +119,10 @@ check_and_resolve_prompts() {
         log_info "Plan mode approval prompt detected in $session_name - auto-approving"
         # Send "1" to select "Yes, clear context and bypass permissions"
         tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "1" C-m
+        return 0
     fi
+
+    return 1
 }
 
 main() {
@@ -176,11 +179,17 @@ main() {
     start_time=$(date +%s)
 
     local session_name="${SESSION_PREFIX}${name}"
+    local prompt_resolved=false
 
     # Poll for signals and interactive prompts while background process runs
     while true; do
-        # Check for interactive prompts that need auto-approval (e.g., plan mode)
-        check_and_resolve_prompts "$session_name"
+        # Check for interactive prompts that need auto-approval (e.g., plan mode).
+        # Only attempt once to avoid sending stray keystrokes after the prompt clears.
+        if [[ "$prompt_resolved" != "true" ]]; then
+            if check_and_resolve_prompts "$session_name"; then
+                prompt_resolved=true
+            fi
+        fi
 
         # Check if agent-wait.sh has finished
         if ! kill -0 "$wait_pid" 2>/dev/null; then
