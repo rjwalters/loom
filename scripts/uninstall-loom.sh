@@ -557,6 +557,9 @@ if [[ "$LOCAL_MODE" != "true" ]]; then
     git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
   fi
 
+  # Prune any stale worktree metadata (defensive: handles incomplete cleanup)
+  git worktree prune 2>/dev/null || true
+
   # Find available branch name
   BRANCH_NAME="$BASE_BRANCH_NAME"
   SUFFIX=2
@@ -632,6 +635,12 @@ for dir in "${RUNTIME_DIRS[@]}"; do
     REMOVED_COUNT=$((REMOVED_COUNT + 1))
   fi
 done
+
+# Prune stale worktree metadata from git's internal tracking
+# This prevents "missing but already registered worktree" errors on reinstall
+info "Pruning git worktree metadata..."
+cd "$TARGET_PATH"
+git worktree prune 2>/dev/null || true
 
 success "Removed $REMOVED_COUNT files/directories"
 echo ""
