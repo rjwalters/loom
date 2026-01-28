@@ -47,7 +47,7 @@ while [[ $# -gt 0 ]]; do
     --cleanup-worktree) CLEANUP_WORKTREE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --auto) AUTO_MERGE=true; shift ;;
--*)  error "Unknown option: $1" ;;
+    -*)  error "Unknown option: $1" ;;
     *)
       if [[ -z "$PR_NUMBER" ]]; then
         PR_NUMBER="$1"
