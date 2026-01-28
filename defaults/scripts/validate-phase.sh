@@ -27,6 +27,8 @@
 set -euo pipefail
 
 # Colors for output (disabled if stdout is not a terminal)
+# BLUE unused but kept for consistency with other scripts and future use
+# shellcheck disable=SC2034
 if [[ -t 1 ]]; then
     RED='\033[0;31m'
     GREEN='\033[0;32m'
@@ -50,9 +52,9 @@ find_repo_root() {
                 local gitdir
                 gitdir=$(cat "$dir/.git" | sed 's/^gitdir: //')
                 if [[ "$gitdir" == /* ]]; then
-                    echo "$(dirname "$(dirname "$(dirname "$gitdir")")")"
+                    dirname "$(dirname "$(dirname "$gitdir")")"
                 else
-                    echo "$(dirname "$(dirname "$(dirname "$dir/$gitdir")")")"
+                    dirname "$(dirname "$(dirname "$dir/$gitdir")")"
                 fi
             else
                 echo "$dir"

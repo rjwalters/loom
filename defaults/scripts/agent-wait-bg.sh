@@ -27,7 +27,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
 
-# Colors
+# Colors (RED unused but kept for consistency with other scripts and future error logging)
+# shellcheck disable=SC2034
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
