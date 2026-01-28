@@ -194,6 +194,15 @@ validate_curator() {
 }
 
 validate_builder() {
+    # First: Check if issue is already closed (builder may have resolved without PR)
+    # This is valid for verification tasks, documentation issues, research tasks, etc.
+    local issue_state
+    issue_state=$(gh issue view "$ISSUE" --json state --jq '.state' 2>/dev/null) || true
+    if [[ "$issue_state" == "CLOSED" ]]; then
+        output_result "satisfied" "Issue #$ISSUE is closed (resolved without PR)"
+        return 0
+    fi
+
     # Check if a PR already exists for this issue
     local pr
     pr=$(gh pr list --search "Closes #${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
