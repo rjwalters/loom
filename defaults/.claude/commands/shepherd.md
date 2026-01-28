@@ -165,9 +165,18 @@ For each phase, the shepherd spawns an ephemeral tmux worker:
 2. **Spawn worker**: `agent-spawn.sh --role <role> --name <role>-issue-<N> --args "<N>" --on-demand`
 3. **Wait for completion (non-blocking)**: Run `agent-wait-bg.sh` in background, poll with `TaskOutput`, report heartbeats
 4. **Check exit code**: Exit code 3 means shutdown signal detected - clean up and exit gracefully
-5. **Verify completion**: Poll labels to confirm the role completed successfully
-6. **Clean up**: `agent-destroy.sh <role>-issue-<N>`
-7. **Announce completion**: `"[Role] phase complete"`
+5. **Clean up**: `agent-destroy.sh <role>-issue-<N>`
+6. **VALIDATE (REQUIRED)**: `validate-phase.sh <phase> "$ISSUE" [--worktree|--pr args] --task-id "$TASK_ID"`
+7. **Handle validation result**: If validation fails (non-zero exit), the issue is blocked - exit
+8. **Announce completion**: `"[Role] phase complete"`
+
+> **⚠️ IMPORTANT: Phase Validation is MANDATORY**
+>
+> You MUST call `validate-phase.sh` after every phase completes. Never skip validation.
+> - It verifies the phase contract was satisfied (expected labels, PRs, etc.)
+> - It attempts automatic recovery when possible (e.g., applying missing labels)
+> - It marks issues as `loom:blocked` when recovery fails
+> - Skipping validation can leave issues in inconsistent states
 
 Example for each phase:
 
