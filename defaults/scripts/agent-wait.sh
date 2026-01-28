@@ -25,6 +25,9 @@ SESSION_PREFIX="loom-"
 DEFAULT_TIMEOUT=3600
 DEFAULT_POLL_INTERVAL=5
 
+# Find repository root (for log file access)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -60,9 +63,10 @@ ${YELLOW}EXAMPLES:${NC}
     agent-wait.sh shepherd-1 --poll-interval 10 --json
 
 ${YELLOW}HOW IT WORKS:${NC}
-    Finds the tmux session's shell PID, then checks if any claude
-    process exists in the process tree under that shell. When claude
-    exits, the shell is idle and the agent is considered complete.
+    Monitors the agent's log file for /exit command (explicit completion),
+    and also checks if any claude process exists in the process tree under
+    the tmux session's shell. When /exit is detected or claude exits,
+    the agent is considered complete.
 
 EOF
 }
@@ -100,6 +104,59 @@ claude_is_running() {
 session_exists() {
     local session_name="$1"
     tmux -L "$TMUX_SOCKET" has-session -t "$session_name" 2>/dev/null
+}
+
+# Check for /exit command in log file
+# Returns 0 if /exit detected, 1 otherwise
+check_exit_command() {
+    local session_name="$1"
+    local log_file="${REPO_ROOT}/.loom/logs/${session_name}.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        return 1
+    fi
+
+    # Get recent log content (last 100 lines)
+    local recent_log
+    recent_log=$(tail -100 "$log_file" 2>/dev/null || true)
+
+    if [[ -z "$recent_log" ]]; then
+        return 1
+    fi
+
+    # Check for /exit command in output
+    # Pattern matches: prompt with /exit, indented /exit from LLM output
+    if echo "$recent_log" | grep -qE '(^|\s+|❯\s*|>\s*)/exit\s*$'; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Handle /exit detection - send /exit to prompt and destroy session
+handle_exit_detection() {
+    local session_name="$1"
+    local name="$2"
+    local elapsed="$3"
+    local json_output="$4"
+
+    log_info "/exit detected in output - sending /exit to prompt and terminating '$session_name'"
+
+    # Send /exit to the actual tmux prompt as backup
+    # This ensures the CLI receives /exit even if the LLM just output it as text
+    tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "/exit" C-m 2>/dev/null || true
+
+    # Brief pause to let /exit process
+    sleep 1
+
+    # Destroy the tmux session to clean up
+    tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+    if [[ "$json_output" == "true" ]]; then
+        echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"explicit_exit\",\"elapsed\":$elapsed}"
+    else
+        log_success "Agent '$name' completed (explicit /exit after ${elapsed}s)"
+    fi
 }
 
 main() {
@@ -182,6 +239,13 @@ main() {
             else
                 log_success "Agent '$name' completed (session destroyed after ${elapsed}s)"
             fi
+            exit 0
+        fi
+
+        # Check for /exit command in log file (explicit completion signal)
+        if check_exit_command "$session_name"; then
+            elapsed=$(( $(date +%s) - start_time ))
+            handle_exit_detection "$session_name" "$name" "$elapsed" "$json_output"
             exit 0
         fi
 
