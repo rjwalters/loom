@@ -12,6 +12,34 @@ Loom is a multi-terminal desktop application for macOS that orchestrates AI-powe
 
 **Loom Repository**: https://github.com/rjwalters/loom
 
+## Installing Loom
+
+To install Loom into a target repository, run from the **Loom source repository**:
+
+```bash
+./install.sh /path/to/target-repo
+```
+
+**Options**:
+- `--yes` or `-y`: Non-interactive mode (skips confirmation prompts)
+
+**Installation Methods**:
+The installer offers two methods:
+1. **Quick Install** - Fast direct installation using loom-daemon init. Good for personal projects or quick testing.
+2. **Full Install** - Creates GitHub issue, uses git worktree, syncs labels, creates PR. Recommended for team projects.
+
+**Getting the Installer**:
+Clone the Loom repository: https://github.com/rjwalters/loom
+
+**Advanced Usage** (Full Install workflow only):
+For more control, you can use `scripts/install-loom.sh` directly:
+```bash
+./scripts/install-loom.sh [OPTIONS] /path/to/target-repo
+```
+Additional options for `install-loom.sh`:
+- `--force` or `-f`: Force overwrite existing files and enable auto-merge
+- `--clean`: Uninstall first, then fresh install
+
 ## Three-Layer Architecture
 
 Loom uses a three-layer orchestration architecture for scalable automation:
