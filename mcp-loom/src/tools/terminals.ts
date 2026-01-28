@@ -7,12 +7,11 @@
  * - Get terminal output
  * - Configure terminal settings
  * - Control autonomous mode
- * - Monitor tmux health
  * - Query agent metrics
  */
 
 import { exec } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -148,121 +147,6 @@ async function sendTerminalInput(terminalId: string, input: string): Promise<str
     return `Unexpected response: ${response.type}`;
   } catch (error) {
     return `Error sending input: ${error}`;
-  }
-}
-
-/**
- * Check tmux server health
- */
-async function checkTmuxServerHealth(): Promise<{
-  serverRunning: boolean;
-  sessionCount: number;
-  sessions: string[];
-  errorMessage?: string;
-}> {
-  try {
-    const { stdout } = await execAsync("tmux -L loom list-sessions -F '#{session_name}'");
-    const sessions = stdout
-      .trim()
-      .split("\n")
-      .filter((s) => s.startsWith("loom-"));
-
-    return {
-      serverRunning: true,
-      sessionCount: sessions.length,
-      sessions,
-    };
-  } catch (error: unknown) {
-    const err = error as { code?: number; stderr?: string };
-    return {
-      serverRunning: false,
-      sessionCount: 0,
-      sessions: [],
-      errorMessage: err.stderr || String(error),
-    };
-  }
-}
-
-/**
- * Get tmux server information
- */
-async function getTmuxServerInfo(): Promise<{
-  serverProcess?: string;
-  socketPath: string;
-  socketExists: boolean;
-  tmuxVersion?: string;
-  errorMessage?: string;
-}> {
-  const uid = process.getuid?.() || 0;
-  const socketPath = `/private/tmp/tmux-${uid}/loom`;
-
-  try {
-    const socketExists = await stat(socketPath)
-      .then(() => true)
-      .catch(() => false);
-
-    let serverProcess: string | undefined;
-    try {
-      const { stdout } = await execAsync("ps aux | grep 'tmux.*-L loom' | grep -v grep");
-      serverProcess = stdout.trim();
-    } catch {
-      serverProcess = undefined;
-    }
-
-    let tmuxVersion: string | undefined;
-    try {
-      const { stdout } = await execAsync("tmux -V");
-      tmuxVersion = stdout.trim();
-    } catch {
-      tmuxVersion = undefined;
-    }
-
-    return {
-      serverProcess,
-      socketPath,
-      socketExists,
-      tmuxVersion,
-    };
-  } catch (error) {
-    return {
-      socketPath,
-      socketExists: false,
-      errorMessage: String(error),
-    };
-  }
-}
-
-/**
- * Toggle tmux verbose logging
- */
-async function toggleTmuxVerboseLogging(): Promise<{
-  success: boolean;
-  message: string;
-  pid?: string;
-}> {
-  try {
-    const { stdout } = await execAsync("pgrep -f 'tmux.*-L loom'");
-    const pid = stdout.trim();
-
-    if (!pid) {
-      return {
-        success: false,
-        message: "tmux server not found (no process matching 'tmux.*-L loom')",
-      };
-    }
-
-    await execAsync(`kill -SIGUSR2 ${pid}`);
-
-    return {
-      success: true,
-      message: `Sent SIGUSR2 to tmux server (PID ${pid}) - check for tmux-server-${pid}.log`,
-      pid,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      message: `Error toggling tmux verbose logging: ${error}`,
-    };
   }
 }
 
@@ -555,54 +439,6 @@ async function setPrimaryTerminal(terminalId: string): Promise<{
 }
 
 /**
- * Clear terminal history
- */
-async function clearTerminalHistory(terminalId: string): Promise<{
-  success: boolean;
-  error?: string;
-}> {
-  try {
-    const terminals = await listTerminals();
-    const terminal = terminals.find((t) => t.id === terminalId);
-
-    if (!terminal) {
-      return {
-        success: false,
-        error: `Terminal ${terminalId} not found`,
-      };
-    }
-
-    try {
-      await execAsync(`tmux -L loom clear-history -t "${terminal.tmux_session}"`);
-    } catch (error) {
-      const stderr = (error as { stderr?: string }).stderr || "";
-      if (!stderr.includes("no server running") && !stderr.includes("session not found")) {
-        // Log warning but continue
-      }
-    }
-
-    const outputFile = `/tmp/loom-${terminalId}.out`;
-    try {
-      await writeFile(outputFile, "", "utf-8");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        return {
-          success: false,
-          error: `Failed to clear output log file: ${error}`,
-        };
-      }
-    }
-
-    return { success: true };
-  } catch (error) {
-    return {
-      success: false,
-      error: `Error clearing terminal history: ${error}`,
-    };
-  }
-}
-
-/**
  * Get agent performance metrics
  */
 async function getAgentMetrics(options: {
@@ -754,33 +590,6 @@ export const terminalTools: Tool[] = [
     },
   },
   {
-    name: "check_tmux_server_health",
-    description:
-      "Check if tmux server is running and count active loom sessions. Use this to verify tmux server status and detect crashes.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "get_tmux_server_info",
-    description:
-      "Get tmux server information including PID, socket path, and version. Use this to diagnose tmux server issues and verify socket paths.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "toggle_tmux_verbose_logging",
-    description:
-      "Toggle tmux verbose logging by sending SIGUSR2 to the tmux server. Creates tmux-server-{PID}.log file. Use this for deep debugging of tmux issues.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
     name: "create_terminal",
     description:
       "Create a new Loom terminal session. Returns the new terminal's ID which can be used for other operations. The terminal will be created with its own tmux session.",
@@ -909,21 +718,6 @@ export const terminalTools: Tool[] = [
         terminal_id: {
           type: "string",
           description: "Terminal ID to set as primary (e.g., 'terminal-1')",
-        },
-      },
-      required: ["terminal_id"],
-    },
-  },
-  {
-    name: "clear_terminal_history",
-    description:
-      "Clear a terminal's scrollback history and output log. This clears the tmux scrollback buffer and truncates the output log file. Useful for clearing sensitive data or resetting terminal state without restarting.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        terminal_id: {
-          type: "string",
-          description: "Terminal ID to clear history for (e.g., 'terminal-1')",
         },
       },
       required: ["terminal_id"],
@@ -1118,67 +912,6 @@ export async function handleTerminalTool(
       return [{ type: "text", text: result }];
     }
 
-    case "check_tmux_server_health": {
-      const health = await checkTmuxServerHealth();
-
-      if (!health.serverRunning) {
-        return [
-          {
-            type: "text",
-            text: `=== tmux Server Health ===\n\nServer Status: NOT RUNNING\n\nError: ${health.errorMessage || "Server not responding"}\n\nThis usually means:\n- tmux server crashed\n- No tmux sessions have been created yet\n- Socket path issue\n\nTo start the server, create a new terminal or run:\n  tmux -L loom new-session -d`,
-          },
-        ];
-      }
-
-      const sessionList = health.sessions.map((s) => `  - ${s}`).join("\n");
-      return [
-        {
-          type: "text",
-          text: `=== tmux Server Health ===\n\nServer Status: RUNNING\nSession Count: ${health.sessionCount}\n\nActive loom sessions:\n${sessionList || "  (none)"}`,
-        },
-      ];
-    }
-
-    case "get_tmux_server_info": {
-      const info = await getTmuxServerInfo();
-
-      let statusText = `=== tmux Server Information ===\n\n`;
-      statusText += `Socket Path: ${info.socketPath}\n`;
-      statusText += `Socket Exists: ${info.socketExists ? "Yes" : "No"}\n\n`;
-
-      if (info.tmuxVersion) {
-        statusText += `tmux Version: ${info.tmuxVersion}\n\n`;
-      }
-
-      if (info.serverProcess) {
-        statusText += `Server Process:\n${info.serverProcess}\n`;
-      } else {
-        statusText += `Server Process: Not found (no matching process)\n`;
-      }
-
-      return [{ type: "text", text: statusText }];
-    }
-
-    case "toggle_tmux_verbose_logging": {
-      const result = await toggleTmuxVerboseLogging();
-
-      if (!result.success) {
-        return [
-          {
-            type: "text",
-            text: `=== Toggle tmux Verbose Logging ===\n\nFailed\n\n${result.message}`,
-          },
-        ];
-      }
-
-      return [
-        {
-          type: "text",
-          text: `=== Toggle tmux Verbose Logging ===\n\nSuccess\n\n${result.message}\n\nNote: Verbose logging writes to tmux-server-${result.pid}.log in the current directory where the tmux server was started.`,
-        },
-      ];
-    }
-
     case "create_terminal": {
       const config: CreateTerminalConfig = {
         name: args?.name as string | undefined,
@@ -1366,32 +1099,6 @@ export async function handleTerminalTool(
         {
           type: "text",
           text: `=== Set Primary Terminal ===\n\nSuccess\n\nTerminal ${terminalId} is now the primary (selected) terminal.\n\nThe UI will focus on this terminal.`,
-        },
-      ];
-    }
-
-    case "clear_terminal_history": {
-      const terminalId = args?.terminal_id as string;
-
-      if (!terminalId) {
-        return [{ type: "text", text: "Error: terminal_id is required" }];
-      }
-
-      const result = await clearTerminalHistory(terminalId);
-
-      if (!result.success) {
-        return [
-          {
-            type: "text",
-            text: `=== Clear Terminal History ===\n\nFailed\n\n${result.error}`,
-          },
-        ];
-      }
-
-      return [
-        {
-          type: "text",
-          text: `=== Clear Terminal History ===\n\nSuccess\n\nTerminal ${terminalId} history has been cleared.\n\nCleared:\n- tmux scrollback buffer\n- Output log file (/tmp/loom-${terminalId}.out)`,
         },
       ];
     }
