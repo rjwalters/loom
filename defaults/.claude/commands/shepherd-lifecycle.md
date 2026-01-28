@@ -454,11 +454,11 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate1" ]; then
-  # Check if --force-pr or --force-merge mode - auto-approve
-  if [ "$FORCE_PR" = "true" ] || [ "$FORCE_MERGE" = "true" ]; then
-    echo "Force mode: auto-approving issue"
+  # Check if --force or default mode - auto-approve
+  if [ "$FORCE_MODE" = "true" ] || [ "$DEFAULT_MODE" = "true" ]; then
+    echo "Auto-approving issue (force/default mode)"
     gh issue edit $ISSUE_NUMBER --add-label "loom:issue"
-    gh issue comment $ISSUE_NUMBER --body "**Auto-approved** via \`/shepherd --force-pr\` or \`--force-merge\`"
+    gh issue comment $ISSUE_NUMBER --body "**Auto-approved** via shepherd orchestration"
   else
     # Wait for human or Champion to promote to loom:issue
     TIMEOUT=1800  # 30 minutes
@@ -616,16 +616,16 @@ fi
 
 ```bash
 if [ "$PHASE" = "gate2" ]; then
-  # Check if --force-pr mode - stop here, don't merge
-  if [ "$FORCE_PR" = "true" ]; then
-    echo "Force-pr mode: stopping at loom:pr state"
-    gh issue comment $ISSUE_NUMBER --body "**PR approved** - stopping at \`loom:pr\` per \`--force-pr\`. Ready for human merge."
+  # Check if default mode - stop here, don't merge
+  if [ "$DEFAULT_MODE" = "true" ]; then
+    echo "Default mode: stopping at loom:pr state"
+    gh issue comment $ISSUE_NUMBER --body "**PR approved** - stopping at \`loom:pr\`. Ready for human merge or Champion auto-merge."
     exit 0
   fi
 
-  # Check if --force-merge mode - auto-merge with conflict resolution
-  if [ "$FORCE_MERGE" = "true" ]; then
-    echo "Force-merge mode: auto-merging PR"
+  # Check if --force mode - auto-merge with conflict resolution
+  if [ "$FORCE_MODE" = "true" ]; then
+    echo "Force mode: auto-merging PR"
 
     # Use merge-pr.sh for worktree-safe merge via GitHub API
     ./.loom/scripts/merge-pr.sh $PR_NUMBER --cleanup-worktree || {
@@ -634,7 +634,7 @@ if [ "$PHASE" = "gate2" ]; then
     }
     echo "PR merged successfully"
 
-    gh issue comment $ISSUE_NUMBER --body "**Auto-merged** PR #$PR_NUMBER via \`/shepherd --force-merge\`"
+    gh issue comment $ISSUE_NUMBER --body "**Auto-merged** PR #$PR_NUMBER via \`/shepherd --force\`"
   else
     # Trigger Champion or wait for human merge
     CHAMPION_TERMINAL="terminal-5"  # if exists

@@ -15,10 +15,14 @@
 #   ./.loom/scripts/shepherd-loop.sh <issue-number> [options]
 #
 # Options:
-#   --force-pr      Auto-approve issue, run through Judge, stop at loom:pr
-#   --force-merge   Auto-approve, resolve conflicts, auto-merge after approval
+#   --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+#   --wait          Wait for human approval at each gate (explicit non-default)
 #   --to <phase>    Stop after specified phase (curated, pr, approved)
 #   --task-id <id>  Use specific task ID (generated if not provided)
+#
+# Deprecated:
+#   --force-pr      (deprecated) Now the default behavior
+#   --force-merge   (deprecated) Use --force or -f instead
 #
 # Environment Variables:
 #   LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 600)
@@ -29,11 +33,14 @@
 #   LOOM_POLL_INTERVAL       Seconds between completion checks (default: 15)
 #
 # Example:
-#   # Shepherd issue 42 with auto-approve and auto-merge
-#   ./.loom/scripts/shepherd-loop.sh 42 --force-merge
+#   # Shepherd issue 42 (creates PR without waiting, default)
+#   ./.loom/scripts/shepherd-loop.sh 42
 #
-#   # Shepherd with custom timeout and stop at PR creation
-#   LOOM_BUILDER_TIMEOUT=3600 ./.loom/scripts/shepherd-loop.sh 42 --force-pr
+#   # Shepherd issue 42 with full automation (auto-merge)
+#   ./.loom/scripts/shepherd-loop.sh 42 --force
+#
+#   # Shepherd with custom timeout and wait for human approval
+#   LOOM_BUILDER_TIMEOUT=3600 ./.loom/scripts/shepherd-loop.sh 42 --wait
 
 set -euo pipefail
 
@@ -120,7 +127,7 @@ log_error() { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*"; }
 # ─── Parse arguments ──────────────────────────────────────────────────────────
 
 ISSUE=""
-MODE="normal"
+MODE="force-pr"
 STOP_AFTER=""
 TASK_ID=""
 
@@ -132,11 +139,15 @@ ${YELLOW}USAGE:${NC}
     shepherd-loop.sh <issue-number> [OPTIONS]
 
 ${YELLOW}OPTIONS:${NC}
-    --force-pr      Auto-approve issue, run through Judge, stop at loom:pr
-    --force-merge   Auto-approve, resolve conflicts, auto-merge after approval
+    --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+    --wait          Wait for human approval at each gate (explicit non-default)
     --to <phase>    Stop after specified phase (curated, pr, approved)
     --task-id <id>  Use specific task ID (generated if not provided)
     --help          Show this help message
+
+${YELLOW}DEPRECATED:${NC}
+    --force-pr      (deprecated) Now the default behavior
+    --force-merge   (deprecated) Use --force or -f instead
 
 ${YELLOW}PHASES:${NC}
     1. Curator    - Enhance issue with implementation guidance
@@ -144,7 +155,7 @@ ${YELLOW}PHASES:${NC}
     3. Builder    - Create worktree, implement, create PR
     4. Judge      - Review PR, approve or request changes
     5. Doctor     - Address requested changes (if any)
-    6. Merge      - Auto-merge (force-merge) or wait for human
+    6. Merge      - Auto-merge (--force) or wait for human
 
 ${YELLOW}ENVIRONMENT:${NC}
     LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 600)
@@ -155,11 +166,15 @@ ${YELLOW}ENVIRONMENT:${NC}
     LOOM_POLL_INTERVAL       Seconds between completion checks (default: 15)
 
 ${YELLOW}EXAMPLES:${NC}
-    # Full automation with auto-merge
-    shepherd-loop.sh 42 --force-merge
+    # Create PR without waiting (default behavior)
+    shepherd-loop.sh 42
 
-    # Stop after PR is approved (manual merge)
-    shepherd-loop.sh 42 --force-pr
+    # Full automation with auto-merge
+    shepherd-loop.sh 42 --force
+    shepherd-loop.sh 42 -f
+
+    # Wait for human approval at each gate
+    shepherd-loop.sh 42 --wait
 
     # Stop after curation (for review before building)
     shepherd-loop.sh 42 --to curated
@@ -169,11 +184,23 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --force|-f)
+            MODE="force-merge"
+            shift
+            ;;
+        --wait)
+            MODE="normal"
+            shift
+            ;;
         --force-pr)
+            # Deprecated: now the default behavior
+            log_warn "Flag --force-pr is deprecated (now default behavior)"
             MODE="force-pr"
             shift
             ;;
         --force-merge)
+            # Deprecated: use --force or -f instead
+            log_warn "Flag --force-merge is deprecated (use --force or -f instead)"
             MODE="force-merge"
             shift
             ;;

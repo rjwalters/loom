@@ -283,7 +283,7 @@ def auto_spawn_shepherds(state, snapshot_data, debug_mode=False):
 
     # Determine shepherd mode based on daemon's force_mode
     force_mode = state.get("force_mode", False)
-    shepherd_flag = "--force-merge" if force_mode else "--force-pr"
+    shepherd_flag = "--force" if force_mode else ""  # default is force-pr behavior
 
     debug(f"Issue selection: {len(ready_issues)} ready issues, {active_count}/{max_shepherds} shepherds active")
     debug(f"Shepherd mode: {shepherd_flag} (force_mode={force_mode})")
@@ -966,7 +966,7 @@ When running with `--debug`, iteration produces verbose logging:
 [DEBUG] Spawning tmux shepherd: shepherd-issue-456 for issue #456
 [DEBUG] Spawning decision: shepherd assigned to #456 (verified)
 [DEBUG]   tmux session: loom-shepherd-issue-456
-[DEBUG] Shepherd mode: --force-merge (force_mode=true)
+[DEBUG] Shepherd mode: --force (force_mode=true)
 [DEBUG] Checking support roles via spawn-support-role.sh (interval-based)
 [DEBUG] guide: spawn needed (interval_elapsed)
 [DEBUG] State update: guide marked running in-memory (tmux session: loom-guide)

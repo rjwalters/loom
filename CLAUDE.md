@@ -320,13 +320,13 @@ Shepherds report progress milestones to `.loom/progress/` for daemon visibility.
 {
   "task_id": "a7dc1e0",
   "issue": 123,
-  "mode": "force-pr",
+  "mode": "default",
   "started_at": "2026-01-25T10:00:00Z",
   "current_phase": "builder",
   "last_heartbeat": "2026-01-25T10:15:00Z",
   "status": "working",
   "milestones": [
-    {"event": "started", "timestamp": "2026-01-25T10:00:00Z", "data": {"issue": 123, "mode": "force-pr"}},
+    {"event": "started", "timestamp": "2026-01-25T10:00:00Z", "data": {"issue": 123, "mode": "default"}},
     {"event": "phase_entered", "timestamp": "2026-01-25T10:01:00Z", "data": {"phase": "curator"}},
     {"event": "phase_entered", "timestamp": "2026-01-25T10:05:00Z", "data": {"phase": "builder"}},
     {"event": "worktree_created", "timestamp": "2026-01-25T10:06:00Z", "data": {"path": ".loom/worktrees/issue-123"}},
@@ -354,8 +354,8 @@ Shepherds report progress milestones to `.loom/progress/` for daemon visibility.
 Shepherds use the `report-milestone.sh` script:
 
 ```bash
-# Report shepherd started
-./.loom/scripts/report-milestone.sh started --task-id abc123 --issue 42 --mode force-pr
+# Report shepherd started (mode is "default", "force", or "wait")
+./.loom/scripts/report-milestone.sh started --task-id abc123 --issue 42 --mode default
 
 # Report phase transition
 ./.loom/scripts/report-milestone.sh phase_entered --task-id abc123 --phase builder
