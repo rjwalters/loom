@@ -22,7 +22,7 @@ This role definition is split across multiple files for maintainability:
 | **builder.md** (this file) | Core workflow, labels, finding work, guidelines |
 | **builder-worktree.md** | Git worktree workflows, Tauri App mode, parallel claiming |
 | **builder-complexity.md** | Complexity assessment, issue decomposition, scope management |
-| **builder-pr.md** | PR creation, test output, quality requirements |
+| **builder-pr.md** | PR creation, **acceptance criteria verification**, test output, quality requirements |
 
 ## Argument Handling
 
@@ -374,6 +374,10 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
 For detailed PR creation and quality requirements, see **builder-pr.md**.
 
 **Quick reference:**
+- **Verify ALL acceptance criteria** before creating PR (see builder-pr.md for details)
+- Extract criteria from issue body/comments (checkboxes, numbered items, "must"/"should" statements)
+- Verify each criterion explicitly with concrete checks (not "I think it works")
+- Include criterion verification table in PR description
 - Add `loom:review-requested` label when creating PR
 - Use "Closes #N" syntax for auto-close
 - Never touch PR labels after creation
