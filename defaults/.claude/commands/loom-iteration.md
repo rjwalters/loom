@@ -104,7 +104,9 @@ def loom_iterate(force_mode=False, debug_mode=False):
     # 1. Load state from JSON (enables stateless execution)
     state = load_daemon_state(".loom/daemon-state.json")
     iteration = state.get("iteration", 0) + 1
+    our_session_id = state.get("daemon_session_id")
     debug(f"Iteration {iteration} starting at {now()}")
+    debug(f"Session ID: {our_session_id}")
 
     # 1b. Reconcile force_mode from argument and state
     # The argument takes precedence (it comes from the current daemon invocation)
@@ -199,7 +201,19 @@ def loom_iterate(force_mode=False, debug_mode=False):
         stale_recovered = check_stale_building(state, debug_mode)
         recovered_count += stale_recovered
 
-    # 11. Save state to JSON
+    # 11. Save state to JSON (with session ID validation)
+    # Before writing, verify our session ID still owns the state file
+    # This prevents dual-daemon state corruption
+    if our_session_id:
+        current_state = load_daemon_state(".loom/daemon-state.json")
+        current_session_id = current_state.get("daemon_session_id")
+        if current_session_id and current_session_id != our_session_id:
+            debug(f"SESSION CONFLICT: State file session changed!")
+            debug(f"  Our session:  {our_session_id}")
+            debug(f"  File session: {current_session_id}")
+            debug(f"  Refusing to write state - another daemon has taken over")
+            return f"SESSION_CONFLICT our={our_session_id} file={current_session_id}"
+
     state["iteration"] = state.get("iteration", 0) + 1
     state["last_poll"] = now()
     state["debug_mode"] = debug_mode
@@ -1125,13 +1139,22 @@ def check_orphaned_shepherds(state, debug_mode=False):
 
 ## Iteration State Handling
 
-The iteration subagent reads and writes state atomically:
+The iteration subagent reads and writes state atomically, with session ID validation:
 
 ```python
-# Read state at start
+# Read state at start (capture session ID for later validation)
 state = json.load(open(".loom/daemon-state.json"))
+our_session_id = state.get("daemon_session_id")
 
 # ... do all iteration work ...
+
+# Validate session ownership before writing (dual-daemon prevention)
+if our_session_id:
+    current = json.load(open(".loom/daemon-state.json"))
+    if current.get("daemon_session_id") != our_session_id:
+        # Another daemon has taken over - do NOT write
+        print(f"SESSION CONFLICT: refusing to write state (our={our_session_id}, file={current.get('daemon_session_id')})")
+        return "SESSION_CONFLICT"
 
 # Write state at end (atomic)
 with open(".loom/daemon-state.json.tmp", "w") as f:
