@@ -53,6 +53,10 @@ DOCTOR_TIMEOUT="${LOOM_DOCTOR_TIMEOUT:-900}"
 DOCTOR_MAX_RETRIES="${LOOM_DOCTOR_MAX_RETRIES:-3}"
 POLL_INTERVAL="${LOOM_POLL_INTERVAL:-5}"
 
+# Marker file to prevent premature worktree cleanup during orchestration
+# See issue #1485: cleanup scripts will skip worktrees with this marker
+WORKTREE_MARKER_FILE=".loom-in-use"
+
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
 if [[ -t 1 ]]; then
@@ -123,6 +127,41 @@ log_info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
 log_success() { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*"; }
 log_warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*"; }
 log_error() { echo -e "${RED}[$(date '+%H:%M:%S')] ✗${NC} $*"; }
+
+# ─── Worktree marker functions ────────────────────────────────────────────────
+# Marker file prevents cleanup scripts from removing worktrees during orchestration
+# See issue #1485: worktree was being deleted while judge phase still needed it
+
+# Track the worktree path for cleanup in exit handler
+ACTIVE_WORKTREE_PATH=""
+
+create_worktree_marker() {
+    local worktree_path="$1"
+    if [[ -d "$worktree_path" ]]; then
+        local marker_path="${worktree_path}/${WORKTREE_MARKER_FILE}"
+        local timestamp
+        timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        cat > "$marker_path" <<EOF
+{
+  "shepherd_task_id": "$TASK_ID",
+  "issue": $ISSUE,
+  "created_at": "$timestamp",
+  "pid": $$
+}
+EOF
+        ACTIVE_WORKTREE_PATH="$worktree_path"
+        log_info "Created worktree marker: $marker_path"
+    fi
+}
+
+remove_worktree_marker() {
+    local worktree_path="${1:-$ACTIVE_WORKTREE_PATH}"
+    if [[ -n "$worktree_path" && -f "${worktree_path}/${WORKTREE_MARKER_FILE}" ]]; then
+        rm -f "${worktree_path}/${WORKTREE_MARKER_FILE}"
+        log_info "Removed worktree marker"
+    fi
+    ACTIVE_WORKTREE_PATH=""
+}
 
 # ─── Parse arguments ──────────────────────────────────────────────────────────
 
@@ -333,6 +372,10 @@ LAST_FAILURE_PHASE=""
 # Report error status on non-zero exit
 report_final_status() {
     local exit_code=$?
+
+    # Always remove worktree marker on exit (prevents orphaned markers)
+    # The marker prevents cleanup scripts from removing the worktree during orchestration
+    remove_worktree_marker
 
     # Only report errors for non-zero exits (excluding shutdown which is 0)
     # Also requires TASK_ID to be set and progress file to exist (created after 'started' milestone)
@@ -644,6 +687,11 @@ main() {
             add_label "$ISSUE" "loom:building"
         fi
 
+        # Create marker if worktree exists (doctor phase may need it)
+        if [[ -d "$worktree_path" ]]; then
+            create_worktree_marker "$worktree_path"
+        fi
+
         completed_phases+=("Builder (skipped - PR #$existing_pr exists)")
         pr_number="$existing_pr"
     else
@@ -683,6 +731,10 @@ main() {
                     --quiet || true
             fi
         fi
+
+        # Create marker to prevent premature cleanup during orchestration (issue #1485)
+        # This marker is checked by clean.sh and will be removed on orchestration completion
+        create_worktree_marker "$worktree_path"
 
         local builder_exit=0
         run_phase "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
