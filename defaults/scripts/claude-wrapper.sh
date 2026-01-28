@@ -194,10 +194,12 @@ run_with_retry() {
         temp_output=$(mktemp)
 
         # Run claude with all arguments passed to wrapper
-        # Use script or unbuffer to preserve interactivity if available
+        # Use macOS `script` to preserve TTY (so Claude CLI sees isatty(stdout) = true)
+        # while still capturing output to a file. A plain pipe (`| tee`) would replace
+        # stdout with a pipe fd, causing Claude to switch to non-interactive --print mode.
         set +e  # Temporarily disable errexit to capture exit code
-        claude "$@" 2>&1 | tee "${temp_output}"
-        exit_code="${PIPESTATUS[0]}"
+        script -q "${temp_output}" claude "$@"
+        exit_code=$?
         set -e
 
         output=$(cat "${temp_output}")
