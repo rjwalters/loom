@@ -155,7 +155,8 @@ check_completion_patterns() {
 
     # Generic completion: /exit command detected
     # More robust pattern to catch various prompt styles and formatting
-    if echo "$recent_log" | grep -qE '(^|❯\s*|>\s*)/exit\s*$'; then
+    # Including indented /exit from LLM text output (e.g., "  /exit")
+    if echo "$recent_log" | grep -qE '(^|\s+|❯\s*|>\s*)/exit\s*$'; then
         COMPLETION_REASON="explicit_exit"
         return 0
     fi
@@ -323,7 +324,14 @@ main() {
             # /exit is an explicit completion signal - no grace period needed
             if [[ "$COMPLETION_REASON" == "explicit_exit" ]]; then
                 local elapsed=$(( $(date +%s) - start_time ))
-                log_info "/exit detected - terminating session '$session_name' immediately"
+                log_info "/exit detected in output - sending /exit to prompt and terminating '$session_name'"
+
+                # Send /exit to the actual tmux prompt as backup
+                # This ensures the CLI receives /exit even if the LLM just output it as text
+                tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "/exit" C-m 2>/dev/null || true
+
+                # Brief pause to let /exit process
+                sleep 1
 
                 # Kill the background wait process
                 kill "$wait_pid" 2>/dev/null || true
