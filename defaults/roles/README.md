@@ -92,39 +92,30 @@ You are a specialist in {{workspace}} repository...
 
 ## Completion
 
-**After completing your task, exit Claude Code to signal completion.**
+**Work completion is detected automatically.**
 
-When you have finished your work, execute:
-
-\`\`\`
-/exit
-\`\`\`
-
-### Why This Matters
-- Enables automation: Shepherd orchestration detects worker completion
-- Prevents hanging: Without /exit, agent-wait-bg.sh waits until timeout
-- Saves resources: Idle sessions consume memory and context budget
-
-### When to Exit
-- ✅ After completing the task successfully
-- ✅ When no work is available
-- ❌ NOT during active work
+When you complete your task (apply appropriate end-state labels), the orchestration
+layer detects this and terminates the session automatically. No explicit exit command is needed.
 ```
 
-### Exit After Completion Convention
+### Completion Detection
 
-**All worker roles MUST include a "Completion" section** instructing the agent to exit Claude Code after completing their task.
+Worker completion is detected automatically through **phase contracts** - the orchestration layer validates that the expected end-state has been achieved (e.g., correct labels applied) and terminates the session.
 
-This is critical for shepherd orchestration:
+**How it works:**
 1. Shepherds spawn worker agents (builder, judge, doctor, curator) for each phase
-2. `agent-wait-bg.sh` monitors the worker, waiting for completion
-3. When the worker executes `/exit`, the session ends and the shepherd proceeds to the next phase
-4. Without `/exit`, the shepherd waits until timeout (30+ minutes), blocking pipeline progress
+2. `validate-phase.sh` checks for phase-specific completion criteria:
+   - **Curator**: `loom:curated` label on issue
+   - **Builder**: PR with `loom:review-requested` label linked to issue
+   - **Judge**: `loom:pr` or `loom:changes-requested` label on PR
+   - **Doctor**: `loom:review-requested` label after fixes
+3. When the phase contract is satisfied, the session terminates automatically
+4. Idle detection provides a fallback if the agent becomes unresponsive
 
-**Backup detection**: `agent-wait-bg.sh` also monitors logs for completion patterns as a fallback, but explicit `/exit` is preferred because:
-- Faster detection (immediate vs. polling delay)
-- Cleaner session cleanup
-- No ambiguity about completion state
+**Benefits of automatic detection:**
+- No ambiguity about what "completion" means (it's defined by labels)
+- Agents don't need to execute shell commands to signal completion
+- Consistent behavior across all worker roles
 
 ### Template Variables
 
