@@ -435,6 +435,14 @@ main() {
         exit 1
     fi
 
+    # Check if issue is already closed
+    local issue_state
+    issue_state=$(gh issue view "$ISSUE" --json state --jq '.state' 2>/dev/null)
+    if [[ "$issue_state" == "CLOSED" ]]; then
+        log_info "Issue #$ISSUE is already closed - no orchestration needed"
+        exit 0
+    fi
+
     local issue_title
     issue_title=$(gh issue view "$ISSUE" --json title --jq '.title' 2>/dev/null)
     log_info "Title: $issue_title"
