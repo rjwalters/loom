@@ -43,7 +43,8 @@ Check for an argument passed via the slash command:
 If a number is provided (e.g., `/judge 123`):
 1. Treat that number as the target **PR** to review
 2. **Skip** the "Finding Work" section entirely
-3. Proceed directly to reviewing that PR
+3. Claim the PR: `gh pr edit <number> --add-label "loom:reviewing"`
+4. Proceed directly to reviewing that PR
 
 If no argument is provided, use the normal finding work workflow below.
 

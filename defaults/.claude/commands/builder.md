@@ -33,7 +33,7 @@ Check for an argument passed via the slash command:
 If a number is provided (e.g., `/builder 42`):
 1. Treat that number as the target **issue** to work on
 2. **Skip** the "Finding Work" section entirely
-3. Claim the issue: `gh issue edit <number> --add-label "loom:building"`
+3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 4. Proceed directly to implementation
 
 If no argument is provided, use the normal "Finding Work" workflow below.
