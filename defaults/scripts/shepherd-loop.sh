@@ -846,8 +846,8 @@ main() {
         else
             log_error "Failed to merge PR #$pr_number"
             add_label "$ISSUE" "loom:blocked"
-            gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to auto-merge PR #$pr_number. May have merge conflicts." >/dev/null 2>&1 || true
-            fail_with_reason "merge" "failed to auto-merge PR #$pr_number"
+            gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to merge PR #$pr_number. Branch may be out of date or have merge conflicts." >/dev/null 2>&1 || true
+            fail_with_reason "merge" "failed to merge PR #$pr_number"
         fi
     elif [[ "$MODE" == "force-pr" ]]; then
         log_info "Stopping at loom:pr state (force-pr mode)"

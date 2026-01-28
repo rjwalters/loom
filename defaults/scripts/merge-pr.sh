@@ -112,19 +112,51 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
-# Merge via API (squash)
-MERGE_RESPONSE=$(gh api "repos/$REPO_NWO/pulls/$PR_NUMBER/merge" \
-  -X PUT \
-  -f merge_method=squash \
-  2>&1) || {
+# Merge via API (squash) with retry for stale branch
+MAX_MERGE_RETRIES=3
+MERGE_RETRY_DELAY=5
+
+for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
+  MERGE_RESPONSE=$(gh api "repos/$REPO_NWO/pulls/$PR_NUMBER/merge" \
+    -X PUT \
+    -f merge_method=squash \
+    2>&1) && break  # Success, exit loop
+
   # Check if it merged despite error (race condition)
   RECHECK=$(gh api "repos/$REPO_NWO/pulls/$PR_NUMBER" --jq '.merged' 2>/dev/null || echo "false")
   if [[ "$RECHECK" == "true" ]]; then
     warning "Merge reported error but PR is merged (race condition)"
-  else
-    error "Failed to merge PR #$PR_NUMBER: $MERGE_RESPONSE"
+    break
   fi
-}
+
+  # Check for stale branch error (base branch was modified)
+  if echo "$MERGE_RESPONSE" | grep -q "Base branch was modified"; then
+    if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
+      info "Branch is behind base branch, updating... (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES)"
+
+      # Update branch via GitHub API
+      UPDATE_RESPONSE=$(gh api "repos/$REPO_NWO/pulls/$PR_NUMBER/update-branch" \
+        -X PUT \
+        2>&1) || {
+        warning "Failed to update branch: $UPDATE_RESPONSE"
+        # Continue to retry merge anyway - update may have partially succeeded
+      }
+
+      # Wait for branch to sync
+      info "Waiting ${MERGE_RETRY_DELAY}s for branch to sync..."
+      sleep "$MERGE_RETRY_DELAY"
+
+      # Increase delay for next attempt (exponential backoff)
+      MERGE_RETRY_DELAY=$((MERGE_RETRY_DELAY * 2))
+      continue
+    else
+      error "Failed to merge PR #$PR_NUMBER after $MAX_MERGE_RETRIES attempts: Branch remains behind base branch"
+    fi
+  fi
+
+  # Other merge errors - fail immediately
+  error "Failed to merge PR #$PR_NUMBER: $MERGE_RESPONSE"
+done
 
 # Verify merge
 VERIFY_MERGED=$(gh api "repos/$REPO_NWO/pulls/$PR_NUMBER" --jq '.merged' 2>/dev/null || echo "false")
