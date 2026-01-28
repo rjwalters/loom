@@ -5,11 +5,20 @@
 # This allows shepherds to detect shutdown/abort requests during long waits
 # instead of blocking until the phase completes.
 #
+# Also includes stuck detection with configurable thresholds to identify agents
+# that appear unresponsive or making no progress.
+#
 # Exit codes:
 #   0 - Agent completed (same as agent-wait.sh)
 #   1 - Timeout reached (same as agent-wait.sh)
 #   2 - Session not found (same as agent-wait.sh)
 #   3 - Shutdown signal detected during wait
+#   4 - Agent stuck and intervention triggered (pause/restart)
+#
+# Stuck Detection Environment Variables:
+#   LOOM_STUCK_WARNING   - Seconds without progress before warning (default: 300)
+#   LOOM_STUCK_CRITICAL  - Seconds without progress before critical (default: 600)
+#   LOOM_STUCK_ACTION    - Action on stuck: warn, pause, restart (default: warn)
 #
 # Usage:
 #   agent-wait-bg.sh <name> [--timeout <s>] [--poll-interval <s>] [--issue <N>] [--json]
@@ -17,6 +26,7 @@
 # Examples:
 #   agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
 #   agent-wait-bg.sh shepherd-1 --poll-interval 10 --json
+#   LOOM_STUCK_WARNING=180 LOOM_STUCK_ACTION=pause agent-wait-bg.sh builder-1
 
 set -euo pipefail
 
@@ -45,6 +55,14 @@ DEFAULT_SIGNAL_POLL=5
 # Grace period (seconds) to wait after detecting completion before force-terminating
 DEFAULT_GRACE_PERIOD=30
 
+# Stuck detection thresholds (configurable via environment variables)
+STUCK_WARNING_THRESHOLD=${LOOM_STUCK_WARNING:-300}   # 5 min default
+STUCK_CRITICAL_THRESHOLD=${LOOM_STUCK_CRITICAL:-600} # 10 min default
+STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart
+
+# Progress tracking file prefix
+PROGRESS_DIR="/tmp/loom-agent-progress"
+
 show_help() {
     cat <<EOF
 ${BLUE}agent-wait-bg.sh - Wait for agent with shutdown signal checking${NC}
@@ -65,6 +83,7 @@ ${YELLOW}EXIT CODES:${NC}
     1  Timeout reached
     2  Session not found
     3  Shutdown signal detected
+    4  Agent stuck and intervention triggered
 
 ${YELLOW}SIGNALS CHECKED:${NC}
     - .loom/stop-shepherds file (global shepherd shutdown)
@@ -77,9 +96,20 @@ ${YELLOW}COMPLETION DETECTION:${NC}
     - Doctor: PR fixed and labeled with loom:review-requested
     - Curator: Issue labeled with loom:curated
 
+${YELLOW}STUCK DETECTION:${NC}
+    Monitors agent progress by tracking tmux pane content changes.
+    Configure via environment variables:
+
+    LOOM_STUCK_WARNING   Seconds without progress before warning (default: 300)
+    LOOM_STUCK_CRITICAL  Seconds without progress before critical (default: 600)
+    LOOM_STUCK_ACTION    Action on stuck: warn, pause, restart (default: warn)
+
 ${YELLOW}EXAMPLES:${NC}
     agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
     agent-wait-bg.sh curator-issue-10 --poll-interval 10 --json
+
+    # With custom stuck thresholds
+    LOOM_STUCK_WARNING=180 LOOM_STUCK_ACTION=pause agent-wait-bg.sh builder-1
 
 EOF
 }
@@ -105,6 +135,161 @@ check_signals() {
     fi
 
     return 1
+}
+
+# Initialize progress tracking for an agent
+init_progress_tracking() {
+    local name="$1"
+
+    mkdir -p "$PROGRESS_DIR"
+
+    local progress_file="$PROGRESS_DIR/${name}"
+    local hash_file="${progress_file}.hash"
+    local time_file="${progress_file}.time"
+
+    # Initialize with current time as last progress
+    date +%s > "$time_file"
+    # Clear any existing hash
+    rm -f "$hash_file"
+}
+
+# Check for progress by comparing tmux pane content hash
+# Returns 0 if progress detected, 1 if no change
+check_progress() {
+    local name="$1"
+    local session_name="$2"
+
+    local progress_file="$PROGRESS_DIR/${name}"
+    local hash_file="${progress_file}.hash"
+    local time_file="${progress_file}.time"
+
+    # Capture current pane content and hash it
+    local current_content
+    current_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || echo "")
+
+    if [[ -z "$current_content" ]]; then
+        # Can't capture pane - session may be gone
+        return 1
+    fi
+
+    local current_hash
+    current_hash=$(echo "$current_content" | md5 -q 2>/dev/null || echo "$current_content" | md5sum 2>/dev/null | cut -d' ' -f1)
+
+    local last_hash=""
+    if [[ -f "$hash_file" ]]; then
+        last_hash=$(cat "$hash_file" 2>/dev/null || echo "")
+    fi
+
+    if [[ "$current_hash" != "$last_hash" ]]; then
+        # Content changed - progress detected
+        echo "$current_hash" > "$hash_file"
+        date +%s > "$time_file"
+        return 0  # Progress detected
+    fi
+
+    return 1  # No progress
+}
+
+# Get idle time (seconds since last progress)
+get_idle_time() {
+    local name="$1"
+
+    local time_file="$PROGRESS_DIR/${name}.time"
+
+    if [[ ! -f "$time_file" ]]; then
+        echo "0"
+        return
+    fi
+
+    local last_progress
+    last_progress=$(cat "$time_file" 2>/dev/null || echo "0")
+    local now
+    now=$(date +%s)
+
+    echo $((now - last_progress))
+}
+
+# Check if agent is stuck and return status
+# Returns: OK, WARNING, or CRITICAL
+check_stuck_status() {
+    local name="$1"
+
+    local idle_time
+    idle_time=$(get_idle_time "$name")
+
+    if [[ "$idle_time" -gt "$STUCK_CRITICAL_THRESHOLD" ]]; then
+        echo "CRITICAL"
+    elif [[ "$idle_time" -gt "$STUCK_WARNING_THRESHOLD" ]]; then
+        echo "WARNING"
+    else
+        echo "OK"
+    fi
+}
+
+# Handle stuck agent intervention
+# Returns 0 if should continue waiting, 1 if should exit
+handle_stuck() {
+    local name="$1"
+    local session_name="$2"
+    local status="$3"
+    local issue="$4"
+    local json_output="$5"
+    local elapsed="$6"
+
+    local idle_time
+    idle_time=$(get_idle_time "$name")
+
+    case "$STUCK_ACTION" in
+        warn)
+            if [[ "$status" == "CRITICAL" ]]; then
+                log_warn "CRITICAL: Agent '$name' appears stuck (no progress for ${idle_time}s)"
+            else
+                log_warn "WARNING: Agent '$name' may be stuck (no progress for ${idle_time}s)"
+            fi
+            return 0  # Continue waiting
+            ;;
+        pause)
+            log_warn "PAUSE: Pausing stuck agent '$name' (no progress for ${idle_time}s)"
+
+            # Signal the agent to pause via .loom/signals
+            local signal_file="${REPO_ROOT}/.loom/signals/pause-${name}"
+            mkdir -p "${REPO_ROOT}/.loom/signals"
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) - Auto-paused: stuck detection (idle ${idle_time}s)" > "$signal_file"
+
+            if [[ "$json_output" == "true" ]]; then
+                echo "{\"status\":\"stuck\",\"name\":\"$name\",\"action\":\"paused\",\"idle_time\":$idle_time,\"stuck_status\":\"$status\",\"elapsed\":$elapsed}"
+            fi
+            return 1  # Exit with stuck status
+            ;;
+        restart)
+            log_warn "RESTART: Restarting stuck agent '$name' (no progress for ${idle_time}s)"
+
+            # Destroy the tmux session
+            tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+            # Clean up progress files
+            cleanup_progress_files "$name"
+
+            if [[ "$json_output" == "true" ]]; then
+                echo "{\"status\":\"stuck\",\"name\":\"$name\",\"action\":\"restarted\",\"idle_time\":$idle_time,\"stuck_status\":\"$status\",\"elapsed\":$elapsed}"
+            fi
+            return 1  # Exit with stuck status (shepherd will respawn)
+            ;;
+        *)
+            # Unknown action, default to warn
+            log_warn "Agent '$name' stuck status: $status (idle ${idle_time}s)"
+            return 0
+            ;;
+    esac
+}
+
+# Clean up progress tracking files for an agent
+cleanup_progress_files() {
+    local name="$1"
+
+    rm -f "$PROGRESS_DIR/${name}.hash"
+    rm -f "$PROGRESS_DIR/${name}.time"
+    rm -f "$PROGRESS_DIR/${name}"
 }
 
 # Check for role-specific completion patterns in log file
@@ -245,6 +430,7 @@ main() {
     done
 
     log_info "Waiting for agent '$name' with signal checking (poll: ${poll_interval}s, timeout: ${timeout}s)"
+    log_info "Stuck detection: warning=${STUCK_WARNING_THRESHOLD}s, critical=${STUCK_CRITICAL_THRESHOLD}s, action=${STUCK_ACTION}"
 
     # Launch agent-wait.sh in the background
     "${SCRIPT_DIR}/agent-wait.sh" "$name" --timeout "$timeout" --poll-interval "$poll_interval" --json &
@@ -257,9 +443,14 @@ main() {
     local prompt_resolved=false
     local completion_detected=false
     local completion_time=0
+    local stuck_warned=false
+    local stuck_critical_reported=false
     COMPLETION_REASON=""
 
-    # Poll for signals, prompts, and completion patterns while background process runs
+    # Initialize progress tracking
+    init_progress_tracking "$name"
+
+    # Poll for signals, prompts, completion patterns, and stuck detection while background process runs
     while true; do
         # Check for interactive prompts that need auto-approval (e.g., plan mode).
         # Only attempt once to avoid sending stray keystrokes after the prompt clears.
@@ -275,6 +466,9 @@ main() {
             wait "$wait_pid"
             local exit_code=$?
 
+            # Clean up progress files on completion
+            cleanup_progress_files "$name"
+
             if [[ "$json_output" == "true" ]]; then
                 # agent-wait.sh already output JSON, just pass through exit code
                 :
@@ -289,6 +483,9 @@ main() {
             # Kill the background wait process
             kill "$wait_pid" 2>/dev/null || true
             wait "$wait_pid" 2>/dev/null || true
+
+            # Clean up progress files
+            cleanup_progress_files "$name"
 
             if [[ "$json_output" == "true" ]]; then
                 local signal_type="shutdown"
@@ -337,6 +534,9 @@ main() {
                 kill "$wait_pid" 2>/dev/null || true
                 wait "$wait_pid" 2>/dev/null || true
 
+                # Clean up progress files
+                cleanup_progress_files "$name"
+
                 # Destroy the tmux session to clean up
                 tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
 
@@ -357,6 +557,9 @@ main() {
                 kill "$wait_pid" 2>/dev/null || true
                 wait "$wait_pid" 2>/dev/null || true
 
+                # Clean up progress files
+                cleanup_progress_files "$name"
+
                 # Destroy the tmux session to clean up
                 tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
 
@@ -366,6 +569,43 @@ main() {
                     log_success "Agent '$name' completed (pattern: $COMPLETION_REASON, forced after ${grace_period}s grace period)"
                 fi
                 exit 0
+            fi
+        fi
+
+        # Check for progress and update stuck tracking
+        check_progress "$name" "$session_name" || true
+
+        # Check stuck status (only if not already completing)
+        if [[ "$completion_detected" != "true" ]]; then
+            local stuck_status
+            stuck_status=$(check_stuck_status "$name")
+
+            if [[ "$stuck_status" == "WARNING" ]] && [[ "$stuck_warned" != "true" ]]; then
+                stuck_warned=true
+                local elapsed=$(( $(date +%s) - start_time ))
+                if [[ "$STUCK_ACTION" != "warn" ]]; then
+                    # For pause/restart actions, only trigger on CRITICAL
+                    log_warn "Agent '$name' showing signs of being stuck (no progress for $(get_idle_time "$name")s)"
+                else
+                    handle_stuck "$name" "$session_name" "$stuck_status" "$issue" "$json_output" "$elapsed"
+                fi
+            elif [[ "$stuck_status" == "CRITICAL" ]] && [[ "$stuck_critical_reported" != "true" ]]; then
+                stuck_critical_reported=true
+                local elapsed=$(( $(date +%s) - start_time ))
+
+                # For pause/restart, trigger intervention at CRITICAL level
+                if ! handle_stuck "$name" "$session_name" "$stuck_status" "$issue" "$json_output" "$elapsed"; then
+                    # Intervention triggered that requires exit
+
+                    # Kill the background wait process
+                    kill "$wait_pid" 2>/dev/null || true
+                    wait "$wait_pid" 2>/dev/null || true
+
+                    # Clean up progress files
+                    cleanup_progress_files "$name"
+
+                    exit 4
+                fi
             fi
         fi
 
