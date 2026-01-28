@@ -327,7 +327,7 @@ handle_shutdown() {
 # ─── Phase execution ──────────────────────────────────────────────────────────
 
 # Run a phase worker and wait for completion
-# Usage: run_phase <role> <name> <timeout> [--worktree <path>] [--args <args>]
+# Usage: run_phase <role> <name> <timeout> [--worktree <path>] [--args <args>] [--pr <N>]
 run_phase() {
     local role="$1"
     local name="$2"
@@ -336,6 +336,7 @@ run_phase() {
 
     local worktree=""
     local args=""
+    local pr_number=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -345,6 +346,10 @@ run_phase() {
                 ;;
             --args)
                 args="$2"
+                shift 2
+                ;;
+            --pr)
+                pr_number="$2"
                 shift 2
                 ;;
             *)
@@ -377,12 +382,25 @@ run_phase() {
         return 1
     fi
 
-    # Wait for completion with signal checking
+    # Wait for completion with signal checking and phase-aware completion detection
+    local wait_cmd=(
+        "$REPO_ROOT/.loom/scripts/agent-wait-bg.sh" "$name"
+        --timeout "$timeout"
+        --poll-interval "$POLL_INTERVAL"
+        --issue "$ISSUE"
+        --phase "$role"
+    )
+
+    if [[ -n "$worktree" ]]; then
+        wait_cmd+=(--worktree "$worktree")
+    fi
+
+    if [[ -n "$pr_number" ]]; then
+        wait_cmd+=(--pr "$pr_number")
+    fi
+
     local wait_exit=0
-    "$REPO_ROOT/.loom/scripts/agent-wait-bg.sh" "$name" \
-        --timeout "$timeout" \
-        --poll-interval "$POLL_INTERVAL" \
-        --issue "$ISSUE" || wait_exit=$?
+    "${wait_cmd[@]}" || wait_exit=$?
 
     # Clean up the worker session
     "$REPO_ROOT/.loom/scripts/agent-destroy.sh" "$name" --force >/dev/null 2>&1 || true
@@ -629,7 +647,9 @@ main() {
         fi
 
         local judge_exit=0
-        run_phase "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" --args "$pr_number" || judge_exit=$?
+        run_phase "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" \
+            --args "$pr_number" \
+            --pr "$pr_number" || judge_exit=$?
 
         if [[ $judge_exit -eq 3 ]]; then
             handle_shutdown "judge"
@@ -680,7 +700,8 @@ main() {
             local doctor_exit=0
             run_phase "doctor" "doctor-issue-${ISSUE}" "$DOCTOR_TIMEOUT" \
                 --worktree "$worktree_path" \
-                --args "$pr_number" || doctor_exit=$?
+                --args "$pr_number" \
+                --pr "$pr_number" || doctor_exit=$?
 
             if [[ $doctor_exit -eq 3 ]]; then
                 handle_shutdown "doctor"

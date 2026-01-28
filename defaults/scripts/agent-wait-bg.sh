@@ -22,10 +22,12 @@
 #
 # Usage:
 #   agent-wait-bg.sh <name> [--timeout <s>] [--poll-interval <s>] [--issue <N>] [--json]
+#                    [--phase <phase>] [--worktree <path>] [--pr <N>] [--idle-timeout <s>]
 #
 # Examples:
-#   agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
+#   agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42 --phase builder --worktree /path/to/worktree
 #   agent-wait-bg.sh shepherd-1 --poll-interval 10 --json
+#   agent-wait-bg.sh judge-42 --issue 42 --phase judge --pr 123
 #   LOOM_STUCK_WARNING=180 LOOM_STUCK_ACTION=pause agent-wait-bg.sh builder-1
 
 set -euo pipefail
@@ -55,6 +57,10 @@ DEFAULT_SIGNAL_POLL=5
 # Grace period (seconds) to wait after detecting completion before force-terminating
 DEFAULT_GRACE_PERIOD=30
 
+# Idle timeout (seconds) for activity-based completion detection
+# When agent is idle for this long, check if phase contract is satisfied
+DEFAULT_IDLE_TIMEOUT=60
+
 # Stuck detection thresholds (configurable via environment variables)
 STUCK_WARNING_THRESHOLD=${LOOM_STUCK_WARNING:-300}   # 5 min default
 STUCK_CRITICAL_THRESHOLD=${LOOM_STUCK_CRITICAL:-600} # 10 min default
@@ -75,6 +81,10 @@ ${YELLOW}OPTIONS:${NC}
     --poll-interval <seconds>  Time between signal checks (default: $DEFAULT_SIGNAL_POLL)
     --issue <N>                Issue number for per-issue abort checking
     --grace-period <seconds>   Time to wait after completion detection (default: $DEFAULT_GRACE_PERIOD)
+    --phase <phase>            Phase being monitored (curator, builder, judge, doctor)
+    --worktree <path>          Worktree path (required for builder phase recovery)
+    --pr <N>                   PR number (required for judge/doctor phases)
+    --idle-timeout <seconds>   Idle time before checking phase contract (default: $DEFAULT_IDLE_TIMEOUT)
     --json                     Output result as JSON
     --help                     Show this help message
 
@@ -90,11 +100,20 @@ ${YELLOW}SIGNALS CHECKED:${NC}
     - loom:abort label on issue (per-issue abort, requires --issue)
 
 ${YELLOW}COMPLETION DETECTION:${NC}
-    As a backup to /exit, monitors logs for role-specific completion patterns:
+    Multiple detection mechanisms (in priority order):
+    1. /exit command in output (immediate completion)
+    2. Log-based pattern matching (role-specific patterns)
+    3. Activity-based GitHub state check (when idle for --idle-timeout)
+
+    Log patterns detected:
     - Builder: PR created with loom:review-requested
     - Judge: PR labeled with loom:pr or loom:changes-requested
     - Doctor: PR fixed and labeled with loom:review-requested
     - Curator: Issue labeled with loom:curated
+
+    Activity-based detection (requires --phase):
+    When agent is idle for --idle-timeout seconds, validates phase
+    contract via GitHub state (labels, PRs) using validate-phase.sh
 
 ${YELLOW}STUCK DETECTION:${NC}
     Monitors agent progress by tracking tmux pane content changes.
@@ -105,8 +124,15 @@ ${YELLOW}STUCK DETECTION:${NC}
     LOOM_STUCK_ACTION    Action on stuck: warn, pause, restart (default: warn)
 
 ${YELLOW}EXAMPLES:${NC}
-    agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
-    agent-wait-bg.sh curator-issue-10 --poll-interval 10 --json
+    # Builder with phase-aware completion detection
+    agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42 \\
+        --phase builder --worktree .loom/worktrees/issue-42
+
+    # Judge with PR context
+    agent-wait-bg.sh judge-42 --issue 42 --phase judge --pr 123
+
+    # Curator with shorter idle timeout
+    agent-wait-bg.sh curator-issue-10 --issue 10 --phase curator --idle-timeout 30
 
     # With custom stuck thresholds
     LOOM_STUCK_WARNING=180 LOOM_STUCK_ACTION=pause agent-wait-bg.sh builder-1
@@ -349,6 +375,52 @@ check_completion_patterns() {
     return 1
 }
 
+# Check if phase contract is satisfied via GitHub state (using validate-phase.sh)
+# This is a backup for when /exit fails or log patterns aren't detected.
+# Returns 0 if contract satisfied, 1 otherwise
+# Sets COMPLETION_REASON global variable with the validation result
+check_phase_contract() {
+    local phase="$1"
+    local issue="$2"
+    local worktree="$3"
+    local pr_number="$4"
+
+    if [[ -z "$phase" || -z "$issue" ]]; then
+        return 1
+    fi
+
+    local validate_script="${SCRIPT_DIR}/validate-phase.sh"
+    if [[ ! -x "$validate_script" ]]; then
+        log_warn "validate-phase.sh not found or not executable"
+        return 1
+    fi
+
+    # Build validation command
+    local validate_cmd=("$validate_script" "$phase" "$issue" --json)
+
+    if [[ -n "$worktree" ]]; then
+        validate_cmd+=(--worktree "$worktree")
+    fi
+
+    if [[ -n "$pr_number" ]]; then
+        validate_cmd+=(--pr "$pr_number")
+    fi
+
+    # Run validation (suppress output, we just care about exit code)
+    local result
+    if result=$("${validate_cmd[@]}" 2>/dev/null); then
+        # Extract status from JSON result
+        local status
+        status=$(echo "$result" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || echo "")
+        if [[ "$status" == "satisfied" || "$status" == "recovered" ]]; then
+            COMPLETION_REASON="phase_contract_${status}"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # Check for interactive prompts in the agent's tmux pane and auto-resolve them.
 # Claude Code's plan mode presents an approval prompt that blocks execution when
 # no human is present. This function detects the prompt and sends the approval
@@ -386,6 +458,10 @@ main() {
     local poll_interval="$DEFAULT_SIGNAL_POLL"
     local issue=""
     local grace_period="$DEFAULT_GRACE_PERIOD"
+    local phase=""
+    local worktree=""
+    local pr_number=""
+    local idle_timeout="$DEFAULT_IDLE_TIMEOUT"
     local json_output=false
 
     if [[ $# -lt 1 ]]; then
@@ -414,6 +490,22 @@ main() {
                 grace_period="$2"
                 shift 2
                 ;;
+            --phase)
+                phase="$2"
+                shift 2
+                ;;
+            --worktree)
+                worktree="$2"
+                shift 2
+                ;;
+            --pr)
+                pr_number="$2"
+                shift 2
+                ;;
+            --idle-timeout)
+                idle_timeout="$2"
+                shift 2
+                ;;
             --json)
                 json_output=true
                 shift
@@ -430,6 +522,9 @@ main() {
     done
 
     log_info "Waiting for agent '$name' with signal checking (poll: ${poll_interval}s, timeout: ${timeout}s)"
+    if [[ -n "$phase" ]]; then
+        log_info "Phase-aware completion: phase=$phase, idle-timeout=${idle_timeout}s"
+    fi
     log_info "Stuck detection: warning=${STUCK_WARNING_THRESHOLD}s, critical=${STUCK_CRITICAL_THRESHOLD}s, action=${STUCK_ACTION}"
 
     # Launch agent-wait.sh in the background
@@ -445,12 +540,13 @@ main() {
     local completion_time=0
     local stuck_warned=false
     local stuck_critical_reported=false
+    local phase_contract_checked=false
     COMPLETION_REASON=""
 
     # Initialize progress tracking
     init_progress_tracking "$name"
 
-    # Poll for signals, prompts, completion patterns, and stuck detection while background process runs
+    # Poll for signals, prompts, completion patterns, phase contracts, and stuck detection
     while true; do
         # Check for interactive prompts that need auto-approval (e.g., plan mode).
         # Only attempt once to avoid sending stray keystrokes after the prompt clears.
@@ -573,7 +669,32 @@ main() {
         fi
 
         # Check for progress and update stuck tracking
-        check_progress "$name" "$session_name" || true
+        # If progress detected, reset phase_contract_checked to allow re-checking after idle
+        if check_progress "$name" "$session_name"; then
+            phase_contract_checked=false
+        fi
+
+        # Activity-based completion detection via phase contract
+        # If phase is specified and agent has been idle for idle_timeout, check GitHub state
+        if [[ "$completion_detected" != "true" ]] && [[ -n "$phase" ]] && [[ -n "$issue" ]]; then
+            local idle_time
+            idle_time=$(get_idle_time "$name")
+
+            if [[ "$idle_time" -ge "$idle_timeout" ]] && [[ "$phase_contract_checked" != "true" ]]; then
+                log_info "Agent idle for ${idle_time}s - checking phase contract via GitHub state"
+
+                if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number"; then
+                    completion_detected=true
+                    completion_time=$(date +%s)
+                    log_warn "Phase contract satisfied ($COMPLETION_REASON) via GitHub state check"
+                    log_warn "Agent completed work but didn't exit - waiting ${grace_period}s grace period"
+                else
+                    # Mark that we've checked so we don't spam GitHub API
+                    phase_contract_checked=true
+                    log_info "Phase contract not yet satisfied, continuing to wait"
+                fi
+            fi
+        fi
 
         # Check stuck status (only if not already completing)
         if [[ "$completion_detected" != "true" ]]; then
