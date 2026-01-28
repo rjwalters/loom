@@ -292,9 +292,37 @@ cleanup_progress_files() {
     rm -f "$PROGRESS_DIR/${name}"
 }
 
+# Extract phase from session name (e.g., "builder-issue-123" -> "builder")
+# Returns empty string if no recognized phase found
+extract_phase_from_session() {
+    local session_name="$1"
+
+    # Remove the "loom-" prefix if present (session_name may be full tmux session name)
+    local base_name="${session_name#loom-}"
+
+    # Extract the first component before "-issue-" or "-"
+    local phase
+    phase=$(echo "$base_name" | sed -E 's/^(builder|judge|curator|doctor|shepherd)-.*$/\1/')
+
+    # Verify it's a recognized phase
+    case "$phase" in
+        builder|judge|curator|doctor|shepherd)
+            echo "$phase"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+}
+
 # Check for role-specific completion patterns in log file
 # Returns 0 if completion detected, 1 otherwise
 # Sets COMPLETION_REASON global variable with the detected pattern
+#
+# The function is phase-aware: it only checks patterns relevant to the
+# current phase (extracted from session name) to avoid false matches.
+# For example, a judge reviewing a PR with loom:review-requested won't
+# incorrectly match the builder_pr_created pattern.
 check_completion_patterns() {
     local session_name="$1"
     local log_file="${REPO_ROOT}/.loom/logs/${session_name}.log"
@@ -311,40 +339,73 @@ check_completion_patterns() {
         return 1
     fi
 
-    # Builder completion: PR created with loom:review-requested
-    # Look for patterns like "gh pr create" followed by "loom:review-requested"
-    # or explicit PR creation success messages
-    if echo "$recent_log" | grep -qE 'loom:review-requested|PR #[0-9]+ created|pull request.*created'; then
-        COMPLETION_REASON="builder_pr_created"
-        return 0
-    fi
+    # Extract phase from session name for phase-aware pattern matching
+    local phase
+    phase=$(extract_phase_from_session "$session_name")
 
-    # Judge completion: PR labeled with loom:pr or loom:changes-requested
-    if echo "$recent_log" | grep -qE 'add-label.*loom:pr|add-label.*loom:changes-requested|--add-label "loom:pr"|--add-label "loom:changes-requested"'; then
-        COMPLETION_REASON="judge_review_complete"
-        return 0
-    fi
-
-    # Doctor completion: PR labeled with loom:review-requested after fixes
-    # Similar to builder but in context of fixing (look for treating label removal)
-    if echo "$recent_log" | grep -qE 'remove-label.*loom:treating.*add-label.*loom:review-requested|remove-label.*loom:changes-requested.*add-label.*loom:review-requested'; then
-        COMPLETION_REASON="doctor_fixes_complete"
-        return 0
-    fi
-
-    # Curator completion: Issue labeled with loom:curated
-    if echo "$recent_log" | grep -qE 'add-label.*loom:curated|--add-label "loom:curated"'; then
-        COMPLETION_REASON="curator_curation_complete"
-        return 0
-    fi
-
-    # Generic completion: /exit command detected
+    # Generic completion: /exit command detected (always checked regardless of phase)
     # More robust pattern to catch various prompt styles and formatting
     # Including indented /exit from LLM text output (e.g., "  /exit")
     if echo "$recent_log" | grep -qE '(^|\s+|❯\s*|>\s*)/exit\s*$'; then
         COMPLETION_REASON="explicit_exit"
         return 0
     fi
+
+    # Phase-specific completion patterns
+    # Only check the pattern relevant to the current phase to avoid false matches
+    case "$phase" in
+        builder)
+            # Builder completion: PR created with loom:review-requested
+            # Look for patterns like "gh pr create" followed by "loom:review-requested"
+            # or explicit PR creation success messages
+            if echo "$recent_log" | grep -qE 'loom:review-requested|PR #[0-9]+ created|pull request.*created'; then
+                COMPLETION_REASON="builder_pr_created"
+                return 0
+            fi
+            ;;
+        judge)
+            # Judge completion: PR labeled with loom:pr or loom:changes-requested
+            if echo "$recent_log" | grep -qE 'add-label.*loom:pr|add-label.*loom:changes-requested|--add-label "loom:pr"|--add-label "loom:changes-requested"'; then
+                COMPLETION_REASON="judge_review_complete"
+                return 0
+            fi
+            ;;
+        doctor)
+            # Doctor completion: PR labeled with loom:review-requested after fixes
+            # Similar to builder but in context of fixing (look for treating label removal)
+            if echo "$recent_log" | grep -qE 'remove-label.*loom:treating.*add-label.*loom:review-requested|remove-label.*loom:changes-requested.*add-label.*loom:review-requested'; then
+                COMPLETION_REASON="doctor_fixes_complete"
+                return 0
+            fi
+            ;;
+        curator)
+            # Curator completion: Issue labeled with loom:curated
+            if echo "$recent_log" | grep -qE 'add-label.*loom:curated|--add-label "loom:curated"'; then
+                COMPLETION_REASON="curator_curation_complete"
+                return 0
+            fi
+            ;;
+        *)
+            # Unknown phase or shepherd - check all patterns as fallback
+            # This handles generic or shepherd sessions that may spawn worker roles
+            if echo "$recent_log" | grep -qE 'loom:review-requested|PR #[0-9]+ created|pull request.*created'; then
+                COMPLETION_REASON="builder_pr_created"
+                return 0
+            fi
+            if echo "$recent_log" | grep -qE 'add-label.*loom:pr|add-label.*loom:changes-requested|--add-label "loom:pr"|--add-label "loom:changes-requested"'; then
+                COMPLETION_REASON="judge_review_complete"
+                return 0
+            fi
+            if echo "$recent_log" | grep -qE 'remove-label.*loom:treating.*add-label.*loom:review-requested|remove-label.*loom:changes-requested.*add-label.*loom:review-requested'; then
+                COMPLETION_REASON="doctor_fixes_complete"
+                return 0
+            fi
+            if echo "$recent_log" | grep -qE 'add-label.*loom:curated|--add-label "loom:curated"'; then
+                COMPLETION_REASON="curator_curation_complete"
+                return 0
+            fi
+            ;;
+    esac
 
     return 1
 }
