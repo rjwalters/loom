@@ -25,9 +25,9 @@
 #   --force-merge   (deprecated) Use --force or -f instead
 #
 # Environment Variables:
-#   LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 600)
+#   LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 300)
 #   LOOM_BUILDER_TIMEOUT     Seconds for builder phase (default: 1800)
-#   LOOM_JUDGE_TIMEOUT       Seconds for judge phase (default: 900)
+#   LOOM_JUDGE_TIMEOUT       Seconds for judge phase (default: 600)
 #   LOOM_DOCTOR_TIMEOUT      Seconds for doctor phase (default: 900)
 #   LOOM_DOCTOR_MAX_RETRIES  Maximum doctor retry attempts (default: 3)
 #   LOOM_POLL_INTERVAL       Seconds between completion checks (default: 15)
@@ -46,9 +46,9 @@ set -euo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-CURATOR_TIMEOUT="${LOOM_CURATOR_TIMEOUT:-600}"
+CURATOR_TIMEOUT="${LOOM_CURATOR_TIMEOUT:-300}"
 BUILDER_TIMEOUT="${LOOM_BUILDER_TIMEOUT:-1800}"
-JUDGE_TIMEOUT="${LOOM_JUDGE_TIMEOUT:-900}"
+JUDGE_TIMEOUT="${LOOM_JUDGE_TIMEOUT:-600}"
 DOCTOR_TIMEOUT="${LOOM_DOCTOR_TIMEOUT:-900}"
 DOCTOR_MAX_RETRIES="${LOOM_DOCTOR_MAX_RETRIES:-3}"
 POLL_INTERVAL="${LOOM_POLL_INTERVAL:-15}"
@@ -158,9 +158,9 @@ ${YELLOW}PHASES:${NC}
     6. Merge      - Auto-merge (--force) or wait for human
 
 ${YELLOW}ENVIRONMENT:${NC}
-    LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 600)
+    LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 300)
     LOOM_BUILDER_TIMEOUT     Seconds for builder phase (default: 1800)
-    LOOM_JUDGE_TIMEOUT       Seconds for judge phase (default: 900)
+    LOOM_JUDGE_TIMEOUT       Seconds for judge phase (default: 600)
     LOOM_DOCTOR_TIMEOUT      Seconds for doctor phase (default: 900)
     LOOM_DOCTOR_MAX_RETRIES  Maximum doctor retry attempts (default: 3)
     LOOM_POLL_INTERVAL       Seconds between completion checks (default: 15)
