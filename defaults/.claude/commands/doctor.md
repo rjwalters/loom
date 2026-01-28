@@ -646,23 +646,6 @@ Keep it brief (3-6 words) and descriptive:
 
 ## Completion
 
-**After completing your task, exit Claude Code to signal completion.**
+**Work completion is detected automatically.**
 
-When you have finished your work (feedback addressed and PR labeled with `loom:review-requested`), execute:
-
-```
-/exit
-```
-
-### Why This Matters
-
-- **Enables automation**: Shepherd orchestration relies on detecting when workers complete
-- **Prevents hanging**: Without `/exit`, `agent-wait-bg.sh` waits until timeout
-- **Saves resources**: Idle Claude Code sessions consume memory and context budget
-
-### When to Exit
-
-- ✅ **After fixing PR** and labeling with `loom:review-requested`
-- ✅ **After resolving merge conflicts** and pushing changes
-- ✅ **When no work is available** (no PRs with `loom:changes-requested` or conflicts)
-- ❌ **NOT during active work** (only after fixes are complete)
+When you complete your task (feedback addressed and PR labeled with `loom:review-requested`), the orchestration layer detects this and terminates the session automatically. No explicit exit command is needed.
