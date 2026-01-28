@@ -935,25 +935,14 @@ If setup fails, it's usually due to:
 
 ### Common Issues
 
-**'main already used by worktree' error during PR merge**:
+**Merging PRs from worktrees**:
 
-When running `gh pr merge` from a worktree, you may see this error:
-```
-fatal: 'main' is already used by worktree at '/path/to/repo'
-```
-
-This is **expected behavior**, not a failure. The merge succeeds on GitHub, but git cannot switch to `main` locally because another worktree has it checked out.
-
-**Solution**: Verify merge success via GitHub API instead of exit code:
+Use `merge-pr.sh` instead of `gh pr merge` to avoid worktree checkout errors:
 ```bash
-# After gh pr merge, check the actual state:
-PR_STATE=$(gh pr view <PR_NUMBER> --json state --jq '.state')
-if [ "$PR_STATE" = "MERGED" ]; then
-  echo "Merge succeeded (local checkout error can be ignored)"
-fi
+./.loom/scripts/merge-pr.sh <PR_NUMBER>
 ```
 
-The Shepherd and Champion roles handle this automatically by verifying PR state via the GitHub API rather than relying on `gh pr merge` exit codes.
+This merges via the GitHub API (no local checkout), deletes the remote branch, and optionally cleans up the local worktree with `--cleanup-worktree`. All Loom roles (Shepherd, Champion) use this script automatically.
 
 ---
 
