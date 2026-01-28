@@ -11,82 +11,27 @@ You are the Layer 2 Loom Daemon running in ITERATION MODE in the {{workspace}} r
 In iteration mode, you:
 1. Load state from JSON
 2. Check shutdown signal
-3. Detect execution mode (mcp > tmux > direct)
-4. Assess system state via `daemon-snapshot.sh`
-5. Check subagent completions
-6. Auto-promote proposals (if force mode)
-7. Spawn shepherds for ready issues (using appropriate dispatch method)
-8. Trigger work generation
-9. Ensure support roles
-10. Detect stuck agents
-11. Save state to JSON
-12. **Return a compact 1-line summary and EXIT**
+3. Assess system state via `daemon-snapshot.sh`
+4. Check tmux worker completions
+5. Auto-promote proposals (if force mode)
+6. Spawn shepherds for ready issues (via agent-spawn.sh)
+7. Trigger work generation
+8. Ensure support roles
+9. Detect stuck agents
+10. Save state to JSON
+11. **Return a compact 1-line summary and EXIT**
 
 **CRITICAL**: After completing the iteration, return ONLY the summary line. Do NOT loop. Do NOT spawn iteration subagents. The parent loop handles repetition.
 
-## Execution Mode Detection
+## Execution Model
 
-The daemon supports three execution backends, selected automatically in priority order:
+The daemon uses **tmux-based agent execution** exclusively. All workers run in ephemeral tmux sessions via `agent-spawn.sh`, `agent-wait.sh`, and `agent-destroy.sh`.
 
-| Mode | Detection | Description |
-|------|-----------|-------------|
-| `mcp` | MCP tools available (Tauri app running) | Delegate to Tauri-managed terminals |
-| `tmux` | `tmux -L loom has-session` succeeds | Delegate to tmux-backed agent sessions |
-| `direct` | Default fallback | Spawn Task subagents directly |
-
-**Mode selection is automatic** - the daemon detects which backend is available and uses the highest-priority option.
-
-```python
-def detect_execution_mode(debug_mode=False):
-    """Detect available execution backend in priority order: mcp > tmux > direct."""
-
-    def debug(msg):
-        if debug_mode:
-            print(f"[DEBUG] {msg}")
-
-    # Priority 1: Check for MCP (Tauri app running)
-    # MCP mode is detected by checking if mcp__loom_terminals tools are available
-    # For now, we check via the get_ui_state heartbeat approach
-    try:
-        heartbeat = mcp__loom_ui__get_heartbeat()
-        if heartbeat and heartbeat.get("status") in ["healthy", "active", "idle"]:
-            debug("Mode detection: MCP available (Tauri app running)")
-            return "mcp"
-    except Exception:
-        pass  # MCP not available
-
-    # Priority 2: Check for tmux agent pool
-    result = run("tmux -L loom has-session 2>/dev/null && echo 'yes' || echo 'no'")
-    if result.strip() == "yes":
-        # Verify we have shepherd agents available
-        sessions = run("tmux -L loom list-sessions -F '#{session_name}' 2>/dev/null || true")
-        shepherd_sessions = [s for s in sessions.strip().split('\n') if 'shepherd' in s.lower()]
-        if len(shepherd_sessions) > 0:
-            debug(f"Mode detection: tmux pool available ({len(shepherd_sessions)} shepherd sessions)")
-            return "tmux"
-        debug("Mode detection: tmux server running but no shepherd sessions")
-
-    # Priority 3: Fall back to direct mode (Task subagents)
-    debug("Mode detection: using direct mode (Task subagents)")
-    return "direct"
-
-
-def get_tmux_idle_shepherds(debug_mode=False):
-    """Get list of idle shepherd agents in the tmux pool."""
-
-    def debug(msg):
-        if debug_mode:
-            print(f"[DEBUG] {msg}")
-
-    # Get all shepherd sessions
-    sessions = run("tmux -L loom list-sessions -F '#{session_name}' 2>/dev/null || true")
-    shepherd_sessions = [s for s in sessions.strip().split('\n') if s.startswith('loom-shepherd')]
-
-    # For now, assume all shepherd sessions are available
-    # More sophisticated status detection can be added later via progress files
-    debug(f"tmux shepherd sessions: {shepherd_sessions}")
-    return shepherd_sessions
-```
+- **Shepherds**: Spawned as on-demand tmux sessions (e.g., `loom-shepherd-issue-42`)
+- **Support roles**: Spawned as on-demand tmux sessions (e.g., `loom-guide`, `loom-champion`)
+- **Completion detection**: `agent-wait.sh` polls process trees
+- **Cleanup**: `agent-destroy.sh` removes sessions after completion
+- **Observability**: `tmux -L loom attach -t <session-name>`
 
 ## Iteration Execution
 
@@ -119,14 +64,6 @@ def loom_iterate(force_mode=False, debug_mode=False):
         debug("Shutdown signal detected")
         return "SHUTDOWN_SIGNAL"
 
-    # 2b. Detect execution mode (mcp > tmux > direct)
-    execution_mode = state.get("execution_mode")
-    if not execution_mode or iteration == 1:
-        execution_mode = detect_execution_mode(debug_mode)
-        state["execution_mode"] = execution_mode
-        save_daemon_state(state)
-    debug(f"Execution mode: {execution_mode}")
-
     # 3. CRITICAL: Get system state via daemon-snapshot.sh
     # This is the CANONICAL source for all state and recommended actions
     snapshot = run("./.loom/scripts/daemon-snapshot.sh")
@@ -142,13 +79,13 @@ def loom_iterate(force_mode=False, debug_mode=False):
     debug(f"Pipeline state: ready={ready_count} building={snapshot_data['computed']['total_building']}")
     debug(f"Recommended actions: {recommended_actions}")
 
-    # 4. Check subagent completions (non-blocking TaskOutput)
-    completions = check_all_completions(state)
+    # 4. Check tmux worker completions (shepherd and support role sessions)
+    completions = check_all_completions(state, debug_mode)
     if debug_mode and completions:
         for c in completions:
-            debug(f"Completion detected: {c.agent_id} issue=#{c.issue} status={c.status}")
+            debug(f"Completion detected: {c['name']} issue=#{c.get('issue', 'N/A')}")
 
-    # 4b. Check support role completions (all 7 roles: Guide, Champion, Doctor, Auditor, Judge, Architect, Hermit)
+    # 4b. Check support role completions (all 7 roles)
     completed_support_roles = check_support_role_completions(state, debug_mode)
     if completed_support_roles:
         debug(f"Support roles completed: {completed_support_roles}")
@@ -164,7 +101,7 @@ def loom_iterate(force_mode=False, debug_mode=False):
     spawned_shepherds = []
     if "spawn_shepherds" in recommended_actions:
         debug(f"Shepherd pool: {format_shepherd_pool(state)}")
-        spawned_shepherds = auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode)
+        spawned_shepherds = auto_spawn_shepherds(state, snapshot_data, debug_mode)
 
     # 7. Check workflow demand (demand-based spawning for champion/doctor/judge)
     demand_spawned = check_workflow_demand(state, snapshot_data, recommended_actions, debug_mode)
@@ -220,7 +157,6 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 ```
 
 **Summary components:**
-- `mode=X` - Execution mode (mcp/tmux/direct) - only shown on first iteration
 - `ready=N` - Issues with loom:issue label
 - `building=N` - Issues with loom:building label
 - `shepherds=N/M` - Active/max shepherds
@@ -243,13 +179,12 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 
 **Example summaries:**
 ```
-mode=tmux ready=5 building=2 shepherds=2/3
+ready=5 building=2 shepherds=2/3
 ready=3 building=3 shepherds=3/3 +shepherd=#456 completed=#123
 ready=0 building=1 shepherds=1/3 +architect +hermit
 ready=2 building=2 shepherds=2/3 stuck=1
 ready=2 building=2 shepherds=2/3 spawn-fail=1
 ready=3 building=0 shepherds=0/3 promoted=3
-mode=direct ready=5 building=0 shepherds=0/3 (tmux pool not detected)
 SHUTDOWN_SIGNAL
 ```
 
@@ -304,40 +239,14 @@ fi
 
 ## Auto-Spawn Shepherds
 
-> **CRITICAL: Use slash commands directly in Task prompts**
->
-> When spawning roles via Task subagents, use the slash command directly as the prompt.
->
-> **CORRECT** - Slash command is the entire prompt:
-> ```python
-> Task(
->     description="Shepherd issue #123",
->     prompt="/shepherd 123 --force-pr",
->     run_in_background=True
-> )
-> ```
->
-> **WRONG** - Telling subagent to call Skill (expands role into subagent context):
-> ```python
-> Task(
->     prompt="""Skill(skill="shepherd", args="123 --force-pr")"""  # DON'T DO THIS
-> )
-> ```
->
-> **Why**: Claude Code executes slash commands natively. Telling a subagent to "call Skill"
-> causes it to invoke Skill itself, expanding the role prompt into its own context window
-> instead of running the role. This wastes context and causes spawn failures.
->
-> This pattern applies to ALL role spawning: shepherds, architect, hermit, guide, champion,
-> doctor, auditor, and judge. The Skill tool is only for the parent daemon invoking iteration
-> subagents (parent → iteration), not for iteration subagents invoking roles.
+Shepherds are spawned as ephemeral tmux sessions via `agent-spawn.sh`. Each shepherd runs in its own attachable session with fresh context.
 
 ```python
 # Maximum spawn failures before marking an issue as blocked
 MAX_SPAWN_FAILURES = 3
 
-def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False):
-    """Automatically spawn shepherds using the appropriate execution backend.
+def auto_spawn_shepherds(state, snapshot_data, debug_mode=False):
+    """Automatically spawn shepherds as ephemeral tmux workers.
 
     Tracks spawn failures per issue. After MAX_SPAWN_FAILURES consecutive failures,
     the issue is marked as loom:blocked to prevent infinite retry loops.
@@ -364,23 +273,9 @@ def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False)
 
     debug(f"Issue selection: {len(ready_issues)} ready issues, {active_count}/{max_shepherds} shepherds active")
     debug(f"Shepherd mode: {shepherd_flag} (force_mode={force_mode})")
-    debug(f"Execution mode: {execution_mode}")
 
     spawned = []
     spawn_failures = 0
-
-    # For tmux mode, get available idle shepherd sessions
-    tmux_idle_shepherds = []
-    if execution_mode == "tmux":
-        tmux_idle_shepherds = get_tmux_idle_shepherds(debug_mode)
-        # Filter to only idle ones (not currently assigned to issues)
-        assigned_shepherds = set()
-        for shepherd_id, info in state.get("shepherds", {}).items():
-            if info.get("issue") and info.get("tmux_session"):
-                assigned_shepherds.add(info["tmux_session"])
-        tmux_idle_shepherds = [s for s in tmux_idle_shepherds if s not in assigned_shepherds]
-        debug(f"tmux idle shepherds: {tmux_idle_shepherds}")
-        max_shepherds = len(tmux_idle_shepherds) + active_count  # Limit to available tmux sessions
 
     while active_count < max_shepherds and len(ready_issues) > 0:
         issue = ready_issues.pop(0)["number"]
@@ -399,13 +294,9 @@ def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False)
         # Claim immediately (atomic operation)
         run(f"gh issue edit {issue} --remove-label 'loom:issue' --add-label 'loom:building'")
 
-        # Dispatch based on execution mode
-        if execution_mode == "tmux":
-            # tmux mode: Send command to idle shepherd session
-            result = dispatch_shepherd_tmux(issue, shepherd_flag, tmux_idle_shepherds, state, debug_mode)
-        else:
-            # direct mode: Spawn Task subagent
-            result = dispatch_shepherd_direct(issue, shepherd_flag, debug_mode)
+        # Spawn shepherd as ephemeral tmux worker
+        session_name = f"shepherd-issue-{issue}"
+        result = dispatch_shepherd_tmux(issue, shepherd_flag, session_name, debug_mode)
 
         # Verify spawn succeeded
         if not result.get("success"):
@@ -440,192 +331,63 @@ def auto_spawn_shepherds(state, snapshot_data, execution_mode, debug_mode=False)
             save_daemon_state(state)
 
         debug(f"Spawning decision: shepherd assigned to #{issue} (verified)")
+        debug(f"  tmux session: loom-{session_name}")
 
-        # Record assignment based on mode
-        if execution_mode == "tmux":
-            debug(f"  tmux session: {result['tmux_session']}")
-            record_shepherd_assignment_tmux(state, issue, result["tmux_session"])
-            # Remove from idle pool
-            if result["tmux_session"] in tmux_idle_shepherds:
-                tmux_idle_shepherds.remove(result["tmux_session"])
-        else:
-            debug(f"  Task ID: {result['task_id']}")
-            debug(f"  Output file: {result['output_file']}")
-            record_shepherd_assignment(state, issue, result["task_id"], result["output_file"])
+        # Record assignment
+        record_shepherd_assignment(state, issue, session_name)
 
         active_count += 1
         spawned.append(issue)
 
-        mode_suffix = f"tmux:{result.get('tmux_session', '')}" if execution_mode == "tmux" else "direct"
-        print(f"  AUTO-SPAWNED: shepherd for issue #{issue} ({shepherd_flag}, {mode_suffix})")
+        print(f"  AUTO-SPAWNED: shepherd for issue #{issue} ({shepherd_flag}, tmux:loom-{session_name})")
 
     if len(spawned) == 0 and len(ready_issues) == 0:
         debug("No shepherds spawned: no ready issues available")
     elif len(spawned) == 0:
-        if execution_mode == "tmux" and len(tmux_idle_shepherds) == 0:
-            debug("No shepherds spawned: no idle tmux sessions available")
-        else:
-            debug(f"No shepherds spawned: at capacity ({max_shepherds} max)")
+        debug(f"No shepherds spawned: at capacity ({max_shepherds} max)")
 
     return {"spawned": spawned, "failures": spawn_failures}
 
 
-def dispatch_shepherd_tmux(issue, shepherd_flag, idle_shepherds, state, debug_mode=False):
-    """Dispatch shepherd work to an idle tmux session via loom send."""
+def dispatch_shepherd_tmux(issue, shepherd_flag, session_name, debug_mode=False):
+    """Spawn a shepherd as an ephemeral tmux worker via agent-spawn.sh."""
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    if len(idle_shepherds) == 0:
-        return {"success": False, "error": "no_idle_shepherds"}
+    debug(f"Spawning tmux shepherd: {session_name} for issue #{issue}")
 
-    # Pick first idle shepherd
-    tmux_session = idle_shepherds[0]
-    agent_name = tmux_session.replace("loom-", "")  # e.g., "shepherd-1"
-
-    # Send the shepherd command
-    command = f"/shepherd {issue} {shepherd_flag}"
-    debug(f"Sending to {tmux_session}: {command}")
-
-    result = run(f'./.loom/scripts/cli/loom-send.sh "{agent_name}" "{command}" --json')
+    # Spawn ephemeral tmux session with shepherd role
+    result = run(
+        f'./.loom/scripts/agent-spawn.sh --role shepherd --name "{session_name}" '
+        f'--args "{issue} {shepherd_flag}" --on-demand --json'
+    )
 
     try:
-        send_result = json.loads(result)
-        if send_result.get("success"):
+        spawn_result = json.loads(result)
+        if spawn_result.get("status") == "started":
             return {
                 "success": True,
-                "tmux_session": tmux_session,
-                "command": command
+                "session_name": session_name
             }
         else:
-            return {"success": False, "error": send_result.get("error", "send_failed")}
+            return {"success": False, "error": spawn_result.get("error", "spawn_failed")}
     except Exception as e:
-        debug(f"Failed to parse loom send result: {e}")
+        debug(f"Failed to parse agent-spawn.sh result: {e}")
         return {"success": False, "error": str(e)}
 
 
-def dispatch_shepherd_direct(issue, shepherd_flag, debug_mode=False):
-    """Dispatch shepherd as a Task subagent (direct mode).
-
-    Uses slash command directly as prompt - Claude Code executes /shepherd natively.
-    This avoids the Skill-in-Task anti-pattern that expands role prompts into subagent context.
-    """
-
-    def debug(msg):
-        if debug_mode:
-            print(f"[DEBUG] {msg}")
-
-    # Use slash command directly - Claude Code executes this natively
-    # DO NOT use Skill() in the prompt - it expands the role into the subagent's context
-    result = Task(
-        description=f"Shepherd issue #{issue}",
-        prompt=f"/shepherd {issue} {shepherd_flag}",
-        run_in_background=True
-    )
-
-    # Verify the task actually started before recording
-    if not verify_task_spawn(result, f"shepherd for #{issue}"):
-        return {"success": False, "error": "verification_failed"}
-
-    # Double-check task_id format to catch fabricated IDs
-    # Real Task tool IDs are 7-char hex (e.g., 'a7dc1e0'), not 'shepherd-123456'
-    if not validate_task_id(result.task_id):
-        debug(f"Task ID format invalid: '{result.task_id}' - Task tool may not have been invoked")
-        return {"success": False, "error": f"invalid_task_id_format: {result.task_id}"}
-
-    return {
-        "success": True,
-        "task_id": result.task_id,
-        "output_file": result.output_file
-    }
-
-
-def record_shepherd_assignment_tmux(state, issue, tmux_session):
-    """Record shepherd assignment for tmux mode."""
+def record_shepherd_assignment(state, issue, session_name):
+    """Record shepherd assignment in daemon state."""
     if "shepherds" not in state:
         state["shepherds"] = {}
 
-    shepherd_id = tmux_session.replace("loom-", "")  # e.g., "shepherd-1"
-    state["shepherds"][shepherd_id] = {
+    state["shepherds"][session_name] = {
         "status": "working",
         "issue": issue,
-        "tmux_session": tmux_session,
-        "started": now(),
-        "execution_mode": "tmux"
-    }
-    save_daemon_state(state)
-
-
-def validate_task_id(task_id):
-    """Validate that a task_id matches the expected format from the Task tool.
-
-    Real Task tool task IDs are 7-character lowercase hexadecimal strings (e.g., 'a7dc1e0', 'abeb2e8').
-    Fabricated task IDs typically look like 'auditor-1769471216' or 'champion-12345'.
-
-    Returns True if valid, False if fabricated or malformed.
-    """
-    if not task_id or not isinstance(task_id, str):
-        return False
-
-    # Real task IDs are 7-char hex strings
-    import re
-    return bool(re.match(r'^[a-f0-9]{7}$', task_id))
-
-
-def record_support_role(state, role_name, task_id, output_file):
-    """Record support role assignment in daemon state with task_id validation.
-
-    Validates the task_id format before recording to prevent fabricated IDs
-    (e.g., 'auditor-1769471216') from being stored in daemon-state.json.
-    Only real Task tool IDs (7-char hex UUIDs like 'a7dc1e0') are accepted.
-    """
-    # Validate task_id format before recording
-    if not validate_task_id(task_id):
-        raise ValueError(
-            f"Invalid task_id format for {role_name}: '{task_id}' "
-            f"(expected 7-char hex UUID like 'a7dc1e0', got fabricated string). "
-            f"The Task tool was likely not actually invoked."
-        )
-
-    if "support_roles" not in state:
-        state["support_roles"] = {}
-
-    state["support_roles"][role_name] = {
-        "status": "running",
-        "task_id": task_id,
-        "output_file": output_file,
-        "started_at": now()
-    }
-    save_daemon_state(state)
-
-
-def record_shepherd_assignment(state, issue, task_id, output_file):
-    """Record shepherd assignment for direct mode with task_id validation.
-
-    Validates the task_id format before recording to prevent fabricated IDs
-    from being stored in daemon-state.json.
-    """
-    # Validate task_id format before recording
-    if not validate_task_id(task_id):
-        raise ValueError(
-            f"Invalid task_id format for shepherd (issue #{issue}): '{task_id}' "
-            f"(expected 7-char hex UUID like 'a7dc1e0', got fabricated string). "
-            f"The Task tool was likely not actually invoked."
-        )
-
-    if "shepherds" not in state:
-        state["shepherds"] = {}
-
-    # Find next available shepherd slot
-    shepherd_id = find_next_shepherd_id(state)
-    state["shepherds"][shepherd_id] = {
-        "status": "working",
-        "issue": issue,
-        "task_id": task_id,
-        "output_file": output_file,
-        "started": now(),
-        "execution_mode": "direct"
+        "tmux_session": f"loom-{session_name}",
+        "started": now()
     }
     save_daemon_state(state)
 ```
@@ -879,86 +641,58 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
 
 
 def trigger_support_role(state, role_name, description, debug_mode=False):
-    """Spawn a support role using Task tool with direct slash command.
-
-    Uses slash command directly - Claude Code executes /role natively.
-    This avoids the Skill-in-Task anti-pattern that expands role prompts into subagent context.
+    """Spawn a support role as an ephemeral tmux worker via agent-spawn.sh.
 
     After successful spawn, updates in-memory state only. The iteration subagent
     is the sole writer of daemon-state.json - state is saved once at the end of
-    the iteration via save_daemon_state(state). This eliminates race conditions
-    between the iteration subagent and spawn-support-role.sh.
+    the iteration via save_daemon_state(state).
     """
 
     def debug(msg):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    # Use slash commands directly - Claude Code executes these natively
-    # DO NOT use Skill() in prompts - it expands the role into the subagent's context
-    role_prompts = {
-        "guide": "/guide",
-        "champion": "/champion",
-        "doctor": "/doctor",
-        "auditor": "/auditor",
-        "judge": "/judge",
-        "architect": "/architect --autonomous",
-        "hermit": "/hermit"
-    }
-
-    prompt = role_prompts.get(role_name)
-    if not prompt:
-        debug(f"Unknown role: {role_name}")
-        return False
-
-    result = Task(
-        description=description,
-        prompt=prompt,
-        run_in_background=True
+    # Spawn as ephemeral tmux session
+    session_name = role_name  # e.g., "guide", "champion"
+    result = run(
+        f'./.loom/scripts/agent-spawn.sh --role {role_name} --name "{session_name}" --on-demand --json'
     )
 
-    if not verify_task_spawn(result, role_name.capitalize()):
-        print(f"  SPAWN FAILED: {role_name.capitalize()} - verification failed")
-        return False
-
-    # Validate task_id format to catch fabricated IDs (e.g., 'auditor-1769471216')
-    # Real Task tool IDs are 7-char hex strings (e.g., 'a7dc1e0')
-    if not validate_task_id(result.task_id):
-        print(f"  SPAWN FAILED: {role_name.capitalize()} - fabricated task_id: '{result.task_id}'")
-        print(f"    Expected 7-char hex UUID, got non-Task-tool string")
-        print(f"    The Task tool was likely not actually invoked")
+    try:
+        spawn_result = json.loads(result)
+        if spawn_result.get("status") != "started":
+            print(f"  SPAWN FAILED: {role_name.capitalize()} - {spawn_result.get('error', 'unknown')}")
+            return False
+    except Exception as e:
+        print(f"  SPAWN FAILED: {role_name.capitalize()} - parse error: {e}")
         return False
 
     # Update in-memory state only - iteration writes state file once at end
-    # This eliminates the race condition where spawn-support-role.sh --mark-running
-    # would write to daemon-state.json concurrently with the iteration subagent
     if "support_roles" not in state:
         state["support_roles"] = {}
     state["support_roles"][role_name] = {
         "status": "running",
-        "task_id": result.task_id,
-        "output_file": result.output_file,
+        "tmux_session": f"loom-{session_name}",
         "started_at": now()
     }
 
-    debug(f"State update: {role_name} marked running in-memory (task_id={result.task_id})")
-    print(f"  AUTO-SPAWNED: {role_name.capitalize()} (verified, task_id={result.task_id})")
+    debug(f"State update: {role_name} marked running in-memory (tmux session: loom-{session_name})")
+    print(f"  AUTO-SPAWNED: {role_name.capitalize()} (tmux:loom-{session_name})")
     return True
 ```
 
 ## Check Support Role Completions
 
-Updates in-memory state when support roles complete. The iteration subagent is the
-sole writer of daemon-state.json, so all state transitions happen in-memory and
-are persisted in the single `save_daemon_state(state)` call at the end of the iteration.
+Uses `agent-wait.sh` with `--timeout 0` (non-blocking) to check if tmux worker sessions
+have completed. Updates in-memory state when support roles finish.
 
 ```python
 def check_support_role_completions(state, debug_mode=False):
     """Check if any support roles have completed and update their in-memory state.
 
+    Uses agent-wait.sh with --timeout 0 for non-blocking completion checks.
     All state updates happen in-memory only. The iteration subagent writes
-    daemon-state.json once at the end of the iteration, eliminating race
-    conditions between concurrent writers.
+    daemon-state.json once at the end of the iteration.
     """
 
     def debug(msg):
@@ -977,50 +711,42 @@ def check_support_role_completions(state, debug_mode=False):
         if role_info.get("status") != "running":
             continue
 
-        task_id = role_info.get("task_id")
-        if not task_id:
+        tmux_session = role_info.get("tmux_session")
+        if not tmux_session:
             continue
 
-        # Detect fabricated task IDs already in state (from previous buggy iterations)
-        # Real Task tool IDs are 7-char hex (e.g., 'a7dc1e0'), not 'auditor-1769471216'
-        if not validate_task_id(task_id):
-            debug(f"WARNING: {role_name.capitalize()} has fabricated task_id in state: '{task_id}'")
-            debug(f"  Resetting {role_name} to idle (task was never actually spawned)")
-            # Update in-memory state only - written at end of iteration
-            role_info["status"] = "idle"
-            role_info["last_completed"] = now_iso
-            role_info["last_error"] = f"fabricated_task_id: {task_id}"
-            role_info["task_id"] = None
-            role_info["output_file"] = None
-            completed_roles.append(role_name)
-            continue
+        session_name = tmux_session.replace("loom-", "")
+
+        # Non-blocking check: does the tmux session still exist and is claude running?
+        result = run(f'./.loom/scripts/agent-wait.sh "{session_name}" --timeout 0 --json 2>/dev/null || true')
 
         try:
-            # Non-blocking check for completion
-            check = TaskOutput(task_id=task_id, block=False, timeout=1000)
+            wait_result = json.loads(result) if result.strip() else {}
+        except Exception:
+            wait_result = {}
 
-            if check.status == "completed":
-                # Update in-memory state only - written at end of iteration
-                role_info["status"] = "idle"
-                role_info["last_completed"] = now_iso
-                role_info["task_id"] = None
-                role_info["output_file"] = None
+        status = wait_result.get("status")
 
-                completed_roles.append(role_name)
-                debug(f"{role_name.capitalize()} completed (task {task_id})")
+        if status == "completed":
+            # Agent finished - update in-memory state
+            role_info["status"] = "idle"
+            role_info["last_completed"] = now_iso
+            role_info["tmux_session"] = None
 
-            elif check.status == "failed":
-                # Update in-memory state only - written at end of iteration
-                role_info["status"] = "idle"
-                role_info["last_completed"] = now_iso
-                role_info["last_error"] = "task_failed"
-                role_info["task_id"] = None
-                role_info["output_file"] = None
+            completed_roles.append(role_name)
+            debug(f"{role_name.capitalize()} completed (session {tmux_session})")
 
-                debug(f"{role_name.capitalize()} failed (task {task_id})")
+            # Clean up the tmux session
+            run(f'./.loom/scripts/agent-destroy.sh "{session_name}" --force 2>/dev/null || true')
 
-        except Exception as e:
-            debug(f"Error checking {role_name} status: {e}")
+        elif status == "not_found":
+            # Session no longer exists - mark as completed
+            role_info["status"] = "idle"
+            role_info["last_completed"] = now_iso
+            role_info["tmux_session"] = None
+
+            completed_roles.append(role_name)
+            debug(f"{role_name.capitalize()} session not found (already cleaned up)")
 
     return completed_roles
 ```
@@ -1139,7 +865,7 @@ with open(".loom/daemon-state.json.tmp", "w") as f:
 os.rename(".loom/daemon-state.json.tmp", ".loom/daemon-state.json")
 ```
 
-**Important:** All context-heavy operations (gh commands, TaskOutput, spawning) happen ONLY in iteration mode.
+**Important:** All context-heavy operations (gh commands, tmux worker management) happen ONLY in iteration mode.
 
 ## Empty Backlog Handling
 
@@ -1186,34 +912,23 @@ if "iterate" in args:
 
 When running with `--debug`, iteration produces verbose logging:
 
-**Direct Mode (Task subagents):**
 ```
 [DEBUG] Iteration 5 starting at 2026-01-25T10:30:00Z
-[DEBUG] Mode detection: using direct mode (Task subagents)
-[DEBUG] Execution mode: direct
 [DEBUG] Pipeline state: ready=3 building=1 review_requested=2
-[DEBUG] Shepherd pool: shepherd-1=working(#123) shepherd-2=idle shepherd-3=idle
-[DEBUG] Issue selection: Considering #456 (age: 2h, priority: normal)
-[DEBUG] Issue selection: Skipping #457 (blocked by #400)
+[DEBUG] Shepherd pool: shepherd-issue-123=working shepherd-issue-200=working
+[DEBUG] Issue selection: Claiming #456 (prior failures=0)
+[DEBUG] Spawning tmux shepherd: shepherd-issue-456 for issue #456
+[DEBUG] Spawning decision: shepherd assigned to #456 (verified)
+[DEBUG]   tmux session: loom-shepherd-issue-456
 [DEBUG] Shepherd mode: --force-merge (force_mode=true)
-[DEBUG] Spawning decision: shepherd-2 assigned to #456
-[DEBUG]   Task ID: abc123
-[DEBUG]   Output file: /tmp/claude/.../abc123.output
-[DEBUG]   Command: /shepherd 456 --force-merge
-[DEBUG] Iteration 5 completed in 1.2s
+[DEBUG] Checking support roles via spawn-support-role.sh (interval-based)
+[DEBUG] guide: spawn needed (interval_elapsed)
+[DEBUG] State update: guide marked running in-memory (tmux session: loom-guide)
+[DEBUG] Iteration 5 completed
 ```
 
-**tmux Mode (tmux agent pool):**
-```
-[DEBUG] Iteration 5 starting at 2026-01-25T10:30:00Z
-[DEBUG] Mode detection: tmux pool available (3 shepherd sessions)
-[DEBUG] Execution mode: tmux
-[DEBUG] Pipeline state: ready=3 building=1 review_requested=2
-[DEBUG] tmux shepherd sessions: ['loom-shepherd-1', 'loom-shepherd-2', 'loom-shepherd-3']
-[DEBUG] tmux idle shepherds: ['loom-shepherd-2', 'loom-shepherd-3']
-[DEBUG] Issue selection: Claiming #456
-[DEBUG] Sending to loom-shepherd-2: /shepherd 456 --force-merge
-[DEBUG] Spawning decision: shepherd assigned to #456 (verified)
-[DEBUG]   tmux session: loom-shepherd-2
-[DEBUG] Iteration 5 completed in 0.8s
+**Observability**: Attach to any worker while running:
+```bash
+tmux -L loom attach -t loom-shepherd-issue-456
+tmux -L loom attach -t loom-guide
 ```
