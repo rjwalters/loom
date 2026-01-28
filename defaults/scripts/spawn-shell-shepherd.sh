@@ -231,8 +231,8 @@ if [[ -n "$MODE" ]]; then
     SHEPHERD_CMD="$SHEPHERD_CMD $MODE"
 fi
 
-# Append to log file and output to tmux
-SHEPHERD_CMD="$SHEPHERD_CMD 2>&1 | tee -a '$LOG_FILE'"
+# Redirect stderr to stdout (logging handled by pipe-pane below)
+SHEPHERD_CMD="$SHEPHERD_CMD 2>&1"
 
 # Create new detached session with working directory
 if ! tmux -L "$TMUX_SOCKET" new-session -d -s "$FULL_SESSION_NAME" -c "$REPO_ROOT"; then
