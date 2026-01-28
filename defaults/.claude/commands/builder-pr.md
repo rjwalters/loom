@@ -299,6 +299,13 @@ Closes #123
 
 ## Creating Pull Requests: Label and Auto-Close Requirements
 
+> **CRITICAL**: PRs MUST include `Closes #N` (or `Fixes #N` / `Resolves #N`) in the body.
+> This is required for:
+> 1. GitHub to auto-close the issue when the PR merges
+> 2. **Shepherd orchestration to detect your PR during phase validation**
+>
+> Without this keyword, shepherd phase validation cannot find your PR and will report false failures.
+
 ### PR Label Rules
 
 **When creating a NEW PR:**
