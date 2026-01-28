@@ -134,6 +134,23 @@ fi
 
 success "PR #$PR_NUMBER merged successfully"
 
+# Clean up workflow labels on linked issue
+info "Cleaning up workflow labels on linked issue..."
+PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
+LINKED_ISSUE=$(echo "$PR_BODY" | grep -oE '(Closes|closes|Fixes|fixes|Resolves|resolves) #[0-9]+' | grep -oE '[0-9]+' | head -1)
+
+if [[ -n "$LINKED_ISSUE" ]]; then
+  info "Found linked issue: #$LINKED_ISSUE"
+  # Remove workflow labels that shouldn't persist on closed issues
+  for label in loom:building loom:issue loom:curated loom:curating loom:treating loom:blocked; do
+    gh issue edit "$LINKED_ISSUE" --remove-label "$label" 2>/dev/null && \
+      info "  Removed label: $label" || true
+  done
+  success "Workflow labels cleaned up for issue #$LINKED_ISSUE"
+else
+  info "No linked issue found in PR body (no 'Closes #N' pattern)"
+fi
+
 # Delete remote branch
 info "Deleting remote branch: $PR_BRANCH"
 gh api "repos/$REPO_NWO/git/refs/heads/$PR_BRANCH" -X DELETE 2>/dev/null && \
