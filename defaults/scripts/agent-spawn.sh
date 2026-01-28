@@ -405,7 +405,7 @@ EOF
     while [[ $elapsed -lt $max_wait ]]; do
         # Look for the ❯ prompt character that indicates Claude Code is ready for input
         if tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null | grep -q '❯'; then
-            log_info "Claude CLI ready after ${elapsed}s"
+            log_info "Claude CLI prompt detected after ${elapsed}s"
             break
         fi
         sleep 1
@@ -424,6 +424,45 @@ EOF
 
     log_info "Sending role command: $role_cmd"
     tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
+
+    # Verify the command was actually processed.
+    # Claude Code renders the ❯ prompt character as part of its TUI layout BEFORE
+    # the input handler is ready, so we may have sent the command too early.
+    # Poll for processing indicators and re-send Enter if the command appears stuck.
+    local verify_elapsed=0
+    local verify_max=8
+    local command_processed=false
+    log_info "Verifying command was processed..."
+
+    sleep 2  # Initial wait for processing to begin
+
+    while [[ $verify_elapsed -lt $verify_max ]]; do
+        local pane_content
+        pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
+        # Check for indicators that the command is being processed:
+        # - Spinner characters (Claude thinking)
+        # - Progress/status text
+        # - Tool use indicators
+        if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
+            command_processed=true
+            log_info "Command processing confirmed after $((verify_elapsed + 2))s"
+            break
+        fi
+
+        # If the slash command text is still visible at the prompt, it wasn't consumed
+        if echo "$pane_content" | grep -qF "$role_cmd"; then
+            log_warn "Command still at prompt (attempt $((verify_elapsed + 1))), re-sending Enter..."
+            tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-m
+        fi
+
+        sleep 1
+        verify_elapsed=$((verify_elapsed + 1))
+    done
+
+    if [[ "$command_processed" != "true" ]]; then
+        log_warn "Could not confirm command processing within $((verify_max + 2))s (agent may still be starting)"
+    fi
 
     log_success "Agent spawned successfully"
     log_info ""
