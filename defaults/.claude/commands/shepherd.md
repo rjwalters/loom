@@ -38,7 +38,7 @@ The shepherd spawns each role phase as an ephemeral tmux session using `agent-sp
 - Each phase runs in its own tmux session with fresh context
 - Sessions are attachable for live observation (`tmux -L loom attach -t loom-builder-issue-42`)
 - Sequential execution through orchestration phases
-- Completion detection via `agent-wait.sh` (process tree inspection)
+- Completion detection via `agent-wait-bg.sh` (process tree inspection with signal checking)
 - Cleanup via `agent-destroy.sh` after each phase
 
 ### Fresh Context Per Phase
@@ -146,11 +146,11 @@ When orchestrating issue #N, follow this progression:
 
 0. [Announce]     -> Print orchestration mode and issue info
 1. [Check State]  -> Read issue labels, determine current phase
-2. [Curator]      -> agent-spawn.sh curator -> agent-wait.sh -> verify loom:curated -> agent-destroy.sh
+2. [Curator]      -> agent-spawn.sh curator -> agent-wait-bg.sh -> verify loom:curated -> agent-destroy.sh
 3. [Gate 1]       -> Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
-4. [Builder]      -> agent-spawn.sh builder -> agent-wait.sh -> verify loom:review-requested -> agent-destroy.sh
-5. [Judge]        -> agent-spawn.sh judge -> agent-wait.sh -> verify loom:pr or loom:changes-requested -> agent-destroy.sh
-6. [Doctor loop]  -> If changes requested: agent-spawn.sh doctor -> agent-wait.sh -> goto 5 (max 3x)
+4. [Builder]      -> agent-spawn.sh builder -> agent-wait-bg.sh -> verify loom:review-requested -> agent-destroy.sh
+5. [Judge]        -> agent-spawn.sh judge -> agent-wait-bg.sh -> verify loom:pr or loom:changes-requested -> agent-destroy.sh
+6. [Doctor loop]  -> If changes requested: agent-spawn.sh doctor -> agent-wait-bg.sh -> goto 5 (max 3x)
 7. [Gate 2]       -> Wait for merge (--force-pr stops here, --force-merge auto-merges)
 8. [Complete]     -> Report success
 ```
@@ -163,36 +163,41 @@ For each phase, the shepherd spawns an ephemeral tmux worker:
 
 1. **Announce the phase**: `"Starting [Role] phase..."`
 2. **Spawn worker**: `agent-spawn.sh --role <role> --name <role>-issue-<N> --args "<N>" --on-demand`
-3. **Wait for completion**: `agent-wait.sh <role>-issue-<N> --timeout 1800`
-4. **Verify completion**: Poll labels to confirm the role completed successfully
-5. **Clean up**: `agent-destroy.sh <role>-issue-<N>`
-6. **Announce completion**: `"[Role] phase complete"`
+3. **Wait for completion**: `agent-wait-bg.sh <role>-issue-<N> --timeout 1800 --issue <N>`
+4. **Check exit code**: Exit code 3 means shutdown signal detected - clean up and exit gracefully
+5. **Verify completion**: Poll labels to confirm the role completed successfully
+6. **Clean up**: `agent-destroy.sh <role>-issue-<N>`
+7. **Announce completion**: `"[Role] phase complete"`
 
 Example for each phase:
 
 ```bash
 # Curator Phase
 ./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
-./.loom/scripts/agent-wait.sh "curator-issue-${ISSUE}" --timeout 600
+./.loom/scripts/agent-wait-bg.sh "curator-issue-${ISSUE}" --timeout 600 --issue "$ISSUE"
+# Exit code 3 = shutdown signal, clean up and exit
 # Verify: gh issue view $ISSUE --json labels --jq '.labels[].name' | grep loom:curated
 ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
 
 # Builder Phase (with worktree)
 ./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" \
     --worktree ".loom/worktrees/issue-${ISSUE}" --on-demand
-./.loom/scripts/agent-wait.sh "builder-issue-${ISSUE}" --timeout 1800
+./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE}" --timeout 1800 --issue "$ISSUE"
+# Exit code 3 = shutdown signal, clean up and exit
 # Verify: gh pr list --search "Closes #$ISSUE" to find PR
 ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
 
 # Judge Phase
 ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
-./.loom/scripts/agent-wait.sh "judge-issue-${ISSUE}" --timeout 900
+./.loom/scripts/agent-wait-bg.sh "judge-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
+# Exit code 3 = shutdown signal, clean up and exit
 # Verify: check PR labels for loom:pr or loom:changes-requested
 ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
 
 # Doctor Phase
 ./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
-./.loom/scripts/agent-wait.sh "doctor-issue-${ISSUE}" --timeout 900
+./.loom/scripts/agent-wait-bg.sh "doctor-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
+# Exit code 3 = shutdown signal, clean up and exit
 # Verify: check PR labels for loom:review-requested
 ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"
 ```
@@ -206,41 +211,38 @@ For detailed step-by-step workflow examples, see `shepherd-lifecycle.md`.
 
 ## Graceful Shutdown Handling
 
-Shepherds support graceful shutdown by checking for a shutdown signal at phase boundaries.
+Shepherds support graceful shutdown via `agent-wait-bg.sh`, which checks for shutdown signals during phase waits rather than only at phase boundaries.
 
 ### Shutdown Signal
 
-The daemon creates `.loom/stop-shepherds` when initiating graceful shutdown. Shepherds check for this signal between phases.
-
-### Phase Boundary Checks
-
-Insert shutdown checks at these points in the orchestration flow:
-
-1. **After Curator phase** (before Gate 1)
-2. **After Builder phase** (before Judge)
-3. **After Judge phase** (before Merge)
-
-```bash
-# Check for graceful shutdown signal
-if [ -f .loom/stop-shepherds ]; then
-    echo "Shutdown signal detected - exiting gracefully at phase boundary"
-    # Revert issue label so it can be picked up again
-    gh issue edit $ISSUE_NUMBER --remove-label "loom:building" --add-label "loom:issue"
-    exit 0
-fi
-```
+The daemon creates `.loom/stop-shepherds` when initiating graceful shutdown. The `agent-wait-bg.sh` script polls for this file every poll interval during waits.
 
 ### Per-Issue Abort
 
-For aborting a specific shepherd without stopping all shepherds, add `loom:abort` label to the issue:
+For aborting a specific shepherd without stopping all shepherds, add `loom:abort` label to the issue. The `agent-wait-bg.sh` script checks for this label when `--issue <N>` is provided.
+
+### Signal-Responsive Waits
+
+When `agent-wait-bg.sh` detects a shutdown signal (exit code 3), the shepherd should:
+
+1. Clean up the current worker session (`agent-destroy.sh`)
+2. Revert the issue label so it can be picked up again
+3. Exit gracefully
 
 ```bash
-if echo "$LABELS" | grep -q "loom:abort"; then
-    echo "Abort signal detected for issue #$ISSUE_NUMBER"
-    gh issue edit $ISSUE_NUMBER --remove-label "loom:abort" --remove-label "loom:building" --add-label "loom:issue"
+# Wait with signal checking
+./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE}" --timeout 1800 --issue "$ISSUE"
+WAIT_EXIT=$?
+
+if [ "$WAIT_EXIT" -eq 3 ]; then
+    echo "Shutdown signal detected during wait"
+    ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
+    gh issue edit $ISSUE --remove-label "loom:building" --add-label "loom:issue"
     exit 0
 fi
 ```
+
+**Note**: `agent-wait.sh` still exists for non-shepherd use cases that don't need signal checking.
 
 For detailed checkpoint logic and implementation, see `shepherd-lifecycle.md`.
 
