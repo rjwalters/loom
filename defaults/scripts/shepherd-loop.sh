@@ -64,9 +64,7 @@ else
     NC=''
 fi
 
-# ─── Script directory and repository root ─────────────────────────────────────
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ─── Repository root detection ────────────────────────────────────────────────
 
 # Find the repository root (works from any subdirectory including worktrees)
 find_repo_root() {
