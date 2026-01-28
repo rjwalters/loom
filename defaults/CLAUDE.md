@@ -199,6 +199,8 @@ LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
 
 **Note**: The `/loom` command relies on the LLM correctly implementing the two-tier architecture (parent loop spawning iteration subagents). While this generally works, the shell wrapper provides more deterministic behavior for production use.
 
+**Dual Daemon Prevention**: Both `daemon-loop.sh` and `/loom` use PID-based locking and session ID tracking to prevent multiple daemon instances from running simultaneously. If a second daemon is started, it will detect the conflict and refuse to start. The `daemon_session_id` field in `daemon-state.json` (format: `timestamp-PID`) enables each daemon to verify it still owns the state file before writing updates. This prevents state corruption when Claude Code sessions are auto-continued.
+
 **Force Mode** (`--force`):
 
 When running with `--force`, the daemon enables aggressive autonomous development:
@@ -654,6 +656,7 @@ The daemon state file provides comprehensive information for debugging, crash re
   "last_poll": "2026-01-23T11:30:00Z",
   "running": true,
   "iteration": 42,
+  "daemon_session_id": "1706400000-12345",
 
   "shepherds": {
     "shepherd-1": {

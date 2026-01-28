@@ -21,6 +21,7 @@ The daemon maintains state in `.loom/daemon-state.json`. This file provides comp
   "iteration": 42,
   "force_mode": false,
   "debug_mode": false,
+  "daemon_session_id": "1706400000-12345",
 
   "shepherds": {
     "shepherd-1": {
