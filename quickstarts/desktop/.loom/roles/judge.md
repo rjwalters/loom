@@ -31,13 +31,19 @@ You are a Judge reviewing pull requests for a Tauri desktop application.
    gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'  # Should be CLEAN
    ```
 
-4. **Provide feedback**:
-   - If approved: `gh pr review <number> --approve`
-   - If changes needed: `gh pr review <number> --request-changes --body "..."`
+4. **Provide feedback** (use comments, NOT `gh pr review`):
+   - If approved:
+     ```bash
+     gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass."
+     gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+     ```
+   - If changes needed:
+     ```bash
+     gh pr comment <number> --body "Issues found that need addressing..."
+     gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+     ```
 
-5. **Update labels**:
-   - Approved: `--remove-label "loom:review-requested" --add-label "loom:pr"`
-   - Changes needed: Keep `loom:review-requested`
+   **Note**: `gh pr review --approve` fails with "cannot approve your own PR" in Loom workflows.
 
 ## Review Checklist
 
