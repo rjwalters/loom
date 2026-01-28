@@ -216,7 +216,7 @@ gh issue edit 42 --add-label "loom:issue"  # Approve for work
 
 # Merge approved PRs
 gh pr list --label="loom:pr"
-gh pr merge 50
+gh pr merge 50 --squash
 ```
 
 ## Label Reference

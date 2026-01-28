@@ -505,7 +505,7 @@ Configure merge settings during installation or manually:
 ./scripts/install/setup-repository-settings.sh /path/to/repo --dry-run  # Preview
 ```
 
-Settings applied: merge commits only (no squash/rebase), delete branches on merge, auto-merge enabled.
+Settings applied: squash merge only (no merge commits/rebase), delete branches on merge, auto-merge enabled.
 
 ## Troubleshooting
 
