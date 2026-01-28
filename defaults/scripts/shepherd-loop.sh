@@ -327,7 +327,7 @@ handle_shutdown() {
 # ─── Phase execution ──────────────────────────────────────────────────────────
 
 # Run a phase worker and wait for completion
-# Usage: run_phase <role> <name> <timeout> [--worktree <path>] [--args <args>]
+# Usage: run_phase <role> <name> <timeout> [--worktree <path>] [--args <args>] [--phase <phase>] [--pr <N>]
 run_phase() {
     local role="$1"
     local name="$2"
@@ -336,6 +336,8 @@ run_phase() {
 
     local worktree=""
     local args=""
+    local phase=""
+    local pr_number=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -345,6 +347,14 @@ run_phase() {
                 ;;
             --args)
                 args="$2"
+                shift 2
+                ;;
+            --phase)
+                phase="$2"
+                shift 2
+                ;;
+            --pr)
+                pr_number="$2"
                 shift 2
                 ;;
             *)
@@ -378,11 +388,26 @@ run_phase() {
     fi
 
     # Wait for completion with signal checking
+    # Pass phase info for activity-based completion detection (see issue #1461)
     local wait_exit=0
-    "$REPO_ROOT/.loom/scripts/agent-wait-bg.sh" "$name" \
-        --timeout "$timeout" \
-        --poll-interval "$POLL_INTERVAL" \
-        --issue "$ISSUE" || wait_exit=$?
+    local wait_args=(
+        "$name"
+        --timeout "$timeout"
+        --poll-interval "$POLL_INTERVAL"
+        --issue "$ISSUE"
+    )
+
+    if [[ -n "$phase" ]]; then
+        wait_args+=(--phase "$phase")
+    fi
+    if [[ -n "$worktree" ]]; then
+        wait_args+=(--worktree "$worktree")
+    fi
+    if [[ -n "$pr_number" ]]; then
+        wait_args+=(--pr "$pr_number")
+    fi
+
+    "$REPO_ROOT/.loom/scripts/agent-wait-bg.sh" "${wait_args[@]}" || wait_exit=$?
 
     # Clean up the worker session
     "$REPO_ROOT/.loom/scripts/agent-destroy.sh" "$name" --force >/dev/null 2>&1 || true
@@ -471,7 +496,9 @@ main() {
         fi
 
         local curator_exit=0
-        run_phase "curator" "curator-issue-${ISSUE}" "$CURATOR_TIMEOUT" --args "$ISSUE" || curator_exit=$?
+        run_phase "curator" "curator-issue-${ISSUE}" "$CURATOR_TIMEOUT" \
+            --phase "curator" \
+            --args "$ISSUE" || curator_exit=$?
 
         if [[ $curator_exit -eq 3 ]]; then
             handle_shutdown "curator"
@@ -572,6 +599,7 @@ main() {
 
     local builder_exit=0
     run_phase "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
+        --phase "builder" \
         --worktree "$worktree_path" \
         --args "$ISSUE" || builder_exit=$?
 
@@ -629,7 +657,10 @@ main() {
         fi
 
         local judge_exit=0
-        run_phase "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" --args "$pr_number" || judge_exit=$?
+        run_phase "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" \
+            --phase "judge" \
+            --pr "$pr_number" \
+            --args "$pr_number" || judge_exit=$?
 
         if [[ $judge_exit -eq 3 ]]; then
             handle_shutdown "judge"
@@ -679,6 +710,8 @@ main() {
 
             local doctor_exit=0
             run_phase "doctor" "doctor-issue-${ISSUE}" "$DOCTOR_TIMEOUT" \
+                --phase "doctor" \
+                --pr "$pr_number" \
                 --worktree "$worktree_path" \
                 --args "$pr_number" || doctor_exit=$?
 
