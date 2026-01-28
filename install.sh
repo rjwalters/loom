@@ -48,6 +48,20 @@ header "║        AI-Powered Development Orchestration               ║"
 header "╚═══════════════════════════════════════════════════════════╝"
 echo ""
 
+# Parse flags
+NON_INTERACTIVE=false
+while [[ "${1:-}" == -* ]]; do
+  case "$1" in
+    -y|--yes)
+      NON_INTERACTIVE=true
+      shift
+      ;;
+    *)
+      error "Unknown flag: $1"
+      ;;
+  esac
+done
+
 # Get target path from argument or prompt
 TARGET_PATH="${1:-}"
 
@@ -312,25 +326,37 @@ if is_loom_source_repo "$TARGET_PATH"; then
 elif [[ -d "$TARGET_PATH/.loom" ]]; then
   warning "Loom appears to be already installed in this repository"
   echo ""
-  echo "1. Clean install (uninstall first, then fresh install)"
-  echo "2. Overwrite existing configuration"
-  echo "3. Cancel"
+  info "Reinstall will uninstall the existing installation first, then perform"
+  info "a fresh install and create a PR with the changes."
   echo ""
-  read -r -p "Choose option [1/2/3]: " -n 1 REINSTALL_CHOICE
-  echo ""
-  case "$REINSTALL_CHOICE" in
-    1)
-      FORCE_FLAG="--clean"
-      ;;
-    2)
-      FORCE_FLAG="--force"
-      ;;
-    *)
+
+  if [[ "$NON_INTERACTIVE" != true ]]; then
+    read -r -p "Proceed with reinstall? [y/N] " -n 1 REINSTALL_CONFIRM
+    echo ""
+    if [[ ! $REINSTALL_CONFIRM =~ ^[Yy]$ ]]; then
       info "Installation cancelled"
       exit 0
-      ;;
-  esac
-  SELF_INSTALL=false
+    fi
+  else
+    info "Non-interactive mode: proceeding with reinstall"
+  fi
+
+  # Uninstall existing installation (local mode, no separate PR)
+  info "Uninstalling existing Loom installation..."
+  "$LOOM_ROOT/scripts/uninstall-loom.sh" --yes --local "$TARGET_PATH" || \
+    error "Uninstall failed - aborting reinstall"
+  echo ""
+  success "Existing installation removed"
+  echo ""
+
+  # Delegate to Full Install (creates worktree + PR)
+  info "Running fresh install via Full Install workflow..."
+  echo ""
+  INSTALL_FLAGS=()
+  if [[ "$NON_INTERACTIVE" == true ]]; then
+    INSTALL_FLAGS+=(--yes)
+  fi
+  exec "$LOOM_ROOT/scripts/install-loom.sh" "${INSTALL_FLAGS[@]}" "$TARGET_PATH"
 else
   FORCE_FLAG=""
   SELF_INSTALL=false
@@ -366,11 +392,15 @@ echo "  • Creates GitHub labels for workflow coordination"
 echo "  • Creates tracking issue with 'loom:building' label"
 echo "  • Creates pull request with 'loom:review-requested' label"
 echo ""
-read -r -p "Proceed with installation? [y/N] " -n 1 PROCEED
-echo ""
-if [[ ! $PROCEED =~ ^[Yy]$ ]]; then
-  info "Installation cancelled"
-  exit 0
+if [[ "$NON_INTERACTIVE" != true ]]; then
+  read -r -p "Proceed with installation? [y/N] " -n 1 PROCEED
+  echo ""
+  if [[ ! $PROCEED =~ ^[Yy]$ ]]; then
+    info "Installation cancelled"
+    exit 0
+  fi
+else
+  info "Non-interactive mode: proceeding with installation"
 fi
 
 echo ""
