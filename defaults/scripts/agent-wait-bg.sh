@@ -35,6 +35,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*" >&2; }
+log_success() { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*" >&2; }
 
 # Default poll interval for signal checking
