@@ -40,7 +40,7 @@ set -euo pipefail
 # Configuration
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
-STARTUP_WAIT_SECONDS=3
+READINESS_TIMEOUT_SECONDS=30
 
 # Colors for output
 RED='\033[0;31m'
@@ -398,9 +398,23 @@ EOF
     log_info "Starting Claude CLI..."
     tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$claude_cmd" C-m
 
-    # Wait for Claude to initialize
-    log_info "Waiting ${STARTUP_WAIT_SECONDS}s for Claude to initialize..."
-    sleep "$STARTUP_WAIT_SECONDS"
+    # Wait for Claude to be ready by polling for the input prompt indicator
+    local max_wait=$READINESS_TIMEOUT_SECONDS
+    local elapsed=0
+    log_info "Waiting for Claude CLI to become ready (up to ${max_wait}s)..."
+    while [[ $elapsed -lt $max_wait ]]; do
+        # Look for the ❯ prompt character that indicates Claude Code is ready for input
+        if tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null | grep -q '❯'; then
+            log_info "Claude CLI ready after ${elapsed}s"
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [[ $elapsed -ge $max_wait ]]; then
+        log_warn "Claude CLI did not show ready prompt within ${max_wait}s, sending command anyway"
+    fi
 
     # Send the role slash command
     local role_cmd="/${role}"
