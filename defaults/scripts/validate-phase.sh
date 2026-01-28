@@ -352,12 +352,69 @@ validate_builder() {
     fi
 
     # Check if a PR already exists for this issue
-    # Use branch-based lookup (deterministic) instead of search API (has indexing lag)
+    # Strategy: Try multiple search methods to find the PR
+    # Method 1 (branch-based) is deterministic and preferred over search API (has indexing lag)
+    local pr=""
+    local pr_found_by=""
+
+    # Method 1: Branch-based lookup (deterministic, no indexing lag)
     # Branch name follows convention from worktree.sh: feature/issue-<number>
-    local pr
     pr=$(gh pr list --head "feature/issue-${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+    if [[ -n "$pr" && "$pr" != "null" ]]; then
+        pr_found_by="branch_name"
+    fi
+
+    # Method 2: Search by "Closes #N" in PR body (fallback if branch name differs)
+    if [[ -z "$pr" || "$pr" == "null" ]]; then
+        pr=$(gh pr list --search "Closes #${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+        if [[ -n "$pr" && "$pr" != "null" ]]; then
+            pr_found_by="closes_keyword"
+        fi
+    fi
+
+    # Method 3: Search by "Fixes #N" in PR body
+    if [[ -z "$pr" || "$pr" == "null" ]]; then
+        pr=$(gh pr list --search "Fixes #${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+        if [[ -n "$pr" && "$pr" != "null" ]]; then
+            pr_found_by="fixes_keyword"
+        fi
+    fi
+
+    # Method 4: Search by "Resolves #N" in PR body
+    if [[ -z "$pr" || "$pr" == "null" ]]; then
+        pr=$(gh pr list --search "Resolves #${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+        if [[ -n "$pr" && "$pr" != "null" ]]; then
+            pr_found_by="resolves_keyword"
+        fi
+    fi
 
     if [[ -n "$pr" && "$pr" != "null" ]]; then
+        # PR found - check if it has proper issue reference (needed for auto-close)
+        if [[ "$pr_found_by" == "branch_name" ]]; then
+            # PR found by branch name - check if it needs "Closes #N" added
+            local pr_body
+            pr_body=$(gh pr view "$pr" --json body --jq '.body' 2>/dev/null) || pr_body=""
+
+            if ! echo "$pr_body" | grep -qE "(Closes|Fixes|Resolves)[[:space:]]+#${ISSUE}"; then
+                echo -e "${YELLOW}PR #$pr found but missing issue reference - adding 'Closes #${ISSUE}'${NC}"
+                # Append "Closes #N" to existing body
+                local new_body
+                if [[ -z "$pr_body" || "$pr_body" == "null" ]]; then
+                    new_body="Closes #${ISSUE}"
+                else
+                    new_body="${pr_body}
+
+Closes #${ISSUE}"
+                fi
+                if gh pr edit "$pr" --body "$new_body" 2>/dev/null; then
+                    report_milestone "heartbeat" --action "recovery: added 'Closes #${ISSUE}' to PR #$pr body"
+                    echo -e "${GREEN}Added 'Closes #${ISSUE}' to PR #$pr body${NC}"
+                else
+                    echo -e "${YELLOW}Warning: Could not add issue reference to PR body${NC}"
+                fi
+            fi
+        fi
+
         # Check for loom:review-requested label
         local pr_labels
         pr_labels=$(gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null) || true
@@ -374,10 +431,11 @@ validate_builder() {
         fi
     fi
 
-    # No PR found - attempt recovery from worktree
+    # No PR found (searched by branch name and Closes/Fixes/Resolves keywords)
+    # Attempt recovery from worktree
     if [[ -z "$WORKTREE" ]]; then
-        output_result "failed" "No PR found and no worktree path provided for recovery"
-        mark_blocked "Builder did not create a PR and no worktree available for recovery."
+        output_result "failed" "No PR found (searched by branch 'feature/issue-${ISSUE}' and keywords) and no worktree path provided"
+        mark_blocked "Builder did not create a PR. Searched for: branch 'feature/issue-${ISSUE}' and 'Closes/Fixes/Resolves #${ISSUE}' in PR body. No worktree available for recovery."
         return 1
     fi
 
@@ -402,10 +460,10 @@ validate_builder() {
         local unpushed
         unpushed=$(git -C "$WORKTREE" log --oneline '@{upstream}..HEAD' 2>/dev/null) || unpushed=""
         if [[ -z "$unpushed" ]]; then
-            output_result "failed" "No changes in worktree to recover"
+            output_result "failed" "No PR found and no changes in worktree to recover (all changes already pushed?)"
             local diagnostics
             diagnostics=$(gather_builder_diagnostics)
-            mark_blocked "Builder did not create a PR and worktree has no uncommitted or unpushed changes." "$diagnostics"
+            mark_blocked "Builder did not create a PR. Worktree has no uncommitted or unpushed changes. If a PR was pushed but not created, check branch 'feature/issue-${ISSUE}' manually." "$diagnostics"
             return 1
         fi
     fi
