@@ -1,0 +1,368 @@
+#!/bin/bash
+
+# validate-phase.sh - Validate shepherd phase contracts and attempt recovery
+#
+# Usage:
+#   validate-phase.sh <phase> <issue-number> [options]
+#
+# Phases:
+#   curator     Check for loom:curated label
+#   builder     Check for PR with loom:review-requested
+#   judge       Check for loom:pr or loom:changes-requested on PR
+#   doctor      Check for loom:review-requested on PR
+#
+# Options:
+#   --worktree <path>   Worktree path (required for builder recovery)
+#   --pr <number>       PR number (required for judge/doctor)
+#   --task-id <id>      Shepherd task ID for milestone reporting
+#   --json              Output results as JSON
+#
+# Exit codes:
+#   0 - Contract satisfied (initially or after recovery)
+#   1 - Contract failed, recovery failed or not possible
+#   2 - Invalid arguments
+#
+# Part of the Loom orchestration system for shepherd phase contract validation.
+
+set -euo pipefail
+
+# Colors for output (disabled if stdout is not a terminal)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m'
+else
+    RED=''
+    GREEN=''
+    YELLOW=''
+    BLUE=''
+    NC=''
+fi
+
+# Find the repository root (works from any subdirectory including worktrees)
+find_repo_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
+            if [[ -f "$dir/.git" ]]; then
+                local gitdir
+                gitdir=$(cat "$dir/.git" | sed 's/^gitdir: //')
+                if [[ "$gitdir" == /* ]]; then
+                    echo "$(dirname "$(dirname "$(dirname "$gitdir")")")"
+                else
+                    echo "$(dirname "$(dirname "$(dirname "$dir/$gitdir")")")"
+                fi
+            else
+                echo "$dir"
+            fi
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "$PWD"
+}
+
+REPO_ROOT="$(find_repo_root)"
+
+# Parse arguments
+PHASE=""
+ISSUE=""
+WORKTREE=""
+PR_NUMBER=""
+TASK_ID=""
+JSON_OUTPUT=false
+
+if [[ $# -lt 2 ]]; then
+    echo -e "${RED}Error: Missing required arguments${NC}"
+    echo "Usage: validate-phase.sh <phase> <issue-number> [--worktree <path>] [--pr <number>] [--task-id <id>] [--json]"
+    exit 2
+fi
+
+PHASE="$1"
+ISSUE="$2"
+shift 2
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --worktree)
+            WORKTREE="$2"
+            shift 2
+            ;;
+        --pr)
+            PR_NUMBER="$2"
+            shift 2
+            ;;
+        --task-id)
+            TASK_ID="$2"
+            shift 2
+            ;;
+        --json)
+            JSON_OUTPUT=true
+            shift
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown argument: $1${NC}"
+            exit 2
+            ;;
+    esac
+done
+
+# Validate phase name
+case "$PHASE" in
+    curator|builder|judge|doctor) ;;
+    *)
+        echo -e "${RED}Error: Invalid phase '$PHASE'. Must be one of: curator, builder, judge, doctor${NC}"
+        exit 2
+        ;;
+esac
+
+# Validate issue number is numeric
+if ! [[ "$ISSUE" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}Error: Issue number must be numeric, got '$ISSUE'${NC}"
+    exit 2
+fi
+
+# Helper: report milestone if task-id provided
+report_milestone() {
+    local event="$1"
+    shift
+    if [[ -n "$TASK_ID" ]] && [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
+        "$REPO_ROOT/.loom/scripts/report-milestone.sh" "$event" --task-id "$TASK_ID" "$@" 2>/dev/null || true
+    fi
+}
+
+# Helper: output result
+output_result() {
+    local status="$1"  # satisfied, recovered, failed
+    local message="$2"
+    local recovery_action="${3:-none}"
+
+    if $JSON_OUTPUT; then
+        cat <<EOF
+{"phase":"$PHASE","issue":$ISSUE,"status":"$status","message":"$message","recovery_action":"$recovery_action"}
+EOF
+    else
+        case "$status" in
+            satisfied)
+                echo -e "${GREEN}✓ $PHASE phase contract satisfied: $message${NC}"
+                ;;
+            recovered)
+                echo -e "${YELLOW}⟳ $PHASE phase recovered: $message${NC}"
+                ;;
+            failed)
+                echo -e "${RED}✗ $PHASE phase contract failed: $message${NC}"
+                ;;
+        esac
+    fi
+}
+
+# Helper: mark issue as blocked
+mark_blocked() {
+    local reason="$1"
+    gh issue edit "$ISSUE" --add-label "loom:blocked" 2>/dev/null || true
+    gh issue comment "$ISSUE" --body "**Phase contract failed**: \`$PHASE\` phase did not produce expected outcome. $reason" 2>/dev/null || true
+}
+
+# ─── Phase contract validators ───────────────────────────────────────────────
+
+validate_curator() {
+    local labels
+    labels=$(gh issue view "$ISSUE" --json labels --jq '.labels[].name' 2>/dev/null) || {
+        output_result "failed" "Could not fetch issue labels"
+        return 1
+    }
+
+    if echo "$labels" | grep -q "loom:curated"; then
+        output_result "satisfied" "Issue has loom:curated label"
+        return 0
+    fi
+
+    # Recovery: apply loom:curated label (curator may have enhanced but not labeled)
+    echo -e "${YELLOW}Attempting recovery: applying loom:curated label${NC}"
+    if gh issue edit "$ISSUE" --add-label "loom:curated" 2>/dev/null; then
+        report_milestone "heartbeat" --action "recovery: applied loom:curated label"
+        output_result "recovered" "Applied loom:curated label" "apply_label"
+        return 0
+    fi
+
+    output_result "failed" "Could not apply loom:curated label"
+    return 1
+}
+
+validate_builder() {
+    # Check if a PR already exists for this issue
+    local pr
+    pr=$(gh pr list --search "Closes #${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+
+    if [[ -n "$pr" && "$pr" != "null" ]]; then
+        # Check for loom:review-requested label
+        local pr_labels
+        pr_labels=$(gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null) || true
+        if echo "$pr_labels" | grep -q "loom:review-requested"; then
+            output_result "satisfied" "PR #$pr exists with loom:review-requested"
+            return 0
+        fi
+        # PR exists but missing label - add it
+        echo -e "${YELLOW}Attempting recovery: adding loom:review-requested to PR #$pr${NC}"
+        if gh pr edit "$pr" --add-label "loom:review-requested" 2>/dev/null; then
+            report_milestone "heartbeat" --action "recovery: added loom:review-requested to PR #$pr"
+            output_result "recovered" "Added loom:review-requested to existing PR #$pr" "add_label"
+            return 0
+        fi
+    fi
+
+    # No PR found - attempt recovery from worktree
+    if [[ -z "$WORKTREE" ]]; then
+        output_result "failed" "No PR found and no worktree path provided for recovery"
+        mark_blocked "Builder did not create a PR and no worktree available for recovery."
+        return 1
+    fi
+
+    if [[ ! -d "$WORKTREE" ]]; then
+        output_result "failed" "Worktree path does not exist: $WORKTREE"
+        mark_blocked "Builder did not create a PR and worktree path does not exist."
+        return 1
+    fi
+
+    # Check for uncommitted changes in worktree
+    local status_output
+    status_output=$(git -C "$WORKTREE" status --porcelain 2>/dev/null) || {
+        output_result "failed" "Could not check worktree status"
+        mark_blocked "Builder did not create a PR and worktree is not a valid git directory."
+        return 1
+    }
+
+    if [[ -z "$status_output" ]]; then
+        # Check if there are unpushed commits
+        local unpushed
+        unpushed=$(git -C "$WORKTREE" log --oneline '@{upstream}..HEAD' 2>/dev/null) || unpushed=""
+        if [[ -z "$unpushed" ]]; then
+            output_result "failed" "No changes in worktree to recover"
+            mark_blocked "Builder did not create a PR and worktree has no uncommitted or unpushed changes."
+            return 1
+        fi
+    fi
+
+    echo -e "${YELLOW}Attempting recovery: committing and pushing worktree changes${NC}"
+    report_milestone "heartbeat" --action "recovery: attempting builder worktree recovery"
+
+    # Commit uncommitted changes if any
+    if [[ -n "$status_output" ]]; then
+        git -C "$WORKTREE" add -A 2>/dev/null || {
+            output_result "failed" "Could not stage changes"
+            mark_blocked "Recovery failed: could not stage worktree changes."
+            return 1
+        }
+        git -C "$WORKTREE" commit -m "Auto-commit: builder did not complete workflow for #${ISSUE}" 2>/dev/null || {
+            output_result "failed" "Could not commit changes"
+            mark_blocked "Recovery failed: could not commit worktree changes."
+            return 1
+        }
+    fi
+
+    # Push if not pushed
+    local branch
+    branch=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || {
+        output_result "failed" "Could not determine branch name"
+        mark_blocked "Recovery failed: could not determine worktree branch."
+        return 1
+    }
+
+    # Check if upstream exists
+    if ! git -C "$WORKTREE" rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
+        git -C "$WORKTREE" push -u origin "$branch" 2>/dev/null || {
+            output_result "failed" "Could not push branch"
+            mark_blocked "Recovery failed: could not push worktree branch."
+            return 1
+        }
+    else
+        git -C "$WORKTREE" push 2>/dev/null || {
+            output_result "failed" "Could not push changes"
+            mark_blocked "Recovery failed: could not push worktree changes."
+            return 1
+        }
+    fi
+
+    # Create PR
+    local new_pr
+    new_pr=$(gh pr create \
+        --head "$branch" \
+        --label "loom:review-requested" \
+        --title "Issue #${ISSUE}: Auto-recovered PR" \
+        --body "$(cat <<EOF
+Closes #${ISSUE}
+
+_PR created by shepherd recovery after builder failed to complete workflow._
+EOF
+)" 2>/dev/null) || {
+        output_result "failed" "Could not create PR"
+        mark_blocked "Recovery failed: could not create PR from worktree."
+        return 1
+    }
+
+    report_milestone "heartbeat" --action "recovery: created PR from worktree"
+    output_result "recovered" "Created PR from worktree changes: $new_pr" "create_pr"
+    return 0
+}
+
+validate_judge() {
+    if [[ -z "$PR_NUMBER" ]]; then
+        output_result "failed" "PR number required for judge phase validation"
+        return 1
+    fi
+
+    local labels
+    labels=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null) || {
+        output_result "failed" "Could not fetch PR labels"
+        return 1
+    }
+
+    if echo "$labels" | grep -q "loom:pr"; then
+        output_result "satisfied" "PR #$PR_NUMBER approved (loom:pr)"
+        return 0
+    fi
+
+    if echo "$labels" | grep -q "loom:changes-requested"; then
+        output_result "satisfied" "PR #$PR_NUMBER has changes requested (loom:changes-requested)"
+        return 0
+    fi
+
+    # No recovery possible for judge - it must make a decision
+    output_result "failed" "Judge did not produce loom:pr or loom:changes-requested on PR #$PR_NUMBER"
+    mark_blocked "Judge phase did not produce a review decision on PR #$PR_NUMBER."
+    return 1
+}
+
+validate_doctor() {
+    if [[ -z "$PR_NUMBER" ]]; then
+        output_result "failed" "PR number required for doctor phase validation"
+        return 1
+    fi
+
+    local labels
+    labels=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name' 2>/dev/null) || {
+        output_result "failed" "Could not fetch PR labels"
+        return 1
+    }
+
+    if echo "$labels" | grep -q "loom:review-requested"; then
+        output_result "satisfied" "PR #$PR_NUMBER has loom:review-requested"
+        return 0
+    fi
+
+    # No recovery possible for doctor
+    output_result "failed" "Doctor did not re-request review on PR #$PR_NUMBER"
+    mark_blocked "Doctor phase did not apply loom:review-requested to PR #$PR_NUMBER."
+    return 1
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+case "$PHASE" in
+    curator)  validate_curator  ;;
+    builder)  validate_builder  ;;
+    judge)    validate_judge    ;;
+    doctor)   validate_doctor   ;;
+esac

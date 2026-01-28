@@ -146,11 +146,11 @@ When orchestrating issue #N, follow this progression:
 
 0. [Announce]     -> Print orchestration mode and issue info
 1. [Check State]  -> Read issue labels, determine current phase
-2. [Curator]      -> agent-spawn.sh curator -> agent-wait-bg.sh -> verify loom:curated -> agent-destroy.sh
+2. [Curator]      -> agent-spawn.sh curator -> agent-wait-bg.sh -> agent-destroy.sh -> validate-phase.sh curator
 3. [Gate 1]       -> Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
-4. [Builder]      -> agent-spawn.sh builder -> agent-wait-bg.sh -> verify loom:review-requested -> agent-destroy.sh
-5. [Judge]        -> agent-spawn.sh judge -> agent-wait-bg.sh -> verify loom:pr or loom:changes-requested -> agent-destroy.sh
-6. [Doctor loop]  -> If changes requested: agent-spawn.sh doctor -> agent-wait-bg.sh -> goto 5 (max 3x)
+4. [Builder]      -> agent-spawn.sh builder -> agent-wait-bg.sh -> agent-destroy.sh -> validate-phase.sh builder --worktree ...
+5. [Judge]        -> agent-spawn.sh judge -> agent-wait-bg.sh -> agent-destroy.sh -> validate-phase.sh judge --pr ...
+6. [Doctor loop]  -> If changes requested: agent-spawn.sh doctor -> agent-wait-bg.sh -> agent-destroy.sh -> validate-phase.sh doctor --pr ... -> goto 5 (max 3x)
 7. [Gate 2]       -> Wait for merge (--force-pr stops here, --force-merge auto-merges)
 8. [Complete]     -> Report success
 ```
@@ -176,30 +176,30 @@ Example for each phase:
 ./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
 ./.loom/scripts/agent-wait-bg.sh "curator-issue-${ISSUE}" --timeout 600 --issue "$ISSUE"
 # Exit code 3 = shutdown signal, clean up and exit
-# Verify: gh issue view $ISSUE --json labels --jq '.labels[].name' | grep loom:curated
 ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh curator "$ISSUE" --task-id "$TASK_ID"
 
 # Builder Phase (with worktree)
 ./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" \
     --worktree ".loom/worktrees/issue-${ISSUE}" --on-demand
 ./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE}" --timeout 1800 --issue "$ISSUE"
 # Exit code 3 = shutdown signal, clean up and exit
-# Verify: gh pr list --search "Closes #$ISSUE" to find PR
 ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh builder "$ISSUE" --worktree ".loom/worktrees/issue-${ISSUE}" --task-id "$TASK_ID"
 
 # Judge Phase
 ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
 ./.loom/scripts/agent-wait-bg.sh "judge-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
 # Exit code 3 = shutdown signal, clean up and exit
-# Verify: check PR labels for loom:pr or loom:changes-requested
 ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh judge "$ISSUE" --pr "$PR_NUMBER" --task-id "$TASK_ID"
 
 # Doctor Phase
 ./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
 ./.loom/scripts/agent-wait-bg.sh "doctor-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
 # Exit code 3 = shutdown signal, clean up and exit
-# Verify: check PR labels for loom:review-requested
 ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh doctor "$ISSUE" --pr "$PR_NUMBER" --task-id "$TASK_ID"
 ```
 
 **Observability**: While a worker is running, attach to it live:

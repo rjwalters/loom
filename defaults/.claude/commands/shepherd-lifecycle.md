@@ -65,12 +65,12 @@ fi
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"; handle_shutdown; }
 
-# Verify completion by checking labels
-LABELS=$(gh issue view $ISSUE --json labels --jq '.labels[].name')
-echo "$LABELS" | grep -q "loom:curated" || echo "$LABELS" | grep -q "loom:issue"
-
 # Clean up
 ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
+
+# Validate phase contract (recovers by applying loom:curated if missing)
+./.loom/scripts/validate-phase.sh curator "$ISSUE" --task-id "$TASK_ID"
+[ $? -ne 0 ] && exit 1
 ```
 
 **Builder Phase:**
@@ -82,11 +82,15 @@ echo "$LABELS" | grep -q "loom:curated" || echo "$LABELS" | grep -q "loom:issue"
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"; handle_shutdown; }
 
-# Verify completion by checking for PR
-PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --json number --jq '.[0].number')
-
 # Clean up (worktree stays for judge/doctor phases)
 ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
+
+# Validate phase contract (recovers by committing/pushing worktree and creating PR)
+./.loom/scripts/validate-phase.sh builder "$ISSUE" --worktree ".loom/worktrees/issue-${ISSUE}" --task-id "$TASK_ID"
+[ $? -ne 0 ] && exit 1
+
+# Get PR number for subsequent phases
+PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --state open --json number --jq '.[0].number')
 ```
 
 **Judge Phase:**
@@ -97,16 +101,20 @@ PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --json number --jq '.[0].numb
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"; handle_shutdown; }
 
-# Verify completion by checking PR labels
+# Clean up
+./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
+
+# Validate phase contract (no recovery — marks loom:blocked if neither label present)
+./.loom/scripts/validate-phase.sh judge "$ISSUE" --pr "$PR_NUMBER" --task-id "$TASK_ID"
+[ $? -ne 0 ] && exit 1
+
+# Determine next phase from PR labels
 LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
 if echo "$LABELS" | grep -q "loom:pr"; then
     PHASE="gate2"  # Approved
 elif echo "$LABELS" | grep -q "loom:changes-requested"; then
     PHASE="doctor"  # Needs fixes
 fi
-
-# Clean up
-./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
 ```
 
 **Doctor Phase:**
@@ -117,12 +125,12 @@ fi
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"; handle_shutdown; }
 
-# Verify completion by checking for review-requested label
-LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-echo "$LABELS" | grep -q "loom:review-requested"
-
 # Clean up
 ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"
+
+# Validate phase contract (no recovery — marks loom:blocked if label missing)
+./.loom/scripts/validate-phase.sh doctor "$ISSUE" --pr "$PR_NUMBER" --task-id "$TASK_ID"
+[ $? -ne 0 ] && exit 1
 ```
 
 ### Complete Orchestration Example
@@ -148,6 +156,8 @@ echo "Starting Curator phase for issue #${ISSUE}..."
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"; handle_shutdown; }
 ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh curator "$ISSUE"
+[ $? -ne 0 ] && { echo "Curator phase contract failed"; exit 1; }
 echo "Curator phase complete"
 
 # Gate 1: Wait for approval (or auto-approve in force mode)
@@ -161,8 +171,10 @@ echo "Starting Builder phase for issue #${ISSUE}..."
 ./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE}" --timeout 1800 --issue "$ISSUE"
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"; handle_shutdown; }
-PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --json number --jq '.[0].number')
 ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh builder "$ISSUE" --worktree ".loom/worktrees/issue-${ISSUE}"
+[ $? -ne 0 ] && { echo "Builder phase contract failed"; exit 1; }
+PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --json number --jq '.[0].number')
 echo "Builder phase complete - PR #${PR_NUMBER} created"
 
 # Phase 3: Judge
@@ -172,6 +184,8 @@ echo "Starting Judge phase for PR #${PR_NUMBER}..."
 WAIT_EXIT=$?
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"; handle_shutdown; }
 ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
+./.loom/scripts/validate-phase.sh judge "$ISSUE" --pr "$PR_NUMBER"
+[ $? -ne 0 ] && { echo "Judge phase contract failed"; exit 1; }
 echo "Judge phase complete"
 
 # Continue with Doctor loop and merge as needed...
@@ -200,7 +214,35 @@ Exit codes from `agent-wait-bg.sh`:
 
 After `agent-wait-bg.sh` returns with exit code 0, always verify success by checking labels — the worker may have encountered issues:
 
-### Label Verification
+### Post-Phase Contract Validation
+
+After each phase completes, use `validate-phase.sh` to verify the expected outcome occurred and attempt recovery if it didn't. This replaces manual label checking with a standardized validation + recovery pipeline.
+
+```bash
+# After each phase: spawn -> wait -> destroy -> validate
+./.loom/scripts/validate-phase.sh <phase> $ISSUE [--worktree <path>] [--pr <number>] [--task-id <id>]
+VALIDATE_EXIT=$?
+if [ "$VALIDATE_EXIT" -ne 0 ]; then
+    echo "Phase contract failed for <phase>, issue blocked"
+    # validate-phase.sh already applied loom:blocked and commented
+    exit 1
+fi
+```
+
+**Phase contracts and recovery**:
+
+| Phase | Expected Outcome | Recovery |
+|-------|-----------------|----------|
+| `curator` | `loom:curated` label on issue | Apply label (curator may have enhanced but not labeled) |
+| `builder` | PR exists with `loom:review-requested` | Commit/push worktree changes, create PR |
+| `judge` | `loom:pr` or `loom:changes-requested` on PR | No recovery — mark `loom:blocked` |
+| `doctor` | `loom:review-requested` on PR | No recovery — mark `loom:blocked` |
+
+Use `--json` for machine-readable output. Exit code 0 means contract satisfied (initially or after recovery), 1 means failed.
+
+### Label Verification (Legacy)
+
+The `validate-phase.sh` script supersedes manual label checking. For reference, the previous approach:
 
 ```bash
 # After curator phase
@@ -213,7 +255,7 @@ elif echo "$LABELS" | grep -q "loom:blocked"; then
 fi
 ```
 
-### PR Label Verification
+### PR Label Verification (Legacy)
 
 For PR-related phases:
 
@@ -310,10 +352,10 @@ if [ "$PHASE" = "curator" ]; then
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE_NUMBER}"
 
-  # Verify completion
-  LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
-  if ! echo "$LABELS" | grep -q "loom:curated\|loom:issue"; then
-    echo "Curator did not complete successfully"
+  # Validate phase contract
+  ./.loom/scripts/validate-phase.sh curator "$ISSUE_NUMBER" --task-id "$TASK_ID"
+  if [ $? -ne 0 ]; then
+    echo "Curator phase contract failed"
     exit 1
   fi
 
@@ -367,12 +409,15 @@ if [ "$PHASE" = "builder" ]; then
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE_NUMBER}"
 
-  # Find the PR
-  PR_NUMBER=$(gh pr list --search "Closes #$ISSUE_NUMBER" --state open --json number --jq '.[0].number')
-  if [ -z "$PR_NUMBER" ]; then
-    echo "Builder did not create a PR"
+  # Validate phase contract (attempts recovery from worktree if no PR)
+  ./.loom/scripts/validate-phase.sh builder "$ISSUE_NUMBER" --worktree ".loom/worktrees/issue-${ISSUE_NUMBER}" --task-id "$TASK_ID"
+  if [ $? -ne 0 ]; then
+    echo "Builder phase contract failed"
     exit 1
   fi
+
+  # Find the PR
+  PR_NUMBER=$(gh pr list --search "Closes #$ISSUE_NUMBER" --state open --json number --jq '.[0].number')
   echo "PR #$PR_NUMBER created"
 
   update_progress "builder" "complete" "$PR_NUMBER"
@@ -389,6 +434,13 @@ if [ "$PHASE" = "judge" ]; then
   WAIT_EXIT=$?
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"
+
+  # Validate phase contract
+  ./.loom/scripts/validate-phase.sh judge "$ISSUE_NUMBER" --pr "$PR_NUMBER" --task-id "$TASK_ID"
+  if [ $? -ne 0 ]; then
+    echo "Judge phase contract failed"
+    exit 1
+  fi
 
   # Check review result
   # Note: Judge uses label-based reviews (comment + label change), not GitHub's
@@ -418,9 +470,9 @@ while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS 
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE_NUMBER}"
 
-  # Verify doctor completed
-  LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-  if echo "$LABELS" | grep -q "loom:review-requested"; then
+  # Validate doctor phase contract
+  ./.loom/scripts/validate-phase.sh doctor "$ISSUE_NUMBER" --pr "$PR_NUMBER" --task-id "$TASK_ID"
+  if [ $? -eq 0 ]; then
     echo "Doctor completed, returning to Judge"
     PHASE="judge"
   fi
@@ -434,6 +486,10 @@ while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS 
     WAIT_EXIT=$?
     [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"; handle_shutdown; }
     ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"
+
+    # Validate judge phase contract
+    ./.loom/scripts/validate-phase.sh judge "$ISSUE_NUMBER" --pr "$PR_NUMBER" --task-id "$TASK_ID"
+    [ $? -ne 0 ] && { echo "Judge phase contract failed in doctor loop"; exit 1; }
 
     # Check result
     LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
@@ -597,6 +653,7 @@ The shepherd requires these scripts in `.loom/scripts/`:
 - `agent-wait-bg.sh` — wait for worker completion with shutdown signal checking
 - `agent-wait.sh` — wait for worker completion (used by `agent-wait-bg.sh` internally)
 - `agent-destroy.sh` — clean up worker sessions
+- `validate-phase.sh` — validate phase contracts and attempt recovery
 
 No terminal pre-configuration is needed — workers are created on-demand per phase.
 
