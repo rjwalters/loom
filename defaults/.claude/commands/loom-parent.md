@@ -30,49 +30,25 @@ The daemon relies on deterministic bash scripts for critical operations. These s
 | Script | Purpose |
 |--------|---------|
 | `daemon-snapshot.sh` | Pipeline state assessment (replaces 10+ gh commands) |
-| `validate-daemon-state.sh` | Validates state file, catches fabricated task IDs |
-| `check-completions.sh` | Detects task completions and silent failures |
-| `spawn-shepherd-direct.sh` | Atomic shepherd spawning with rollback |
+| `validate-daemon-state.sh` | Validates state file |
+| `agent-spawn.sh` | Spawn tmux agent sessions |
+| `agent-wait.sh` | Detect when tmux agents complete |
+| `agent-destroy.sh` | Clean up tmux agent sessions |
 | `spawn-support-role.sh` | Support role spawning with interval checking |
 | `stale-building-check.sh` | Recovers orphaned loom:building issues |
 | `recover-orphaned-shepherds.sh` | Recovers from daemon crashes |
 
 See `loom-iteration.md` for how these scripts are used in each iteration.
 
-## Execution Modes
+## Execution Model
 
-The daemon automatically detects and uses the best available execution backend:
+The daemon uses **tmux-based agent execution** exclusively. All workers (shepherds, support roles) run in attachable tmux sessions via `agent-spawn.sh`:
 
-| Mode | Priority | Detection | Description |
-|------|----------|-----------|-------------|
-| `mcp` | 1 (highest) | MCP tools available | Delegate to Tauri-managed terminals |
-| `tmux` | 2 | `tmux -L loom has-session` | Delegate to tmux-backed agent sessions |
-| `direct` | 3 (default) | Fallback | Spawn Task subagents directly |
-
-**Mode Selection Flow:**
-```
-IF Tauri app running (MCP heartbeat responds):
-    MODE = "mcp"      <- Best: Full UI integration
-ELIF tmux pool running (loom start has been run):
-    MODE = "tmux"     <- Good: Persistent, inspectable terminals
-ELSE:
-    MODE = "direct"   <- Fallback: Task subagents (opaque but functional)
-```
-
-**tmux Mode Benefits:**
-- Persistent terminals that survive daemon restarts
-- Inspectable via `loom attach shepherd-1`
-- Lower overhead than spawning new Task subagents
-- Output visible via `loom logs shepherd-1`
-
-**To enable tmux mode:**
-```bash
-# Start the tmux agent pool
-./loom start
-
-# Then run the daemon (will auto-detect tmux mode)
-/loom
-```
+- **Shepherds**: Spawned as on-demand ephemeral tmux sessions (e.g., `loom-shepherd-issue-42`)
+- **Support roles**: Spawned as on-demand ephemeral tmux sessions (e.g., `loom-guide`, `loom-champion`)
+- **Observability**: Attach to any session with `tmux -L loom attach -t <session-name>`
+- **Completion detection**: `agent-wait.sh` polls process trees to detect when Claude finishes
+- **Cleanup**: `agent-destroy.sh` removes sessions after completion
 
 ## Core Principles
 
@@ -132,100 +108,31 @@ Skill(skill="loom-iteration", args="--force --debug")
 its full role prompt (`loom-iteration.md`) so it can execute the complete iteration logic.
 
 **Iteration→role spawning** (shepherds, support roles) happens in `loom-iteration.md` and
-uses **direct slash commands**, NOT Skill:
+uses **tmux agent-spawn.sh** to create ephemeral tmux sessions:
 
-```python
-# Iteration spawns shepherd (uses slash command - Claude Code executes natively)
-Task(
-    description="Shepherd issue #123",
-    prompt="/shepherd 123 --force-pr",
-    run_in_background=True
-)
+```bash
+# Iteration spawns shepherd as tmux worker
+./.loom/scripts/agent-spawn.sh --role shepherd --name "shepherd-issue-123" --args "123 --force-pr" --on-demand
+
+# Wait for completion
+./.loom/scripts/agent-wait.sh "shepherd-issue-123" --timeout 1800
+
+# Clean up
+./.loom/scripts/agent-destroy.sh "shepherd-issue-123"
 ```
-
-**Why slash commands for iteration→roles**: Claude Code executes slash commands natively.
-Using `Skill()` in a Task prompt causes the subagent to expand the role prompt into its
-own context, wasting tokens and failing to actually run the role. See `loom-iteration.md`
-for the complete role spawning implementation.
 
 **Shepherd Force Mode Flags**:
 - `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
 - `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
 
-**Tool Invocation Summary**:
+**Delegation Summary**:
 
 | Delegation | Pattern | Reason |
 |------------|---------|--------|
 | parent → iteration | `Skill(skill="loom-iteration")` | Need iteration's full role prompt |
-| iteration → shepherd | `Task(prompt="/shepherd N")` | Slash command executes natively |
-| iteration → support role | `Task(prompt="/guide")` | Slash command executes natively |
-| shepherd → builder | `Task(prompt="/builder N")` | Slash command executes natively |
-
-### Task Spawn Verification
-
-After spawning a Task subagent, you MUST verify the task actually started before recording its task_id in daemon-state.json.
-
-```python
-def validate_task_id(task_id):
-    """Validate that a task_id matches the expected format from the Task tool.
-
-    Real Task tool task IDs are 7-character lowercase hexadecimal strings (e.g., 'a7dc1e0', 'abeb2e8').
-    Fabricated task IDs typically look like 'auditor-1769471216' or 'champion-12345'.
-
-    Returns True if valid, False if fabricated or malformed.
-    """
-    if not task_id or not isinstance(task_id, str):
-        return False
-
-    # Real task IDs are 7-char hex strings
-    import re
-    return bool(re.match(r'^[a-f0-9]{7}$', task_id))
-
-
-def verify_task_spawn(result, description="task"):
-    """Verify a Task spawn succeeded by checking TaskOutput immediately.
-
-    Validates both that the task started AND that the task_id is a real
-    Task tool ID (not a fabricated string like 'auditor-1769471216').
-    """
-    if not result or not result.task_id:
-        print(f"  SPAWN FAILED: {description} - no task_id returned")
-        return False
-
-    # Validate task_id format BEFORE attempting TaskOutput check
-    # This catches fabricated IDs like "auditor-1769471216" that the LLM
-    # may generate instead of actually invoking the Task tool
-    if not validate_task_id(result.task_id):
-        print(f"  SPAWN FAILED: {description} - invalid task_id format: '{result.task_id}'")
-        print(f"    Expected 7-char hex UUID (e.g., 'a7dc1e0'), got fabricated string")
-        print(f"    This usually means the Task tool was not actually invoked")
-        return False
-
-    try:
-        check = TaskOutput(task_id=result.task_id, block=False, timeout=1000)
-        if check.status in ["running", "completed"]:
-            # Check output for CLI error patterns
-            if check.output:
-                cli_error_patterns = [
-                    "error: unknown option",
-                    "Did you mean",
-                    "unrecognized command",
-                    "command not found"
-                ]
-                for pattern in cli_error_patterns:
-                    if pattern in check.output:
-                        print(f"  SPAWN FAILED: {description} - CLI error detected")
-                        return False
-            return True
-        elif check.status == "failed":
-            print(f"  SPAWN FAILED: {description} - task immediately failed")
-            return False
-    except Exception as e:
-        print(f"  SPAWN FAILED: {description} - verification error: {e}")
-        return False
-
-    return True
-```
+| iteration → shepherd | `agent-spawn.sh --role shepherd` | Ephemeral tmux session, attachable |
+| iteration → support role | `agent-spawn.sh --role guide` | Ephemeral tmux session, attachable |
+| shepherd → builder | `agent-spawn.sh --role builder` | Ephemeral tmux session, attachable |
 
 ## Configuration Parameters
 
@@ -467,22 +374,12 @@ def parent_loop(force_mode=False, debug_mode=False, session_id=None):
     debug_flag = "--debug" if debug_mode else ""
     flags = f"{force_flag} {debug_flag}".strip()
 
-    # Detect execution mode for banner
-    execution_mode = detect_execution_mode(debug_mode)
-
     print("=" * 60)
     print("  LOOM DAEMON - SUBAGENT-PER-ITERATION MODE")
     print("=" * 60)
     print(f"  Force mode: {'ENABLED' if force_mode else 'disabled'}")
     print(f"  Debug: {'ENABLED' if debug_mode else 'disabled'}")
-    print(f"  Session ID: {session_id}")
-    print(f"  Execution backend: {execution_mode.upper()}")
-    if execution_mode == "tmux":
-        print("    -> Using tmux agent pool (loom attach to inspect)")
-    elif execution_mode == "mcp":
-        print("    -> Using Tauri-managed terminals")
-    else:
-        print("    -> Using Task subagents (start 'loom start' for tmux mode)")
+    print(f"  Execution: tmux workers (attach via tmux -L loom attach)")
     print(f"  Poll interval: {POLL_INTERVAL}s")
     print("  Parent loop accumulates only iteration summaries")
     print("=" * 60)
@@ -518,8 +415,8 @@ def parent_loop(force_mode=False, debug_mode=False, session_id=None):
         # ====================================
         # The iteration subagent gets fresh context and handles:
         # - Assess system state (gh commands)
-        # - Check completions (TaskOutput)
-        # - Spawn shepherds (background Tasks)
+        # - Check tmux worker completions (agent-wait.sh)
+        # - Spawn shepherds (agent-spawn.sh)
         # - Trigger work generation
         # - Ensure support roles
         # - Stuck detection
@@ -560,7 +457,7 @@ Do not include any other text or explanation.""",
 
 **Key benefits of thin parent loop:**
 - Parent context grows by ~100 bytes per iteration (just summaries)
-- All gh commands, TaskOutput, and subagent spawning in iteration subagent
+- All gh commands and tmux worker spawning in iteration subagent
 - Iteration subagent context discarded after each iteration
 - Can run indefinitely without context compaction issues
 
@@ -677,9 +574,7 @@ For detailed state file format, see `loom-reference.md`.
 
 ## Example Session
 
-**With tmux pool (recommended):**
 ```
-$ ./loom start         # First, start the tmux agent pool
 $ claude
 > /loom
 
@@ -688,13 +583,12 @@ $ claude
 ====================================================================
   Force mode: disabled
   Debug: disabled
-  Execution backend: TMUX
-    -> Using tmux agent pool (loom attach to inspect)
+  Execution: tmux workers (attach via tmux -L loom attach)
   Poll interval: 120s
   Parent loop accumulates only iteration summaries
 ====================================================================
 
-Iteration 1: mode=tmux ready=5 building=0 shepherds=3/3 +shepherd=#1010 +shepherd=#1011 +shepherd=#1012
+Iteration 1: ready=5 building=0 shepherds=3/3 +shepherd=#1010 +shepherd=#1011 +shepherd=#1012
 Iteration 2: ready=2 building=3 shepherds=3/3
 Iteration 3: ready=2 building=3 shepherds=3/3
 Iteration 4: ready=2 building=3 shepherds=3/3 pr=#1015
@@ -706,27 +600,13 @@ Graceful shutdown initiated...
   Cleanup complete
 ```
 
-**Without tmux pool (direct mode fallback):**
-```
-$ claude
-> /loom
-
-====================================================================
-  LOOM DAEMON - SUBAGENT-PER-ITERATION MODE
-====================================================================
-  Force mode: disabled
-  Debug: disabled
-  Execution backend: DIRECT
-    -> Using Task subagents (start 'loom start' for tmux mode)
-  Poll interval: 120s
-  Parent loop accumulates only iteration summaries
-====================================================================
-
-Iteration 1: mode=direct ready=5 building=0 shepherds=3/3 +shepherd=#1010 +shepherd=#1011 +shepherd=#1012
-...
+**Observability**: While running, attach to any worker session:
+```bash
+tmux -L loom attach -t loom-shepherd-issue-42
+tmux -L loom attach -t loom-guide
 ```
 
-**Notice**: Parent loop only shows compact summaries (~50-100 chars each). The execution mode is shown on the first iteration only.
+**Notice**: Parent loop only shows compact summaries (~50-100 chars each).
 
 ## Context Clearing
 

@@ -39,7 +39,7 @@ ELSE (no "iterate" in arguments, e.g., "/loom" or "/loom --force"):
 
 - **Parent mode** (`/loom` or `/loom --force`): You run a thin loop that spawns subagents
   - Parent accumulates only ~100 bytes per iteration (summaries)
-  - All heavy work (gh commands, TaskOutput, spawning) happens in subagents
+  - All heavy work (gh commands, spawning) happens in subagents
   - Can run for hours/days without hitting context limits
 
 - **Iteration mode** (`/loom iterate` or `/loom iterate --force`): You execute ONE iteration
@@ -83,9 +83,9 @@ Before proceeding, check the arguments: `{{ARGUMENTS}}`
 |  Tier 2: Iteration Subagent (fresh ctx) |
 |  1. Read .loom/daemon-state.json        |
 |  2. Assess system (gh commands)         |
-|  3. Check completions (TaskOutput)      |
+|  3. Check tmux worker completions       |
 |  4. Auto-promote proposals (force mode) |
-|  5. Spawn shepherds (Task, background)  |
+|  5. Spawn shepherds (tmux workers)      |
 |  6. Spawn work generation               |
 |  7. Demand-based support role spawning  |
 |  8. Interval-based support role spawn   |
@@ -96,9 +96,10 @@ Before proceeding, check the arguments: `{{ARGUMENTS}}`
 
 **Why this architecture?**
 - Parent accumulates only ~100 bytes per iteration (summaries)
-- Each iteration gets fresh context (all gh/TaskOutput calls)
+- Each iteration gets fresh context (all gh calls)
 - Can run for hours/days without context compaction
 - State continuity maintained via JSON file
+- All workers run in attachable tmux sessions (observable via `tmux -L loom attach`)
 
 ## Your Role
 
