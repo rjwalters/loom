@@ -611,6 +611,27 @@ The Loom daemon uses these configuration parameters:
 | `ISSUES_PER_SHEPHERD` | 2 | Scale factor: target = ready_issues / ISSUES_PER_SHEPHERD |
 | `POLL_INTERVAL` | 60 | Seconds between daemon loop iterations |
 | `ISSUE_STRATEGY` | fifo | Issue selection strategy (see below) |
+| `SHELL_SHEPHERDS` | false | Use shell-based shepherds instead of LLM-based |
+
+**Shell-Based Shepherds** (`LOOM_SHELL_SHEPHERDS`):
+
+When enabled, the daemon uses `shepherd-loop.sh` instead of spawning Claude Code with the `/shepherd` role:
+
+```bash
+# Enable shell-based shepherds
+LOOM_SHELL_SHEPHERDS=true /loom --force
+```
+
+| Mode | Script | Description |
+|------|--------|-------------|
+| Shell (recommended) | `shepherd-loop.sh` | Deterministic bash orchestration, ~80% token reduction |
+| LLM (default) | `/shepherd` role | LLM-interpreted orchestration, more flexible but higher cost |
+
+Shell-based shepherds provide:
+- **No token accumulation**: Each phase runs in fresh Claude session
+- **Deterministic behavior**: Shell conditionals vs LLM reasoning
+- **Configurable polling**: Shell sleep vs LLM polling overhead
+- **Debuggable**: Read shell script vs conversation history
 
 **Issue Selection Strategy** (`LOOM_ISSUE_STRATEGY`):
 
