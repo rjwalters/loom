@@ -364,7 +364,18 @@ def auto_spawn_shepherds(state, snapshot_data, debug_mode=False):
 
 
 def dispatch_shepherd_tmux(issue, shepherd_flag, session_name, debug_mode=False):
-    """Spawn a shepherd as an ephemeral tmux worker via agent-spawn.sh."""
+    """Spawn a shepherd as an ephemeral tmux worker.
+
+    Uses either:
+    - Shell-based shepherd (LOOM_SHELL_SHEPHERDS=true): spawn-shell-shepherd.sh
+      - Deterministic shell script orchestration
+      - No token accumulation across phases
+      - ~80% token cost reduction vs LLM shepherd
+
+    - LLM-based shepherd (default): agent-spawn.sh --role shepherd
+      - LLM-interpreted orchestration via /shepherd slash command
+      - Higher token cost but more flexible
+    """
 
     def debug(msg):
         if debug_mode:
@@ -372,15 +383,27 @@ def dispatch_shepherd_tmux(issue, shepherd_flag, session_name, debug_mode=False)
 
     debug(f"Spawning tmux shepherd: {session_name} for issue #{issue}")
 
-    # Spawn ephemeral tmux session with shepherd role
-    result = run(
-        f'./.loom/scripts/agent-spawn.sh --role shepherd --name "{session_name}" '
-        f'--args "{issue} {shepherd_flag}" --on-demand --json'
-    )
+    # Check if shell-based shepherds are enabled
+    use_shell_shepherd = os.environ.get("LOOM_SHELL_SHEPHERDS", "false").lower() == "true"
+
+    if use_shell_shepherd:
+        # Use deterministic shell-based shepherd
+        debug("Using shell-based shepherd (LOOM_SHELL_SHEPHERDS=true)")
+        result = run(
+            f'./.loom/scripts/spawn-shell-shepherd.sh {issue} '
+            f'{shepherd_flag} --name "{session_name}" --json'
+        )
+    else:
+        # Use LLM-based shepherd via agent-spawn.sh
+        debug("Using LLM-based shepherd (default)")
+        result = run(
+            f'./.loom/scripts/agent-spawn.sh --role shepherd --name "{session_name}" '
+            f'--args "{issue} {shepherd_flag}" --on-demand --json'
+        )
 
     try:
         spawn_result = json.loads(result)
-        if spawn_result.get("status") == "started":
+        if spawn_result.get("status") in ("started", "spawned"):
             return {
                 "success": True,
                 "session_name": session_name
@@ -388,7 +411,7 @@ def dispatch_shepherd_tmux(issue, shepherd_flag, session_name, debug_mode=False)
         else:
             return {"success": False, "error": spawn_result.get("error", "spawn_failed")}
     except Exception as e:
-        debug(f"Failed to parse agent-spawn.sh result: {e}")
+        debug(f"Failed to parse shepherd spawn result: {e}")
         return {"success": False, "error": str(e)}
 
 
