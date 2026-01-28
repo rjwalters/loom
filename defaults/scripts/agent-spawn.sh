@@ -7,7 +7,7 @@
 #
 # Features:
 # - Creates tmux sessions with predictable names (loom-<name>)
-# - Uses dedicated tmux socket (-L loom-agents) for isolation
+# - Uses shared tmux socket (-L loom) for unified session visibility
 # - Captures all output to .loom/logs/<session-name>.log
 # - Integrates with signal.sh for graceful shutdown
 # - Wraps Claude CLI with claude-wrapper.sh for resilience
@@ -29,12 +29,12 @@
 #   agent-spawn.sh --check shepherd-1
 #
 #   # Attach to a running session
-#   tmux -L loom-agents attach -t loom-shepherd-1
+#   tmux -L loom attach -t loom-shepherd-1
 
 set -euo pipefail
 
 # Configuration
-TMUX_SOCKET="loom-agents"
+TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
 STARTUP_WAIT_SECONDS=3
 
@@ -115,7 +115,7 @@ ${YELLOW}EXAMPLES:${NC}
     agent-spawn.sh --list
 
     # Attach to a running session
-    tmux -L loom-agents attach -t loom-shepherd-1
+    tmux -L loom attach -t loom-shepherd-1
 
     # Stop a session gracefully
     ./.loom/scripts/signal.sh stop shepherd-1
@@ -127,7 +127,7 @@ ${YELLOW}ENVIRONMENT:${NC}
     LOOM_BACKOFF_MULTIPLIER - Backoff multiplier (default: 2)
 
 ${YELLOW}TMUX ARCHITECTURE:${NC}
-    Socket: -L loom-agents (separate from user's default and daemon's socket)
+    Socket: -L loom (shared with CLI tools for unified visibility)
     Session naming: loom-<name> where <name> is the --name parameter
     Output capture: .loom/logs/<session-name>.log via pipe-pane
 
