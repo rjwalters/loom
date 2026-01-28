@@ -89,7 +89,42 @@ You are a specialist in {{workspace}} repository...
 ## Guidelines
 - Best practices
 - Working style
+
+## Completion
+
+**After completing your task, exit Claude Code to signal completion.**
+
+When you have finished your work, execute:
+
+\`\`\`
+/exit
+\`\`\`
+
+### Why This Matters
+- Enables automation: Shepherd orchestration detects worker completion
+- Prevents hanging: Without /exit, agent-wait-bg.sh waits until timeout
+- Saves resources: Idle sessions consume memory and context budget
+
+### When to Exit
+- ✅ After completing the task successfully
+- ✅ When no work is available
+- ❌ NOT during active work
 ```
+
+### Exit After Completion Convention
+
+**All worker roles MUST include a "Completion" section** instructing the agent to exit Claude Code after completing their task.
+
+This is critical for shepherd orchestration:
+1. Shepherds spawn worker agents (builder, judge, doctor, curator) for each phase
+2. `agent-wait-bg.sh` monitors the worker, waiting for completion
+3. When the worker executes `/exit`, the session ends and the shepherd proceeds to the next phase
+4. Without `/exit`, the shepherd waits until timeout (30+ minutes), blocking pipeline progress
+
+**Backup detection**: `agent-wait-bg.sh` also monitors logs for completion patterns as a fallback, but explicit `/exit` is preferred because:
+- Faster detection (immediate vs. polling delay)
+- Cleaner session cleanup
+- No ambiguity about completion state
 
 ### Template Variables
 

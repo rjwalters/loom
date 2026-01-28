@@ -460,3 +460,26 @@ Keep it brief (3-6 words) and descriptive:
 - **Be consistent**: Always use the same format
 - **Be honest**: If you're idle, say so
 - **Be brief**: Task description should be 3-6 words max
+
+## Completion
+
+**After completing your task, exit Claude Code to signal completion.**
+
+When you have finished your work (PR created with `loom:review-requested` label, or issue marked as `loom:blocked`), execute:
+
+```
+/exit
+```
+
+### Why This Matters
+
+- **Enables automation**: Shepherd orchestration relies on detecting when workers complete
+- **Prevents hanging**: Without `/exit`, `agent-wait-bg.sh` waits until timeout
+- **Saves resources**: Idle Claude Code sessions consume memory and context budget
+
+### When to Exit
+
+- ✅ **After creating PR** with `loom:review-requested` label
+- ✅ **After marking issue** as `loom:blocked`
+- ✅ **When no work is available** (no `loom:issue` issues to claim)
+- ❌ **NOT during active work** (only after task is complete)

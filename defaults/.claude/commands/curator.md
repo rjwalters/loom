@@ -586,3 +586,25 @@ After completing your iteration (enhancing an issue and marking it curated), exe
 - ✅ **After completing curation** (issue enhanced and labeled)
 - ✅ **When no work is available** (no issues to curate)
 - ❌ **NOT during active work** (only after iteration is complete)
+
+## Completion
+
+**After completing your task, exit Claude Code to signal completion.**
+
+When you have finished your work (issue enhanced and labeled with `loom:curated`), execute:
+
+```
+/exit
+```
+
+### Why This Matters
+
+- **Enables automation**: Shepherd orchestration relies on detecting when workers complete
+- **Prevents hanging**: Without `/exit`, `agent-wait-bg.sh` waits until timeout
+- **Saves resources**: Idle Claude Code sessions consume memory and context budget
+
+### When to Exit
+
+- ✅ **After curating issue** and labeling with `loom:curated`
+- ✅ **When no work is available** (no issues to curate)
+- ❌ **NOT during active work** (only after curation is complete)

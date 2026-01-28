@@ -35,10 +35,14 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 log_info() { echo -e "${BLUE}[$(date '+%H:%M:%S')]${NC} $*" >&2; }
+log_success() { echo -e "${GREEN}[$(date '+%H:%M:%S')] ✓${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*" >&2; }
 
 # Default poll interval for signal checking
 DEFAULT_SIGNAL_POLL=5
+
+# Grace period (seconds) to wait after detecting completion before force-terminating
+DEFAULT_GRACE_PERIOD=30
 
 show_help() {
     cat <<EOF
@@ -51,6 +55,7 @@ ${YELLOW}OPTIONS:${NC}
     --timeout <seconds>        Maximum time to wait (default: 3600)
     --poll-interval <seconds>  Time between signal checks (default: $DEFAULT_SIGNAL_POLL)
     --issue <N>                Issue number for per-issue abort checking
+    --grace-period <seconds>   Time to wait after completion detection (default: $DEFAULT_GRACE_PERIOD)
     --json                     Output result as JSON
     --help                     Show this help message
 
@@ -63,6 +68,13 @@ ${YELLOW}EXIT CODES:${NC}
 ${YELLOW}SIGNALS CHECKED:${NC}
     - .loom/stop-shepherds file (global shepherd shutdown)
     - loom:abort label on issue (per-issue abort, requires --issue)
+
+${YELLOW}COMPLETION DETECTION:${NC}
+    As a backup to /exit, monitors logs for role-specific completion patterns:
+    - Builder: PR created with loom:review-requested
+    - Judge: PR labeled with loom:pr or loom:changes-requested
+    - Doctor: PR fixed and labeled with loom:review-requested
+    - Curator: Issue labeled with loom:curated
 
 ${YELLOW}EXAMPLES:${NC}
     agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
@@ -89,6 +101,61 @@ check_signals() {
             log_warn "Abort signal detected for issue #${issue}"
             return 0
         fi
+    fi
+
+    return 1
+}
+
+# Check for role-specific completion patterns in log file
+# Returns 0 if completion detected, 1 otherwise
+# Sets COMPLETION_REASON global variable with the detected pattern
+check_completion_patterns() {
+    local session_name="$1"
+    local log_file="${REPO_ROOT}/.loom/logs/${session_name}.log"
+
+    if [[ ! -f "$log_file" ]]; then
+        return 1
+    fi
+
+    # Get recent log content (last 100 lines to check for completion)
+    local recent_log
+    recent_log=$(tail -100 "$log_file" 2>/dev/null || true)
+
+    if [[ -z "$recent_log" ]]; then
+        return 1
+    fi
+
+    # Builder completion: PR created with loom:review-requested
+    # Look for patterns like "gh pr create" followed by "loom:review-requested"
+    # or explicit PR creation success messages
+    if echo "$recent_log" | grep -qE 'loom:review-requested|PR #[0-9]+ created|pull request.*created'; then
+        COMPLETION_REASON="builder_pr_created"
+        return 0
+    fi
+
+    # Judge completion: PR labeled with loom:pr or loom:changes-requested
+    if echo "$recent_log" | grep -qE 'add-label.*loom:pr|add-label.*loom:changes-requested|--add-label "loom:pr"|--add-label "loom:changes-requested"'; then
+        COMPLETION_REASON="judge_review_complete"
+        return 0
+    fi
+
+    # Doctor completion: PR labeled with loom:review-requested after fixes
+    # Similar to builder but in context of fixing (look for treating label removal)
+    if echo "$recent_log" | grep -qE 'remove-label.*loom:treating.*add-label.*loom:review-requested|remove-label.*loom:changes-requested.*add-label.*loom:review-requested'; then
+        COMPLETION_REASON="doctor_fixes_complete"
+        return 0
+    fi
+
+    # Curator completion: Issue labeled with loom:curated
+    if echo "$recent_log" | grep -qE 'add-label.*loom:curated|--add-label "loom:curated"'; then
+        COMPLETION_REASON="curator_curation_complete"
+        return 0
+    fi
+
+    # Generic completion: /exit command detected
+    if echo "$recent_log" | grep -qE '^/exit$|❯ /exit'; then
+        COMPLETION_REASON="explicit_exit"
+        return 0
     fi
 
     return 1
@@ -130,6 +197,7 @@ main() {
     local timeout="3600"
     local poll_interval="$DEFAULT_SIGNAL_POLL"
     local issue=""
+    local grace_period="$DEFAULT_GRACE_PERIOD"
     local json_output=false
 
     if [[ $# -lt 1 ]]; then
@@ -152,6 +220,10 @@ main() {
                 ;;
             --issue)
                 issue="$2"
+                shift 2
+                ;;
+            --grace-period)
+                grace_period="$2"
                 shift 2
                 ;;
             --json)
@@ -180,8 +252,11 @@ main() {
 
     local session_name="${SESSION_PREFIX}${name}"
     local prompt_resolved=false
+    local completion_detected=false
+    local completion_time=0
+    COMPLETION_REASON=""
 
-    # Poll for signals and interactive prompts while background process runs
+    # Poll for signals, prompts, and completion patterns while background process runs
     while true; do
         # Check for interactive prompts that need auto-approval (e.g., plan mode).
         # Only attempt once to avoid sending stray keystrokes after the prompt clears.
@@ -226,6 +301,39 @@ main() {
                 log_warn "Shutdown signal detected after ${elapsed}s - aborting wait for '$name'"
             fi
             exit 3
+        fi
+
+        # Check for completion patterns in log (backup detection)
+        if [[ "$completion_detected" != "true" ]]; then
+            if check_completion_patterns "$session_name"; then
+                completion_detected=true
+                completion_time=$(date +%s)
+                log_warn "Completion pattern detected ($COMPLETION_REASON) but session still running - waiting ${grace_period}s grace period"
+                log_warn "Agent should have executed /exit after completing task"
+            fi
+        fi
+
+        # If completion was detected, check if grace period has elapsed
+        if [[ "$completion_detected" == "true" ]]; then
+            local grace_elapsed=$(( $(date +%s) - completion_time ))
+            if [[ "$grace_elapsed" -ge "$grace_period" ]]; then
+                local elapsed=$(( $(date +%s) - start_time ))
+                log_warn "Grace period expired - force-terminating session '$session_name'"
+
+                # Kill the background wait process
+                kill "$wait_pid" 2>/dev/null || true
+                wait "$wait_pid" 2>/dev/null || true
+
+                # Destroy the tmux session to clean up
+                tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+                if [[ "$json_output" == "true" ]]; then
+                    echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"completion_pattern_detected\",\"pattern\":\"$COMPLETION_REASON\",\"elapsed\":$elapsed,\"grace_period_used\":true}"
+                else
+                    log_success "Agent '$name' completed (pattern: $COMPLETION_REASON, forced after ${grace_period}s grace period)"
+                fi
+                exit 0
+            fi
         fi
 
         sleep "$poll_interval"
