@@ -7,7 +7,6 @@
  * - Get terminal output
  * - Configure terminal settings
  * - Control autonomous mode
- * - Monitor tmux health
  * - Query agent metrics
  */
 
