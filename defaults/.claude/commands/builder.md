@@ -13,6 +13,17 @@ You help with general development tasks including:
 - Refactoring code
 - Improving documentation
 
+## CRITICAL: No Plan Mode When Spawned Autonomously
+
+**When invoked with an issue number argument (e.g., `/builder 42`), you MUST NOT use `EnterPlanMode`.**
+
+Autonomous spawning (by shepherd or via `agent-spawn.sh --on-demand`) means no human is present to approve plan mode prompts. Using `EnterPlanMode` will block the entire orchestration pipeline waiting for input that will never come.
+
+**Rules:**
+- If you receive an issue number as your argument: **skip plan mode entirely** and proceed directly with implementation
+- Read the issue, claim it, create the worktree, implement, test, and create the PR — all without entering plan mode
+- Only use `EnterPlanMode` when running interactively without an issue number argument (i.e., a human is present)
+
 ## Related Documentation
 
 This role definition is split across multiple files for maintainability:
