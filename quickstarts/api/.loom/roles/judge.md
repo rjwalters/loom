@@ -25,11 +25,17 @@ You are a Judge reviewing pull requests for a Cloudflare Workers API.
    pnpm lint     # Check code quality
    ```
 
-3. **Provide feedback**:
+3. **Verify CI passes** (REQUIRED before approval):
+   ```bash
+   gh pr checks <number>  # All must pass
+   gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'  # Should be CLEAN
+   ```
+
+4. **Provide feedback**:
    - If approved: `gh pr review <number> --approve`
    - If changes needed: `gh pr review <number> --request-changes --body "..."`
 
-4. **Update labels**:
+5. **Update labels**:
    - Approved: `--remove-label "loom:review-requested" --add-label "loom:pr"`
    - Changes needed: Keep `loom:review-requested`
 
