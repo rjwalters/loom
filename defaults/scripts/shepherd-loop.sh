@@ -324,6 +324,46 @@ handle_shutdown() {
     exit 0
 }
 
+# ─── Exit handling for error status reporting ─────────────────────────────────
+
+# Track last failure for exit handler
+LAST_FAILURE_REASON=""
+LAST_FAILURE_PHASE=""
+
+# Report error status on non-zero exit
+report_final_status() {
+    local exit_code=$?
+
+    # Only report errors for non-zero exits (excluding shutdown which is 0)
+    # Also requires TASK_ID to be set and progress file to exist (created after 'started' milestone)
+    if [[ $exit_code -ne 0 ]] && [[ -n "$TASK_ID" ]]; then
+        local progress_file="$REPO_ROOT/.loom/progress/shepherd-${TASK_ID}.json"
+        if [[ -f "$progress_file" ]]; then
+            local error_msg="${LAST_FAILURE_REASON:-Orchestration failed with exit code $exit_code}"
+            if [[ -n "$LAST_FAILURE_PHASE" ]]; then
+                error_msg="$LAST_FAILURE_PHASE phase: $error_msg"
+            fi
+
+            if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
+                "$REPO_ROOT/.loom/scripts/report-milestone.sh" error \
+                    --task-id "$TASK_ID" \
+                    --error "$error_msg" \
+                    --quiet || true
+            fi
+        fi
+    fi
+}
+
+# Install exit trap
+trap 'report_final_status' EXIT
+
+# Helper to record failure reason before exiting
+fail_with_reason() {
+    LAST_FAILURE_PHASE="$1"
+    LAST_FAILURE_REASON="$2"
+    exit 1
+}
+
 # ─── Phase execution ──────────────────────────────────────────────────────────
 
 # Run a phase worker and wait for completion
@@ -507,7 +547,7 @@ main() {
         # Validate curator phase
         if ! "$REPO_ROOT/.loom/scripts/validate-phase.sh" curator "$ISSUE" --task-id "$TASK_ID"; then
             log_error "Curator phase validation failed"
-            exit 1
+            fail_with_reason "curator" "validation failed"
         fi
 
         completed_phases+=("Curator")
@@ -585,7 +625,7 @@ main() {
         log_info "Creating worktree..."
         "$REPO_ROOT/.loom/scripts/worktree.sh" "$ISSUE" >/dev/null 2>&1 || {
             log_error "Failed to create worktree"
-            exit 1
+            fail_with_reason "builder" "failed to create worktree"
         }
 
         # Report worktree created
@@ -615,14 +655,14 @@ main() {
         --worktree "$worktree_path" \
         --task-id "$TASK_ID"; then
         log_error "Builder phase validation failed"
-        exit 1
+        fail_with_reason "builder" "validation failed"
     fi
 
     # Get PR number
     pr_number=$(get_pr_for_issue "$ISSUE")
     if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
         log_error "Could not find PR for issue #$ISSUE"
-        exit 1
+        fail_with_reason "builder" "could not find PR for issue"
     fi
 
     # Report PR created
@@ -671,7 +711,7 @@ main() {
             --pr "$pr_number" \
             --task-id "$TASK_ID"; then
             log_error "Judge phase validation failed"
-            exit 1
+            fail_with_reason "judge" "validation failed"
         fi
 
         # Check result
@@ -689,7 +729,7 @@ main() {
                 log_error "Doctor max retries ($DOCTOR_MAX_RETRIES) exceeded"
                 add_label "$ISSUE" "loom:blocked"
                 gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor could not resolve Judge feedback after $DOCTOR_MAX_RETRIES attempts." >/dev/null 2>&1 || true
-                exit 1
+                fail_with_reason "doctor" "max retries ($DOCTOR_MAX_RETRIES) exceeded"
             fi
 
             # ─── Doctor Phase ─────────────────────────────────────────────
@@ -724,14 +764,14 @@ main() {
                 --pr "$pr_number" \
                 --task-id "$TASK_ID"; then
                 log_error "Doctor phase validation failed"
-                exit 1
+                fail_with_reason "doctor" "validation failed"
             fi
 
             completed_phases+=("Doctor (fixes applied)")
             log_success "Doctor applied fixes"
         else
             log_error "Unexpected state: PR has neither loom:pr nor loom:changes-requested"
-            exit 1
+            fail_with_reason "judge" "PR has neither loom:pr nor loom:changes-requested"
         fi
     done
 
@@ -759,7 +799,7 @@ main() {
             log_error "Failed to merge PR #$pr_number"
             add_label "$ISSUE" "loom:blocked"
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to auto-merge PR #$pr_number. May have merge conflicts." >/dev/null 2>&1 || true
-            exit 1
+            fail_with_reason "merge" "failed to auto-merge PR #$pr_number"
         fi
     elif [[ "$MODE" == "force-pr" ]]; then
         log_info "Stopping at loom:pr state (force-pr mode)"
