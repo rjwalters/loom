@@ -153,7 +153,8 @@ check_completion_patterns() {
     fi
 
     # Generic completion: /exit command detected
-    if echo "$recent_log" | grep -qE '^/exit$|❯ /exit'; then
+    # More robust pattern to catch various prompt styles and formatting
+    if echo "$recent_log" | grep -qE '(^|❯\s*|>\s*)/exit\s*$'; then
         COMPLETION_REASON="explicit_exit"
         return 0
     fi
@@ -308,13 +309,36 @@ main() {
             if check_completion_patterns "$session_name"; then
                 completion_detected=true
                 completion_time=$(date +%s)
-                log_warn "Completion pattern detected ($COMPLETION_REASON) but session still running - waiting ${grace_period}s grace period"
-                log_warn "Agent should have executed /exit after completing task"
+                # Only warn about grace period for role-specific patterns, not explicit /exit
+                if [[ "$COMPLETION_REASON" != "explicit_exit" ]]; then
+                    log_warn "Completion pattern detected ($COMPLETION_REASON) but session still running - waiting ${grace_period}s grace period"
+                    log_warn "Agent should have executed /exit after completing task"
+                fi
             fi
         fi
 
         # If completion was detected, check if grace period has elapsed
         if [[ "$completion_detected" == "true" ]]; then
+            # /exit is an explicit completion signal - no grace period needed
+            if [[ "$COMPLETION_REASON" == "explicit_exit" ]]; then
+                local elapsed=$(( $(date +%s) - start_time ))
+                log_info "/exit detected - terminating session '$session_name' immediately"
+
+                # Kill the background wait process
+                kill "$wait_pid" 2>/dev/null || true
+                wait "$wait_pid" 2>/dev/null || true
+
+                # Destroy the tmux session to clean up
+                tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+                if [[ "$json_output" == "true" ]]; then
+                    echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"explicit_exit\",\"elapsed\":$elapsed}"
+                else
+                    log_success "Agent '$name' completed (explicit /exit after ${elapsed}s)"
+                fi
+                exit 0
+            fi
+
             local grace_elapsed=$(( $(date +%s) - completion_time ))
             if [[ "$grace_elapsed" -ge "$grace_period" ]]; then
                 local elapsed=$(( $(date +%s) - start_time ))
