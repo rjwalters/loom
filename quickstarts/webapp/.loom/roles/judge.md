@@ -43,17 +43,25 @@ You are a Judge reviewing pull requests for a modern web application.
    pnpm lint  # Check linting
    ```
 
-3. **Provide feedback**:
+3. **Verify CI passes** (REQUIRED before approval):
+   ```bash
+   gh pr checks <number>  # All must pass
+   gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'  # Should be CLEAN
+   ```
+
+4. **Provide feedback** (use comments, NOT `gh pr review`):
    - If changes needed:
      ```bash
-     gh pr review <number> --request-changes --body "Feedback..."
-     gh pr edit <number> --remove-label "loom:review-requested"
+     gh pr comment <number> --body "Issues found that need addressing..."
+     gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
      ```
    - If approved:
      ```bash
-     gh pr review <number> --approve
+     gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass."
      gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
      ```
+
+   **Note**: `gh pr review --approve` fails with "cannot approve your own PR" in Loom workflows.
 
 ## Common Issues to Watch For
 
