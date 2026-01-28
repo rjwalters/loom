@@ -163,8 +163,123 @@ EOF
 # Helper: mark issue as blocked
 mark_blocked() {
     local reason="$1"
+    local diagnostics="${2:-}"
     gh issue edit "$ISSUE" --add-label "loom:blocked" 2>/dev/null || true
-    gh issue comment "$ISSUE" --body "**Phase contract failed**: \`$PHASE\` phase did not produce expected outcome. $reason" 2>/dev/null || true
+    local comment_body="**Phase contract failed**: \`$PHASE\` phase did not produce expected outcome. $reason"
+    if [[ -n "$diagnostics" ]]; then
+        comment_body="$comment_body
+
+$diagnostics"
+    fi
+    gh issue comment "$ISSUE" --body "$comment_body" 2>/dev/null || true
+}
+
+# Helper: gather builder diagnostic information for debugging
+# Returns diagnostic text that can be included in the blocked comment
+gather_builder_diagnostics() {
+    local diagnostics=""
+    local worktree_path="$WORKTREE"
+    local issue_number="$ISSUE"
+
+    diagnostics+="<details>
+<summary>Diagnostic Information</summary>
+
+"
+
+    # 1. Worktree state
+    if [[ -d "$worktree_path" ]]; then
+        local branch_name
+        branch_name=$(git -C "$worktree_path" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch_name="unknown"
+        diagnostics+="**Worktree**: \`$worktree_path\` exists
+**Branch**: \`$branch_name\`
+"
+
+        # Check commits on branch vs main
+        local main_branch
+        main_branch=$(git -C "$worktree_path" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@') || main_branch="main"
+        local commits_ahead
+        commits_ahead=$(git -C "$worktree_path" rev-list --count "origin/${main_branch}..HEAD" 2>/dev/null) || commits_ahead="?"
+        local commits_behind
+        commits_behind=$(git -C "$worktree_path" rev-list --count "HEAD..origin/${main_branch}" 2>/dev/null) || commits_behind="?"
+        diagnostics+="**Commits ahead of $main_branch**: $commits_ahead
+**Commits behind $main_branch**: $commits_behind
+"
+
+        # Check if branch was ever pushed
+        if git -C "$worktree_path" rev-parse --abbrev-ref '@{upstream}' &>/dev/null; then
+            diagnostics+="**Remote tracking**: configured
+"
+        else
+            diagnostics+="**Remote tracking**: not configured (branch never pushed)
+"
+        fi
+    else
+        diagnostics+="**Worktree**: \`$worktree_path\` does not exist
+"
+    fi
+
+    # 2. Check for tmux session log (builder may have left output)
+    local session_name="loom-builder-issue-${issue_number}"
+    local log_patterns=(
+        "/tmp/loom-${session_name}.out"
+        "$REPO_ROOT/.loom/logs/${session_name}.log"
+    )
+    local found_log=""
+    for log_path in "${log_patterns[@]}"; do
+        if [[ -f "$log_path" ]]; then
+            found_log="$log_path"
+            break
+        fi
+    done
+
+    if [[ -n "$found_log" ]]; then
+        local log_tail
+        log_tail=$(tail -20 "$found_log" 2>/dev/null | head -15) || log_tail=""
+        if [[ -n "$log_tail" ]]; then
+            diagnostics+="
+**Last 15 lines from session log** (\`$found_log\`):
+\`\`\`
+$log_tail
+\`\`\`
+"
+        fi
+    fi
+
+    # 3. Check issue state for clues
+    local issue_labels
+    issue_labels=$(gh issue view "$issue_number" --json labels --jq '.labels[].name' 2>/dev/null | tr '\n' ', ') || issue_labels=""
+    if [[ -n "$issue_labels" ]]; then
+        diagnostics+="
+**Current issue labels**: $issue_labels
+"
+    fi
+
+    # 4. Potential causes based on state
+    diagnostics+="
+**Possible causes**:
+"
+    if [[ ! -d "$worktree_path" ]]; then
+        diagnostics+="- Worktree was never created (agent may have failed early)
+- Worktree creation script failed
+"
+    elif [[ "${commits_ahead:-0}" == "0" ]]; then
+        diagnostics+="- Builder exited without making any commits
+- Builder may have determined issue was invalid or already resolved
+- Builder may have encountered an error during implementation
+- Builder may have timed out before completing work
+"
+    fi
+
+    diagnostics+="
+**Recovery suggestions**:
+1. Check the issue description for clarity - is it actionable?
+2. Review any curator comments for implementation guidance
+3. If the issue is valid, remove \`loom:blocked\` and add \`loom:issue\` to retry
+4. Consider adding more detail to the issue if it was unclear
+
+</details>"
+
+    echo "$diagnostics"
 }
 
 # ─── Phase contract validators ───────────────────────────────────────────────
@@ -233,7 +348,9 @@ validate_builder() {
 
     if [[ ! -d "$WORKTREE" ]]; then
         output_result "failed" "Worktree path does not exist: $WORKTREE"
-        mark_blocked "Builder did not create a PR and worktree path does not exist."
+        local diagnostics
+        diagnostics=$(gather_builder_diagnostics)
+        mark_blocked "Builder did not create a PR and worktree path does not exist." "$diagnostics"
         return 1
     fi
 
@@ -251,7 +368,9 @@ validate_builder() {
         unpushed=$(git -C "$WORKTREE" log --oneline '@{upstream}..HEAD' 2>/dev/null) || unpushed=""
         if [[ -z "$unpushed" ]]; then
             output_result "failed" "No changes in worktree to recover"
-            mark_blocked "Builder did not create a PR and worktree has no uncommitted or unpushed changes."
+            local diagnostics
+            diagnostics=$(gather_builder_diagnostics)
+            mark_blocked "Builder did not create a PR and worktree has no uncommitted or unpushed changes." "$diagnostics"
             return 1
         fi
     fi
