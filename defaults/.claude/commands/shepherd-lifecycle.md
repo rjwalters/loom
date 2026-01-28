@@ -19,12 +19,21 @@ Shutdown signal checking is integrated into `agent-wait-bg.sh`, which polls for 
 
 ### Handling Exit Code 3
 
-When `agent-wait-bg.sh` returns exit code 3, the shepherd should clean up and exit:
+When `agent-wait-bg.sh` returns exit code 3 (detected via polling), the shepherd should clean up and exit:
 
 ```bash
-# Wait with signal checking
-./.loom/scripts/agent-wait-bg.sh "${ROLE}-issue-${ISSUE_NUMBER}" --timeout 900 --issue "$ISSUE_NUMBER"
-WAIT_EXIT=$?
+# Run wait in background
+Bash(command="./.loom/scripts/agent-wait-bg.sh '${ROLE}-issue-${ISSUE_NUMBER}' --timeout 900 --issue '$ISSUE_NUMBER'", run_in_background=true)
+# Returns WAIT_TASK_ID
+
+# Poll loop with heartbeat reporting
+while not completed:
+    result = TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+    if result.status == "completed":
+        WAIT_EXIT = result.exit_code
+        break
+    ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for ${ROLE}"
+    sleep 15
 
 if [ "$WAIT_EXIT" -eq 3 ]; then
     echo "Shutdown signal detected during ${ROLE} phase"
@@ -61,8 +70,12 @@ fi
 ```bash
 # Spawn curator worker in ephemeral tmux session
 ./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
-./.loom/scripts/agent-wait-bg.sh "curator-issue-${ISSUE}" --timeout 600 --issue "$ISSUE"
-WAIT_EXIT=$?
+
+# Non-blocking wait with heartbeat polling
+Bash(command="./.loom/scripts/agent-wait-bg.sh 'curator-issue-${ISSUE}' --timeout 600 --issue '$ISSUE'", run_in_background=true)
+# Poll loop: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+# Each iteration: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for curator"
+# When completed: WAIT_EXIT = result.exit_code
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"; handle_shutdown; }
 
 # Clean up
@@ -78,8 +91,12 @@ WAIT_EXIT=$?
 # Spawn builder worker with worktree isolation
 ./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" \
     --worktree ".loom/worktrees/issue-${ISSUE}" --on-demand
-./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE}" --timeout 1800 --issue "$ISSUE"
-WAIT_EXIT=$?
+
+# Non-blocking wait with heartbeat polling
+Bash(command="./.loom/scripts/agent-wait-bg.sh 'builder-issue-${ISSUE}' --timeout 1800 --issue '$ISSUE'", run_in_background=true)
+# Poll loop: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+# Each iteration: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for builder"
+# When completed: WAIT_EXIT = result.exit_code
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"; handle_shutdown; }
 
 # Clean up (worktree stays for judge/doctor phases)
@@ -97,8 +114,12 @@ PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --state open --json number --
 ```bash
 # Spawn judge worker
 ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
-./.loom/scripts/agent-wait-bg.sh "judge-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
-WAIT_EXIT=$?
+
+# Non-blocking wait with heartbeat polling
+Bash(command="./.loom/scripts/agent-wait-bg.sh 'judge-issue-${ISSUE}' --timeout 900 --issue '$ISSUE'", run_in_background=true)
+# Poll loop: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+# Each iteration: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for judge"
+# When completed: WAIT_EXIT = result.exit_code
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"; handle_shutdown; }
 
 # Clean up
@@ -121,8 +142,12 @@ fi
 ```bash
 # Spawn doctor worker
 ./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
-./.loom/scripts/agent-wait-bg.sh "doctor-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
-WAIT_EXIT=$?
+
+# Non-blocking wait with heartbeat polling
+Bash(command="./.loom/scripts/agent-wait-bg.sh 'doctor-issue-${ISSUE}' --timeout 900 --issue '$ISSUE'", run_in_background=true)
+# Poll loop: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+# Each iteration: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for doctor"
+# When completed: WAIT_EXIT = result.exit_code
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"; handle_shutdown; }
 
 # Clean up
@@ -149,11 +174,28 @@ handle_shutdown() {
     exit 0
 }
 
+# Helper: non-blocking wait with heartbeat polling
+# Usage: wait_with_heartbeat <session-name> <timeout> <role-label>
+# Sets WAIT_EXIT when complete
+wait_with_heartbeat() {
+    local SESSION_NAME="$1" TIMEOUT="$2" ROLE_LABEL="$3"
+    # Run wait in background
+    Bash(command="./.loom/scripts/agent-wait-bg.sh '${SESSION_NAME}' --timeout ${TIMEOUT} --issue '$ISSUE'", run_in_background=true)
+    # Returns WAIT_TASK_ID
+    # Poll loop with heartbeat
+    while not completed:
+        result = TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+        if result.status == "completed":
+            WAIT_EXIT = result.exit_code
+            break
+        ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for ${ROLE_LABEL}"
+        sleep 15
+}
+
 # Phase 1: Curator
 echo "Starting Curator phase for issue #${ISSUE}..."
 ./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
-./.loom/scripts/agent-wait-bg.sh "curator-issue-${ISSUE}" --timeout 600 --issue "$ISSUE"
-WAIT_EXIT=$?
+wait_with_heartbeat "curator-issue-${ISSUE}" 600 "curator"
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"; handle_shutdown; }
 ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
 ./.loom/scripts/validate-phase.sh curator "$ISSUE"
@@ -168,8 +210,7 @@ fi
 # Phase 2: Builder
 echo "Starting Builder phase for issue #${ISSUE}..."
 ./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" --on-demand
-./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE}" --timeout 1800 --issue "$ISSUE"
-WAIT_EXIT=$?
+wait_with_heartbeat "builder-issue-${ISSUE}" 1800 "builder"
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"; handle_shutdown; }
 ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
 ./.loom/scripts/validate-phase.sh builder "$ISSUE" --worktree ".loom/worktrees/issue-${ISSUE}"
@@ -180,8 +221,7 @@ echo "Builder phase complete - PR #${PR_NUMBER} created"
 # Phase 3: Judge
 echo "Starting Judge phase for PR #${PR_NUMBER}..."
 ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
-./.loom/scripts/agent-wait-bg.sh "judge-issue-${ISSUE}" --timeout 900 --issue "$ISSUE"
-WAIT_EXIT=$?
+wait_with_heartbeat "judge-issue-${ISSUE}" 900 "judge"
 [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"; handle_shutdown; }
 ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
 ./.loom/scripts/validate-phase.sh judge "$ISSUE" --pr "$PR_NUMBER"
@@ -204,7 +244,22 @@ tmux -L loom list-sessions
 
 ## Waiting for Completion
 
-After spawning a worker with `agent-spawn.sh`, use `agent-wait-bg.sh` to wait for completion while checking shutdown signals. The script runs `agent-wait.sh` in the background and polls for `stop-shepherds` file and `loom:abort` label during the wait.
+After spawning a worker with `agent-spawn.sh`, run `agent-wait-bg.sh` in the background using `Bash(run_in_background=true)`, then poll with `TaskOutput(block=false)` in a loop. This non-blocking pattern allows the shepherd to report heartbeat milestones during the wait, keeping the daemon informed of progress.
+
+```
+# Launch wait in background
+Bash(command="./.loom/scripts/agent-wait-bg.sh '<name>' --timeout <T> --issue '$ISSUE'", run_in_background=true)
+# Returns WAIT_TASK_ID
+
+# Poll with heartbeat reporting every 15 seconds
+while not completed:
+    result = TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+    if result.status == "completed":
+        WAIT_EXIT = result.exit_code
+        break
+    ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for <role>"
+    sleep 15
+```
 
 Exit codes from `agent-wait-bg.sh`:
 - **0**: Agent completed normally
@@ -347,8 +402,12 @@ fi
 if [ "$PHASE" = "curator" ]; then
   # Spawn ephemeral curator worker
   ./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE_NUMBER}" --args "$ISSUE_NUMBER" --on-demand
-  ./.loom/scripts/agent-wait-bg.sh "curator-issue-${ISSUE_NUMBER}" --timeout 600 --issue "$ISSUE_NUMBER"
-  WAIT_EXIT=$?
+
+  # Non-blocking wait with heartbeat polling
+  Bash(command="./.loom/scripts/agent-wait-bg.sh 'curator-issue-${ISSUE_NUMBER}' --timeout 600 --issue '$ISSUE_NUMBER'", run_in_background=true)
+  # Poll: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+  # Heartbeat: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for curator"
+  # When completed: WAIT_EXIT = result.exit_code
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE_NUMBER}"
 
@@ -404,8 +463,12 @@ fi
 if [ "$PHASE" = "builder" ]; then
   # Spawn ephemeral builder worker
   ./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE_NUMBER}" --args "$ISSUE_NUMBER" --on-demand
-  ./.loom/scripts/agent-wait-bg.sh "builder-issue-${ISSUE_NUMBER}" --timeout 1800 --issue "$ISSUE_NUMBER"
-  WAIT_EXIT=$?
+
+  # Non-blocking wait with heartbeat polling
+  Bash(command="./.loom/scripts/agent-wait-bg.sh 'builder-issue-${ISSUE_NUMBER}' --timeout 1800 --issue '$ISSUE_NUMBER'", run_in_background=true)
+  # Poll: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+  # Heartbeat: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for builder"
+  # When completed: WAIT_EXIT = result.exit_code
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE_NUMBER}"
 
@@ -430,8 +493,12 @@ fi
 if [ "$PHASE" = "judge" ]; then
   # Spawn ephemeral judge worker
   ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
-  ./.loom/scripts/agent-wait-bg.sh "judge-issue-${ISSUE_NUMBER}" --timeout 900 --issue "$ISSUE_NUMBER"
-  WAIT_EXIT=$?
+
+  # Non-blocking wait with heartbeat polling
+  Bash(command="./.loom/scripts/agent-wait-bg.sh 'judge-issue-${ISSUE_NUMBER}' --timeout 900 --issue '$ISSUE_NUMBER'", run_in_background=true)
+  # Poll: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+  # Heartbeat: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for judge"
+  # When completed: WAIT_EXIT = result.exit_code
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"
 
@@ -465,8 +532,12 @@ DOCTOR_ITERATION=0
 while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS ]; do
   # Spawn ephemeral doctor worker
   ./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
-  ./.loom/scripts/agent-wait-bg.sh "doctor-issue-${ISSUE_NUMBER}" --timeout 900 --issue "$ISSUE_NUMBER"
-  WAIT_EXIT=$?
+
+  # Non-blocking wait with heartbeat polling
+  Bash(command="./.loom/scripts/agent-wait-bg.sh 'doctor-issue-${ISSUE_NUMBER}' --timeout 900 --issue '$ISSUE_NUMBER'", run_in_background=true)
+  # Poll: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+  # Heartbeat: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for doctor"
+  # When completed: WAIT_EXIT = result.exit_code
   [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE_NUMBER}"; handle_shutdown; }
   ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE_NUMBER}"
 
@@ -482,8 +553,12 @@ while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS 
   # If we've returned to judge phase, run the judge again
   if [ "$PHASE" = "judge" ]; then
     ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
-    ./.loom/scripts/agent-wait-bg.sh "judge-issue-${ISSUE_NUMBER}" --timeout 900 --issue "$ISSUE_NUMBER"
-    WAIT_EXIT=$?
+
+    # Non-blocking wait with heartbeat polling
+    Bash(command="./.loom/scripts/agent-wait-bg.sh 'judge-issue-${ISSUE_NUMBER}' --timeout 900 --issue '$ISSUE_NUMBER'", run_in_background=true)
+    # Poll: TaskOutput(task_id=WAIT_TASK_ID, block=false, timeout=5000)
+    # Heartbeat: ./.loom/scripts/report-milestone.sh heartbeat --task-id "$TASK_ID" --action "waiting for judge (doctor loop)"
+    # When completed: WAIT_EXIT = result.exit_code
     [ "$WAIT_EXIT" -eq 3 ] && { ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"; handle_shutdown; }
     ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"
 
@@ -678,10 +753,10 @@ fi
 
 ### Worker Timeout
 
-If `agent-wait-bg.sh` returns a non-zero exit code:
+After the polling loop completes, check exit code:
 
 ```bash
-WAIT_EXIT=$?
+# WAIT_EXIT is obtained from the TaskOutput polling loop
 if [ "$WAIT_EXIT" -eq 3 ]; then
     echo "Shutdown signal detected - cleaning up"
     ./.loom/scripts/agent-destroy.sh "${ROLE}-issue-${ISSUE}"
