@@ -15,6 +15,7 @@
 #
 # Usage:
 #   agent-spawn.sh --role <role> --name <name> [--args "<args>"] [--worktree <path>]
+#   agent-spawn.sh --role <role> --name <name> --on-demand [--wait [--timeout <s>]]
 #   agent-spawn.sh --check <name>
 #   agent-spawn.sh --help
 #
@@ -24,6 +25,9 @@
 #
 #   # Spawn a builder agent in a worktree
 #   agent-spawn.sh --role builder --args "42" --name builder-1 --worktree .loom/worktrees/issue-42
+#
+#   # Spawn an ephemeral on-demand worker and wait for completion
+#   agent-spawn.sh --role builder --name builder-issue-42 --args "42" --on-demand --wait --timeout 1800
 #
 #   # Check if a session exists
 #   agent-spawn.sh --check shepherd-1
@@ -93,6 +97,10 @@ ${YELLOW}OPTIONS:${NC}
     --name <name>       Session identifier (used in tmux session name: loom-<name>)
     --args "<args>"     Arguments to pass to the role slash command
     --worktree <path>   Path to git worktree (agent runs in isolated worktree)
+    --on-demand         Mark session as ephemeral (for agent-destroy.sh cleanup)
+    --wait              Block until agent completes (requires agent-wait.sh)
+    --timeout <seconds> Timeout for --wait (default: 3600)
+    --json              Output spawn result as JSON
     --check <name>      Check if session exists (exit 0 if yes, 1 if no)
     --list              List all active loom-agent sessions
     --help              Show this help message
@@ -107,6 +115,10 @@ ${YELLOW}EXAMPLES:${NC}
 
     # Spawn a support role (judge, champion, etc.) from main repo
     agent-spawn.sh --role judge --name judge-1
+
+    # Spawn ephemeral worker, wait for completion, get JSON result
+    agent-spawn.sh --role builder --name builder-issue-42 --args "42" \\
+        --worktree .loom/worktrees/issue-42 --on-demand --wait --timeout 1800 --json
 
     # Check if a session exists
     agent-spawn.sh --check shepherd-1
@@ -417,6 +429,10 @@ main() {
     local worktree=""
     local check_name=""
     local do_list=false
+    local on_demand=false
+    local do_wait=false
+    local wait_timeout=3600
+    local json_output=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
@@ -436,6 +452,22 @@ main() {
             --worktree)
                 worktree="$2"
                 shift 2
+                ;;
+            --on-demand)
+                on_demand=true
+                shift
+                ;;
+            --wait)
+                do_wait=true
+                shift
+                ;;
+            --timeout)
+                wait_timeout="$2"
+                shift 2
+                ;;
+            --json)
+                json_output=true
+                shift
                 ;;
             --check)
                 check_name="$2"
@@ -540,7 +572,40 @@ main() {
 
     # Spawn the agent
     if ! spawn_agent "$role" "$name" "$args" "$worktree" "$repo_root"; then
+        if [[ "$json_output" == "true" ]]; then
+            echo "{\"status\":\"error\",\"name\":\"$name\",\"error\":\"spawn_failed\"}"
+        fi
         exit 1
+    fi
+
+    # Mark as on-demand (ephemeral) for agent-destroy.sh
+    if [[ "$on_demand" == "true" ]]; then
+        tmux -L "$TMUX_SOCKET" set-environment -t "${SESSION_PREFIX}${name}" LOOM_ON_DEMAND "true"
+    fi
+
+    local session_name="${SESSION_PREFIX}${name}"
+    local log_file="${repo_root}/.loom/logs/${session_name}.log"
+
+    if [[ "$json_output" == "true" ]] && [[ "$do_wait" != "true" ]]; then
+        echo "{\"status\":\"spawned\",\"name\":\"$name\",\"session\":\"$session_name\",\"on_demand\":$on_demand,\"log\":\"$log_file\"}"
+    fi
+
+    # Wait for completion if requested
+    if [[ "$do_wait" == "true" ]]; then
+        local wait_script="${repo_root}/.loom/scripts/agent-wait.sh"
+        if [[ ! -x "$wait_script" ]]; then
+            log_error "agent-wait.sh not found at $wait_script"
+            exit 1
+        fi
+
+        local wait_args=("$name" "--timeout" "$wait_timeout")
+        if [[ "$json_output" == "true" ]]; then
+            wait_args+=("--json")
+        fi
+
+        # agent-wait.sh exits 0=completed, 1=timeout, 2=not found
+        "$wait_script" "${wait_args[@]}"
+        exit $?
     fi
 
     exit 0
