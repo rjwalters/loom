@@ -52,6 +52,12 @@ ELSE (no "iterate" in arguments, e.g., "/loom" or "/loom --force"):
 - Eventually hits context limits after a few hours
 - System becomes unresponsive and requires restart
 
+**FAILURE MODE TO AVOID**: Starting a second daemon instance (dual-daemon conflict):
+- When a Claude Code session runs out of context and auto-continues, the continuation may re-invoke `/loom`
+- Two daemon instances competing for `daemon-state.json` causes state corruption
+- **Always check for existing daemon before starting** (see `loom-parent.md` for details)
+- The parent loop uses a `daemon_session_id` field to detect and prevent conflicts
+
 ### Check Your Mode Now
 
 Before proceeding, check the arguments: `{{ARGUMENTS}}`

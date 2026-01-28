@@ -230,6 +230,7 @@ The daemon state file provides comprehensive information for debugging, crash re
   "last_poll": "2026-01-23T11:30:00Z",
   "running": true,
   "iteration": 42,
+  "daemon_session_id": "1706400000-12345",
 
   "shepherds": {
     "shepherd-1": {

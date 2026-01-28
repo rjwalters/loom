@@ -681,6 +681,15 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   git worktree remove "${WORKTREE_PATH}" --force 2>/dev/null || true
   git branch -D "${BRANCH_NAME}" 2>/dev/null || true
 
+  # Restore any staged changes left by --clean uninstall
+  # When --clean runs uninstall in --local mode, it stages file deletions
+  # Since no changes are needed, we restore those files to their original state
+  if [[ "$CLEAN_FIRST" == "true" ]]; then
+    info "Restoring files staged by uninstall..."
+    git -C "$TARGET_PATH" restore --staged . 2>/dev/null || true
+    git -C "$TARGET_PATH" checkout -- . 2>/dev/null || true
+  fi
+
   # Disable error trap and exit successfully
   trap - EXIT SIGINT SIGTERM
 

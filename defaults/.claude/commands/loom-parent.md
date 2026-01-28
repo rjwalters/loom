@@ -193,6 +193,102 @@ GUIDE/CHAMPION/DOCTOR/AUDITOR:
 - Proposals are auto-promoted to `loom:issue` by the daemon
 - Only `loom:blocked` issues require human intervention
 
+## CRITICAL: Dual Daemon Prevention
+
+**Before starting the parent loop, you MUST check for an existing daemon instance.**
+
+This prevents the critical bug where two daemon instances compete for `daemon-state.json`, causing state corruption, duplicate shepherd spawns, and unpredictable behavior.
+
+### Checking for Existing Daemon
+
+```python
+def check_for_existing_daemon():
+    """Check if another daemon instance is already running.
+
+    Uses PID file (.loom/daemon-loop.pid) as the primary check,
+    and daemon_session_id in state file as a secondary check.
+
+    Returns True if safe to start, False if another daemon is running.
+    """
+    pid_file = ".loom/daemon-loop.pid"
+
+    # Check PID file (shell wrapper daemon)
+    if exists(pid_file):
+        pid = read_file(pid_file).strip()
+        # Check if process is still alive
+        result = run(f"kill -0 {pid} 2>/dev/null && echo alive || echo dead")
+        if result.strip() == "alive":
+            print(f"ERROR: Daemon loop already running (PID: {pid})")
+            print(f"  The shell wrapper daemon-loop.sh is active.")
+            print(f"  Stop it first: touch .loom/stop-daemon")
+            print(f"  Or check status: ./.loom/scripts/daemon-loop.sh --status")
+            return False
+        else:
+            print(f"Warning: Removing stale PID file (PID {pid} is not running)")
+            rm(pid_file)
+
+    # Check state file for active LLM-interpreted daemon
+    state_file = ".loom/daemon-state.json"
+    if exists(state_file):
+        state = json.load(open(state_file))
+        if state.get("running") == True and state.get("daemon_session_id"):
+            session_id = state["daemon_session_id"]
+            last_poll = state.get("last_poll")
+            if last_poll:
+                # Check if last poll was recent (within 5 minutes)
+                # If so, another daemon is likely still active
+                poll_age_seconds = seconds_since(last_poll)
+                if poll_age_seconds < 300:
+                    print(f"WARNING: Another daemon session may be active")
+                    print(f"  Session ID: {session_id}")
+                    print(f"  Last poll: {last_poll} ({poll_age_seconds}s ago)")
+                    print(f"  If you are sure no other daemon is running, delete .loom/daemon-state.json")
+                    print(f"  Proceeding with caution - will use session ID to detect conflicts")
+
+    return True
+```
+
+### Continuation Detection
+
+**CRITICAL**: When Claude Code runs out of context and auto-continues, the continuation MUST NOT re-invoke the parent loop. If you detect that you are in a continuation (e.g., conversation history shows a previous `/loom` invocation that was running), do NOT start a new parent loop. Instead:
+
+1. Check if `.loom/daemon-state.json` shows `running: true` with a recent `last_poll`
+2. If yes, you are likely a continuation of a previous daemon session
+3. Do NOT start a new parent loop - this would create a dual-daemon conflict
+4. Instead, print a warning and exit:
+
+```python
+def detect_continuation():
+    """Detect if this is a continuation of a previous daemon session.
+
+    When Claude Code runs out of context and auto-continues, the new
+    session may try to re-invoke /loom. This detects that scenario.
+    """
+    if exists(".loom/daemon-state.json"):
+        state = json.load(open(".loom/daemon-state.json"))
+        if state.get("running") == True:
+            last_poll = state.get("last_poll")
+            if last_poll:
+                poll_age = seconds_since(last_poll)
+                # If last poll was very recent, another daemon is likely running
+                if poll_age < 300:  # 5 minutes
+                    print("=" * 60)
+                    print("  CONTINUATION DETECTED - NOT STARTING NEW DAEMON")
+                    print("=" * 60)
+                    print(f"  daemon-state.json shows running=true")
+                    print(f"  Last poll: {poll_age}s ago")
+                    print(f"  Session ID: {state.get('daemon_session_id', 'unknown')}")
+                    print()
+                    print("  This appears to be a continuation of a previous session.")
+                    print("  Starting a second daemon would cause state corruption.")
+                    print()
+                    print("  To force restart: rm .loom/daemon-state.json && /loom")
+                    print("  To stop daemon:   touch .loom/stop-daemon")
+                    print("=" * 60)
+                    return True
+    return False
+```
+
 ## Startup Validation
 
 Before entering the main loop, validate role configuration:
@@ -220,6 +316,12 @@ def validate_at_startup():
 
 ```python
 def start_daemon(force_mode=False, debug_mode=False):
+    # 0. CRITICAL: Check for existing daemon instance (dual-daemon prevention)
+    if detect_continuation():
+        return  # Don't start - continuation of previous session detected
+    if not check_for_existing_daemon():
+        return  # Don't start - another daemon is running
+
     # 1. Rotate existing state file to preserve session history
     run("./.loom/scripts/rotate-daemon-state.sh")
 
@@ -227,6 +329,12 @@ def start_daemon(force_mode=False, debug_mode=False):
     state = load_or_create_state(".loom/daemon-state.json")
     state["started_at"] = now()
     state["running"] = True
+
+    # 2b. Generate and store session ID for conflict detection
+    import time, os
+    session_id = f"{int(time.time())}-{os.getpid()}"
+    state["daemon_session_id"] = session_id
+    print(f"  Session ID: {session_id}")
 
     # 3. Set force mode if enabled
     if force_mode:
@@ -250,7 +358,7 @@ def start_daemon(force_mode=False, debug_mode=False):
     save_daemon_state(state)
 
     # 7. Enter thin parent loop
-    parent_loop(force_mode, debug_mode)
+    parent_loop(force_mode, debug_mode, session_id)
 ```
 
 ### Parent Loop (Thin - Context Efficient)
@@ -258,7 +366,7 @@ def start_daemon(force_mode=False, debug_mode=False):
 **CRITICAL**: The parent loop does MINIMAL work. All orchestration happens in iteration subagents.
 
 ```python
-def parent_loop(force_mode=False, debug_mode=False):
+def parent_loop(force_mode=False, debug_mode=False, session_id=None):
     """Thin parent loop - spawns iteration subagents to do actual work."""
 
     iteration = 0
@@ -286,6 +394,21 @@ def parent_loop(force_mode=False, debug_mode=False):
             print(f"\nIteration {iteration}: Shutdown signal detected")
             graceful_shutdown()
             break
+
+        # ====================================
+        # STEP 1b: SESSION OWNERSHIP CHECK (dual-daemon prevention)
+        # ====================================
+        # Verify our session ID still matches the state file.
+        # If another daemon has taken over, yield gracefully.
+        if session_id and exists(".loom/daemon-state.json"):
+            state = json.load(open(".loom/daemon-state.json"))
+            file_session_id = state.get("daemon_session_id")
+            if file_session_id and file_session_id != session_id:
+                print(f"\nIteration {iteration}: SESSION CONFLICT DETECTED")
+                print(f"  Our session:  {session_id}")
+                print(f"  File session: {file_session_id}")
+                print(f"  Another daemon has taken over. Yielding.")
+                break
 
         # ====================================
         # STEP 2: SPAWN ITERATION SUBAGENT (does ALL work)
@@ -425,6 +548,7 @@ The daemon maintains state in `.loom/daemon-state.json`:
   "iteration": 42,
   "force_mode": false,
   "debug_mode": false,
+  "daemon_session_id": "1706400000-12345",
   "shepherds": { ... },
   "support_roles": { ... },
   "pipeline_state": { ... },
@@ -438,6 +562,10 @@ The daemon maintains state in `.loom/daemon-state.json`:
   }
 }
 ```
+
+**daemon_session_id**: Unique identifier (format: `timestamp-PID`) for the current daemon session.
+Used for dual-daemon conflict detection - before writing state, the daemon verifies its session
+ID still matches the file to prevent state corruption from competing daemon instances.
 
 **spawn_retry_queue**: Tracks spawn failures per issue to prevent infinite retry loops.
 After `MAX_SPAWN_FAILURES` (3) consecutive failures, the issue is marked as `loom:blocked`.

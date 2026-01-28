@@ -99,6 +99,10 @@ if [[ -d "$WORKTREE_PATH" ]]; then
   git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || true
 fi
 
+# Prune any stale worktree metadata (defensive: handles incomplete uninstall)
+info "Pruning stale worktree metadata..."
+git worktree prune 2>/dev/null || true
+
 # Find an available branch name (handle case where remote branch exists)
 BRANCH_NAME="$BASE_BRANCH_NAME"
 SUFFIX=2
