@@ -16,7 +16,7 @@
 #     2. Creates installation worktree (.loom/worktrees/loom-installation)
 #     3. Initializes Loom configuration (copies defaults to .loom/)
 #     4. Syncs GitHub labels for Loom workflow
-#     5. Configures branch protection rules (interactive mode only)
+#     5. Configures branch rulesets (interactive mode only)
 #     6. Creates pull request with loom:review-requested label
 #
 #   Requirements:
@@ -580,10 +580,10 @@ fi
 echo ""
 
 # ============================================================================
-# STEP 5: Configure Branch Protection
+# STEP 5: Configure Branch Rulesets
 # ============================================================================
-CURRENT_STEP="Configure Branch Protection"
-header "Step 5: Configure Branch Protection"
+CURRENT_STEP="Configure Branch Rulesets"
+header "Step 5: Configure Branch Rulesets"
 echo ""
 
 # Detect default branch
@@ -593,25 +593,25 @@ info "Detected default branch: ${DEFAULT_BRANCH}"
 
 # Prompt user
 if [[ "$NON_INTERACTIVE" == "true" ]]; then
-  info "Non-interactive mode: Skipping branch protection setup"
+  info "Non-interactive mode: Skipping branch ruleset setup"
   info "To configure manually, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
 else
   echo ""
-  read -p "Configure branch protection rules for '${DEFAULT_BRANCH}' branch? (y/N) " -n 1 -r
+  read -p "Configure branch ruleset for '${DEFAULT_BRANCH}' branch? (y/N) " -n 1 -r
   echo ""
   if [[ $REPLY =~ ^[Yy]$ ]]; then
-    info "Applying branch protection rules..."
+    info "Applying branch ruleset..."
 
-    # Apply protection rules
+    # Apply ruleset
     if "$LOOM_ROOT/scripts/install/setup-branch-protection.sh" "$TARGET_PATH" "$DEFAULT_BRANCH"; then
       echo ""
     else
       echo ""
-      warning "Failed to configure branch protection (may require admin permissions)"
-      info "You can configure manually via GitHub Settings > Branches"
+      warning "Failed to configure branch ruleset (may require admin permissions)"
+      info "You can configure manually via GitHub Settings > Rules > Rulesets"
     fi
   else
-    info "Skipping branch protection setup"
+    info "Skipping branch ruleset setup"
     info "To configure later, run: $LOOM_ROOT/scripts/install/setup-branch-protection.sh $TARGET_PATH $DEFAULT_BRANCH"
   fi
 fi
@@ -777,7 +777,7 @@ case "$MERGE_STATUS" in
   auto)
     # Auto-merge enabled - PR will merge once requirements are met
     echo "  The installation PR has auto-merge enabled and will merge"
-    echo "  automatically once branch protection requirements are met."
+    echo "  automatically once ruleset requirements are met."
     echo ""
     echo "  Once merged, choose your workflow:"
     echo ""

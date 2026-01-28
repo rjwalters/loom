@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Setup branch protection rules for Loom workflow
+# Setup branch rulesets for Loom workflow
 #
 # Usage:
 #   ./scripts/install/setup-branch-protection.sh /path/to/target-repo [branch-name]
 #
-# Applies recommended branch protection rules:
-#   - Require PRs (0 approvals for solo dev/Loom workflows)
-#   - Dismiss stale reviews
-#   - Prevent force pushes and deletions
+# Creates or updates a GitHub ruleset with recommended rules:
+#   - Prevent branch deletion and force pushes
+#   - Require linear history (squash merges only)
+#   - Require pull requests (0 approvals for solo dev/Loom workflows)
 
 set -euo pipefail
 
@@ -23,6 +23,7 @@ fi
 
 TARGET_PATH="${1:-}"
 BRANCH_NAME="${2:-main}"
+RULESET_NAME="main"
 
 if [[ -z "$TARGET_PATH" ]]; then
   error "Target path required"
@@ -40,8 +41,6 @@ if [[ -z "$ORIGIN_URL" ]]; then
 fi
 
 # Extract owner/repo from URL (handles both HTTPS and SSH)
-# HTTPS: https://github.com/owner/repo.git -> owner/repo
-# SSH: git@github.com:owner/repo.git -> owner/repo
 REPO_NAME=$(echo "$ORIGIN_URL" | sed -E 's#^.*(github\.com[/:])##; s/\.git$//')
 
 if [[ ! "$REPO_NAME" =~ ^[^/]+/[^/]+$ ]]; then
@@ -53,62 +52,83 @@ OWNER=$(echo "$REPO_NAME" | cut -d'/' -f1)
 REPO=$(echo "$REPO_NAME" | cut -d'/' -f2)
 
 echo ""
-info "Configuring branch protection for: ${OWNER}/${REPO} (${BRANCH_NAME})"
+info "Configuring branch ruleset for: ${OWNER}/${REPO} (${BRANCH_NAME})"
 
 # Check if user has admin permissions
 HAS_ADMIN=$(gh api "repos/${OWNER}/${REPO}" --jq '.permissions.admin' 2>/dev/null || echo "false")
 if [[ "$HAS_ADMIN" != "true" ]]; then
-  warning "You may not have admin permissions to configure branch protection"
+  warning "You may not have admin permissions to configure rulesets"
   warning "Attempting anyway (may fail with permission error)..."
 fi
 
-# Apply branch protection rules using JSON payload
-# Note: Using --input with JSON is more reliable than --field with bracket notation
-# Note: required_approving_review_count is 0 to support solo development and Loom workflows
-#       (GitHub's review API doesn't work for self-authored PRs, and Loom uses label-based reviews)
-if gh api --method PUT "repos/${OWNER}/${REPO}/branches/${BRANCH_NAME}/protection" --input - > /dev/null 2>&1 <<'EOF'
-{
-  "required_status_checks": null,
-  "enforce_admins": false,
-  "required_pull_request_reviews": {
-    "dismiss_stale_reviews": true,
-    "require_code_owner_reviews": false,
-    "required_approving_review_count": 0
+# Ruleset payload
+RULESET_PAYLOAD='{
+  "name": "'"$RULESET_NAME"'",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["~DEFAULT_BRANCH"],
+      "exclude": []
+    }
   },
-  "restrictions": null,
-  "allow_force_pushes": false,
-  "allow_deletions": false,
-  "required_linear_history": false
-}
-EOF
-then
+  "rules": [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {"type": "required_linear_history"},
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_approving_review_count": 0,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": false,
+        "allowed_merge_methods": ["squash"]
+      }
+    }
+  ]
+}'
 
-  success "Branch protection configured successfully"
+# Check if a ruleset named "main" already exists
+EXISTING_ID=$(gh api "repos/${OWNER}/${REPO}/rulesets" --jq '.[] | select(.name == "'"$RULESET_NAME"'") | .id' 2>/dev/null || echo "")
+
+if [[ -n "$EXISTING_ID" ]]; then
+  info "Found existing ruleset '${RULESET_NAME}' (ID: ${EXISTING_ID}), updating..."
+  API_METHOD="PUT"
+  API_URL="repos/${OWNER}/${REPO}/rulesets/${EXISTING_ID}"
+else
+  info "Creating new ruleset '${RULESET_NAME}'..."
+  API_METHOD="POST"
+  API_URL="repos/${OWNER}/${REPO}/rulesets"
+fi
+
+if echo "$RULESET_PAYLOAD" | gh api --method "$API_METHOD" "$API_URL" --input - > /dev/null 2>&1; then
+  success "Branch ruleset configured successfully"
   echo ""
   echo "Applied rules:"
-  echo "  - Require pull requests before merging (0 approvals required)"
-  echo "  - Dismiss stale reviews on new commits"
-  echo "  - Prevent force pushes"
   echo "  - Prevent branch deletion"
-  echo "  - Admins can bypass (enforce_admins=false)"
+  echo "  - Prevent force pushes"
+  echo "  - Require linear history (squash merges only)"
+  echo "  - Require pull requests (0 approvals required)"
+  echo "  - Dismiss stale reviews on new commits"
   echo ""
   echo "Note: 0 approvals required supports solo development and Loom's label-based review system."
   echo ""
-  info "To modify: GitHub Settings > Branches > ${BRANCH_NAME}"
+  info "To modify: GitHub Settings > Rules > Rulesets"
   exit 0
 else
-  error "Failed to configure branch protection"
+  error "Failed to configure branch ruleset"
   echo ""
   echo "This can happen if:"
   echo "  - You lack admin permissions on ${OWNER}/${REPO}"
-  echo "  - The branch '${BRANCH_NAME}' does not exist yet"
   echo "  - GitHub API is unreachable"
   echo ""
   info "To configure manually:"
-  echo "  1. Go to: https://github.com/${OWNER}/${REPO}/settings/branches"
-  echo "  2. Add rule for '${BRANCH_NAME}' branch"
-  echo "  3. Enable: Require pull request reviews (0 approvals)"
-  echo "  4. Enable: Dismiss stale reviews"
-  echo "  5. Enable: Prevent force pushes"
+  echo "  1. Go to: https://github.com/${OWNER}/${REPO}/settings/rules"
+  echo "  2. Create a new ruleset for the default branch"
+  echo "  3. Enable: Prevent deletion, prevent force push"
+  echo "  4. Enable: Require linear history"
+  echo "  5. Enable: Require pull request (0 approvals)"
   exit 1
 fi

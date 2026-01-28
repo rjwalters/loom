@@ -369,53 +369,54 @@ cat > .loom/roles/my-role.json <<EOF
 EOF
 ```
 
-### Branch Protection
+### Branch Rulesets
 
-Loom works best with branch protection enabled on your default branch. Branch protection ensures all changes go through the PR workflow and prevents accidental direct commits.
+Loom works best with a GitHub ruleset enabled on your default branch. Rulesets ensure all changes go through the PR workflow and prevent accidental direct commits.
 
 #### During Installation
 
-The installation script optionally configures branch protection:
+The installation script optionally configures a branch ruleset:
 
-**Interactive mode**: Prompts you to enable protection
+**Interactive mode**: Prompts you to enable the ruleset
 ```bash
 ./scripts/install-loom.sh /path/to/repo
-# Will prompt: Configure branch protection rules for 'main' branch? (y/N)
+# Will prompt: Configure branch ruleset for 'main' branch? (y/N)
 ```
 
-**Non-interactive mode**: Skips branch protection (configure manually)
+**Non-interactive mode**: Skips ruleset setup (configure manually)
 ```bash
 ./scripts/install-loom.sh --yes /path/to/repo
-# Skips protection setup for automation safety
+# Skips ruleset setup for automation safety
 ```
 
 #### Manual Configuration
 
-Configure branch protection after installation:
+Configure the branch ruleset after installation:
 
 ```bash
 ./scripts/install/setup-branch-protection.sh /path/to/repo main
 ```
 
 Or configure via GitHub Settings:
-1. Go to: `Settings > Branches` in your repository
-2. Add rule for your default branch (usually `main`)
+1. Go to: `Settings > Rules > Rulesets` in your repository
+2. Create a new ruleset targeting the default branch
 3. Enable:
-   - Require pull request reviews (1 approval)
-   - Dismiss stale reviews on new commits
-   - Prevent force pushes
    - Prevent branch deletion
+   - Prevent force pushes
+   - Require linear history (squash merges only)
+   - Require pull requests (0 approvals)
+   - Dismiss stale reviews on new commits
 
-#### Protection Rules Applied
+#### Ruleset Rules Applied
 
 The setup script configures these rules:
-- ✅ Require pull request before merging
-- ✅ Require 1 approval (can be bypassed by admins)
-- ✅ Dismiss stale reviews when new commits pushed
-- ✅ Prevent force pushes
 - ✅ Prevent branch deletion
+- ✅ Prevent force pushes
+- ✅ Require linear history (squash merges only)
+- ✅ Require pull request before merging (0 approvals)
+- ✅ Dismiss stale reviews when new commits pushed
 
-#### Why Branch Protection?
+#### Why Rulesets?
 
 **Enforces Loom workflow**:
 - All changes require pull requests

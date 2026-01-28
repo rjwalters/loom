@@ -485,13 +485,13 @@ You are a specialist in {{workspace}}.
 EOF
 ```
 
-### Branch Protection
+### Branch Rulesets
 
-Loom works best with branch protection enabled. During installation:
+Loom works best with a GitHub ruleset enabled on the default branch. During installation:
 
 ```bash
-./scripts/install-loom.sh /path/to/repo  # Interactive, prompts for protection
-./scripts/install-loom.sh --yes /path/to/repo  # Non-interactive, skip protection
+./scripts/install-loom.sh /path/to/repo  # Interactive, prompts for ruleset
+./scripts/install-loom.sh --yes /path/to/repo  # Non-interactive, skip ruleset
 ```
 
 Manual configuration: `./scripts/install/setup-branch-protection.sh /path/to/repo main`
@@ -505,7 +505,7 @@ Configure merge settings during installation or manually:
 ./scripts/install/setup-repository-settings.sh /path/to/repo --dry-run  # Preview
 ```
 
-Settings applied: merge commits only (no squash/rebase), delete branches on merge, auto-merge enabled.
+Settings applied: squash merge only (no merge commits/rebase), delete branches on merge, auto-merge enabled.
 
 ## Troubleshooting
 

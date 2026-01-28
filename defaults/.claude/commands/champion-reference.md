@@ -23,7 +23,7 @@ fi
 
 **Decision**: **Allow merge** - absence of CI is not a blocker.
 
-**Rationale**: Many repositories don't use CI, or use branch protection without status checks.
+**Rationale**: Many repositories don't use CI, or use rulesets without status checks.
 
 ---
 
@@ -596,7 +596,7 @@ done
 ### Common Issues
 
 **PR not merging despite passing all checks**
-- Check if branch protection requires additional approvals
+- Check if rulesets require additional approvals
 - Verify GitHub API rate limits haven't been hit
 - Check for webhook delays in GitHub's processing
 

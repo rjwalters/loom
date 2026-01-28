@@ -42,7 +42,7 @@ This repository uses several automated tools to detect security issues:
 
 ### Development Practices
 
-- Branch protection requires pull request reviews before merging
+- Branch rulesets require pull request reviews before merging
 - All changes go through CI checks including security scans
 - Secrets and credentials are never committed to the repository
 - Regular security audits run weekly via GitHub Actions

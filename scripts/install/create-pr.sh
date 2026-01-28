@@ -276,7 +276,7 @@ if [[ "$FORCE_AUTO_MERGE" == "true" ]]; then
     MERGE_STATUS="merged"
   else
     # If immediate merge fails, try enabling auto-merge
-    info "Immediate merge not available (branch protection may require reviews)"
+    info "Immediate merge not available (ruleset may require reviews)"
     if gh pr merge "$PR_URL" --auto --squash --delete-branch 2>/dev/null; then
       success "Auto-merge enabled - PR will merge once requirements are met"
       MERGE_STATUS="auto"
