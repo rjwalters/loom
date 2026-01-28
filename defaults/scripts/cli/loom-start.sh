@@ -44,6 +44,7 @@ if [[ -z "$REPO_ROOT" ]]; then
 fi
 
 CONFIG_FILE="$REPO_ROOT/.loom/config.json"
+# shellcheck disable=SC2034  # LOG_DIR reserved for future logging enhancements
 LOG_DIR="/tmp"
 TMUX_SOCKET="loom"
 
