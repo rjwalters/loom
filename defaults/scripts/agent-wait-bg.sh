@@ -23,6 +23,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# tmux configuration (must match agent-spawn.sh)
+TMUX_SOCKET="loom"
+SESSION_PREFIX="loom-"
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -90,6 +94,34 @@ check_signals() {
     return 1
 }
 
+# Check for interactive prompts in the agent's tmux pane and auto-resolve them.
+# Claude Code's plan mode presents an approval prompt that blocks execution when
+# no human is present. This function detects the prompt and sends the approval
+# keystroke so autonomous agents can proceed.
+check_and_resolve_prompts() {
+    local session_name="$1"
+
+    # Capture current pane content (silently fail if session gone)
+    local pane_content
+    pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
+    if [[ -z "$pane_content" ]]; then
+        return
+    fi
+
+    # Detect Claude Code plan mode approval prompt.
+    # The prompt shows numbered options like:
+    #   "Would you like to proceed?"
+    #   1. Yes, clear context and bypass permissions
+    #   2. Yes, and bypass permissions
+    # We look for the distinctive "Would you like to proceed" text.
+    if echo "$pane_content" | grep -q "Would you like to proceed"; then
+        log_info "Plan mode approval prompt detected in $session_name - auto-approving"
+        # Send "1" to select "Yes, clear context and bypass permissions"
+        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "1" C-m
+    fi
+}
+
 main() {
     local name=""
     local timeout="3600"
@@ -143,8 +175,13 @@ main() {
     local start_time
     start_time=$(date +%s)
 
-    # Poll for signals while background process runs
+    local session_name="${SESSION_PREFIX}${name}"
+
+    # Poll for signals and interactive prompts while background process runs
     while true; do
+        # Check for interactive prompts that need auto-approval (e.g., plan mode)
+        check_and_resolve_prompts "$session_name"
+
         # Check if agent-wait.sh has finished
         if ! kill -0 "$wait_pid" 2>/dev/null; then
             # Process exited, get its exit code
