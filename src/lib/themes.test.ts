@@ -64,7 +64,8 @@ describe("themes", () => {
       const styles = getThemeStyles(theme, false);
 
       expect(styles.borderColor).toBe(theme.border);
-      expect(styles.backgroundColor).toBe(theme.background);
+      // In light mode, backgroundColor is 10% opacity tint of primary color
+      expect(styles.backgroundColor).toBe("rgba(6, 182, 212, 0.1)");
       expect(styles.activeColor).toBe(theme.primary);
       expect(styles.hoverColor).toBeDefined();
       expect(styles.hoverColor).not.toBe(theme.primary);
@@ -75,18 +76,27 @@ describe("themes", () => {
       const styles = getThemeStyles(theme, true);
 
       expect(styles.borderColor).toBe(theme.border);
+      // In dark mode, uses theme.background if defined
       expect(styles.backgroundColor).toBe(theme.background);
       expect(styles.activeColor).toBe(theme.primary);
       expect(styles.hoverColor).toBeDefined();
     });
 
-    it("should use transparent background for themes without background", () => {
+    it("should use transparent background for themes without background in dark mode", () => {
       const theme = TERMINAL_THEMES.default;
-      const stylesLight = getThemeStyles(theme, false);
       const stylesDark = getThemeStyles(theme, true);
 
-      expect(stylesLight.backgroundColor).toBe("transparent");
+      // In dark mode, themes without background use transparent
       expect(stylesDark.backgroundColor).toBe("transparent");
+    });
+
+    it("should use tinted background for themes without background in light mode", () => {
+      const theme = TERMINAL_THEMES.default;
+      const stylesLight = getThemeStyles(theme, false);
+
+      // In light mode, all themes get a 10% opacity tint of their primary color
+      // default theme primary is #3b82f6 (blue)
+      expect(stylesLight.backgroundColor).toBe("rgba(59, 130, 246, 0.1)");
     });
 
     it("should generate different hover colors for light and dark modes", () => {

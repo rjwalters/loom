@@ -3,6 +3,7 @@
  *
  * Configures:
  * - WebCrypto polyfill for happy-dom (required by Tauri API)
+ * - localStorage mock for happy-dom (required for theme tests)
  * - Tauri API mocks for testing IPC calls
  */
 
@@ -17,6 +18,36 @@ beforeAll(async () => {
   // Use defineProperty because global.crypto is read-only in happy-dom
   Object.defineProperty(globalThis, "crypto", {
     value: webcrypto,
+    writable: true,
+    configurable: true,
+  });
+});
+
+// Mock localStorage for happy-dom (required by theme tests)
+// happy-dom provides localStorage but with incomplete API - we enhance it
+beforeAll(() => {
+  const store: Record<string, string> = {};
+  const localStorageMock: Storage = {
+    getItem: (key: string) => store[key] ?? null,
+    setItem: (key: string, value: string) => {
+      store[key] = value;
+    },
+    removeItem: (key: string) => {
+      delete store[key];
+    },
+    clear: () => {
+      for (const key of Object.keys(store)) {
+        delete store[key];
+      }
+    },
+    get length() {
+      return Object.keys(store).length;
+    },
+    key: (index: number) => Object.keys(store)[index] ?? null,
+  };
+
+  Object.defineProperty(globalThis, "localStorage", {
+    value: localStorageMock,
     writable: true,
     configurable: true,
   });

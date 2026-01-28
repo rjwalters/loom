@@ -11,6 +11,47 @@ vi.mock("./terminal-manager", () => ({
   getTerminalManager: vi.fn(),
 }));
 
+// Mock circuit-breaker module - execute passes through to the callback
+vi.mock("./circuit-breaker", () => ({
+  CircuitState: { CLOSED: "closed", OPEN: "open", HALF_OPEN: "half-open" },
+  CircuitOpenError: class CircuitOpenError extends Error {
+    constructor(
+      public readonly circuitName: string,
+      public readonly state: string
+    ) {
+      super(`Circuit breaker '${circuitName}' is ${state}, request rejected`);
+      this.name = "CircuitOpenError";
+    }
+  },
+  getDaemonCircuitBreaker: vi.fn(() => ({
+    execute: vi.fn((fn: () => Promise<unknown>) => fn()),
+    canAttempt: vi.fn(() => true),
+    getState: vi.fn(() => "closed"),
+    getSnapshot: vi.fn(() => ({
+      state: "closed",
+      failures: 0,
+      successes: 0,
+      lastFailureTime: null,
+      lastSuccessTime: null,
+      lastStateChange: null,
+    })),
+    reset: vi.fn(),
+    onEvent: vi.fn(() => () => {}),
+    recordSuccess: vi.fn(),
+    recordFailure: vi.fn(),
+  })),
+}));
+
+// Mock history-cache module
+vi.mock("./history-cache", () => ({
+  getHistoryCache: vi.fn(() => ({
+    appendToHistory: vi.fn(),
+    appendOutput: vi.fn().mockResolvedValue(undefined),
+    getHistory: vi.fn(() => []),
+    isReady: vi.fn(() => false), // Return false to skip caching during tests
+  })),
+}));
+
 import { invoke } from "@tauri-apps/api/core";
 import { getTerminalManager } from "./terminal-manager";
 
