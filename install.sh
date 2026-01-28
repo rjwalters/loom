@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # Loom Setup - Install Loom into a target repository
-# Usage: ./setup.sh [/path/to/target-repo]
+# Usage: ./install.sh [OPTIONS] [/path/to/target-repo]
+#
+# Options:
+#   -y, --yes    Non-interactive mode (skip confirmation prompts)
+#   --quick      Quick Install - direct install without GitHub workflow
+#   --full       Full Install - creates issue, worktree, and PR
+#   -h, --help   Show this help message
+#
+# Examples:
+#   ./install.sh --quick ~/projects/my-app
+#   ./install.sh --full /path/to/team-project
+#   ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick
 
 set -euo pipefail
 
@@ -50,17 +61,56 @@ echo ""
 
 # Parse flags
 NON_INTERACTIVE=false
+INSTALL_TYPE=""
 while [[ "${1:-}" == -* ]]; do
   case "$1" in
     -y|--yes)
       NON_INTERACTIVE=true
       shift
       ;;
+    --quick)
+      # Check for conflicting --full flag
+      if [[ "$INSTALL_TYPE" == "2" ]]; then
+        error "Cannot specify both --quick and --full"
+      fi
+      INSTALL_TYPE="1"
+      NON_INTERACTIVE=true  # --quick implies non-interactive
+      shift
+      ;;
+    --full)
+      # Check for conflicting --quick flag
+      if [[ "$INSTALL_TYPE" == "1" ]]; then
+        error "Cannot specify both --quick and --full"
+      fi
+      INSTALL_TYPE="2"
+      NON_INTERACTIVE=true  # --full implies non-interactive
+      shift
+      ;;
+    -h|--help)
+      echo "Usage: ./install.sh [OPTIONS] [TARGET_PATH]"
+      echo ""
+      echo "Options:"
+      echo "  -y, --yes    Non-interactive mode (skip confirmation prompts)"
+      echo "  --quick      Quick Install - direct install without GitHub workflow"
+      echo "  --full       Full Install - creates issue, worktree, and PR"
+      echo "  -h, --help   Show this help message"
+      echo ""
+      echo "Examples:"
+      echo "  ./install.sh --quick ~/projects/my-app"
+      echo "  ./install.sh --full /path/to/team-project"
+      echo "  ./install.sh -y ~/projects/my-app  # Non-interactive, defaults to quick install"
+      exit 0
+      ;;
     *)
       error "Unknown flag: $1"
       ;;
   esac
 done
+
+# Early validation for --full: requires gh CLI
+if [[ "$INSTALL_TYPE" == "2" ]] && ! command -v gh &> /dev/null; then
+  error "Full Install requires GitHub CLI (gh)\n       Install: brew install gh\n       Or use --quick for installation without GitHub integration"
+fi
 
 # Get target path from argument or prompt
 TARGET_PATH="${1:-}"
@@ -326,8 +376,13 @@ if is_loom_source_repo "$TARGET_PATH"; then
 elif [[ -d "$TARGET_PATH/.loom" ]]; then
   warning "Loom appears to be already installed in this repository"
   echo ""
-  info "Reinstall will uninstall the existing installation first, then perform"
-  info "a fresh install and create a PR with the changes."
+  if [[ "$INSTALL_TYPE" == "1" ]]; then
+    info "Reinstall will uninstall the existing installation first, then perform"
+    info "a fresh Quick Install."
+  else
+    info "Reinstall will uninstall the existing installation first, then perform"
+    info "a fresh install and create a PR with the changes."
+  fi
   echo ""
 
   if [[ "$NON_INTERACTIVE" != true ]]; then
@@ -349,7 +404,29 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   success "Existing installation removed"
   echo ""
 
-  # Delegate to Full Install (creates worktree + PR)
+  # If --quick was specified, do a quick reinstall instead of full workflow
+  if [[ "$INSTALL_TYPE" == "1" ]]; then
+    info "Running fresh Quick Install..."
+    echo ""
+
+    # Check if loom-daemon is built
+    if [[ ! -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
+      warning "loom-daemon binary not found"
+      info "Building loom-daemon (this may take a minute)..."
+      cd "$LOOM_ROOT"
+      pnpm daemon:build || error "Failed to build loom-daemon"
+      echo ""
+    fi
+
+    # Run loom-daemon init
+    "$LOOM_ROOT/target/release/loom-daemon" init "$TARGET_PATH" || \
+      error "Installation failed"
+    echo ""
+    success "Quick reinstallation complete!"
+    exit 0
+  fi
+
+  # Default: delegate to Full Install (creates worktree + PR)
   info "Running fresh install via Full Install workflow..."
   echo ""
   INSTALL_FLAGS=()
@@ -403,38 +480,54 @@ else
   info "Non-interactive mode: proceeding with installation"
 fi
 
-echo ""
-header "Installation Options"
-echo ""
-echo "1. Quick Install (Direct)"
-echo "   - Fast installation using loom-daemon init"
-echo "   - No GitHub issue or PR created"
-echo "   - Good for personal projects or quick testing"
-echo ""
-echo "2. Full Install (Workflow)"
-echo "   - Creates GitHub issue to track installation"
-echo "   - Uses git worktree for clean separation"
-echo "   - Syncs labels and creates PR for review"
-echo "   - Recommended for team projects"
-echo ""
-
-# Retry loop for method selection (up to 3 attempts)
-METHOD=""
-for attempt in 1 2 3; do
-  read -r -p "Choose installation method [1/2]: " -n 1 METHOD
+# Determine installation method
+if [[ -n "$INSTALL_TYPE" ]]; then
+  # Installation type was specified via --quick or --full flag
+  METHOD="$INSTALL_TYPE"
+  if [[ "$METHOD" == "1" ]]; then
+    info "Using Quick Install (via --quick flag)"
+  else
+    info "Using Full Install (via --full flag)"
+  fi
+elif [[ "$NON_INTERACTIVE" == true ]]; then
+  # Non-interactive mode without explicit type defaults to quick install
+  METHOD="1"
+  info "Non-interactive mode: defaulting to Quick Install"
+else
+  # Interactive mode: show options and prompt
+  echo ""
+  header "Installation Options"
+  echo ""
+  echo "1. Quick Install (Direct)"
+  echo "   - Fast installation using loom-daemon init"
+  echo "   - No GitHub issue or PR created"
+  echo "   - Good for personal projects or quick testing"
+  echo ""
+  echo "2. Full Install (Workflow)"
+  echo "   - Creates GitHub issue to track installation"
+  echo "   - Uses git worktree for clean separation"
+  echo "   - Syncs labels and creates PR for review"
+  echo "   - Recommended for team projects"
   echo ""
 
-  if [[ "$METHOD" == "1" || "$METHOD" == "2" ]]; then
-    break
-  fi
-
-  if [[ $attempt -lt 3 ]]; then
-    warning "Invalid choice '$METHOD'. Please enter 1 or 2."
+  # Retry loop for method selection (up to 3 attempts)
+  METHOD=""
+  for attempt in 1 2 3; do
+    read -r -p "Choose installation method [1/2]: " -n 1 METHOD
     echo ""
-  else
-    error "Invalid choice after 3 attempts. Please run again and select 1 or 2."
-  fi
-done
+
+    if [[ "$METHOD" == "1" || "$METHOD" == "2" ]]; then
+      break
+    fi
+
+    if [[ $attempt -lt 3 ]]; then
+      warning "Invalid choice '$METHOD'. Please enter 1 or 2."
+      echo ""
+    else
+      error "Invalid choice after 3 attempts. Please run again and select 1 or 2."
+    fi
+  done
+fi
 
 echo ""
 
