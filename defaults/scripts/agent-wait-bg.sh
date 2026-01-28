@@ -22,10 +22,12 @@
 #
 # Usage:
 #   agent-wait-bg.sh <name> [--timeout <s>] [--poll-interval <s>] [--issue <N>] [--json]
+#                    [--phase <phase>] [--worktree <path>] [--pr <N>]
 #
 # Examples:
 #   agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
 #   agent-wait-bg.sh shepherd-1 --poll-interval 10 --json
+#   agent-wait-bg.sh builder-issue-42 --phase builder --worktree .loom/worktrees/issue-42 --pr 123
 #   LOOM_STUCK_WARNING=180 LOOM_STUCK_ACTION=pause agent-wait-bg.sh builder-1
 
 set -euo pipefail
@@ -75,6 +77,10 @@ ${YELLOW}OPTIONS:${NC}
     --poll-interval <seconds>  Time between signal checks (default: $DEFAULT_SIGNAL_POLL)
     --issue <N>                Issue number for per-issue abort checking
     --grace-period <seconds>   Time to wait after completion detection (default: $DEFAULT_GRACE_PERIOD)
+    --phase <phase>            Explicit phase for completion detection (builder, judge, curator, doctor)
+                               Overrides session name extraction when provided
+    --worktree <path>          Worktree path for builder phase (enables worktree-based validation)
+    --pr <N>                   PR number for judge/doctor phases (enables PR state validation)
     --json                     Output result as JSON
     --help                     Show this help message
 
@@ -107,6 +113,10 @@ ${YELLOW}STUCK DETECTION:${NC}
 ${YELLOW}EXAMPLES:${NC}
     agent-wait-bg.sh builder-issue-42 --timeout 1800 --issue 42
     agent-wait-bg.sh curator-issue-10 --poll-interval 10 --json
+
+    # With explicit phase context (recommended for shepherd orchestration)
+    agent-wait-bg.sh builder-issue-42 --phase builder --worktree .loom/worktrees/issue-42
+    agent-wait-bg.sh judge-issue-42 --phase judge --pr 123
 
     # With custom stuck thresholds
     LOOM_STUCK_WARNING=180 LOOM_STUCK_ACTION=pause agent-wait-bg.sh builder-1
@@ -320,11 +330,15 @@ extract_phase_from_session() {
 # Sets COMPLETION_REASON global variable with the detected pattern
 #
 # The function is phase-aware: it only checks patterns relevant to the
-# current phase (extracted from session name) to avoid false matches.
-# For example, a judge reviewing a PR with loom:review-requested won't
-# incorrectly match the builder_pr_created pattern.
+# current phase to avoid false matches. For example, a judge reviewing
+# a PR with loom:review-requested won't incorrectly match the
+# builder_pr_created pattern.
+#
+# Usage: check_completion_patterns <session_name> [explicit_phase]
+#   If explicit_phase is provided, it takes precedence over session name extraction.
 check_completion_patterns() {
     local session_name="$1"
+    local explicit_phase="${2:-}"
     local log_file="${REPO_ROOT}/.loom/logs/${session_name}.log"
 
     if [[ ! -f "$log_file" ]]; then
@@ -339,9 +353,13 @@ check_completion_patterns() {
         return 1
     fi
 
-    # Extract phase from session name for phase-aware pattern matching
+    # Use explicit phase if provided, otherwise extract from session name
     local phase
-    phase=$(extract_phase_from_session "$session_name")
+    if [[ -n "$explicit_phase" ]]; then
+        phase="$explicit_phase"
+    else
+        phase=$(extract_phase_from_session "$session_name")
+    fi
 
     # Generic completion: /exit command detected (always checked regardless of phase)
     # More robust pattern to catch various prompt styles and formatting
@@ -448,6 +466,9 @@ main() {
     local issue=""
     local grace_period="$DEFAULT_GRACE_PERIOD"
     local json_output=false
+    local explicit_phase=""
+    local worktree=""
+    local pr_number=""
 
     if [[ $# -lt 1 ]]; then
         show_help
@@ -475,6 +496,18 @@ main() {
                 grace_period="$2"
                 shift 2
                 ;;
+            --phase)
+                explicit_phase="$2"
+                shift 2
+                ;;
+            --worktree)
+                worktree="$2"
+                shift 2
+                ;;
+            --pr)
+                pr_number="$2"
+                shift 2
+                ;;
             --json)
                 json_output=true
                 shift
@@ -492,6 +525,11 @@ main() {
 
     log_info "Waiting for agent '$name' with signal checking (poll: ${poll_interval}s, timeout: ${timeout}s)"
     log_info "Stuck detection: warning=${STUCK_WARNING_THRESHOLD}s, critical=${STUCK_CRITICAL_THRESHOLD}s, action=${STUCK_ACTION}"
+    if [[ -n "$explicit_phase" ]]; then
+        log_info "Phase context: $explicit_phase (explicit)"
+        [[ -n "$worktree" ]] && log_info "  worktree: $worktree"
+        [[ -n "$pr_number" ]] && log_info "  PR: #$pr_number"
+    fi
 
     # Launch agent-wait.sh in the background
     "${SCRIPT_DIR}/agent-wait.sh" "$name" --timeout "$timeout" --poll-interval "$poll_interval" --json &
@@ -566,7 +604,7 @@ main() {
 
         # Check for completion patterns in log (backup detection)
         if [[ "$completion_detected" != "true" ]]; then
-            if check_completion_patterns "$session_name"; then
+            if check_completion_patterns "$session_name" "$explicit_phase"; then
                 completion_detected=true
                 completion_time=$(date +%s)
                 # Only warn about grace period for role-specific patterns, not explicit /exit
