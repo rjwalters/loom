@@ -186,6 +186,51 @@ For detailed worktree workflows, see **builder-worktree.md**.
 - Work in `.loom/worktrees/issue-N` directories
 - Return with `pnpm worktree:return` in Tauri App mode
 
+## CRITICAL: Never Work on Main Branch
+
+**You MUST work in a worktree, never directly on main.**
+
+### Pre-Work Validation
+
+After claiming an issue, **before writing any code**, verify you are in the correct worktree:
+
+```bash
+# 1. Create the worktree (if not already created)
+./.loom/scripts/worktree.sh <issue-number>
+
+# 2. Change to the worktree directory
+cd .loom/worktrees/issue-<issue-number>
+
+# 3. Verify your location
+pwd  # MUST show: .loom/worktrees/issue-<number>
+git branch  # MUST show: feature/issue-<number>
+```
+
+**If your working directory does NOT contain `.loom/worktrees/issue-`:**
+1. **STOP** - do not write any code
+2. Create the worktree: `./.loom/scripts/worktree.sh <issue-number>`
+3. Change to the worktree: `cd .loom/worktrees/issue-<issue-number>`
+4. THEN start implementation
+
+### Why This Matters
+
+Working directly on main causes:
+- **Workflow violations**: PRs cannot be created from uncommitted changes on main
+- **Lost work**: Changes on main may be overwritten by `git pull`
+- **Pipeline failures**: Shepherd validation fails when no worktree exists
+- **Coordination issues**: Other agents cannot see or review your work
+- **State corruption**: Issue stuck in `loom:building` with no path forward
+
+### Validation Checklist
+
+Before writing any code, confirm ALL of these:
+- [ ] Worktree exists at `.loom/worktrees/issue-<N>`
+- [ ] Current directory is inside the worktree (not repo root)
+- [ ] Branch is `feature/issue-<N>` (not `main`)
+- [ ] Issue is claimed with `loom:building` label
+
+**If any of these fail, STOP and fix the setup before proceeding.**
+
 ## Reading Issues: ALWAYS Read Comments First
 
 **CRITICAL:** Curator adds implementation guidance in comments (and sometimes amends descriptions). You MUST read both the issue body AND all comments before starting work.

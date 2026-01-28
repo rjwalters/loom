@@ -254,19 +254,35 @@ $log_tail
 "
     fi
 
-    # 4. Potential causes based on state
+    # 4. Check for uncommitted changes on main (common workflow violation)
+    local main_changes=""
+    main_changes=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null) || true
+    if [[ -n "$main_changes" ]]; then
+        diagnostics+="
+**⚠️ WARNING: Uncommitted changes detected on main branch**:
+\`\`\`
+$(echo "$main_changes" | head -10)
+\`\`\`
+This suggests the builder may have worked directly on main instead of in a worktree.
+This is a workflow violation - builders MUST work in worktrees.
+"
+    fi
+
+    # 5. Potential causes based on state
     diagnostics+="
 **Possible causes**:
 "
     if [[ ! -d "$worktree_path" ]]; then
         diagnostics+="- Worktree was never created (agent may have failed early)
 - Worktree creation script failed
+- **Agent worked on main instead of worktree** (check for uncommitted changes on main)
 "
     elif [[ "${commits_ahead:-0}" == "0" ]]; then
         diagnostics+="- Builder exited without making any commits
 - Builder may have determined issue was invalid or already resolved
 - Builder may have encountered an error during implementation
 - Builder may have timed out before completing work
+- **Agent may have worked on main instead of worktree** (check for uncommitted changes on main)
 "
     fi
 
@@ -309,6 +325,23 @@ validate_curator() {
 }
 
 validate_builder() {
+    # Pre-check: Detect if builder worked on main instead of worktree (workflow violation)
+    # This catches the common failure mode where agents forget to create/use worktrees
+    if [[ -n "$WORKTREE" ]] && [[ ! -d "$WORKTREE" ]]; then
+        local main_changes
+        main_changes=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null) || true
+        if [[ -n "$main_changes" ]]; then
+            echo -e "${RED}⚠️ WORKFLOW VIOLATION DETECTED${NC}"
+            echo -e "${RED}Builder appears to have worked on main instead of in a worktree.${NC}"
+            echo -e "${YELLOW}Uncommitted changes on main:${NC}"
+            echo "$main_changes" | head -10
+            echo ""
+            echo -e "${YELLOW}Expected worktree path: $WORKTREE${NC}"
+            echo ""
+            # Don't fail immediately - continue with normal validation which will gather diagnostics
+        fi
+    fi
+
     # First: Check if issue is already closed (builder may have resolved without PR)
     # This is valid for verification tasks, documentation issues, research tasks, etc.
     local issue_state
