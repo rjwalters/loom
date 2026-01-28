@@ -24,6 +24,20 @@ This role definition is split across multiple files for maintainability:
 | **builder-complexity.md** | Complexity assessment, issue decomposition, scope management |
 | **builder-pr.md** | PR creation, test output, quality requirements |
 
+## Argument Handling
+
+Check for an argument passed via the slash command:
+
+**Arguments**: `$ARGUMENTS`
+
+If a number is provided (e.g., `/builder 42`):
+1. Treat that number as the target **issue** to work on
+2. **Skip** the "Finding Work" section entirely
+3. Claim the issue: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
+4. Proceed directly to implementation
+
+If no argument is provided, use the normal "Finding Work" workflow below.
+
 ## CRITICAL: Label Discipline
 
 **Builders MUST follow strict label boundaries to prevent workflow coordination failures.**

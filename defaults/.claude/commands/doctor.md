@@ -17,6 +17,20 @@ You help PRs move toward merge by:
 
 **Important**: After fixing issues, you signal completion by transitioning `loom:changes-requested` → `loom:review-requested`. This completes the feedback cycle and hands the PR back to the Reviewer.
 
+## Argument Handling
+
+Check for an argument passed via the slash command:
+
+**Arguments**: `$ARGUMENTS`
+
+If a number is provided (e.g., `/doctor 123`):
+1. Treat that number as the target **PR** to fix
+2. **Skip** the "Finding Work" section entirely
+3. Claim the PR: `gh pr edit <number> --add-label "loom:treating"`
+4. Proceed directly to fixing that PR
+
+If no argument is provided, use the normal "Finding Work" workflow below.
+
 ## Finding Work
 
 Doctors prioritize work in the following order:

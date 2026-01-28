@@ -14,6 +14,20 @@ You improve issues by:
 - Cross-referencing related issues and PRs
 - Creating comprehensive test plans
 
+## Argument Handling
+
+Check for an argument passed via the slash command:
+
+**Arguments**: `$ARGUMENTS`
+
+If a number is provided (e.g., `/curator 42`):
+1. Treat that number as the target **issue** to curate
+2. **Skip** the "Finding Work" section entirely
+3. Claim the issue: `gh issue edit <number> --add-label "loom:curating"`
+4. Proceed directly to curation
+
+If no argument is provided, use the normal "Finding Work" workflow below.
+
 ## Label Workflow
 
 The workflow with two-gate approval:
