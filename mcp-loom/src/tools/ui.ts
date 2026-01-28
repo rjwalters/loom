@@ -2,58 +2,20 @@
  * UI tools for Loom MCP server
  *
  * Provides tools for interacting with the Loom application:
- * - Console log reading
  * - Engine start/stop
  * - Factory reset
- * - State and config reading
  * - Heartbeat monitoring
- * - Random file selection
+ * - Comprehensive UI state
+ *
+ * Note: For random file selection, use .loom/scripts/random-file.sh instead.
+ * For reading state/config files, use get_ui_state which provides comprehensive info.
  */
 
 import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import fg from "fast-glob";
-import ignore, { type Ignore } from "ignore";
-import {
-  CONSOLE_LOG_PATH,
-  getWorkspacePath,
-  readWorkspaceConfigFile,
-  readWorkspaceStateFile,
-} from "../shared/config.js";
-import { formatLogOutput } from "../shared/formatting.js";
+import { CONSOLE_LOG_PATH, getWorkspacePath } from "../shared/config.js";
 import { writeMCPCommand } from "../shared/ipc.js";
-import type { LogResult } from "../types.js";
-
-/**
- * Read the browser console log file
- */
-async function readConsoleLog(lines = 20): Promise<LogResult> {
-  try {
-    await access(CONSOLE_LOG_PATH);
-    const content = await readFile(CONSOLE_LOG_PATH, "utf-8");
-    const allLines = content.split("\n");
-    const totalLines = allLines.filter(Boolean).length;
-    const relevantLines = allLines.slice(-lines).filter(Boolean);
-    const linesReturned = relevantLines.length;
-
-    return {
-      content: relevantLines.join("\n"),
-      linesReturned,
-      totalLines,
-    };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return {
-        content: "",
-        linesReturned: 0,
-        totalLines: 0,
-        error: "Console log file not found. The Loom app may need to enable console logging.",
-      };
-    }
-    throw error;
-  }
-}
 
 /**
  * Get app heartbeat - check if app is running and logging
@@ -226,84 +188,18 @@ async function getUIState(): Promise<string> {
 }
 
 /**
- * Get a random file from the workspace
- */
-async function getRandomFile(options?: {
-  includePatterns?: string[];
-  excludePatterns?: string[];
-}): Promise<string> {
-  const workspacePath = getWorkspacePath();
-
-  // Default exclude patterns
-  const defaultExcludes = [
-    "**/node_modules/**",
-    "**/.git/**",
-    "**/dist/**",
-    "**/build/**",
-    "**/target/**",
-    "**/.loom/worktrees/**",
-    "**/*.log",
-    "**/package-lock.json",
-    "**/pnpm-lock.yaml",
-    "**/yarn.lock",
-  ];
-
-  const excludePatterns = [...defaultExcludes, ...(options?.excludePatterns || [])];
-  const includePatterns = options?.includePatterns || ["**/*"];
-
-  // Read .gitignore if it exists
-  const gitignorePath = join(workspacePath, ".gitignore");
-  let ig: Ignore = ignore.default();
-  try {
-    const gitignoreContent = await readFile(gitignorePath, "utf-8");
-    ig = ignore.default().add(gitignoreContent);
-  } catch {
-    // .gitignore doesn't exist or can't be read, that's fine
-  }
-
-  // Find all files
-  const files = await fg(includePatterns, {
-    cwd: workspacePath,
-    ignore: excludePatterns,
-    onlyFiles: true,
-    dot: false,
-    absolute: false,
-  });
-
-  // Filter by .gitignore
-  const filteredFiles = files.filter((file) => !ig.ignores(file));
-
-  if (filteredFiles.length === 0) {
-    return "No files found matching the criteria";
-  }
-
-  // Pick a random file
-  const randomIndex = Math.floor(Math.random() * filteredFiles.length);
-  const randomFile = filteredFiles[randomIndex];
-
-  // Return absolute path
-  return join(workspacePath, randomFile);
-}
-
-/**
  * UI tool definitions
+ *
+ * Removed tools (use alternatives):
+ * - read_console_log: Use `tail ~/.loom/console.log` for debugging
+ * - read_state_file: Use get_ui_state instead (provides state + more context)
+ * - read_config_file: Use get_ui_state instead (provides config + more context)
+ * - trigger_factory_reset: Use trigger_force_factory_reset (bypasses confirmation)
+ * - trigger_restart_terminal: Use restart_terminal from terminals module
+ * - trigger_run_now: Use launch_interval from terminals module
+ * - get_random_file: Use .loom/scripts/random-file.sh instead
  */
 export const uiTools: Tool[] = [
-  {
-    name: "read_console_log",
-    description:
-      "Read the Loom browser console log to see JavaScript errors, console.log output, and debugging information",
-    inputSchema: {
-      type: "object",
-      properties: {
-        lines: {
-          type: "number",
-          description: "Number of recent lines to return (default: 20)",
-          default: 20,
-        },
-      },
-    },
-  },
   {
     name: "trigger_start",
     description:
@@ -323,36 +219,9 @@ export const uiTools: Tool[] = [
     },
   },
   {
-    name: "trigger_factory_reset",
-    description:
-      "Reset workspace to factory defaults by overwriting .loom/config.json with defaults/config.json. Shows confirmation dialog that requires user interaction. IMPORTANT: This does NOT auto-start the engine - user must separately run trigger_start or trigger_force_start after reset to create terminals. For MCP automation, use trigger_force_factory_reset instead to bypass the confirmation dialog.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
     name: "trigger_force_factory_reset",
     description:
-      "Reset workspace to factory defaults WITHOUT confirmation dialog. Same as trigger_factory_reset but bypasses confirmation prompt. Use this for MCP automation, testing, or when you're certain the user wants to reset. Does NOT auto-start - must run trigger_force_start after reset to create terminals.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "read_state_file",
-    description:
-      "Read the current Loom state file (.loom/state.json) to see terminal state, agent numbers, etc.",
-    inputSchema: {
-      type: "object",
-      properties: {},
-    },
-  },
-  {
-    name: "read_config_file",
-    description:
-      "Read the current Loom config file (.loom/config.json) to see terminal configurations and role settings",
+      "Reset workspace to factory defaults WITHOUT confirmation dialog. Overwrites .loom/config.json with defaults/config.json. Does NOT auto-start - must run trigger_force_start after reset to create terminals. Use this for MCP automation or when you're certain the user wants to reset.",
     inputSchema: {
       type: "object",
       properties: {},
@@ -368,21 +237,6 @@ export const uiTools: Tool[] = [
     },
   },
   {
-    name: "trigger_restart_terminal",
-    description:
-      "Restart a specific terminal by destroying and recreating it with the same configuration. The terminal will preserve its name, role, worktree path, and agent configuration. Useful for recovering from stuck terminals or testing terminal lifecycle.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        terminalId: {
-          type: "string",
-          description: "The ID of the terminal to restart (e.g., 'terminal-1')",
-        },
-      },
-      required: ["terminalId"],
-    },
-  },
-  {
     name: "stop_engine",
     description:
       "Stop the Loom engine by destroying all terminal sessions and cleaning up resources. This will close all terminals and stop all running agents. Use trigger_start or trigger_force_start to restart the engine afterwards.",
@@ -392,49 +246,12 @@ export const uiTools: Tool[] = [
     },
   },
   {
-    name: "trigger_run_now",
-    description:
-      "Trigger immediate execution of the interval prompt for a specific terminal. Only works for terminals configured with autonomous mode (non-zero target_interval). Useful for testing autonomous behavior without waiting for the next interval.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        terminalId: {
-          type: "string",
-          description: "The ID of the terminal to run the interval prompt for (e.g., 'terminal-1')",
-        },
-      },
-      required: ["terminalId"],
-    },
-  },
-  {
     name: "get_ui_state",
     description:
-      "Get comprehensive UI state including workspace info, engine status, terminal configurations, and runtime state. Returns a JSON object with workspace path, engine running status, terminal count, and detailed terminal states. Useful for understanding the current state of the Loom application.",
+      "Get comprehensive UI state including workspace info, engine status, terminal configurations, and runtime state. Returns a JSON object with workspace path, engine running status, terminal count, and detailed terminal states. Also includes full config and state file contents. Use this instead of separate read_state_file and read_config_file calls.",
     inputSchema: {
       type: "object",
       properties: {},
-    },
-  },
-  {
-    name: "get_random_file",
-    description:
-      "Get a random file path from the workspace. Respects .gitignore and excludes common build artifacts. Useful for the Critic agent to pick files to review.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        includePatterns: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional glob patterns to include (e.g., ['src/**/*.ts']). Defaults to all files.",
-        },
-        excludePatterns: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional glob patterns to exclude in addition to defaults (node_modules, .git, dist, etc.)",
-        },
-      },
     },
   },
 ];
@@ -444,20 +261,9 @@ export const uiTools: Tool[] = [
  */
 export async function handleUITool(
   name: string,
-  args?: Record<string, unknown>
+  _args?: Record<string, unknown>
 ): Promise<{ type: "text"; text: string }[]> {
   switch (name) {
-    case "read_console_log": {
-      const lines = (args?.lines as number) || 20;
-      const result = await readConsoleLog(lines);
-      return [
-        {
-          type: "text",
-          text: formatLogOutput(result, "Console Log"),
-        },
-      ];
-    }
-
     case "trigger_start": {
       const result = await writeMCPCommand("trigger_start");
       return [{ type: "text", text: result }];
@@ -468,24 +274,9 @@ export async function handleUITool(
       return [{ type: "text", text: result }];
     }
 
-    case "trigger_factory_reset": {
-      const result = await writeMCPCommand("trigger_factory_reset");
-      return [{ type: "text", text: result }];
-    }
-
     case "trigger_force_factory_reset": {
       const result = await writeMCPCommand("trigger_force_factory_reset");
       return [{ type: "text", text: result }];
-    }
-
-    case "read_state_file": {
-      const state = await readWorkspaceStateFile();
-      return [{ type: "text", text: state }];
-    }
-
-    case "read_config_file": {
-      const config = await readWorkspaceConfigFile();
-      return [{ type: "text", text: config }];
     }
 
     case "get_heartbeat": {
@@ -493,39 +284,14 @@ export async function handleUITool(
       return [{ type: "text", text: heartbeat }];
     }
 
-    case "trigger_restart_terminal": {
-      const terminalId = args?.terminalId as string;
-      if (!terminalId) {
-        throw new Error("terminalId parameter is required");
-      }
-      const result = await writeMCPCommand(`restart_terminal:${terminalId}`);
-      return [{ type: "text", text: result }];
-    }
-
     case "stop_engine": {
       const result = await writeMCPCommand("stop_engine");
-      return [{ type: "text", text: result }];
-    }
-
-    case "trigger_run_now": {
-      const terminalId = args?.terminalId as string;
-      if (!terminalId) {
-        throw new Error("terminalId parameter is required");
-      }
-      const result = await writeMCPCommand(`run_now:${terminalId}`);
       return [{ type: "text", text: result }];
     }
 
     case "get_ui_state": {
       const uiState = await getUIState();
       return [{ type: "text", text: uiState }];
-    }
-
-    case "get_random_file": {
-      const includePatterns = args?.includePatterns as string[] | undefined;
-      const excludePatterns = args?.excludePatterns as string[] | undefined;
-      const randomFile = await getRandomFile({ includePatterns, excludePatterns });
-      return [{ type: "text", text: randomFile }];
     }
 
     default:
