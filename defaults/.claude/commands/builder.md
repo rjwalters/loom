@@ -47,8 +47,17 @@ If no argument is provided, use the normal "Finding Work" workflow below.
 | Action | Remove | Add |
 |--------|--------|-----|
 | Claim issue | `loom:issue` | `loom:building` |
-| Block issue | - | `loom:blocked` |
+| Block issue | `loom:building` | `loom:blocked` |
 | Create PR | - | `loom:review-requested` (on new PR only) |
+
+**IMPORTANT**: `loom:building` and `loom:blocked` are **mutually exclusive** - an issue cannot be in both states. Always use atomic transitions:
+```bash
+# CORRECT: Atomic transition to blocked state
+gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
+
+# WRONG: Leaves issue in invalid state with both labels
+gh issue edit <number> --add-label "loom:blocked"
+```
 
 ### Labels You NEVER Touch
 
@@ -326,9 +335,9 @@ Open the issue and look for:
 If you discover a dependency while working:
 
 1. **Add Dependencies section** to the issue
-2. **Mark as blocked**:
+2. **Mark as blocked** (atomic transition from building to blocked):
    ```bash
-   gh issue edit <number> --add-label "loom:blocked"
+   gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
    ```
 3. **Create comment** explaining the dependency
 4. **Wait** for dependency to be resolved, or switch to another issue
