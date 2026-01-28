@@ -227,7 +227,7 @@ PR_NUMBER=$(gh pr list --label "loom:review-requested" --json number --jq '.[0].
 
 if [ -n "$PR_NUMBER" ]; then
   echo "Merging Loom installation PR #$PR_NUMBER..."
-  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --admin || {
+  ./.loom/scripts/merge-pr.sh "$PR_NUMBER" || {
     echo "WARNING: PR merge may have failed, please check manually"
   }
   echo "Loom installed successfully"
