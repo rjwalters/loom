@@ -161,10 +161,12 @@ EOF
 }
 
 # Helper: mark issue as blocked
+# Uses atomic transition: loom:building -> loom:blocked (mutually exclusive states)
 mark_blocked() {
     local reason="$1"
     local diagnostics="${2:-}"
-    gh issue edit "$ISSUE" --add-label "loom:blocked" 2>/dev/null || true
+    # Atomic transition to prevent state machine violation
+    gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" 2>/dev/null || true
     local comment_body="**Phase contract failed**: \`$PHASE\` phase did not produce expected outcome. $reason"
     if [[ -n "$diagnostics" ]]; then
         comment_body="$comment_body

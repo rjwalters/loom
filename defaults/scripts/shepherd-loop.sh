@@ -775,7 +775,8 @@ main() {
 
             if [[ $doctor_attempts -ge $DOCTOR_MAX_RETRIES ]]; then
                 log_error "Doctor max retries ($DOCTOR_MAX_RETRIES) exceeded"
-                add_label "$ISSUE" "loom:blocked"
+                # Atomic transition: loom:building -> loom:blocked (mutually exclusive states)
+                gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
                 gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor could not resolve Judge feedback after $DOCTOR_MAX_RETRIES attempts." >/dev/null 2>&1 || true
                 fail_with_reason "doctor" "max retries ($DOCTOR_MAX_RETRIES) exceeded"
             fi
@@ -845,7 +846,8 @@ main() {
             log_success "PR #$pr_number merged successfully"
         else
             log_error "Failed to merge PR #$pr_number"
-            add_label "$ISSUE" "loom:blocked"
+            # Atomic transition: loom:building -> loom:blocked (mutually exclusive states)
+            gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to merge PR #$pr_number. Branch may be out of date or have merge conflicts." >/dev/null 2>&1 || true
             fail_with_reason "merge" "failed to merge PR #$pr_number"
         fi
