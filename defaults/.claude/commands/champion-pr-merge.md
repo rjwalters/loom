@@ -350,7 +350,7 @@ fi
 
 **Merge strategy**:
 - **`--squash`**: Combines all commits into single commit (clean history)
-- **`--auto`**: Enables GitHub's auto-merge if branch protection requires wait
+- **`--auto`**: Enables GitHub's auto-merge if ruleset requires wait
 - **`--delete-branch`**: Automatically removes feature branch after merge
 
 ### Step 4: Verify Issue Auto-Close
