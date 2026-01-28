@@ -9,7 +9,6 @@
 #   --cleanup-worktree   Remove local worktree after successful merge
 #   --dry-run            Show what would happen without merging
 #   --auto               Enable auto-merge instead of immediate merge
-#   --admin              Bypass branch protection (requires admin access)
 #
 # Exit codes:
 #   0 = merged (or auto-merge enabled)
@@ -42,15 +41,13 @@ PR_NUMBER=""
 CLEANUP_WORKTREE=false
 DRY_RUN=false
 AUTO_MERGE=false
-ADMIN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cleanup-worktree) CLEANUP_WORKTREE=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --auto) AUTO_MERGE=true; shift ;;
-    --admin) ADMIN=true; shift ;;
-    -*)  error "Unknown option: $1" ;;
+-*)  error "Unknown option: $1" ;;
     *)
       if [[ -z "$PR_NUMBER" ]]; then
         PR_NUMBER="$1"
@@ -62,7 +59,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--cleanup-worktree] [--dry-run] [--auto] [--admin]"
+[[ -z "$PR_NUMBER" ]] && error "Usage: merge-pr.sh <pr-number> [--cleanup-worktree] [--dry-run] [--auto]"
 [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || error "PR number must be numeric: $PR_NUMBER"
 
 # Fetch PR state
