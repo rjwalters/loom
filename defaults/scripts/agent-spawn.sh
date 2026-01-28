@@ -428,13 +428,19 @@ EOF
     # Verify the command was actually processed.
     # Claude Code renders the ❯ prompt character as part of its TUI layout BEFORE
     # the input handler is ready, so we may have sent the command too early.
-    # Poll for processing indicators and re-send Enter if the command appears stuck.
+    # Poll for processing indicators to confirm the command is being handled.
+    #
+    # IMPORTANT: We do NOT re-send Enter if the command text is still visible.
+    # The command text often remains visible in terminal scrollback even after
+    # Claude has started processing (it appears in conversation history). Re-sending
+    # Enter mid-processing can cause issues. If the command wasn't consumed, the
+    # session will show no processing indicators and we log a warning.
     local verify_elapsed=0
-    local verify_max=8
+    local verify_max=10
     local command_processed=false
     log_info "Verifying command was processed..."
 
-    sleep 2  # Initial wait for processing to begin
+    sleep 3  # Grace period: Claude needs time to parse skill and load context
 
     while [[ $verify_elapsed -lt $verify_max ]]; do
         local pane_content
@@ -446,14 +452,8 @@ EOF
         # - Tool use indicators
         if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
             command_processed=true
-            log_info "Command processing confirmed after $((verify_elapsed + 2))s"
+            log_info "Command processing confirmed after $((verify_elapsed + 3))s"
             break
-        fi
-
-        # If the slash command text is still visible at the prompt, it wasn't consumed
-        if echo "$pane_content" | grep -qF "$role_cmd"; then
-            log_warn "Command still at prompt (attempt $((verify_elapsed + 1))), re-sending Enter..."
-            tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-m
         fi
 
         sleep 1
@@ -461,7 +461,7 @@ EOF
     done
 
     if [[ "$command_processed" != "true" ]]; then
-        log_warn "Could not confirm command processing within $((verify_max + 2))s (agent may still be starting)"
+        log_warn "Could not confirm command processing within $((verify_max + 3))s (agent may still be starting)"
     fi
 
     log_success "Agent spawned successfully"
