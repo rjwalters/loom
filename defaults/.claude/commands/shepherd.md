@@ -32,33 +32,19 @@ For detailed step-by-step workflow examples, MCP terminal triggering sequences, 
 - They do their one job and don't know about orchestration
 - Only YOU coordinate terminals and manage workflow progression
 
-### Two Execution Modes
+### tmux-Based Worker Execution
 
-The orchestrator operates in one of two modes depending on the environment:
-
-**MCP Mode** (Tauri App):
-- Triggers separate role terminals via MCP
-- Each role runs in isolation with fresh context
-- Supports parallelism (multiple agents simultaneously)
-- Requires Loom desktop app running
-
-**Direct Mode** (Task Subagent Execution):
-- Spawns each role phase as a Task subagent with fresh context
+The shepherd spawns each role phase as an ephemeral tmux session using `agent-spawn.sh`:
+- Each phase runs in its own tmux session with fresh context
+- Sessions are attachable for live observation (`tmux -L loom attach -t loom-builder-issue-42`)
 - Sequential execution through orchestration phases
-- Fresh context per subagent (no accumulation between phases)
-- Works anywhere Claude Code runs (no additional dependencies)
+- Completion detection via `agent-wait.sh` (process tree inspection)
+- Cleanup via `agent-destroy.sh` after each phase
 
 ### Fresh Context Per Phase
-- Each role phase runs with fresh context (no accumulated pollution)
-- In MCP Mode: Terminal is restarted before triggering each phase
-- In Direct Mode: Each phase spawns as a Task subagent with clean context
+- Each role phase runs in a fresh tmux Claude session (no accumulated pollution)
+- The shepherd spawns a new session per phase, waits for completion, then destroys it
 - This ensures maximum cognitive clarity for each phase
-
-### Platform Agnostic
-- You trigger terminals via MCP, you don't care what LLM runs in them
-- Each terminal can be Claude, GPT, or any other LLM
-- Coordination is through labels and MCP, not LLM-specific APIs
-- In Direct Mode, you spawn Task subagents that execute roles with fresh context
 
 ## Command Options
 
@@ -111,57 +97,19 @@ Curator -> [auto-approve] -> Builder -> Judge -> [resolve conflicts] -> [auto-me
 
 **Warning**: Force-merge mode auto-merges PRs after Judge approval without waiting for human confirmation.
 
-## Execution Mode Detection
+## Orchestration Announcement
 
-At orchestration start, detect which mode to use:
+Always announce orchestration at start:
 
-```bash
-# Attempt MCP call to detect Loom Tauri app
-if mcp__loom__get_ui_state >/dev/null 2>&1; then
-  MODE="mcp"
-  echo "MCP Mode: Loom app detected, will delegate to role terminals"
-else
-  MODE="direct"
-  echo "Direct Mode: Spawning each phase as a Task subagent with fresh context"
-fi
-```
-
-### Mode Announcement
-
-Always inform the user which mode is active at orchestration start:
-
-**MCP Mode (Tauri App):**
 ```
 ## Loom Orchestration Started
 
-**Mode**: MCP (Tauri App)
+**Mode**: tmux workers
 **Issue**: #123 - [Title]
 **Phases**: Curator -> Approval -> Builder -> Judge -> Merge
 
-Will delegate each phase to configured role terminals.
+Each phase runs as an ephemeral tmux session (attachable for observation).
 ```
-
-**Direct Mode (Task Subagent Execution):**
-```
-## Loom Orchestration Started
-
-**Mode**: Direct (Task Subagent Execution)
-**Issue**: #123 - [Title]
-**Phases**: Curator -> Approval -> Builder -> Judge -> Merge
-
-Spawning each phase as a Task subagent with fresh context.
-```
-
-**Mode Characteristics:**
-
-| Aspect | MCP Mode | Direct Mode |
-|--------|----------|-------------|
-| Requires | Loom Tauri app running | Claude Code CLI only |
-| Parallelism | Multiple terminals | Sequential phases |
-| Context | Fresh per terminal | Fresh per subagent |
-| Best for | Multi-agent workflows | Single-issue orchestration |
-
-Both modes are fully functional. Direct Mode is the default for CLI-based workflows and works without any additional dependencies.
 
 ## Token Optimization Strategy
 
@@ -180,10 +128,10 @@ Use cheaper models for simpler phases, reserving opus for complex work:
 
 **2. Fresh Context Per Phase**
 
-Each phase starts fresh via Task subagents, preventing context accumulation:
+Each phase starts fresh in its own tmux session, preventing context accumulation:
 - No bloat from previous phase outputs
 - No accumulated conversation history
-- Each subagent receives only what it needs
+- Each worker receives only its slash command
 
 **3. Truncate Verbose Output**
 
@@ -196,81 +144,62 @@ When orchestrating issue #N, follow this progression:
 ```
 /shepherd <issue-number>
 
-0. [Detect Mode]  -> Check if MCP available, announce mode
+0. [Announce]     -> Print orchestration mode and issue info
 1. [Check State]  -> Read issue labels, determine current phase
-2. [Curator]      -> trigger_run_now(curator) OR Task subagent -> wait for loom:curated
+2. [Curator]      -> agent-spawn.sh curator -> agent-wait.sh -> verify loom:curated -> agent-destroy.sh
 3. [Gate 1]       -> Wait for loom:issue (or auto-approve if --force-pr/--force-merge)
-4. [Builder]      -> trigger_run_now(builder) OR Task subagent -> wait for loom:review-requested
-5. [Judge]        -> trigger_run_now(judge) OR Task subagent -> wait for loom:pr or loom:changes-requested
-6. [Doctor loop]  -> If changes requested: Task subagent -> goto 5 (max 3x)
+4. [Builder]      -> agent-spawn.sh builder -> agent-wait.sh -> verify loom:review-requested -> agent-destroy.sh
+5. [Judge]        -> agent-spawn.sh judge -> agent-wait.sh -> verify loom:pr or loom:changes-requested -> agent-destroy.sh
+6. [Doctor loop]  -> If changes requested: agent-spawn.sh doctor -> agent-wait.sh -> goto 5 (max 3x)
 7. [Gate 2]       -> Wait for merge (--force-pr stops here, --force-merge auto-merges)
 8. [Complete]     -> Report success
 ```
 
-**Note**: In Direct Mode, "trigger_run_now" becomes "spawn Task subagent with role-specific slash command".
-
 **Important**: Curation is mandatory. Even if an issue already has `loom:issue` label, the shepherd will run Curator first if `loom:curated` is not present. This ensures all issues receive proper enhancement (acceptance criteria, implementation guidance, test plans) before building begins.
 
-### Direct Mode Role Execution Pattern
+### tmux Worker Execution Pattern
 
-> **IMPORTANT**: In Direct Mode, always use `Task` subagents for phase delegation.
-> Do NOT use the `Skill` tool — it expands the role prompt into your conversation,
-> replacing your orchestration context. Only `Task` preserves your control flow.
->
-> The `Skill` tool is used by the *daemon* to invoke *shepherds* (so the shepherd
-> gets its full role prompt expanded). Shepherds themselves use plain `Task` subagents
-> with slash-command prompts for phase delegation.
-
-For each phase, the shepherd spawns a Task subagent:
+For each phase, the shepherd spawns an ephemeral tmux worker:
 
 1. **Announce the phase**: `"Starting [Role] phase..."`
-2. **Spawn Task subagent**: Use Task tool with role-specific slash command
-3. **Wait for completion**: Task runs synchronously (run_in_background=False)
+2. **Spawn worker**: `agent-spawn.sh --role <role> --name <role>-issue-<N> --args "<N>" --on-demand`
+3. **Wait for completion**: `agent-wait.sh <role>-issue-<N> --timeout 1800`
 4. **Verify completion**: Poll labels to confirm the role completed successfully
-5. **Announce completion**: `"[Role] phase complete"`
+5. **Clean up**: `agent-destroy.sh <role>-issue-<N>`
+6. **Announce completion**: `"[Role] phase complete"`
 
 Example for each phase:
 
-```python
-# Phase-specific model selection:
-# - sonnet: curator, doctor (structured tasks)
-# - opus: builder, judge (complex reasoning)
-
+```bash
 # Curator Phase
-result = Task(
-    description=f"Curate issue #{issue_number}",
-    prompt=f"/curator {issue_number}",
-    subagent_type="general-purpose",
-    model="sonnet",
-    run_in_background=False
-)
+./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
+./.loom/scripts/agent-wait.sh "curator-issue-${ISSUE}" --timeout 600
+# Verify: gh issue view $ISSUE --json labels --jq '.labels[].name' | grep loom:curated
+./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
 
-# Builder Phase
-result = Task(
-    description=f"Build issue #{issue_number}",
-    prompt=f"/builder {issue_number}",
-    subagent_type="general-purpose",
-    model="opus",
-    run_in_background=False
-)
+# Builder Phase (with worktree)
+./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" \
+    --worktree ".loom/worktrees/issue-${ISSUE}" --on-demand
+./.loom/scripts/agent-wait.sh "builder-issue-${ISSUE}" --timeout 1800
+# Verify: gh pr list --search "Closes #$ISSUE" to find PR
+./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
 
 # Judge Phase
-result = Task(
-    description=f"Review PR #{pr_number}",
-    prompt=f"/judge {pr_number}",
-    subagent_type="general-purpose",
-    model="opus",
-    run_in_background=False
-)
+./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
+./.loom/scripts/agent-wait.sh "judge-issue-${ISSUE}" --timeout 900
+# Verify: check PR labels for loom:pr or loom:changes-requested
+./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
 
 # Doctor Phase
-result = Task(
-    description=f"Address feedback on PR #{pr_number}",
-    prompt=f"/doctor {pr_number}",
-    subagent_type="general-purpose",
-    model="sonnet",
-    run_in_background=False
-)
+./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
+./.loom/scripts/agent-wait.sh "doctor-issue-${ISSUE}" --timeout 900
+# Verify: check PR labels for loom:review-requested
+./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"
+```
+
+**Observability**: While a worker is running, attach to it live:
+```bash
+tmux -L loom attach -t loom-builder-issue-42
 ```
 
 For detailed step-by-step workflow examples, see `shepherd-lifecycle.md`.
@@ -325,28 +254,12 @@ If any phase marks the issue as `loom:blocked`:
 gh issue comment $ISSUE_NUMBER --body "Orchestration paused: Issue is blocked. Check issue comments for details."
 ```
 
-### Terminal Not Found (MCP Mode)
+### Worker Spawn Failure
 
-**In Force Mode** (`--force`, `--force-pr`, `--force-merge`):
-- Auto-configure the terminal using defaults from `.loom/roles/<role>.json`
-- See `shepherd-lifecycle.md` for auto-configuration details
-
-**In Normal Mode**:
-- Prompt user for action or abort orchestration
-
-### Mode Selection
-
-The shepherd automatically selects the appropriate execution mode:
-
-```bash
-if mcp__loom__get_ui_state >/dev/null 2>&1; then
-  MODE="mcp"
-else
-  MODE="direct"
-fi
-```
-
-Both modes are fully supported and provide fresh context per phase.
+If `agent-spawn.sh` fails for a phase:
+- Log the error and add a comment to the issue
+- If the failure is transient (tmux issues), retry once
+- If persistent, mark issue as `loom:blocked` and exit
 
 ## Report Format
 

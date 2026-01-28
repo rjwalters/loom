@@ -78,249 +78,150 @@ if echo "$LABELS" | grep -q "loom:abort"; then
 fi
 ```
 
-## Direct Mode - Detailed Examples
+## tmux Worker Execution - Detailed Examples
 
-### Phase-Specific Task Subagent Execution
+### Phase-Specific Worker Execution
 
-**Curator Phase (Task Subagent):**
-```python
-# Spawn curator subagent with fresh context
-# Use sonnet - curation is structured enhancement work
-result = Task(
-    description=f"Curate issue #{issue_number} - add implementation details and acceptance criteria",
-    prompt=f"/curator {issue_number}",
-    subagent_type="general-purpose",
-    model="sonnet",
-    run_in_background=False
-)
+**Curator Phase:**
+```bash
+# Spawn curator worker in ephemeral tmux session
+./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
+./.loom/scripts/agent-wait.sh "curator-issue-${ISSUE}" --timeout 600
 
 # Verify completion by checking labels
-labels = gh_issue_view(issue_number, "--json labels --jq '.labels[].name'")
-assert "loom:curated" in labels or "loom:issue" in labels
+LABELS=$(gh issue view $ISSUE --json labels --jq '.labels[].name')
+echo "$LABELS" | grep -q "loom:curated" || echo "$LABELS" | grep -q "loom:issue"
+
+# Clean up
+./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
 ```
 
-**Builder Phase (Task Subagent):**
-```python
-# Spawn builder subagent with fresh context
-# Use opus - implementation requires deep reasoning
-result = Task(
-    description=f"Build issue #{issue_number} - implement feature and create PR",
-    prompt=f"/builder {issue_number}",
-    subagent_type="general-purpose",
-    model="opus",
-    run_in_background=False
-)
+**Builder Phase:**
+```bash
+# Spawn builder worker with worktree isolation
+./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" \
+    --worktree ".loom/worktrees/issue-${ISSUE}" --on-demand
+./.loom/scripts/agent-wait.sh "builder-issue-${ISSUE}" --timeout 1800
 
 # Verify completion by checking for PR
-pr_number = gh_pr_list(f"--search 'Closes #{issue_number}' --json number --jq '.[0].number'")
-assert pr_number is not None
+PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --json number --jq '.[0].number')
+
+# Clean up (worktree stays for judge/doctor phases)
+./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
 ```
 
-**Judge Phase (Task Subagent):**
-```python
-# Spawn judge subagent with fresh context
-# Use opus - thorough code review needs deep understanding
-result = Task(
-    description=f"Review PR #{pr_number} for issue #{issue_number}",
-    prompt=f"/judge {pr_number}",
-    subagent_type="general-purpose",
-    model="opus",
-    run_in_background=False
-)
+**Judge Phase:**
+```bash
+# Spawn judge worker
+./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
+./.loom/scripts/agent-wait.sh "judge-issue-${ISSUE}" --timeout 900
 
 # Verify completion by checking PR labels
-labels = gh_pr_view(pr_number, "--json labels --jq '.labels[].name'")
-if "loom:pr" in labels:
-    phase = "gate2"  # Approved
-elif "loom:changes-requested" in labels:
-    phase = "doctor"  # Needs fixes
+LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+if echo "$LABELS" | grep -q "loom:pr"; then
+    PHASE="gate2"  # Approved
+elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+    PHASE="doctor"  # Needs fixes
+fi
+
+# Clean up
+./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
 ```
 
-**Doctor Phase (Task Subagent):**
-```python
-# Spawn doctor subagent with fresh context
-# Use sonnet - PR fixes are usually targeted and scoped
-result = Task(
-    description=f"Address review feedback on PR #{pr_number} for issue #{issue_number}",
-    prompt=f"/doctor {pr_number}",
-    subagent_type="general-purpose",
-    model="sonnet",
-    run_in_background=False
-)
+**Doctor Phase:**
+```bash
+# Spawn doctor worker
+./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
+./.loom/scripts/agent-wait.sh "doctor-issue-${ISSUE}" --timeout 900
 
 # Verify completion by checking for review-requested label
-labels = gh_pr_view(pr_number, "--json labels --jq '.labels[].name'")
-assert "loom:review-requested" in labels
+LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+echo "$LABELS" | grep -q "loom:review-requested"
+
+# Clean up
+./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE}"
 ```
 
-### Complete Direct Mode Example
+### Complete Orchestration Example
 
-Here's the full orchestration flow using Task subagents with phase-specific models:
+```bash
+# Shepherd orchestrating issue #123
+ISSUE=123
 
-```python
-# Shepherd orchestrating issue #123 in Direct Mode
-issue_number = 123
-
-# Phase 1: Curator (sonnet - structured enhancement)
-print(f"Starting Curator phase for issue #{issue_number}...")
-Task(
-    description=f"Curator phase for #{issue_number}",
-    prompt=f"/curator {issue_number}",
-    subagent_type="general-purpose",
-    model="sonnet",
-    run_in_background=False
-)
-print("Curator phase complete")
+# Phase 1: Curator
+echo "Starting Curator phase for issue #${ISSUE}..."
+./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE}" --args "$ISSUE" --on-demand
+./.loom/scripts/agent-wait.sh "curator-issue-${ISSUE}" --timeout 600
+./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE}"
+echo "Curator phase complete"
 
 # Gate 1: Wait for approval (or auto-approve in force mode)
-if force_mode:
-    gh_issue_edit(issue_number, "--add-label 'loom:issue'")
+if [ "$FORCE_MODE" = "true" ]; then
+    gh issue edit $ISSUE --add-label "loom:issue"
+fi
 
-# Phase 2: Builder (opus - complex implementation)
-print(f"Starting Builder phase for issue #{issue_number}...")
-Task(
-    description=f"Builder phase for #{issue_number}",
-    prompt=f"/builder {issue_number}",
-    subagent_type="general-purpose",
-    model="opus",
-    run_in_background=False
-)
-pr_number = get_pr_for_issue(issue_number)
-print(f"Builder phase complete - PR #{pr_number} created")
+# Phase 2: Builder
+echo "Starting Builder phase for issue #${ISSUE}..."
+./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE}" --args "$ISSUE" --on-demand
+./.loom/scripts/agent-wait.sh "builder-issue-${ISSUE}" --timeout 1800
+PR_NUMBER=$(gh pr list --search "Closes #${ISSUE}" --json number --jq '.[0].number')
+./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE}"
+echo "Builder phase complete - PR #${PR_NUMBER} created"
 
-# Phase 3: Judge (opus - thorough code review)
-print(f"Starting Judge phase for PR #{pr_number}...")
-Task(
-    description=f"Judge phase for PR #{pr_number}",
-    prompt=f"/judge {pr_number}",
-    subagent_type="general-purpose",
-    model="opus",
-    run_in_background=False
-)
-print("Judge phase complete")
+# Phase 3: Judge
+echo "Starting Judge phase for PR #${PR_NUMBER}..."
+./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE}" --args "$PR_NUMBER" --on-demand
+./.loom/scripts/agent-wait.sh "judge-issue-${ISSUE}" --timeout 900
+./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE}"
+echo "Judge phase complete"
 
-# Continue with Doctor loop (sonnet) and merge as needed...
+# Continue with Doctor loop and merge as needed...
 ```
 
-## Triggering Terminals (MCP Mode)
+### Observability
 
-### Finding Terminal IDs
-
-Before triggering, identify which terminal runs which role:
-
+All worker sessions are attachable for live observation:
 ```bash
-# List all terminals
-mcp__loom__list_terminals
+# Watch builder working on issue 42
+tmux -L loom attach -t loom-builder-issue-42
 
-# Returns terminal IDs and their configurations
-# Example output:
-# terminal-1: Judge (judge.md)
-# terminal-2: Curator (curator.md)
-# terminal-3: Builder (builder.md)
-```
-
-### Restart for Fresh Context
-
-Before triggering a role, restart the terminal to clear context:
-
-```bash
-# Restart terminal to clear context
-mcp__loom__restart_terminal --terminal_id terminal-2
-```
-
-### Configure Phase-Specific Prompt
-
-Set the interval prompt to focus on the specific issue:
-
-```bash
-# Configure with issue-specific prompt
-mcp__loom__configure_terminal \
-  --terminal_id terminal-2 \
-  --interval_prompt "Curate issue #123. Follow .loom/roles/curator.md"
-```
-
-### Trigger Immediate Run
-
-Execute the role immediately:
-
-```bash
-# Trigger immediate run
-mcp__loom__trigger_run_now --terminalId terminal-2
-```
-
-### Full Trigger Sequence (MCP Mode)
-
-For each phase, execute this sequence:
-
-```bash
-# 1. Restart for fresh context
-mcp__loom__restart_terminal --terminal_id <terminal-id>
-
-# 2. Configure with phase-specific prompt
-mcp__loom__configure_terminal \
-  --terminal_id <terminal-id> \
-  --interval_prompt "<Role> for issue #<N>. <specific instructions>"
-
-# 3. Trigger immediate execution
-mcp__loom__trigger_run_now --terminalId <terminal-id>
+# List all active worker sessions
+tmux -L loom list-sessions
 ```
 
 ## Waiting for Completion
 
-**Note**: In Direct Mode, the Task subagent runs synchronously (run_in_background=False), so you know when the phase completes. However, you should still verify success by polling labels - the subagent may have encountered issues or been unable to complete its task.
+After spawning a worker with `agent-spawn.sh`, use `agent-wait.sh` to block until it finishes. The wait script detects completion by checking the process tree under the tmux session's shell PID.
 
-### Label Polling (MCP Mode Only)
+After `agent-wait.sh` returns, always verify success by checking labels — the worker may have encountered issues:
 
-Poll labels every 30 seconds to detect phase completion:
-
-```bash
-# Poll for label changes
-while true; do
-  labels=$(gh issue view <number> --json labels --jq '.labels[].name')
-
-  # Check for expected completion label
-  if echo "$labels" | grep -q "loom:curated"; then
-    echo "Curator phase complete"
-    break
-  fi
-
-  # Check for blocked state
-  if echo "$labels" | grep -q "loom:blocked"; then
-    echo "Issue is blocked"
-    exit 1
-  fi
-
-  sleep 30
-done
-```
-
-### PR Label Polling
-
-For PR-related phases, poll the PR instead:
+### Label Verification
 
 ```bash
-# Find PR for issue
-PR_NUMBER=$(gh pr list --search "Closes #<issue-number>" --json number --jq '.[0].number')
-
-# Poll PR labels
-labels=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-
-if echo "$labels" | grep -q "loom:pr"; then
-  echo "PR approved, ready for merge"
-elif echo "$labels" | grep -q "loom:changes-requested"; then
-  echo "Changes requested, triggering Doctor"
+# After curator phase
+LABELS=$(gh issue view $ISSUE --json labels --jq '.labels[].name')
+if echo "$LABELS" | grep -q "loom:curated"; then
+  echo "Curator phase complete"
+elif echo "$LABELS" | grep -q "loom:blocked"; then
+  echo "Issue is blocked"
+  exit 1
 fi
 ```
 
-### Terminal Output Monitoring
+### PR Label Verification
 
-Optionally check terminal output for completion signals:
+For PR-related phases:
 
 ```bash
-output=$(mcp__loom__get_terminal_output --terminal_id terminal-2 --lines 100)
+# Find PR for issue
+PR_NUMBER=$(gh pr list --search "Closes #$ISSUE" --json number --jq '.[0].number')
 
-if echo "$output" | grep -q "Role Assumed: Curator"; then
-  echo "Curator completed its iteration"
+# Check PR labels
+LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+if echo "$LABELS" | grep -q "loom:pr"; then
+  echo "PR approved, ready for merge"
+elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+  echo "Changes requested, triggering Doctor"
 fi
 ```
 
@@ -397,26 +298,17 @@ fi
 
 ```bash
 if [ "$PHASE" = "curator" ]; then
-  # Find curator terminal
-  CURATOR_TERMINAL="terminal-2"  # or lookup from config
+  # Spawn ephemeral curator worker
+  ./.loom/scripts/agent-spawn.sh --role curator --name "curator-issue-${ISSUE_NUMBER}" --args "$ISSUE_NUMBER" --on-demand
+  ./.loom/scripts/agent-wait.sh "curator-issue-${ISSUE_NUMBER}" --timeout 600
+  ./.loom/scripts/agent-destroy.sh "curator-issue-${ISSUE_NUMBER}"
 
-  # Restart and configure
-  mcp__loom__restart_terminal --terminal_id $CURATOR_TERMINAL
-  mcp__loom__configure_terminal \
-    --terminal_id $CURATOR_TERMINAL \
-    --interval_prompt "Curate issue #$ISSUE_NUMBER. Add implementation details and acceptance criteria."
-
-  # Trigger
-  mcp__loom__trigger_run_now --terminalId $CURATOR_TERMINAL
-
-  # Wait for completion
-  while true; do
-    LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
-    if echo "$LABELS" | grep -q "loom:curated\|loom:issue"; then
-      break
-    fi
-    sleep 30
-  done
+  # Verify completion
+  LABELS=$(gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name')
+  if ! echo "$LABELS" | grep -q "loom:curated\|loom:issue"; then
+    echo "Curator did not complete successfully"
+    exit 1
+  fi
 
   # Update progress
   update_progress "curator" "complete"
@@ -461,25 +353,18 @@ fi
 
 ```bash
 if [ "$PHASE" = "builder" ]; then
-  BUILDER_TERMINAL="terminal-3"
+  # Spawn ephemeral builder worker
+  ./.loom/scripts/agent-spawn.sh --role builder --name "builder-issue-${ISSUE_NUMBER}" --args "$ISSUE_NUMBER" --on-demand
+  ./.loom/scripts/agent-wait.sh "builder-issue-${ISSUE_NUMBER}" --timeout 1800
+  ./.loom/scripts/agent-destroy.sh "builder-issue-${ISSUE_NUMBER}"
 
-  mcp__loom__restart_terminal --terminal_id $BUILDER_TERMINAL
-  mcp__loom__configure_terminal \
-    --terminal_id $BUILDER_TERMINAL \
-    --interval_prompt "Build issue #$ISSUE_NUMBER. Create worktree, implement, test, create PR."
-
-  mcp__loom__trigger_run_now --terminalId $BUILDER_TERMINAL
-
-  # Wait for PR creation
-  while true; do
-    # Check if a PR exists for this issue
-    PR_NUMBER=$(gh pr list --search "Closes #$ISSUE_NUMBER" --state open --json number --jq '.[0].number')
-    if [ -n "$PR_NUMBER" ]; then
-      echo "PR #$PR_NUMBER created"
-      break
-    fi
-    sleep 30
-  done
+  # Find the PR
+  PR_NUMBER=$(gh pr list --search "Closes #$ISSUE_NUMBER" --state open --json number --jq '.[0].number')
+  if [ -z "$PR_NUMBER" ]; then
+    echo "Builder did not create a PR"
+    exit 1
+  fi
+  echo "PR #$PR_NUMBER created"
 
   update_progress "builder" "complete" "$PR_NUMBER"
 fi
@@ -489,31 +374,22 @@ fi
 
 ```bash
 if [ "$PHASE" = "judge" ]; then
-  JUDGE_TERMINAL="terminal-1"
+  # Spawn ephemeral judge worker
+  ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
+  ./.loom/scripts/agent-wait.sh "judge-issue-${ISSUE_NUMBER}" --timeout 900
+  ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"
 
-  mcp__loom__restart_terminal --terminal_id $JUDGE_TERMINAL
-  mcp__loom__configure_terminal \
-    --terminal_id $JUDGE_TERMINAL \
-    --interval_prompt "Review PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
-
-  mcp__loom__trigger_run_now --terminalId $JUDGE_TERMINAL
-
-  # Wait for review completion
+  # Check review result
   # Note: Judge uses label-based reviews (comment + label change), not GitHub's
   # review API, so self-approval is not a problem. See judge.md for details.
-  while true; do
-    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-    if echo "$LABELS" | grep -q "loom:pr"; then
-      echo "PR approved"
-      PHASE="gate2"
-      break
-    elif echo "$LABELS" | grep -q "loom:changes-requested"; then
-      echo "Changes requested"
-      PHASE="doctor"
-      break
-    fi
-    sleep 30
-  done
+  LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+  if echo "$LABELS" | grep -q "loom:pr"; then
+    echo "PR approved"
+    PHASE="gate2"
+  elif echo "$LABELS" | grep -q "loom:changes-requested"; then
+    echo "Changes requested"
+    PHASE="doctor"
+  fi
 fi
 ```
 
@@ -524,31 +400,25 @@ MAX_DOCTOR_ITERATIONS=3
 DOCTOR_ITERATION=0
 
 while [ "$PHASE" = "doctor" ] && [ $DOCTOR_ITERATION -lt $MAX_DOCTOR_ITERATIONS ]; do
-  DOCTOR_TERMINAL="terminal-4"  # or lookup
+  # Spawn ephemeral doctor worker
+  ./.loom/scripts/agent-spawn.sh --role doctor --name "doctor-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
+  ./.loom/scripts/agent-wait.sh "doctor-issue-${ISSUE_NUMBER}" --timeout 900
+  ./.loom/scripts/agent-destroy.sh "doctor-issue-${ISSUE_NUMBER}"
 
-  mcp__loom__restart_terminal --terminal_id $DOCTOR_TERMINAL
-  mcp__loom__configure_terminal \
-    --terminal_id $DOCTOR_TERMINAL \
-    --interval_prompt "Address review feedback on PR #$PR_NUMBER for issue #$ISSUE_NUMBER."
-
-  mcp__loom__trigger_run_now --terminalId $DOCTOR_TERMINAL
-
-  # Wait for Doctor to complete and re-trigger Judge
-  while true; do
-    LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
-    if echo "$LABELS" | grep -q "loom:review-requested"; then
-      echo "Doctor completed, returning to Judge"
-      PHASE="judge"
-      break
-    fi
-    sleep 30
-  done
+  # Verify doctor completed
+  LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
+  if echo "$LABELS" | grep -q "loom:review-requested"; then
+    echo "Doctor completed, returning to Judge"
+    PHASE="judge"
+  fi
 
   DOCTOR_ITERATION=$((DOCTOR_ITERATION + 1))
 
   # If we've returned to judge phase, run the judge again
   if [ "$PHASE" = "judge" ]; then
-    # ... trigger judge again (same as Step 5) ...
+    ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
+    ./.loom/scripts/agent-wait.sh "judge-issue-${ISSUE_NUMBER}" --timeout 900
+    ./.loom/scripts/agent-destroy.sh "judge-issue-${ISSUE_NUMBER}"
 
     # Check result
     LABELS=$(gh pr view $PR_NUMBER --json labels --jq '.labels[].name')
@@ -705,232 +575,43 @@ EOF
 )"
 ```
 
-## Terminal Configuration Requirements (MCP Mode Only)
+## Prerequisites
 
-For MCP Mode orchestration, you need these terminals configured:
+The shepherd requires these scripts in `.loom/scripts/`:
+- `agent-spawn.sh` — spawn ephemeral tmux worker sessions
+- `agent-wait.sh` — wait for worker completion (process tree inspection)
+- `agent-destroy.sh` — clean up worker sessions
 
-| Terminal | Role | Suggested Name |
-|----------|------|----------------|
-| terminal-1 | judge.md | Judge |
-| terminal-2 | curator.md | Curator |
-| terminal-3 | builder.md | Builder |
-| terminal-4 | doctor.md | Doctor |
-| terminal-5 | champion.md | Champion (optional) |
-
-You can discover terminal configurations with:
-
-```bash
-mcp__loom__get_ui_state
-```
-
-**Note**: In Direct Mode, terminal configuration is not required. The orchestrator spawns Task subagents for each role phase.
-
-## Auto-Configuring Missing Terminals (Force Mode)
-
-In MCP Mode, when `--force`, `--force-pr`, or `--force-merge` is specified, the orchestrator automatically configures any missing required terminals instead of prompting the user.
-
-### Why Auto-Configure?
-
-Force mode implies minimal user interaction. Stopping to ask "Add Builder terminal?" defeats the purpose. The orchestrator should:
-1. Detect missing terminals
-2. Auto-configure with sensible defaults
-3. Log what was configured
-4. Continue orchestration
-
-### Detection Logic
-
-Before each phase, check if the required terminal exists:
-
-```bash
-# Check for a terminal with specific role
-TERMINALS=$(mcp__loom__list_terminals)
-BUILDER_TERMINAL=$(echo "$TERMINALS" | jq -r '.[] | select(.roleConfig.roleFile == "builder.md") | .id' | head -1)
-
-if [ -z "$BUILDER_TERMINAL" ]; then
-  if [ "$FORCE_MODE" = "true" ]; then
-    # Auto-configure the missing terminal
-    auto_configure_terminal "builder"
-  else
-    # Prompt user (normal mode behavior)
-    echo "Missing Builder terminal. Add one?"
-  fi
-fi
-```
-
-### Auto-Configuration Process
-
-When a required terminal is missing and force mode is active:
-
-**Step 1: Read Role Defaults**
-
-```bash
-# Load defaults from role JSON file
-ROLE_JSON=$(cat .loom/roles/builder.json)
-ROLE_NAME=$(echo "$ROLE_JSON" | jq -r '.name')                    # "Development Worker"
-WORKER_TYPE=$(echo "$ROLE_JSON" | jq -r '.suggestedWorkerType')   # "claude"
-INTERVAL=$(echo "$ROLE_JSON" | jq -r '.defaultInterval')          # 0
-```
-
-**Step 2: Create Terminal via MCP**
-
-```bash
-# Create the terminal with role defaults
-mcp__loom__create_terminal \
-  --name "$ROLE_NAME" \
-  --role "builder"
-```
-
-**Step 3: Configure Role Settings**
-
-```bash
-# Get the new terminal ID (will be terminal-N based on nextAgentNumber)
-NEW_TERMINAL_ID=$(mcp__loom__list_terminals | jq -r '.[-1].id')
-
-# Configure with role-specific settings
-mcp__loom__configure_terminal \
-  --terminal_id "$NEW_TERMINAL_ID" \
-  --target_interval "$INTERVAL" \
-  --role_file "builder.md"
-```
-
-**Step 4: Log What Was Configured**
-
-```bash
-echo "Auto-configured $ROLE_NAME terminal ($NEW_TERMINAL_ID)"
-```
-
-### Role Defaults Reference
-
-Each role has defaults in its JSON metadata file:
-
-| Role | Name | Worker Type | Interval | Autonomous |
-|------|------|-------------|----------|------------|
-| builder | Development Worker | claude | 0 | No |
-| curator | Issue Curator | codex | 300000 | Yes |
-| judge | Code Review Specialist | codex | 300000 | Yes |
-| doctor | PR Fixer | claude | 300000 | Yes |
-| champion | PR Champion | codex | 600000 | Yes |
-
-### Terminal Configuration Structure
-
-Auto-configured terminals follow this structure:
-
-```json
-{
-  "id": "terminal-N",
-  "name": "<role.name from JSON>",
-  "role": "<role-key>",
-  "roleConfig": {
-    "workerType": "<role.suggestedWorkerType>",
-    "roleFile": "<role>.md",
-    "targetInterval": "<role.defaultInterval>",
-    "intervalPrompt": ""
-  }
-}
-```
-
-### Complete Auto-Configuration Function
-
-```bash
-auto_configure_terminal() {
-  local ROLE_KEY=$1  # e.g., "builder", "curator", "judge"
-
-  # Read role metadata
-  local ROLE_JSON_FILE=".loom/roles/${ROLE_KEY}.json"
-  if [ ! -f "$ROLE_JSON_FILE" ]; then
-    echo "ERROR: Role file not found: $ROLE_JSON_FILE"
-    return 1
-  fi
-
-  local ROLE_JSON=$(cat "$ROLE_JSON_FILE")
-  local ROLE_NAME=$(echo "$ROLE_JSON" | jq -r '.name // "Unknown Role"')
-  local WORKER_TYPE=$(echo "$ROLE_JSON" | jq -r '.suggestedWorkerType // "claude"')
-  local INTERVAL=$(echo "$ROLE_JSON" | jq -r '.defaultInterval // 0')
-
-  # Create terminal
-  mcp__loom__create_terminal \
-    --name "$ROLE_NAME" \
-    --role "$ROLE_KEY"
-
-  # Get newly created terminal ID
-  local NEW_TERMINAL_ID=$(mcp__loom__list_terminals | jq -r '.[-1].id')
-
-  # Configure role settings
-  mcp__loom__configure_terminal \
-    --terminal_id "$NEW_TERMINAL_ID" \
-    --target_interval "$INTERVAL" \
-    --role_file "${ROLE_KEY}.md"
-
-  echo "Auto-configured $ROLE_NAME terminal ($NEW_TERMINAL_ID)"
-
-  # Return the terminal ID for use
-  echo "$NEW_TERMINAL_ID"
-}
-```
-
-### Usage in Phase Execution
-
-Before triggering each phase, check and auto-configure:
-
-```bash
-# Example: Builder phase with auto-configuration
-if [ "$PHASE" = "builder" ]; then
-  # Find existing Builder terminal
-  BUILDER_TERMINAL=$(mcp__loom__list_terminals | \
-    jq -r '.[] | select(.roleConfig.roleFile == "builder.md") | .id' | head -1)
-
-  # Auto-configure if missing and in force mode
-  if [ -z "$BUILDER_TERMINAL" ]; then
-    if [ "$FORCE_MODE" = "true" ]; then
-      BUILDER_TERMINAL=$(auto_configure_terminal "builder")
-    else
-      echo "ERROR: No Builder terminal configured"
-      exit 1
-    fi
-  fi
-
-  # Now proceed with the phase using $BUILDER_TERMINAL
-  mcp__loom__restart_terminal --terminal_id "$BUILDER_TERMINAL"
-  mcp__loom__configure_terminal \
-    --terminal_id "$BUILDER_TERMINAL" \
-    --interval_prompt "Build issue #$ISSUE_NUMBER"
-  mcp__loom__trigger_run_now --terminalId "$BUILDER_TERMINAL"
-fi
-```
-
-### Behavior Summary
-
-| Mode | Missing Terminal | Behavior |
-|------|------------------|----------|
-| Normal (`/shepherd N`) | Builder missing | Prompt user: "Add Builder terminal?" |
-| Force (`--force`) | Builder missing | Auto-configure Builder, log, continue |
-| Force PR (`--force-pr`) | Builder missing | Auto-configure Builder, log, continue |
-| Force Merge (`--force-merge`) | Builder missing | Auto-configure Builder, log, continue |
-| Direct Mode | Any missing | N/A - executes roles directly |
-
-### Persistence
-
-Auto-configured terminals are persisted to `.loom/config.json` by the MCP server. They will be available for future orchestrations.
+No terminal pre-configuration is needed — workers are created on-demand per phase.
 
 ## Error Handling Details
 
-### Terminal Not Found
+### Worker Spawn Failure
 
-If a required terminal isn't configured:
+If `agent-spawn.sh` fails:
 
-**In Force Mode** (`--force`, `--force-pr`, `--force-merge`):
-- Auto-configure the terminal using defaults from `.loom/roles/<role>.json`
-- See "Auto-Configuring Missing Terminals" section above
-
-**In Normal Mode**:
 ```bash
-# Prompt user for action
-echo "Missing $ROLE terminal. Options:"
-echo "1. Add $ROLE terminal with default configuration"
-echo "2. Skip this phase (may cause issues)"
-echo "3. Abort orchestration"
+# Retry once for transient failures
+if ! ./.loom/scripts/agent-spawn.sh --role "$ROLE" --name "${ROLE}-issue-${ISSUE}" --args "$ARGS" --on-demand; then
+    sleep 5
+    if ! ./.loom/scripts/agent-spawn.sh --role "$ROLE" --name "${ROLE}-issue-${ISSUE}" --args "$ARGS" --on-demand; then
+        echo "ERROR: Failed to spawn $ROLE worker after retry"
+        gh issue edit $ISSUE --add-label "loom:blocked"
+        gh issue comment $ISSUE --body "**Orchestration blocked**: Failed to spawn $ROLE worker."
+        exit 1
+    fi
+fi
+```
 
-# If user chooses to abort:
-echo "ERROR: No terminal found for role '$ROLE'. Configure a terminal with roleFile: $ROLE.md"
-gh issue comment $ISSUE_NUMBER --body "**Orchestration paused**: Missing terminal for $ROLE role. Run with --force to auto-configure."
+### Worker Timeout
+
+If `agent-wait.sh` times out (exit code 1):
+
+```bash
+WAIT_EXIT=$?
+if [ "$WAIT_EXIT" -eq 1 ]; then
+    echo "Worker timed out - destroying session"
+    ./.loom/scripts/agent-destroy.sh "${ROLE}-issue-${ISSUE}" --force
+    # Check if the worker made partial progress via labels
+fi
 ```
