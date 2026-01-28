@@ -7,14 +7,14 @@ import {
 } from "./terminal-actions";
 import { showToast } from "./toast";
 
-// Mock autonomous manager with stable instance
+// Mock interval-prompt-manager with stable instance
 const mockRunNow = vi.fn().mockResolvedValue(undefined);
-const mockAutonomousManager = {
+const mockIntervalPromptManager = {
   runNow: mockRunNow,
 };
 
-vi.mock("./autonomous-manager", () => ({
-  getAutonomousManager: vi.fn(() => mockAutonomousManager),
+vi.mock("./interval-prompt-manager", () => ({
+  getIntervalPromptManager: vi.fn(() => mockIntervalPromptManager),
 }));
 
 vi.mock("./toast", () => ({
@@ -50,19 +50,19 @@ describe("terminal-actions", () => {
         isPrimary: false,
       });
 
-      const { getAutonomousManager } = await import("./autonomous-manager");
+      const { getIntervalPromptManager } = await import("./interval-prompt-manager");
       await handleRunNowClick("term-1", { state });
 
-      expect(getAutonomousManager).toHaveBeenCalled();
-      const manager = getAutonomousManager();
+      expect(getIntervalPromptManager).toHaveBeenCalled();
+      const manager = getIntervalPromptManager();
       expect(manager.runNow).toHaveBeenCalledWith(expect.objectContaining({ id: "term-1" }));
     });
 
     it("handles terminal not found", async () => {
       await handleRunNowClick("nonexistent", { state });
 
-      const { getAutonomousManager } = await import("./autonomous-manager");
-      const manager = getAutonomousManager();
+      const { getIntervalPromptManager } = await import("./interval-prompt-manager");
+      const manager = getIntervalPromptManager();
       expect(manager.runNow).not.toHaveBeenCalled();
     });
 
@@ -74,8 +74,8 @@ describe("terminal-actions", () => {
         isPrimary: false,
       });
 
-      const { getAutonomousManager } = await import("./autonomous-manager");
-      vi.mocked(getAutonomousManager).mockReturnValue({
+      const { getIntervalPromptManager } = await import("./interval-prompt-manager");
+      vi.mocked(getIntervalPromptManager).mockReturnValue({
         runNow: vi.fn().mockRejectedValue(new Error("Execution failed")),
       } as any);
 

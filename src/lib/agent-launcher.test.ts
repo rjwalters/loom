@@ -126,10 +126,10 @@ describe("agent-launcher", () => {
         filename: "worker.md",
       });
 
-      // Should send Claude command
+      // Should send Claude wrapper command with environment variables
       expect(invoke).toHaveBeenCalledWith("send_terminal_input", {
         id: "terminal-1",
-        data: "claude --dangerously-skip-permissions",
+        data: "LOOM_TERMINAL_ID=terminal-1 LOOM_WORKSPACE=/path/to/workspace ./.loom/scripts/claude-wrapper.sh --dangerously-skip-permissions",
       });
 
       // Should send Enter to execute

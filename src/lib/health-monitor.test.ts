@@ -22,6 +22,34 @@ vi.mock("./output-poller", () => ({
   getOutputPoller: vi.fn(),
 }));
 
+// Mock circuit-breaker module - execute passes through to the callback
+vi.mock("./circuit-breaker", () => ({
+  CircuitState: { CLOSED: "closed", OPEN: "open", HALF_OPEN: "half-open" },
+  CircuitOpenError: class CircuitOpenError extends Error {
+    constructor(
+      public readonly circuitName: string,
+      public readonly state: string
+    ) {
+      super(`Circuit breaker '${circuitName}' is ${state}, request rejected`);
+      this.name = "CircuitOpenError";
+    }
+  },
+  getDaemonCircuitBreaker: vi.fn(() => ({
+    execute: vi.fn((fn: () => Promise<unknown>) => fn()),
+    getState: vi.fn(() => "closed"),
+    getSnapshot: vi.fn(() => ({
+      state: "closed",
+      failures: 0,
+      successes: 0,
+      lastFailureTime: null,
+      lastSuccessTime: null,
+      lastStateChange: null,
+    })),
+    reset: vi.fn(),
+    onEvent: vi.fn(() => () => {}), // Returns unsubscribe function
+  })),
+}));
+
 import { invoke } from "@tauri-apps/api/core";
 import { getOutputPoller } from "./output-poller";
 import { getAppState } from "./state";
