@@ -295,6 +295,33 @@ fi
 
 Use `--json` for machine-readable output. Exit code 0 means contract satisfied (initially or after recovery), 1 means failed.
 
+### Common Mistakes to Avoid
+
+> **⚠️ WARNING**: These mistakes can leave issues in inconsistent states, breaking the orchestration pipeline.
+
+| Mistake | Consequence | Prevention |
+|---------|-------------|------------|
+| Skipping `validate-phase.sh` | Issue may be missing labels or PR; next phase fails or gets stuck | Always validate after every phase |
+| Only checking labels manually | Misses recovery opportunities; inconsistent error handling | Use `validate-phase.sh` instead of manual checks |
+| Ignoring validation exit code | Issue proceeds despite failed contracts; downstream chaos | Always check `$?` and exit on failure |
+| Validating before `agent-destroy.sh` | Worker session may still be writing; race conditions | Destroy session first, then validate |
+
+**Correct order for every phase:**
+```bash
+# 1. Spawn worker
+agent-spawn.sh ...
+
+# 2. Wait for completion
+agent-wait-bg.sh ... (in background, poll with heartbeat)
+
+# 3. Destroy session FIRST
+agent-destroy.sh ...
+
+# 4. THEN validate (REQUIRED)
+validate-phase.sh ...
+[ $? -ne 0 ] && exit 1
+```
+
 ### Label Verification (Legacy)
 
 The `validate-phase.sh` script supersedes manual label checking. For reference, the previous approach:
