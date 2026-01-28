@@ -267,13 +267,16 @@ Then the Builder would address the feedback and re-request review.
 Once the PR is approved (`loom:pr` label), you can merge it:
 
 ```bash
-gh pr merge 43 --squash --delete-branch
+./.loom/scripts/merge-pr.sh 43
 ```
 
 **Expected output:**
 ```
-✓ Squashed and merged pull request #43 into main
-✓ Deleted branch feature/issue-42
+Merging PR #43: Fix widget alignment
+Branch: feature/issue-42
+PR #43 merged successfully
+Branch 'feature/issue-42' deleted
+Done
 ```
 
 The issue (#42) will automatically close because the PR had "Closes #42" in the description.

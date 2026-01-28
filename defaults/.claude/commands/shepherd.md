@@ -78,7 +78,7 @@ Curator -> [auto-approve] -> Builder -> Judge -> [STOP at loom:pr]
 When `--force-merge` is specified:
 1. **Gate 1 (Approval)**: Auto-add `loom:issue` label instead of waiting
 2. **Judge Phase**: Runs normally using label-based reviews (not GitHub's review API)
-3. **Gate 2 (Merge)**: Auto-merge PR via `gh pr merge --squash` after Judge approval
+3. **Gate 2 (Merge)**: Auto-merge PR via `merge-pr.sh` (GitHub API) after Judge approval
 4. **Conflict Resolution**: If merge conflicts exist, attempt automatic resolution
 
 ```bash

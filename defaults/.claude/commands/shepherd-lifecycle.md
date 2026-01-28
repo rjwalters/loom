@@ -525,66 +525,12 @@ if [ "$PHASE" = "gate2" ]; then
   if [ "$FORCE_MERGE" = "true" ]; then
     echo "Force-merge mode: auto-merging PR"
 
-    # IMPORTANT: Worktree Checkout Error Handling
-    # ============================================
-    # When running from a worktree, `gh pr merge` may succeed on GitHub but fail
-    # locally with: "fatal: 'main' is already used by worktree at '/path/to/repo'"
-    #
-    # This is EXPECTED behavior - the merge completes remotely but git can't switch
-    # to main locally because another worktree already has it checked out.
-    #
-    # Solution: Always verify PR state via GitHub API rather than relying on exit code.
-    # The exit code of `gh pr merge` is unreliable when running from worktrees.
-
-    MERGE_OUTPUT=$(gh pr merge $PR_NUMBER --squash --delete-branch 2>&1)
-    MERGE_EXIT=$?
-
-    # Always verify actual merge state via GitHub API (exit code is unreliable in worktrees)
-    PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
-
-    if [ "$PR_STATE" = "MERGED" ]; then
-      # Merge succeeded - any error was just the local checkout failure (expected in worktrees)
-      if [ $MERGE_EXIT -ne 0 ]; then
-        if echo "$MERGE_OUTPUT" | grep -q "already used by worktree"; then
-          echo "PR merged successfully (local checkout skipped - worktree conflict is expected)"
-        else
-          echo "PR merged successfully (non-fatal local error ignored)"
-        fi
-      else
-        echo "PR merged successfully"
-      fi
-    else
-      # Merge actually failed on GitHub - this is a real error that needs handling
-      echo "Merge failed (PR state: $PR_STATE)"
-
-      # Check for merge conflicts
-      MERGEABLE=$(gh pr view $PR_NUMBER --json mergeable --jq '.mergeable')
-      if [ "$MERGEABLE" = "CONFLICTING" ]; then
-        echo "Attempting conflict resolution..."
-        git fetch origin main
-        git checkout $BRANCH_NAME 2>/dev/null || git checkout -b $BRANCH_NAME origin/$BRANCH_NAME
-        git merge origin/main --no-edit || {
-          # Auto-resolve conflicts if possible
-          git checkout --theirs .
-          git add -A
-          git commit -m "Resolve merge conflicts (auto-resolved)"
-        }
-        git push origin $BRANCH_NAME
-
-        # Retry merge and verify via API (not exit code)
-        gh pr merge $PR_NUMBER --squash --delete-branch 2>&1
-        PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
-        if [ "$PR_STATE" = "MERGED" ]; then
-          echo "PR merged successfully after conflict resolution"
-        else
-          echo "Merge failed after conflict resolution"
-          exit 1
-        fi
-      else
-        echo "Merge failed: $MERGE_OUTPUT"
-        exit 1
-      fi
-    fi
+    # Use merge-pr.sh for worktree-safe merge via GitHub API
+    ./.loom/scripts/merge-pr.sh $PR_NUMBER --cleanup-worktree || {
+      echo "Merge failed for PR #$PR_NUMBER"
+      exit 1
+    }
+    echo "PR merged successfully"
 
     gh issue comment $ISSUE_NUMBER --body "**Auto-merged** PR #$PR_NUMBER via \`/shepherd --force-merge\`"
   else
