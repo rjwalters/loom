@@ -356,7 +356,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
   if [[ "$NON_INTERACTIVE" == true ]]; then
     INSTALL_FLAGS+=(--yes)
   fi
-  exec "$LOOM_ROOT/scripts/install-loom.sh" "${INSTALL_FLAGS[@]}" "$TARGET_PATH"
+  exec "$LOOM_ROOT/scripts/install-loom.sh" ${INSTALL_FLAGS[@]+"${INSTALL_FLAGS[@]}"} "$TARGET_PATH"
 else
   FORCE_FLAG=""
   SELF_INSTALL=false
