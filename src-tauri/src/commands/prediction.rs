@@ -970,7 +970,9 @@ mod tests {
 
     #[test]
     fn test_extract_features() {
-        let prompt = "Add a new function to src/lib/utils.ts that handles error logging";
+        // Note: Avoid "error", "fix", "bug" in prompt as detect_intent_category
+        // checks those first (before "add") and would return "fix" category
+        let prompt = "Add a new function to src/lib/utils.ts that handles request logging";
         let features = extract_features(prompt, Some("builder"), None);
 
         assert!(features.length > 0);
