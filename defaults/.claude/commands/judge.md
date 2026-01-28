@@ -728,3 +728,26 @@ After completing your iteration (reviewing a PR and updating labels), execute:
 - ✅ **After completing a review** (PR approved or changes requested)
 - ✅ **When no work is available** (no PRs to review)
 - ❌ **NOT during active work** (only after iteration is complete)
+
+## Completion
+
+**After completing your task, exit Claude Code to signal completion.**
+
+When you have finished your work (PR reviewed and labeled with `loom:pr` or `loom:changes-requested`), execute:
+
+```
+/exit
+```
+
+### Why This Matters
+
+- **Enables automation**: Shepherd orchestration relies on detecting when workers complete
+- **Prevents hanging**: Without `/exit`, `agent-wait-bg.sh` waits until timeout
+- **Saves resources**: Idle Claude Code sessions consume memory and context budget
+
+### When to Exit
+
+- ✅ **After approving PR** (labeled with `loom:pr`)
+- ✅ **After requesting changes** (labeled with `loom:changes-requested`)
+- ✅ **When no work is available** (no PRs with `loom:review-requested`)
+- ❌ **NOT during active work** (only after review is complete)
