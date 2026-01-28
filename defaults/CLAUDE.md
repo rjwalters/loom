@@ -110,7 +110,7 @@ Loom uses a three-layer orchestration architecture for scalable automation:
 **Layer 1 (Shepherds)**:
 - Fully autonomous once spawned
 - Handles entire issue lifecycle including Judge review
-- Uses `--force-pr` by default (stops at ready-to-merge), or `--force-merge` for full automation
+- Creates PR without waiting by default (stops at ready-to-merge), or use `--force` for full automation with auto-merge
 
 ### When to Use Which Layer
 
@@ -309,7 +309,7 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Purpose**: Evaluate proposals and auto-merge approved PRs
 - **Workflow**: Evaluates `loom:curated`, `loom:architect`, `loom:hermit` proposals → promotes to `loom:issue`. Also finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
 - **When to use**: Default daemon mode - handles both proposal promotion and PR merging
-- **Note**: Not needed for PR merging when shepherds run with `--force-merge` (shepherds handle their own merges)
+- **Note**: Not needed for PR merging when shepherds run with `--force` (shepherds handle their own merges)
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues

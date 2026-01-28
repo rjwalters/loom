@@ -9,18 +9,23 @@
 #   spawn-shell-shepherd.sh <issue-number> [options]
 #
 # Options:
-#   --force-pr      Auto-approve issue, run through Judge, stop at loom:pr
-#   --force-merge   Auto-approve, resolve conflicts, auto-merge after approval
+#   --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+#   --wait          Wait for human approval at each gate (explicit non-default)
 #   --name <name>   Session name (default: shepherd-issue-<N>)
 #   --json          Output spawn result as JSON
 #   --help          Show this help message
+#
+# Deprecated:
+#   --force-pr      (deprecated) Now the default behavior
+#   --force-merge   (deprecated) Use --force or -f instead
 #
 # The daemon can configure LOOM_SHELL_SHEPHERDS=true to use this script
 # instead of agent-spawn.sh for shepherd spawning.
 #
 # Example:
-#   spawn-shell-shepherd.sh 42 --force-merge --json
-#   spawn-shell-shepherd.sh 42 --name shepherd-issue-42 --force-pr
+#   spawn-shell-shepherd.sh 42 --json            # Default: create PR without waiting
+#   spawn-shell-shepherd.sh 42 --force --json    # Full automation with auto-merge
+#   spawn-shell-shepherd.sh 42 --name shepherd-issue-42 --wait  # Wait for human approval
 
 set -euo pipefail
 
@@ -86,18 +91,25 @@ ${YELLOW}USAGE:${NC}
     spawn-shell-shepherd.sh <issue-number> [OPTIONS]
 
 ${YELLOW}OPTIONS:${NC}
-    --force-pr      Auto-approve issue, run through Judge, stop at loom:pr
-    --force-merge   Auto-approve, resolve conflicts, auto-merge after approval
+    --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+    --wait          Wait for human approval at each gate (explicit non-default)
     --name <name>   Session name (default: shepherd-issue-<N>)
     --json          Output spawn result as JSON
     --help          Show this help message
 
+${YELLOW}DEPRECATED:${NC}
+    --force-pr      (deprecated) Now the default behavior
+    --force-merge   (deprecated) Use --force or -f instead
+
 ${YELLOW}EXAMPLES:${NC}
-    # Spawn with force-merge in background
-    spawn-shell-shepherd.sh 42 --force-merge
+    # Spawn with default behavior (create PR without waiting)
+    spawn-shell-shepherd.sh 42
+
+    # Spawn with full automation (auto-merge)
+    spawn-shell-shepherd.sh 42 --force
 
     # Spawn with custom name and JSON output
-    spawn-shell-shepherd.sh 42 --name shepherd-1 --force-pr --json
+    spawn-shell-shepherd.sh 42 --name shepherd-1 --json
 
 ${YELLOW}TMUX SESSION:${NC}
     Session: ${SESSION_PREFIX}<name>
@@ -122,12 +134,24 @@ JSON_OUTPUT=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --force|-f)
+            MODE="--force"
+            shift
+            ;;
+        --wait)
+            MODE="--wait"
+            shift
+            ;;
         --force-pr)
-            MODE="--force-pr"
+            # Deprecated: now the default behavior
+            log_warn "Flag --force-pr is deprecated (now default behavior)"
+            MODE=""  # Default, no flag needed
             shift
             ;;
         --force-merge)
-            MODE="--force-merge"
+            # Deprecated: use --force or -f instead
+            log_warn "Flag --force-merge is deprecated (use --force or -f instead)"
+            MODE="--force"
             shift
             ;;
         --name)
@@ -217,7 +241,7 @@ cat > "$LOG_FILE" <<EOF
 # Shell Shepherd Log
 # Session: $FULL_SESSION_NAME
 # Issue: $ISSUE
-# Mode: ${MODE:-normal}
+# Mode: ${MODE:-default}
 # Started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')
 # ---
 EOF

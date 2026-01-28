@@ -112,7 +112,7 @@ uses **tmux agent-spawn.sh** to create ephemeral tmux sessions:
 
 ```bash
 # Iteration spawns shepherd as tmux worker
-./.loom/scripts/agent-spawn.sh --role shepherd --name "shepherd-issue-123" --args "123 --force-pr" --on-demand
+./.loom/scripts/agent-spawn.sh --role shepherd --name "shepherd-issue-123" --args "123" --on-demand
 
 # Wait for completion
 ./.loom/scripts/agent-wait.sh "shepherd-issue-123" --timeout 1800
@@ -122,8 +122,9 @@ uses **tmux agent-spawn.sh** to create ephemeral tmux sessions:
 ```
 
 **Shepherd Force Mode Flags**:
-- `--force-merge`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
-- `--force-pr`: Stops at `loom:pr` (ready-to-merge), requires Champion for merge (default)
+- `--force` or `-f`: Full automation - auto-merge after Judge approval (use when daemon is in force mode)
+- (default): Stops at `loom:pr` (ready-to-merge), requires Champion for merge
+- `--wait`: Explicit wait for human approval at each gate
 
 **Delegation Summary**:
 
@@ -523,7 +524,7 @@ The `.loom/stop-shepherds` file acts as a coordination signal:
 When `/loom --force` is invoked, the daemon enables **force mode**:
 
 1. **Auto-Promote Proposals**: Champion automatically promotes `loom:architect`, `loom:hermit`, and `loom:curated` proposals to `loom:issue`
-2. **Shepherd Auto-Merge**: Shepherds use `--force-merge` flag
+2. **Shepherd Auto-Merge**: Shepherds use `--force` flag
 3. **Audit Trail**: All auto-promoted items include `[force-mode]` marker
 
 **Use cases**: New project bootstrap, solo developer, weekend hack mode
