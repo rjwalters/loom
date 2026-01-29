@@ -41,6 +41,7 @@ set -euo pipefail
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
 READINESS_TIMEOUT_SECONDS=30
+STUCK_SESSION_THRESHOLD_SECONDS=${LOOM_STUCK_SESSION_THRESHOLD:-300}  # 5 minutes
 
 # Colors for output
 RED='\033[0;31m'
@@ -98,6 +99,7 @@ ${YELLOW}OPTIONS:${NC}
     --args "<args>"     Arguments to pass to the role slash command
     --worktree <path>   Path to git worktree (agent runs in isolated worktree)
     --on-demand         Mark session as ephemeral (for agent-destroy.sh cleanup)
+    --fresh             Force new session even if one already exists (kills stuck sessions)
     --wait              Block until agent completes (requires agent-wait.sh)
     --timeout <seconds> Timeout for --wait (default: 3600)
     --json              Output spawn result as JSON
@@ -137,6 +139,7 @@ ${YELLOW}ENVIRONMENT:${NC}
     LOOM_INITIAL_WAIT      - Initial wait time in seconds (default: 60)
     LOOM_MAX_WAIT          - Maximum wait time in seconds (default: 1800)
     LOOM_BACKOFF_MULTIPLIER - Backoff multiplier (default: 2)
+    LOOM_STUCK_SESSION_THRESHOLD - Seconds before idle session is considered stuck (default: 300)
 
 ${YELLOW}TMUX ARCHITECTURE:${NC}
     Socket: -L loom (shared with CLI tools for unified visibility)
@@ -266,6 +269,109 @@ cleanup_dead_session() {
 
     log_info "Cleaning up dead session: $session_name"
     tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+}
+
+# Check if an existing session is stuck (idle with no claude activity)
+# Returns 0 if stuck, 1 if healthy
+session_is_stuck() {
+    local name="$1"
+    local repo_root="$2"
+    local session_name="${SESSION_PREFIX}${name}"
+    local log_file="${repo_root}/.loom/logs/${session_name}.log"
+
+    # Check 1: Is claude actually running in this session?
+    local shell_pid
+    shell_pid=$(tmux -L "$TMUX_SOCKET" list-panes -t "$session_name" -F '#{pane_pid}' 2>/dev/null | head -1)
+    if [[ -z "$shell_pid" ]]; then
+        log_warn "Session has no shell PID - considered stuck"
+        return 0
+    fi
+
+    local claude_running=false
+    if pgrep -P "$shell_pid" -f "claude" >/dev/null 2>&1; then
+        claude_running=true
+    else
+        # Check grandchildren (claude-wrapper.sh -> claude)
+        local children
+        children=$(pgrep -P "$shell_pid" 2>/dev/null || true)
+        for child in $children; do
+            if pgrep -P "$child" -f "claude" >/dev/null 2>&1; then
+                claude_running=true
+                break
+            fi
+        done
+    fi
+
+    if [[ "$claude_running" != "true" ]]; then
+        log_warn "No claude process found in session - considered stuck"
+        return 0
+    fi
+
+    # Check 2: Has the log file been written to recently?
+    if [[ -f "$log_file" ]]; then
+        local now
+        now=$(date +%s)
+        local log_mtime
+        # macOS stat syntax
+        if stat -f '%m' "$log_file" >/dev/null 2>&1; then
+            log_mtime=$(stat -f '%m' "$log_file")
+        else
+            # Linux stat syntax
+            log_mtime=$(stat -c '%Y' "$log_file")
+        fi
+        local idle_seconds=$((now - log_mtime))
+
+        if [[ "$idle_seconds" -ge "$STUCK_SESSION_THRESHOLD_SECONDS" ]]; then
+            log_warn "Session log idle for ${idle_seconds}s (threshold: ${STUCK_SESSION_THRESHOLD_SECONDS}s)"
+
+            # Check 3: Look for progress milestones as a secondary signal
+            local progress_dir="${repo_root}/.loom/progress"
+            local has_recent_milestone=false
+            if [[ -d "$progress_dir" ]]; then
+                for pfile in "$progress_dir"/shepherd-*.json; do
+                    [[ -f "$pfile" ]] || continue
+                    local pfile_mtime
+                    if stat -f '%m' "$pfile" >/dev/null 2>&1; then
+                        pfile_mtime=$(stat -f '%m' "$pfile")
+                    else
+                        pfile_mtime=$(stat -c '%Y' "$pfile")
+                    fi
+                    local pfile_age=$((now - pfile_mtime))
+                    if [[ "$pfile_age" -lt "$STUCK_SESSION_THRESHOLD_SECONDS" ]]; then
+                        has_recent_milestone=true
+                        break
+                    fi
+                done
+            fi
+
+            if [[ "$has_recent_milestone" == "true" ]]; then
+                log_info "Recent progress milestone found - session may still be active"
+                return 1  # Not stuck
+            fi
+
+            return 0  # Stuck
+        fi
+    fi
+
+    # Session appears healthy
+    return 1
+}
+
+# Kill a stuck session and clean up
+kill_stuck_session() {
+    local name="$1"
+    local session_name="${SESSION_PREFIX}${name}"
+
+    log_warn "Killing stuck session: $session_name"
+
+    # Attempt graceful shutdown first
+    tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-c 2>/dev/null || true
+    sleep 1
+
+    # Force kill
+    tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+    log_success "Stuck session killed: $session_name"
 }
 
 # List all loom-agent sessions
@@ -482,6 +588,7 @@ main() {
     local check_name=""
     local do_list=false
     local on_demand=false
+    local fresh=false
     local do_wait=false
     local wait_timeout=3600
     local json_output=false
@@ -507,6 +614,10 @@ main() {
                 ;;
             --on-demand)
                 on_demand=true
+                shift
+                ;;
+            --fresh)
+                fresh=true
                 shift
                 ;;
             --wait)
@@ -612,10 +723,21 @@ main() {
 
     # Handle idempotency - check if session already exists
     if session_exists "$name"; then
-        if session_is_alive "$name"; then
-            log_success "Session already exists and is running: ${SESSION_PREFIX}${name}"
-            log_info "Attach:  tmux -L $TMUX_SOCKET attach -t ${SESSION_PREFIX}${name}"
-            exit 0
+        if [[ "$fresh" == "true" ]]; then
+            log_info "Fresh session requested - killing existing session: ${SESSION_PREFIX}${name}"
+            kill_stuck_session "$name"
+        elif session_is_alive "$name"; then
+            # Session exists and has windows - check if it's actually making progress
+            log_info "Checking health of existing session: ${SESSION_PREFIX}${name}"
+            if session_is_stuck "$name" "$repo_root"; then
+                log_warn "Session is stuck (idle > ${STUCK_SESSION_THRESHOLD_SECONDS}s with no progress)"
+                log_info "Recovering: killing stuck session and restarting fresh"
+                kill_stuck_session "$name"
+            else
+                log_success "Session already exists and is healthy: ${SESSION_PREFIX}${name}"
+                log_info "Attach:  tmux -L $TMUX_SOCKET attach -t ${SESSION_PREFIX}${name}"
+                exit 0
+            fi
         else
             # Session exists but is dead - clean it up
             cleanup_dead_session "$name"
