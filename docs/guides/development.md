@@ -12,9 +12,9 @@ This guide covers the development workflow, tooling, and best practices for cont
 ## Documentation Overview
 
 This guide covers code quality, tooling, and development practices. For:
-- **Day-to-day development workflow**: See [DEV_WORKFLOW.md](DEV_WORKFLOW.md)
-- **Project vision and architecture**: See [README.md](README.md)
-- **Agent workflows**: See [WORKFLOWS.md](WORKFLOWS.md)
+- **Day-to-day development workflow**: See [DEV_WORKFLOW.md](dev-workflow.md)
+- **Project vision and architecture**: See [README.md](../../README.md)
+- **Agent workflows**: See [WORKFLOWS.md](../workflows.md)
 
 ## Getting Started
 
@@ -34,7 +34,7 @@ This guide covers code quality, tooling, and development practices. For:
    pnpm run app:dev
    ```
 
-   This starts both the daemon and Tauri dev server in one command. For detailed workflow information, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
+   This starts both the daemon and Tauri dev server in one command. For detailed workflow information, see [DEV_WORKFLOW.md](dev-workflow.md).
 
 ## Code Quality Tools
 
@@ -80,7 +80,7 @@ pnpm run daemon:restart
 pnpm run daemon:dev
 ```
 
-For detailed workflow information, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
+For detailed workflow information, see [DEV_WORKFLOW.md](dev-workflow.md).
 
 #### Frontend Linting and Formatting
 ```bash

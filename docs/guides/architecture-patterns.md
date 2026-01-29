@@ -338,7 +338,7 @@ Each role consists of two files:
 
 **Label-based Workflow Coordination**:
 
-Roles coordinate work through GitHub labels with two human approval gates (see [WORKFLOWS.md](../../WORKFLOWS.md) for complete details):
+Roles coordinate work through GitHub labels with two human approval gates (see [WORKFLOWS.md](../workflows.md) for complete details):
 
 1. **Architect** creates issues with `loom:architect` label
 2. **Human approval (Gate 1)**: User reviews and removes label to approve proposal
