@@ -18,7 +18,7 @@
 # Stuck Detection Environment Variables:
 #   LOOM_STUCK_WARNING   - Seconds without progress before warning (default: 300)
 #   LOOM_STUCK_CRITICAL  - Seconds without progress before critical (default: 600)
-#   LOOM_STUCK_ACTION    - Action on stuck: warn, pause, restart (default: warn)
+#   LOOM_STUCK_ACTION    - Action on stuck: warn, pause, restart, retry (default: warn)
 #
 # Usage:
 #   agent-wait-bg.sh <name> [--timeout <s>] [--poll-interval <s>] [--issue <N>] [--json]
@@ -63,7 +63,7 @@ DEFAULT_IDLE_TIMEOUT=60
 # Stuck detection thresholds (configurable via environment variables)
 STUCK_WARNING_THRESHOLD=${LOOM_STUCK_WARNING:-300}   # 5 min default
 STUCK_CRITICAL_THRESHOLD=${LOOM_STUCK_CRITICAL:-600} # 10 min default
-STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart
+STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart, retry
 
 # Progress tracking file prefix
 PROGRESS_DIR="/tmp/loom-agent-progress"
@@ -243,6 +243,45 @@ check_stuck_status() {
     fi
 }
 
+# Capture diagnostic information from a stuck agent before killing it
+# Saves tmux pane content and log tail to a diagnostics file
+capture_stuck_diagnostics() {
+    local name="$1"
+    local session_name="$2"
+    local idle_time="$3"
+
+    local diag_dir="${REPO_ROOT}/.loom/diagnostics"
+    mkdir -p "$diag_dir"
+
+    local timestamp
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local diag_file="${diag_dir}/stuck-${name}-$(date +%s).txt"
+
+    {
+        echo "=== Stuck Agent Diagnostics ==="
+        echo "Agent: $name"
+        echo "Session: $session_name"
+        echo "Timestamp: $timestamp"
+        echo "Idle time: ${idle_time}s"
+        echo ""
+
+        echo "=== Tmux Pane Content (last visible) ==="
+        tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || echo "(session not available)"
+        echo ""
+
+        echo "=== Log File Tail ==="
+        local log_file="${REPO_ROOT}/.loom/logs/${session_name}.log"
+        if [[ -f "$log_file" ]]; then
+            tail -50 "$log_file" 2>/dev/null || echo "(could not read log)"
+        else
+            echo "(no log file found at $log_file)"
+        fi
+    } > "$diag_file" 2>&1
+
+    log_info "Diagnostics captured to $diag_file"
+    echo "$diag_file"
+}
+
 # Handle stuck agent intervention
 # Returns 0 if should continue waiting, 1 if should exit
 handle_stuck() {
@@ -281,6 +320,9 @@ handle_stuck() {
         restart)
             log_warn "RESTART: Restarting stuck agent '$name' (no progress for ${idle_time}s)"
 
+            # Capture diagnostics before killing
+            capture_stuck_diagnostics "$name" "$session_name" "$idle_time" || true
+
             # Destroy the tmux session
             tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
 
@@ -291,6 +333,23 @@ handle_stuck() {
                 echo "{\"status\":\"stuck\",\"name\":\"$name\",\"action\":\"restarted\",\"idle_time\":$idle_time,\"stuck_status\":\"$status\",\"elapsed\":$elapsed}"
             fi
             return 1  # Exit with stuck status (shepherd will respawn)
+            ;;
+        retry)
+            log_warn "RETRY: Killing stuck agent '$name' for retry (no progress for ${idle_time}s)"
+
+            # Capture diagnostics before killing
+            capture_stuck_diagnostics "$name" "$session_name" "$idle_time" || true
+
+            # Destroy the tmux session
+            tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+            # Clean up progress files
+            cleanup_progress_files "$name"
+
+            if [[ "$json_output" == "true" ]]; then
+                echo "{\"status\":\"stuck\",\"name\":\"$name\",\"action\":\"retry\",\"idle_time\":$idle_time,\"stuck_status\":\"$status\",\"elapsed\":$elapsed}"
+            fi
+            return 1  # Exit with stuck status (shepherd will retry phase)
             ;;
         *)
             # Unknown action, default to warn

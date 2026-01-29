@@ -51,6 +51,7 @@ BUILDER_TIMEOUT="${LOOM_BUILDER_TIMEOUT:-1800}"
 JUDGE_TIMEOUT="${LOOM_JUDGE_TIMEOUT:-600}"
 DOCTOR_TIMEOUT="${LOOM_DOCTOR_TIMEOUT:-900}"
 DOCTOR_MAX_RETRIES="${LOOM_DOCTOR_MAX_RETRIES:-3}"
+STUCK_MAX_RETRIES="${LOOM_STUCK_MAX_RETRIES:-1}"
 POLL_INTERVAL="${LOOM_POLL_INTERVAL:-5}"
 
 # Marker file to prevent premature worktree cleanup during orchestration
@@ -539,6 +540,42 @@ run_phase() {
     return $wait_exit
 }
 
+# Run a phase with automatic retry on stuck detection (exit code 4)
+# Uses LOOM_STUCK_ACTION=retry to enable kill-and-retry behavior.
+# On exit code 4, retries the phase up to STUCK_MAX_RETRIES times.
+# All arguments are passed through to run_phase.
+run_phase_with_retry() {
+    local role="$1"
+    local stuck_retries=0
+    local phase_exit=0
+
+    while true; do
+        phase_exit=0
+        LOOM_STUCK_ACTION=retry run_phase "$@" || phase_exit=$?
+
+        if [[ $phase_exit -ne 4 ]]; then
+            # Not a stuck exit - return as-is (0=ok, 3=shutdown, other=error)
+            return $phase_exit
+        fi
+
+        stuck_retries=$((stuck_retries + 1))
+        if [[ $stuck_retries -gt $STUCK_MAX_RETRIES ]]; then
+            log_error "$role worker stuck after $STUCK_MAX_RETRIES retry attempt(s) - giving up"
+            return 4
+        fi
+
+        log_warn "$role worker was stuck - retrying (attempt $stuck_retries of $STUCK_MAX_RETRIES)"
+
+        # Report retry milestone
+        if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
+            "$REPO_ROOT/.loom/scripts/report-milestone.sh" heartbeat \
+                --task-id "$TASK_ID" \
+                --action "retrying stuck $role (attempt $stuck_retries)" \
+                --quiet || true
+        fi
+    done
+}
+
 # ─── Get PR for issue ─────────────────────────────────────────────────────────
 
 # Find a PR for an issue, trying multiple linking patterns
@@ -639,22 +676,26 @@ main() {
         fi
 
         local curator_exit=0
-        run_phase "curator" "curator-issue-${ISSUE}" "$CURATOR_TIMEOUT" \
+        run_phase_with_retry "curator" "curator-issue-${ISSUE}" "$CURATOR_TIMEOUT" \
             --phase "curator" \
             --args "$ISSUE" || curator_exit=$?
 
         if [[ $curator_exit -eq 3 ]]; then
             handle_shutdown "curator"
-        fi
+        elif [[ $curator_exit -eq 4 ]]; then
+            log_warn "Curator stuck after retry - skipping curation, proceeding to builder"
+            completed_phases+=("Curator (stuck - skipped)")
+            # Don't block issue for curator failure - it's not critical
+        else
+            # Validate curator phase
+            if ! "$REPO_ROOT/.loom/scripts/validate-phase.sh" curator "$ISSUE" --task-id "$TASK_ID"; then
+                log_error "Curator phase validation failed"
+                fail_with_reason "curator" "validation failed"
+            fi
 
-        # Validate curator phase
-        if ! "$REPO_ROOT/.loom/scripts/validate-phase.sh" curator "$ISSUE" --task-id "$TASK_ID"; then
-            log_error "Curator phase validation failed"
-            fail_with_reason "curator" "validation failed"
+            completed_phases+=("Curator")
+            log_success "Curator phase complete"
         fi
-
-        completed_phases+=("Curator")
-        log_success "Curator phase complete"
     else
         log_info "Issue already curated, skipping curator phase"
         completed_phases+=("Curator (skipped)")
@@ -789,7 +830,7 @@ main() {
         create_worktree_marker "$worktree_path"
 
         local builder_exit=0
-        run_phase "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
+        run_phase_with_retry "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
             --phase "builder" \
             --worktree "$worktree_path" \
             --args "$ISSUE" || builder_exit=$?
@@ -799,6 +840,11 @@ main() {
             remove_label "$ISSUE" "loom:building"
             add_label "$ISSUE" "loom:issue"
             handle_shutdown "builder"
+        elif [[ $builder_exit -eq 4 ]]; then
+            log_error "Builder stuck after retry - marking issue as blocked"
+            gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE" --body "**Shepherd blocked**: Builder agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
+            fail_with_reason "builder" "agent stuck after retry"
         fi
 
         # Validate builder phase
@@ -849,13 +895,18 @@ main() {
         fi
 
         local judge_exit=0
-        run_phase "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" \
+        run_phase_with_retry "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" \
             --phase "judge" \
             --pr "$pr_number" \
             --args "$pr_number" || judge_exit=$?
 
         if [[ $judge_exit -eq 3 ]]; then
             handle_shutdown "judge"
+        elif [[ $judge_exit -eq 4 ]]; then
+            log_error "Judge stuck after retry - marking issue as blocked"
+            gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+            gh issue comment "$ISSUE" --body "**Shepherd blocked**: Judge agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
+            fail_with_reason "judge" "agent stuck after retry"
         fi
 
         # Validate judge phase
@@ -902,7 +953,7 @@ main() {
             fi
 
             local doctor_exit=0
-            run_phase "doctor" "doctor-issue-${ISSUE}" "$DOCTOR_TIMEOUT" \
+            run_phase_with_retry "doctor" "doctor-issue-${ISSUE}" "$DOCTOR_TIMEOUT" \
                 --phase "doctor" \
                 --pr "$pr_number" \
                 --worktree "$worktree_path" \
@@ -910,6 +961,11 @@ main() {
 
             if [[ $doctor_exit -eq 3 ]]; then
                 handle_shutdown "doctor"
+            elif [[ $doctor_exit -eq 4 ]]; then
+                log_error "Doctor stuck after retry - marking issue as blocked"
+                gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+                gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
+                fail_with_reason "doctor" "agent stuck after retry"
             fi
 
             # Validate doctor phase
