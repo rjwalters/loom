@@ -210,7 +210,7 @@ pnpm daemon:build
 - Builds the Rust daemon from source
 - Initializes your repository
 
-**Next:** See [DEVELOPMENT.md](../../DEVELOPMENT.md) for development workflow.
+**Next:** See [DEVELOPMENT.md](development.md) for development workflow.
 
 ### Option 3: Interactive Install Script (Recommended)
 
@@ -299,7 +299,7 @@ Visual application with workspace management and terminal controls.
 
 5. **Start Working**
    - Terminals are now ready for manual commands or AI agents
-   - See [WORKFLOWS.md](../../WORKFLOWS.md) for agent coordination patterns
+   - See [WORKFLOWS.md](../workflows.md) for agent coordination patterns
 
 **Next:** Configure terminal roles via the settings UI.
 
@@ -504,7 +504,7 @@ gh label sync -f .github/labels.yml
 gh label list | grep "loom:"
 ```
 
-Labels enable workflow coordination between agents. See [WORKFLOWS.md](../../WORKFLOWS.md) for details.
+Labels enable workflow coordination between agents. See [WORKFLOWS.md](../workflows.md) for details.
 
 ### 3. Start Using Agents
 
@@ -573,7 +573,7 @@ See [defaults/roles/README.md](../../defaults/roles/README.md) for role creation
 
 Read the comprehensive workflow documentation:
 
-- [WORKFLOWS.md](../../WORKFLOWS.md) - Agent coordination patterns
+- [WORKFLOWS.md](../workflows.md) - Agent coordination patterns
 - [Agent Archetypes](../philosophy/agent-archetypes.md) - Role philosophy
 - [Git Workflow](git-workflow.md) - Branch strategy and PR process
 
@@ -721,7 +721,7 @@ You've successfully installed Loom and are ready to start orchestrating AI agent
 - ✅ Customize roles for your project's needs
 
 **Next:**
-- Read [WORKFLOWS.md](../../WORKFLOWS.md) to understand agent coordination
+- Read [WORKFLOWS.md](../workflows.md) to understand agent coordination
 - Review [Git Workflow](git-workflow.md) for development patterns
 - Explore [Agent Archetypes](../philosophy/agent-archetypes.md) for role philosophy
 

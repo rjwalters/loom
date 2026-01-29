@@ -285,6 +285,6 @@ Potential improvements to the monitoring interface:
 
 ## See Also
 
-- [DEV_WORKFLOW.md](DEV_WORKFLOW.md) - Complete development workflow guide
-- [scripts/README.md](scripts/README.md) - Script reference documentation
-- [DEVELOPMENT.md](DEVELOPMENT.md) - Code quality and testing
+- [DEV_WORKFLOW.md](dev-workflow.md) - Complete development workflow guide
+- [scripts/README.md](../../scripts/README.md) - Script reference documentation
+- [DEVELOPMENT.md](development.md) - Code quality and testing

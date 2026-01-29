@@ -104,7 +104,7 @@ This is useful for:
 - [Getting Started Guide](docs/guides/getting-started.md) - Complete setup walkthrough
 - [CLI Reference](docs/guides/cli-reference.md) - Full `loom-daemon init` documentation
 
-For detailed development workflows, see [DEV_WORKFLOW.md](DEV_WORKFLOW.md).
+For detailed development workflows, see [DEV_WORKFLOW.md](docs/guides/dev-workflow.md).
 
 ## Development Workflow
 
@@ -281,9 +281,9 @@ loom/
 
 - **[README.md](README.md)** - Project overview and vision
 - **[CLAUDE.md](CLAUDE.md)** - AI development context and patterns
-- **[DEV_WORKFLOW.md](DEV_WORKFLOW.md)** - Development workflow with hot reload
-- **[DEVELOPMENT.md](DEVELOPMENT.md)** - Code quality and testing
-- **[WORKFLOWS.md](WORKFLOWS.md)** - Agent coordination via labels
+- **[DEV_WORKFLOW.md](docs/guides/dev-workflow.md)** - Development workflow with hot reload
+- **[DEVELOPMENT.md](docs/guides/development.md)** - Code quality and testing
+- **[WORKFLOWS.md](docs/workflows.md)** - Agent coordination via labels
 
 ### Development Guides
 

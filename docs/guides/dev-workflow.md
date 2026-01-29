@@ -4,10 +4,10 @@ This document describes the recommended workflow for frontend development with h
 
 ## Related Documentation
 
-- [README.md](README.md) - Project overview and quick start
-- [DEVELOPMENT.md](DEVELOPMENT.md) - Code quality and testing
-- [scripts/README.md](scripts/README.md) - Daemon script reference
-- [CLAUDE.md](CLAUDE.md) - AI development context
+- [README.md](../../README.md) - Project overview and quick start
+- [DEVELOPMENT.md](development.md) - Code quality and testing
+- [scripts/README.md](../../scripts/README.md) - Daemon script reference
+- [CLAUDE.md](../../CLAUDE.md) - AI development context
 
 ## Quick Start
 

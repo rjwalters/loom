@@ -405,7 +405,7 @@ gh auth status
 ## Additional Resources
 
 - **[Getting Started Guide](getting-started.md)** - Installation and setup
-- **[Workflows Documentation](../../WORKFLOWS.md)** - Complete label workflow reference
+- **[Workflows Documentation](../workflows.md)** - Complete label workflow reference
 - **[Role Definitions](../../defaults/roles/README.md)** - Learn about each role
 - **[Git Workflow Guide](git-workflow.md)** - Worktree management and branching strategy
 - **[Architecture Patterns](architecture-patterns.md)** - Understand Loom's design
