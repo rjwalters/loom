@@ -408,7 +408,7 @@ report_final_status() {
 
     # Always remove worktree marker on exit (prevents orphaned markers)
     # The marker prevents cleanup scripts from removing the worktree during orchestration
-    remove_worktree_marker
+    remove_worktree_marker "$ACTIVE_WORKTREE_PATH"
 
     # Only report errors for non-zero exits (excluding shutdown which is 0)
     # Also requires TASK_ID to be set and progress file to exist (created after 'started' milestone)
