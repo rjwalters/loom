@@ -559,6 +559,17 @@ main() {
         exit 0
     fi
 
+    # Check if issue is blocked
+    if has_label "$ISSUE" "loom:blocked"; then
+        if [[ "$MODE" == "force-merge" ]]; then
+            log_warn "Issue #$ISSUE has loom:blocked label - proceeding anyway (--force mode)"
+        else
+            log_error "Issue #$ISSUE has loom:blocked label - refusing to process"
+            log_info "Use --force to override blocked status"
+            exit 1
+        fi
+    fi
+
     local issue_title
     issue_title=$(gh issue view "$ISSUE" --json title --jq '.title' 2>/dev/null)
     log_info "Title: $issue_title"
