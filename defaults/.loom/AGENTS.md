@@ -268,7 +268,7 @@ Every 15 minutes: Review issue backlog, update priorities and organization
 
 1. **Curator** finds vague issue #42, enhances it with technical details
    - Adds `loom:curated` label
-   - Human reviews and removes `loom:curated`, adds `loom:issue`
+   - Human/Champion reviews and adds `loom:issue` (curated label is preserved)
 
 2. **Builder** (you) claims the issue
    ```bash
