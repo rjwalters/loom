@@ -462,10 +462,28 @@ Closes #${ISSUE}"
         local unpushed
         unpushed=$(git -C "$WORKTREE" log --oneline '@{upstream}..HEAD' 2>/dev/null) || unpushed=""
         if [[ -z "$unpushed" ]]; then
-            output_result "failed" "No PR found and no changes in worktree to recover (all changes already pushed?)"
+            # Worktree exists but builder made no commits and has no changes
+            # Clean up the stale worktree so the next retry starts fresh
+            local stale_branch
+            stale_branch=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || stale_branch=""
+            echo -e "${YELLOW}Cleaning up stale worktree (no commits, no changes): $WORKTREE${NC}"
+            if git worktree remove "$WORKTREE" --force 2>/dev/null; then
+                echo -e "${GREEN}✓ Removed stale worktree: $WORKTREE${NC}"
+                # Delete the empty branch
+                if [[ -n "$stale_branch" && "$stale_branch" != "main" ]]; then
+                    if git -C "$REPO_ROOT" branch -d "$stale_branch" 2>/dev/null; then
+                        echo -e "${GREEN}✓ Removed empty branch: $stale_branch${NC}"
+                    else
+                        echo -e "${YELLOW}Could not delete branch $stale_branch (may have upstream references)${NC}"
+                    fi
+                fi
+            else
+                echo -e "${YELLOW}Could not remove stale worktree (may need manual cleanup)${NC}"
+            fi
+            output_result "failed" "No PR found and no changes in worktree to recover. Stale worktree cleaned up for retry."
             local diagnostics
             diagnostics=$(gather_builder_diagnostics)
-            mark_blocked "Builder did not create a PR. Worktree has no uncommitted or unpushed changes. If a PR was pushed but not created, check branch 'feature/issue-${ISSUE}' manually." "$diagnostics"
+            mark_blocked "Builder did not create a PR. Worktree had no uncommitted or unpushed changes. Stale worktree has been cleaned up so the next attempt starts fresh." "$diagnostics"
             return 1
         fi
     fi
@@ -477,10 +495,24 @@ Closes #${ISSUE}"
         local substantive_changes
         substantive_changes=$(echo "$status_output" | grep -v '\.loom-in-use$' | grep -v '\.loom/' || true)
         if [[ -z "$substantive_changes" ]]; then
-            output_result "failed" "No substantive changes to recover (only marker files found)"
+            # Only marker files found - clean up the stale worktree
+            local stale_branch
+            stale_branch=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || stale_branch=""
+            echo -e "${YELLOW}Cleaning up stale worktree (only marker files, no substantive changes): $WORKTREE${NC}"
+            if git worktree remove "$WORKTREE" --force 2>/dev/null; then
+                echo -e "${GREEN}✓ Removed stale worktree: $WORKTREE${NC}"
+                if [[ -n "$stale_branch" && "$stale_branch" != "main" ]]; then
+                    if git -C "$REPO_ROOT" branch -d "$stale_branch" 2>/dev/null; then
+                        echo -e "${GREEN}✓ Removed empty branch: $stale_branch${NC}"
+                    fi
+                fi
+            else
+                echo -e "${YELLOW}Could not remove stale worktree (may need manual cleanup)${NC}"
+            fi
+            output_result "failed" "No substantive changes to recover (only marker files found). Stale worktree cleaned up for retry."
             local diagnostics
             diagnostics=$(gather_builder_diagnostics)
-            mark_blocked "Builder did not produce substantive changes. Only marker/infrastructure files were found in the worktree. This typically indicates the agent was rate-limited or failed to start." "$diagnostics"
+            mark_blocked "Builder did not produce substantive changes. Only marker/infrastructure files were found in the worktree. Stale worktree has been cleaned up so the next attempt starts fresh." "$diagnostics"
             return 1
         fi
     fi
