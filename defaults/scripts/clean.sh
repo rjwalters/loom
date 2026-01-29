@@ -394,9 +394,8 @@ if [[ "$BRANCHES_ONLY" == false && "$TMUX_ONLY" == false ]]; then
 
       # Check for in-use marker (shepherd orchestration in progress)
       # See issue #1485: prevents premature cleanup during orchestration
-      local marker_file="${worktree_path}/.loom-in-use"
+      marker_file="${worktree_path}/.loom-in-use"
       if [[ -f "$marker_file" ]]; then
-        local marker_task_id marker_pid
         marker_task_id=$(jq -r '.shepherd_task_id // "unknown"' "$marker_file" 2>/dev/null || echo "unknown")
         marker_pid=$(jq -r '.pid // "unknown"' "$marker_file" 2>/dev/null || echo "unknown")
         info "  Worktree in use by shepherd (task: $marker_task_id, pid: $marker_pid) - preserving"

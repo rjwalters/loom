@@ -154,6 +154,7 @@ EOF
     fi
 }
 
+# shellcheck disable=SC2120  # Function designed with optional argument, called without args when using ACTIVE_WORKTREE_PATH
 remove_worktree_marker() {
     local worktree_path="${1:-$ACTIVE_WORKTREE_PATH}"
     if [[ -n "$worktree_path" && -f "${worktree_path}/${WORKTREE_MARKER_FILE}" ]]; then
