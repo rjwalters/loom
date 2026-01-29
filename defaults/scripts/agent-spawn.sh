@@ -520,6 +520,14 @@ EOF
 
     if [[ $elapsed -ge $max_wait ]]; then
         log_warn "Claude CLI did not show ready prompt within ${max_wait}s, sending command anyway"
+    else
+        # IMPORTANT: Claude Code renders the ❯ prompt character as part of its TUI layout
+        # BEFORE the input handler is fully ready to receive keystrokes. If we send
+        # the command immediately after detecting the prompt, the Enter key may be lost.
+        # Wait for the TUI to fully initialize before sending the command.
+        # See: https://github.com/rjwalters/loom/issues/1535
+        log_info "Waiting for TUI input handler to initialize..."
+        sleep 2
     fi
 
     # Send the role slash command
