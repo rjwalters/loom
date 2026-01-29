@@ -332,6 +332,38 @@ remove_label_pr() {
     gh pr edit "$pr" --remove-label "$label" >/dev/null 2>&1 || true
 }
 
+# ─── Rate limit checking ─────────────────────────────────────────────────────
+
+# Check if Claude API usage is too high to spawn agents.
+# Uses check-usage.sh (requires claude-monitor) to detect approaching limits.
+# Returns 0 if rate-limited (should NOT spawn), 1 if OK to proceed.
+# Silently returns 1 (OK) if check-usage.sh is unavailable.
+RATE_LIMIT_THRESHOLD="${LOOM_RATE_LIMIT_THRESHOLD:-90}"
+
+is_rate_limited() {
+    local usage_script="$REPO_ROOT/.loom/scripts/check-usage.sh"
+    if [[ ! -x "$usage_script" ]]; then
+        return 1  # No usage script, assume OK
+    fi
+
+    local usage_json
+    usage_json=$("$usage_script" 2>/dev/null) || return 1
+
+    # Check session percent
+    local session_pct
+    session_pct=$(echo "$usage_json" | jq -r '.session_percent // 0' 2>/dev/null) || return 1
+    if [[ -n "$session_pct" && "$session_pct" != "null" ]]; then
+        # Remove decimal part for integer comparison
+        local session_int="${session_pct%.*}"
+        if [[ "$session_int" -ge "$RATE_LIMIT_THRESHOLD" ]]; then
+            log_warn "Rate limited: session usage at ${session_pct}% (threshold: ${RATE_LIMIT_THRESHOLD}%)"
+            return 0
+        fi
+    fi
+
+    return 1  # Not rate-limited
+}
+
 # ─── Shutdown signal handling ─────────────────────────────────────────────────
 
 check_shutdown() {
@@ -701,6 +733,14 @@ main() {
 
         if check_shutdown; then
             handle_shutdown "builder"
+        fi
+
+        # Check rate limits before spawning the builder (most expensive phase)
+        if is_rate_limited; then
+            log_error "Cannot spawn builder: API rate limit exceeded"
+            log_info "Issue #$ISSUE will remain available for retry when limits reset"
+            # Don't claim the issue - leave it for retry
+            fail_with_reason "builder" "API rate limit exceeded (session usage >= ${RATE_LIMIT_THRESHOLD}%)"
         fi
 
         # Report phase
