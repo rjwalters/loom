@@ -470,6 +470,21 @@ Closes #${ISSUE}"
         fi
     fi
 
+    # Guard: check if changes are substantive (not just marker files)
+    # When agents are rate-limited, the only file in the worktree may be .loom-in-use
+    # or other non-code artifacts. Creating a PR from these wastes review cycles.
+    if [[ -n "$status_output" ]]; then
+        local substantive_changes
+        substantive_changes=$(echo "$status_output" | grep -v '\.loom-in-use$' | grep -v '\.loom/' || true)
+        if [[ -z "$substantive_changes" ]]; then
+            output_result "failed" "No substantive changes to recover (only marker files found)"
+            local diagnostics
+            diagnostics=$(gather_builder_diagnostics)
+            mark_blocked "Builder did not produce substantive changes. Only marker/infrastructure files were found in the worktree. This typically indicates the agent was rate-limited or failed to start." "$diagnostics"
+            return 1
+        fi
+    fi
+
     echo -e "${YELLOW}Attempting recovery: committing and pushing worktree changes${NC}"
     report_milestone "heartbeat" --action "recovery: attempting builder worktree recovery"
 
