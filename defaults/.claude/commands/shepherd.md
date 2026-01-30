@@ -33,10 +33,10 @@ Parse the issue number and any flags from the arguments.
 
 ## Execution
 
-Invoke the shell script with all provided arguments:
+Invoke the shepherd wrapper with all provided arguments:
 
 ```bash
-./.loom/scripts/shepherd-loop.sh $ARGUMENTS
+./.loom/scripts/loom-shepherd.sh $ARGUMENTS
 ```
 
 Run this command now. Report the exit status when complete.
@@ -45,4 +45,6 @@ Run this command now. Report the exit status when complete.
 
 For detailed orchestration workflow, phase definitions, and troubleshooting:
 - **Lifecycle details**: `.claude/commands/shepherd-lifecycle.md`
-- **Shell script**: `.loom/scripts/shepherd-loop.sh`
+- **Wrapper script**: `.loom/scripts/loom-shepherd.sh` (routes to Python or shell)
+- **Python implementation**: `loom-tools/src/loom_tools/shepherd/`
+- **Shell script (fallback)**: `.loom/scripts/shepherd-loop.sh`
