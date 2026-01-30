@@ -309,6 +309,22 @@ cleanup_stale_progress_files() {
           rm -f "$progress_file"
           info "Deleted stale progress file: $(basename "$progress_file") (status: $status)"
         fi
+      else
+        # Stale working file - check if associated issue is closed
+        local file_issue
+        file_issue=$(jq -r '.issue // 0' "$progress_file" 2>/dev/null || echo "0")
+        if [[ "$file_issue" != "0" ]]; then
+          local issue_state
+          issue_state=$(gh issue view "$file_issue" --json state --jq '.state' 2>/dev/null || echo "unknown")
+          if [[ "$issue_state" == "CLOSED" ]]; then
+            if [[ "$DRY_RUN" == true ]]; then
+              info "[DRY-RUN] Would delete orphaned progress file: $(basename "$progress_file") (issue #$file_issue closed, status: working)"
+            else
+              rm -f "$progress_file"
+              info "Deleted orphaned progress file: $(basename "$progress_file") (issue #$file_issue closed, status: working)"
+            fi
+          fi
+        fi
       fi
     fi
   done
