@@ -126,11 +126,13 @@ def run_worker_phase(
         spawn_cmd.extend(["--worktree", str(worktree)])
 
     # Spawn the worker
+    # Redirect to DEVNULL to suppress output - agent logs are captured to
+    # .loom/logs/<session>.log for debugging purposes
     spawn_result = subprocess.run(
         spawn_cmd,
         cwd=ctx.repo_root,
-        text=True,
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         check=False,
     )
 
@@ -168,11 +170,13 @@ def run_worker_phase(
     env["LOOM_STUCK_ACTION"] = "retry"
 
     # Wait for completion
+    # Redirect to DEVNULL to suppress output - agent logs are captured to
+    # .loom/logs/<session>.log for debugging purposes
     wait_result = subprocess.run(
         wait_cmd,
         cwd=ctx.repo_root,
-        text=True,
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         check=False,
         env=env,
     )
@@ -184,8 +188,8 @@ def run_worker_phase(
     subprocess.run(
         destroy_cmd,
         cwd=ctx.repo_root,
-        text=True,
-        capture_output=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         check=False,
     )
 
