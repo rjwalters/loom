@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import pathlib
 import re
 import subprocess
@@ -39,6 +38,50 @@ PROCESSING_INDICATORS = "esc to interrupt"
 
 # Progress tracking directory
 PROGRESS_DIR = pathlib.Path("/tmp/loom-agent-progress")
+
+# Adaptive contract checking intervals (see issue #1678)
+# Contract checks are expensive (GitHub API calls), so we start with longer
+# intervals and decrease them over time as completion becomes more likely.
+#
+# Interval schedule based on elapsed time:
+#   0-180s:   No contract checks (wait for initial processing)
+#   180-270s: 90s interval (agent still early in work)
+#   270-330s: 60s interval (agent progressing)
+#   330-360s: 30s interval (likely nearing completion)
+#   360s+:    10s interval (final detection mode)
+CONTRACT_INITIAL_DELAY = 180
+
+
+def get_adaptive_contract_interval(elapsed: int, override: int = 0) -> int:
+    """Get adaptive contract check interval based on elapsed time since agent started.
+
+    Returns the appropriate interval in seconds, or 0 if we should skip this check.
+
+    The schedule balances detection latency against API cost:
+      0-180s:   Skip checks (return 0) - agent still processing initial work
+      180-270s: 90s interval - early work phase
+      270-330s: 60s interval - mid work phase
+      330-360s: 30s interval - likely nearing completion
+      360s+:    10s interval - final rapid detection mode
+
+    If override is set > 0, returns that fixed value instead.
+    Returns 0 to signal "skip this check" (used during initial delay period).
+    """
+    # Allow override for testing or specific use cases
+    if override > 0:
+        return override
+
+    # Adaptive schedule based on elapsed time
+    if elapsed < 180:
+        return 0  # No check yet - wait for initial delay
+    elif elapsed < 270:
+        return 90
+    elif elapsed < 330:
+        return 60
+    elif elapsed < 360:
+        return 30
+    else:
+        return 10
 
 
 @dataclass
@@ -166,11 +209,27 @@ class AgentMonitor:
                 f"(task-id: {self.config.task_id})"
             )
 
-        if self.config.phase and self.config.contract_interval > 0:
-            log_info(
-                f"Proactive contract checking: every {self.config.contract_interval}s "
-                f"for phase '{self.config.phase}'"
+        if self.config.phase:
+            # Check if using adaptive or fixed intervals
+            override = (
+                self.config.contract_interval
+                if self.config.contract_interval != 90
+                else 0
             )
+            if override == 0:
+                log_info(
+                    f"Proactive contract checking: adaptive intervals for phase "
+                    f"'{self.config.phase}' (initial delay: {CONTRACT_INITIAL_DELAY}s)"
+                )
+            elif override > 0:
+                log_info(
+                    f"Proactive contract checking: fixed {override}s interval "
+                    f"for phase '{self.config.phase}'"
+                )
+            else:
+                log_info(
+                    f"Proactive contract checking: disabled for phase '{self.config.phase}'"
+                )
 
         sc = self.config.stuck_config
         log_info(
@@ -413,9 +472,7 @@ class AgentMonitor:
 
         # Check for role slash command visible at the prompt line
         command_at_prompt = bool(
-            re.search(
-                r"❯\s*/?(builder|judge|curator|doctor|shepherd)", pane_content
-            )
+            re.search(r"❯\s*/?(builder|judge|curator|doctor|shepherd)", pane_content)
         )
 
         # Check for processing indicators
@@ -460,22 +517,43 @@ class AgentMonitor:
         return False
 
     def _check_proactive_contract(self) -> bool:
-        """Proactive phase contract checking at regular intervals."""
+        """Proactive phase contract checking with adaptive intervals.
+
+        Uses adaptive intervals that decrease as the agent runs longer (issue #1678):
+          0-180s:   No checks (initial processing delay)
+          180-270s: 90s interval
+          270-330s: 60s interval
+          330-360s: 30s interval
+          360s+:    10s interval (final rapid detection)
+
+        Override with config.contract_interval to use a fixed interval instead.
+        Set contract_interval to 0 to disable proactive checking.
+        """
         if not self.config.phase:
             return False
-        if self.config.contract_interval <= 0:
+
+        # Get adaptive interval based on elapsed time
+        # If contract_interval is set (non-default), use it as override
+        override = (
+            self.config.contract_interval if self.config.contract_interval != 90 else 0
+        )
+        adaptive_interval = get_adaptive_contract_interval(self.elapsed, override)
+
+        # adaptive_interval of 0 means "skip this check" (during initial delay or disabled)
+        if adaptive_interval <= 0:
             return False
 
         now = time.time()
         since_last = now - self._last_contract_check
-        if since_last < self.config.contract_interval:
+        if since_last < adaptive_interval:
             return False
 
         self._last_contract_check = now
         result = self._check_phase_contract(check_only=True)
         if result.satisfied:
             log_info(
-                f"Phase contract satisfied ({result.status}) via proactive check"
+                f"Phase contract satisfied ({result.status}) via proactive check "
+                f"(interval: {adaptive_interval}s)"
             )
             log_info("Agent completed work but didn't exit - terminating session")
             return True
@@ -500,7 +578,9 @@ class AgentMonitor:
 
         result = self._check_phase_contract(check_only=True)
         if result.satisfied:
-            log_info(f"Phase contract satisfied ({result.status}) - terminating session")
+            log_info(
+                f"Phase contract satisfied ({result.status}) - terminating session"
+            )
             return True
 
         self._idle_contract_checked = True
@@ -589,7 +669,7 @@ class AgentMonitor:
                 return CompletionReason.BUILDER_PR_CREATED
         elif phase == "judge":
             if re.search(
-                r'add-label.*loom:pr|add-label.*loom:changes-requested|'
+                r"add-label.*loom:pr|add-label.*loom:changes-requested|"
                 r'--add-label "loom:pr"|--add-label "loom:changes-requested"',
                 recent_log,
             ):
@@ -611,7 +691,7 @@ class AgentMonitor:
             if re.search(r"https://github\.com/.*/pull/[0-9]+", recent_log):
                 return CompletionReason.BUILDER_PR_CREATED
             if re.search(
-                r'add-label.*loom:pr|add-label.*loom:changes-requested|'
+                r"add-label.*loom:pr|add-label.*loom:changes-requested|"
                 r'--add-label "loom:pr"|--add-label "loom:changes-requested"',
                 recent_log,
             ):
@@ -651,7 +731,9 @@ class AgentMonitor:
         self._cleanup_progress_files()
         kill_session(self.session_name)
 
-        log_success(f"Agent '{self.config.name}' completed ({reason.value} after {self.elapsed}s)")
+        log_success(
+            f"Agent '{self.config.name}' completed ({reason.value} after {self.elapsed}s)"
+        )
 
         return WaitResult(
             status=WaitStatus.COMPLETED,
@@ -847,12 +929,8 @@ def main() -> None:
         help="Time between signal checks (default: 5)",
     )
     parser.add_argument("--issue", type=int, help="Issue number for per-issue abort")
-    parser.add_argument(
-        "--task-id", help="Shepherd task ID for heartbeat emission"
-    )
-    parser.add_argument(
-        "--phase", help="Phase name (curator, builder, judge, doctor)"
-    )
+    parser.add_argument("--task-id", help="Shepherd task ID for heartbeat emission")
+    parser.add_argument("--phase", help="Phase name (curator, builder, judge, doctor)")
     parser.add_argument("--worktree", help="Worktree path for builder phase recovery")
     parser.add_argument("--pr", type=int, help="PR number for judge/doctor validation")
     parser.add_argument(
@@ -898,9 +976,13 @@ def main() -> None:
     else:
         # Exit with appropriate code
         if result.status == WaitStatus.COMPLETED:
-            log_success(f"Agent completed: {result.reason.value if result.reason else 'unknown'}")
+            log_success(
+                f"Agent completed: {result.reason.value if result.reason else 'unknown'}"
+            )
         elif result.status == WaitStatus.SIGNAL:
-            log_warning(f"Signal detected: {result.signal_type.value if result.signal_type else 'unknown'}")
+            log_warning(
+                f"Signal detected: {result.signal_type.value if result.signal_type else 'unknown'}"
+            )
 
     # Exit codes matching agent-wait-bg.sh
     exit_codes = {
