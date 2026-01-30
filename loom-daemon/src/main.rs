@@ -448,9 +448,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             for failure in &report.verification_failures {
                                 eprintln!("  ✗ {failure}");
                             }
-                            eprintln!(
-                                "\n  Some scripts may not have been updated correctly."
-                            );
+                            eprintln!("\n  Some scripts may not have been updated correctly.");
                             eprintln!(
                                 "  Try running install again with --force, or copy manually from defaults/."
                             );
