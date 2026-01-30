@@ -40,7 +40,6 @@ set -euo pipefail
 # Configuration
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
-READINESS_TIMEOUT_SECONDS=30
 STUCK_SESSION_THRESHOLD_SECONDS=${LOOM_STUCK_SESSION_THRESHOLD:-300}  # 5 minutes
 
 # Colors for output
