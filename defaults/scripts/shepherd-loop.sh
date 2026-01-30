@@ -15,13 +15,14 @@
 #   ./.loom/scripts/shepherd-loop.sh <issue-number> [options]
 #
 # Options:
-#   --force, -f     Auto-approve, auto-merge after approval (does NOT skip Judge review)
+#   --merge, -m     Auto-approve, auto-merge after approval (does NOT skip Judge review)
 #   --to <phase>    Stop after specified phase (curated, pr, approved)
 #   --task-id <id>  Use specific task ID (generated if not provided)
 #
 # Deprecated:
+#   --force, -f     (deprecated) Use --merge or -m instead
 #   --force-pr      (deprecated) Now the default behavior
-#   --force-merge   (deprecated) Use --force or -f instead
+#   --force-merge   (deprecated) Use --merge or -m instead
 #   --wait          (deprecated) No longer blocks; shepherd always exits after PR approval
 #
 # Environment Variables:
@@ -37,7 +38,7 @@
 #   ./.loom/scripts/shepherd-loop.sh 42
 #
 #   # Shepherd issue 42 with full automation (auto-merge)
-#   ./.loom/scripts/shepherd-loop.sh 42 --force
+#   ./.loom/scripts/shepherd-loop.sh 42 --merge
 #
 #   # Shepherd with custom timeout and wait for human approval
 #   LOOM_BUILDER_TIMEOUT=3600 ./.loom/scripts/shepherd-loop.sh 42 --wait
@@ -189,7 +190,8 @@ ${YELLOW}USAGE:${NC}
     shepherd-loop.sh <issue-number> [OPTIONS]
 
 ${YELLOW}OPTIONS:${NC}
-    --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+    --merge, -m     Auto-approve, resolve conflicts, auto-merge after approval.
+                    Also overrides loom:blocked status.
     --from <phase>  Start from specified phase (skip earlier phases)
                     Valid phases: curator, builder, judge, merge
     --to <phase>    Stop after specified phase (curated, pr, approved)
@@ -197,24 +199,25 @@ ${YELLOW}OPTIONS:${NC}
     --help          Show this help message
 
 ${YELLOW}DEPRECATED:${NC}
+    --force, -f     (deprecated) Use --merge or -m instead
     --force-pr      (deprecated) Now the default behavior
-    --force-merge   (deprecated) Use --force or -f instead
+    --force-merge   (deprecated) Use --merge or -m instead
     --wait          (deprecated) No longer blocks; shepherd always exits after PR approval
 
 ${YELLOW}PHASES:${NC}
     1. Curator    - Enhance issue with implementation guidance
-    2. Approval   - Wait for loom:issue label (or auto-approve in force mode)
+    2. Approval   - Wait for loom:issue label (or auto-approve in merge mode)
     3. Builder    - Create worktree, implement, create PR
-    4. Judge      - Review PR, approve or request changes (always runs, even in force mode)
+    4. Judge      - Review PR, approve or request changes (always runs, even in merge mode)
     5. Doctor     - Address requested changes (if any)
-    6. Merge      - Auto-merge (--force) or exit at loom:pr (default)
+    6. Merge      - Auto-merge (--merge) or exit at loom:pr (default)
 
 ${YELLOW}NOTE:${NC}
-    Force mode does NOT skip the Judge phase. Code review always runs because
-    GitHub's API prevents self-approval of PRs. Force mode enables auto-approval
+    Merge mode does NOT skip the Judge phase. Code review always runs because
+    GitHub's API prevents self-approval of PRs. Merge mode enables auto-approval
     at phase 2 and auto-merge at phase 6.
 
-    Without --force, the shepherd exits after the PR is approved (loom:pr).
+    Without --merge, the shepherd exits after the PR is approved (loom:pr).
     The Champion role handles merging approved PRs. This frees the shepherd
     slot for new issues instead of blocking indefinitely.
 
@@ -231,21 +234,27 @@ ${YELLOW}EXAMPLES:${NC}
     shepherd-loop.sh 42
 
     # Full automation with auto-merge
-    shepherd-loop.sh 42 --force
-    shepherd-loop.sh 42 -f
+    shepherd-loop.sh 42 --merge
+    shepherd-loop.sh 42 -m
 
     # Stop after curation (for review before building)
     shepherd-loop.sh 42 --to curated
 
     # Resume from judge phase (PR already exists)
-    shepherd-loop.sh 42 --from judge --force
+    shepherd-loop.sh 42 --from judge --merge
 
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --merge|-m)
+            MODE="force-merge"
+            shift
+            ;;
         --force|-f)
+            # Deprecated: use --merge or -m instead
+            log_warn "Flag $1 is deprecated (use --merge or -m instead)"
             MODE="force-merge"
             shift
             ;;
@@ -263,8 +272,8 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --force-merge)
-            # Deprecated: use --force or -f instead
-            log_warn "Flag --force-merge is deprecated (use --force or -f instead)"
+            # Deprecated: use --merge or -m instead
+            log_warn "Flag --force-merge is deprecated (use --merge or -m instead)"
             MODE="force-merge"
             shift
             ;;
@@ -778,10 +787,10 @@ main() {
     # Check if issue is blocked (uses cached labels from above)
     if has_label "$ISSUE" "loom:blocked"; then
         if [[ "$MODE" == "force-merge" ]]; then
-            log_warn "Issue #$ISSUE has loom:blocked label - proceeding anyway (--force mode)"
+            log_warn "Issue #$ISSUE has loom:blocked label - proceeding anyway (--merge mode)"
         else
             log_error "Issue #$ISSUE has loom:blocked label - refusing to process"
-            log_info "Use --force to override blocked status"
+            log_info "Use --merge to override blocked status"
             exit 1
         fi
     fi

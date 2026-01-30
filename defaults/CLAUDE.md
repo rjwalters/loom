@@ -110,7 +110,7 @@ Loom uses a three-layer orchestration architecture for scalable automation:
 **Layer 1 (Shepherds)**:
 - Fully autonomous once spawned
 - Handles entire issue lifecycle including Judge review
-- Creates PR without waiting by default (stops at ready-to-merge), or use `--force` for full automation with auto-merge
+- Creates PR without waiting by default (stops at ready-to-merge), or use `--merge` for full automation with auto-merge
 
 ### When to Use Which Layer
 
@@ -200,10 +200,10 @@ Run the Loom daemon for fully autonomous system orchestration.
 ./.loom/scripts/daemon-loop.sh
 
 # Start in force mode
-./.loom/scripts/daemon-loop.sh --force
+./.loom/scripts/daemon-loop.sh --merge
 
 # Run in background
-nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
+nohup ./.loom/scripts/daemon-loop.sh --merge > /dev/null 2>&1 &
 
 # Custom poll interval (default: 120s)
 LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
@@ -215,8 +215,8 @@ LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
 # Start the daemon (runs continuously)
 /loom
 
-# Start with force mode for aggressive autonomous development
-/loom --force
+# Start with merge mode for aggressive autonomous development
+/loom --merge
 
 # The daemon will:
 # 1. Monitor system state every 60 seconds
@@ -229,9 +229,9 @@ LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
 
 **Dual Daemon Prevention**: Both `daemon-loop.sh` and `/loom` use PID-based locking and session ID tracking to prevent multiple daemon instances from running simultaneously. If a second daemon is started, it will detect the conflict and refuse to start. The `daemon_session_id` field in `daemon-state.json` (format: `timestamp-PID`) enables each daemon to verify it still owns the state file before writing updates. This prevents state corruption when Claude Code sessions are auto-continued.
 
-**Force Mode** (`--force`):
+**Merge Mode** (`--merge`):
 
-When running with `--force`, the daemon enables aggressive autonomous development:
+When running with `--merge`, the daemon enables aggressive autonomous development:
 - Champion auto-promotes all `loom:architect` and `loom:hermit` proposals
 - Champion auto-promotes all `loom:curated` issues
 - Shepherds auto-approve issues at Gate 1 (skip human approval)
@@ -239,7 +239,7 @@ When running with `--force`, the daemon enables aggressive autonomous developmen
 - Audit trail with `[force-mode]` markers on all auto-promoted items
 - Safety guardrails still apply (no force-push, respect `loom:blocked`)
 
-**Force mode does NOT skip code review.** The Judge phase always runs, even in force mode. This is because GitHub's API prevents self-approval of PRs (`gh pr review --approve` fails when the same user created the PR). Loom's label-based review system (`loom:review-requested` -> `loom:pr`) works around this restriction and functions identically in both normal and force modes. Force mode's value is auto-promotion and auto-merge, not review bypass.
+**Merge mode does NOT skip code review.** The Judge phase always runs, even in merge mode. This is because GitHub's API prevents self-approval of PRs (`gh pr review --approve` fails when the same user created the PR). Loom's label-based review system (`loom:review-requested` -> `loom:pr`) works around this restriction and functions identically in both normal and merge modes. Merge mode's value is auto-promotion and auto-merge, not review bypass.
 
 **Example daemon workflow**:
 ```
@@ -313,7 +313,7 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **Purpose**: Evaluate proposals and auto-merge approved PRs
 - **Workflow**: Evaluates `loom:curated`, `loom:architect`, `loom:hermit` proposals → promotes to `loom:issue`. Also finds `loom:pr` PRs → verifies safety criteria → auto-merges if safe
 - **When to use**: Default daemon mode - handles both proposal promotion and PR merging
-- **Note**: Not needed for PR merging when shepherds run with `--force` (shepherds handle their own merges)
+- **Note**: Not needed for PR merging when shepherds run with `--merge` (shepherds handle their own merges)
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues
@@ -623,7 +623,7 @@ When enabled, the daemon uses `shepherd-loop.sh` instead of spawning Claude Code
 
 ```bash
 # Enable shell-based shepherds
-LOOM_SHELL_SHEPHERDS=true /loom --force
+LOOM_SHELL_SHEPHERDS=true /loom --merge
 ```
 
 | Mode | Script | Description |

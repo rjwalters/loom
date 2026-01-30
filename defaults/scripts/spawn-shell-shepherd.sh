@@ -9,14 +9,15 @@
 #   spawn-shell-shepherd.sh <issue-number> [options]
 #
 # Options:
-#   --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+#   --merge, -m     Auto-approve, resolve conflicts, auto-merge after approval
 #   --name <name>   Session name (default: shepherd-issue-<N>)
 #   --json          Output spawn result as JSON
 #   --help          Show this help message
 #
 # Deprecated:
+#   --force, -f     (deprecated) Use --merge or -m instead
 #   --force-pr      (deprecated) Now the default behavior
-#   --force-merge   (deprecated) Use --force or -f instead
+#   --force-merge   (deprecated) Use --merge or -m instead
 #   --wait          (deprecated) No longer blocks; shepherd always exits after PR approval
 #
 # The daemon can configure LOOM_SHELL_SHEPHERDS=true to use this script
@@ -24,7 +25,7 @@
 #
 # Example:
 #   spawn-shell-shepherd.sh 42 --json            # Default: exit after PR approval
-#   spawn-shell-shepherd.sh 42 --force --json    # Full automation with auto-merge
+#   spawn-shell-shepherd.sh 42 --merge --json    # Full automation with auto-merge
 
 set -euo pipefail
 
@@ -90,14 +91,15 @@ ${YELLOW}USAGE:${NC}
     spawn-shell-shepherd.sh <issue-number> [OPTIONS]
 
 ${YELLOW}OPTIONS:${NC}
-    --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+    --merge, -m     Auto-approve, resolve conflicts, auto-merge after approval
     --name <name>   Session name (default: shepherd-issue-<N>)
     --json          Output spawn result as JSON
     --help          Show this help message
 
 ${YELLOW}DEPRECATED:${NC}
+    --force, -f     (deprecated) Use --merge or -m instead
     --force-pr      (deprecated) Now the default behavior
-    --force-merge   (deprecated) Use --force or -f instead
+    --force-merge   (deprecated) Use --merge or -m instead
     --wait          (deprecated) No longer blocks; shepherd always exits after PR approval
 
 ${YELLOW}EXAMPLES:${NC}
@@ -105,7 +107,7 @@ ${YELLOW}EXAMPLES:${NC}
     spawn-shell-shepherd.sh 42
 
     # Spawn with full automation (auto-merge)
-    spawn-shell-shepherd.sh 42 --force
+    spawn-shell-shepherd.sh 42 --merge
 
     # Spawn with custom name and JSON output
     spawn-shell-shepherd.sh 42 --name shepherd-1 --json
@@ -133,8 +135,14 @@ JSON_OUTPUT=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --merge|-m)
+            MODE="--merge"
+            shift
+            ;;
         --force|-f)
-            MODE="--force"
+            # Deprecated: use --merge or -m instead
+            log_warn "Flag $1 is deprecated (use --merge or -m instead)"
+            MODE="--merge"
             shift
             ;;
         --wait)
@@ -150,9 +158,9 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --force-merge)
-            # Deprecated: use --force or -f instead
-            log_warn "Flag --force-merge is deprecated (use --force or -f instead)"
-            MODE="--force"
+            # Deprecated: use --merge or -m instead
+            log_warn "Flag --force-merge is deprecated (use --merge or -m instead)"
+            MODE="--merge"
             shift
             ;;
         --name)

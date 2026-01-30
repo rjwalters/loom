@@ -321,7 +321,7 @@ def auto_spawn_shepherds(state, snapshot_data, debug_mode=False):
 
     # Determine shepherd mode based on daemon's force_mode
     force_mode = state.get("force_mode", False)
-    shepherd_flag = "--force" if force_mode else ""  # default is force-pr behavior
+    shepherd_flag = "--merge" if force_mode else ""  # default is force-pr behavior
 
     debug(f"Issue selection: {len(ready_issues)} ready issues, {active_count}/{max_shepherds} shepherds active")
     debug(f"Shepherd mode: {shepherd_flag} (force_mode={force_mode})")
@@ -1166,7 +1166,7 @@ def handle_empty_backlog(state, debug_mode):
 | Command | Description |
 |---------|-------------|
 | `/loom iterate` | Execute single iteration (used by parent loop) |
-| `/loom iterate --force` | Single iteration with force mode |
+| `/loom iterate --merge` | Single iteration with merge mode |
 | `/loom iterate --debug` | Single iteration with verbose debug logging |
 
 ### Command Detection
@@ -1175,7 +1175,7 @@ def handle_empty_backlog(state, debug_mode):
 args = "$ARGUMENTS".strip().split()
 
 if "iterate" in args:
-    force_mode = "--force" in args
+    force_mode = "--merge" in args or "--force" in args  # --force is deprecated alias
     debug_mode = "--debug" in args
     summary = loom_iterate(force_mode, debug_mode)
     print(summary)  # This is what parent receives
@@ -1193,7 +1193,7 @@ When running with `--debug`, iteration produces verbose logging:
 [DEBUG] Spawning tmux shepherd: shepherd-issue-456 for issue #456
 [DEBUG] Spawning decision: shepherd assigned to #456 (verified)
 [DEBUG]   tmux session: loom-shepherd-issue-456
-[DEBUG] Shepherd mode: --force (force_mode=true)
+[DEBUG] Shepherd mode: --merge (force_mode=true)
 [DEBUG] Checking support roles via spawn-support-role.sh (interval-based)
 [DEBUG] guide: spawn needed (interval_elapsed)
 [DEBUG] State update: guide marked running in-memory (tmux session: loom-guide)

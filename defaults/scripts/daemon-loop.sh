@@ -5,10 +5,10 @@
 # delegating iteration work to Claude via the /loom iterate command.
 #
 # Usage:
-#   ./.loom/scripts/daemon-loop.sh [--force] [--debug] [--status] [--health]
+#   ./.loom/scripts/daemon-loop.sh [--merge] [--debug] [--status] [--health]
 #
 # Options:
-#   --force    Enable force mode for aggressive autonomous development
+#   --merge    Enable merge mode for aggressive autonomous development
 #   --debug    Enable debug mode for verbose subagent troubleshooting
 #   --status   Check if daemon loop is running
 #   --health   Show daemon health status and exit
@@ -37,11 +37,11 @@
 #   # Start daemon with default settings
 #   ./.loom/scripts/daemon-loop.sh
 #
-#   # Start in force mode with custom interval
-#   LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh --force
+#   # Start in merge mode with custom interval
+#   LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh --merge
 #
 #   # Run in background
-#   nohup ./.loom/scripts/daemon-loop.sh --force > /dev/null 2>&1 &
+#   nohup ./.loom/scripts/daemon-loop.sh --merge > /dev/null 2>&1 &
 #
 #   # Check if daemon is running
 #   ./.loom/scripts/daemon-loop.sh --status
@@ -91,8 +91,14 @@ DEBUG_FLAG=""
 SHOW_HEALTH=false
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --merge|-m)
+            FORCE_FLAG="--merge"
+            shift
+            ;;
         --force|-f)
-            FORCE_FLAG="--force"
+            # Deprecated: use --merge or -m instead
+            echo -e "${YELLOW}Warning: Flag $1 is deprecated (use --merge or -m instead)${NC}" >&2
+            FORCE_FLAG="--merge"
             shift
             ;;
         --debug|-d)
@@ -125,10 +131,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "Usage: $0 [--force] [--debug] [--status] [--health]"
+            echo "Usage: $0 [--merge] [--debug] [--status] [--health]"
             echo ""
             echo "Options:"
-            echo "  --force, -f    Enable force mode for aggressive autonomous development"
+            echo "  --merge, -m    Enable merge mode for aggressive autonomous development"
+            echo "  --force, -f    (deprecated) Use --merge or -m instead"
             echo "  --debug, -d    Enable debug mode for verbose subagent troubleshooting"
             echo "  --status       Check if daemon loop is running"
             echo "  --health       Show daemon health status and exit"

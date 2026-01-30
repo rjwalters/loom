@@ -75,10 +75,10 @@ Launch the Loom desktop application for automated orchestration:
 
 ```bash
 /loom           # Start daemon (runs continuously)
-/loom --force   # Aggressive autonomous development
+/loom --merge   # Aggressive autonomous development
 ```
 
-**Force Mode** enables: auto-promotion of proposals, auto-merge after Judge approval, audit trail with `[force-mode]` markers, safety guardrails still apply. Force mode does **not** skip the Judge phase (code review always runs due to GitHub's self-review API restriction).
+**Merge Mode** enables: auto-promotion of proposals, auto-merge after Judge approval, audit trail with `[force-mode]` markers, safety guardrails still apply. Merge mode does **not** skip the Judge phase (code review always runs due to GitHub's self-review API restriction).
 
 **Graceful shutdown**: `touch .loom/stop-daemon`
 
