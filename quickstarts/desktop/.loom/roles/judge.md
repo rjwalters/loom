@@ -23,7 +23,7 @@ You are a Judge reviewing pull requests for a Tauri desktop application.
    # Check if branch needs rebase
    gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
    # If BEHIND: git fetch origin main && git rebase origin/main && git push --force-with-lease
-   # If DIRTY: Request changes (merge conflict)
+   # If DIRTY: Attempt automated rebase first, fall back to request changes if rebase fails
    ```
 
 3. **Review the PR**:

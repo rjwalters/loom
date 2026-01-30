@@ -140,14 +140,21 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 
 1. **Find work**: `gh pr list --label="loom:review-requested" --state=open`
 2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
-3. **Understand context**: Read PR description and linked issues
-4. **Check out code**: `gh pr checkout <number>` to get the branch locally
-5. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
-6. **Run quality checks**: Tests, lints, type checks, build
-7. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
-8. **Review changes**: Examine diff, look for issues, suggest improvements
-9. **Provide feedback**: Use `gh pr comment` to provide review feedback
-10. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file):
+3. **Check merge state**: Check for conflicts and attempt automated rebase if DIRTY (see Automated Rebase for DIRTY PRs below)
+   ```bash
+   MERGE_STATE=$(gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus')
+   if [ "$MERGE_STATE" = "DIRTY" ]; then
+       # Attempt automated rebase (see detailed workflow in Rebase Check section)
+   fi
+   ```
+4. **Understand context**: Read PR description and linked issues
+5. **Check out code**: `gh pr checkout <number>` to get the branch locally
+6. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
+7. **Run quality checks**: Tests, lints, type checks, build
+8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
+9. **Review changes**: Examine diff, look for issues, suggest improvements
+10. **Provide feedback**: Use `gh pr comment` to provide review feedback
+11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file):
    - If approved: Comment with approval, remove `loom:review-requested` and `loom:reviewing`, add `loom:pr` (blue badge - ready for user to merge)
    - If changes needed: Comment with issues, remove `loom:review-requested` and `loom:reviewing`, add `loom:changes-requested` (amber badge - Fixer will address)
 
@@ -252,9 +259,98 @@ gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
 | Status | Action |
 |--------|--------|
 | `CLEAN` | Continue to review |
-| `BEHIND` | Attempt rebase (see below) |
-| `DIRTY` | Request changes - existing conflict |
+| `BEHIND` | Attempt rebase (see If BEHIND section below) |
+| `DIRTY` | Attempt automated rebase (see If DIRTY section below) |
 | `BLOCKED`/`UNSTABLE` | Continue to review (CI issue, not branch issue) |
+
+### If DIRTY: Attempt Automated Rebase
+
+**When a PR has merge conflicts, attempt automated rebase before routing to Doctor.**
+
+This reduces the Doctor→Judge→Merge cycle by handling simple conflicts directly.
+
+```bash
+PR_NUMBER=<number>
+MERGE_STATE=$(gh pr view $PR_NUMBER --json mergeStateStatus --jq '.mergeStateStatus')
+
+if [ "$MERGE_STATE" = "DIRTY" ]; then
+    echo "PR has merge conflicts - attempting automated rebase"
+
+    # Checkout PR branch
+    gh pr checkout $PR_NUMBER
+
+    # Verify we're on the correct branch (not detached HEAD)
+    CURRENT_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null || echo "DETACHED")
+    if [ "$CURRENT_BRANCH" = "DETACHED" ]; then
+        echo "Checkout resulted in detached HEAD - falling back to change request"
+        # Fall back to current behavior (see below)
+    fi
+
+    # Fetch latest main
+    git fetch origin main
+
+    # Attempt rebase
+    if git rebase origin/main; then
+        # Rebase succeeded - push changes
+        if git push --force-with-lease; then
+            echo "Rebase successful - proceeding with review"
+            gh pr comment $PR_NUMBER --body "🔀 Automatically rebased branch to resolve merge conflicts. Proceeding with code review."
+            # Continue with normal review
+        else
+            echo "Push failed - falling back to change request"
+            git rebase --abort 2>/dev/null || true
+            # Fall back: apply loom:merge-conflict + loom:changes-requested
+            gh pr comment $PR_NUMBER --body "$(cat <<'EOF'
+❌ **Changes Requested - Merge Conflict**
+
+Automated rebase succeeded but push failed (possibly due to branch protection or concurrent changes).
+
+Please rebase your branch manually and push:
+```bash
+git fetch origin
+git rebase origin/main
+git push --force-with-lease
+```
+
+I'll review again once conflicts are resolved.
+EOF
+)"
+            gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
+        fi
+    else
+        echo "Rebase failed (complex conflicts) - falling back to change request"
+        git rebase --abort
+
+        # Fall back: apply loom:merge-conflict + loom:changes-requested
+        gh pr comment $PR_NUMBER --body "$(cat <<'EOF'
+❌ **Changes Requested - Merge Conflict**
+
+This PR has merge conflicts that could not be automatically resolved.
+
+Please rebase your branch on main and resolve conflicts:
+```bash
+git fetch origin
+git rebase origin/main
+# Resolve conflicts
+git push --force-with-lease
+```
+
+I'll review again once conflicts are resolved, or the Doctor role will handle this.
+EOF
+)"
+        gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
+    fi
+fi
+```
+
+**Edge cases for DIRTY rebase:**
+
+| Scenario | Handling |
+|----------|----------|
+| Push permission denied | Abort rebase, fall back to change request |
+| Concurrent push during rebase | `--force-with-lease` fails safely, fall back |
+| Detached HEAD after checkout | Skip rebase, fall back to change request |
+| Rebase succeeds but CI may fail | Continue to review - CI verification handles this |
 
 ### If BEHIND: Attempt Rebase
 
@@ -365,8 +461,8 @@ gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 | `CLEAN` | All checks pass, no conflicts | Safe to approve |
 | `BLOCKED` | Required checks failing | Request changes |
 | `UNSTABLE` | Non-required checks failing | Review if acceptable |
-| `BEHIND` | Branch needs rebase | May need update |
-| `DIRTY` | Merge conflicts | Request changes |
+| `BEHIND` | Branch needs rebase | Attempt rebase |
+| `DIRTY` | Merge conflicts | Attempt automated rebase (see Rebase Check section) |
 | `UNKNOWN` | Status not computed yet | Wait and retry |
 
 ### When CI Fails
@@ -395,23 +491,33 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 
 ### When Merge Conflicts Exist
 
-If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **do NOT approve**. Apply `loom:merge-conflict` for visibility:
+If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **attempt automated rebase first** before requesting changes.
+
+**See the "If DIRTY: Attempt Automated Rebase" section above for the complete workflow.**
+
+The automated rebase will:
+1. Checkout the PR branch
+2. Fetch latest main and attempt rebase
+3. If successful: push with `--force-with-lease` and continue review
+4. If failed: abort rebase and apply `loom:merge-conflict` + `loom:changes-requested`
+
+**Fallback behavior** (when automated rebase fails):
 
 ```bash
 gh pr comment <number> --body "$(cat <<'EOF'
-❌ **Changes Requested - Merge Conflicts**
+❌ **Changes Requested - Merge Conflict**
 
-This PR has merge conflicts that need to be resolved before it can be reviewed.
+This PR has merge conflicts that could not be automatically resolved.
 
 Please rebase your branch on main and resolve conflicts:
-\`\`\`bash
+```bash
 git fetch origin
 git rebase origin/main
 # Resolve conflicts
 git push --force-with-lease
-\`\`\`
+```
 
-I'll review again once conflicts are resolved.
+I'll review again once conflicts are resolved, or the Doctor role will handle this.
 EOF
 )"
 gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
