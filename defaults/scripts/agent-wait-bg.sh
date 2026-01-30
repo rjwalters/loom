@@ -85,8 +85,10 @@ STUCK_CRITICAL_THRESHOLD=${LOOM_STUCK_CRITICAL:-600} # 10 min default
 STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart, retry
 
 # "Stuck at prompt" detection - command visible but not processing
-# This is a distinct, faster-detectable failure mode from general stuck detection
-PROMPT_STUCK_THRESHOLD=${LOOM_PROMPT_STUCK_THRESHOLD:-30}  # 30 seconds default
+# This is a distinct, faster-detectable failure mode from general stuck detection.
+# Checked periodically (every PROMPT_STUCK_THRESHOLD seconds) so we can detect
+# agents that start working then later become idle at prompt (see issue #1668).
+PROMPT_STUCK_THRESHOLD=${LOOM_PROMPT_STUCK_THRESHOLD:-30}  # check every 30 seconds
 
 # Pattern for detecting Claude is processing a command (shared with agent-spawn.sh)
 # Claude Code shows "esc to interrupt" in the status bar whenever it is working
@@ -822,7 +824,7 @@ main() {
     local last_contract_check=0
     local stuck_warned=false
     local stuck_critical_reported=false
-    local prompt_stuck_checked=false
+    local last_prompt_stuck_check=0
     local prompt_stuck_recovery_attempted=false
     local last_heartbeat_time=$start_time
     COMPLETION_REASON=""
@@ -917,11 +919,15 @@ main() {
 
         # Fast "stuck at prompt" detection - command visible but not processing
         # This failure mode can be detected in ~30s vs the 5min general stuck threshold.
-        # Only check once after the threshold and only if not already processing.
-        local elapsed=$(( $(date +%s) - start_time ))
-        if [[ "$prompt_stuck_checked" != "true" ]] && [[ "$prompt_stuck_recovery_attempted" != "true" ]] && [[ "$elapsed" -ge "$PROMPT_STUCK_THRESHOLD" ]]; then
+        # Check periodically (every PROMPT_STUCK_THRESHOLD seconds) rather than once,
+        # so we can detect agents that start working then later become idle at prompt.
+        local now
+        now=$(date +%s)
+        local since_last_prompt_check=$((now - last_prompt_stuck_check))
+        if [[ "$since_last_prompt_check" -ge "$PROMPT_STUCK_THRESHOLD" ]] && [[ "$prompt_stuck_recovery_attempted" != "true" ]]; then
+            last_prompt_stuck_check=$now
             if check_stuck_at_prompt "$session_name"; then
-                prompt_stuck_checked=true
+                local elapsed=$(( now - start_time ))
                 log_warn "Agent appears stuck at prompt (command visible but not processing after ${elapsed}s)"
 
                 # Attempt recovery
@@ -939,25 +945,22 @@ main() {
 
                 if attempt_prompt_stuck_recovery "$session_name" "$role_cmd"; then
                     log_success "Agent recovered from stuck-at-prompt state"
-                    # Reset tracking so we continue normal monitoring
-                    prompt_stuck_checked=false
+                    # Reset recovery flag so we can detect future stuck-at-prompt states
+                    prompt_stuck_recovery_attempted=false
                 else
                     # Recovery failed - let the general stuck detection handle escalation
                     log_warn "Stuck-at-prompt recovery failed - waiting for general stuck detection"
                 fi
-            else
-                # Not stuck at prompt - mark as checked so we don't keep rechecking
-                prompt_stuck_checked=true
             fi
         fi
 
-        # Reset prompt stuck tracking if we see progress (pane content changed)
-        if [[ "$prompt_stuck_checked" == "true" ]] || [[ "$prompt_stuck_recovery_attempted" == "true" ]]; then
+        # Reset prompt stuck recovery tracking if we see progress (pane content changed)
+        # This allows us to attempt recovery again if agent gets stuck later
+        if [[ "$prompt_stuck_recovery_attempted" == "true" ]]; then
             local pane_content
             pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
             if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-                # Agent is now processing - reset tracking
-                prompt_stuck_checked=false
+                # Agent is now processing - reset recovery tracking
                 prompt_stuck_recovery_attempted=false
             fi
         fi
