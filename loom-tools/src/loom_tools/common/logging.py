@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import sys
 from datetime import datetime, timezone
@@ -15,7 +16,10 @@ _RESET = "\033[0m"
 
 
 def _use_color() -> bool:
-    return os.isatty(sys.stderr.fileno())
+    try:
+        return os.isatty(sys.stderr.fileno())
+    except (OSError, ValueError, io.UnsupportedOperation):
+        return False
 
 
 def _timestamp() -> str:

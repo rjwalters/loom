@@ -7,6 +7,16 @@ import pathlib
 _cached_root: pathlib.Path | None = None
 
 
+def clear_repo_cache() -> None:
+    """Clear the cached repository root.
+
+    This is mainly useful for testing where the working directory
+    changes between test cases.
+    """
+    global _cached_root
+    _cached_root = None
+
+
 def find_repo_root(start: pathlib.Path | None = None) -> pathlib.Path:
     """Walk up from *start* (default cwd) to find the git repo root.
 
