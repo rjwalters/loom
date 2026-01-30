@@ -35,6 +35,7 @@
 # Note: The pattern uses alternation (|) for grep -E compatibility.
 # Spinner characters are the most reliable indicators of activity.
 #
+# shellcheck disable=SC2034  # Variable is used by scripts that source this file
 PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|✻|✶|✳|✢|✽|·|⏺|◐|◓|◑|◒|● '
 
 # ==============================================================================
