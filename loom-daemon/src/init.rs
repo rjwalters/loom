@@ -464,6 +464,27 @@ pub fn initialize_workspace(
     // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
     setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
 
+    // Verify scaffolding directories match their sources
+    // Note: Files with template substitution (CLAUDE.md, workflows) will show
+    // as mismatches in byte comparison - this is expected. The shell-based
+    // verify-install.sh checksums the rendered output for accurate verification.
+    let claude_src = defaults.join(".claude");
+    let claude_dst = workspace.join(".claude");
+    verify_copied_files(&claude_src, &claude_dst, ".claude", &mut report);
+
+    let codex_src = defaults.join(".codex");
+    let codex_dst = workspace.join(".codex");
+    verify_copied_files(&codex_src, &codex_dst, ".codex", &mut report);
+
+    let github_src = defaults.join(".github");
+    let github_dst = workspace.join(".github");
+    verify_copied_files(&github_src, &github_dst, ".github", &mut report);
+
+    // Generate installation manifest using verify-install.sh
+    // This creates .loom/manifest.json with SHA-256 checksums of all
+    // installed files (computed on the rendered output, not source templates).
+    generate_manifest(workspace);
+
     Ok(report)
 }
 
@@ -1113,6 +1134,43 @@ fn setup_repository_scaffolding(
     }
 
     Ok(())
+}
+
+/// Generate installation manifest by running verify-install.sh
+///
+/// Attempts to run `.loom/scripts/verify-install.sh generate --quiet` to create
+/// `.loom/manifest.json` with SHA-256 checksums of all installed files.
+/// This is non-fatal - manifest generation failure doesn't prevent installation.
+fn generate_manifest(workspace_path: &Path) {
+    let script = workspace_path
+        .join(".loom")
+        .join("scripts")
+        .join("verify-install.sh");
+
+    if !script.exists() {
+        return;
+    }
+
+    let result = Command::new("bash")
+        .arg(&script)
+        .arg("generate")
+        .arg("--quiet")
+        .current_dir(workspace_path)
+        .output();
+
+    match result {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!(
+                    "Warning: Manifest generation failed (exit {})",
+                    output.status.code().unwrap_or(-1)
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not run verify-install.sh: {e}");
+        }
+    }
 }
 
 /// Update .gitignore with Loom ephemeral patterns

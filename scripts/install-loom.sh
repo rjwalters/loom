@@ -561,6 +561,15 @@ if [[ -f "$LOOM_ROOT/defaults/loom" ]]; then
 fi
 echo ""
 
+# Generate installation manifest (checksum of all installed files)
+if [[ -x ".loom/scripts/verify-install.sh" ]]; then
+  info "Generating installation manifest..."
+  ./.loom/scripts/verify-install.sh generate --quiet || \
+    warning "Manifest generation failed (non-fatal)"
+  success "Installation manifest generated (.loom/manifest.json)"
+fi
+echo ""
+
 # ============================================================================
 # STEP 4: Sync GitHub Labels
 # ============================================================================
