@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +45,44 @@ class ShepherdContext:
         self.worktree_path = (
             self.repo_root / ".loom" / "worktrees" / f"issue-{self.config.issue}"
         )
+        self._cleanup_stale_progress_for_issue()
+
+    def _cleanup_stale_progress_for_issue(self) -> None:
+        """Remove stale progress files for this issue.
+
+        When a new shepherd starts for an issue that already has a progress
+        file (from a previous crashed/orphaned run), remove it to prevent
+        stale data from interfering with the new run.
+        """
+        logger = logging.getLogger(__name__)
+        progress_dir = self.repo_root / ".loom" / "progress"
+        if not progress_dir.is_dir():
+            return
+
+        issue = self.config.issue
+        for progress_file in progress_dir.glob("shepherd-*.json"):
+            try:
+                data = json.loads(progress_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            if data.get("issue") != issue:
+                continue
+
+            # Don't remove our own progress file (matched by task_id)
+            if data.get("task_id") == self.config.task_id:
+                continue
+
+            logger.info(
+                "Removing stale progress file %s for issue #%s (task_id: %s)",
+                progress_file.name,
+                issue,
+                data.get("task_id", "unknown"),
+            )
+            try:
+                progress_file.unlink()
+            except OSError:
+                pass
 
     @property
     def scripts_dir(self) -> Path:
