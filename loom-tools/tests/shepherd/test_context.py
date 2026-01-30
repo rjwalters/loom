@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-
-import pytest
 
 from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
