@@ -15,7 +15,7 @@
 #   ./.loom/scripts/shepherd-loop.sh <issue-number> [options]
 #
 # Options:
-#   --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
+#   --force, -f     Auto-approve, auto-merge after approval (does NOT skip Judge review)
 #   --wait          Wait for human approval at each gate (explicit non-default)
 #   --to <phase>    Stop after specified phase (curated, pr, approved)
 #   --task-id <id>  Use specific task ID (generated if not provided)
@@ -197,9 +197,14 @@ ${YELLOW}PHASES:${NC}
     1. Curator    - Enhance issue with implementation guidance
     2. Approval   - Wait for loom:issue label (or auto-approve in force mode)
     3. Builder    - Create worktree, implement, create PR
-    4. Judge      - Review PR, approve or request changes
+    4. Judge      - Review PR, approve or request changes (always runs, even in force mode)
     5. Doctor     - Address requested changes (if any)
     6. Merge      - Auto-merge (--force) or wait for human
+
+${YELLOW}NOTE:${NC}
+    Force mode does NOT skip the Judge phase. Code review always runs because
+    GitHub's API prevents self-approval of PRs. Force mode enables auto-approval
+    at phase 2 and auto-merge at phase 6.
 
 ${YELLOW}ENVIRONMENT:${NC}
     LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 300)

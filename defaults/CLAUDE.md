@@ -234,8 +234,12 @@ LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
 When running with `--force`, the daemon enables aggressive autonomous development:
 - Champion auto-promotes all `loom:architect` and `loom:hermit` proposals
 - Champion auto-promotes all `loom:curated` issues
+- Shepherds auto-approve issues at Gate 1 (skip human approval)
+- Shepherds auto-merge PRs at Gate 2 (after Judge approval)
 - Audit trail with `[force-mode]` markers on all auto-promoted items
 - Safety guardrails still apply (no force-push, respect `loom:blocked`)
+
+**Force mode does NOT skip code review.** The Judge phase always runs, even in force mode. This is because GitHub's API prevents self-approval of PRs (`gh pr review --approve` fails when the same user created the PR). Loom's label-based review system (`loom:review-requested` -> `loom:pr`) works around this restriction and functions identically in both normal and force modes. Force mode's value is auto-promotion and auto-merge, not review bypass.
 
 **Example daemon workflow**:
 ```

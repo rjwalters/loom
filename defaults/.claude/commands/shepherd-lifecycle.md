@@ -518,6 +518,21 @@ else
 fi
 ```
 
+## Mode Behavior at Each Phase
+
+The `--force` flag affects Gate 1 (approval) and Gate 2 (merge), but **does not skip the Judge phase**. Code review always runs because GitHub's API prevents self-approval of PRs.
+
+| Phase | Default (`--force-pr`) | `--wait` | `--force` |
+|-------|----------------------|----------|-----------|
+| Curator | Runs | Runs | Runs |
+| Gate 1 (Approval) | Auto-approve | Wait for human | Auto-approve |
+| Builder | Runs | Runs | Runs |
+| **Judge** | **Runs** | **Runs** | **Runs** |
+| Doctor (if needed) | Runs | Runs | Runs |
+| Gate 2 (Merge) | Stop at `loom:pr` | Wait for human | Auto-merge |
+
+**Why Judge always runs**: GitHub's API returns "cannot approve your own PR" when the same user who created a PR tries to approve it. Loom works around this via label-based reviews (Judge sets `loom:pr` label instead of calling `gh pr review --approve`), which works in all modes. Force mode's value is auto-promotion at Gate 1 and auto-merge at Gate 2, not review bypass.
+
 ## Full Orchestration Workflow
 
 ### Step 1: Check State
@@ -637,9 +652,11 @@ fi
 
 ### Step 5: Judge Phase
 
+**Note**: The Judge phase runs in ALL modes, including `--force`. Force mode does not skip code review. GitHub's API prevents self-approval of PRs, but Loom's label-based review system (Judge adds `loom:pr` label instead of using `gh pr review --approve`) works around this restriction. See `judge.md` for details.
+
 ```bash
 if [ "$PHASE" = "judge" ]; then
-  # Spawn ephemeral judge worker
+  # Spawn ephemeral judge worker (always runs, even in force mode)
   ./.loom/scripts/agent-spawn.sh --role judge --name "judge-issue-${ISSUE_NUMBER}" --args "$PR_NUMBER" --on-demand
 
   # Non-blocking wait with heartbeat polling

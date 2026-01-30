@@ -78,7 +78,7 @@ Launch the Loom desktop application for automated orchestration:
 /loom --force   # Aggressive autonomous development
 ```
 
-**Force Mode** enables: auto-promotion of proposals, audit trail with `[force-mode]` markers, safety guardrails still apply.
+**Force Mode** enables: auto-promotion of proposals, auto-merge after Judge approval, audit trail with `[force-mode]` markers, safety guardrails still apply. Force mode does **not** skip the Judge phase (code review always runs due to GitHub's self-review API restriction).
 
 **Graceful shutdown**: `touch .loom/stop-daemon`
 
