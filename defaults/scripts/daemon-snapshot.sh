@@ -56,6 +56,13 @@ JUDGE_INTERVAL="${LOOM_JUDGE_INTERVAL:-300}"        # 5 minutes default
 # Note: loom:urgent always takes precedence regardless of strategy
 ISSUE_STRATEGY="${LOOM_ISSUE_STRATEGY:-fifo}"
 
+# Retry configuration for blocked issues
+MAX_RETRY_COUNT="${LOOM_MAX_RETRY_COUNT:-3}"
+RETRY_COOLDOWN="${LOOM_RETRY_COOLDOWN:-1800}"            # 30 minutes initial cooldown
+RETRY_BACKOFF_MULTIPLIER="${LOOM_RETRY_BACKOFF_MULTIPLIER:-2}"
+RETRY_MAX_COOLDOWN="${LOOM_RETRY_MAX_COOLDOWN:-14400}"   # 4 hours max cooldown
+SYSTEMATIC_FAILURE_THRESHOLD="${LOOM_SYSTEMATIC_FAILURE_THRESHOLD:-3}"
+
 # Find the repository root (works from any subdirectory)
 find_repo_root() {
     local dir="$PWD"
@@ -572,6 +579,15 @@ elif [[ "$HERMIT_STATUS" != "running" ]]; then
     HERMIT_NEEDS_TRIGGER="true"
 fi
 
+# Early check: systematic failure suppresses shepherd spawning
+SYSTEMATIC_FAILURE_SUPPRESSES_SPAWN="false"
+if [[ -f "$DAEMON_STATE_FILE" ]]; then
+    sf_active=$(jq -r '.systematic_failure.active // false' "$DAEMON_STATE_FILE" 2>/dev/null || echo "false")
+    if [[ "$sf_active" == "true" ]]; then
+        SYSTEMATIC_FAILURE_SUPPRESSES_SPAWN="true"
+    fi
+fi
+
 # Build recommended actions array
 ACTIONS="[]"
 
@@ -580,8 +596,8 @@ if [[ $TOTAL_PROPOSALS -gt 0 ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["promote_proposals"]')
 fi
 
-# Action: spawn shepherds
-if [[ $READY_COUNT -gt 0 ]] && [[ $AVAILABLE_SHEPHERD_SLOTS -gt 0 ]]; then
+# Action: spawn shepherds (suppressed during systematic failure)
+if [[ $READY_COUNT -gt 0 ]] && [[ $AVAILABLE_SHEPHERD_SLOTS -gt 0 ]] && [[ "$SYSTEMATIC_FAILURE_SUPPRESSES_SPAWN" != "true" ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["spawn_shepherds"]')
 fi
 
@@ -878,6 +894,125 @@ if [[ "$INVALID_TASK_ID_COUNT" -gt 0 ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["validate_state"]')
 fi
 
+# ─── Pipeline health computation ────────────────────────────────────────────
+# Determines if the pipeline is stalled, degraded, or healthy based on
+# the current state of ready, blocked, and building issues.
+# Also reads retry metadata from daemon-state.json to classify blocked
+# issues as retryable vs permanently blocked.
+
+# Read retry metadata from daemon-state.json
+BLOCKED_ISSUE_RETRIES="{}"
+if [[ -f "$DAEMON_STATE_FILE" ]]; then
+    BLOCKED_ISSUE_RETRIES=$(jq -r '.blocked_issue_retries // {}' "$DAEMON_STATE_FILE" 2>/dev/null || echo "{}")
+fi
+
+# Classify blocked issues as retryable vs permanent
+# An issue is retryable if retry_count < MAX_RETRY_COUNT AND cooldown has elapsed
+RETRYABLE_COUNT=0
+PERMANENT_BLOCKED_COUNT=0
+RETRYABLE_ISSUES="[]"
+
+for blocked_num in $(echo "$BLOCKED_ISSUES" | jq -r '.[].number'); do
+    [[ -z "$blocked_num" ]] && continue
+
+    issue_key="$blocked_num"
+    retry_info=$(echo "$BLOCKED_ISSUE_RETRIES" | jq --arg key "$issue_key" '.[$key] // {"retry_count": 0, "last_retry_at": null, "retry_exhausted": false}')
+    retry_count=$(echo "$retry_info" | jq -r '.retry_count // 0')
+    retry_exhausted=$(echo "$retry_info" | jq -r '.retry_exhausted // false')
+
+    if [[ "$retry_exhausted" == "true" ]] || [[ "$retry_count" -ge "$MAX_RETRY_COUNT" ]]; then
+        PERMANENT_BLOCKED_COUNT=$((PERMANENT_BLOCKED_COUNT + 1))
+    else
+        # Check cooldown: is enough time elapsed since last retry?
+        last_retry=$(echo "$retry_info" | jq -r '.last_retry_at // ""')
+        cooldown_elapsed="true"
+
+        if [[ -n "$last_retry" && "$last_retry" != "null" ]]; then
+            if [[ "$(uname)" == "Darwin" ]]; then
+                last_retry_epoch=$(TZ=UTC date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_retry" "+%s" 2>/dev/null || echo "0")
+            else
+                last_retry_epoch=$(date -d "$last_retry" "+%s" 2>/dev/null || echo "0")
+            fi
+
+            if [[ "$last_retry_epoch" != "0" ]]; then
+                # Calculate cooldown with exponential backoff
+                # cooldown = RETRY_COOLDOWN * (RETRY_BACKOFF_MULTIPLIER ^ retry_count)
+                effective_cooldown=$RETRY_COOLDOWN
+                for ((i=0; i<retry_count; i++)); do
+                    effective_cooldown=$((effective_cooldown * RETRY_BACKOFF_MULTIPLIER))
+                done
+                if [[ $effective_cooldown -gt $RETRY_MAX_COOLDOWN ]]; then
+                    effective_cooldown=$RETRY_MAX_COOLDOWN
+                fi
+
+                elapsed=$((NOW_EPOCH - last_retry_epoch))
+                if [[ $elapsed -lt $effective_cooldown ]]; then
+                    cooldown_elapsed="false"
+                fi
+            fi
+        fi
+
+        if [[ "$cooldown_elapsed" == "true" ]]; then
+            RETRYABLE_COUNT=$((RETRYABLE_COUNT + 1))
+            RETRYABLE_ISSUES=$(echo "$RETRYABLE_ISSUES" | jq --argjson num "$blocked_num" --argjson rc "$retry_count" '. + [{"number": $num, "retry_count": $rc}]')
+        else
+            # Waiting for cooldown - count as permanent for now (not actionable)
+            PERMANENT_BLOCKED_COUNT=$((PERMANENT_BLOCKED_COUNT + 1))
+        fi
+    fi
+done
+
+# Determine pipeline health status
+PIPELINE_STATUS="healthy"
+STALL_REASON="null"
+
+if [[ $READY_COUNT -eq 0 ]] && [[ $BLOCKED_COUNT -gt 0 ]] && [[ $BUILDING_COUNT -eq 0 ]]; then
+    PIPELINE_STATUS="stalled"
+    STALL_REASON="\"all_issues_blocked\""
+elif [[ $READY_COUNT -eq 0 ]] && [[ $BLOCKED_COUNT -eq 0 ]] && [[ $BUILDING_COUNT -eq 0 ]] && [[ $TOTAL_IN_FLIGHT -eq 0 ]]; then
+    PIPELINE_STATUS="stalled"
+    STALL_REASON="\"no_ready_issues\""
+elif [[ $BLOCKED_COUNT -gt 0 ]] && [[ $BLOCKED_COUNT -gt $READY_COUNT ]]; then
+    PIPELINE_STATUS="degraded"
+    STALL_REASON="null"
+fi
+
+# Build pipeline_health JSON
+PIPELINE_HEALTH=$(jq -n \
+    --arg status "$PIPELINE_STATUS" \
+    --argjson stall_reason "$STALL_REASON" \
+    --argjson blocked_count "$BLOCKED_COUNT" \
+    --argjson retryable_count "$RETRYABLE_COUNT" \
+    --argjson permanent_blocked_count "$PERMANENT_BLOCKED_COUNT" \
+    --argjson retryable_issues "$RETRYABLE_ISSUES" \
+    '{
+        status: $status,
+        stall_reason: $stall_reason,
+        blocked_count: $blocked_count,
+        retryable_count: $retryable_count,
+        permanent_blocked_count: $permanent_blocked_count,
+        retryable_issues: $retryable_issues
+    }')
+
+# Read systematic failure tracking from daemon-state.json
+SYSTEMATIC_FAILURE="{}"
+if [[ -f "$DAEMON_STATE_FILE" ]]; then
+    SYSTEMATIC_FAILURE=$(jq -r '.systematic_failure // {}' "$DAEMON_STATE_FILE" 2>/dev/null || echo "{}")
+fi
+SYSTEMATIC_FAILURE_ACTIVE="false"
+SYSTEMATIC_FAILURE_PATTERN=""
+SYSTEMATIC_FAILURE_COUNT=0
+if [[ "$SYSTEMATIC_FAILURE" != "{}" ]]; then
+    SYSTEMATIC_FAILURE_ACTIVE=$(echo "$SYSTEMATIC_FAILURE" | jq -r '.active // false')
+    SYSTEMATIC_FAILURE_PATTERN=$(echo "$SYSTEMATIC_FAILURE" | jq -r '.pattern // ""')
+    SYSTEMATIC_FAILURE_COUNT=$(echo "$SYSTEMATIC_FAILURE" | jq -r '.count // 0')
+fi
+
+# Add retry_blocked_issues action if retryable issues exist and pipeline is stalled
+if [[ "$PIPELINE_STATUS" == "stalled" ]] && [[ $RETRYABLE_COUNT -gt 0 ]]; then
+    ACTIONS=$(echo "$ACTIONS" | jq '. + ["retry_blocked_issues"]')
+fi
+
 # Compute health warnings and status
 # Each warning has: code, level (warning|info), message
 HEALTH_WARNINGS="[]"
@@ -1014,6 +1149,13 @@ OUTPUT=$(jq -n \
     --arg hermit_status "$HERMIT_STATUS" \
     --argjson invalid_task_ids "$INVALID_TASK_IDS" \
     --argjson invalid_task_id_count "$INVALID_TASK_ID_COUNT" \
+    --argjson pipeline_health "$PIPELINE_HEALTH" \
+    --argjson systematic_failure_active "$SYSTEMATIC_FAILURE_ACTIVE" \
+    --arg systematic_failure_pattern "$SYSTEMATIC_FAILURE_PATTERN" \
+    --argjson systematic_failure_count "$SYSTEMATIC_FAILURE_COUNT" \
+    --argjson max_retry_count "$MAX_RETRY_COUNT" \
+    --argjson retry_cooldown "$RETRY_COOLDOWN" \
+    --argjson systematic_failure_threshold "$SYSTEMATIC_FAILURE_THRESHOLD" \
     --arg health_status "$HEALTH_STATUS" \
     --argjson health_warnings "$HEALTH_WARNINGS" \
     '{
@@ -1090,6 +1232,12 @@ OUTPUT=$(jq -n \
                 needs_trigger: $hermit_needs_trigger
             }
         },
+        pipeline_health: $pipeline_health,
+        systematic_failure: {
+            active: $systematic_failure_active,
+            pattern: $systematic_failure_pattern,
+            count: $systematic_failure_count
+        },
         usage: ($usage + {healthy: $usage_healthy}),
         tmux_pool: $tmux_pool,
         computed: {
@@ -1116,6 +1264,8 @@ OUTPUT=$(jq -n \
             execution_mode: $tmux_execution_mode,
             tmux_available: $tmux_available,
             tmux_shepherd_count: $tmux_shepherd_count,
+            pipeline_health_status: $pipeline_health.status,
+            systematic_failure_active: $systematic_failure_active,
             health_status: $health_status,
             health_warnings: $health_warnings
         },
@@ -1123,7 +1273,10 @@ OUTPUT=$(jq -n \
             issue_threshold: $issue_threshold,
             max_shepherds: $max_shepherds,
             max_proposals: $max_proposals,
-            issue_strategy: $issue_strategy
+            issue_strategy: $issue_strategy,
+            max_retry_count: $max_retry_count,
+            retry_cooldown: $retry_cooldown,
+            systematic_failure_threshold: $systematic_failure_threshold
         }
     }')
 
