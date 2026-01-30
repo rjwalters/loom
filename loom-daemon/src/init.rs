@@ -794,21 +794,19 @@ fn force_merge_dir_with_report(
 ///
 /// Compares each file in the source directory with the corresponding file in the
 /// destination directory. Files that don't match are added to the report's
-/// verification_failures list.
+/// `verification_failures` list.
 fn verify_copied_files(src: &Path, dst: &Path, prefix: &str, report: &mut InitReport) {
     if !src.exists() || !dst.exists() {
         return;
     }
 
-    let entries = match fs::read_dir(src) {
-        Ok(entries) => entries,
-        Err(_) => return,
+    let Ok(entries) = fs::read_dir(src) else {
+        return;
     };
 
     for entry in entries.flatten() {
-        let file_type = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
+        let Ok(file_type) = entry.file_type() else {
+            continue;
         };
 
         let src_path = entry.path();
