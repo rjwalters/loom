@@ -15,17 +15,27 @@
 # Pattern for detecting Claude Code activity in a tmux pane.
 # Used to determine if Claude is actively processing a command.
 #
-# This includes:
-# - Braille spinner characters (Claude thinking indicator)
-# - Status text indicators (Beaming, Loading, etc.)
-# - Progress indicators (●, ✓, spinning characters)
-# - Activity keywords (thinking, streaming, Wandering)
+# IMPORTANT: Claude Code uses a large, changing library of status words
+# (Beaming, Manifesting, Crafting, Wandering, etc.). Do NOT try to enumerate
+# them all - they change between versions. Instead, we detect:
+#
+# 1. Spinner characters (stable across versions):
+#    - Braille spinners: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏
+#    - Star spinners (v2.1.25+): ✻✶✳✢✽·
+#    - Circle spinners: ◐◓◑◒
+#
+# 2. Tool/progress indicators:
+#    - ⏺ (tool execution)
+#    - ● (active indicator, followed by status text)
 #
 # Used by:
 # - agent-spawn.sh: Verify Claude started processing after spawn
 # - agent-wait-bg.sh: Detect stuck-at-prompt condition
 #
-PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming|Wandering'
+# Note: The pattern uses alternation (|) for grep -E compatibility.
+# Spinner characters are the most reliable indicators of activity.
+#
+PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|✻|✶|✳|✢|✽|·|⏺|◐|◓|◑|◒|● '
 
 # ==============================================================================
 # Future shared constants can be added below
