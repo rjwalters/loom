@@ -55,6 +55,18 @@ DOCTOR_MAX_RETRIES="${LOOM_DOCTOR_MAX_RETRIES:-3}"
 STUCK_MAX_RETRIES="${LOOM_STUCK_MAX_RETRIES:-1}"
 POLL_INTERVAL="${LOOM_POLL_INTERVAL:-5}"
 
+# ─── Error Class Constants ────────────────────────────────────────────────────
+# Used by fail_with_reason() for structured error tracking and retry classification
+
+EC_UNKNOWN="unknown"                    # Default for unclassified failures
+EC_RATE_LIMITED="rate_limited"          # API rate limit exceeded
+EC_WORKTREE_FAILED="worktree_failed"    # Failed to create worktree
+EC_BUILDER_VALIDATION="builder_validation"  # Builder phase validation failure
+EC_JUDGE_VALIDATION="judge_validation"      # Judge phase validation failure
+EC_DOCTOR_VALIDATION="doctor_validation"    # Doctor phase validation failure
+EC_AGENT_STUCK="agent_stuck"            # Agent stuck after retry attempts
+EC_MERGE_FAILED="merge_failed"          # Failed to merge PR
+
 # Marker file to prevent premature worktree cleanup during orchestration
 # See issue #1485: cleanup scripts will skip worktrees with this marker
 WORKTREE_MARKER_FILE=".loom-in-use"
@@ -522,31 +534,18 @@ trap 'report_final_status' EXIT
 #   2. Transitions issue from loom:building to loom:blocked (if issue has loom:building)
 #   3. Records structured error metadata via record-blocked-reason.sh
 #   4. Updates systematic failure tracking via detect-systematic-failure.sh
+#
+# Usage: fail_with_reason <phase> <reason> [error_class]
+#   phase       - The phase where failure occurred (curator, builder, judge, doctor, merge)
+#   reason      - Human-readable failure reason
+#   error_class - Error class constant (EC_*). Defaults to EC_UNKNOWN if not provided.
 fail_with_reason() {
     local phase="$1"
     local reason="$2"
+    local error_class="${3:-$EC_UNKNOWN}"
 
     LAST_FAILURE_PHASE="$phase"
     LAST_FAILURE_REASON="$reason"
-
-    # Map phase/reason to error class for structured tracking
-    local error_class="unknown"
-    case "${phase}:${reason}" in
-        builder:*"rate limit"*)           error_class="rate_limited" ;;
-        builder:*"worktree"*)             error_class="worktree_failed" ;;
-        builder:*"validation"*)           error_class="builder_validation" ;;
-        builder:*"could not find PR"*)    error_class="builder_validation" ;;
-        builder:*"agent stuck"*)          error_class="builder_stuck" ;;
-        judge:*"validation"*)             error_class="judge_validation" ;;
-        judge:*"agent stuck"*)            error_class="judge_stuck" ;;
-        doctor:*"validation"*)            error_class="doctor_validation" ;;
-        doctor:*"agent stuck"*)           error_class="doctor_stuck" ;;
-        doctor:*"max retries"*)           error_class="doctor_exhausted" ;;
-        merge:*"failed to merge"*)        error_class="merge_failed" ;;
-        curator:*"validation"*)           error_class="unknown" ;;  # Curator failures are non-blocking
-        *:*"skipped via --from"*)         error_class="skip_precondition" ;;  # --from flag precondition failed
-        *)                                error_class="unknown" ;;
-    esac
 
     # Only transition to blocked if issue currently has loom:building
     # This prevents double-transitions and handles edge cases where issue
@@ -903,7 +902,7 @@ main() {
             # Validate curator phase
             if ! "$REPO_ROOT/.loom/scripts/validate-phase.sh" curator "$ISSUE" --task-id "$TASK_ID"; then
                 log_error "Curator phase validation failed"
-                fail_with_reason "curator" "validation failed"
+                fail_with_reason "curator" "validation failed" "$EC_UNKNOWN"
             fi
 
             # Belt-and-suspenders: ensure loom:curating is removed after curator completes
@@ -980,7 +979,7 @@ main() {
         if [[ -z "$existing_pr" || "$existing_pr" == "null" ]]; then
             log_error "Cannot skip builder phase: no existing PR found for issue #$ISSUE"
             log_error "Use --from with an earlier phase, or create a PR first"
-            fail_with_reason "builder" "skipped via --from but no PR exists"
+            fail_with_reason "builder" "skipped via --from but no PR exists" "$EC_BUILDER_VALIDATION"
         fi
         log_info "Skipping builder phase (--from $START_FROM)"
         log_info "Using existing PR #$existing_pr"
@@ -1025,7 +1024,7 @@ main() {
             log_error "Cannot spawn builder: API rate limit exceeded"
             log_info "Issue #$ISSUE will remain available for retry when limits reset"
             # Don't claim the issue - leave it for retry
-            fail_with_reason "builder" "API rate limit exceeded (session usage >= ${RATE_LIMIT_THRESHOLD}%)"
+            fail_with_reason "builder" "API rate limit exceeded (session usage >= ${RATE_LIMIT_THRESHOLD}%)" "$EC_RATE_LIMITED"
         fi
 
         # Report phase
@@ -1045,7 +1044,7 @@ main() {
             log_info "Creating worktree..."
             "$REPO_ROOT/.loom/scripts/worktree.sh" "$ISSUE" >/dev/null 2>&1 || {
                 log_error "Failed to create worktree"
-                fail_with_reason "builder" "failed to create worktree"
+                fail_with_reason "builder" "failed to create worktree" "$EC_WORKTREE_FAILED"
             }
 
             # Report worktree created
@@ -1079,7 +1078,7 @@ main() {
             "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "builder_stuck" --phase "builder" --details "agent stuck after retry" 2>/dev/null || true
             "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Builder agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
-            fail_with_reason "builder" "agent stuck after retry"
+            fail_with_reason "builder" "agent stuck after retry" "$EC_AGENT_STUCK"
         fi
 
         # Validate builder phase
@@ -1108,14 +1107,14 @@ main() {
                 fi
             fi
             log_error "Builder phase validation failed"
-            fail_with_reason "builder" "validation failed"
+            fail_with_reason "builder" "validation failed" "$EC_BUILDER_VALIDATION"
         fi
 
         # Get PR number
         pr_number=$(get_pr_for_issue "$ISSUE")
         if [[ -z "$pr_number" || "$pr_number" == "null" ]]; then
             log_error "Could not find PR for issue #$ISSUE"
-            fail_with_reason "builder" "could not find PR for issue"
+            fail_with_reason "builder" "could not find PR for issue" "$EC_BUILDER_VALIDATION"
         fi
 
         # Report PR created
@@ -1146,7 +1145,7 @@ main() {
         else
             log_error "Cannot skip judge phase: PR #$pr_number is not approved"
             log_error "PR needs loom:pr label to skip judge phase"
-            fail_with_reason "judge" "skipped via --from but PR not approved"
+            fail_with_reason "judge" "skipped via --from but PR not approved" "$EC_JUDGE_VALIDATION"
         fi
     fi
 
@@ -1180,7 +1179,7 @@ main() {
             "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "judge_stuck" --phase "judge" --details "agent stuck after retry" 2>/dev/null || true
             "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Judge agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
-            fail_with_reason "judge" "agent stuck after retry"
+            fail_with_reason "judge" "agent stuck after retry" "$EC_AGENT_STUCK"
         fi
 
         # Validate judge phase
@@ -1188,7 +1187,7 @@ main() {
             --pr "$pr_number" \
             --task-id "$TASK_ID"; then
             log_error "Judge phase validation failed"
-            fail_with_reason "judge" "validation failed"
+            fail_with_reason "judge" "validation failed" "$EC_JUDGE_VALIDATION"
         fi
 
         # Check result
@@ -1222,7 +1221,7 @@ main() {
                 "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "doctor_exhausted" --phase "doctor" --details "max retries ($DOCTOR_MAX_RETRIES) exceeded, issue type: $issue_type" 2>/dev/null || true
                 "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
                 gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor could not resolve Judge feedback after $DOCTOR_MAX_RETRIES attempts. Issue type: $issue_type." >/dev/null 2>&1 || true
-                fail_with_reason "doctor" "max retries ($DOCTOR_MAX_RETRIES) exceeded"
+                fail_with_reason "doctor" "max retries ($DOCTOR_MAX_RETRIES) exceeded" "$EC_DOCTOR_VALIDATION"
             fi
 
             # ─── Doctor Phase ─────────────────────────────────────────────
@@ -1257,7 +1256,7 @@ main() {
                 "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "doctor_stuck" --phase "doctor" --details "agent stuck after retry" 2>/dev/null || true
                 "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
                 gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
-                fail_with_reason "doctor" "agent stuck after retry"
+                fail_with_reason "doctor" "agent stuck after retry" "$EC_AGENT_STUCK"
             fi
 
             # Validate doctor phase
@@ -1265,7 +1264,7 @@ main() {
                 --pr "$pr_number" \
                 --task-id "$TASK_ID"; then
                 log_error "Doctor phase validation failed"
-                fail_with_reason "doctor" "validation failed"
+                fail_with_reason "doctor" "validation failed" "$EC_DOCTOR_VALIDATION"
             fi
 
             # Check if Doctor signaled conflict-only resolution (enables fast-track review)
@@ -1278,7 +1277,7 @@ main() {
             fi
         else
             log_error "Unexpected state: PR has neither loom:pr nor loom:changes-requested"
-            fail_with_reason "judge" "PR has neither loom:pr nor loom:changes-requested"
+            fail_with_reason "judge" "PR has neither loom:pr nor loom:changes-requested" "$EC_JUDGE_VALIDATION"
         fi
     done
 
@@ -1309,7 +1308,7 @@ main() {
             "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "merge_failed" --phase "merge" --details "failed to merge PR #$pr_number" 2>/dev/null || true
             "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to merge PR #$pr_number. Branch may be out of date or have merge conflicts." >/dev/null 2>&1 || true
-            fail_with_reason "merge" "failed to merge PR #$pr_number"
+            fail_with_reason "merge" "failed to merge PR #$pr_number" "$EC_MERGE_FAILED"
         fi
     else
         # Both force-pr (default) and normal (--wait) modes exit here.
