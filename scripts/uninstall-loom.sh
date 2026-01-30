@@ -278,7 +278,7 @@ if [[ -d "$DEFAULTS_PATH" ]]; then
     if [[ -f "$TARGET_PATH/$target_file" ]]; then
       REMOVE_FILES+=("$target_file")
     fi
-  done < <(find "$DEFAULTS_PATH" -type f -print0 | sort -z)
+  done < <(find -L "$DEFAULTS_PATH" -type f -print0 | sort -z)
 else
   warning "Loom defaults/ directory not found at $DEFAULTS_PATH"
   info "Using fallback pattern matching for file detection"
@@ -362,6 +362,16 @@ fi
 # Only scan directories that the install process creates — NOT runtime dirs like worktrees/
 LOOM_DIRS=(".loom/roles" ".loom/scripts" ".loom/docs" ".claude/commands" ".claude/agents")
 
+# Claimed role name prefixes — any file in .loom/roles/ matching these prefixes
+# is owned by Loom and should be removed during uninstall. This handles deprecated
+# role files from older versions (e.g., builder-complexity.md, hermit-patterns.md)
+# without needing to maintain an explicit list of deprecated filenames.
+CLAIMED_ROLE_PREFIXES=(
+  architect auditor builder champion curator
+  doctor driver guide hermit judge
+  loom shepherd
+)
+
 for loom_dir in "${LOOM_DIRS[@]}"; do
   if [[ ! -d "$TARGET_PATH/$loom_dir" ]]; then
     continue
@@ -378,6 +388,20 @@ for loom_dir in "${LOOM_DIRS[@]}"; do
         break
       fi
     done
+
+    # For .loom/roles/, also check claimed role name prefixes
+    # This catches deprecated role files from older Loom versions
+    if [[ "$is_known" == "false" ]] && [[ "$loom_dir" == ".loom/roles" ]]; then
+      base_name=$(basename "$rel_file")
+      for prefix in "${CLAIMED_ROLE_PREFIXES[@]}"; do
+        if [[ "$base_name" == "${prefix}"* ]]; then
+          is_known=true
+          # Add to removal list since it's a claimed Loom file
+          REMOVE_FILES+=("$rel_file")
+          break
+        fi
+      done
+    fi
 
     if [[ "$is_known" == "false" ]]; then
       UNKNOWN_FILES+=("$rel_file")
