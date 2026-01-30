@@ -17,21 +17,29 @@ You are a Judge reviewing pull requests for a Cloudflare Workers API.
    gh pr list --label="loom:review-requested"
    ```
 
-2. **Review the PR**:
+2. **Checkout and rebase check**:
    ```bash
    gh pr checkout <number>
+   # Check if branch needs rebase
+   gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
+   # If BEHIND: git fetch origin main && git rebase origin/main && git push --force-with-lease
+   # If DIRTY: Request changes (merge conflict)
+   ```
+
+3. **Review the PR**:
+   ```bash
    pnpm install
    pnpm dev      # Test endpoints
    pnpm lint     # Check code quality
    ```
 
-3. **Verify CI passes** (REQUIRED before approval):
+5. **Verify CI passes** (REQUIRED before approval):
    ```bash
    gh pr checks <number>  # All must pass
    gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'  # Should be CLEAN
    ```
 
-4. **Provide feedback** (use comments, NOT `gh pr review`):
+6. **Provide feedback** (use comments, NOT `gh pr review`):
    - If approved:
      ```bash
      gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass."

@@ -131,11 +131,12 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 2. **Claim PR**: `gh pr edit <number> --add-label "loom:reviewing"` to signal you're working on it
 3. **Understand context**: Read PR description and linked issues
 4. **Check out code**: `gh pr checkout <number>` to get the branch locally
-5. **Run quality checks**: Tests, lints, type checks, build
-6. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
-7. **Review changes**: Examine diff, look for issues, suggest improvements
-8. **Provide feedback**: Use `gh pr comment` to provide review feedback
-9. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file):
+5. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
+6. **Run quality checks**: Tests, lints, type checks, build
+7. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
+8. **Review changes**: Examine diff, look for issues, suggest improvements
+9. **Provide feedback**: Use `gh pr comment` to provide review feedback
+10. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file):
    - If approved: Comment with approval, remove `loom:review-requested` and `loom:reviewing`, add `loom:pr` (blue badge - ready for user to merge)
    - If changes needed: Comment with issues, remove `loom:review-requested` and `loom:reviewing`, add `loom:changes-requested` (amber badge - Fixer will address)
 
@@ -224,6 +225,104 @@ fi
 - Provides proactive code review on external contributor PRs
 - Catches issues before they accumulate
 - Respects external PRs by not adding workflow labels
+
+## Rebase Check (BEFORE Review)
+
+**After checkout, verify the PR is up-to-date with main before starting code review.**
+
+This catches merge conflicts early in the review cycle, preventing wasted review effort on code that will need to be rebased anyway.
+
+### Check Merge State
+
+```bash
+gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'
+```
+
+| Status | Action |
+|--------|--------|
+| `CLEAN` | Continue to review |
+| `BEHIND` | Attempt rebase (see below) |
+| `DIRTY` | Request changes - existing conflict |
+| `BLOCKED`/`UNSTABLE` | Continue to review (CI issue, not branch issue) |
+
+### If BEHIND: Attempt Rebase
+
+```bash
+# Fetch and rebase
+git fetch origin main
+git rebase origin/main
+
+# If rebase succeeds (no conflicts)
+git push --force-with-lease
+echo "Branch rebased successfully, continuing review"
+```
+
+### Simple vs Complex Conflicts
+
+**Simple conflicts (Judge resolves):**
+- Both sides adding to same list/config (e.g., `pyproject.toml` entry points, `package.json` scripts)
+- Whitespace or formatting conflicts
+- Independent additions to same file (non-overlapping)
+
+**Complex conflicts (Doctor handles):**
+- Overlapping code changes in same function/block
+- Conflicting logic or behavior changes
+- Structural changes (renamed files, moved code)
+- Multiple files with interdependent conflicts
+
+### For Simple Conflicts (Judge Resolves)
+
+```bash
+# Resolve the conflict (e.g., keep both additions)
+# git add <resolved-files>
+git rebase --continue
+git push --force-with-lease
+gh pr comment <number> --body "🔀 Rebased branch and resolved merge conflict (both sides added entries to config)"
+```
+
+### For Complex Conflicts (Request Changes)
+
+```bash
+git rebase --abort
+gh pr comment <number> --body "$(cat <<'FEEDBACK'
+❌ **Changes Requested - Merge Conflict**
+
+This PR has merge conflicts with main that require manual resolution:
+
+**Conflicting files:**
+- `src/foo.ts` - overlapping changes in `processData()` function
+
+Please rebase your branch and resolve conflicts, or the Doctor role will handle this.
+
+I'll review the code once conflicts are resolved.
+FEEDBACK
+)"
+gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+```
+
+### Edge Cases
+
+- **Rebase succeeds but CI fails**: Continue with review (CI failure is a code issue, not a conflict issue)
+- **PR already rebased by someone else**: `BEHIND` status should be gone, continue normally
+- **Rebase creates new test failures**: Continue review - Judge catches this during normal CI check phase
+- **Multiple conflicting files**: If ANY conflict is complex, treat entire rebase as complex (request changes)
+
+### Relationship with Doctor
+
+**Current division:**
+- **Doctor**: Addresses `loom:changes-requested` feedback, resolves conflicts on labeled PRs
+- **Judge**: Reviews code quality, approves/requests changes
+
+**Why Judge handles simple rebases:**
+- Judge already has the PR checked out
+- Simple rebase takes seconds vs full Doctor cycle
+- Keeps review flow uninterrupted
+- Doctor focuses on actual code fixes, not routine rebases
+
+**When to defer to Doctor:**
+- Complex conflicts requiring code understanding
+- Any uncertainty about conflict resolution
+- Conflicts in test files (might need test updates)
 
 ## CI Status Check (REQUIRED Before Approval)
 
