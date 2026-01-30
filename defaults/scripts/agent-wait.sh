@@ -60,6 +60,7 @@ ${YELLOW}USAGE:${NC}
 ${YELLOW}OPTIONS:${NC}
     --timeout <seconds>        Maximum time to wait (default: $DEFAULT_TIMEOUT)
     --poll-interval <seconds>  Time between checks (default: $DEFAULT_POLL_INTERVAL)
+    --min-idle-elapsed <secs>  Minimum seconds before idle prompt detection (default: $MIN_IDLE_ELAPSED)
     --json                     Output result as JSON
     --help                     Show this help message
 
@@ -245,6 +246,10 @@ main() {
                 ;;
             --poll-interval)
                 poll_interval="$2"
+                shift 2
+                ;;
+            --min-idle-elapsed)
+                MIN_IDLE_ELAPSED="$2"
                 shift 2
                 ;;
             --json)
