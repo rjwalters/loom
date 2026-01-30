@@ -284,10 +284,12 @@ class TestStuckHistory:
 
 
 class TestStuckDetection:
-    def test_to_dict_drops_none_issue(self) -> None:
+    def test_to_dict_includes_none_issue(self) -> None:
+        """Issue field is always present, even when None, for bash compatibility."""
         det = StuckDetection(agent_id="s-1", status="idle", stuck=False)
         d = det.to_dict()
-        assert "issue" not in d
+        assert "issue" in d
+        assert d["issue"] is None
 
     def test_to_dict_includes_issue(self) -> None:
         det = StuckDetection(agent_id="s-1", issue=42, status="working", stuck=True)
