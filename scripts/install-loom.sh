@@ -526,6 +526,31 @@ done
 success "All Loom files installed"
 echo ""
 
+# Verify installed scripts match source defaults
+info "Verifying scripts match source..."
+VERIFY_FAILURES=0
+if [[ -d "$LOOM_ROOT/defaults/scripts" ]] && [[ -d ".loom/scripts" ]]; then
+  while IFS= read -r -d '' src_file; do
+    rel_path="${src_file#$LOOM_ROOT/defaults/scripts/}"
+    dst_file=".loom/scripts/$rel_path"
+    if [[ -f "$dst_file" ]]; then
+      if ! cmp -s "$src_file" "$dst_file"; then
+        warning "Script mismatch: .loom/scripts/$rel_path differs from source"
+        VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+      fi
+    else
+      warning "Script missing: .loom/scripts/$rel_path not installed"
+      VERIFY_FAILURES=$((VERIFY_FAILURES + 1))
+    fi
+  done < <(find "$LOOM_ROOT/defaults/scripts" -type f -print0)
+fi
+if [[ $VERIFY_FAILURES -gt 0 ]]; then
+  warning "$VERIFY_FAILURES script(s) failed verification — see above"
+else
+  success "All scripts verified (match source defaults)"
+fi
+echo ""
+
 # Install Loom CLI wrapper (./loom)
 if [[ -f "$LOOM_ROOT/defaults/loom" ]]; then
   info "Installing Loom CLI wrapper..."

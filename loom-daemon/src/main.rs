@@ -434,11 +434,24 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             );
                             println!("     delete them and run install again, or use --force.");
                         }
-                        if !report.updated.is_empty() && force {
+                        if !report.updated.is_empty() {
                             println!("\nFiles updated ({}):", report.updated.len());
                             for file in &report.updated {
                                 println!("  ~ {file}");
                             }
+                        }
+                        if !report.verification_failures.is_empty() {
+                            eprintln!(
+                                "\n⚠️  Verification failures ({}):",
+                                report.verification_failures.len()
+                            );
+                            for failure in &report.verification_failures {
+                                eprintln!("  ✗ {failure}");
+                            }
+                            eprintln!("\n  Some scripts may not have been updated correctly.");
+                            eprintln!(
+                                "  Try running install again with --force, or copy manually from defaults/."
+                            );
                         }
                     }
 
