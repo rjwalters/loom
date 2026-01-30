@@ -15,6 +15,10 @@ loom-agent-monitor = "loom_tools.agent_monitor:main"
 loom-daemon-diagnostic = "loom_tools.daemon_diagnostic:main"
 loom-daemon-loop = "loom_tools.daemon:main"
 loom-stuck-detection = "loom_tools.stuck_detection:main"
+loom-claim = "loom_tools.claim:main"
+loom-check-completions = "loom_tools.completions:main"
+loom-clean = "loom_tools.clean:main"
+loom-worktree = "loom_tools.worktree:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
