@@ -32,6 +32,8 @@ TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
 DEFAULT_TIMEOUT=3600
 DEFAULT_POLL_INTERVAL=5
+MIN_IDLE_ELAPSED=10             # Minimum seconds before idle prompt detection activates
+IDLE_PROMPT_CONFIRM_COUNT=2     # Consecutive idle observations required before declaring completion
 
 # Find repository root (for log file access)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -292,6 +294,7 @@ main() {
     local elapsed=0
     local start_time
     start_time=$(date +%s)
+    local idle_prompt_count=0
 
     while true; do
         # Check if session still exists (may have been destroyed)
@@ -336,14 +339,27 @@ main() {
         # This catches support roles that complete their task but leave the CLI
         # at an interactive prompt. Without this, the daemon cannot detect
         # completion and never respawns them on their interval schedule.
-        if check_idle_prompt "$session_name"; then
-            elapsed=$(( $(date +%s) - start_time ))
-            if [[ "$json_output" == "true" ]]; then
-                echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"idle_prompt\",\"elapsed\":$elapsed}"
+        #
+        # Guards against false positives:
+        # - MIN_IDLE_ELAPSED: skip during startup when pane may show prompt before
+        #   Claude has begun working (e.g., --timeout 0 called immediately after spawn)
+        # - IDLE_PROMPT_CONFIRM_COUNT: require consecutive idle observations to avoid
+        #   triggering on a brief prompt flash between tool calls
+        elapsed=$(( $(date +%s) - start_time ))
+        if [[ "$elapsed" -ge "$MIN_IDLE_ELAPSED" ]]; then
+            if check_idle_prompt "$session_name"; then
+                idle_prompt_count=$(( idle_prompt_count + 1 ))
+                if [[ "$idle_prompt_count" -ge "$IDLE_PROMPT_CONFIRM_COUNT" ]]; then
+                    if [[ "$json_output" == "true" ]]; then
+                        echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"idle_prompt\",\"elapsed\":$elapsed}"
+                    else
+                        log_success "Agent '$name' completed (idle at prompt after ${elapsed}s)"
+                    fi
+                    exit 0
+                fi
             else
-                log_success "Agent '$name' completed (idle at prompt after ${elapsed}s)"
+                idle_prompt_count=0
             fi
-            exit 0
         fi
 
         # Check timeout
