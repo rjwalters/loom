@@ -969,8 +969,27 @@ main() {
         # Check for completion patterns in log (backup detection)
         if [[ "$completion_detected" != "true" ]]; then
             if check_completion_patterns "$session_name"; then
-                completion_detected=true
-                if [[ "$COMPLETION_REASON" != "explicit_exit" ]]; then
+                if [[ "$COMPLETION_REASON" == "explicit_exit" ]]; then
+                    completion_detected=true
+                elif [[ -n "$phase" ]] && [[ -n "$issue" ]]; then
+                    # Non-exit completion pattern detected (e.g., label command in log).
+                    # The pattern matches the *intent* to run a gh command, not its
+                    # confirmed execution. Sleep briefly to let the gh command finish,
+                    # then verify the phase contract is actually satisfied before
+                    # terminating. This prevents killing the session while gh is still
+                    # executing (see issue #1596).
+                    log_info "Completion pattern detected ($COMPLETION_REASON) - verifying phase contract"
+                    sleep 3
+                    if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
+                        completion_detected=true
+                        log_info "Phase contract verified ($CONTRACT_STATUS) - terminating session"
+                    else
+                        log_warn "Completion pattern detected but phase contract not yet satisfied - continuing to wait"
+                        COMPLETION_REASON=""
+                    fi
+                else
+                    # No phase info available, trust the pattern
+                    completion_detected=true
                     log_info "Completion pattern detected ($COMPLETION_REASON) - terminating session"
                 fi
             fi
