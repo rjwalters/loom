@@ -206,6 +206,8 @@ LINKED_ISSUE=$(echo "$PR_BODY" | grep -oE '(Closes|closes|Fixes|fixes|Resolves|r
 if [[ -n "$LINKED_ISSUE" ]]; then
   info "Found linked issue: #$LINKED_ISSUE"
   # Remove workflow labels that shouldn't persist on closed issues
+  # NOTE: Origin labels (loom:architect, loom:hermit, loom:auditor) are intentionally
+  # preserved for audit trail - they indicate where the issue originated from
   for label in loom:building loom:issue loom:curated loom:curating loom:treating loom:blocked; do
     gh issue edit "$LINKED_ISSUE" --remove-label "$label" 2>/dev/null && \
       info "  Removed label: $label" || true
