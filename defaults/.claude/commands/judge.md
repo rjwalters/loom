@@ -151,6 +151,11 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 5. **Check out code**: `gh pr checkout <number>` to get the branch locally
 6. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
 7. **Run quality checks**: Tests, lints, type checks, build
+7b. **Execute test plan**: Parse PR description for "## Test Plan" section.
+    If found, classify each step as automatable or observation-only.
+    Execute automatable steps and document results in review comment.
+    Flag observation-only steps as "not executed — requires manual verification."
+    (See Test Plan Execution section below for details.)
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
 9. **Review changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `gh pr comment` to provide review feedback
@@ -963,6 +968,62 @@ This saves significant time and reduces coordination overhead for issues that ta
 - Are non-obvious decisions explained?
 - Is the changelog updated?
 
+### Test Plan Execution
+
+When a PR includes a "## Test Plan" section in its description, the Judge should extract and execute the automatable steps.
+
+**Extracting the test plan:**
+
+```bash
+# Get the PR body and look for Test Plan section
+gh pr view <number> --json body --jq '.body'
+```
+
+**Classifying test plan steps:**
+
+| Category | Examples | Action |
+|----------|----------|--------|
+| **Automatable** | "run `pnpm test:unit`", "verify output contains X", "check file Z exists", "run `pnpm check:ci`" | Execute and capture output |
+| **Observation-only** | "watch for N seconds", "start daemon and observe", "verify UI behavior", "manually test in browser" | Flag as not executed |
+| **Long-running (>2 min)** | "run full integration suite", "stress test for 5 minutes" | Skip with explanation |
+| **External dependency** | "test against staging API", "verify email delivery" | Skip with explanation |
+| **Unclear/ambiguous** | Vague steps without concrete commands | Ask for clarification |
+
+**Execution approach:**
+1. Extract test plan steps from PR description
+2. For each automatable step, run the command and capture output (truncated to reasonable length)
+3. Compare results against expected outcomes stated in the test plan
+4. Document all results in the review comment using the template below
+
+**Documenting results in review comment:**
+
+Include a "Test Execution" section in your review comment:
+
+```markdown
+## Test Execution
+
+**Test plan from PR description:**
+1. [step] — ✅ Executed: [result summary]
+2. [step] — ⚠️ Skipped: requires manual observation
+3. [step] — ✅ Executed: [result summary]
+4. [step] — ⏭️ Skipped: long-running process (>2 min)
+5. [step] — ⏭️ Skipped: requires external service
+```
+
+**Edge cases:**
+
+| Scenario | Judge Behavior |
+|----------|---------------|
+| No test plan in PR | Note absence in review; don't block approval |
+| Test plan requires manual observation | Flag as "not executed" with reason |
+| Test step involves long-running process (>2 min) | Skip with explanation |
+| Test step is unclear or ambiguous | Ask for clarification in change request |
+| Test plan references external services | Skip with explanation |
+| All test plan steps are observation-only | Document that none were automatable |
+| Test plan step fails | Report the failure; use judgment on whether to block approval |
+
+**Important:** Test plan execution supplements the review — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note.
+
 ## Feedback Style
 
 - **Be specific**: Reference exact files and line numbers
@@ -1105,7 +1166,17 @@ gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:changes-r
 # Note: PR now has loom:changes-requested (amber badge) - Fixer will address and change back to loom:review-requested
 
 # Approve PR (green → blue)
-gh pr comment 42 --body "✅ **Approved!** Great work on this feature. Tests look comprehensive and the code is clean."
+gh pr comment 42 --body "$(cat <<'EOF'
+✅ **Approved!** Great work on this feature. Tests look comprehensive and the code is clean.
+
+## Test Execution
+
+**Test plan from PR description:**
+1. Run `pnpm test:unit` — ✅ Executed: All 42 tests pass
+2. Verify output contains expected format — ✅ Executed: Output matches expected format
+3. Start daemon and observe behavior — ⚠️ Skipped: requires manual observation
+EOF
+)"
 gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 # Note: PR now has loom:pr (blue badge) - ready for user to merge
 ```
