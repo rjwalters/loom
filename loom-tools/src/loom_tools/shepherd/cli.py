@@ -204,6 +204,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
     """
     start_time = time.time()
     completed_phases: list[str] = []
+    phase_durations: dict[str, int] = {}
 
     try:
         # Validate issue
@@ -234,7 +235,9 @@ def orchestrate(ctx: ShepherdContext) -> int:
             completed_phases.append(f"Curator ({reason})")
         else:
             _print_phase_header("PHASE 1: CURATOR")
+            phase_start = time.time()
             result = curator.run(ctx)
+            elapsed = int(time.time() - phase_start)
 
             if result.is_shutdown:
                 raise ShutdownSignal(result.message)
@@ -246,8 +249,12 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status == PhaseStatus.SKIPPED:
                 completed_phases.append(f"Curator ({result.message})")
             else:
+                phase_durations["Curator"] = elapsed
                 completed_phases.append("Curator")
-                log_success("Curator phase complete")
+                log_success(f"Curator phase complete ({elapsed}s)")
+                ctx.report_milestone(
+                    "phase_completed", phase="curator", duration_seconds=elapsed, status="success"
+                )
 
         if ctx.config.stop_after == "curated":
             _print_phase_header("STOPPING: Reached --to curated")
@@ -255,15 +262,21 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         # ─── PHASE 2: Approval Gate ───────────────────────────────────────
         _print_phase_header("PHASE 2: APPROVAL GATE")
+        phase_start = time.time()
         approval = ApprovalPhase()
         result = approval.run(ctx)
+        elapsed = int(time.time() - phase_start)
 
         if result.is_shutdown:
             raise ShutdownSignal(result.message)
 
+        phase_durations["Approval"] = elapsed
         completed_phases.append(f"Approval ({result.message.split('(')[-1].rstrip(')')}")
         if result.status == PhaseStatus.SUCCESS:
-            log_success(result.message)
+            log_success(f"{result.message} ({elapsed}s)")
+            ctx.report_milestone(
+                "phase_completed", phase="approval", duration_seconds=elapsed, status="success"
+            )
 
         if ctx.config.stop_after == "approved":
             _print_phase_header("STOPPING: Reached --to approved")
@@ -278,7 +291,9 @@ def orchestrate(ctx: ShepherdContext) -> int:
             completed_phases.append(f"Builder ({reason})")
         else:
             _print_phase_header("PHASE 3: BUILDER")
+            phase_start = time.time()
             result = builder.run(ctx)
+            elapsed = int(time.time() - phase_start)
 
             if result.is_shutdown:
                 raise ShutdownSignal(result.message)
@@ -290,8 +305,12 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status == PhaseStatus.SKIPPED:
                 completed_phases.append(f"Builder ({result.message})")
             else:
+                phase_durations["Builder"] = elapsed
                 completed_phases.append(f"Builder (PR #{ctx.pr_number})")
-                log_success(f"Builder phase complete - PR #{ctx.pr_number} created")
+                log_success(f"Builder phase complete - PR #{ctx.pr_number} created ({elapsed}s)")
+                ctx.report_milestone(
+                    "phase_completed", phase="builder", duration_seconds=elapsed, status="success"
+                )
 
         # ─── PHASE 4/5: Judge/Doctor Loop ─────────────────────────────────
         doctor_attempts = 0
@@ -306,10 +325,16 @@ def orchestrate(ctx: ShepherdContext) -> int:
             completed_phases.append(f"Judge ({reason})")
             pr_approved = True
 
+        judge_total_elapsed = 0
+        doctor_total_elapsed = 0
+
         while not pr_approved and doctor_attempts < ctx.config.doctor_max_retries:
             _print_phase_header(f"PHASE 4: JUDGE (attempt {doctor_attempts + 1})")
 
+            phase_start = time.time()
             result = judge.run(ctx)
+            elapsed = int(time.time() - phase_start)
+            judge_total_elapsed += elapsed
 
             if result.is_shutdown:
                 raise ShutdownSignal(result.message)
@@ -321,10 +346,22 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.data.get("approved"):
                 pr_approved = True
                 completed_phases.append("Judge (approved)")
-                log_success(f"PR #{ctx.pr_number} approved by Judge")
+                log_success(f"PR #{ctx.pr_number} approved by Judge ({elapsed}s)")
+                ctx.report_milestone(
+                    "phase_completed",
+                    phase="judge",
+                    duration_seconds=elapsed,
+                    status="approved",
+                )
             elif result.data.get("changes_requested"):
-                log_warning(f"Judge requested changes on PR #{ctx.pr_number}")
+                log_warning(f"Judge requested changes on PR #{ctx.pr_number} ({elapsed}s)")
                 completed_phases.append("Judge (changes requested)")
+                ctx.report_milestone(
+                    "phase_completed",
+                    phase="judge",
+                    duration_seconds=elapsed,
+                    status="changes_requested",
+                )
 
                 doctor_attempts += 1
 
@@ -336,8 +373,11 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 # ─── Doctor Phase ─────────────────────────────────────
                 _print_phase_header(f"PHASE 5: DOCTOR (attempt {doctor_attempts})")
 
+                phase_start = time.time()
                 doctor = DoctorPhase()
                 result = doctor.run(ctx)
+                elapsed = int(time.time() - phase_start)
+                doctor_total_elapsed += elapsed
 
                 if result.is_shutdown:
                     raise ShutdownSignal(result.message)
@@ -347,10 +387,21 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     return 1
 
                 completed_phases.append("Doctor (fixes applied)")
-                log_success("Doctor applied fixes")
+                log_success(f"Doctor applied fixes ({elapsed}s)")
+                ctx.report_milestone(
+                    "phase_completed",
+                    phase="doctor",
+                    duration_seconds=elapsed,
+                    status="success",
+                )
             else:
                 log_error(result.message)
                 return 1
+
+        if judge_total_elapsed > 0:
+            phase_durations["Judge"] = judge_total_elapsed
+        if doctor_total_elapsed > 0:
+            phase_durations["Doctor"] = doctor_total_elapsed
 
         if ctx.config.stop_after == "pr":
             _print_phase_header("STOPPING: Reached --to pr")
@@ -358,8 +409,10 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         # ─── PHASE 6: Merge Gate ──────────────────────────────────────────
         _print_phase_header("PHASE 6: MERGE GATE")
+        phase_start = time.time()
         merge = MergePhase()
         result = merge.run(ctx)
+        elapsed = int(time.time() - phase_start)
 
         if result.is_shutdown:
             raise ShutdownSignal(result.message)
@@ -368,12 +421,16 @@ def orchestrate(ctx: ShepherdContext) -> int:
             log_error(result.message)
             return 1
 
+        phase_durations["Merge"] = elapsed
         if result.data.get("merged"):
             completed_phases.append("Merge (auto-merged)")
-            log_success(f"PR #{ctx.pr_number} merged successfully")
+            log_success(f"PR #{ctx.pr_number} merged successfully ({elapsed}s)")
+            ctx.report_milestone(
+                "phase_completed", phase="merge", duration_seconds=elapsed, status="merged"
+            )
         else:
             completed_phases.append("Merge (awaiting merge)")
-            log_info(f"PR #{ctx.pr_number} is approved and ready for Champion to merge")
+            log_info(f"PR #{ctx.pr_number} is approved and ready for Champion to merge ({elapsed}s)")
             log_info(f"To merge manually: gh pr merge {ctx.pr_number} --squash --delete-branch")
 
         # ─── Complete ─────────────────────────────────────────────────────
@@ -391,9 +448,15 @@ def orchestrate(ctx: ShepherdContext) -> int:
         log_info(f"Mode: {ctx.config.mode.value}")
         log_info(f"Duration: {duration}s")
         print()
-        log_info("Phases completed:")
-        for phase in completed_phases:
-            print(f"  - {phase}")
+        if phase_durations:
+            log_info("Phase timing:")
+            for phase_name, phase_secs in phase_durations.items():
+                pct = int(phase_secs * 100 / duration) if duration > 0 else 0
+                log_info(f"  - {phase_name}: {phase_secs}s ({pct}%)")
+        else:
+            log_info("Phases completed:")
+            for phase in completed_phases:
+                print(f"  - {phase}")
         print()
         log_success("Orchestration complete!")
 
