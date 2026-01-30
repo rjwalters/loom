@@ -26,6 +26,13 @@
       "resource_usage": {
         "active_shepherds": 0,
         "session_percent": 40.0
+      },
+      "pipeline_health": {
+        "status": "healthy",
+        "blocked_count": 0,
+        "retryable_count": 0,
+        "permanent_blocked_count": 0,
+        "systematic_failure_active": false
       }
     }
   ],
