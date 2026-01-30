@@ -1172,3 +1172,431 @@ class TestCLI:
         assert exc.value.code == 1
         captured = capsys.readouterr()
         assert "Unknown option" in captured.err
+
+    def test_h_short_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Short -h flag should also display help and exit 0."""
+        with pytest.raises(SystemExit) as exc:
+            main(["-h"])
+        assert exc.value.code == 0
+        captured = capsys.readouterr()
+        assert "daemon-snapshot.py" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Behavior validation tests (bash/Python parity)
+# ---------------------------------------------------------------------------
+
+
+class TestBehaviorParity:
+    """Tests validating that snapshot.py matches daemon-snapshot.sh behavior.
+
+    Since daemon-snapshot.sh now delegates directly to Python via exec, the
+    implementations are identical by design. These tests document expected
+    behavior and validate edge cases.
+    """
+
+    def test_malformed_daemon_state_json(self, tmp_path: pathlib.Path) -> None:
+        """Malformed JSON in daemon-state.json should produce empty state."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{ not valid json }")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data={
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {},
+            },
+            _tmux_pool=TmuxPool(),
+        )
+        # Should produce valid output with empty shepherds
+        assert snapshot["shepherds"]["stale_heartbeat_count"] == 0
+        assert snapshot["validation"]["invalid_task_id_count"] == 0
+
+    def test_empty_daemon_state_json(self, tmp_path: pathlib.Path) -> None:
+        """Empty daemon-state.json should be handled gracefully."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data={
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {},
+            },
+            _tmux_pool=TmuxPool(),
+        )
+        assert "timestamp" in snapshot
+
+    def test_missing_daemon_state_json(self, tmp_path: pathlib.Path) -> None:
+        """Missing daemon-state.json should be handled gracefully."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        # Don't create daemon-state.json
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data={
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {},
+            },
+            _tmux_pool=TmuxPool(),
+        )
+        assert "timestamp" in snapshot
+
+    def test_array_daemon_state_json(self, tmp_path: pathlib.Path) -> None:
+        """Array (not object) in daemon-state.json returns empty state."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("[1, 2, 3]")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data={
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {},
+            },
+            _tmux_pool=TmuxPool(),
+        )
+        # Should handle gracefully, returning empty state
+        assert snapshot["validation"]["invalid_task_id_count"] == 0
+
+    def test_progress_file_malformed(self, tmp_path: pathlib.Path) -> None:
+        """Malformed progress file should be handled gracefully (not crash).
+
+        The behavior is that malformed JSON is treated as an empty dict {},
+        which produces a ShepherdProgress with default values. This is safe
+        because the progress file will have task_id="" which won't match any
+        real shepherd.
+        """
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        # Create one valid and one malformed progress file
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "last_heartbeat": "2026-01-30T17:59:30Z",
+        }))
+        (progress_dir / "shepherd-bad0000.json").write_text("{ invalid }")
+
+        result = compute_shepherd_progress(tmp_path, _cfg(), _now=NOW)
+        # Both files are processed - malformed one gets default values
+        assert len(result) == 2
+        # Verify we have the valid one
+        valid = [r for r in result if r.raw["task_id"] == "abc1234"]
+        assert len(valid) == 1
+        assert valid[0].heartbeat_stale is False
+        # The malformed one has empty task_id (safe - won't match anything)
+        malformed = [r for r in result if r.raw["task_id"] == ""]
+        assert len(malformed) == 1
+
+    def test_usage_error_handling(self, tmp_path: pathlib.Path) -> None:
+        """Usage data with error should set healthy to True (conservative)."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data={
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {"error": "no data"},
+            },
+            _tmux_pool=TmuxPool(),
+        )
+        assert snapshot["usage"]["healthy"] is True
+        assert snapshot["usage"]["error"] == "no data"
+
+    def test_output_schema_matches_expected_structure(
+        self, tmp_path: pathlib.Path,
+    ) -> None:
+        """Validate complete output schema matches documented structure."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data={
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {"session_percent": 50},
+            },
+            _tmux_pool=TmuxPool(),
+        )
+
+        # Top-level sections
+        assert set(snapshot.keys()) == {
+            "timestamp", "pipeline", "proposals", "prs", "shepherds",
+            "validation", "support_roles", "pipeline_health",
+            "systematic_failure", "usage", "tmux_pool", "computed", "config",
+        }
+
+        # Pipeline subsections
+        assert set(snapshot["pipeline"].keys()) == {
+            "ready_issues", "building_issues", "blocked_issues",
+        }
+
+        # Proposals subsections
+        assert set(snapshot["proposals"].keys()) == {
+            "architect", "hermit", "curated",
+        }
+
+        # PRs subsections
+        assert set(snapshot["prs"].keys()) == {
+            "review_requested", "changes_requested", "ready_to_merge",
+        }
+
+        # Shepherds subsections
+        assert "progress" in snapshot["shepherds"]
+        assert "stale_heartbeat_count" in snapshot["shepherds"]
+        assert "orphaned" in snapshot["shepherds"]
+        assert "orphaned_count" in snapshot["shepherds"]
+
+        # Validation subsections
+        assert "invalid_task_ids" in snapshot["validation"]
+        assert "invalid_task_id_count" in snapshot["validation"]
+
+        # Support roles - all 7 roles present
+        assert set(snapshot["support_roles"].keys()) == {
+            "guide", "champion", "doctor", "auditor", "judge",
+            "architect", "hermit",
+        }
+
+        # Pipeline health
+        assert "status" in snapshot["pipeline_health"]
+        assert "stall_reason" in snapshot["pipeline_health"]
+        assert "retryable_count" in snapshot["pipeline_health"]
+
+        # Systematic failure
+        assert "active" in snapshot["systematic_failure"]
+        assert "probe_count" in snapshot["systematic_failure"]
+        assert "cooldown_elapsed" in snapshot["systematic_failure"]
+
+        # Computed fields
+        computed = snapshot["computed"]
+        expected_computed = {
+            "total_ready", "total_building", "total_blocked",
+            "total_proposals", "total_in_flight", "active_shepherds",
+            "available_shepherd_slots", "needs_work_generation",
+            "architect_cooldown_ok", "hermit_cooldown_ok",
+            "promotable_proposals", "recommended_actions",
+            "stale_heartbeat_count", "orphaned_count",
+            "prs_awaiting_review", "prs_needing_fixes", "prs_ready_to_merge",
+            "champion_demand", "doctor_demand", "judge_demand",
+            "execution_mode", "tmux_available", "tmux_shepherd_count",
+            "pipeline_health_status", "systematic_failure_active",
+            "health_status", "health_warnings",
+        }
+        assert set(computed.keys()) == expected_computed
+
+        # Config contains expected fields
+        assert "issue_threshold" in snapshot["config"]
+        assert "max_shepherds" in snapshot["config"]
+        assert "issue_strategy" in snapshot["config"]
+
+    def test_cli_pretty_flag_produces_indented_json(
+        self, tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """--pretty flag should produce indented JSON output."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        # Mock find_repo_root to return tmp_path
+        monkeypatch.setattr(
+            "loom_tools.snapshot.find_repo_root",
+            lambda: tmp_path,
+        )
+        # Mock collect_pipeline_data to avoid GitHub API calls
+        monkeypatch.setattr(
+            "loom_tools.snapshot.collect_pipeline_data",
+            lambda _: {
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {},
+            },
+        )
+        # Mock tmux pool detection
+        monkeypatch.setattr(
+            "loom_tools.snapshot.detect_tmux_pool",
+            lambda _: TmuxPool(),
+        )
+
+        main(["--pretty"])
+
+        captured = capsys.readouterr()
+        # Pretty output should have indentation (multiple lines with spaces)
+        assert "\n  " in captured.out
+        # Should be valid JSON
+        parsed = json.loads(captured.out)
+        assert "timestamp" in parsed
+
+    def test_cli_compact_output_without_pretty(
+        self, tmp_path: pathlib.Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without --pretty, output should be compact (single line)."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        monkeypatch.setattr(
+            "loom_tools.snapshot.find_repo_root",
+            lambda: tmp_path,
+        )
+        monkeypatch.setattr(
+            "loom_tools.snapshot.collect_pipeline_data",
+            lambda _: {
+                "ready_issues": [],
+                "building_issues": [],
+                "blocked_issues": [],
+                "architect_proposals": [],
+                "hermit_proposals": [],
+                "curated_issues": [],
+                "review_requested": [],
+                "changes_requested": [],
+                "ready_to_merge": [],
+                "usage": {},
+            },
+        )
+        monkeypatch.setattr(
+            "loom_tools.snapshot.detect_tmux_pool",
+            lambda _: TmuxPool(),
+        )
+
+        main([])
+
+        captured = capsys.readouterr()
+        # Compact output should be a single line (minus trailing newline)
+        lines = captured.out.strip().split("\n")
+        assert len(lines) == 1
+        # Should be valid JSON
+        parsed = json.loads(captured.out)
+        assert "timestamp" in parsed
+
+
+class TestEnvironmentVariables:
+    """Tests for environment variable configuration."""
+
+    def test_all_loom_env_vars_supported(self) -> None:
+        """All documented LOOM_* environment variables should be read."""
+        env = {
+            "LOOM_ISSUE_THRESHOLD": "5",
+            "LOOM_MAX_SHEPHERDS": "6",
+            "LOOM_MAX_PROPOSALS": "10",
+            "LOOM_ARCHITECT_COOLDOWN": "3600",
+            "LOOM_HERMIT_COOLDOWN": "3600",
+            "LOOM_GUIDE_INTERVAL": "1800",
+            "LOOM_CHAMPION_INTERVAL": "1200",
+            "LOOM_DOCTOR_INTERVAL": "600",
+            "LOOM_AUDITOR_INTERVAL": "1200",
+            "LOOM_JUDGE_INTERVAL": "600",
+            "LOOM_ISSUE_STRATEGY": "lifo",
+            "LOOM_HEARTBEAT_STALE_THRESHOLD": "240",
+            "LOOM_TMUX_SOCKET": "custom",
+            "LOOM_MAX_RETRY_COUNT": "5",
+            "LOOM_RETRY_COOLDOWN": "3600",
+            "LOOM_RETRY_BACKOFF_MULTIPLIER": "3",
+            "LOOM_RETRY_MAX_COOLDOWN": "28800",
+            "LOOM_SYSTEMATIC_FAILURE_THRESHOLD": "4",
+            "LOOM_SYSTEMATIC_FAILURE_COOLDOWN": "3600",
+            "LOOM_SYSTEMATIC_FAILURE_MAX_PROBES": "5",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            cfg = SnapshotConfig.from_env()
+
+        assert cfg.issue_threshold == 5
+        assert cfg.max_shepherds == 6
+        assert cfg.max_proposals == 10
+        assert cfg.architect_cooldown == 3600
+        assert cfg.hermit_cooldown == 3600
+        assert cfg.guide_interval == 1800
+        assert cfg.champion_interval == 1200
+        assert cfg.doctor_interval == 600
+        assert cfg.auditor_interval == 1200
+        assert cfg.judge_interval == 600
+        assert cfg.issue_strategy == "lifo"
+        assert cfg.heartbeat_stale_threshold == 240
+        assert cfg.tmux_socket == "custom"
+        assert cfg.max_retry_count == 5
+        assert cfg.retry_cooldown == 3600
+        assert cfg.retry_backoff_multiplier == 3
+        assert cfg.retry_max_cooldown == 28800
+        assert cfg.systematic_failure_threshold == 4
+        assert cfg.systematic_failure_cooldown == 3600
+        assert cfg.systematic_failure_max_probes == 5
