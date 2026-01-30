@@ -56,6 +56,13 @@ DEFAULT_SIGNAL_POLL=5
 # Default idle timeout (seconds) before checking phase contract via GitHub state
 DEFAULT_IDLE_TIMEOUT=60
 
+# Default interval (seconds) for proactive phase contract checking
+# Checks the phase contract periodically during the poll loop rather than
+# waiting for idle timeout. This detects completion much faster for phases
+# like builder where the signal is on GitHub (PR exists) rather than in logs.
+# Set to 0 to disable proactive checking (fall back to idle timeout only).
+DEFAULT_CONTRACT_INTERVAL=30
+
 # Stuck detection thresholds (configurable via environment variables)
 STUCK_WARNING_THRESHOLD=${LOOM_STUCK_WARNING:-300}   # 5 min default
 STUCK_CRITICAL_THRESHOLD=${LOOM_STUCK_CRITICAL:-600} # 10 min default
@@ -87,6 +94,7 @@ ${YELLOW}OPTIONS:${NC}
     --pr <N>                   PR number for judge/doctor phase validation
     --grace-period <seconds>   Deprecated (no-op). Agent is terminated immediately on completion detection.
     --idle-timeout <seconds>   Time without output before checking phase contract (default: $DEFAULT_IDLE_TIMEOUT)
+    --contract-interval <s>    Seconds between proactive phase contract checks (default: $DEFAULT_CONTRACT_INTERVAL, 0=disable)
     --json                     Output result as JSON
     --help                     Show this help message
 
@@ -102,10 +110,15 @@ ${YELLOW}SIGNALS CHECKED:${NC}
     - loom:abort label on issue (per-issue abort, requires --issue)
 
 ${YELLOW}COMPLETION DETECTION:${NC}
-    Primary: Phase contract validation via GitHub state (when --phase provided)
+    Primary: Proactive phase contract checking (when --phase provided)
     - Checks actual GitHub labels/PRs rather than parsing log output
+    - Proactively checked every --contract-interval seconds (default: ${DEFAULT_CONTRACT_INTERVAL}s)
+    - Uses validate-phase.sh --check-only for safe, side-effect-free verification
+    - Detects completion within one interval of actual work finishing
+
+    Secondary: Idle-triggered phase contract check (when --phase provided)
     - Triggers when agent is idle (no output for --idle-timeout seconds)
-    - Uses validate-phase.sh for contract verification
+    - Acts as fallback if proactive checks are disabled (--contract-interval 0)
 
     Fallback: Log pattern matching (when --phase not provided)
     - Builder: PR created with loom:review-requested
@@ -681,6 +694,7 @@ main() {
     local poll_interval="$DEFAULT_SIGNAL_POLL"
     local issue=""
     local idle_timeout="$DEFAULT_IDLE_TIMEOUT"
+    local contract_interval="$DEFAULT_CONTRACT_INTERVAL"
     local phase=""
     local worktree=""
     local pr_number=""
@@ -716,6 +730,10 @@ main() {
                 idle_timeout="$2"
                 shift 2
                 ;;
+            --contract-interval)
+                contract_interval="$2"
+                shift 2
+                ;;
             --phase)
                 phase="$2"
                 shift 2
@@ -744,6 +762,9 @@ main() {
     done
 
     log_info "Waiting for agent '$name' with signal checking (poll: ${poll_interval}s, timeout: ${timeout}s)"
+    if [[ -n "$phase" ]] && [[ "$contract_interval" -gt 0 ]]; then
+        log_info "Proactive contract checking: every ${contract_interval}s for phase '$phase'"
+    fi
     log_info "Stuck detection: warning=${STUCK_WARNING_THRESHOLD}s, critical=${STUCK_CRITICAL_THRESHOLD}s, action=${STUCK_ACTION}"
     log_info "Prompt stuck detection: threshold=${PROMPT_STUCK_THRESHOLD}s"
 
@@ -759,6 +780,7 @@ main() {
     local prompt_resolved=false
     local completion_detected=false
     local idle_contract_checked=false
+    local last_contract_check=0
     local stuck_warned=false
     local stuck_critical_reported=false
     local prompt_stuck_checked=false
@@ -869,8 +891,31 @@ main() {
             fi
         fi
 
+        # Proactive phase contract checking: check periodically regardless of idle state
+        # This detects completion within one contract_interval of actual work finishing,
+        # rather than waiting for the idle timeout to trigger (see issue #1581)
+        if [[ "$completion_detected" != "true" ]] && [[ -n "$phase" ]] && [[ "$contract_interval" -gt 0 ]]; then
+            local now
+            now=$(date +%s)
+            local since_last_check=$((now - last_contract_check))
+
+            if [[ "$since_last_check" -ge "$contract_interval" ]]; then
+                last_contract_check=$now
+
+                if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
+                    completion_detected=true
+                    completion_time=$now
+                    COMPLETION_REASON="phase_contract_satisfied"
+
+                    log_info "Phase contract satisfied ($CONTRACT_STATUS) via proactive check"
+                    log_warn "Agent completed work but didn't exit - waiting ${grace_period}s grace period"
+                fi
+            fi
+        fi
+
         # Activity-based completion detection: check phase contract when agent is idle
         # This is a backup mechanism when /exit doesn't work (see issue #1461)
+        # Skipped if proactive checking already detected completion above
         if [[ "$completion_detected" != "true" ]] && [[ -n "$phase" ]] && [[ "$idle_contract_checked" != "true" ]]; then
             local idle_time
             idle_time=$(get_log_idle_time "$log_file")
