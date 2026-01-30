@@ -489,11 +489,13 @@ check_completion_patterns() {
 # Check phase contract satisfaction via validate-phase.sh
 # Returns 0 if contract is satisfied (work complete), 1 otherwise
 # Sets CONTRACT_STATUS global variable with the validation result
+# Optional 5th parameter: "check_only" to skip side effects (for idle timeout checks)
 check_phase_contract() {
     local phase="$1"
     local issue="$2"
     local worktree="$3"
     local pr_number="$4"
+    local check_only="${5:-}"
 
     if [[ -z "$phase" ]] || [[ -z "$issue" ]]; then
         return 1
@@ -505,6 +507,11 @@ check_phase_contract() {
     fi
     if [[ -n "$pr_number" ]]; then
         validate_args+=("--pr" "$pr_number")
+    fi
+    # Use --check-only to avoid side effects (worktree removal, label changes)
+    # when checking during idle timeout (see issue #1536)
+    if [[ "$check_only" == "check_only" ]]; then
+        validate_args+=("--check-only")
     fi
     validate_args+=("--json")
 
@@ -731,7 +738,9 @@ main() {
             if [[ "$idle_time" -ge "$idle_timeout" ]]; then
                 log_info "Agent idle for ${idle_time}s (threshold: ${idle_timeout}s) - checking phase contract"
 
-                if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number"; then
+                # Use check_only mode to avoid side effects during idle check
+                # This prevents premature worktree removal that breaks retry (issue #1536)
+                if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
                     completion_detected=true
                     completion_time=$(date +%s)
                     COMPLETION_REASON="phase_contract_satisfied"

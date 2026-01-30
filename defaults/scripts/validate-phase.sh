@@ -16,6 +16,8 @@
 #   --pr <number>       PR number (required for judge/doctor)
 #   --task-id <id>      Shepherd task ID for milestone reporting
 #   --json              Output results as JSON
+#   --check-only        Only check contract status, skip all side effects
+#                       (no worktree removal, branch deletion, or label changes)
 #
 # Exit codes:
 #   0 - Contract satisfied (initially or after recovery)
@@ -75,6 +77,7 @@ WORKTREE=""
 PR_NUMBER=""
 TASK_ID=""
 JSON_OUTPUT=false
+CHECK_ONLY=false
 
 if [[ $# -lt 2 ]]; then
     echo -e "${RED}Error: Missing required arguments${NC}"
@@ -102,6 +105,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --json)
             JSON_OUTPUT=true
+            shift
+            ;;
+        --check-only)
+            CHECK_ONLY=true
             shift
             ;;
         *)
@@ -314,6 +321,12 @@ validate_curator() {
         return 0
     fi
 
+    # In check-only mode, skip recovery and just report status
+    if $CHECK_ONLY; then
+        output_result "failed" "Issue missing loom:curated label (check-only mode, no recovery attempted)"
+        return 1
+    fi
+
     # Recovery: apply loom:curated label (curator may have enhanced but not labeled)
     echo -e "${YELLOW}Attempting recovery: applying loom:curated label${NC}"
     if gh issue edit "$ISSUE" --add-label "loom:curated" 2>/dev/null; then
@@ -392,8 +405,9 @@ validate_builder() {
 
     if [[ -n "$pr" && "$pr" != "null" ]]; then
         # PR found - check if it has proper issue reference (needed for auto-close)
-        if [[ "$pr_found_by" == "branch_name" ]]; then
+        if [[ "$pr_found_by" == "branch_name" ]] && ! $CHECK_ONLY; then
             # PR found by branch name - check if it needs "Closes #N" added
+            # Skip this recovery in check-only mode
             local pr_body
             pr_body=$(gh pr view "$pr" --json body --jq '.body' 2>/dev/null) || pr_body=""
 
@@ -424,6 +438,13 @@ Closes #${ISSUE}"
             output_result "satisfied" "PR #$pr exists with loom:review-requested"
             return 0
         fi
+
+        # In check-only mode, report status without attempting recovery
+        if $CHECK_ONLY; then
+            output_result "failed" "PR #$pr exists but missing loom:review-requested (check-only mode, no recovery attempted)"
+            return 1
+        fi
+
         # PR exists but missing label - add it
         echo -e "${YELLOW}Attempting recovery: adding loom:review-requested to PR #$pr${NC}"
         if gh pr edit "$pr" --add-label "loom:review-requested" 2>/dev/null; then
@@ -434,6 +455,12 @@ Closes #${ISSUE}"
     fi
 
     # No PR found (searched by branch name and Closes/Fixes/Resolves keywords)
+    # In check-only mode, skip recovery and just report status
+    if $CHECK_ONLY; then
+        output_result "failed" "No PR found for issue #${ISSUE} (check-only mode, no recovery attempted)"
+        return 1
+    fi
+
     # Attempt recovery from worktree
     if [[ -z "$WORKTREE" ]]; then
         output_result "failed" "No PR found (searched by branch 'feature/issue-${ISSUE}' and keywords) and no worktree path provided"
@@ -603,7 +630,10 @@ validate_judge() {
 
     # No recovery possible for judge - it must make a decision
     output_result "failed" "Judge did not produce loom:pr or loom:changes-requested on PR #$PR_NUMBER"
-    mark_blocked "Judge phase did not produce a review decision on PR #$PR_NUMBER."
+    # In check-only mode, skip marking issue as blocked
+    if ! $CHECK_ONLY; then
+        mark_blocked "Judge phase did not produce a review decision on PR #$PR_NUMBER."
+    fi
     return 1
 }
 
@@ -626,7 +656,10 @@ validate_doctor() {
 
     # No recovery possible for doctor
     output_result "failed" "Doctor did not re-request review on PR #$PR_NUMBER"
-    mark_blocked "Doctor phase did not apply loom:review-requested to PR #$PR_NUMBER."
+    # In check-only mode, skip marking issue as blocked
+    if ! $CHECK_ONLY; then
+        mark_blocked "Doctor phase did not apply loom:review-requested to PR #$PR_NUMBER."
+    fi
     return 1
 }
 
