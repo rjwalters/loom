@@ -53,12 +53,7 @@ log_warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*" >&2; }
 # Default poll interval for signal checking
 DEFAULT_SIGNAL_POLL=5
 
-# Grace period (seconds) to wait after detecting completion before force-terminating
-DEFAULT_GRACE_PERIOD=30
-
 # Default idle timeout (seconds) before checking phase contract via GitHub state
-# This is separate from grace period - idle timeout triggers contract check,
-# grace period is how long to wait after detecting completion pattern
 DEFAULT_IDLE_TIMEOUT=60
 
 # Stuck detection thresholds (configurable via environment variables)
@@ -90,7 +85,7 @@ ${YELLOW}OPTIONS:${NC}
     --phase <phase>            Phase name (curator, builder, judge, doctor) for contract checking
     --worktree <path>          Worktree path for builder phase recovery
     --pr <N>                   PR number for judge/doctor phase validation
-    --grace-period <seconds>   Time to wait after completion detection (default: $DEFAULT_GRACE_PERIOD)
+    --grace-period <seconds>   Deprecated (no-op). Agent is terminated immediately on completion detection.
     --idle-timeout <seconds>   Time without output before checking phase contract (default: $DEFAULT_IDLE_TIMEOUT)
     --json                     Output result as JSON
     --help                     Show this help message
@@ -685,7 +680,6 @@ main() {
     local timeout="3600"
     local poll_interval="$DEFAULT_SIGNAL_POLL"
     local issue=""
-    local grace_period="$DEFAULT_GRACE_PERIOD"
     local idle_timeout="$DEFAULT_IDLE_TIMEOUT"
     local phase=""
     local worktree=""
@@ -715,7 +709,7 @@ main() {
                 shift 2
                 ;;
             --grace-period)
-                grace_period="$2"
+                # Deprecated: grace period is no longer used (agents are terminated immediately)
                 shift 2
                 ;;
             --idle-timeout)
@@ -764,7 +758,6 @@ main() {
     local log_file="${REPO_ROOT}/.loom/logs/${session_name}.log"
     local prompt_resolved=false
     local completion_detected=false
-    local completion_time=0
     local idle_contract_checked=false
     local stuck_warned=false
     local stuck_critical_reported=false
@@ -831,7 +824,7 @@ main() {
 
         # Fast "stuck at prompt" detection - command visible but not processing
         # This failure mode can be detected in ~30s vs the 5min general stuck threshold.
-        # Only check once after the grace period and only if not already processing.
+        # Only check once after the threshold and only if not already processing.
         local elapsed=$(( $(date +%s) - start_time ))
         if [[ "$prompt_stuck_checked" != "true" ]] && [[ "$prompt_stuck_recovery_attempted" != "true" ]] && [[ "$elapsed" -ge "$PROMPT_STUCK_THRESHOLD" ]]; then
             if check_stuck_at_prompt "$session_name"; then
@@ -889,11 +882,9 @@ main() {
                 # This prevents premature worktree removal that breaks retry (issue #1536)
                 if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
                     completion_detected=true
-                    completion_time=$(date +%s)
                     COMPLETION_REASON="phase_contract_satisfied"
 
-                    log_info "Phase contract satisfied ($CONTRACT_STATUS) - treating as complete"
-                    log_warn "Agent completed work but didn't exit - waiting ${grace_period}s grace period"
+                    log_info "Phase contract satisfied ($CONTRACT_STATUS) - terminating session"
                 else
                     # Contract not satisfied, don't check again until next idle timeout
                     idle_contract_checked=true
@@ -915,20 +906,17 @@ main() {
         if [[ "$completion_detected" != "true" ]]; then
             if check_completion_patterns "$session_name"; then
                 completion_detected=true
-                completion_time=$(date +%s)
-                # Only warn about grace period for role-specific patterns, not explicit /exit
                 if [[ "$COMPLETION_REASON" != "explicit_exit" ]]; then
-                    log_warn "Completion pattern detected ($COMPLETION_REASON) but session still running - waiting ${grace_period}s grace period"
-                    log_warn "Agent should have executed /exit after completing task"
+                    log_info "Completion pattern detected ($COMPLETION_REASON) - terminating session"
                 fi
             fi
         fi
 
-        # If completion was detected, check if grace period has elapsed
+        # If completion was detected, terminate immediately
         if [[ "$completion_detected" == "true" ]]; then
-            # /exit is an explicit completion signal - no grace period needed
+            local elapsed=$(( $(date +%s) - start_time ))
+
             if [[ "$COMPLETION_REASON" == "explicit_exit" ]]; then
-                local elapsed=$(( $(date +%s) - start_time ))
                 log_info "/exit detected in output - sending /exit to prompt and terminating '$session_name'"
 
                 # Send /exit to the actual tmux prompt as backup
@@ -937,47 +925,24 @@ main() {
 
                 # Brief pause to let /exit process
                 sleep 1
-
-                # Kill the background wait process
-                kill "$wait_pid" 2>/dev/null || true
-                wait "$wait_pid" 2>/dev/null || true
-
-                # Clean up progress files
-                cleanup_progress_files "$name"
-
-                # Destroy the tmux session to clean up
-                tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
-
-                if [[ "$json_output" == "true" ]]; then
-                    echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"explicit_exit\",\"elapsed\":$elapsed}"
-                else
-                    log_success "Agent '$name' completed (explicit /exit after ${elapsed}s)"
-                fi
-                exit 0
             fi
 
-            local grace_elapsed=$(( $(date +%s) - completion_time ))
-            if [[ "$grace_elapsed" -ge "$grace_period" ]]; then
-                local elapsed=$(( $(date +%s) - start_time ))
-                log_warn "Grace period expired - force-terminating session '$session_name'"
+            # Kill the background wait process
+            kill "$wait_pid" 2>/dev/null || true
+            wait "$wait_pid" 2>/dev/null || true
 
-                # Kill the background wait process
-                kill "$wait_pid" 2>/dev/null || true
-                wait "$wait_pid" 2>/dev/null || true
+            # Clean up progress files
+            cleanup_progress_files "$name"
 
-                # Clean up progress files
-                cleanup_progress_files "$name"
+            # Destroy the tmux session to clean up
+            tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
 
-                # Destroy the tmux session to clean up
-                tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
-
-                if [[ "$json_output" == "true" ]]; then
-                    echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"completion_pattern_detected\",\"pattern\":\"$COMPLETION_REASON\",\"elapsed\":$elapsed,\"grace_period_used\":true}"
-                else
-                    log_success "Agent '$name' completed (pattern: $COMPLETION_REASON, forced after ${grace_period}s grace period)"
-                fi
-                exit 0
+            if [[ "$json_output" == "true" ]]; then
+                echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"$COMPLETION_REASON\",\"elapsed\":$elapsed}"
+            else
+                log_success "Agent '$name' completed ($COMPLETION_REASON after ${elapsed}s)"
             fi
+            exit 0
         fi
 
         # Check for progress and update stuck tracking
