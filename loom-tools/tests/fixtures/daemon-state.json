@@ -1,0 +1,78 @@
+{
+  "started_at": "2026-01-26T18:30:00Z",
+  "last_poll": "2026-01-27T04:29:30Z",
+  "running": false,
+  "iteration": 4,
+  "force_mode": true,
+  "execution_mode": "direct",
+  "shepherds": {
+    "shepherd-1": {
+      "status": "idle",
+      "issue": null,
+      "task_id": null,
+      "output_file": null,
+      "idle_since": "2026-01-27T04:29:30Z",
+      "idle_reason": "task_not_found",
+      "last_issue": 1353,
+      "last_completed": "2026-01-27T04:29:08Z"
+    },
+    "shepherd-2": {
+      "status": "working",
+      "issue": 1354,
+      "task_id": "20",
+      "started": "2026-01-27T04:18:07Z",
+      "execution_mode": "direct"
+    },
+    "shepherd-3": {
+      "status": "idle",
+      "issue": null,
+      "task_id": null,
+      "output_file": null,
+      "idle_since": "2026-01-27T04:29:30Z",
+      "idle_reason": "task_not_found",
+      "last_issue": 1355,
+      "last_completed": "2026-01-27T04:29:11Z"
+    }
+  },
+  "support_roles": {
+    "guide": {
+      "status": "running",
+      "task_id": "22",
+      "started": "2026-01-27T04:18:07Z"
+    },
+    "champion": {
+      "status": "running",
+      "task_id": "23",
+      "started": "2026-01-27T04:18:07Z"
+    },
+    "doctor": {
+      "status": "running",
+      "task_id": "24",
+      "started": "2026-01-27T04:18:07Z"
+    },
+    "auditor": {
+      "status": "running",
+      "task_id": "25",
+      "started": "2026-01-27T04:18:07Z"
+    },
+    "judge": {
+      "status": "running",
+      "task_id": "26",
+      "started": "2026-01-27T04:18:07Z"
+    }
+  },
+  "pipeline_state": {
+    "ready": ["#1356", "#1357", "#1358"],
+    "building": ["#1353", "#1354", "#1355"],
+    "review_requested": [],
+    "changes_requested": [],
+    "ready_to_merge": [],
+    "blocked": [],
+    "last_updated": "2026-01-27T04:26:10Z"
+  },
+  "warnings": [],
+  "completed_issues": [],
+  "total_prs_merged": 0,
+  "last_architect_trigger": null,
+  "last_hermit_trigger": null
+}
