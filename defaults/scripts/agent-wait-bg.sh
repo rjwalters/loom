@@ -19,7 +19,9 @@
 #   LOOM_STUCK_WARNING   - Seconds without progress before warning (default: 300)
 #   LOOM_STUCK_CRITICAL  - Seconds without progress before critical (default: 600)
 #   LOOM_STUCK_ACTION    - Action on stuck: warn, pause, restart, retry (default: warn)
-#   LOOM_PROMPT_STUCK_THRESHOLD - Seconds before checking for 'stuck at prompt' (default: 30)
+#   LOOM_PROMPT_STUCK_CHECK_INTERVAL - Check interval for 'stuck at prompt' detection (default: 10)
+#   LOOM_PROMPT_STUCK_AGE_THRESHOLD - How long stuck before triggering detection (default: 30)
+#   LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN - Seconds before re-attempting recovery (default: 60)
 #
 # Usage:
 #   agent-wait-bg.sh <name> [--timeout <s>] [--poll-interval <s>] [--issue <N>] [--task-id <id>] [--json]
@@ -94,9 +96,17 @@ STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart, ret
 
 # "Stuck at prompt" detection - command visible but not processing
 # This is a distinct, faster-detectable failure mode from general stuck detection.
-# Checked periodically (every PROMPT_STUCK_THRESHOLD seconds) so we can detect
-# agents that start working then later become idle at prompt (see issue #1668).
-PROMPT_STUCK_THRESHOLD=${LOOM_PROMPT_STUCK_THRESHOLD:-30}  # check every 30 seconds
+# Detection fires when agent has been stuck for >= AGE_THRESHOLD seconds.
+# We check at CHECK_INTERVAL frequency for responsiveness.
+#
+# LOOM_PROMPT_STUCK_CHECK_INTERVAL: How often to poll for stuck state (default: 10s)
+# LOOM_PROMPT_STUCK_AGE_THRESHOLD: How long stuck before detection fires (default: 30s)
+# LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN: Seconds before re-attempting recovery (default: 60s)
+#
+# With defaults (check=10s, age=30s, poll=5s), detection fires within ~35-40s of becoming stuck.
+PROMPT_STUCK_CHECK_INTERVAL=${LOOM_PROMPT_STUCK_CHECK_INTERVAL:-10}  # check every 10 seconds
+PROMPT_STUCK_AGE_THRESHOLD=${LOOM_PROMPT_STUCK_AGE_THRESHOLD:-30}    # stuck for 30s before detection
+PROMPT_STUCK_RECOVERY_COOLDOWN=${LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN:-60}  # 60s before re-trying recovery
 
 # Pattern for detecting Claude is processing a command (shared with agent-spawn.sh)
 # Claude Code shows "esc to interrupt" in the status bar whenever it is working
@@ -209,11 +219,15 @@ ${YELLOW}PROMPT STUCK DETECTION:${NC}
     This distinct failure mode is detected much faster than general stuck detection.
     Configure via environment variables:
 
-    LOOM_PROMPT_STUCK_THRESHOLD  Seconds before checking for stuck-at-prompt (default: 30)
+    LOOM_PROMPT_STUCK_CHECK_INTERVAL   How often to check for stuck state (default: 10)
+    LOOM_PROMPT_STUCK_AGE_THRESHOLD    How long stuck before detection fires (default: 30)
+    LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN  Seconds before re-attempting recovery (default: 60)
 
-    Recovery is attempted automatically:
+    With defaults (check=10s, age=30s, poll=5s), detection fires within ~35-40s.
+    Recovery is attempted automatically after age threshold is reached:
     1. Enter key nudge (command may just need Enter to submit)
     2. Full command retry (if recoverable from session name)
+    Recovery can be re-attempted after RECOVERY_COOLDOWN if still stuck.
 
 ${YELLOW}EXAMPLES:${NC}
     # Phase-aware completion detection with heartbeat (recommended)
@@ -862,7 +876,7 @@ main() {
         fi
     fi
     log_info "Stuck detection: warning=${STUCK_WARNING_THRESHOLD}s, critical=${STUCK_CRITICAL_THRESHOLD}s, action=${STUCK_ACTION}"
-    log_info "Prompt stuck detection: threshold=${PROMPT_STUCK_THRESHOLD}s"
+    log_info "Prompt stuck detection: check_interval=${PROMPT_STUCK_CHECK_INTERVAL}s, age_threshold=${PROMPT_STUCK_AGE_THRESHOLD}s, recovery_cooldown=${PROMPT_STUCK_RECOVERY_COOLDOWN}s"
 
     # Launch agent-wait.sh in the background
     local wait_cmd=("${SCRIPT_DIR}/agent-wait.sh" "$name" --timeout "$timeout" --poll-interval "$poll_interval" --json)
@@ -884,7 +898,9 @@ main() {
     local stuck_warned=false
     local stuck_critical_reported=false
     local last_prompt_stuck_check=$start_time
+    local prompt_stuck_since=0                  # When stuck state was first detected (0 = not stuck)
     local prompt_stuck_recovery_attempted=false
+    local prompt_stuck_recovery_time=0          # When last recovery was attempted
     local last_heartbeat_time=$start_time
     COMPLETION_REASON=""
     CONTRACT_STATUS=""
@@ -977,49 +993,99 @@ main() {
         fi
 
         # Fast "stuck at prompt" detection - command visible but not processing
-        # This failure mode can be detected in ~30s vs the 5min general stuck threshold.
-        # Check periodically (every PROMPT_STUCK_THRESHOLD seconds) rather than once,
-        # so we can detect agents that start working then later become idle at prompt.
+        # This failure mode can be detected faster than the 5min general stuck threshold.
+        #
+        # Key variables:
+        #   prompt_stuck_since: timestamp when stuck state was first detected (0 = not stuck)
+        #   prompt_stuck_recovery_attempted: whether recovery was tried this stuck episode
+        #   prompt_stuck_recovery_time: timestamp of last recovery attempt
+        #
+        # Detection fires when stuck for >= PROMPT_STUCK_AGE_THRESHOLD seconds.
+        # We check at PROMPT_STUCK_CHECK_INTERVAL frequency for responsiveness.
         local now
         now=$(date +%s)
         local since_last_prompt_check=$((now - last_prompt_stuck_check))
-        if [[ "$since_last_prompt_check" -ge "$PROMPT_STUCK_THRESHOLD" ]] && [[ "$prompt_stuck_recovery_attempted" != "true" ]]; then
+
+        if [[ "$since_last_prompt_check" -ge "$PROMPT_STUCK_CHECK_INTERVAL" ]]; then
             last_prompt_stuck_check=$now
+
             if check_stuck_at_prompt "$session_name"; then
-                local elapsed=$(( now - start_time ))
-                log_warn "Agent appears stuck at prompt (command visible but not processing after ${elapsed}s)"
-
-                # Attempt recovery
-                prompt_stuck_recovery_attempted=true
-                # Extract the likely role command from the session name for retry
-                local role_cmd=""
-                if [[ "$name" == builder-issue-* ]]; then
-                    local issue_num="${name#builder-issue-}"
-                    role_cmd="/builder ${issue_num}"
-                elif [[ "$name" == judge-* ]] || [[ "$name" == curator-* ]] || [[ "$name" == doctor-* ]]; then
-                    # For other roles, we can't easily reconstruct the command
-                    # Enter nudge is still attempted
-                    role_cmd=""
+                # Agent appears stuck at prompt
+                if [[ "$prompt_stuck_since" -eq 0 ]]; then
+                    # First detection of stuck state
+                    prompt_stuck_since=$now
+                    log_info "Checking for stuck-at-prompt (first detection, waiting for age threshold)"
                 fi
 
-                if attempt_prompt_stuck_recovery "$session_name" "$role_cmd"; then
-                    log_success "Agent recovered from stuck-at-prompt state"
-                    # Reset recovery flag so we can detect future stuck-at-prompt states
-                    prompt_stuck_recovery_attempted=false
-                else
-                    # Recovery failed - let the general stuck detection handle escalation
-                    log_warn "Stuck-at-prompt recovery failed - waiting for general stuck detection"
+                local stuck_duration=$((now - prompt_stuck_since))
+
+                # Check if recovery cooldown has elapsed (allow re-attempt)
+                local since_recovery=0
+                if [[ "$prompt_stuck_recovery_time" -gt 0 ]]; then
+                    since_recovery=$((now - prompt_stuck_recovery_time))
                 fi
+                local recovery_allowed=true
+                if [[ "$prompt_stuck_recovery_attempted" == "true" ]] && [[ "$since_recovery" -lt "$PROMPT_STUCK_RECOVERY_COOLDOWN" ]]; then
+                    recovery_allowed=false
+                fi
+
+                # Only take action if stuck for >= threshold AND recovery is allowed
+                if [[ "$stuck_duration" -ge "$PROMPT_STUCK_AGE_THRESHOLD" ]] && [[ "$recovery_allowed" == "true" ]]; then
+                    local elapsed=$(( now - start_time ))
+                    log_warn "Agent stuck at prompt for ${stuck_duration}s (total elapsed: ${elapsed}s) - attempting recovery"
+
+                    # Attempt recovery
+                    prompt_stuck_recovery_attempted=true
+                    prompt_stuck_recovery_time=$now
+
+                    # Extract the likely role command from the session name for retry
+                    local role_cmd=""
+                    if [[ "$name" == builder-issue-* ]]; then
+                        local issue_num="${name#builder-issue-}"
+                        role_cmd="/builder ${issue_num}"
+                    elif [[ "$name" == judge-* ]] || [[ "$name" == curator-* ]] || [[ "$name" == doctor-* ]]; then
+                        # For other roles, we can't easily reconstruct the command
+                        # Enter nudge is still attempted
+                        role_cmd=""
+                    fi
+
+                    if attempt_prompt_stuck_recovery "$session_name" "$role_cmd"; then
+                        log_success "Agent recovered from stuck-at-prompt state"
+                        # Reset stuck tracking on successful recovery
+                        prompt_stuck_since=0
+                        prompt_stuck_recovery_attempted=false
+                    else
+                        # Recovery failed - log with timing info for debugging
+                        local remaining_cooldown=$((PROMPT_STUCK_RECOVERY_COOLDOWN - since_recovery))
+                        if [[ "$remaining_cooldown" -lt 0 ]]; then
+                            remaining_cooldown=0
+                        fi
+                        log_warn "Stuck-at-prompt recovery failed - will retry after ${PROMPT_STUCK_RECOVERY_COOLDOWN}s cooldown"
+                    fi
+                elif [[ "$stuck_duration" -lt "$PROMPT_STUCK_AGE_THRESHOLD" ]]; then
+                    # Still within initial detection period
+                    local remaining=$((PROMPT_STUCK_AGE_THRESHOLD - stuck_duration))
+                    log_info "Agent may be stuck at prompt (${stuck_duration}s/${PROMPT_STUCK_AGE_THRESHOLD}s threshold, ${remaining}s until detection)"
+                fi
+            else
+                # Agent is not stuck at prompt - reset tracking
+                if [[ "$prompt_stuck_since" -gt 0 ]]; then
+                    log_info "Agent no longer stuck at prompt - resetting tracking"
+                fi
+                prompt_stuck_since=0
+                prompt_stuck_recovery_attempted=false
             fi
         fi
 
-        # Reset prompt stuck recovery tracking if we see progress (pane content changed)
-        # This allows us to attempt recovery again if agent gets stuck later
-        if [[ "$prompt_stuck_recovery_attempted" == "true" ]]; then
+        # Also check for processing indicators to reset stuck tracking (even between checks)
+        # This provides faster recovery detection if agent starts processing
+        if [[ "$prompt_stuck_since" -gt 0 ]]; then
             local pane_content
             pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
             if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-                # Agent is now processing - reset recovery tracking
+                # Agent is now processing - reset all stuck tracking
+                log_info "Agent now processing - resetting stuck-at-prompt tracking"
+                prompt_stuck_since=0
                 prompt_stuck_recovery_attempted=false
             fi
         fi

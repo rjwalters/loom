@@ -186,8 +186,10 @@ class AgentMonitor:
         self._last_contract_check = 0.0
         self._stuck_warned = False
         self._stuck_critical_reported = False
-        self._prompt_stuck_checked = False
+        self._last_prompt_stuck_check = 0.0
+        self._prompt_stuck_since = 0.0  # When stuck state was first detected (0 = not stuck)
         self._prompt_stuck_recovery_attempted = False
+        self._prompt_stuck_recovery_time = 0.0  # When last recovery was attempted
         self._prompt_resolved = False
         self._last_heartbeat_time = self.start_time
 
@@ -236,7 +238,11 @@ class AgentMonitor:
             f"Stuck detection: warning={sc.warning_threshold}s, "
             f"critical={sc.critical_threshold}s, action={sc.action.value}"
         )
-        log_info(f"Prompt stuck detection: threshold={sc.prompt_stuck_threshold}s")
+        log_info(
+            f"Prompt stuck detection: check_interval={sc.prompt_stuck_check_interval}s, "
+            f"age_threshold={sc.prompt_stuck_age_threshold}s, "
+            f"recovery_cooldown={sc.prompt_stuck_recovery_cooldown}s"
+        )
 
         while True:
             # Check timeout
@@ -425,42 +431,88 @@ class AgentMonitor:
         return False
 
     def _check_prompt_stuck(self) -> WaitResult | None:
-        """Fast detection of 'stuck at prompt' state."""
+        """Fast detection of 'stuck at prompt' state.
+
+        Detection fires when agent has been stuck for >= age_threshold seconds.
+        We check at check_interval frequency for responsiveness.
+        Recovery can be re-attempted after recovery_cooldown if still stuck.
+        """
         sc = self.config.stuck_config
+        now = time.time()
+        since_last_check = now - self._last_prompt_stuck_check
 
-        if self._prompt_stuck_checked and not self._prompt_stuck_recovery_attempted:
-            return None
-        if self._prompt_stuck_recovery_attempted:
-            # Check if now processing
-            pane_content = capture_pane(self.session_name)
-            if pane_content and PROCESSING_INDICATORS in pane_content:
-                self._prompt_stuck_checked = False
-                self._prompt_stuck_recovery_attempted = False
+        if since_last_check < sc.prompt_stuck_check_interval:
+            # Not time to check yet - but still check for processing indicators
+            # to reset stuck tracking faster
+            if self._prompt_stuck_since > 0:
+                pane_content = capture_pane(self.session_name)
+                if pane_content and PROCESSING_INDICATORS in pane_content:
+                    log_info("Agent now processing - resetting stuck-at-prompt tracking")
+                    self._prompt_stuck_since = 0.0
+                    self._prompt_stuck_recovery_attempted = False
             return None
 
-        if self.elapsed < sc.prompt_stuck_threshold:
-            return None
+        self._last_prompt_stuck_check = now
 
         if self._is_stuck_at_prompt():
-            self._prompt_stuck_checked = True
-            log_warning(
-                f"Agent appears stuck at prompt "
-                f"(command visible but not processing after {self.elapsed}s)"
+            # Agent appears stuck at prompt
+            if self._prompt_stuck_since == 0:
+                # First detection of stuck state
+                self._prompt_stuck_since = now
+                log_info(
+                    "Checking for stuck-at-prompt (first detection, "
+                    "waiting for age threshold)"
+                )
+
+            stuck_duration = int(now - self._prompt_stuck_since)
+
+            # Check if recovery cooldown has elapsed (allow re-attempt)
+            since_recovery = 0.0
+            if self._prompt_stuck_recovery_time > 0:
+                since_recovery = now - self._prompt_stuck_recovery_time
+            recovery_allowed = (
+                not self._prompt_stuck_recovery_attempted
+                or since_recovery >= sc.prompt_stuck_recovery_cooldown
             )
 
-            self._prompt_stuck_recovery_attempted = True
-            role_cmd = self._extract_role_command()
-
-            if self._attempt_prompt_stuck_recovery(role_cmd):
-                log_success("Agent recovered from stuck-at-prompt state")
-                self._prompt_stuck_checked = False
-            else:
+            # Only take action if stuck for >= threshold AND recovery is allowed
+            if (
+                stuck_duration >= sc.prompt_stuck_age_threshold
+                and recovery_allowed
+            ):
                 log_warning(
-                    "Stuck-at-prompt recovery failed - "
-                    "waiting for general stuck detection"
+                    f"Agent stuck at prompt for {stuck_duration}s "
+                    f"(total elapsed: {self.elapsed}s) - attempting recovery"
+                )
+
+                self._prompt_stuck_recovery_attempted = True
+                self._prompt_stuck_recovery_time = now
+                role_cmd = self._extract_role_command()
+
+                if self._attempt_prompt_stuck_recovery(role_cmd):
+                    log_success("Agent recovered from stuck-at-prompt state")
+                    # Reset stuck tracking on successful recovery
+                    self._prompt_stuck_since = 0.0
+                    self._prompt_stuck_recovery_attempted = False
+                else:
+                    log_warning(
+                        f"Stuck-at-prompt recovery failed - "
+                        f"will retry after {sc.prompt_stuck_recovery_cooldown}s cooldown"
+                    )
+            elif stuck_duration < sc.prompt_stuck_age_threshold:
+                # Still within initial detection period
+                remaining = sc.prompt_stuck_age_threshold - stuck_duration
+                log_info(
+                    f"Agent may be stuck at prompt "
+                    f"({stuck_duration}s/{sc.prompt_stuck_age_threshold}s threshold, "
+                    f"{remaining}s until detection)"
                 )
         else:
-            self._prompt_stuck_checked = True
+            # Agent is not stuck at prompt - reset tracking
+            if self._prompt_stuck_since > 0:
+                log_info("Agent no longer stuck at prompt - resetting tracking")
+            self._prompt_stuck_since = 0.0
+            self._prompt_stuck_recovery_attempted = False
 
         return None
 
