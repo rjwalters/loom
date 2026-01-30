@@ -17,6 +17,7 @@
 #   merge_failed          - PR merge failed (conflicts, checks)
 #   rate_limited          - API rate limit exceeded
 #   worktree_failed       - Failed to create worktree
+#   skip_precondition     - --from flag precondition failed (e.g., no PR exists, PR not approved)
 #   unknown               - Unclassified error
 
 set -euo pipefail

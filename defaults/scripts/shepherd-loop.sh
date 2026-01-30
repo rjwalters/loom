@@ -544,6 +544,7 @@ fail_with_reason() {
         doctor:*"max retries"*)           error_class="doctor_exhausted" ;;
         merge:*"failed to merge"*)        error_class="merge_failed" ;;
         curator:*"validation"*)           error_class="unknown" ;;  # Curator failures are non-blocking
+        *:*"skipped via --from"*)         error_class="skip_precondition" ;;  # --from flag precondition failed
         *)                                error_class="unknown" ;;
     esac
 
