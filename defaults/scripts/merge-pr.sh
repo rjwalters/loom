@@ -161,6 +161,21 @@ for MERGE_ATTEMPT in $(seq 1 $MAX_MERGE_RETRIES); do
     break
   fi
 
+  # Check for "Merge already in progress" (HTTP 405)
+  # This happens when auto-merge triggers at the same time as our merge attempt
+  if echo "$MERGE_RESPONSE" | grep -q "Merge already in progress"; then
+    info "Merge already in progress (HTTP 405), waiting for completion..."
+    sleep 5
+    RECHECK=$($GH --no-cache api "repos/$REPO_NWO/pulls/$PR_NUMBER" --jq '.merged' 2>/dev/null || echo "false")
+    if [[ "$RECHECK" == "true" ]]; then
+      success "PR #$PR_NUMBER merged (concurrent merge completed)"
+      break
+    fi
+    # Still not merged after wait - continue retry loop
+    warning "Concurrent merge not yet complete, retrying..."
+    continue
+  fi
+
   # Check for stale branch error (base branch was modified)
   if echo "$MERGE_RESPONSE" | grep -q "Base branch was modified"; then
     if [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
