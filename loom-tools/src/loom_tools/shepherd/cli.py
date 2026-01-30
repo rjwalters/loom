@@ -50,7 +50,7 @@ PHASES:
     3. Builder    - Create worktree, implement, create PR
     4. Judge      - Review PR, approve or request changes (always runs, even in force mode)
     5. Doctor     - Address requested changes (if any)
-    6. Merge      - Auto-merge (--force) or exit at loom:pr (default)
+    6. Merge      - Auto-merge (--force/--merge) or exit at loom:pr (default)
 
 NOTE:
     Force mode does NOT skip the Judge phase. Code review always runs because
@@ -67,6 +67,8 @@ EXAMPLES:
     # Full automation with auto-merge
     loom-shepherd 42 --force
     loom-shepherd 42 -f
+    loom-shepherd 42 --merge
+    loom-shepherd 42 -m
 
     # Stop after curation (for review before building)
     loom-shepherd 42 --to curated
@@ -86,7 +88,15 @@ EXAMPLES:
         "--force",
         "-f",
         action="store_true",
+        dest="force",
         help="Auto-approve, resolve conflicts, auto-merge after approval",
+    )
+    parser.add_argument(
+        "--merge",
+        "-m",
+        action="store_true",
+        dest="force",
+        help="Alias for --force (matches bash shepherd-loop.sh)",
     )
 
     parser.add_argument(
