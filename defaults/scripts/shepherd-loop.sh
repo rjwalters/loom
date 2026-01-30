@@ -1013,6 +1013,8 @@ main() {
         elif [[ $builder_exit -eq 4 ]]; then
             log_error "Builder stuck after retry - marking issue as blocked"
             gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+            "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "builder_stuck" --phase "builder" --details "agent stuck after retry" 2>/dev/null || true
+            "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Builder agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
             fail_with_reason "builder" "agent stuck after retry"
         fi
@@ -1112,6 +1114,8 @@ main() {
         elif [[ $judge_exit -eq 4 ]]; then
             log_error "Judge stuck after retry - marking issue as blocked"
             gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+            "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "judge_stuck" --phase "judge" --details "agent stuck after retry" 2>/dev/null || true
+            "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Judge agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
             fail_with_reason "judge" "agent stuck after retry"
         fi
@@ -1139,6 +1143,8 @@ main() {
                 log_error "Doctor max retries ($DOCTOR_MAX_RETRIES) exceeded"
                 # Atomic transition: loom:building -> loom:blocked (mutually exclusive states)
                 gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+                "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "doctor_exhausted" --phase "doctor" --details "max retries ($DOCTOR_MAX_RETRIES) exceeded" 2>/dev/null || true
+                "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
                 gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor could not resolve Judge feedback after $DOCTOR_MAX_RETRIES attempts." >/dev/null 2>&1 || true
                 fail_with_reason "doctor" "max retries ($DOCTOR_MAX_RETRIES) exceeded"
             fi
@@ -1172,6 +1178,8 @@ main() {
             elif [[ $doctor_exit -eq 4 ]]; then
                 log_error "Doctor stuck after retry - marking issue as blocked"
                 gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+                "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "doctor_stuck" --phase "doctor" --details "agent stuck after retry" 2>/dev/null || true
+                "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
                 gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor agent was stuck and did not recover after retry. Diagnostics saved to \`.loom/diagnostics/\`." >/dev/null 2>&1 || true
                 fail_with_reason "doctor" "agent stuck after retry"
             fi
@@ -1216,6 +1224,8 @@ main() {
             log_error "Failed to merge PR #$pr_number"
             # Atomic transition: loom:building -> loom:blocked (mutually exclusive states)
             gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+            "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "merge_failed" --phase "merge" --details "failed to merge PR #$pr_number" 2>/dev/null || true
+            "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to merge PR #$pr_number. Branch may be out of date or have merge conflicts." >/dev/null 2>&1 || true
             fail_with_reason "merge" "failed to merge PR #$pr_number"
         fi

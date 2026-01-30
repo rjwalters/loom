@@ -663,11 +663,44 @@ while true; do
         fi
     else
         log "${GREEN}Iteration $iteration: $summary (${iteration_duration}s)${NC}"
-        # Reset backoff on success
-        if [[ $consecutive_failures -gt 0 ]] || [[ $current_backoff -ne $POLL_INTERVAL ]]; then
-            consecutive_failures=0
-            current_backoff=$POLL_INTERVAL
-            log "${GREEN}Backoff reset to ${POLL_INTERVAL}s${NC}"
+
+        # Check for pipeline stall: if the iteration "succeeded" but the pipeline
+        # is stalled (0 ready, N blocked, 0 building), treat as a soft failure
+        # for backoff purposes to avoid busy-polling an empty pipeline.
+        pipeline_stalled=false
+        if [[ -x "./.loom/scripts/daemon-snapshot.sh" ]]; then
+            # Quick check: read pipeline_health.status from most recent snapshot
+            # Use cached health metrics if available to avoid extra API call
+            if [[ -f ".loom/health-metrics.json" ]]; then
+                pipeline_status=$(jq -r '(.metrics | last // {}).pipeline_health.status // "healthy"' .loom/health-metrics.json 2>/dev/null || echo "healthy")
+                if [[ "$pipeline_status" == "stalled" ]]; then
+                    pipeline_stalled=true
+                fi
+            fi
+        fi
+
+        if [[ "$pipeline_stalled" == "true" ]]; then
+            # Pipeline is stalled - maintain or increase backoff (soft failure)
+            consecutive_failures=$((consecutive_failures + 1))
+            if [[ $consecutive_failures -ge $BACKOFF_THRESHOLD ]]; then
+                new_backoff=$((current_backoff * BACKOFF_MULTIPLIER))
+                if [[ $new_backoff -gt $MAX_BACKOFF ]]; then
+                    new_backoff=$MAX_BACKOFF
+                fi
+                if [[ $new_backoff -ne $current_backoff ]]; then
+                    current_backoff=$new_backoff
+                    log "${YELLOW}Pipeline stalled - increasing backoff to ${current_backoff}s${NC}"
+                fi
+            else
+                log "${YELLOW}Pipeline stalled - maintaining backoff at ${current_backoff}s (soft failure ${consecutive_failures}/${BACKOFF_THRESHOLD})${NC}"
+            fi
+        else
+            # Normal success - reset backoff
+            if [[ $consecutive_failures -gt 0 ]] || [[ $current_backoff -ne $POLL_INTERVAL ]]; then
+                consecutive_failures=0
+                current_backoff=$POLL_INTERVAL
+                log "${GREEN}Backoff reset to ${POLL_INTERVAL}s${NC}"
+            fi
         fi
     fi
 

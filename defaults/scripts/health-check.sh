@@ -234,6 +234,17 @@ collect_current_metrics() {
     active_shepherds=$(echo "$snapshot" | jq -r '.computed.active_shepherds // 0')
     stale_heartbeats=$(echo "$snapshot" | jq -r '.computed.stale_heartbeat_count // 0')
 
+    # Get pipeline health from snapshot
+    local pipeline_health_status blocked_count retryable_count permanent_blocked_count
+    pipeline_health_status=$(echo "$snapshot" | jq -r '.pipeline_health.status // "healthy"')
+    blocked_count=$(echo "$snapshot" | jq -r '.computed.total_blocked // 0')
+    retryable_count=$(echo "$snapshot" | jq -r '.pipeline_health.retryable_count // 0')
+    permanent_blocked_count=$(echo "$snapshot" | jq -r '.pipeline_health.permanent_blocked_count // 0')
+
+    # Get systematic failure status
+    local systematic_failure_active
+    systematic_failure_active=$(echo "$snapshot" | jq -r '.systematic_failure.active // false')
+
     # Get daemon metrics if available
     local session_percent iteration_count avg_duration success_rate consecutive_failures
     session_percent=0
@@ -317,6 +328,13 @@ collect_current_metrics() {
   "resource_usage": {
     "active_shepherds": $active_shepherds,
     "session_percent": $session_percent
+  },
+  "pipeline_health": {
+    "status": "$pipeline_health_status",
+    "blocked_count": $blocked_count,
+    "retryable_count": $retryable_count,
+    "permanent_blocked_count": $permanent_blocked_count,
+    "systematic_failure_active": $systematic_failure_active
   }
 }
 EOF
@@ -410,6 +428,22 @@ calculate_health_score() {
         elif [[ $decline_percent -ge 10 ]]; then
             score=$((score - 5))
         fi
+    fi
+
+    # Factor 6: Pipeline stall (0-20 points deduction)
+    local pipeline_status
+    pipeline_status=$(echo "$latest" | jq -r '.pipeline_health.status // "healthy"')
+    if [[ "$pipeline_status" == "stalled" ]]; then
+        score=$((score - 20))
+    elif [[ "$pipeline_status" == "degraded" ]]; then
+        score=$((score - 10))
+    fi
+
+    # Factor 7: Systematic failure (0-15 points deduction)
+    local sys_failure_active
+    sys_failure_active=$(echo "$latest" | jq -r '.pipeline_health.systematic_failure_active // "false"')
+    if [[ "$sys_failure_active" == "true" ]]; then
+        score=$((score - 15))
     fi
 
     # Ensure score is within bounds
@@ -522,6 +556,54 @@ generate_alerts() {
                 "timestamp": $timestamp,
                 "acknowledged": false,
                 "context": {"session_percent": $percent}
+            }]')
+    fi
+
+    # Check for pipeline stall
+    local pipeline_status
+    pipeline_status=$(echo "$latest" | jq -r '.pipeline_health.status // "healthy"')
+    if [[ "$pipeline_status" == "stalled" ]]; then
+        local stall_blocked stall_retryable stall_permanent
+        stall_blocked=$(echo "$latest" | jq -r '.pipeline_health.blocked_count // 0')
+        stall_retryable=$(echo "$latest" | jq -r '.pipeline_health.retryable_count // 0')
+        stall_permanent=$(echo "$latest" | jq -r '.pipeline_health.permanent_blocked_count // 0')
+        local severity="warning"
+        if [[ "$stall_retryable" -eq 0 ]]; then
+            severity="critical"
+        fi
+        local alert_id="alert-pipeline-stall-$(date +%s)"
+        alerts=$(echo "$alerts" | jq --arg id "$alert_id" \
+            --arg severity "$severity" \
+            --arg timestamp "$timestamp" \
+            --argjson blocked "$stall_blocked" \
+            --argjson retryable "$stall_retryable" \
+            --argjson permanent "$stall_permanent" \
+            '. + [{
+                "id": $id,
+                "type": "pipeline_stall",
+                "severity": $severity,
+                "message": "Pipeline stalled: \($blocked) blocked (\($retryable) retryable, \($permanent) permanent)",
+                "timestamp": $timestamp,
+                "acknowledged": false,
+                "context": {"blocked_count": $blocked, "retryable_count": $retryable, "permanent_blocked_count": $permanent}
+            }]')
+    fi
+
+    # Check for systematic failure
+    local sys_failure_active
+    sys_failure_active=$(echo "$latest" | jq -r '.pipeline_health.systematic_failure_active // "false"')
+    if [[ "$sys_failure_active" == "true" ]]; then
+        local alert_id="alert-systematic-failure-$(date +%s)"
+        alerts=$(echo "$alerts" | jq --arg id "$alert_id" \
+            --arg timestamp "$timestamp" \
+            '. + [{
+                "id": $id,
+                "type": "systematic_failure",
+                "severity": "critical",
+                "message": "Systematic failure detected - shepherd spawning paused",
+                "timestamp": $timestamp,
+                "acknowledged": false,
+                "context": {}
             }]')
     fi
 
