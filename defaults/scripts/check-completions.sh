@@ -252,7 +252,7 @@ while IFS= read -r shepherd_entry; do
                     COMPLETED+=("$shepherd_id:$issue:$task_id")
                     log_success "Shepherd $shepherd_id completed (issue #$issue)"
                     continue
-                elif [[ "$progress_status" == "error" ]]; then
+                elif [[ "$progress_status" == "errored" ]]; then
                     ERRORED+=("$shepherd_id:$issue:$task_id:progress_error")
                     log_error "Shepherd $shepherd_id errored (issue #$issue)"
                     continue
