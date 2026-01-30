@@ -686,11 +686,11 @@ main() {
         exit 1
     fi
 
-    # Check if issue is already closed
+    # Check if issue is already closed or merged
     local issue_state
     issue_state=$(gh issue view "$ISSUE" --json state --jq '.state' 2>/dev/null)
-    if [[ "$issue_state" == "CLOSED" ]]; then
-        log_info "Issue #$ISSUE is already closed - no orchestration needed"
+    if [[ "$issue_state" != "OPEN" ]]; then
+        log_info "Issue #$ISSUE is already $issue_state - no orchestration needed"
         exit 0
     fi
 
