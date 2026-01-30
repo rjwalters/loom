@@ -89,7 +89,9 @@ STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart, ret
 PROMPT_STUCK_THRESHOLD=${LOOM_PROMPT_STUCK_THRESHOLD:-30}  # 30 seconds default
 
 # Pattern for detecting Claude is processing a command (shared with agent-spawn.sh)
-PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming|Wandering'
+# Claude Code shows "esc to interrupt" in the status bar whenever it is working
+# (thinking, running tools, streaming). This text is absent when idle at prompt.
+PROCESSING_INDICATORS='esc to interrupt'
 
 # Progress tracking file prefix
 PROGRESS_DIR="/tmp/loom-agent-progress"
