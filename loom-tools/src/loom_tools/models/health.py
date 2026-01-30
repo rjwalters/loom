@@ -107,6 +107,34 @@ class ResourceUsage:
 
 
 @dataclass
+class PipelineHealthMetric:
+    status: str = "healthy"
+    blocked_count: int = 0
+    retryable_count: int = 0
+    permanent_blocked_count: int = 0
+    systematic_failure_active: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PipelineHealthMetric:
+        return cls(
+            status=data.get("status", "healthy"),
+            blocked_count=data.get("blocked_count", 0),
+            retryable_count=data.get("retryable_count", 0),
+            permanent_blocked_count=data.get("permanent_blocked_count", 0),
+            systematic_failure_active=data.get("systematic_failure_active", False),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "blocked_count": self.blocked_count,
+            "retryable_count": self.retryable_count,
+            "permanent_blocked_count": self.permanent_blocked_count,
+            "systematic_failure_active": self.systematic_failure_active,
+        }
+
+
+@dataclass
 class MetricEntry:
     timestamp: str = ""
     throughput: ThroughputMetric = field(default_factory=ThroughputMetric)
@@ -114,6 +142,7 @@ class MetricEntry:
     queue_depths: QueueDepths = field(default_factory=QueueDepths)
     error_rates: ErrorRates = field(default_factory=ErrorRates)
     resource_usage: ResourceUsage = field(default_factory=ResourceUsage)
+    pipeline_health: PipelineHealthMetric = field(default_factory=PipelineHealthMetric)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MetricEntry:
@@ -124,6 +153,9 @@ class MetricEntry:
             queue_depths=QueueDepths.from_dict(data.get("queue_depths", {})),
             error_rates=ErrorRates.from_dict(data.get("error_rates", {})),
             resource_usage=ResourceUsage.from_dict(data.get("resource_usage", {})),
+            pipeline_health=PipelineHealthMetric.from_dict(
+                data.get("pipeline_health", {})
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -134,6 +166,7 @@ class MetricEntry:
             "queue_depths": self.queue_depths.to_dict(),
             "error_rates": self.error_rates.to_dict(),
             "resource_usage": self.resource_usage.to_dict(),
+            "pipeline_health": self.pipeline_health.to_dict(),
         }
 
 

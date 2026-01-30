@@ -10,10 +10,7 @@
         "stuck": true,
         "severity": "elevated",
         "suggested_intervention": "clarify",
-        "indicators": [
-          "no_progress:759s",
-          "error_spike:59"
-        ],
+        "indicators": ["no_progress:759s", "error_spike:59"],
         "metrics": {
           "idle_seconds": 759,
           "working_seconds": -27972,
@@ -38,9 +35,7 @@
         "stuck": true,
         "severity": "elevated",
         "suggested_intervention": "clarify",
-        "indicators": [
-          "error_spike:26"
-        ],
+        "indicators": ["error_spike:26"],
         "metrics": {
           "idle_seconds": 365,
           "working_seconds": -28392,
