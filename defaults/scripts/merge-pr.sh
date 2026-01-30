@@ -220,6 +220,15 @@ if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
   if [[ -n "$ISSUE_NUM" ]]; then
     WORKTREE_PATH="$REPO_ROOT/.loom/worktrees/issue-$ISSUE_NUM"
     if [[ -d "$WORKTREE_PATH" ]]; then
+      # Check if we're currently inside the worktree being removed
+      CURRENT_DIR="$(pwd -P 2>/dev/null || pwd)"
+      WORKTREE_REAL="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
+      if [[ "$CURRENT_DIR" == "$WORKTREE_REAL"* ]]; then
+        warning "Your shell is currently inside the worktree being removed."
+        warning "After removal, run: cd $REPO_ROOT"
+        info "Changing to main repository before removal..."
+        cd "$REPO_ROOT"
+      fi
       info "Removing worktree: $WORKTREE_PATH"
       git -C "$REPO_ROOT" worktree remove "$WORKTREE_PATH" --force 2>/dev/null && \
         success "Worktree removed" || \
