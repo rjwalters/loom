@@ -573,36 +573,54 @@ EOF
         verify_elapsed=$((verify_elapsed + 1))
     done
 
-    # If command processing wasn't confirmed, retry the command dispatch
+    # If command processing wasn't confirmed, try recovery strategies
     if [[ "$command_processed" != "true" ]]; then
-        log_warn "Command not processed after $((verify_max + 3))s, attempting retry..."
+        log_warn "Command not processed after $((verify_max + 3))s, attempting recovery..."
         retry_attempted=true
 
-        # Wait additional time for TUI to be fully ready
-        sleep 5
+        # Strategy 1: Try an Enter key nudge first
+        # The command is typically already visible at the prompt and just needs Enter to trigger processing.
+        # This is a lighter-weight intervention that avoids potentially double-sending the command.
+        log_info "Trying Enter key nudge..."
+        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-m
+        sleep 2
 
-        # Re-send the full command + Enter
-        log_info "Retrying role command: $role_cmd"
-        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
+        local pane_content
+        pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+        if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
+            command_processed=true
+            log_success "Command processed after Enter nudge"
+        fi
 
-        # Re-verify with shorter window
-        sleep 3
-        local retry_verify_elapsed=0
-        local retry_verify_max=5
+        # Strategy 2: If nudge failed, re-send the full command
+        if [[ "$command_processed" != "true" ]]; then
+            log_info "Enter nudge failed, re-sending full command..."
 
-        while [[ $retry_verify_elapsed -lt $retry_verify_max ]]; do
-            local pane_content
-            pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+            # Wait additional time for TUI to be fully ready
+            sleep 3
 
-            if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-                command_processed=true
-                log_success "Command processed successfully after retry"
-                break
-            fi
+            # Re-send the full command + Enter
+            log_info "Retrying role command: $role_cmd"
+            tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
 
-            sleep 1
-            retry_verify_elapsed=$((retry_verify_elapsed + 1))
-        done
+            # Re-verify with shorter window
+            sleep 3
+            local retry_verify_elapsed=0
+            local retry_verify_max=5
+
+            while [[ $retry_verify_elapsed -lt $retry_verify_max ]]; do
+                pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
+                if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
+                    command_processed=true
+                    log_success "Command processed after full retry"
+                    break
+                fi
+
+                sleep 1
+                retry_verify_elapsed=$((retry_verify_elapsed + 1))
+            done
+        fi
     fi
 
     # Fail spawn if command still wasn't processed after retry
