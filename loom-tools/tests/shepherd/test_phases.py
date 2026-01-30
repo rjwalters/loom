@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -19,6 +20,7 @@ from loom_tools.shepherd.phases import (
     MergePhase,
     PhaseStatus,
 )
+from loom_tools.shepherd.phases.base import _print_heartbeat, _read_heartbeats
 
 
 @pytest.fixture
@@ -293,3 +295,91 @@ class TestStaleBranchDetection:
                 ShepherdContext._check_stale_branch(mock_context, 42)
 
         assert not any("Stale branch" in r.message for r in caplog.records)
+
+
+class TestReadHeartbeats:
+    """Test _read_heartbeats helper."""
+
+    def test_extracts_heartbeat_milestones(self, tmp_path: Path) -> None:
+        """Should return only heartbeat milestones from a progress file."""
+        progress = {
+            "task_id": "abc123",
+            "milestones": [
+                {"event": "started", "timestamp": "t0", "data": {"issue": 42}},
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t1",
+                    "data": {"action": "builder running (1m elapsed)"},
+                },
+                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "judge"}},
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t3",
+                    "data": {"action": "builder running (2m elapsed)"},
+                },
+            ],
+        }
+        f = tmp_path / "shepherd-abc123.json"
+        f.write_text(json.dumps(progress))
+
+        result = _read_heartbeats(f)
+
+        assert len(result) == 2
+        assert result[0]["data"]["action"] == "builder running (1m elapsed)"
+        assert result[1]["data"]["action"] == "builder running (2m elapsed)"
+
+    def test_returns_empty_for_missing_file(self, tmp_path: Path) -> None:
+        """Should return empty list when file does not exist."""
+        f = tmp_path / "nonexistent.json"
+        assert _read_heartbeats(f) == []
+
+    def test_returns_empty_for_invalid_json(self, tmp_path: Path) -> None:
+        """Should return empty list when file has invalid JSON."""
+        f = tmp_path / "bad.json"
+        f.write_text("not json")
+        assert _read_heartbeats(f) == []
+
+    def test_returns_empty_for_no_milestones(self, tmp_path: Path) -> None:
+        """Should return empty list when there are no milestones."""
+        f = tmp_path / "empty.json"
+        f.write_text(json.dumps({"task_id": "abc", "milestones": []}))
+        assert _read_heartbeats(f) == []
+
+    def test_returns_empty_when_no_heartbeats(self, tmp_path: Path) -> None:
+        """Should return empty list when milestones exist but none are heartbeats."""
+        progress = {
+            "milestones": [
+                {"event": "started", "timestamp": "t0", "data": {}},
+                {"event": "phase_entered", "timestamp": "t1", "data": {"phase": "builder"}},
+            ],
+        }
+        f = tmp_path / "no-hb.json"
+        f.write_text(json.dumps(progress))
+        assert _read_heartbeats(f) == []
+
+
+class TestPrintHeartbeat:
+    """Test _print_heartbeat output formatting."""
+
+    def test_prints_to_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Should print heartbeat with dim ANSI formatting to stderr."""
+        _print_heartbeat("builder running (1m elapsed)")
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "builder running (1m elapsed)" in captured.err
+        assert "\u27f3" in captured.err  # looping arrow symbol
+
+    def test_includes_timestamp(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Should include HH:MM:SS timestamp in output."""
+        _print_heartbeat("test action")
+        captured = capsys.readouterr()
+        # Timestamp is in [HH:MM:SS] format
+        assert "[" in captured.err
+        assert "]" in captured.err
+
+    def test_uses_dim_ansi(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Should use dim ANSI escape code, not cyan."""
+        _print_heartbeat("test")
+        captured = capsys.readouterr()
+        assert "\033[2m" in captured.err  # dim
+        assert "\033[0m" in captured.err  # reset
