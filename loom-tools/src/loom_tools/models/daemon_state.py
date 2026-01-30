@@ -144,6 +144,56 @@ class PipelineState:
 
 
 @dataclass
+class SystematicFailure:
+    """Systematic failure tracking from daemon-state.json."""
+
+    active: bool = False
+    pattern: str = ""
+    count: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SystematicFailure:
+        return cls(
+            active=data.get("active", False),
+            pattern=data.get("pattern", ""),
+            count=data.get("count", 0),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active": self.active,
+            "pattern": self.pattern,
+            "count": self.count,
+        }
+
+
+@dataclass
+class BlockedIssueRetry:
+    """Retry metadata for a single blocked issue."""
+
+    retry_count: int = 0
+    last_retry_at: str | None = None
+    retry_exhausted: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> BlockedIssueRetry:
+        return cls(
+            retry_count=data.get("retry_count", 0),
+            last_retry_at=data.get("last_retry_at"),
+            retry_exhausted=data.get("retry_exhausted", False),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "retry_count": self.retry_count,
+            "retry_exhausted": self.retry_exhausted,
+        }
+        if self.last_retry_at is not None:
+            d["last_retry_at"] = self.last_retry_at
+        return d
+
+
+@dataclass
 class DaemonState:
     started_at: str | None = None
     last_poll: str | None = None
@@ -160,6 +210,8 @@ class DaemonState:
     total_prs_merged: int = 0
     last_architect_trigger: str | None = None
     last_hermit_trigger: str | None = None
+    systematic_failure: SystematicFailure = field(default_factory=SystematicFailure)
+    blocked_issue_retries: dict[str, BlockedIssueRetry] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DaemonState:
@@ -174,6 +226,15 @@ class DaemonState:
         pipeline_raw = data.get("pipeline_state", {})
         pipeline = PipelineState.from_dict(pipeline_raw) if pipeline_raw else PipelineState()
         warnings = [Warning.from_dict(w) for w in data.get("warnings", [])]
+
+        sf_raw = data.get("systematic_failure", {})
+        systematic_failure = SystematicFailure.from_dict(sf_raw) if sf_raw else SystematicFailure()
+
+        retries_raw = data.get("blocked_issue_retries", {})
+        blocked_issue_retries = {
+            k: BlockedIssueRetry.from_dict(v)
+            for k, v in retries_raw.items()
+        }
 
         return cls(
             started_at=data.get("started_at"),
@@ -191,6 +252,8 @@ class DaemonState:
             total_prs_merged=data.get("total_prs_merged", 0),
             last_architect_trigger=data.get("last_architect_trigger"),
             last_hermit_trigger=data.get("last_hermit_trigger"),
+            systematic_failure=systematic_failure,
+            blocked_issue_retries=blocked_issue_retries,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -205,6 +268,10 @@ class DaemonState:
             "warnings": [w.to_dict() for w in self.warnings],
             "completed_issues": self.completed_issues,
             "total_prs_merged": self.total_prs_merged,
+            "systematic_failure": self.systematic_failure.to_dict(),
+            "blocked_issue_retries": {
+                k: v.to_dict() for k, v in self.blocked_issue_retries.items()
+            },
         }
         for k in (
             "started_at", "last_poll", "daemon_session_id",

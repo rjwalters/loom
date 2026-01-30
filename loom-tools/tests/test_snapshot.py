@@ -9,15 +9,23 @@ from unittest import mock
 
 import pytest
 
-from loom_tools.models.daemon_state import DaemonState, ShepherdEntry, SupportRoleEntry
+from loom_tools.models.daemon_state import (
+    BlockedIssueRetry,
+    DaemonState,
+    ShepherdEntry,
+    SupportRoleEntry,
+    SystematicFailure,
+)
 from loom_tools.models.progress import ShepherdProgress
 from loom_tools.snapshot import (
     EnhancedProgress,
+    PipelineHealth,
     SnapshotConfig,
     SupportRoleState,
     TmuxPool,
     build_snapshot,
     compute_health,
+    compute_pipeline_health,
     compute_recommended_actions,
     compute_shepherd_progress,
     compute_support_role_state,
@@ -99,6 +107,25 @@ class TestSnapshotConfig:
         assert d["max_shepherds"] == 3
         assert d["max_proposals"] == 5
         assert d["issue_strategy"] == "fifo"
+        assert d["max_retry_count"] == 3
+        assert d["retry_cooldown"] == 1800
+        assert d["systematic_failure_threshold"] == 3
+
+    def test_from_env_retry_config(self) -> None:
+        env = {
+            "LOOM_MAX_RETRY_COUNT": "5",
+            "LOOM_RETRY_COOLDOWN": "3600",
+            "LOOM_RETRY_BACKOFF_MULTIPLIER": "3",
+            "LOOM_RETRY_MAX_COOLDOWN": "28800",
+            "LOOM_SYSTEMATIC_FAILURE_THRESHOLD": "4",
+        }
+        with mock.patch.dict("os.environ", env, clear=False):
+            cfg = SnapshotConfig.from_env()
+        assert cfg.max_retry_count == 5
+        assert cfg.retry_cooldown == 3600
+        assert cfg.retry_backoff_multiplier == 3
+        assert cfg.retry_max_cooldown == 28800
+        assert cfg.systematic_failure_threshold == 4
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +441,8 @@ class TestRecommendedActions:
                               ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")},
             "orphaned_count": 0,
             "invalid_task_id_count": 0,
+            "systematic_failure_active": False,
+            "pipeline_health": None,
         }
 
     def test_empty_pipeline_returns_wait(self) -> None:
@@ -538,6 +567,154 @@ class TestRecommendedActions:
         assert "spawn_shepherds" in actions
         assert "promote_proposals" in actions
         assert "check_stuck" in actions
+
+    def test_systematic_failure_suppresses_spawn(self) -> None:
+        kw = self._base_kwargs()
+        kw["ready_count"] = 2
+        kw["systematic_failure_active"] = True
+        actions, _ = compute_recommended_actions(**kw)
+        assert "spawn_shepherds" not in actions
+
+    def test_retry_blocked_issues_when_stalled(self) -> None:
+        kw = self._base_kwargs()
+        kw["blocked_count"] = 3
+        kw["pipeline_health"] = PipelineHealth(
+            status="stalled",
+            stall_reason="all_issues_blocked",
+            blocked_count=3,
+            retryable_count=2,
+        )
+        actions, _ = compute_recommended_actions(**kw)
+        assert "retry_blocked_issues" in actions
+
+    def test_no_retry_when_healthy(self) -> None:
+        kw = self._base_kwargs()
+        kw["blocked_count"] = 1
+        kw["ready_count"] = 2
+        kw["pipeline_health"] = PipelineHealth(status="healthy", retryable_count=1)
+        actions, _ = compute_recommended_actions(**kw)
+        assert "retry_blocked_issues" not in actions
+
+
+# ---------------------------------------------------------------------------
+# Pipeline health computation
+# ---------------------------------------------------------------------------
+
+
+class TestPipelineHealth:
+    def test_healthy_pipeline(self) -> None:
+        result = compute_pipeline_health(
+            ready_count=3, building_count=1, blocked_count=0, total_in_flight=2,
+            blocked_issues=[], daemon_state=DaemonState(), cfg=_cfg(), now=NOW,
+        )
+        assert result.status == "healthy"
+        assert result.stall_reason is None
+
+    def test_stalled_all_blocked(self) -> None:
+        blocked = [{"number": 1}, {"number": 2}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=2, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=DaemonState(), cfg=_cfg(), now=NOW,
+        )
+        assert result.status == "stalled"
+        assert result.stall_reason == "all_issues_blocked"
+        assert result.retryable_count == 2
+
+    def test_stalled_no_ready_issues(self) -> None:
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=0, total_in_flight=0,
+            blocked_issues=[], daemon_state=DaemonState(), cfg=_cfg(), now=NOW,
+        )
+        assert result.status == "stalled"
+        assert result.stall_reason == "no_ready_issues"
+
+    def test_degraded_more_blocked_than_ready(self) -> None:
+        blocked = [{"number": 1}, {"number": 2}, {"number": 3}]
+        result = compute_pipeline_health(
+            ready_count=1, building_count=0, blocked_count=3, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=DaemonState(), cfg=_cfg(), now=NOW,
+        )
+        assert result.status == "degraded"
+
+    def test_retry_exhausted_is_permanent(self) -> None:
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(retry_count=3, retry_exhausted=True),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 0
+        assert result.permanent_blocked_count == 1
+
+    def test_cooldown_not_elapsed_is_permanent(self) -> None:
+        """Issue retried 60s ago with 1800s cooldown — still in cooldown."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=1,
+                last_retry_at="2026-01-30T17:59:00Z",  # 60s before NOW
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 0
+        assert result.permanent_blocked_count == 1
+
+    def test_cooldown_elapsed_is_retryable(self) -> None:
+        """Issue retried 3601s ago, retry_count=1, effective cooldown = 1800*2 = 3600."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=1,
+                last_retry_at="2026-01-30T16:59:59Z",  # 3601s before NOW
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 1
+        assert result.retryable_issues[0]["number"] == 100
+        assert result.retryable_issues[0]["retry_count"] == 1
+
+    def test_backoff_multiplier(self) -> None:
+        """After 2 retries, cooldown is 1800 * 2^2 = 7200s.
+
+        With 7199s elapsed, still within cooldown — not retryable.
+        """
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=2,
+                last_retry_at="2026-01-30T16:00:01Z",  # 7199s before NOW
+            ),
+        })
+        blocked = [{"number": 100}]
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 0  # within cooldown, not retryable
+
+    def test_max_cooldown_cap(self) -> None:
+        """Cooldown is capped at retry_max_cooldown (14400s = 4 hours)."""
+        ds = DaemonState(blocked_issue_retries={
+            "100": BlockedIssueRetry(
+                retry_count=2,
+                last_retry_at="2026-01-30T13:59:59Z",  # 14401s before NOW
+            ),
+        })
+        blocked = [{"number": 100}]
+        # effective_cooldown = 1800 * 2^2 = 7200, capped at 14400
+        # elapsed = 14401 > 7200, so retryable
+        result = compute_pipeline_health(
+            ready_count=0, building_count=0, blocked_count=1, total_in_flight=0,
+            blocked_issues=blocked, daemon_state=ds, cfg=_cfg(), now=NOW,
+        )
+        assert result.retryable_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -707,6 +884,7 @@ class TestBuildSnapshot:
         expected_sections = {
             "timestamp", "pipeline", "proposals", "prs",
             "shepherds", "validation", "support_roles",
+            "pipeline_health", "systematic_failure",
             "usage", "tmux_pool", "computed", "config",
         }
         assert set(snapshot.keys()) == expected_sections

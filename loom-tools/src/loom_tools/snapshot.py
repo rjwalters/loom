@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import re
 import subprocess
 import sys
@@ -29,10 +30,11 @@ from loom_tools.common.github import gh_parallel_queries
 from loom_tools.common.logging import log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_daemon_state, read_progress_files
-from loom_tools.common.time_utils import elapsed_seconds, now_utc
+from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
+from loom_tools.models.daemon_state import DaemonState, SupportRoleEntry
 
 # ---------------------------------------------------------------------------
-# Configuration (13 env vars, same defaults as shell version)
+# Configuration (18 env vars, same defaults as shell version)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -52,6 +54,12 @@ class SnapshotConfig:
     issue_strategy: str = "fifo"
     heartbeat_stale_threshold: int = 120
     tmux_socket: str = "loom"
+    # Retry configuration for blocked issues
+    max_retry_count: int = 3
+    retry_cooldown: int = 1800  # 30 minutes initial cooldown
+    retry_backoff_multiplier: int = 2
+    retry_max_cooldown: int = 14400  # 4 hours max cooldown
+    systematic_failure_threshold: int = 3
 
     @classmethod
     def from_env(cls) -> SnapshotConfig:
@@ -77,6 +85,11 @@ class SnapshotConfig:
             issue_strategy=os.environ.get("LOOM_ISSUE_STRATEGY", "fifo"),
             heartbeat_stale_threshold=_int("LOOM_HEARTBEAT_STALE_THRESHOLD", 120),
             tmux_socket=os.environ.get("LOOM_TMUX_SOCKET", "loom"),
+            max_retry_count=_int("LOOM_MAX_RETRY_COUNT", 3),
+            retry_cooldown=_int("LOOM_RETRY_COOLDOWN", 1800),
+            retry_backoff_multiplier=_int("LOOM_RETRY_BACKOFF_MULTIPLIER", 2),
+            retry_max_cooldown=_int("LOOM_RETRY_MAX_COOLDOWN", 14400),
+            systematic_failure_threshold=_int("LOOM_SYSTEMATIC_FAILURE_THRESHOLD", 3),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -85,6 +98,9 @@ class SnapshotConfig:
             "max_shepherds": self.max_shepherds,
             "max_proposals": self.max_proposals,
             "issue_strategy": self.issue_strategy,
+            "max_retry_count": self.max_retry_count,
+            "retry_cooldown": self.retry_cooldown,
+            "systematic_failure_threshold": self.systematic_failure_threshold,
         }
 
 
@@ -108,17 +124,6 @@ class SupportRoleState:
     needs_trigger: bool = False
     demand_trigger: bool = False
 
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
-            "status": self.status,
-            "idle_seconds": self.idle_seconds,
-            "interval": self.interval,
-            "needs_trigger": self.needs_trigger,
-        }
-        if self.demand_trigger is not False:
-            d["demand_trigger"] = self.demand_trigger
-        return d
-
 
 def _role_interval(role: str, cfg: SnapshotConfig) -> int:
     """Return the interval/cooldown for *role*."""
@@ -134,7 +139,7 @@ def _role_interval(role: str, cfg: SnapshotConfig) -> int:
 
 
 def compute_support_role_state(
-    daemon_state: Any,
+    daemon_state: DaemonState,
     cfg: SnapshotConfig,
     *,
     _now: datetime | None = None,
@@ -183,9 +188,9 @@ _PR_FIELDS = ["number", "title", "labels", "headRefName"]
 
 
 def collect_pipeline_data(
-    repo_root: Any,
+    repo_root: pathlib.Path,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Run 10 parallel ``gh`` queries and return raw pipeline data.
+    """Run 9 parallel ``gh`` queries and return raw pipeline data.
 
     Returns a dict with keys:
         ready_issues, building_issues, blocked_issues,
@@ -251,7 +256,7 @@ def _has_label(item: dict[str, Any], label: str) -> bool:
     return False
 
 
-def _collect_usage(repo_root: Any) -> dict[str, Any]:
+def _collect_usage(repo_root: pathlib.Path) -> dict[str, Any]:
     """Run check-usage.sh and return its JSON output."""
     script = repo_root / ".loom" / "scripts" / "check-usage.sh"
     if not script.exists():
@@ -326,7 +331,7 @@ class EnhancedProgress:
 
 
 def compute_shepherd_progress(
-    repo_root: Any,
+    repo_root: pathlib.Path,
     cfg: SnapshotConfig,
     *,
     _now: datetime | None = None,
@@ -422,7 +427,7 @@ def detect_tmux_pool(tmux_socket: str = "loom") -> TmuxPool:
 _TASK_ID_RE = re.compile(r"^[a-f0-9]{7}$")
 
 
-def validate_task_ids(daemon_state: Any) -> list[dict[str, str]]:
+def validate_task_ids(daemon_state: DaemonState) -> list[dict[str, str]]:
     """Check all task IDs in daemon state for ``^[a-f0-9]{7}$`` format.
 
     Returns a list of ``{location, key, task_id}`` dicts for invalid IDs.
@@ -447,7 +452,7 @@ def validate_task_ids(daemon_state: Any) -> list[dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 def detect_orphaned_shepherds(
-    daemon_state: Any,
+    daemon_state: DaemonState,
     building_issues: list[dict[str, Any]],
     shepherd_progress: list[EnhancedProgress],
 ) -> list[dict[str, Any]]:
@@ -500,6 +505,95 @@ def detect_orphaned_shepherds(
 
 
 # ---------------------------------------------------------------------------
+# Pipeline health computation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineHealth:
+    """Pipeline health classification with retry metadata."""
+
+    status: str = "healthy"  # healthy, degraded, stalled
+    stall_reason: str | None = None
+    blocked_count: int = 0
+    retryable_count: int = 0
+    permanent_blocked_count: int = 0
+    retryable_issues: list[dict[str, Any]] = field(default_factory=list)
+
+
+def compute_pipeline_health(
+    *,
+    ready_count: int,
+    building_count: int,
+    blocked_count: int,
+    total_in_flight: int,
+    blocked_issues: list[dict[str, Any]],
+    daemon_state: DaemonState,
+    cfg: SnapshotConfig,
+    now: datetime,
+) -> PipelineHealth:
+    """Classify pipeline health and identify retryable blocked issues."""
+    retryable_count = 0
+    permanent_count = 0
+    retryable_issues: list[dict[str, Any]] = []
+
+    for item in blocked_issues:
+        blocked_num = item.get("number")
+        if blocked_num is None:
+            continue
+
+        issue_key = str(blocked_num)
+        retry_info = daemon_state.blocked_issue_retries.get(issue_key)
+
+        if retry_info and (retry_info.retry_exhausted or retry_info.retry_count >= cfg.max_retry_count):
+            permanent_count += 1
+            continue
+
+        # Check cooldown
+        retry_count = retry_info.retry_count if retry_info else 0
+        last_retry = retry_info.last_retry_at if retry_info else None
+        cooldown_elapsed = True
+
+        if last_retry:
+            try:
+                elapsed = _elapsed(last_retry, now)
+                effective_cooldown = cfg.retry_cooldown * (cfg.retry_backoff_multiplier ** retry_count)
+                if effective_cooldown > cfg.retry_max_cooldown:
+                    effective_cooldown = cfg.retry_max_cooldown
+                if elapsed < effective_cooldown:
+                    cooldown_elapsed = False
+            except (ValueError, OSError):
+                pass
+
+        if cooldown_elapsed:
+            retryable_count += 1
+            retryable_issues.append({"number": blocked_num, "retry_count": retry_count})
+        else:
+            permanent_count += 1
+
+    # Determine status
+    status = "healthy"
+    stall_reason: str | None = None
+
+    if ready_count == 0 and blocked_count > 0 and building_count == 0:
+        status = "stalled"
+        stall_reason = "all_issues_blocked"
+    elif ready_count == 0 and blocked_count == 0 and building_count == 0 and total_in_flight == 0:
+        status = "stalled"
+        stall_reason = "no_ready_issues"
+    elif blocked_count > 0 and blocked_count > ready_count:
+        status = "degraded"
+
+    return PipelineHealth(
+        status=status,
+        stall_reason=stall_reason,
+        blocked_count=blocked_count,
+        retryable_count=retryable_count,
+        permanent_blocked_count=permanent_count,
+        retryable_issues=retryable_issues,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Recommended actions engine
 # ---------------------------------------------------------------------------
 
@@ -521,6 +615,8 @@ def compute_recommended_actions(
     support_roles: dict[str, SupportRoleState],
     orphaned_count: int,
     invalid_task_id_count: int,
+    systematic_failure_active: bool = False,
+    pipeline_health: PipelineHealth | None = None,
 ) -> tuple[list[str], dict[str, bool]]:
     """Compute recommended actions and demand flags.
 
@@ -534,8 +630,8 @@ def compute_recommended_actions(
     if total_proposals > 0:
         actions.append("promote_proposals")
 
-    # Action: spawn shepherds
-    if ready_count > 0 and available_shepherd_slots > 0:
+    # Action: spawn shepherds (suppressed during systematic failure)
+    if ready_count > 0 and available_shepherd_slots > 0 and not systematic_failure_active:
         actions.append("spawn_shepherds")
 
     # Action: trigger architect
@@ -600,6 +696,10 @@ def compute_recommended_actions(
     # Validate state
     if invalid_task_id_count > 0:
         actions.append("validate_state")
+
+    # Retry blocked issues when pipeline is stalled and retryable issues exist
+    if pipeline_health and pipeline_health.status == "stalled" and pipeline_health.retryable_count > 0:
+        actions.append("retry_blocked_issues")
 
     # Wait fallback
     if not actions or (len(actions) == 1 and actions[0] == "check_stuck"):
@@ -696,7 +796,7 @@ def compute_health(
 def build_snapshot(
     *,
     cfg: SnapshotConfig | None = None,
-    repo_root: Any | None = None,
+    repo_root: pathlib.Path | None = None,
     _now: datetime | None = None,
     _pipeline_data: dict[str, Any] | None = None,
     _tmux_pool: TmuxPool | None = None,
@@ -758,15 +858,7 @@ def build_snapshot(
     # 6. Support role state
     sr_state = compute_support_role_state(daemon_state, cfg, _now=now)
 
-    # 7. Cooldown status (derived from support role state)
-    architect_cooldown_ok = sr_state["architect"].needs_trigger or (
-        sr_state["architect"].status != "running" and sr_state["architect"].idle_seconds == 0
-    )
-    hermit_cooldown_ok = sr_state["hermit"].needs_trigger or (
-        sr_state["hermit"].status != "running" and sr_state["hermit"].idle_seconds == 0
-    )
-
-    # More precise: check directly like the shell does
+    # 7. Cooldown status
     architect_cooldown_ok = _check_cooldown(
         daemon_state.support_roles.get("architect"),
         cfg.architect_cooldown,
@@ -796,7 +888,22 @@ def build_snapshot(
     orphaned = detect_orphaned_shepherds(daemon_state, building_issues, shepherd_progress)
     orphaned_count = len(orphaned)
 
-    # 12. Recommended actions
+    # 12. Pipeline health (retry/backoff classification)
+    p_health = compute_pipeline_health(
+        ready_count=ready_count,
+        building_count=building_count,
+        blocked_count=blocked_count,
+        total_in_flight=total_in_flight,
+        blocked_issues=blocked_issues,
+        daemon_state=daemon_state,
+        cfg=cfg,
+        now=now,
+    )
+
+    # 13. Systematic failure detection
+    sf = daemon_state.systematic_failure
+
+    # 14. Recommended actions
     actions, demand = compute_recommended_actions(
         ready_count=ready_count,
         building_count=building_count,
@@ -814,20 +921,22 @@ def build_snapshot(
         support_roles=sr_state,
         orphaned_count=orphaned_count,
         invalid_task_id_count=invalid_task_id_count,
+        systematic_failure_active=sf.active,
+        pipeline_health=p_health,
     )
 
-    # 13. Promotable proposals
+    # 15. Promotable proposals
     promotable_proposals = (
         [i["number"] for i in architect_proposals]
         + [i["number"] for i in hermit_proposals]
         + [i["number"] for i in curated_issues]
     )
 
-    # 14. Usage health
+    # 16. Usage health
     session_percent = _extract_session_percent(usage)
     usage_healthy = session_percent < 97 if isinstance(session_percent, (int, float)) else True
 
-    # 15. Health status
+    # 17. Health status
     health_status, health_warnings = compute_health(
         ready_count=ready_count,
         building_count=building_count,
@@ -839,7 +948,7 @@ def build_snapshot(
         session_percent=session_percent,
     )
 
-    # 16. Build support_roles output (schema matches shell)
+    # 18. Build support_roles output (schema matches shell)
     support_roles_out: dict[str, Any] = {}
     for role in _SUPPORT_ROLES:
         state = sr_state[role]
@@ -853,7 +962,7 @@ def build_snapshot(
             d["demand_trigger"] = demand.get(f"{role}_demand", False)
         support_roles_out[role] = d
 
-    # 17. Build final output (exact schema match with shell)
+    # 19. Build final output (exact schema match with shell)
     usage_out = dict(usage) if isinstance(usage, dict) else {"error": "no data"}
     usage_out["healthy"] = usage_healthy
 
@@ -885,6 +994,19 @@ def build_snapshot(
             "invalid_task_id_count": invalid_task_id_count,
         },
         "support_roles": support_roles_out,
+        "pipeline_health": {
+            "status": p_health.status,
+            "stall_reason": p_health.stall_reason,
+            "blocked_count": p_health.blocked_count,
+            "retryable_count": p_health.retryable_count,
+            "permanent_blocked_count": p_health.permanent_blocked_count,
+            "retryable_issues": p_health.retryable_issues,
+        },
+        "systematic_failure": {
+            "active": sf.active,
+            "pattern": sf.pattern,
+            "count": sf.count,
+        },
         "usage": usage_out,
         "tmux_pool": tmux_pool.to_dict(),
         "computed": {
@@ -911,6 +1033,8 @@ def build_snapshot(
             "execution_mode": tmux_pool.execution_mode,
             "tmux_available": tmux_pool.available,
             "tmux_shepherd_count": tmux_pool.shepherd_count,
+            "pipeline_health_status": p_health.status,
+            "systematic_failure_active": sf.active,
             "health_status": health_status,
             "health_warnings": health_warnings,
         },
@@ -924,14 +1048,12 @@ def build_snapshot(
 
 def _elapsed(ts: str, now: datetime) -> int:
     """Seconds since ISO timestamp *ts* relative to *now*."""
-    if ts.endswith("Z"):
-        ts = ts[:-1] + "+00:00"
-    dt = datetime.fromisoformat(ts)
+    dt = parse_iso_timestamp(ts)
     return int((now - dt).total_seconds())
 
 
 def _check_cooldown(
-    entry: Any | None,
+    entry: SupportRoleEntry | None,
     cooldown: int,
     now: datetime,
 ) -> bool:
@@ -948,7 +1070,7 @@ def _check_cooldown(
         return True
 
 
-def _extract_session_percent(usage: Any) -> float:
+def _extract_session_percent(usage: dict[str, Any] | Any) -> float:
     """Extract session_percent from usage data, defaulting to 0."""
     if not isinstance(usage, dict):
         return 0.0
@@ -993,6 +1115,11 @@ ENVIRONMENT VARIABLES:
     LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
     LOOM_HEARTBEAT_STALE_THRESHOLD  Heartbeat staleness threshold (default: 120)
     LOOM_TMUX_SOCKET         Tmux socket name (default: loom)
+    LOOM_MAX_RETRY_COUNT     Max retries for blocked issues (default: 3)
+    LOOM_RETRY_COOLDOWN      Initial retry cooldown in seconds (default: 1800)
+    LOOM_RETRY_BACKOFF_MULTIPLIER  Backoff multiplier (default: 2)
+    LOOM_RETRY_MAX_COOLDOWN  Maximum retry cooldown in seconds (default: 14400)
+    LOOM_SYSTEMATIC_FAILURE_THRESHOLD  Consecutive failures to suppress (default: 3)
 """
 
 
