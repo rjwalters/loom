@@ -552,17 +552,19 @@ EOF
     local command_processed=false
     local retry_attempted=false
 
+    # Pattern for detecting Claude is processing a command:
+    # - Spinner characters (Claude thinking)
+    # - Progress/status text
+    # - Tool use indicators
+    local PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'
+
     sleep 3  # Grace period: Claude needs time to parse skill and load context
 
     while [[ $verify_elapsed -lt $verify_max ]]; do
         local pane_content
         pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
 
-        # Check for indicators that the command is being processed:
-        # - Spinner characters (Claude thinking)
-        # - Progress/status text
-        # - Tool use indicators
-        if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
+        if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
             command_processed=true
             break
         fi
@@ -592,7 +594,7 @@ EOF
             local pane_content
             pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
 
-            if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
+            if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
                 command_processed=true
                 log_success "Command processed successfully after retry"
                 break
