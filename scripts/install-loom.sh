@@ -526,16 +526,6 @@ done
 success "All Loom files installed"
 echo ""
 
-# Install cleanup scripts to .loom/scripts/
-info "Installing cleanup scripts..."
-cp "$LOOM_ROOT/scripts/cleanup.sh" ".loom/scripts/cleanup.sh" || \
-  error "Failed to copy cleanup.sh"
-cp "$LOOM_ROOT/scripts/cleanup-branches.sh" ".loom/scripts/cleanup-branches.sh" || \
-  error "Failed to copy cleanup-branches.sh"
-chmod +x ".loom/scripts/cleanup.sh"
-chmod +x ".loom/scripts/cleanup-branches.sh"
-success "Installed cleanup scripts to .loom/scripts/"
-
 # Install Loom CLI wrapper (./loom)
 if [[ -f "$LOOM_ROOT/defaults/loom" ]]; then
   info "Installing Loom CLI wrapper..."

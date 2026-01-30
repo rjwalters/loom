@@ -471,7 +471,7 @@ fail_with_reason() {
 # ─── Phase execution ──────────────────────────────────────────────────────────
 
 # Run a phase worker and wait for completion
-# Usage: run_phase <role> <name> <timeout> [--worktree <path>] [--args <args>] [--phase <phase>] [--pr <N>]
+# Usage: run_phase <role> <name> <timeout> [--worktree <path>] [--args <args>] [--phase <phase>] [--pr <N>] [--task-id <id>]
 run_phase() {
     local role="$1"
     local name="$2"
@@ -482,6 +482,7 @@ run_phase() {
     local args=""
     local phase=""
     local pr_number=""
+    local run_task_id=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -499,6 +500,10 @@ run_phase() {
                 ;;
             --pr)
                 pr_number="$2"
+                shift 2
+                ;;
+            --task-id)
+                run_task_id="$2"
                 shift 2
                 ;;
             *)
@@ -549,6 +554,9 @@ run_phase() {
     fi
     if [[ -n "$pr_number" ]]; then
         wait_args+=(--pr "$pr_number")
+    fi
+    if [[ -n "$run_task_id" ]]; then
+        wait_args+=(--task-id "$run_task_id")
     fi
 
     "$REPO_ROOT/.loom/scripts/agent-wait-bg.sh" "${wait_args[@]}" || wait_exit=$?
@@ -751,6 +759,7 @@ main() {
         local curator_exit=0
         run_phase_with_retry "curator" "curator-issue-${ISSUE}" "$CURATOR_TIMEOUT" \
             --phase "curator" \
+            --task-id "$TASK_ID" \
             --args "$ISSUE" || curator_exit=$?
 
         if [[ $curator_exit -eq 3 ]]; then
@@ -921,6 +930,7 @@ main() {
         run_phase_with_retry "builder" "builder-issue-${ISSUE}" "$BUILDER_TIMEOUT" \
             --phase "builder" \
             --worktree "$worktree_path" \
+            --task-id "$TASK_ID" \
             --args "$ISSUE" || builder_exit=$?
 
         if [[ $builder_exit -eq 3 ]]; then
@@ -1001,6 +1011,7 @@ main() {
         run_phase_with_retry "judge" "judge-issue-${ISSUE}" "$JUDGE_TIMEOUT" \
             --phase "judge" \
             --pr "$pr_number" \
+            --task-id "$TASK_ID" \
             --args "$pr_number" || judge_exit=$?
 
         if [[ $judge_exit -eq 3 ]]; then
@@ -1060,6 +1071,7 @@ main() {
                 --phase "doctor" \
                 --pr "$pr_number" \
                 --worktree "$worktree_path" \
+                --task-id "$TASK_ID" \
                 --args "$pr_number" || doctor_exit=$?
 
             if [[ $doctor_exit -eq 3 ]]; then
