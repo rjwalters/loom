@@ -58,17 +58,29 @@ class TestStuckConfig:
         config = StuckConfig()
         assert config.warning_threshold == 300
         assert config.critical_threshold == 600
-        assert config.prompt_stuck_threshold == 30
+        assert config.prompt_stuck_check_interval == 10
+        assert config.prompt_stuck_age_threshold == 30
+        assert config.prompt_stuck_recovery_cooldown == 60
         assert config.action == StuckAction.WARN
 
     def test_from_env_defaults(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             # Remove our env vars if they exist
-            for key in ["LOOM_STUCK_WARNING", "LOOM_STUCK_CRITICAL", "LOOM_STUCK_ACTION", "LOOM_PROMPT_STUCK_THRESHOLD"]:
+            for key in [
+                "LOOM_STUCK_WARNING",
+                "LOOM_STUCK_CRITICAL",
+                "LOOM_STUCK_ACTION",
+                "LOOM_PROMPT_STUCK_CHECK_INTERVAL",
+                "LOOM_PROMPT_STUCK_AGE_THRESHOLD",
+                "LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN",
+            ]:
                 os.environ.pop(key, None)
             config = StuckConfig.from_env()
         assert config.warning_threshold == 300
         assert config.critical_threshold == 600
+        assert config.prompt_stuck_check_interval == 10
+        assert config.prompt_stuck_age_threshold == 30
+        assert config.prompt_stuck_recovery_cooldown == 60
         assert config.action == StuckAction.WARN
 
     def test_from_env_custom(self) -> None:
@@ -76,12 +88,16 @@ class TestStuckConfig:
             "LOOM_STUCK_WARNING": "180",
             "LOOM_STUCK_CRITICAL": "360",
             "LOOM_STUCK_ACTION": "pause",
-            "LOOM_PROMPT_STUCK_THRESHOLD": "15",
+            "LOOM_PROMPT_STUCK_CHECK_INTERVAL": "5",
+            "LOOM_PROMPT_STUCK_AGE_THRESHOLD": "15",
+            "LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN": "30",
         }):
             config = StuckConfig.from_env()
         assert config.warning_threshold == 180
         assert config.critical_threshold == 360
-        assert config.prompt_stuck_threshold == 15
+        assert config.prompt_stuck_check_interval == 5
+        assert config.prompt_stuck_age_threshold == 15
+        assert config.prompt_stuck_recovery_cooldown == 30
         assert config.action == StuckAction.PAUSE
 
     def test_from_env_invalid_action(self) -> None:

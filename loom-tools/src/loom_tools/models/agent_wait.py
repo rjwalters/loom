@@ -51,7 +51,10 @@ class StuckConfig:
 
     warning_threshold: int = 300  # 5 minutes
     critical_threshold: int = 600  # 10 minutes
-    prompt_stuck_threshold: int = 30  # 30 seconds
+    # Prompt stuck detection: check every 10s, fire after 30s stuck
+    prompt_stuck_check_interval: int = 10  # how often to check
+    prompt_stuck_age_threshold: int = 30  # how long stuck before detection
+    prompt_stuck_recovery_cooldown: int = 60  # seconds before re-trying recovery
     action: StuckAction = StuckAction.WARN
 
     @classmethod
@@ -68,8 +71,14 @@ class StuckConfig:
         return cls(
             warning_threshold=int(os.environ.get("LOOM_STUCK_WARNING", "300")),
             critical_threshold=int(os.environ.get("LOOM_STUCK_CRITICAL", "600")),
-            prompt_stuck_threshold=int(
-                os.environ.get("LOOM_PROMPT_STUCK_THRESHOLD", "30")
+            prompt_stuck_check_interval=int(
+                os.environ.get("LOOM_PROMPT_STUCK_CHECK_INTERVAL", "10")
+            ),
+            prompt_stuck_age_threshold=int(
+                os.environ.get("LOOM_PROMPT_STUCK_AGE_THRESHOLD", "30")
+            ),
+            prompt_stuck_recovery_cooldown=int(
+                os.environ.get("LOOM_PROMPT_STUCK_RECOVERY_COOLDOWN", "60")
             ),
             action=action,
         )
