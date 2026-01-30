@@ -884,6 +884,37 @@ main() {
             exit 3
         fi
 
+        # Check shepherd progress file for errored status (fast error detection)
+        # When shepherd-loop.sh reports an error milestone, the progress file status
+        # is set to "errored". Detecting this here terminates the session within one
+        # poll cycle (~5s) rather than waiting for idle heuristics (issue #1619).
+        if [[ -n "$task_id" ]]; then
+            local progress_file="$REPO_ROOT/.loom/progress/shepherd-${task_id}.json"
+            if [[ -f "$progress_file" ]]; then
+                local progress_status
+                progress_status=$(jq -r '.status // "working"' "$progress_file" 2>/dev/null || echo "working")
+                if [[ "$progress_status" == "errored" ]]; then
+                    local elapsed=$(( $(date +%s) - start_time ))
+                    log_warn "Shepherd errored (progress file status), terminating session '$session_name'"
+
+                    # Kill the background wait process
+                    kill "$wait_pid" 2>/dev/null || true
+                    wait "$wait_pid" 2>/dev/null || true
+
+                    # Clean up progress files
+                    cleanup_progress_files "$name"
+
+                    # Destroy the tmux session
+                    tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+
+                    if [[ "$json_output" == "true" ]]; then
+                        echo "{\"status\":\"errored\",\"name\":\"$name\",\"reason\":\"progress_file_errored\",\"elapsed\":$elapsed}"
+                    fi
+                    exit 4
+                fi
+            fi
+        fi
+
         # Fast "stuck at prompt" detection - command visible but not processing
         # This failure mode can be detected in ~30s vs the 5min general stuck threshold.
         # Only check once after the threshold and only if not already processing.
