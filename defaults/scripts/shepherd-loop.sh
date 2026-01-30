@@ -539,6 +539,7 @@ fail_with_reason() {
         judge:*"validation"*)             error_class="judge_validation" ;;
         doctor:*"validation"*)            error_class="doctor_validation" ;;
         curator:*"validation"*)           error_class="unknown" ;;  # Curator failures are non-blocking
+        *:*"skipped via --from"*)         error_class="skip_precondition" ;;  # --from flag precondition failed
         *)                                error_class="unknown" ;;
     esac
 
