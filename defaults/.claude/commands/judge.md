@@ -73,6 +73,11 @@ gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:cha
 - `loom:review-requested` (green) → `loom:changes-requested` (amber) [needs fixes from Fixer] → `loom:review-requested` (green)
 - When PR is approved and ready for user to merge, it gets `loom:pr` (blue badge)
 
+**Specific issue type labels** (applied alongside `loom:changes-requested`):
+- `loom:merge-conflict` (red) - PR has merge conflicts (`mergeStateStatus` is `DIRTY`)
+- `loom:ci-failure` (red) - PR has failing CI checks
+- These labels help the Shepherd and Doctor understand the specific issue type for faster resolution
+
 ## Exception: Explicit User Instructions
 
 **User commands override the label-based state machine.**
@@ -261,7 +266,7 @@ gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
 
 ### When CI Fails
 
-If CI checks are failing, **do NOT approve**. Instead:
+If CI checks are failing, **do NOT approve**. Instead, apply `loom:ci-failure` for visibility:
 
 ```bash
 gh pr comment <number> --body "$(cat <<'EOF'
@@ -280,7 +285,31 @@ Please fix these issues before the PR can be approved. Common causes:
 I'll review again once CI passes.
 EOF
 )"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:ci-failure"
+```
+
+### When Merge Conflicts Exist
+
+If the PR has merge conflicts (`mergeStateStatus` is `DIRTY`), **do NOT approve**. Apply `loom:merge-conflict` for visibility:
+
+```bash
+gh pr comment <number> --body "$(cat <<'EOF'
+❌ **Changes Requested - Merge Conflicts**
+
+This PR has merge conflicts that need to be resolved before it can be reviewed.
+
+Please rebase your branch on main and resolve conflicts:
+\`\`\`bash
+git fetch origin
+git rebase origin/main
+# Resolve conflicts
+git push --force-with-lease
+\`\`\`
+
+I'll review again once conflicts are resolved.
+EOF
+)"
+gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
 ```
 
 ### When CI is Pending
