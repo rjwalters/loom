@@ -111,6 +111,14 @@ find_repo_root() {
 REPO_ROOT=$(find_repo_root)
 cd "$REPO_ROOT"
 
+# Use gh-cached for read-only queries to reduce API calls (see issue #1609)
+GH_CACHED="$REPO_ROOT/.loom/scripts/gh-cached"
+if [[ -x "$GH_CACHED" ]]; then
+    GH="$GH_CACHED"
+else
+    GH="gh"
+fi
+
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 log() {
@@ -332,7 +340,7 @@ _CACHED_ISSUE_NUMBER=""
 
 refresh_issue_labels() {
     local issue="$1"
-    _CACHED_ISSUE_LABELS=$(gh issue view "$issue" --json labels --jq '.labels[].name' 2>/dev/null) || _CACHED_ISSUE_LABELS=""
+    _CACHED_ISSUE_LABELS=$($GH issue view "$issue" --json labels --jq '.labels[].name' 2>/dev/null) || _CACHED_ISSUE_LABELS=""
     _CACHED_ISSUE_NUMBER="$issue"
 }
 
@@ -360,7 +368,7 @@ has_label_pr() {
     local pr="$1"
     local label="$2"
     local labels
-    labels=$(gh pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null) || return 1
+    labels=$($GH pr view "$pr" --json labels --jq '.labels[].name' 2>/dev/null) || return 1
     echo "$labels" | grep -q "^${label}$"
 }
 
@@ -662,7 +670,7 @@ get_pr_for_issue() {
     fi
 
     # Method 1: Branch-based lookup (deterministic, no indexing lag)
-    pr=$(gh pr list --head "feature/issue-${issue}" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
+    pr=$($GH pr list --head "feature/issue-${issue}" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
     if [[ -n "$pr" && "$pr" != "null" ]]; then
         _CACHED_PR_NUMBER="$pr"
         _CACHED_PR_ISSUE="$issue"
@@ -672,7 +680,7 @@ get_pr_for_issue() {
 
     # Method 2-4: Search body for linking keywords (has indexing lag)
     for pattern in "Closes #${issue}" "Fixes #${issue}" "Resolves #${issue}"; do
-        pr=$(gh pr list --search "$pattern" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
+        pr=$($GH pr list --search "$pattern" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
         if [[ -n "$pr" && "$pr" != "null" ]]; then
             _CACHED_PR_NUMBER="$pr"
             _CACHED_PR_ISSUE="$issue"
@@ -735,7 +743,7 @@ main() {
 
     # Fetch issue metadata in a single API call (url, state, title, labels)
     local issue_meta
-    issue_meta=$(gh issue view "$ISSUE" --json url,state,title,labels 2>/dev/null) || {
+    issue_meta=$($GH issue view "$ISSUE" --json url,state,title,labels 2>/dev/null) || {
         log_error "Issue #$ISSUE does not exist"
         exit 1
     }

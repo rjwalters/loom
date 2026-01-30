@@ -34,6 +34,14 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Use gh-cached for read-only queries to reduce API calls (see issue #1609)
+GH_CACHED="$REPO_ROOT/.loom/scripts/gh-cached"
+if [[ -x "$GH_CACHED" ]]; then
+    GH="$GH_CACHED"
+else
+    GH="gh"
+fi
+
 # tmux configuration (must match agent-spawn.sh)
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
@@ -180,7 +188,7 @@ check_signals() {
     # Check per-issue abort label
     if [ -n "$issue" ]; then
         local labels
-        labels=$(gh issue view "$issue" --repo "$(gh repo view --json nameWithOwner --jq '.nameWithOwner')" --json labels --jq '.labels[].name' 2>/dev/null || true)
+        labels=$($GH issue view "$issue" --repo "$($GH repo view --json nameWithOwner --jq '.nameWithOwner')" --json labels --jq '.labels[].name' 2>/dev/null || true)
         if echo "$labels" | grep -q "loom:abort"; then
             log_warn "Abort signal detected for issue #${issue}"
             return 0
@@ -852,7 +860,7 @@ main() {
                 local signal_type="shutdown"
                 if [ -n "$issue" ]; then
                     local labels
-                    labels=$(gh issue view "$issue" --json labels --jq '.labels[].name' 2>/dev/null || true)
+                    labels=$($GH issue view "$issue" --json labels --jq '.labels[].name' 2>/dev/null || true)
                     if echo "$labels" | grep -q "loom:abort"; then
                         signal_type="abort"
                     fi
