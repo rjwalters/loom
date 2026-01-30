@@ -145,11 +145,23 @@ class PipelineState:
 
 @dataclass
 class SystematicFailure:
-    """Systematic failure tracking from daemon-state.json."""
+    """Systematic failure tracking from daemon-state.json.
+
+    Fields:
+        active: Whether systematic failure is currently detected
+        pattern: The error class pattern that triggered the failure
+        count: Number of consecutive failures with the same pattern
+        detected_at: ISO timestamp when failure was first detected
+        cooldown_until: ISO timestamp when auto-clear probe should occur
+        probe_count: Number of probe attempts since failure was detected
+    """
 
     active: bool = False
     pattern: str = ""
     count: int = 0
+    detected_at: str | None = None
+    cooldown_until: str | None = None
+    probe_count: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SystematicFailure:
@@ -157,14 +169,23 @@ class SystematicFailure:
             active=data.get("active", False),
             pattern=data.get("pattern", ""),
             count=data.get("count", 0),
+            detected_at=data.get("detected_at"),
+            cooldown_until=data.get("cooldown_until"),
+            probe_count=data.get("probe_count", 0),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "active": self.active,
             "pattern": self.pattern,
             "count": self.count,
+            "probe_count": self.probe_count,
         }
+        if self.detected_at is not None:
+            d["detected_at"] = self.detected_at
+        if self.cooldown_until is not None:
+            d["cooldown_until"] = self.cooldown_until
+        return d
 
 
 @dataclass
