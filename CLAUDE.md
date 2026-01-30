@@ -375,7 +375,7 @@ Shepherds use the `report-milestone.sh` script:
 
 **Daemon Snapshot Integration**:
 
-The `daemon-snapshot.sh` script includes shepherd progress in its output:
+The `loom-tools snapshot` command includes shepherd progress in its output:
 
 ```json
 {
@@ -398,7 +398,7 @@ The `daemon-snapshot.sh` script includes shepherd progress in its output:
 
 **Stuck Detection with Milestones**:
 
-The `stuck-detection.sh` script uses milestones for more accurate detection:
+The `loom-stuck-detection` command uses milestones for more accurate detection:
 
 | Indicator | Threshold | Description |
 |-----------|-----------|-------------|
@@ -518,7 +518,7 @@ See `.loom/docs/troubleshooting.md` for detailed troubleshooting including:
 **Quick fixes**:
 
 ```bash
-./.loom/scripts/clean.sh --force        # Clean stale worktrees/branches
+loom-clean --force                       # Clean stale worktrees/branches
 ./.loom/scripts/stale-building-check.sh --recover  # Recover stuck issues
 ./.loom/scripts/recover-orphaned-shepherds.sh --recover  # Recover orphaned shepherds after crash
 gh label sync --file .github/labels.yml  # Re-sync labels

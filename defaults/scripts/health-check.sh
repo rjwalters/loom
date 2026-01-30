@@ -18,7 +18,7 @@
 # The health system is designed to:
 # - Detect degradation patterns before they become critical
 # - Enable extended unattended autonomous operation
-# - Integrate with existing daemon-state.json and daemon-snapshot.sh
+# - Integrate with existing daemon-state.json and loom-tools snapshot
 #
 # Health metrics are stored in .loom/health-metrics.json
 # Alerts are stored in .loom/alerts.json
@@ -215,10 +215,16 @@ collect_current_metrics() {
     local timestamp
     timestamp=$(get_timestamp)
 
-    # Get snapshot data (if daemon-snapshot.sh exists)
+    # Get snapshot data from Python loom-tools
     local snapshot="{}"
-    if [[ -x "$REPO_ROOT/.loom/scripts/daemon-snapshot.sh" ]]; then
-        snapshot=$("$REPO_ROOT/.loom/scripts/daemon-snapshot.sh" 2>/dev/null || echo "{}")
+    local loom_tools_venv="$REPO_ROOT/loom-tools/.venv/bin/python3"
+    local loom_tools_src="$REPO_ROOT/loom-tools/src"
+    if [[ -x "$loom_tools_venv" ]]; then
+        snapshot=$(PYTHONPATH="$loom_tools_src${PYTHONPATH:+:$PYTHONPATH}" \
+            "$loom_tools_venv" -m loom_tools.snapshot 2>/dev/null || echo "{}")
+    elif command -v python3 >/dev/null 2>&1; then
+        snapshot=$(PYTHONPATH="$loom_tools_src${PYTHONPATH:+:$PYTHONPATH}" \
+            python3 -m loom_tools.snapshot 2>/dev/null || echo "{}")
     fi
 
     # Extract metrics from snapshot

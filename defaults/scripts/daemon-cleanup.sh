@@ -215,10 +215,11 @@ handle_shepherd_complete() {
 
   if [[ -d "$worktree_path" ]]; then
     info "Cleaning worktree for issue #$ISSUE_NUMBER..."
+    local loom_clean="$REPO_ROOT/loom-tools/.venv/bin/loom-clean"
     if [[ "$DRY_RUN" == true ]]; then
-      "$SCRIPT_DIR/safe-worktree-cleanup.sh" --dry-run --grace-period "$GRACE_PERIOD" 2>/dev/null || true
+      "$loom_clean" --safe --worktrees-only --dry-run --grace-period "$GRACE_PERIOD" 2>/dev/null || true
     else
-      "$SCRIPT_DIR/safe-worktree-cleanup.sh" --grace-period "$GRACE_PERIOD" 2>/dev/null || true
+      "$loom_clean" --safe --worktrees-only --grace-period "$GRACE_PERIOD" 2>/dev/null || true
     fi
   fi
 
@@ -392,10 +393,11 @@ handle_daemon_startup() {
   # ===================================================================
   # Run safe worktree cleanup
   info "Cleaning stale worktrees..."
+  local loom_clean="$REPO_ROOT/loom-tools/.venv/bin/loom-clean"
   if [[ "$DRY_RUN" == true ]]; then
-    "$SCRIPT_DIR/safe-worktree-cleanup.sh" --dry-run 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
+    "$loom_clean" --safe --worktrees-only --dry-run 2>/dev/null || warning "loom-clean not found"
   else
-    "$SCRIPT_DIR/safe-worktree-cleanup.sh" 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
+    "$loom_clean" --safe --worktrees-only 2>/dev/null || warning "loom-clean not found"
   fi
 
   # ===================================================================
@@ -574,10 +576,11 @@ handle_periodic() {
   # Only clean worktrees if no active shepherds or in force mode
   if [[ "$(has_active_shepherds)" == "false" ]]; then
     info "No active shepherds - running full worktree cleanup..."
+    local loom_clean="$REPO_ROOT/loom-tools/.venv/bin/loom-clean"
     if [[ "$DRY_RUN" == true ]]; then
-      "$SCRIPT_DIR/safe-worktree-cleanup.sh" --dry-run 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
+      "$loom_clean" --safe --worktrees-only --dry-run 2>/dev/null || warning "loom-clean not found"
     else
-      "$SCRIPT_DIR/safe-worktree-cleanup.sh" 2>/dev/null || warning "safe-worktree-cleanup.sh not found"
+      "$loom_clean" --safe --worktrees-only 2>/dev/null || warning "loom-clean not found"
     fi
   else
     info "Skipping worktree cleanup (active shepherds)"
