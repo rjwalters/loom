@@ -150,7 +150,9 @@ check_exit_command() {
 }
 
 # Pattern for detecting Claude is actively processing (shared with agent-wait-bg.sh)
-PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming|Wandering'
+# Claude Code shows "esc to interrupt" in the status bar whenever it is working
+# (thinking, running tools, streaming). This text is absent when idle at prompt.
+PROCESSING_INDICATORS='esc to interrupt'
 
 # Check if Claude is sitting at an idle prompt (task completed, waiting for input).
 # This detects the case where a support role has finished its work but the Claude
