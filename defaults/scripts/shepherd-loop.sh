@@ -677,6 +677,15 @@ main() {
         exit 1
     fi
 
+    # Verify it's an issue, not a pull request
+    local item_url
+    item_url=$(gh issue view "$ISSUE" --json url --jq '.url' 2>/dev/null)
+    if [[ "$item_url" == */pull/* ]]; then
+        log_error "#$ISSUE is a pull request, not an issue"
+        log_info "Hint: Use 'gh pr view $ISSUE' to see PR details"
+        exit 1
+    fi
+
     # Check if issue is already closed
     local issue_state
     issue_state=$(gh issue view "$ISSUE" --json state --jq '.state' 2>/dev/null)
