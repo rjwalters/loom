@@ -16,13 +16,13 @@
 #
 # Options:
 #   --force, -f     Auto-approve, auto-merge after approval (does NOT skip Judge review)
-#   --wait          Wait for human approval at each gate (explicit non-default)
 #   --to <phase>    Stop after specified phase (curated, pr, approved)
 #   --task-id <id>  Use specific task ID (generated if not provided)
 #
 # Deprecated:
 #   --force-pr      (deprecated) Now the default behavior
 #   --force-merge   (deprecated) Use --force or -f instead
+#   --wait          (deprecated) No longer blocks; shepherd always exits after PR approval
 #
 # Environment Variables:
 #   LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 300)
@@ -182,7 +182,6 @@ ${YELLOW}USAGE:${NC}
 
 ${YELLOW}OPTIONS:${NC}
     --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
-    --wait          Wait for human approval at each gate (explicit non-default)
     --from <phase>  Start from specified phase (skip earlier phases)
                     Valid phases: curator, builder, judge, merge
     --to <phase>    Stop after specified phase (curated, pr, approved)
@@ -192,6 +191,7 @@ ${YELLOW}OPTIONS:${NC}
 ${YELLOW}DEPRECATED:${NC}
     --force-pr      (deprecated) Now the default behavior
     --force-merge   (deprecated) Use --force or -f instead
+    --wait          (deprecated) No longer blocks; shepherd always exits after PR approval
 
 ${YELLOW}PHASES:${NC}
     1. Curator    - Enhance issue with implementation guidance
@@ -199,12 +199,16 @@ ${YELLOW}PHASES:${NC}
     3. Builder    - Create worktree, implement, create PR
     4. Judge      - Review PR, approve or request changes (always runs, even in force mode)
     5. Doctor     - Address requested changes (if any)
-    6. Merge      - Auto-merge (--force) or wait for human
+    6. Merge      - Auto-merge (--force) or exit at loom:pr (default)
 
 ${YELLOW}NOTE:${NC}
     Force mode does NOT skip the Judge phase. Code review always runs because
     GitHub's API prevents self-approval of PRs. Force mode enables auto-approval
     at phase 2 and auto-merge at phase 6.
+
+    Without --force, the shepherd exits after the PR is approved (loom:pr).
+    The Champion role handles merging approved PRs. This frees the shepherd
+    slot for new issues instead of blocking indefinitely.
 
 ${YELLOW}ENVIRONMENT:${NC}
     LOOM_CURATOR_TIMEOUT     Seconds for curator phase (default: 300)
@@ -215,15 +219,12 @@ ${YELLOW}ENVIRONMENT:${NC}
     LOOM_POLL_INTERVAL       Seconds between completion checks (default: 5)
 
 ${YELLOW}EXAMPLES:${NC}
-    # Create PR without waiting (default behavior)
+    # Create PR, exit after approval (default behavior)
     shepherd-loop.sh 42
 
     # Full automation with auto-merge
     shepherd-loop.sh 42 --force
     shepherd-loop.sh 42 -f
-
-    # Wait for human approval at each gate
-    shepherd-loop.sh 42 --wait
 
     # Stop after curation (for review before building)
     shepherd-loop.sh 42 --to curated
@@ -241,6 +242,9 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --wait)
+            # Deprecated: --wait used to block indefinitely at the merge gate.
+            # Now all non-force modes exit after PR approval (Champion handles merge).
+            log_warn "Flag --wait is deprecated (shepherd always exits after PR approval)"
             MODE="normal"
             shift
             ;;
@@ -1114,35 +1118,15 @@ main() {
             gh issue comment "$ISSUE" --body "**Shepherd blocked**: Failed to merge PR #$pr_number. Branch may be out of date or have merge conflicts." >/dev/null 2>&1 || true
             fail_with_reason "merge" "failed to merge PR #$pr_number"
         fi
-    elif [[ "$MODE" == "force-pr" ]]; then
-        log_info "Stopping at loom:pr state (force-pr mode)"
-        log_info "PR #$pr_number is approved and ready for human merge"
-        completed_phases+=("Merge (awaiting human)")
     else
-        log_info "Waiting for human to merge PR #$pr_number..."
-        log_info "To merge: gh pr merge $pr_number --squash --delete-branch"
-
-        # Poll until merged or shutdown
-        while true; do
-            if check_shutdown; then
-                handle_shutdown "merge"
-            fi
-
-            local pr_state
-            pr_state=$(gh pr view "$pr_number" --json state --jq '.state' 2>/dev/null) || true
-
-            if [[ "$pr_state" == "MERGED" ]]; then
-                completed_phases+=("Merge (human merged)")
-                log_success "PR #$pr_number merged by human"
-                break
-            elif [[ "$pr_state" == "CLOSED" ]]; then
-                log_warn "PR #$pr_number was closed without merging"
-                completed_phases+=("Merge (closed)")
-                break
-            fi
-
-            sleep "$POLL_INTERVAL"
-        done
+        # Both force-pr (default) and normal (--wait) modes exit here.
+        # The Champion role is responsible for merging loom:pr PRs, so the
+        # shepherd doesn't need to wait. This frees the shepherd slot for
+        # new issues instead of blocking indefinitely.
+        log_info "Stopping at loom:pr state (PR approved, ready for merge)"
+        log_info "PR #$pr_number is approved and ready for Champion to merge"
+        log_info "To merge manually: gh pr merge $pr_number --squash --delete-branch"
+        completed_phases+=("Merge (awaiting merge)")
     fi
 
     # ─── Complete ─────────────────────────────────────────────────────────────
@@ -1153,10 +1137,12 @@ main() {
 
     # Report completion
     if [[ -x "$REPO_ROOT/.loom/scripts/report-milestone.sh" ]]; then
-        "$REPO_ROOT/.loom/scripts/report-milestone.sh" completed \
-            --task-id "$TASK_ID" \
-            --pr-merged \
-            --quiet || true
+        local milestone_args=(completed --task-id "$TASK_ID" --quiet)
+        # Only report --pr-merged if the PR was actually merged (force-merge mode)
+        if [[ "$MODE" == "force-merge" ]]; then
+            milestone_args+=(--pr-merged)
+        fi
+        "$REPO_ROOT/.loom/scripts/report-milestone.sh" "${milestone_args[@]}" || true
     fi
 
     log_phase "SHEPHERD ORCHESTRATION COMPLETE"
