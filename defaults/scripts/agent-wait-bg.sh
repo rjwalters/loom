@@ -904,7 +904,6 @@ main() {
 
                 if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
                     completion_detected=true
-                    completion_time=$now
                     COMPLETION_REASON="phase_contract_satisfied"
 
                     log_info "Phase contract satisfied ($CONTRACT_STATUS) via proactive check"
