@@ -387,16 +387,29 @@ validate_builder() {
     fi
 
     # Check if a PR already exists for this issue
-    # Strategy: Try multiple search methods to find the PR
-    # Method 1 (branch-based) is deterministic and preferred over search API (has indexing lag)
+    # If --pr was passed (from shepherd cache), use it directly to skip the search
     local pr=""
     local pr_found_by=""
 
-    # Method 1: Branch-based lookup (deterministic, no indexing lag)
-    # Branch name follows convention from worktree.sh: feature/issue-<number>
-    pr=$(gh pr list --head "feature/issue-${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
-    if [[ -n "$pr" && "$pr" != "null" ]]; then
-        pr_found_by="branch_name"
+    if [[ -n "$PR_NUMBER" ]]; then
+        # PR number provided by caller (cached from shepherd pipeline)
+        # Verify it still exists and is open
+        local pr_state
+        pr_state=$(gh pr view "$PR_NUMBER" --json state --jq '.state' 2>/dev/null) || pr_state=""
+        if [[ "$pr_state" == "OPEN" ]]; then
+            pr="$PR_NUMBER"
+            pr_found_by="caller_cached"
+        fi
+    fi
+
+    # Fall back to search if no cached PR or it's no longer open
+    if [[ -z "$pr" || "$pr" == "null" ]]; then
+        # Method 1: Branch-based lookup (deterministic, no indexing lag)
+        # Branch name follows convention from worktree.sh: feature/issue-<number>
+        pr=$(gh pr list --head "feature/issue-${ISSUE}" --state open --json number --jq '.[0].number' 2>/dev/null) || true
+        if [[ -n "$pr" && "$pr" != "null" ]]; then
+            pr_found_by="branch_name"
+        fi
     fi
 
     # Method 2: Search by "Closes #N" in PR body (fallback if branch name differs)

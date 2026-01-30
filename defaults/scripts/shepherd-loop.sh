@@ -321,12 +321,35 @@ fi
 
 # ─── Label helpers ────────────────────────────────────────────────────────────
 
+# Cached issue labels to avoid redundant API calls.
+# Call refresh_issue_labels() to fetch fresh data, then use has_label() to check.
+_CACHED_ISSUE_LABELS=""
+_CACHED_ISSUE_NUMBER=""
+
+refresh_issue_labels() {
+    local issue="$1"
+    _CACHED_ISSUE_LABELS=$(gh issue view "$issue" --json labels --jq '.labels[].name' 2>/dev/null) || _CACHED_ISSUE_LABELS=""
+    _CACHED_ISSUE_NUMBER="$issue"
+}
+
 has_label() {
     local issue="$1"
     local label="$2"
-    local labels
-    labels=$(gh issue view "$issue" --json labels --jq '.labels[].name' 2>/dev/null) || return 1
-    echo "$labels" | grep -q "^${label}$"
+    # Use cache if available and for the same issue
+    if [[ "$issue" == "$_CACHED_ISSUE_NUMBER" && -n "$_CACHED_ISSUE_LABELS" ]]; then
+        echo "$_CACHED_ISSUE_LABELS" | grep -q "^${label}$"
+        return $?
+    fi
+    # Cache miss - fetch and cache
+    refresh_issue_labels "$issue"
+    echo "$_CACHED_ISSUE_LABELS" | grep -q "^${label}$"
+}
+
+# Invalidate cached labels after mutations (add/remove label).
+# This forces the next has_label() call to re-fetch from GitHub.
+invalidate_issue_label_cache() {
+    _CACHED_ISSUE_LABELS=""
+    _CACHED_ISSUE_NUMBER=""
 }
 
 has_label_pr() {
@@ -341,12 +364,14 @@ add_label() {
     local issue="$1"
     local label="$2"
     gh issue edit "$issue" --add-label "$label" >/dev/null 2>&1
+    invalidate_issue_label_cache
 }
 
 remove_label() {
     local issue="$1"
     local label="$2"
     gh issue edit "$issue" --remove-label "$label" >/dev/null 2>&1 || true
+    invalidate_issue_label_cache
 }
 
 add_label_pr() {
@@ -613,6 +638,11 @@ run_phase_with_retry() {
 
 # ─── Get PR for issue ─────────────────────────────────────────────────────────
 
+# Cached PR number to avoid redundant 4-pattern searches.
+# Once a PR is found for an issue, subsequent calls return the cached value.
+_CACHED_PR_NUMBER=""
+_CACHED_PR_ISSUE=""
+
 # Find a PR for an issue, trying multiple linking patterns
 # Usage: get_pr_for_issue <issue> [state]
 # state: open (default), closed, or all
@@ -621,18 +651,33 @@ get_pr_for_issue() {
     local state="${2:-open}"
     local pr
 
-    # Try multiple linking patterns (search body for these phrases)
+    # Return cached PR number if available for same issue and state is "open"
+    if [[ "$issue" == "$_CACHED_PR_ISSUE" && -n "$_CACHED_PR_NUMBER" && "$state" == "open" ]]; then
+        echo "$_CACHED_PR_NUMBER"
+        return 0
+    fi
+
+    # Method 1: Branch-based lookup (deterministic, no indexing lag)
+    pr=$(gh pr list --head "feature/issue-${issue}" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
+    if [[ -n "$pr" && "$pr" != "null" ]]; then
+        _CACHED_PR_NUMBER="$pr"
+        _CACHED_PR_ISSUE="$issue"
+        echo "$pr"
+        return 0
+    fi
+
+    # Method 2-4: Search body for linking keywords (has indexing lag)
     for pattern in "Closes #${issue}" "Fixes #${issue}" "Resolves #${issue}"; do
         pr=$(gh pr list --search "$pattern" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
         if [[ -n "$pr" && "$pr" != "null" ]]; then
+            _CACHED_PR_NUMBER="$pr"
+            _CACHED_PR_ISSUE="$issue"
             echo "$pr"
             return 0
         fi
     done
 
-    # Fallback: search by branch name
-    pr=$(gh pr list --head "feature/issue-${issue}" --state "$state" --json number --jq '.[0].number' 2>/dev/null) || true
-    echo "$pr"
+    echo ""
 }
 
 # ─── Phase skip helper ────────────────────────────────────────────────────────
@@ -684,15 +729,16 @@ main() {
     log_info "Repository: $REPO_ROOT"
     echo ""
 
-    # Verify issue exists
-    if ! gh issue view "$ISSUE" --json number >/dev/null 2>&1; then
+    # Fetch issue metadata in a single API call (url, state, title, labels)
+    local issue_meta
+    issue_meta=$(gh issue view "$ISSUE" --json url,state,title,labels 2>/dev/null) || {
         log_error "Issue #$ISSUE does not exist"
         exit 1
-    fi
+    }
 
     # Verify it's an issue, not a pull request
     local item_url
-    item_url=$(gh issue view "$ISSUE" --json url --jq '.url' 2>/dev/null)
+    item_url=$(echo "$issue_meta" | jq -r '.url' 2>/dev/null)
     if [[ "$item_url" == */pull/* ]]; then
         log_error "#$ISSUE is a pull request, not an issue"
         log_info "Hint: Use 'gh pr view $ISSUE' to see PR details"
@@ -701,13 +747,17 @@ main() {
 
     # Check if issue is already closed or merged
     local issue_state
-    issue_state=$(gh issue view "$ISSUE" --json state --jq '.state' 2>/dev/null)
+    issue_state=$(echo "$issue_meta" | jq -r '.state' 2>/dev/null)
     if [[ "$issue_state" != "OPEN" ]]; then
         log_info "Issue #$ISSUE is already $issue_state - no orchestration needed"
         exit 0
     fi
 
-    # Check if issue is blocked
+    # Pre-populate label cache from the metadata we already fetched
+    _CACHED_ISSUE_LABELS=$(echo "$issue_meta" | jq -r '.labels[].name' 2>/dev/null) || _CACHED_ISSUE_LABELS=""
+    _CACHED_ISSUE_NUMBER="$ISSUE"
+
+    # Check if issue is blocked (uses cached labels from above)
     if has_label "$ISSUE" "loom:blocked"; then
         if [[ "$MODE" == "force-merge" ]]; then
             log_warn "Issue #$ISSUE has loom:blocked label - proceeding anyway (--force mode)"
@@ -719,7 +769,7 @@ main() {
     fi
 
     local issue_title
-    issue_title=$(gh issue view "$ISSUE" --json title --jq '.title' 2>/dev/null)
+    issue_title=$(echo "$issue_meta" | jq -r '.title' 2>/dev/null)
     log_info "Title: $issue_title"
     echo ""
 
@@ -812,7 +862,11 @@ main() {
         log_info "To approve: gh issue edit $ISSUE --add-label loom:issue"
 
         # Poll until approved or shutdown
-        while ! has_label "$ISSUE" "loom:issue"; do
+        while true; do
+            invalidate_issue_label_cache  # Force fresh fetch each poll
+            if has_label "$ISSUE" "loom:issue"; then
+                break
+            fi
             if check_shutdown; then
                 handle_shutdown "approval"
             fi
