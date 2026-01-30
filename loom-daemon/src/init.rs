@@ -795,12 +795,7 @@ fn force_merge_dir_with_report(
 /// Compares each file in the source directory with the corresponding file in the
 /// destination directory. Files that don't match are added to the report's
 /// verification_failures list.
-fn verify_copied_files(
-    src: &Path,
-    dst: &Path,
-    prefix: &str,
-    report: &mut InitReport,
-) {
+fn verify_copied_files(src: &Path, dst: &Path, prefix: &str, report: &mut InitReport) {
     if !src.exists() || !dst.exists() {
         return;
     }
@@ -1594,8 +1589,14 @@ mod tests {
 
         // Should have 2 failures: mismatch + missing
         assert_eq!(report.verification_failures.len(), 2);
-        assert!(report.verification_failures.iter().any(|f| f.contains("bad.sh")));
-        assert!(report.verification_failures.iter().any(|f| f.contains("missing.sh")));
+        assert!(report
+            .verification_failures
+            .iter()
+            .any(|f| f.contains("bad.sh")));
+        assert!(report
+            .verification_failures
+            .iter()
+            .any(|f| f.contains("missing.sh")));
     }
 
     #[test]
@@ -1637,11 +1638,8 @@ mod tests {
         fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
         fs::write(defaults.join("scripts").join("test.sh"), "#!/bin/bash").unwrap();
 
-        let result = initialize_workspace(
-            workspace.to_str().unwrap(),
-            defaults.to_str().unwrap(),
-            false,
-        );
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
 
         assert!(result.is_ok());
         let report = result.unwrap();
