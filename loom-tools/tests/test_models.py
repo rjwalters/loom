@@ -19,6 +19,7 @@ from loom_tools.models.health import (
     AlertsFile,
     HealthMetrics,
     MetricEntry,
+    PipelineHealthMetric,
 )
 from loom_tools.models.progress import Milestone, ShepherdProgress
 from loom_tools.models.stuck import (
@@ -147,6 +148,8 @@ class TestHealthMetrics:
         assert m.queue_depths.building == 3
         assert m.error_rates.success_rate == 100
         assert m.resource_usage.session_percent == 40.0
+        assert m.pipeline_health.status == "healthy"
+        assert m.pipeline_health.blocked_count == 0
 
     def test_round_trip(self, raw: dict) -> None:
         hm = HealthMetrics.from_dict(raw)
