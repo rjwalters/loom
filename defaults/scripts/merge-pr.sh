@@ -215,11 +215,16 @@ else
   info "No linked issue found in PR body (no 'Closes #N' pattern)"
 fi
 
-# Delete remote branch
-info "Deleting remote branch: $PR_BRANCH"
-gh api "repos/$REPO_NWO/git/refs/heads/$PR_BRANCH" -X DELETE 2>/dev/null && \
-  success "Branch '$PR_BRANCH' deleted" || \
-  warning "Could not delete branch '$PR_BRANCH' (may already be deleted)"
+# Delete remote branch (skip if GitHub auto-deletes on merge)
+DELETE_BRANCH_ON_MERGE=$($GH api "repos/$REPO_NWO" --jq '.delete_branch_on_merge' 2>/dev/null || echo "false")
+if [[ "$DELETE_BRANCH_ON_MERGE" == "true" ]]; then
+  info "Skipping branch deletion (GitHub auto-delete is enabled)"
+else
+  info "Deleting remote branch: $PR_BRANCH"
+  gh api "repos/$REPO_NWO/git/refs/heads/$PR_BRANCH" -X DELETE 2>/dev/null && \
+    success "Branch '$PR_BRANCH' deleted" || \
+    warning "Could not delete branch '$PR_BRANCH' (may already be deleted)"
+fi
 
 # Cleanup worktree if requested
 if [[ "$CLEANUP_WORKTREE" == "true" ]]; then
