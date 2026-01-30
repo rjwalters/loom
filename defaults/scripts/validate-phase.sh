@@ -349,7 +349,7 @@ validate_curator() {
 
     # Recovery: apply loom:curated label (curator may have enhanced but not labeled)
     echo -e "${YELLOW}Attempting recovery: applying loom:curated label${NC}"
-    if gh issue edit "$ISSUE" --add-label "loom:curated" 2>/dev/null; then
+    if gh issue edit "$ISSUE" --remove-label "loom:curating" --add-label "loom:curated" 2>/dev/null; then
         report_milestone "heartbeat" --action "recovery: applied loom:curated label"
         output_result "recovered" "Applied loom:curated label" "apply_label"
         return 0

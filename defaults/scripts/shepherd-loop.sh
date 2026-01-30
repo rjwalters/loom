@@ -766,6 +766,9 @@ main() {
                 fail_with_reason "curator" "validation failed"
             fi
 
+            # Belt-and-suspenders: ensure loom:curating is removed after curator completes
+            gh issue edit "$ISSUE" --remove-label "loom:curating" 2>/dev/null || true
+
             completed_phases+=("Curator")
             log_success "Curator phase complete"
         fi
