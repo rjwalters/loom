@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -234,3 +236,60 @@ class TestPhaseStatus:
         result = PhaseResult(status=PhaseStatus.SHUTDOWN)
         assert result.is_shutdown is True
         assert result.is_success is False
+
+
+class TestStaleBranchDetection:
+    """Test stale remote branch detection in ShepherdContext."""
+
+    def test_warns_when_stale_branch_exists(
+        self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Should log warning when remote branch feature/issue-N exists."""
+        ls_remote_output = "abc123\trefs/heads/feature/issue-42\n"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=ls_remote_output, stderr=""
+        )
+        with patch("loom_tools.shepherd.context.subprocess.run", return_value=completed):
+            with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
+                ShepherdContext._check_stale_branch(mock_context, 42)
+
+        assert any("Stale branch feature/issue-42" in r.message for r in caplog.records)
+
+    def test_no_warning_when_no_branch(
+        self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Should not warn when no remote branch exists."""
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with patch("loom_tools.shepherd.context.subprocess.run", return_value=completed):
+            with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
+                ShepherdContext._check_stale_branch(mock_context, 42)
+
+        assert not any("Stale branch" in r.message for r in caplog.records)
+
+    def test_no_warning_on_git_failure(
+        self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Should silently continue when git ls-remote fails."""
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=128, stdout="", stderr="fatal: error"
+        )
+        with patch("loom_tools.shepherd.context.subprocess.run", return_value=completed):
+            with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
+                ShepherdContext._check_stale_branch(mock_context, 42)
+
+        assert not any("Stale branch" in r.message for r in caplog.records)
+
+    def test_no_warning_on_os_error(
+        self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Should silently continue when git is not available."""
+        with patch(
+            "loom_tools.shepherd.context.subprocess.run",
+            side_effect=OSError("No such file"),
+        ):
+            with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
+                ShepherdContext._check_stale_branch(mock_context, 42)
+
+        assert not any("Stale branch" in r.message for r in caplog.records)
