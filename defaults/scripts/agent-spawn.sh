@@ -37,6 +37,13 @@
 
 set -euo pipefail
 
+# Script directory for sourcing shared libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source shared constants (provides PROCESSING_INDICATORS pattern)
+# shellcheck source=lib/constants.sh
+source "${SCRIPT_DIR}/lib/constants.sh"
+
 # Configuration
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
@@ -512,12 +519,7 @@ EOF
     # Verify the command is being processed.
     # Since we pass the command at launch, Claude should start processing immediately
     # after startup. We poll for processing indicators to confirm.
-    #
-    # Pattern for detecting Claude is processing a command:
-    # - Spinner characters (Claude thinking)
-    # - Progress/status text
-    # - Tool use indicators
-    local PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'
+    # PROCESSING_INDICATORS is sourced from lib/constants.sh
 
     # Configurable verify parameters (via environment or defaults)
     local verify_timeout="${LOOM_SPAWN_VERIFY_TIMEOUT:-30}"  # Total time to wait for processing

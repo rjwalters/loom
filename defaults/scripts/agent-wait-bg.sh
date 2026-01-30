@@ -70,8 +70,9 @@ STUCK_ACTION=${LOOM_STUCK_ACTION:-warn}              # warn, pause, restart, ret
 # This is a distinct, faster-detectable failure mode from general stuck detection
 PROMPT_STUCK_THRESHOLD=${LOOM_PROMPT_STUCK_THRESHOLD:-30}  # 30 seconds default
 
-# Pattern for detecting Claude is processing a command (shared with agent-spawn.sh)
-PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming|Wandering'
+# Source shared constants (provides PROCESSING_INDICATORS pattern)
+# shellcheck source=lib/constants.sh
+source "${SCRIPT_DIR}/lib/constants.sh"
 
 # Progress tracking file prefix
 PROGRESS_DIR="/tmp/loom-agent-progress"
