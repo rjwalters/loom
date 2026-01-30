@@ -2,8 +2,16 @@
 # agent-wait.sh - Wait for a tmux Claude agent to finish its task
 #
 # Detects when a Claude agent in a tmux session has completed its work
-# by inspecting the process tree. When Claude finishes, the shell becomes
-# idle (no claude child process). This script polls until that happens.
+# by inspecting the process tree and tmux pane content. Completion is
+# detected when:
+#   1. The claude process has exited (shell idle)
+#   2. The /exit command appears in the log file
+#   3. Claude is at an idle prompt (task finished, waiting for input)
+#
+# The idle prompt detection (#3) is critical for support roles (guide,
+# champion, doctor, judge, auditor) which complete their task but leave
+# the Claude CLI at an interactive prompt. Without this detection, the
+# daemon cannot detect completion and never respawns them on schedule.
 #
 # Exit codes:
 #   0 - Agent completed (shell is idle, no claude process)
@@ -64,9 +72,14 @@ ${YELLOW}EXAMPLES:${NC}
 
 ${YELLOW}HOW IT WORKS:${NC}
     Monitors the agent's log file for /exit command (explicit completion),
-    and also checks if any claude process exists in the process tree under
-    the tmux session's shell. When /exit is detected or claude exits,
-    the agent is considered complete.
+    checks if any claude process exists in the process tree under the
+    tmux session's shell, and detects when Claude is at an idle prompt
+    (task finished, waiting for user input). When any of these conditions
+    is met, the agent is considered complete.
+
+    The idle prompt detection is essential for support roles (guide,
+    champion, doctor, judge, auditor) that finish their one-shot task
+    but leave the Claude CLI at an interactive prompt.
 
 EOF
 }
@@ -131,6 +144,51 @@ check_exit_command() {
     fi
 
     return 1
+}
+
+# Pattern for detecting Claude is actively processing (shared with agent-wait-bg.sh)
+PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming|Wandering'
+
+# Check if Claude is sitting at an idle prompt (task completed, waiting for input).
+# This detects the case where a support role has finished its work but the Claude
+# CLI remains at an interactive prompt. The tmux pane will show the prompt character
+# (❯) at the end of the visible content with no processing indicators.
+#
+# Returns 0 if idle at prompt, 1 if processing or cannot determine.
+check_idle_prompt() {
+    local session_name="$1"
+
+    # Capture current pane content (visible terminal output)
+    local pane_content
+    pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
+    if [[ -z "$pane_content" ]]; then
+        return 1  # Can't determine
+    fi
+
+    # Check for processing indicators - if any are present, Claude is working
+    if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
+        return 1  # Still processing
+    fi
+
+    # Check for Claude's idle prompt at the end of pane content.
+    # When Claude finishes a task, the last non-empty line shows the prompt
+    # character (❯) indicating it's waiting for user input.
+    # We check the last few non-empty lines to handle slight variations.
+    local last_lines
+    last_lines=$(echo "$pane_content" | grep -v '^[[:space:]]*$' | tail -5)
+
+    if [[ -z "$last_lines" ]]; then
+        return 1  # Can't determine
+    fi
+
+    # Match Claude's interactive prompt: ❯ possibly followed by whitespace
+    # This catches the idle state where Claude has finished and is waiting for input
+    if echo "$last_lines" | grep -qE '^[[:space:]]*❯[[:space:]]*$'; then
+        return 0  # Idle at prompt
+    fi
+
+    return 1  # Not idle at prompt
 }
 
 # Handle /exit detection - send /exit to prompt and destroy session
@@ -266,6 +324,20 @@ main() {
                 echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"claude_exited\",\"elapsed\":$elapsed}"
             else
                 log_success "Agent '$name' completed (claude exited after ${elapsed}s)"
+            fi
+            exit 0
+        fi
+
+        # Check if Claude is at an idle prompt (task finished, waiting for input).
+        # This catches support roles that complete their task but leave the CLI
+        # at an interactive prompt. Without this, the daemon cannot detect
+        # completion and never respawns them on their interval schedule.
+        if check_idle_prompt "$session_name"; then
+            elapsed=$(( $(date +%s) - start_time ))
+            if [[ "$json_output" == "true" ]]; then
+                echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"idle_prompt\",\"elapsed\":$elapsed}"
+            else
+                log_success "Agent '$name' completed (idle at prompt after ${elapsed}s)"
             fi
             exit 0
         fi
