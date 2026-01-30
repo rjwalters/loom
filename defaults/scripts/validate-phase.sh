@@ -296,11 +296,29 @@ This is a workflow violation - builders MUST work in worktrees.
     fi
 
     diagnostics+="
-**Recovery suggestions**:
-1. Check the issue description for clarity - is it actionable?
-2. Review any curator comments for implementation guidance
-3. If the issue is valid, remove \`loom:blocked\` and add \`loom:issue\` to retry
-4. Consider adding more detail to the issue if it was unclear
+**Recovery options**:
+
+**Option A: Retry with shepherd** (recommended)
+\`\`\`bash
+gh issue edit $issue_number --remove-label loom:blocked --add-label loom:issue
+./.loom/scripts/shepherd-loop.sh $issue_number --force
+\`\`\`
+
+**Option B: Complete manually**
+1. Create worktree: \`./.loom/scripts/worktree.sh $issue_number\`
+2. Navigate: \`cd .loom/worktrees/issue-$issue_number\`
+3. Implement the fix, commit changes
+4. Push and create PR:
+   \`\`\`bash
+   git push -u origin feature/issue-$issue_number
+   gh pr create --label loom:review-requested --body \"Closes #$issue_number\"
+   \`\`\`
+5. Remove blocked label: \`gh issue edit $issue_number --remove-label loom:blocked\`
+
+**Diagnostics**:
+- Check the issue description for clarity - is it actionable?
+- Review any curator comments for implementation guidance
+- Consider adding more detail to the issue if it was unclear
 
 </details>"
 

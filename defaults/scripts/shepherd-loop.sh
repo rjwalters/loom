@@ -170,6 +170,7 @@ remove_worktree_marker() {
 ISSUE=""
 MODE="force-pr"
 STOP_AFTER=""
+START_FROM=""
 TASK_ID=""
 
 show_help() {
@@ -182,6 +183,8 @@ ${YELLOW}USAGE:${NC}
 ${YELLOW}OPTIONS:${NC}
     --force, -f     Auto-approve, resolve conflicts, auto-merge after approval
     --wait          Wait for human approval at each gate (explicit non-default)
+    --from <phase>  Start from specified phase (skip earlier phases)
+                    Valid phases: curator, builder, judge, merge
     --to <phase>    Stop after specified phase (curated, pr, approved)
     --task-id <id>  Use specific task ID (generated if not provided)
     --help          Show this help message
@@ -220,6 +223,9 @@ ${YELLOW}EXAMPLES:${NC}
     # Stop after curation (for review before building)
     shepherd-loop.sh 42 --to curated
 
+    # Resume from judge phase (PR already exists)
+    shepherd-loop.sh 42 --from judge --force
+
 EOF
 }
 
@@ -247,6 +253,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --to)
             STOP_AFTER="$2"
+            shift 2
+            ;;
+        --from)
+            START_FROM="$2"
             shift 2
             ;;
         --task-id)
@@ -290,6 +300,18 @@ fi
 # Generate task ID if not provided (7 lowercase hex chars)
 if [[ -z "$TASK_ID" ]]; then
     TASK_ID=$(head -c 4 /dev/urandom | xxd -p | cut -c1-7)
+fi
+
+# Validate --from phase if provided
+if [[ -n "$START_FROM" ]]; then
+    case "$START_FROM" in
+        curator|builder|judge|merge) ;;
+        *)
+            log_error "Invalid --from phase: $START_FROM"
+            log_error "Valid phases: curator, builder, judge, merge"
+            exit 1
+            ;;
+    esac
 fi
 
 # ─── Label helpers ────────────────────────────────────────────────────────────
@@ -600,6 +622,37 @@ get_pr_for_issue() {
     echo "$pr"
 }
 
+# ─── Phase skip helper ────────────────────────────────────────────────────────
+
+# Check if a phase should be skipped based on --from argument
+# Returns 0 if phase should be skipped, 1 if it should run
+should_skip_phase() {
+    local phase="$1"
+    if [[ -z "$START_FROM" ]]; then
+        return 1  # No --from specified, run all phases
+    fi
+
+    # Define phase order
+    local -a phase_order=(curator builder judge merge)
+    local start_idx=-1
+    local phase_idx=-1
+
+    for i in "${!phase_order[@]}"; do
+        if [[ "${phase_order[$i]}" == "$START_FROM" ]]; then
+            start_idx=$i
+        fi
+        if [[ "${phase_order[$i]}" == "$phase" ]]; then
+            phase_idx=$i
+        fi
+    done
+
+    # Skip if current phase is before start phase
+    if [[ $phase_idx -lt $start_idx ]]; then
+        return 0  # Should skip
+    fi
+    return 1  # Should run
+}
+
 # ─── Main orchestration ───────────────────────────────────────────────────────
 
 main() {
@@ -611,6 +664,9 @@ main() {
     echo ""
     log_info "Issue: #$ISSUE"
     log_info "Mode: $MODE"
+    if [[ -n "$START_FROM" ]]; then
+        log_info "Start from: $START_FROM phase"
+    fi
     log_info "Task ID: $TASK_ID"
     log_info "Repository: $REPO_ROOT"
     echo ""
@@ -660,7 +716,10 @@ main() {
 
     # ─── PHASE 1: Curator ─────────────────────────────────────────────────────
 
-    if ! has_label "$ISSUE" "loom:curated"; then
+    if should_skip_phase "curator"; then
+        log_info "Skipping curator phase (--from $START_FROM)"
+        completed_phases+=("Curator (skipped via --from)")
+    elif ! has_label "$ISSUE" "loom:curated"; then
         log_phase "PHASE 1: CURATOR"
 
         if check_shutdown; then
@@ -754,7 +813,19 @@ main() {
     local worktree_path="$REPO_ROOT/.loom/worktrees/issue-${ISSUE}"
 
     existing_pr=$(get_pr_for_issue "$ISSUE")
-    if [[ -n "$existing_pr" && "$existing_pr" != "null" ]]; then
+
+    # Check if we should skip builder phase
+    if should_skip_phase "builder"; then
+        if [[ -z "$existing_pr" || "$existing_pr" == "null" ]]; then
+            log_error "Cannot skip builder phase: no existing PR found for issue #$ISSUE"
+            log_error "Use --from with an earlier phase, or create a PR first"
+            fail_with_reason "builder" "skipped via --from but no PR exists"
+        fi
+        log_info "Skipping builder phase (--from $START_FROM)"
+        log_info "Using existing PR #$existing_pr"
+        completed_phases+=("Builder (skipped via --from)")
+        pr_number="$existing_pr"
+    elif [[ -n "$existing_pr" && "$existing_pr" != "null" ]]; then
         log_info "Existing PR #$existing_pr found for issue #$ISSUE"
         log_info "Skipping builder phase, proceeding to judge"
 
@@ -878,6 +949,21 @@ main() {
 
     local doctor_attempts=0
     local pr_approved=false
+
+    # Check if we should skip judge phase (--from merge)
+    if should_skip_phase "judge"; then
+        # Verify PR is approved before skipping
+        if has_label_pr "$pr_number" "loom:pr"; then
+            log_info "Skipping judge phase (--from $START_FROM)"
+            log_info "PR #$pr_number already approved"
+            pr_approved=true
+            completed_phases+=("Judge (skipped via --from)")
+        else
+            log_error "Cannot skip judge phase: PR #$pr_number is not approved"
+            log_error "PR needs loom:pr label to skip judge phase"
+            fail_with_reason "judge" "skipped via --from but PR not approved"
+        fi
+    fi
 
     while [[ "$pr_approved" != "true" ]] && [[ $doctor_attempts -lt $DOCTOR_MAX_RETRIES ]]; do
         log_phase "PHASE 4: JUDGE (attempt $((doctor_attempts + 1)))"
