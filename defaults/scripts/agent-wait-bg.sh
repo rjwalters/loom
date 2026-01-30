@@ -883,7 +883,7 @@ main() {
     local last_contract_check=0
     local stuck_warned=false
     local stuck_critical_reported=false
-    local last_prompt_stuck_check=0
+    local last_prompt_stuck_check=$start_time
     local prompt_stuck_recovery_attempted=false
     local last_heartbeat_time=$start_time
     COMPLETION_REASON=""
