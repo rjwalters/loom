@@ -174,7 +174,9 @@ mark_blocked() {
     local diagnostics="${2:-}"
     # Atomic transition to prevent state machine violation
     gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" 2>/dev/null || true
-    local comment_body="**Phase contract failed**: \`$PHASE\` phase did not produce expected outcome. $reason"
+    local comment_body="**Phase contract failed**: \`$PHASE\` phase did not produce expected outcome. $reason
+
+For label state documentation and manual recovery steps, see [\`.claude/commands/shepherd-lifecycle.md\`](../blob/main/.claude/commands/shepherd-lifecycle.md#label-state-machine)."
     if [[ -n "$diagnostics" ]]; then
         comment_body="$comment_body
 
