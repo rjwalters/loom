@@ -135,10 +135,10 @@ ${YELLOW}EXAMPLES:${NC}
     ./.loom/scripts/signal.sh stop shepherd-1
 
 ${YELLOW}ENVIRONMENT:${NC}
-    LOOM_MAX_RETRIES       - Maximum retry attempts (default: 5)
-    LOOM_INITIAL_WAIT      - Initial wait time in seconds (default: 60)
-    LOOM_MAX_WAIT          - Maximum wait time in seconds (default: 1800)
-    LOOM_BACKOFF_MULTIPLIER - Backoff multiplier (default: 2)
+    LOOM_TUI_INIT_WAIT     - TUI initialization wait in seconds (default: 4)
+    LOOM_SPAWN_MAX_RETRIES - Max command dispatch retries (default: 3)
+    LOOM_SPAWN_INITIAL_GRACE - Initial grace period in seconds (default: 4)
+    LOOM_SPAWN_VERIFY_WINDOW - Processing verification window in seconds (default: 5)
     LOOM_STUCK_SESSION_THRESHOLD - Seconds before idle session is considered stuck (default: 300)
 
 ${YELLOW}TMUX ARCHITECTURE:${NC}
@@ -526,8 +526,11 @@ EOF
         # the command immediately after detecting the prompt, the Enter key may be lost.
         # Wait for the TUI to fully initialize before sending the command.
         # See: https://github.com/rjwalters/loom/issues/1535
-        log_info "Waiting for TUI input handler to initialize..."
-        sleep 2
+        #
+        # Configurable via LOOM_TUI_INIT_WAIT (default: 4s, increased from 2s per #1550)
+        local tui_init_wait="${LOOM_TUI_INIT_WAIT:-4}"
+        log_info "Waiting ${tui_init_wait}s for TUI input handler to initialize..."
+        sleep "$tui_init_wait"
     fi
 
     # Send the role slash command
@@ -544,13 +547,8 @@ EOF
     # the input handler is ready, so we may have sent the command too early.
     # Poll for processing indicators to confirm the command is being handled.
     #
-    # If verification fails, we retry the command once before failing the spawn.
-    # This ensures stuck agents are detected quickly (<2 minutes) rather than
-    # after the stuck session threshold (~10 minutes).
-    local verify_elapsed=0
-    local verify_max=5
-    local command_processed=false
-    local retry_attempted=false
+    # Uses exponential backoff with configurable retries. If all retries fail,
+    # the spawn fails immediately to allow fast shepherd recovery.
 
     # Pattern for detecting Claude is processing a command:
     # - Spinner characters (Claude thinking)
@@ -558,82 +556,82 @@ EOF
     # - Tool use indicators
     local PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'
 
-    sleep 3  # Grace period: Claude needs time to parse skill and load context
+    # Configurable retry parameters (via environment or defaults)
+    local max_retries="${LOOM_SPAWN_MAX_RETRIES:-3}"
+    local initial_grace="${LOOM_SPAWN_INITIAL_GRACE:-4}"  # Initial grace period in seconds
+    local verify_window="${LOOM_SPAWN_VERIFY_WINDOW:-5}"  # How long to poll for indicators
 
-    while [[ $verify_elapsed -lt $verify_max ]]; do
-        local pane_content
-        pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+    local command_processed=false
+    local retry_count=0
 
-        if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-            command_processed=true
+    # Initial grace period: Claude needs time to parse skill and load context
+    sleep "$initial_grace"
+
+    while [[ $retry_count -le $max_retries ]]; do
+        # Poll for processing indicators
+        local verify_elapsed=0
+        while [[ $verify_elapsed -lt $verify_window ]]; do
+            local pane_content
+            pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
+            if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
+                command_processed=true
+                break 2  # Exit both loops
+            fi
+
+            sleep 1
+            verify_elapsed=$((verify_elapsed + 1))
+        done
+
+        # Command not processed yet
+        if [[ $retry_count -eq $max_retries ]]; then
+            # No more retries left
             break
         fi
 
-        sleep 1
-        verify_elapsed=$((verify_elapsed + 1))
-    done
+        # Calculate backoff: 2^retry_count seconds (2s, 4s, 8s...)
+        local backoff=$((2 ** retry_count))
+        retry_count=$((retry_count + 1))
 
-    # If command processing wasn't confirmed, try recovery strategies
-    if [[ "$command_processed" != "true" ]]; then
-        log_warn "Command not processed after $((verify_max + 3))s, attempting recovery..."
-        retry_attempted=true
+        log_warn "Command not processed (attempt $retry_count/$max_retries), retrying in ${backoff}s..."
 
         # Strategy 1: Try an Enter key nudge first
         # The command is typically already visible at the prompt and just needs Enter to trigger processing.
-        # This is a lighter-weight intervention that avoids potentially double-sending the command.
         log_info "Trying Enter key nudge..."
         tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-m
-        sleep 2
 
+        # Brief check after nudge
+        sleep 2
         local pane_content
         pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
         if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
             command_processed=true
-            log_success "Command processed after Enter nudge"
+            log_success "Command processed after Enter nudge (attempt $retry_count)"
+            break
         fi
 
-        # Strategy 2: If nudge failed, re-send the full command
-        if [[ "$command_processed" != "true" ]]; then
-            log_info "Enter nudge failed, re-sending full command..."
+        # Strategy 2: Wait with backoff then re-send full command
+        log_info "Enter nudge failed, waiting ${backoff}s before re-sending command..."
+        sleep "$backoff"
 
-            # Wait additional time for TUI to be fully ready
-            sleep 3
+        log_info "Re-sending role command: $role_cmd"
+        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
 
-            # Re-send the full command + Enter
-            log_info "Retrying role command: $role_cmd"
-            tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
+        # Grace period after re-send
+        sleep 2
+    done
 
-            # Re-verify with shorter window
-            sleep 3
-            local retry_verify_elapsed=0
-            local retry_verify_max=5
-
-            while [[ $retry_verify_elapsed -lt $retry_verify_max ]]; do
-                pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
-
-                if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-                    command_processed=true
-                    log_success "Command processed after full retry"
-                    break
-                fi
-
-                sleep 1
-                retry_verify_elapsed=$((retry_verify_elapsed + 1))
-            done
-        fi
-    fi
-
-    # Fail spawn if command still wasn't processed after retry
+    # Fail spawn if command still wasn't processed after all retries
     if [[ "$command_processed" != "true" ]]; then
-        log_error "Command dispatch failed after retry - agent may be stuck at prompt"
+        log_error "Command dispatch failed after $max_retries retries - agent may be stuck at prompt"
         log_error "Session: $session_name"
         log_error "Killing session to allow shepherd retry"
         tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
         return 1
     fi
 
-    if [[ "$retry_attempted" == "true" ]]; then
-        log_info "Note: Command required retry to process (initial dispatch may have been too early)"
+    if [[ $retry_count -gt 0 ]]; then
+        log_info "Note: Command required $retry_count retry(s) to process (initial dispatch may have been too early)"
     fi
 
     log_success "Agent spawned successfully"
