@@ -1,0 +1,1024 @@
+"""Consolidated daemon state snapshot.
+
+Replaces ``daemon-snapshot.sh`` (1,056 lines, 91 jq invocations) with
+typed Python objects and ``concurrent.futures`` for parallel GitHub API
+queries.
+
+Usage::
+
+    python -m loom_tools.snapshot              # compact JSON
+    python -m loom_tools.snapshot --pretty     # indented JSON
+    python -m loom_tools.snapshot --help       # show help
+
+The output JSON is schema-compatible with the shell version consumed by
+``loom-iteration.md`` and ``health-check.sh``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Sequence
+
+from loom_tools.common.github import gh_parallel_queries
+from loom_tools.common.logging import log_warning
+from loom_tools.common.repo import find_repo_root
+from loom_tools.common.state import read_daemon_state, read_progress_files
+from loom_tools.common.time_utils import elapsed_seconds, now_utc
+
+# ---------------------------------------------------------------------------
+# Configuration (13 env vars, same defaults as shell version)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SnapshotConfig:
+    """Configuration thresholds loaded from environment variables."""
+
+    issue_threshold: int = 3
+    max_shepherds: int = 3
+    max_proposals: int = 5
+    architect_cooldown: int = 1800
+    hermit_cooldown: int = 1800
+    guide_interval: int = 900
+    champion_interval: int = 600
+    doctor_interval: int = 300
+    auditor_interval: int = 600
+    judge_interval: int = 300
+    issue_strategy: str = "fifo"
+    heartbeat_stale_threshold: int = 120
+    tmux_socket: str = "loom"
+
+    @classmethod
+    def from_env(cls) -> SnapshotConfig:
+        """Build config from ``LOOM_*`` environment variables."""
+        def _int(key: str, default: int) -> int:
+            val = os.environ.get(key, "")
+            try:
+                return int(val) if val else default
+            except ValueError:
+                return default
+
+        return cls(
+            issue_threshold=_int("LOOM_ISSUE_THRESHOLD", 3),
+            max_shepherds=_int("LOOM_MAX_SHEPHERDS", 3),
+            max_proposals=_int("LOOM_MAX_PROPOSALS", 5),
+            architect_cooldown=_int("LOOM_ARCHITECT_COOLDOWN", 1800),
+            hermit_cooldown=_int("LOOM_HERMIT_COOLDOWN", 1800),
+            guide_interval=_int("LOOM_GUIDE_INTERVAL", 900),
+            champion_interval=_int("LOOM_CHAMPION_INTERVAL", 600),
+            doctor_interval=_int("LOOM_DOCTOR_INTERVAL", 300),
+            auditor_interval=_int("LOOM_AUDITOR_INTERVAL", 600),
+            judge_interval=_int("LOOM_JUDGE_INTERVAL", 300),
+            issue_strategy=os.environ.get("LOOM_ISSUE_STRATEGY", "fifo"),
+            heartbeat_stale_threshold=_int("LOOM_HEARTBEAT_STALE_THRESHOLD", 120),
+            tmux_socket=os.environ.get("LOOM_TMUX_SOCKET", "loom"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "issue_threshold": self.issue_threshold,
+            "max_shepherds": self.max_shepherds,
+            "max_proposals": self.max_proposals,
+            "issue_strategy": self.issue_strategy,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Support role state
+# ---------------------------------------------------------------------------
+
+_SUPPORT_ROLES = ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")
+
+# Roles that can have demand-based triggers
+_DEMAND_ROLES = frozenset({"champion", "doctor", "judge"})
+
+
+@dataclass
+class SupportRoleState:
+    """Computed idle-time and trigger state for a single support role."""
+
+    status: str = "idle"
+    idle_seconds: int = 0
+    interval: int = 0
+    needs_trigger: bool = False
+    demand_trigger: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "status": self.status,
+            "idle_seconds": self.idle_seconds,
+            "interval": self.interval,
+            "needs_trigger": self.needs_trigger,
+        }
+        if self.demand_trigger is not False:
+            d["demand_trigger"] = self.demand_trigger
+        return d
+
+
+def _role_interval(role: str, cfg: SnapshotConfig) -> int:
+    """Return the interval/cooldown for *role*."""
+    return {
+        "guide": cfg.guide_interval,
+        "champion": cfg.champion_interval,
+        "doctor": cfg.doctor_interval,
+        "auditor": cfg.auditor_interval,
+        "judge": cfg.judge_interval,
+        "architect": cfg.architect_cooldown,
+        "hermit": cfg.hermit_cooldown,
+    }.get(role, 0)
+
+
+def compute_support_role_state(
+    daemon_state: Any,
+    cfg: SnapshotConfig,
+    *,
+    _now: datetime | None = None,
+) -> dict[str, SupportRoleState]:
+    """Compute idle times and ``needs_trigger`` for all 7 support roles."""
+    now = _now or now_utc()
+    result: dict[str, SupportRoleState] = {}
+
+    for role in _SUPPORT_ROLES:
+        entry = daemon_state.support_roles.get(role)
+        status = entry.status if entry else "idle"
+        last_completed = entry.last_completed if entry else None
+        interval = _role_interval(role, cfg)
+
+        idle_seconds = 0
+        needs_trigger = False
+
+        if last_completed and last_completed != "null":
+            try:
+                idle_seconds = _elapsed(last_completed, now)
+                if status != "running" and idle_seconds > interval:
+                    needs_trigger = True
+            except (ValueError, OSError):
+                pass
+        elif status != "running":
+            # Never run — needs trigger
+            needs_trigger = True
+
+        state = SupportRoleState(
+            status=status,
+            idle_seconds=idle_seconds,
+            interval=interval,
+            needs_trigger=needs_trigger,
+        )
+        result[role] = state
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Pipeline data collection (parallel gh queries)
+# ---------------------------------------------------------------------------
+
+_ISSUE_FIELDS = ["number", "title", "labels", "createdAt"]
+_PR_FIELDS = ["number", "title", "labels", "headRefName"]
+
+
+def collect_pipeline_data(
+    repo_root: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    """Run 10 parallel ``gh`` queries and return raw pipeline data.
+
+    Returns a dict with keys:
+        ready_issues, building_issues, blocked_issues,
+        architect_proposals, hermit_proposals, curated_issues,
+        review_requested, changes_requested, ready_to_merge,
+        usage
+    """
+    issue_field_str = ",".join(_ISSUE_FIELDS)
+    pr_field_str = ",".join(_PR_FIELDS)
+
+    queries: list[Sequence[str]] = [
+        # 0: ready issues
+        ["issue", "list", "--label", "loom:issue", "--state", "open", "--json", issue_field_str],
+        # 1: building issues
+        ["issue", "list", "--label", "loom:building", "--state", "open", "--json", "number,title,labels"],
+        # 2: architect proposals
+        ["issue", "list", "--label", "loom:architect", "--state", "open", "--json", "number,title,labels"],
+        # 3: hermit proposals
+        ["issue", "list", "--label", "loom:hermit", "--state", "open", "--json", "number,title,labels"],
+        # 4: curated issues
+        ["issue", "list", "--label", "loom:curated", "--state", "open", "--json", "number,title,labels"],
+        # 5: blocked issues
+        ["issue", "list", "--label", "loom:blocked", "--state", "open", "--json", "number,title,labels"],
+        # 6: review-requested PRs
+        ["pr", "list", "--label", "loom:review-requested", "--state", "open", "--json", pr_field_str],
+        # 7: changes-requested PRs
+        ["pr", "list", "--label", "loom:changes-requested", "--state", "open", "--json", pr_field_str],
+        # 8: ready-to-merge PRs
+        ["pr", "list", "--label", "loom:pr", "--state", "open", "--json", pr_field_str],
+    ]
+
+    results = gh_parallel_queries(queries, max_workers=8)
+
+    # Filter curated issues: exclude those also labeled loom:building or loom:issue
+    curated_raw = results[4]
+    curated_filtered = [
+        item for item in curated_raw
+        if not _has_label(item, "loom:building") and not _has_label(item, "loom:issue")
+    ]
+
+    # Run usage check separately (it's a script, not a gh query)
+    usage = _collect_usage(repo_root)
+
+    return {
+        "ready_issues": results[0],
+        "building_issues": results[1],
+        "architect_proposals": results[2],
+        "hermit_proposals": results[3],
+        "curated_issues": curated_filtered,
+        "blocked_issues": results[5],
+        "review_requested": results[6],
+        "changes_requested": results[7],
+        "ready_to_merge": results[8],
+        "usage": usage,
+    }
+
+
+def _has_label(item: dict[str, Any], label: str) -> bool:
+    """Check if an issue/PR dict has a specific label."""
+    for lbl in item.get("labels", []):
+        if lbl.get("name") == label:
+            return True
+    return False
+
+
+def _collect_usage(repo_root: Any) -> dict[str, Any]:
+    """Run check-usage.sh and return its JSON output."""
+    script = repo_root / ".loom" / "scripts" / "check-usage.sh"
+    if not script.exists():
+        return {"error": "check-usage.sh not found"}
+    try:
+        result = subprocess.run(
+            [str(script)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+        return {"error": "invalid response"}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return {"error": "no data"}
+
+
+# ---------------------------------------------------------------------------
+# Issue sorting
+# ---------------------------------------------------------------------------
+
+def sort_issues_by_strategy(
+    issues: list[dict[str, Any]],
+    strategy: str,
+) -> list[dict[str, Any]]:
+    """Sort issues according to strategy, with ``loom:urgent`` always first.
+
+    Strategies:
+        fifo: oldest first (ascending createdAt)
+        lifo: newest first (descending createdAt)
+        priority: same as fifo (urgent first, then oldest)
+        fallback: same as fifo (unknown strategy warning)
+    """
+    urgent = [i for i in issues if _has_label(i, "loom:urgent")]
+    non_urgent = [i for i in issues if not _has_label(i, "loom:urgent")]
+
+    if strategy in ("fifo", "priority"):
+        urgent.sort(key=_created_at_key)
+        non_urgent.sort(key=_created_at_key)
+    elif strategy == "lifo":
+        urgent.sort(key=_created_at_key, reverse=True)
+        non_urgent.sort(key=_created_at_key, reverse=True)
+    else:
+        log_warning(f"Unknown issue strategy '{strategy}', falling back to fifo")
+        urgent.sort(key=_created_at_key)
+        non_urgent.sort(key=_created_at_key)
+
+    return urgent + non_urgent
+
+
+def _created_at_key(item: dict[str, Any]) -> str:
+    """Extract createdAt for sorting (empty string as fallback)."""
+    return item.get("createdAt", "")
+
+
+# ---------------------------------------------------------------------------
+# Shepherd progress and heartbeat staleness
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EnhancedProgress:
+    """Shepherd progress with computed heartbeat fields."""
+
+    raw: dict[str, Any]
+    heartbeat_age_seconds: int = -1
+    heartbeat_stale: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        d = dict(self.raw)
+        d["heartbeat_age_seconds"] = self.heartbeat_age_seconds
+        d["heartbeat_stale"] = self.heartbeat_stale
+        return d
+
+
+def compute_shepherd_progress(
+    repo_root: Any,
+    cfg: SnapshotConfig,
+    *,
+    _now: datetime | None = None,
+) -> list[EnhancedProgress]:
+    """Read progress files and compute heartbeat staleness."""
+    now = _now or now_utc()
+    progress_files = read_progress_files(repo_root)
+    results: list[EnhancedProgress] = []
+
+    for sp in progress_files:
+        age = -1
+        stale = False
+
+        if sp.last_heartbeat:
+            try:
+                age = _elapsed(sp.last_heartbeat, now)
+                if age > cfg.heartbeat_stale_threshold:
+                    stale = True
+            except (ValueError, OSError):
+                pass
+
+        results.append(EnhancedProgress(
+            raw=sp.to_dict(),
+            heartbeat_age_seconds=age,
+            heartbeat_stale=stale,
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Tmux pool detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TmuxPool:
+    """Tmux agent pool status."""
+
+    available: bool = False
+    sessions: list[str] = field(default_factory=list)
+    shepherd_count: int = 0
+    total_count: int = 0
+    execution_mode: str = "direct"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "available": self.available,
+            "sessions": self.sessions,
+            "shepherd_count": self.shepherd_count,
+            "total_count": self.total_count,
+            "execution_mode": self.execution_mode,
+        }
+
+
+def detect_tmux_pool(tmux_socket: str = "loom") -> TmuxPool:
+    """Detect tmux agent pool status via subprocess calls."""
+    try:
+        # Check if tmux server is running with the loom socket
+        subprocess.run(
+            ["tmux", "-L", tmux_socket, "has-session"],
+            capture_output=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return TmuxPool()
+
+    try:
+        result = subprocess.run(
+            ["tmux", "-L", tmux_socket, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return TmuxPool()
+
+        sessions = [s.strip() for s in result.stdout.strip().splitlines() if s.strip()]
+        shepherd_count = sum(1 for s in sessions if "shepherd" in s)
+        execution_mode = "tmux" if shepherd_count > 0 else "direct"
+
+        return TmuxPool(
+            available=True,
+            sessions=sessions,
+            shepherd_count=shepherd_count,
+            total_count=len(sessions),
+            execution_mode=execution_mode,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return TmuxPool()
+
+
+# ---------------------------------------------------------------------------
+# Task ID validation
+# ---------------------------------------------------------------------------
+
+_TASK_ID_RE = re.compile(r"^[a-f0-9]{7}$")
+
+
+def validate_task_ids(daemon_state: Any) -> list[dict[str, str]]:
+    """Check all task IDs in daemon state for ``^[a-f0-9]{7}$`` format.
+
+    Returns a list of ``{location, key, task_id}`` dicts for invalid IDs.
+    """
+    invalid: list[dict[str, str]] = []
+
+    for key, entry in daemon_state.shepherds.items():
+        tid = entry.task_id
+        if tid and not _TASK_ID_RE.match(tid):
+            invalid.append({"location": "shepherds", "key": key, "task_id": tid})
+
+    for key, entry in daemon_state.support_roles.items():
+        tid = entry.task_id
+        if tid and not _TASK_ID_RE.match(tid):
+            invalid.append({"location": "support_roles", "key": key, "task_id": tid})
+
+    return invalid
+
+
+# ---------------------------------------------------------------------------
+# Orphaned shepherd detection
+# ---------------------------------------------------------------------------
+
+def detect_orphaned_shepherds(
+    daemon_state: Any,
+    building_issues: list[dict[str, Any]],
+    shepherd_progress: list[EnhancedProgress],
+) -> list[dict[str, Any]]:
+    """Detect orphaned shepherds.
+
+    An orphaned shepherd is:
+    1. A ``loom:building`` issue not tracked in any daemon-state shepherd
+    2. A progress file with stale heartbeat and ``working`` status
+    """
+    orphaned: list[dict[str, Any]] = []
+
+    # Get issues tracked by active daemon shepherds
+    tracked_issues: set[int] = set()
+    for entry in daemon_state.shepherds.values():
+        if entry.status == "working" and entry.issue is not None:
+            tracked_issues.add(entry.issue)
+
+    # Check 1: building issues not tracked in daemon-state
+    for item in building_issues:
+        issue_num = item.get("number")
+        if issue_num is None:
+            continue
+        if issue_num not in tracked_issues:
+            # Check for active (non-stale) progress file
+            has_active = any(
+                ep.raw.get("issue") == issue_num
+                and ep.raw.get("status") == "working"
+                and not ep.heartbeat_stale
+                for ep in shepherd_progress
+            )
+            if not has_active:
+                orphaned.append({
+                    "type": "untracked_building",
+                    "issue": issue_num,
+                    "reason": "no_daemon_entry",
+                })
+
+    # Check 2: progress files with stale heartbeats
+    for ep in shepherd_progress:
+        if ep.raw.get("status") == "working" and ep.heartbeat_stale:
+            orphaned.append({
+                "type": "stale_heartbeat",
+                "task_id": ep.raw.get("task_id", ""),
+                "issue": ep.raw.get("issue", 0),
+                "age_seconds": ep.heartbeat_age_seconds,
+                "reason": "heartbeat_stale",
+            })
+
+    return orphaned
+
+
+# ---------------------------------------------------------------------------
+# Recommended actions engine
+# ---------------------------------------------------------------------------
+
+def compute_recommended_actions(
+    *,
+    ready_count: int,
+    building_count: int,
+    blocked_count: int,
+    total_proposals: int,
+    architect_count: int,
+    hermit_count: int,
+    review_count: int,
+    changes_count: int,
+    merge_count: int,
+    available_shepherd_slots: int,
+    needs_work_generation: bool,
+    architect_cooldown_ok: bool,
+    hermit_cooldown_ok: bool,
+    support_roles: dict[str, SupportRoleState],
+    orphaned_count: int,
+    invalid_task_id_count: int,
+) -> tuple[list[str], dict[str, bool]]:
+    """Compute recommended actions and demand flags.
+
+    Returns ``(actions, demand_flags)`` where demand_flags has keys
+    ``champion_demand``, ``doctor_demand``, ``judge_demand``.
+    """
+    actions: list[str] = []
+    demand = {"champion_demand": False, "doctor_demand": False, "judge_demand": False}
+
+    # Action: promote proposals (for force mode)
+    if total_proposals > 0:
+        actions.append("promote_proposals")
+
+    # Action: spawn shepherds
+    if ready_count > 0 and available_shepherd_slots > 0:
+        actions.append("spawn_shepherds")
+
+    # Action: trigger architect
+    architect_state = support_roles.get("architect")
+    architect_status = architect_state.status if architect_state else "idle"
+    if (needs_work_generation and architect_cooldown_ok
+            and architect_count < 2 and architect_status != "running"):
+        actions.append("trigger_architect")
+
+    # Action: trigger hermit
+    hermit_state = support_roles.get("hermit")
+    hermit_status = hermit_state.status if hermit_state else "idle"
+    if (needs_work_generation and hermit_cooldown_ok
+            and hermit_count < 2 and hermit_status != "running"):
+        actions.append("trigger_hermit")
+
+    # Action: check stuck
+    if building_count > 0:
+        actions.append("check_stuck")
+
+    # Demand-based spawning
+    champion_status = support_roles.get("champion", SupportRoleState()).status
+    if merge_count > 0 and champion_status != "running":
+        actions.append("spawn_champion_demand")
+        demand["champion_demand"] = True
+
+    doctor_status = support_roles.get("doctor", SupportRoleState()).status
+    if changes_count > 0 and doctor_status != "running":
+        actions.append("spawn_doctor_demand")
+        demand["doctor_demand"] = True
+
+    judge_status = support_roles.get("judge", SupportRoleState()).status
+    if review_count > 0 and judge_status != "running":
+        actions.append("spawn_judge_demand")
+        demand["judge_demand"] = True
+
+    # Interval-based triggers (skip if demand trigger handles it)
+    guide_state = support_roles.get("guide", SupportRoleState())
+    if guide_state.needs_trigger:
+        actions.append("trigger_guide")
+
+    champion_state = support_roles.get("champion", SupportRoleState())
+    if champion_state.needs_trigger and not demand["champion_demand"]:
+        actions.append("trigger_champion")
+
+    doctor_state_obj = support_roles.get("doctor", SupportRoleState())
+    if doctor_state_obj.needs_trigger and not demand["doctor_demand"]:
+        actions.append("trigger_doctor")
+
+    auditor_state = support_roles.get("auditor", SupportRoleState())
+    if auditor_state.needs_trigger:
+        actions.append("trigger_auditor")
+
+    judge_state = support_roles.get("judge", SupportRoleState())
+    if judge_state.needs_trigger and not demand["judge_demand"]:
+        actions.append("trigger_judge")
+
+    # Recover orphans
+    if orphaned_count > 0:
+        actions.append("recover_orphans")
+
+    # Validate state
+    if invalid_task_id_count > 0:
+        actions.append("validate_state")
+
+    # Wait fallback
+    if not actions or (len(actions) == 1 and actions[0] == "check_stuck"):
+        actions.append("wait")
+
+    return actions, demand
+
+
+# ---------------------------------------------------------------------------
+# Health warnings and status
+# ---------------------------------------------------------------------------
+
+def compute_health(
+    *,
+    ready_count: int,
+    building_count: int,
+    blocked_count: int,
+    total_proposals: int,
+    stale_heartbeat_count: int,
+    orphaned_count: int,
+    usage_healthy: bool,
+    session_percent: float,
+) -> tuple[str, list[dict[str, str]]]:
+    """Compute health status and warnings.
+
+    Returns ``(health_status, health_warnings)``.
+    """
+    warnings: list[dict[str, str]] = []
+
+    # pipeline_stalled
+    if ready_count == 0 and building_count == 0 and blocked_count > 0:
+        warnings.append({
+            "code": "pipeline_stalled",
+            "level": "warning",
+            "message": f"0 ready, {blocked_count} blocked, 0 building — pipeline has no actionable work",
+        })
+
+    # proposal_backlog
+    if ready_count == 0 and building_count == 0 and total_proposals > 0:
+        warnings.append({
+            "code": "proposal_backlog",
+            "level": "info",
+            "message": f"{total_proposals} proposals awaiting approval, pipeline empty",
+        })
+
+    # no_work_available
+    if ready_count == 0 and building_count == 0 and blocked_count == 0 and total_proposals == 0:
+        warnings.append({
+            "code": "no_work_available",
+            "level": "info",
+            "message": "No ready, building, blocked, or proposed issues — pipeline is empty",
+        })
+
+    # stale_heartbeats
+    if stale_heartbeat_count > 0:
+        warnings.append({
+            "code": "stale_heartbeats",
+            "level": "warning",
+            "message": f"{stale_heartbeat_count} shepherd(s) with stale heartbeats — may be stuck",
+        })
+
+    # orphaned_issues
+    if orphaned_count > 0:
+        warnings.append({
+            "code": "orphaned_issues",
+            "level": "warning",
+            "message": f"{orphaned_count} orphaned shepherd(s) detected — recovery needed",
+        })
+
+    # session_budget_low
+    if not usage_healthy:
+        warnings.append({
+            "code": "session_budget_low",
+            "level": "warning",
+            "message": f"Session usage at {session_percent}% — nearing budget limit",
+        })
+
+    # Derive status
+    has_warning = any(w["level"] == "warning" for w in warnings)
+    if has_warning:
+        status = "stalled"
+    elif warnings:
+        status = "degraded"
+    else:
+        status = "healthy"
+
+    return status, warnings
+
+
+# ---------------------------------------------------------------------------
+# Top-level orchestrator
+# ---------------------------------------------------------------------------
+
+def build_snapshot(
+    *,
+    cfg: SnapshotConfig | None = None,
+    repo_root: Any | None = None,
+    _now: datetime | None = None,
+    _pipeline_data: dict[str, Any] | None = None,
+    _tmux_pool: TmuxPool | None = None,
+) -> dict[str, Any]:
+    """Build the full snapshot dict.
+
+    Parameters marked with ``_`` are for testing injection; live calls
+    leave them as ``None``.
+    """
+    if cfg is None:
+        cfg = SnapshotConfig.from_env()
+    if repo_root is None:
+        repo_root = find_repo_root()
+
+    now = _now or now_utc()
+    timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 1. Collect pipeline data
+    pipeline = _pipeline_data if _pipeline_data is not None else collect_pipeline_data(repo_root)
+
+    # 2. Sort ready issues
+    ready_issues = sort_issues_by_strategy(pipeline["ready_issues"], cfg.issue_strategy)
+    building_issues = pipeline["building_issues"]
+    blocked_issues = pipeline["blocked_issues"]
+    architect_proposals = pipeline["architect_proposals"]
+    hermit_proposals = pipeline["hermit_proposals"]
+    curated_issues = pipeline["curated_issues"]
+    review_requested = pipeline["review_requested"]
+    changes_requested = pipeline["changes_requested"]
+    ready_to_merge = pipeline["ready_to_merge"]
+    usage = pipeline.get("usage", {"error": "no data"})
+
+    # 3. Read daemon state
+    daemon_state = read_daemon_state(repo_root)
+
+    # 4. Compute counts
+    ready_count = len(ready_issues)
+    building_count = len(building_issues)
+    blocked_count = len(blocked_issues)
+    architect_count = len(architect_proposals)
+    hermit_count = len(hermit_proposals)
+    curated_count = len(curated_issues)
+    review_count = len(review_requested)
+    changes_count = len(changes_requested)
+    merge_count = len(ready_to_merge)
+
+    total_proposals = architect_count + hermit_count + curated_count
+    total_in_flight = building_count + review_count + changes_count + merge_count
+
+    # Active shepherds
+    active_shepherds = sum(
+        1 for e in daemon_state.shepherds.values() if e.status == "working"
+    )
+    available_shepherd_slots = max(0, cfg.max_shepherds - active_shepherds)
+
+    # 5. Needs work generation
+    needs_work_gen = (ready_count < cfg.issue_threshold and total_proposals < cfg.max_proposals)
+
+    # 6. Support role state
+    sr_state = compute_support_role_state(daemon_state, cfg, _now=now)
+
+    # 7. Cooldown status (derived from support role state)
+    architect_cooldown_ok = sr_state["architect"].needs_trigger or (
+        sr_state["architect"].status != "running" and sr_state["architect"].idle_seconds == 0
+    )
+    hermit_cooldown_ok = sr_state["hermit"].needs_trigger or (
+        sr_state["hermit"].status != "running" and sr_state["hermit"].idle_seconds == 0
+    )
+
+    # More precise: check directly like the shell does
+    architect_cooldown_ok = _check_cooldown(
+        daemon_state.support_roles.get("architect"),
+        cfg.architect_cooldown,
+        now,
+    )
+    hermit_cooldown_ok = _check_cooldown(
+        daemon_state.support_roles.get("hermit"),
+        cfg.hermit_cooldown,
+        now,
+    )
+
+    # 8. Shepherd progress
+    shepherd_progress = compute_shepherd_progress(repo_root, cfg, _now=now)
+    stale_heartbeat_count = sum(
+        1 for ep in shepherd_progress
+        if ep.heartbeat_stale and ep.raw.get("status") == "working"
+    )
+
+    # 9. Tmux pool
+    tmux_pool = _tmux_pool if _tmux_pool is not None else detect_tmux_pool(cfg.tmux_socket)
+
+    # 10. Task ID validation
+    invalid_task_ids = validate_task_ids(daemon_state)
+    invalid_task_id_count = len(invalid_task_ids)
+
+    # 11. Orphaned shepherds
+    orphaned = detect_orphaned_shepherds(daemon_state, building_issues, shepherd_progress)
+    orphaned_count = len(orphaned)
+
+    # 12. Recommended actions
+    actions, demand = compute_recommended_actions(
+        ready_count=ready_count,
+        building_count=building_count,
+        blocked_count=blocked_count,
+        total_proposals=total_proposals,
+        architect_count=architect_count,
+        hermit_count=hermit_count,
+        review_count=review_count,
+        changes_count=changes_count,
+        merge_count=merge_count,
+        available_shepherd_slots=available_shepherd_slots,
+        needs_work_generation=needs_work_gen,
+        architect_cooldown_ok=architect_cooldown_ok,
+        hermit_cooldown_ok=hermit_cooldown_ok,
+        support_roles=sr_state,
+        orphaned_count=orphaned_count,
+        invalid_task_id_count=invalid_task_id_count,
+    )
+
+    # 13. Promotable proposals
+    promotable_proposals = (
+        [i["number"] for i in architect_proposals]
+        + [i["number"] for i in hermit_proposals]
+        + [i["number"] for i in curated_issues]
+    )
+
+    # 14. Usage health
+    session_percent = _extract_session_percent(usage)
+    usage_healthy = session_percent < 97 if isinstance(session_percent, (int, float)) else True
+
+    # 15. Health status
+    health_status, health_warnings = compute_health(
+        ready_count=ready_count,
+        building_count=building_count,
+        blocked_count=blocked_count,
+        total_proposals=total_proposals,
+        stale_heartbeat_count=stale_heartbeat_count,
+        orphaned_count=orphaned_count,
+        usage_healthy=usage_healthy,
+        session_percent=session_percent,
+    )
+
+    # 16. Build support_roles output (schema matches shell)
+    support_roles_out: dict[str, Any] = {}
+    for role in _SUPPORT_ROLES:
+        state = sr_state[role]
+        d: dict[str, Any] = {
+            "status": state.status,
+            "idle_seconds": state.idle_seconds,
+            "interval": state.interval,
+            "needs_trigger": state.needs_trigger,
+        }
+        if role in _DEMAND_ROLES:
+            d["demand_trigger"] = demand.get(f"{role}_demand", False)
+        support_roles_out[role] = d
+
+    # 17. Build final output (exact schema match with shell)
+    usage_out = dict(usage) if isinstance(usage, dict) else {"error": "no data"}
+    usage_out["healthy"] = usage_healthy
+
+    return {
+        "timestamp": timestamp,
+        "pipeline": {
+            "ready_issues": ready_issues,
+            "building_issues": building_issues,
+            "blocked_issues": blocked_issues,
+        },
+        "proposals": {
+            "architect": architect_proposals,
+            "hermit": hermit_proposals,
+            "curated": curated_issues,
+        },
+        "prs": {
+            "review_requested": review_requested,
+            "changes_requested": changes_requested,
+            "ready_to_merge": ready_to_merge,
+        },
+        "shepherds": {
+            "progress": [ep.to_dict() for ep in shepherd_progress],
+            "stale_heartbeat_count": stale_heartbeat_count,
+            "orphaned": orphaned,
+            "orphaned_count": orphaned_count,
+        },
+        "validation": {
+            "invalid_task_ids": invalid_task_ids,
+            "invalid_task_id_count": invalid_task_id_count,
+        },
+        "support_roles": support_roles_out,
+        "usage": usage_out,
+        "tmux_pool": tmux_pool.to_dict(),
+        "computed": {
+            "total_ready": ready_count,
+            "total_building": building_count,
+            "total_blocked": blocked_count,
+            "total_proposals": total_proposals,
+            "total_in_flight": total_in_flight,
+            "active_shepherds": active_shepherds,
+            "available_shepherd_slots": available_shepherd_slots,
+            "needs_work_generation": needs_work_gen,
+            "architect_cooldown_ok": architect_cooldown_ok,
+            "hermit_cooldown_ok": hermit_cooldown_ok,
+            "promotable_proposals": promotable_proposals,
+            "recommended_actions": actions,
+            "stale_heartbeat_count": stale_heartbeat_count,
+            "orphaned_count": orphaned_count,
+            "prs_awaiting_review": review_count,
+            "prs_needing_fixes": changes_count,
+            "prs_ready_to_merge": merge_count,
+            "champion_demand": demand["champion_demand"],
+            "doctor_demand": demand["doctor_demand"],
+            "judge_demand": demand["judge_demand"],
+            "execution_mode": tmux_pool.execution_mode,
+            "tmux_available": tmux_pool.available,
+            "tmux_shepherd_count": tmux_pool.shepherd_count,
+            "health_status": health_status,
+            "health_warnings": health_warnings,
+        },
+        "config": cfg.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _elapsed(ts: str, now: datetime) -> int:
+    """Seconds since ISO timestamp *ts* relative to *now*."""
+    if ts.endswith("Z"):
+        ts = ts[:-1] + "+00:00"
+    dt = datetime.fromisoformat(ts)
+    return int((now - dt).total_seconds())
+
+
+def _check_cooldown(
+    entry: Any | None,
+    cooldown: int,
+    now: datetime,
+) -> bool:
+    """Check if a role's cooldown has elapsed (True = OK to trigger)."""
+    if entry is None:
+        return True
+    last_completed = entry.last_completed
+    if not last_completed or last_completed == "null":
+        return True
+    try:
+        elapsed = _elapsed(last_completed, now)
+        return elapsed > cooldown
+    except (ValueError, OSError):
+        return True
+
+
+def _extract_session_percent(usage: Any) -> float:
+    """Extract session_percent from usage data, defaulting to 0."""
+    if not isinstance(usage, dict):
+        return 0.0
+    val = usage.get("session_percent", 0)
+    if val is None or val == "null":
+        return 0.0
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+_HELP_TEXT = """\
+daemon-snapshot.py - Consolidated daemon state snapshot (Python)
+
+USAGE:
+    python -m loom_tools.snapshot              Output JSON snapshot (compact)
+    python -m loom_tools.snapshot --pretty     Output pretty-printed JSON
+    python -m loom_tools.snapshot --help       Show this help
+
+DESCRIPTION:
+    Consolidates all daemon state queries into a single JSON output.
+    Runs GitHub API queries in parallel for efficiency.
+
+    Python port of daemon-snapshot.sh with identical output schema.
+
+ENVIRONMENT VARIABLES:
+    LOOM_ISSUE_THRESHOLD     Threshold for work generation (default: 3)
+    LOOM_MAX_SHEPHERDS       Maximum concurrent shepherds (default: 3)
+    LOOM_MAX_PROPOSALS       Maximum pending proposals (default: 5)
+    LOOM_ARCHITECT_COOLDOWN  Architect trigger cooldown in seconds (default: 1800)
+    LOOM_HERMIT_COOLDOWN     Hermit trigger cooldown in seconds (default: 1800)
+    LOOM_GUIDE_INTERVAL      Guide re-trigger interval in seconds (default: 900)
+    LOOM_CHAMPION_INTERVAL   Champion re-trigger interval in seconds (default: 600)
+    LOOM_DOCTOR_INTERVAL     Doctor re-trigger interval in seconds (default: 300)
+    LOOM_AUDITOR_INTERVAL    Auditor re-trigger interval in seconds (default: 600)
+    LOOM_JUDGE_INTERVAL      Judge re-trigger interval in seconds (default: 300)
+    LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
+    LOOM_HEARTBEAT_STALE_THRESHOLD  Heartbeat staleness threshold (default: 120)
+    LOOM_TMUX_SOCKET         Tmux socket name (default: loom)
+"""
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    """CLI entry point."""
+    args = list(argv if argv is not None else sys.argv[1:])
+
+    pretty = False
+    for arg in args:
+        if arg in ("--help", "-h"):
+            print(_HELP_TEXT)
+            sys.exit(0)
+        elif arg == "--pretty":
+            pretty = True
+        else:
+            print(f"Unknown option: {arg}", file=sys.stderr)
+            print("Run 'python -m loom_tools.snapshot --help' for usage", file=sys.stderr)
+            sys.exit(1)
+
+    snapshot = build_snapshot()
+
+    if pretty:
+        print(json.dumps(snapshot, indent=2))
+    else:
+        print(json.dumps(snapshot, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()
