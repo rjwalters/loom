@@ -536,8 +536,13 @@ fail_with_reason() {
         builder:*"worktree"*)             error_class="worktree_failed" ;;
         builder:*"validation"*)           error_class="builder_validation" ;;
         builder:*"could not find PR"*)    error_class="builder_validation" ;;
+        builder:*"agent stuck"*)          error_class="builder_stuck" ;;
         judge:*"validation"*)             error_class="judge_validation" ;;
+        judge:*"agent stuck"*)            error_class="judge_stuck" ;;
         doctor:*"validation"*)            error_class="doctor_validation" ;;
+        doctor:*"agent stuck"*)           error_class="doctor_stuck" ;;
+        doctor:*"max retries"*)           error_class="doctor_exhausted" ;;
+        merge:*"failed to merge"*)        error_class="merge_failed" ;;
         curator:*"validation"*)           error_class="unknown" ;;  # Curator failures are non-blocking
         *)                                error_class="unknown" ;;
     esac
