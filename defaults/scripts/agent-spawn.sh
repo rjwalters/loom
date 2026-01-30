@@ -40,7 +40,6 @@ set -euo pipefail
 # Configuration
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
-READINESS_TIMEOUT_SECONDS=30
 STUCK_SESSION_THRESHOLD_SECONDS=${LOOM_STUCK_SESSION_THRESHOLD:-300}  # 5 minutes
 
 # Colors for output
@@ -135,10 +134,7 @@ ${YELLOW}EXAMPLES:${NC}
     ./.loom/scripts/signal.sh stop shepherd-1
 
 ${YELLOW}ENVIRONMENT:${NC}
-    LOOM_TUI_INIT_WAIT     - TUI initialization wait in seconds (default: 4)
-    LOOM_SPAWN_MAX_RETRIES - Max command dispatch retries (default: 3)
-    LOOM_SPAWN_INITIAL_GRACE - Initial grace period in seconds (default: 4)
-    LOOM_SPAWN_VERIFY_WINDOW - Processing verification window in seconds (default: 5)
+    LOOM_SPAWN_VERIFY_TIMEOUT - Timeout for processing verification in seconds (default: 30)
     LOOM_STUCK_SESSION_THRESHOLD - Seconds before idle session is considered stuck (default: 300)
 
 ${YELLOW}TMUX ARCHITECTURE:${NC}
@@ -487,151 +483,71 @@ EOF
     tmux -L "$TMUX_SOCKET" set-environment -t "$session_name" LOOM_WORKSPACE "$working_dir"
     tmux -L "$TMUX_SOCKET" set-environment -t "$session_name" LOOM_ROLE "$role"
 
-    # Build the Claude CLI command
-    # Use claude-wrapper.sh if it exists for resilience, otherwise use claude directly
-    local claude_cmd
-    local wrapper_script="${repo_root}/.loom/scripts/claude-wrapper.sh"
-
-    if [[ -x "$wrapper_script" ]]; then
-        # Export environment variables for the wrapper
-        claude_cmd="LOOM_TERMINAL_ID='$name' LOOM_WORKSPACE='$working_dir' '$wrapper_script' --dangerously-skip-permissions"
-    else
-        claude_cmd="claude --dangerously-skip-permissions"
-        log_warn "claude-wrapper.sh not found, using claude directly (no retry logic)"
-    fi
-
-    # Send the Claude CLI command to the session
-    log_info "Starting Claude CLI..."
-    tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$claude_cmd" C-m
-
-    # Wait for Claude to be ready by polling for the input prompt indicator
-    local max_wait=$READINESS_TIMEOUT_SECONDS
-    local elapsed=0
-    log_info "Waiting for Claude CLI to become ready (up to ${max_wait}s)..."
-    while [[ $elapsed -lt $max_wait ]]; do
-        # Look for the ❯ prompt character that indicates Claude Code is ready for input
-        if tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null | grep -q '❯'; then
-            log_info "Claude CLI prompt detected after ${elapsed}s"
-            break
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
-
-    if [[ $elapsed -ge $max_wait ]]; then
-        log_warn "Claude CLI did not show ready prompt within ${max_wait}s, sending command anyway"
-    else
-        # IMPORTANT: Claude Code renders the ❯ prompt character as part of its TUI layout
-        # BEFORE the input handler is fully ready to receive keystrokes. If we send
-        # the command immediately after detecting the prompt, the Enter key may be lost.
-        # Wait for the TUI to fully initialize before sending the command.
-        # See: https://github.com/rjwalters/loom/issues/1535
-        #
-        # Configurable via LOOM_TUI_INIT_WAIT (default: 4s, increased from 2s per #1550)
-        local tui_init_wait="${LOOM_TUI_INIT_WAIT:-4}"
-        log_info "Waiting ${tui_init_wait}s for TUI input handler to initialize..."
-        sleep "$tui_init_wait"
-    fi
-
-    # Send the role slash command
+    # Build the role slash command to pass as initial prompt
     local role_cmd="/${role}"
     if [[ -n "$args" ]]; then
         role_cmd="${role_cmd} ${args}"
     fi
 
-    log_info "Sending role command: $role_cmd"
-    tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
+    # Build the Claude CLI command with the role command as initial prompt
+    # This eliminates TUI timing issues by passing the command at launch
+    # instead of sending it via tmux after the TUI is ready.
+    # See: https://github.com/rjwalters/loom/issues/1559
+    local claude_cmd
+    local wrapper_script="${repo_root}/.loom/scripts/claude-wrapper.sh"
 
-    # Verify the command was actually processed.
-    # Claude Code renders the ❯ prompt character as part of its TUI layout BEFORE
-    # the input handler is ready, so we may have sent the command too early.
-    # Poll for processing indicators to confirm the command is being handled.
+    if [[ -x "$wrapper_script" ]]; then
+        # Export environment variables for the wrapper
+        # Quote the role_cmd to preserve spaces in args
+        claude_cmd="LOOM_TERMINAL_ID='$name' LOOM_WORKSPACE='$working_dir' '$wrapper_script' --dangerously-skip-permissions \"$role_cmd\""
+    else
+        claude_cmd="claude --dangerously-skip-permissions \"$role_cmd\""
+        log_warn "claude-wrapper.sh not found, using claude directly (no retry logic)"
+    fi
+
+    # Send the Claude CLI command with initial prompt to the session
+    log_info "Starting Claude CLI with command: $role_cmd"
+    tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$claude_cmd" C-m
+
+    # Verify the command is being processed.
+    # Since we pass the command at launch, Claude should start processing immediately
+    # after startup. We poll for processing indicators to confirm.
     #
-    # Uses exponential backoff with configurable retries. If all retries fail,
-    # the spawn fails immediately to allow fast shepherd recovery.
-
     # Pattern for detecting Claude is processing a command:
     # - Spinner characters (Claude thinking)
     # - Progress/status text
     # - Tool use indicators
     local PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'
 
-    # Configurable retry parameters (via environment or defaults)
-    local max_retries="${LOOM_SPAWN_MAX_RETRIES:-3}"
-    local initial_grace="${LOOM_SPAWN_INITIAL_GRACE:-4}"  # Initial grace period in seconds
-    local verify_window="${LOOM_SPAWN_VERIFY_WINDOW:-5}"  # How long to poll for indicators
+    # Configurable verify parameters (via environment or defaults)
+    local verify_timeout="${LOOM_SPAWN_VERIFY_TIMEOUT:-30}"  # Total time to wait for processing
 
     local command_processed=false
-    local retry_count=0
+    local elapsed=0
 
-    # Initial grace period: Claude needs time to parse skill and load context
-    sleep "$initial_grace"
+    log_info "Waiting for Claude to start processing (up to ${verify_timeout}s)..."
 
-    while [[ $retry_count -le $max_retries ]]; do
-        # Poll for processing indicators
-        local verify_elapsed=0
-        while [[ $verify_elapsed -lt $verify_window ]]; do
-            local pane_content
-            pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
-
-            if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-                command_processed=true
-                break 2  # Exit both loops
-            fi
-
-            sleep 1
-            verify_elapsed=$((verify_elapsed + 1))
-        done
-
-        # Command not processed yet
-        if [[ $retry_count -eq $max_retries ]]; then
-            # No more retries left
-            break
-        fi
-
-        # Calculate backoff: 2^retry_count seconds (2s, 4s, 8s...)
-        local backoff=$((2 ** retry_count))
-        retry_count=$((retry_count + 1))
-
-        log_warn "Command not processed (attempt $retry_count/$max_retries), retrying in ${backoff}s..."
-
-        # Strategy 1: Try an Enter key nudge first
-        # The command is typically already visible at the prompt and just needs Enter to trigger processing.
-        log_info "Trying Enter key nudge..."
-        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-m
-
-        # Brief check after nudge
-        sleep 2
+    while [[ $elapsed -lt $verify_timeout ]]; do
         local pane_content
         pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
         if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
             command_processed=true
-            log_success "Command processed after Enter nudge (attempt $retry_count)"
+            log_info "Claude started processing after ${elapsed}s"
             break
         fi
 
-        # Strategy 2: Wait with backoff then re-send full command
-        log_info "Enter nudge failed, waiting ${backoff}s before re-sending command..."
-        sleep "$backoff"
-
-        log_info "Re-sending role command: $role_cmd"
-        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
-
-        # Grace period after re-send
-        sleep 2
+        sleep 1
+        elapsed=$((elapsed + 1))
     done
 
-    # Fail spawn if command still wasn't processed after all retries
+    # Fail spawn if command wasn't processed
     if [[ "$command_processed" != "true" ]]; then
-        log_error "Command dispatch failed after $max_retries retries - agent may be stuck at prompt"
+        log_error "Claude did not start processing within ${verify_timeout}s"
         log_error "Session: $session_name"
         log_error "Killing session to allow shepherd retry"
         tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
         return 1
-    fi
-
-    if [[ $retry_count -gt 0 ]]; then
-        log_info "Note: Command required $retry_count retry(s) to process (initial dispatch may have been too early)"
     fi
 
     log_success "Agent spawned successfully"
