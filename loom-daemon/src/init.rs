@@ -32,8 +32,10 @@ pub struct InitReport {
     pub added: Vec<String>,
     /// Files that were preserved (existed before, not overwritten)
     pub preserved: Vec<String>,
-    /// Files that were updated (existed before, overwritten in force mode)
+    /// Files that were updated (existed before, overwritten on reinstall)
     pub updated: Vec<String>,
+    /// Files that failed post-copy verification (destination doesn't match source)
+    pub verification_failures: Vec<String>,
     /// Whether this was a self-installation (Loom source repo)
     pub is_self_install: bool,
     /// Validation results for self-installation mode
@@ -438,6 +440,10 @@ pub fn initialize_workspace(
         }
     }
 
+    // Verify copied files match their sources
+    verify_copied_files(&roles_src, &roles_dst, ".loom/roles", &mut report);
+    verify_copied_files(&scripts_src, &scripts_dst, ".loom/scripts", &mut report);
+
     // Copy .loom-specific README
     let loom_readme_src = defaults.join(".loom-README.md");
     let loom_readme_dst = loom_path.join("README.md");
@@ -782,6 +788,73 @@ fn force_merge_dir_with_report(
     }
 
     Ok(())
+}
+
+/// Verify that copied files match their source after installation
+///
+/// Compares each file in the source directory with the corresponding file in the
+/// destination directory. Files that don't match are added to the report's
+/// verification_failures list.
+fn verify_copied_files(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+) {
+    if !src.exists() || !dst.exists() {
+        return;
+    }
+
+    let entries = match fs::read_dir(src) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst.join(&file_name);
+        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+
+        if file_type.is_dir() {
+            verify_copied_files(&src_path, &dst_path, &rel_path, report);
+        } else if dst_path.exists() {
+            // Compare file contents
+            let src_contents = fs::read(&src_path);
+            let dst_contents = fs::read(&dst_path);
+
+            match (src_contents, dst_contents) {
+                (Ok(src_data), Ok(dst_data)) => {
+                    if src_data != dst_data {
+                        report.verification_failures.push(format!(
+                            "{rel_path} (content mismatch: source {} bytes, installed {} bytes)",
+                            src_data.len(),
+                            dst_data.len()
+                        ));
+                    }
+                }
+                (_, Err(e)) => {
+                    report
+                        .verification_failures
+                        .push(format!("{rel_path} (cannot read installed file: {e})"));
+                }
+                (Err(e), _) => {
+                    report
+                        .verification_failures
+                        .push(format!("{rel_path} (cannot read source file: {e})"));
+                }
+            }
+        } else {
+            report
+                .verification_failures
+                .push(format!("{rel_path} (missing from installation)"));
+        }
+    }
 }
 
 /// Loom section markers for CLAUDE.md content preservation
@@ -1492,6 +1565,93 @@ mod tests {
         assert!(report
             .preserved
             .contains(&".loom/roles/custom-role.md".to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_verify_copied_files_detects_mismatch() {
+        // Post-copy verification should detect files that don't match their source
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        // Create matching file
+        fs::write(src.join("good.sh"), "matching content").unwrap();
+        fs::write(dst.join("good.sh"), "matching content").unwrap();
+
+        // Create mismatched file
+        fs::write(src.join("bad.sh"), "source content").unwrap();
+        fs::write(dst.join("bad.sh"), "different content").unwrap();
+
+        // Create missing file (in source but not in destination)
+        fs::write(src.join("missing.sh"), "should exist").unwrap();
+
+        let mut report = InitReport::default();
+        verify_copied_files(&src, &dst, "scripts", &mut report);
+
+        // Should have 2 failures: mismatch + missing
+        assert_eq!(report.verification_failures.len(), 2);
+        assert!(report.verification_failures.iter().any(|f| f.contains("bad.sh")));
+        assert!(report.verification_failures.iter().any(|f| f.contains("missing.sh")));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_verify_copied_files_passes_on_match() {
+        // Post-copy verification should pass when all files match
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        fs::write(src.join("a.sh"), "content a").unwrap();
+        fs::write(dst.join("a.sh"), "content a").unwrap();
+        fs::write(src.join("b.sh"), "content b").unwrap();
+        fs::write(dst.join("b.sh"), "content b").unwrap();
+
+        let mut report = InitReport::default();
+        verify_copied_files(&src, &dst, "scripts", &mut report);
+
+        assert!(report.verification_failures.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_init_report_includes_verification() {
+        // Full initialization should include verification with no failures
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("scripts")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(defaults.join("scripts").join("test.sh"), "#!/bin/bash").unwrap();
+
+        let result = initialize_workspace(
+            workspace.to_str().unwrap(),
+            defaults.to_str().unwrap(),
+            false,
+        );
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Fresh install should have zero verification failures
+        assert!(
+            report.verification_failures.is_empty(),
+            "Expected no verification failures, got: {:?}",
+            report.verification_failures
+        );
     }
 
     #[test]
