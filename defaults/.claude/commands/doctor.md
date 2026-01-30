@@ -522,6 +522,48 @@ gh pr checks 42
 
 **Important**: Always use `--force-with-lease` instead of `--force` to avoid overwriting others' work.
 
+### Signaling Conflict-Only Resolution (Fast-Track Review)
+
+When you **only** resolve merge conflicts without making substantive code changes, signal this to Judge for an abbreviated review. This optimization significantly reduces re-review time.
+
+**What qualifies as conflict-only:**
+- Pure merge conflict resolution (accepting theirs/ours/merging content)
+- Whitespace-only changes from conflict markers
+- Import reordering due to merge
+- Auto-generated file updates (lock files, etc.)
+
+**What does NOT qualify:**
+- Any logic changes, even if triggered by conflict
+- Bug fixes discovered during conflict resolution
+- Test additions or modifications
+- Documentation updates (other than merge conflict resolution)
+
+**How to signal conflict-only:**
+
+```bash
+# After resolving ONLY merge conflicts (no other changes):
+gh pr comment 42 --body "$(cat <<'EOF'
+🔧 Resolved merge conflicts with main branch.
+
+<!-- loom:conflict-only -->
+
+Changes:
+- Resolved conflicts in `src/foo.ts` (accepted upstream changes)
+- Resolved conflicts in `package-lock.json` (regenerated)
+
+No substantive code changes made - only conflict resolution.
+EOF
+)"
+```
+
+**Important**: The `<!-- loom:conflict-only -->` HTML comment is a machine-readable marker that enables Judge to perform a fast-track review instead of a full code review. Only add this marker when the changes are genuinely conflict-resolution-only.
+
+**Why this matters:**
+- Full code reviews take 2+ minutes even for trivial changes
+- Conflict-only resolutions don't need deep code analysis
+- Fast-track review verifies: merge was clean, CI passes, no unintended changes
+- Reduces the feedback loop from 123+ seconds to ~30 seconds
+
 ### Tests Are Failing
 
 **IMPORTANT**: Before fixing test failures, run the full CI assessment (see "CI Assessment" section above) to identify ALL failing checks, not just tests.
