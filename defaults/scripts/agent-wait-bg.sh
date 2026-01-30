@@ -66,7 +66,10 @@ DEFAULT_IDLE_TIMEOUT=60
 # waiting for idle timeout. This detects completion much faster for phases
 # like builder where the signal is on GitHub (PR exists) rather than in logs.
 # Set to 0 to disable proactive checking (fall back to idle timeout only).
-DEFAULT_CONTRACT_INTERVAL=30
+# Note: The idle timeout (DEFAULT_IDLE_TIMEOUT=60) still provides faster
+# detection when the agent is actually idle, so this interval can be longer
+# without significantly impacting completion detection latency.
+DEFAULT_CONTRACT_INTERVAL=90
 
 # Stuck detection thresholds (configurable via environment variables)
 STUCK_WARNING_THRESHOLD=${LOOM_STUCK_WARNING:-300}   # 5 min default
