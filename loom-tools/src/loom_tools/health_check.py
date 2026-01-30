@@ -1,6 +1,6 @@
 """Diagnostic health check for Loom daemon.
 
-This module provides functionality to:
+This module provides point-in-time diagnostic validation for troubleshooting:
 - Validate daemon state file structure and integrity
 - Check shepherd task ID format (7-char hex)
 - Query GitHub for pipeline state (label counts)
@@ -12,6 +12,22 @@ Exit codes:
     0 - Healthy (no warnings or critical issues)
     1 - Warnings detected (degraded but functional)
     2 - Critical issues (state corruption, orphaned work)
+
+Note: This module is INTENTIONALLY DIFFERENT from health-check.sh.
+--------------------------------------------------------------
+The bash script (.loom/scripts/health-check.sh) is a proactive MONITORING
+system with time-series metrics collection, composite health scoring (0-100),
+and alert management. It is called periodically during daemon operation.
+
+This Python module is a point-in-time DIAGNOSTIC tool for troubleshooting.
+It validates state file integrity and detects orphaned/stale work items.
+
+The two tools serve complementary purposes:
+- Bash: Continuous monitoring and proactive alerting
+- Python: On-demand diagnostics and troubleshooting
+
+See test_health_check.py::TestBashPythonComparison for detailed documentation
+of the intentional differences between these implementations.
 """
 
 from __future__ import annotations
