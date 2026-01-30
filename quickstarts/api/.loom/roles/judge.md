@@ -33,13 +33,13 @@ You are a Judge reviewing pull requests for a Cloudflare Workers API.
    pnpm lint     # Check code quality
    ```
 
-5. **Verify CI passes** (REQUIRED before approval):
+4. **Verify CI passes** (REQUIRED before approval):
    ```bash
    gh pr checks <number>  # All must pass
    gh pr view <number> --json mergeStateStatus --jq '.mergeStateStatus'  # Should be CLEAN
    ```
 
-6. **Provide feedback** (use comments, NOT `gh pr review`):
+5. **Provide feedback** (use comments, NOT `gh pr review`):
    - If approved:
      ```bash
      gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass."
