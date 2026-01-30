@@ -14,14 +14,17 @@ from loom_tools.models.daemon_state import (
     DaemonState,
     ShepherdEntry,
     SupportRoleEntry,
-    SystematicFailure,
+    SystematicFailure as SystematicFailureModel,
 )
+# Rename to avoid conflict with SystematicFailureState from snapshot
+SystematicFailure = SystematicFailureModel
 from loom_tools.models.progress import ShepherdProgress
 from loom_tools.snapshot import (
     EnhancedProgress,
     PipelineHealth,
     SnapshotConfig,
     SupportRoleState,
+    SystematicFailureState,
     TmuxPool,
     build_snapshot,
     compute_health,
@@ -29,6 +32,7 @@ from loom_tools.snapshot import (
     compute_recommended_actions,
     compute_shepherd_progress,
     compute_support_role_state,
+    compute_systematic_failure_state,
     detect_orphaned_shepherds,
     detect_tmux_pool,
     main,
@@ -63,6 +67,8 @@ def _cfg(**overrides: object) -> SnapshotConfig:
         "issue_strategy": "fifo",
         "heartbeat_stale_threshold": 120,
         "tmux_socket": "loom",
+        "systematic_failure_cooldown": 1800,
+        "systematic_failure_max_probes": 3,
     }
     kw.update(overrides)
     return SnapshotConfig(**kw)
@@ -110,6 +116,8 @@ class TestSnapshotConfig:
         assert d["max_retry_count"] == 3
         assert d["retry_cooldown"] == 1800
         assert d["systematic_failure_threshold"] == 3
+        assert d["systematic_failure_cooldown"] == 1800
+        assert d["systematic_failure_max_probes"] == 3
 
     def test_from_env_retry_config(self) -> None:
         env = {
@@ -118,6 +126,8 @@ class TestSnapshotConfig:
             "LOOM_RETRY_BACKOFF_MULTIPLIER": "3",
             "LOOM_RETRY_MAX_COOLDOWN": "28800",
             "LOOM_SYSTEMATIC_FAILURE_THRESHOLD": "4",
+            "LOOM_SYSTEMATIC_FAILURE_COOLDOWN": "3600",
+            "LOOM_SYSTEMATIC_FAILURE_MAX_PROBES": "5",
         }
         with mock.patch.dict("os.environ", env, clear=False):
             cfg = SnapshotConfig.from_env()
@@ -126,6 +136,8 @@ class TestSnapshotConfig:
         assert cfg.retry_backoff_multiplier == 3
         assert cfg.retry_max_cooldown == 28800
         assert cfg.systematic_failure_threshold == 4
+        assert cfg.systematic_failure_cooldown == 3600
+        assert cfg.systematic_failure_max_probes == 5
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +454,7 @@ class TestRecommendedActions:
             "orphaned_count": 0,
             "invalid_task_id_count": 0,
             "systematic_failure_active": False,
+            "systematic_failure_state": None,
             "pipeline_health": None,
         }
 
@@ -575,6 +588,59 @@ class TestRecommendedActions:
         actions, _ = compute_recommended_actions(**kw)
         assert "spawn_shepherds" not in actions
 
+    def test_systematic_failure_probe_after_cooldown(self) -> None:
+        """When systematic failure cooldown has elapsed, recommend probe."""
+        kw = self._base_kwargs()
+        kw["ready_count"] = 2
+        kw["systematic_failure_active"] = True
+        kw["systematic_failure_state"] = SystematicFailureState(
+            active=True,
+            pattern="api_error",
+            probe_count=0,
+            cooldown_elapsed=True,
+            cooldown_remaining_seconds=0,
+            probes_exhausted=False,
+        )
+        actions, _ = compute_recommended_actions(**kw)
+        assert "probe_systematic_failure" in actions
+        # When probing, spawning should be allowed
+        assert "spawn_shepherds" in actions
+
+    def test_systematic_failure_probes_exhausted(self) -> None:
+        """When probes exhausted, require manual intervention."""
+        kw = self._base_kwargs()
+        kw["ready_count"] = 2
+        kw["systematic_failure_active"] = True
+        kw["systematic_failure_state"] = SystematicFailureState(
+            active=True,
+            pattern="api_error",
+            probe_count=3,
+            cooldown_elapsed=True,
+            cooldown_remaining_seconds=0,
+            probes_exhausted=True,
+        )
+        actions, _ = compute_recommended_actions(**kw)
+        assert "systematic_failure_manual_intervention" in actions
+        assert "spawn_shepherds" not in actions
+        assert "probe_systematic_failure" not in actions
+
+    def test_systematic_failure_within_cooldown(self) -> None:
+        """When within cooldown, keep suppressing spawn."""
+        kw = self._base_kwargs()
+        kw["ready_count"] = 2
+        kw["systematic_failure_active"] = True
+        kw["systematic_failure_state"] = SystematicFailureState(
+            active=True,
+            pattern="api_error",
+            probe_count=0,
+            cooldown_elapsed=False,
+            cooldown_remaining_seconds=600,
+            probes_exhausted=False,
+        )
+        actions, _ = compute_recommended_actions(**kw)
+        assert "spawn_shepherds" not in actions
+        assert "probe_systematic_failure" not in actions
+
     def test_retry_blocked_issues_when_stalled(self) -> None:
         kw = self._base_kwargs()
         kw["blocked_count"] = 3
@@ -594,6 +660,97 @@ class TestRecommendedActions:
         kw["pipeline_health"] = PipelineHealth(status="healthy", retryable_count=1)
         actions, _ = compute_recommended_actions(**kw)
         assert "retry_blocked_issues" not in actions
+
+
+# ---------------------------------------------------------------------------
+# Systematic failure state computation
+# ---------------------------------------------------------------------------
+
+
+class TestSystematicFailureState:
+    def test_inactive_systematic_failure(self) -> None:
+        """No systematic failure -> empty state."""
+        ds = DaemonState()
+        result = compute_systematic_failure_state(ds, _cfg(), _now=NOW)
+        assert result.active is False
+        assert result.cooldown_elapsed is False
+
+    def test_cooldown_elapsed_with_cooldown_until(self) -> None:
+        """Cooldown has passed using cooldown_until timestamp."""
+        ds = DaemonState(systematic_failure=SystematicFailure(
+            active=True,
+            pattern="api_error",
+            count=3,
+            detected_at="2026-01-30T17:00:00Z",
+            cooldown_until="2026-01-30T17:30:00Z",  # 30 min before NOW (18:00)
+            probe_count=0,
+        ))
+        result = compute_systematic_failure_state(ds, _cfg(), _now=NOW)
+        assert result.active is True
+        assert result.cooldown_elapsed is True
+        assert result.cooldown_remaining_seconds == 0
+        assert result.probes_exhausted is False
+
+    def test_cooldown_not_elapsed(self) -> None:
+        """Cooldown has not passed yet."""
+        ds = DaemonState(systematic_failure=SystematicFailure(
+            active=True,
+            pattern="api_error",
+            count=3,
+            detected_at="2026-01-30T17:50:00Z",
+            cooldown_until="2026-01-30T18:20:00Z",  # 20 min after NOW
+            probe_count=0,
+        ))
+        result = compute_systematic_failure_state(ds, _cfg(), _now=NOW)
+        assert result.active is True
+        assert result.cooldown_elapsed is False
+        assert result.cooldown_remaining_seconds == 1200  # 20 minutes
+
+    def test_probes_exhausted(self) -> None:
+        """Max probes reached -> probes_exhausted is True."""
+        cfg = _cfg(systematic_failure_max_probes=3)
+        ds = DaemonState(systematic_failure=SystematicFailure(
+            active=True,
+            pattern="api_error",
+            count=3,
+            detected_at="2026-01-30T17:00:00Z",
+            cooldown_until="2026-01-30T17:30:00Z",
+            probe_count=3,
+        ))
+        result = compute_systematic_failure_state(ds, cfg, _now=NOW)
+        assert result.probes_exhausted is True
+
+    def test_fallback_to_detected_at_when_no_cooldown_until(self) -> None:
+        """If no cooldown_until, use detected_at + cooldown."""
+        cfg = _cfg(systematic_failure_cooldown=1800)  # 30 min
+        ds = DaemonState(systematic_failure=SystematicFailure(
+            active=True,
+            pattern="api_error",
+            count=3,
+            detected_at="2026-01-30T17:00:00Z",  # 60 min before NOW
+            cooldown_until=None,
+            probe_count=0,
+        ))
+        result = compute_systematic_failure_state(ds, cfg, _now=NOW)
+        assert result.cooldown_elapsed is True  # 60 min > 30 min cooldown
+
+    def test_exponential_backoff(self) -> None:
+        """Cooldown should double with each probe attempt."""
+        cfg = _cfg(systematic_failure_cooldown=1800)  # 30 min base
+        # After 1 probe: cooldown = 1800 * 2^1 = 3600s (60 min)
+        # detected_at at 17:00, NOW at 18:00 -> 60 min elapsed
+        # With probe_count=1, effective_cooldown=3600, should be exactly at cooldown
+        ds = DaemonState(systematic_failure=SystematicFailure(
+            active=True,
+            pattern="api_error",
+            count=3,
+            detected_at="2026-01-30T17:00:00Z",  # 60 min before NOW
+            cooldown_until=None,
+            probe_count=1,
+        ))
+        result = compute_systematic_failure_state(ds, cfg, _now=NOW)
+        # Elapsed = 3600, cooldown = 3600 -> cooldown_elapsed should be True
+        assert result.cooldown_elapsed is True
 
 
 # ---------------------------------------------------------------------------

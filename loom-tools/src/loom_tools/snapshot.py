@@ -60,6 +60,9 @@ class SnapshotConfig:
     retry_backoff_multiplier: int = 2
     retry_max_cooldown: int = 14400  # 4 hours max cooldown
     systematic_failure_threshold: int = 3
+    # Systematic failure auto-clear configuration
+    systematic_failure_cooldown: int = 1800  # 30 minutes before probe
+    systematic_failure_max_probes: int = 3  # Max probes before giving up
 
     @classmethod
     def from_env(cls) -> SnapshotConfig:
@@ -90,6 +93,8 @@ class SnapshotConfig:
             retry_backoff_multiplier=_int("LOOM_RETRY_BACKOFF_MULTIPLIER", 2),
             retry_max_cooldown=_int("LOOM_RETRY_MAX_COOLDOWN", 14400),
             systematic_failure_threshold=_int("LOOM_SYSTEMATIC_FAILURE_THRESHOLD", 3),
+            systematic_failure_cooldown=_int("LOOM_SYSTEMATIC_FAILURE_COOLDOWN", 1800),
+            systematic_failure_max_probes=_int("LOOM_SYSTEMATIC_FAILURE_MAX_PROBES", 3),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -101,6 +106,8 @@ class SnapshotConfig:
             "max_retry_count": self.max_retry_count,
             "retry_cooldown": self.retry_cooldown,
             "systematic_failure_threshold": self.systematic_failure_threshold,
+            "systematic_failure_cooldown": self.systematic_failure_cooldown,
+            "systematic_failure_max_probes": self.systematic_failure_max_probes,
         }
 
 
@@ -594,6 +601,88 @@ def compute_pipeline_health(
 
 
 # ---------------------------------------------------------------------------
+# Systematic failure state computation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SystematicFailureState:
+    """Computed systematic failure state with cooldown information."""
+
+    active: bool = False
+    pattern: str = ""
+    probe_count: int = 0
+    cooldown_elapsed: bool = False
+    cooldown_remaining_seconds: int = 0
+    probes_exhausted: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active": self.active,
+            "pattern": self.pattern,
+            "probe_count": self.probe_count,
+            "cooldown_elapsed": self.cooldown_elapsed,
+            "cooldown_remaining_seconds": self.cooldown_remaining_seconds,
+            "probes_exhausted": self.probes_exhausted,
+        }
+
+
+def compute_systematic_failure_state(
+    daemon_state: DaemonState,
+    cfg: SnapshotConfig,
+    *,
+    _now: datetime | None = None,
+) -> SystematicFailureState:
+    """Compute systematic failure state with cooldown and probe information.
+
+    Returns a SystematicFailureState with:
+    - cooldown_elapsed: True if enough time has passed for a probe attempt
+    - probes_exhausted: True if max probes reached (require manual intervention)
+    """
+    sf = daemon_state.systematic_failure
+    now = _now or now_utc()
+
+    if not sf.active:
+        return SystematicFailureState()
+
+    # Check if probes are exhausted
+    probes_exhausted = sf.probe_count >= cfg.systematic_failure_max_probes
+
+    # Compute cooldown with exponential backoff based on probe count
+    # First probe: 30min, second: 60min, third: 120min
+    effective_cooldown = cfg.systematic_failure_cooldown * (2 ** sf.probe_count)
+
+    # Check if cooldown has elapsed
+    cooldown_elapsed = False
+    cooldown_remaining = 0
+
+    # Use cooldown_until if set, otherwise fall back to detected_at + cooldown
+    cooldown_reference = sf.cooldown_until or sf.detected_at
+    if cooldown_reference:
+        try:
+            elapsed = _elapsed(cooldown_reference, now)
+            if sf.cooldown_until:
+                # cooldown_until is the target time, so elapsed > 0 means we've passed it
+                cooldown_elapsed = elapsed >= 0
+                cooldown_remaining = max(0, -elapsed)
+            else:
+                # detected_at + effective_cooldown
+                cooldown_elapsed = elapsed >= effective_cooldown
+                cooldown_remaining = max(0, effective_cooldown - elapsed)
+        except (ValueError, OSError):
+            # On parse error, assume cooldown elapsed to allow recovery attempt
+            cooldown_elapsed = True
+
+    return SystematicFailureState(
+        active=sf.active,
+        pattern=sf.pattern,
+        probe_count=sf.probe_count,
+        cooldown_elapsed=cooldown_elapsed,
+        cooldown_remaining_seconds=cooldown_remaining,
+        probes_exhausted=probes_exhausted,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Recommended actions engine
 # ---------------------------------------------------------------------------
 
@@ -616,6 +705,7 @@ def compute_recommended_actions(
     orphaned_count: int,
     invalid_task_id_count: int,
     systematic_failure_active: bool = False,
+    systematic_failure_state: SystematicFailureState | None = None,
     pipeline_health: PipelineHealth | None = None,
 ) -> tuple[list[str], dict[str, bool]]:
     """Compute recommended actions and demand flags.
@@ -630,8 +720,23 @@ def compute_recommended_actions(
     if total_proposals > 0:
         actions.append("promote_proposals")
 
-    # Action: spawn shepherds (suppressed during systematic failure)
-    if ready_count > 0 and available_shepherd_slots > 0 and not systematic_failure_active:
+    # Handle systematic failure state
+    sf_state = systematic_failure_state or SystematicFailureState()
+    should_suppress_spawning = systematic_failure_active
+
+    if systematic_failure_active and sf_state.cooldown_elapsed:
+        if sf_state.probes_exhausted:
+            # Probes exhausted - require manual intervention
+            # Keep suppressing and add a warning action
+            actions.append("systematic_failure_manual_intervention")
+        else:
+            # Cooldown elapsed and probes available - recommend probe
+            actions.append("probe_systematic_failure")
+            # Allow spawning a single probe shepherd
+            should_suppress_spawning = False
+
+    # Action: spawn shepherds (suppressed during systematic failure unless probing)
+    if ready_count > 0 and available_shepherd_slots > 0 and not should_suppress_spawning:
         actions.append("spawn_shepherds")
 
     # Action: trigger architect
@@ -900,8 +1005,9 @@ def build_snapshot(
         now=now,
     )
 
-    # 13. Systematic failure detection
+    # 13. Systematic failure detection and state computation
     sf = daemon_state.systematic_failure
+    sf_state = compute_systematic_failure_state(daemon_state, cfg, _now=now)
 
     # 14. Recommended actions
     actions, demand = compute_recommended_actions(
@@ -922,6 +1028,7 @@ def build_snapshot(
         orphaned_count=orphaned_count,
         invalid_task_id_count=invalid_task_id_count,
         systematic_failure_active=sf.active,
+        systematic_failure_state=sf_state,
         pipeline_health=p_health,
     )
 
@@ -1006,6 +1113,10 @@ def build_snapshot(
             "active": sf.active,
             "pattern": sf.pattern,
             "count": sf.count,
+            "probe_count": sf.probe_count,
+            "cooldown_elapsed": sf_state.cooldown_elapsed,
+            "cooldown_remaining_seconds": sf_state.cooldown_remaining_seconds,
+            "probes_exhausted": sf_state.probes_exhausted,
         },
         "usage": usage_out,
         "tmux_pool": tmux_pool.to_dict(),
@@ -1120,6 +1231,8 @@ ENVIRONMENT VARIABLES:
     LOOM_RETRY_BACKOFF_MULTIPLIER  Backoff multiplier (default: 2)
     LOOM_RETRY_MAX_COOLDOWN  Maximum retry cooldown in seconds (default: 14400)
     LOOM_SYSTEMATIC_FAILURE_THRESHOLD  Consecutive failures to suppress (default: 3)
+    LOOM_SYSTEMATIC_FAILURE_COOLDOWN   Seconds before first probe attempt (default: 1800)
+    LOOM_SYSTEMATIC_FAILURE_MAX_PROBES Maximum probe attempts (default: 3)
 """
 
 
