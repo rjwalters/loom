@@ -536,10 +536,12 @@ check_completion_patterns() {
     # Only check the pattern relevant to the current phase to avoid false matches
     case "$phase" in
         builder)
-            # Builder completion: PR created with loom:review-requested
-            # Look for patterns like "gh pr create" followed by "loom:review-requested"
-            # or explicit PR creation success messages
-            if echo "$recent_log" | grep -qE 'loom:review-requested|PR #[0-9]+ created|pull request.*created'; then
+            # Builder completion: PR created successfully
+            # Match the actual gh pr create OUTPUT (the PR URL), not the command text.
+            # The command text (including "loom:review-requested") appears in Claude Code's
+            # UI rendering while the command is still running, causing false positives.
+            # gh pr create prints the PR URL on success: https://github.com/.../pull/NNN
+            if echo "$recent_log" | grep -qE 'https://github\.com/.*/pull/[0-9]+'; then
                 COMPLETION_REASON="builder_pr_created"
                 return 0
             fi
@@ -569,7 +571,7 @@ check_completion_patterns() {
         *)
             # Unknown phase or shepherd - check all patterns as fallback
             # This handles generic or shepherd sessions that may spawn worker roles
-            if echo "$recent_log" | grep -qE 'loom:review-requested|PR #[0-9]+ created|pull request.*created'; then
+            if echo "$recent_log" | grep -qE 'https://github\.com/.*/pull/[0-9]+'; then
                 COMPLETION_REASON="builder_pr_created"
                 return 0
             fi
