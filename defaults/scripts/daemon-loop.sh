@@ -583,6 +583,21 @@ while true; do
         break
     fi
 
+    # Pre-iteration: Check for retry_blocked_issues action in snapshot
+    # This is handled directly in the shell wrapper (not by LLM iteration)
+    # to ensure deterministic retry behavior with exponential backoff
+    if [[ -x "./.loom/scripts/daemon-snapshot.sh" ]] && [[ -x "./.loom/scripts/retry-blocked-issues.sh" ]]; then
+        snapshot_json=$(./.loom/scripts/daemon-snapshot.sh 2>/dev/null || echo '{}')
+        if echo "$snapshot_json" | jq -e '.computed.recommended_actions | index("retry_blocked_issues")' >/dev/null 2>&1; then
+            log "${CYAN}Retrying blocked issues (exponential backoff)...${NC}"
+            retry_output=$(./.loom/scripts/retry-blocked-issues.sh --execute --json 2>&1) || true
+            retried_count=$(echo "$retry_output" | jq -r '.retried_count // 0' 2>/dev/null || echo "0")
+            if [[ "$retried_count" -gt 0 ]]; then
+                log "${GREEN}Retried $retried_count blocked issue(s)${NC}"
+            fi
+        fi
+    fi
+
     # Run iteration via Claude
     timestamp=$(date -Iseconds)
     iteration_start=$(date +%s)
