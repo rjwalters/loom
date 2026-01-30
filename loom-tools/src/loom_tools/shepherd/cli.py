@@ -29,12 +29,12 @@ from loom_tools.shepherd.phases import (
 
 
 def _print_phase_header(title: str) -> None:
-    """Print a phase header with formatting."""
+    """Print a phase header with formatting to stderr for consistent ordering."""
     width = 67
-    print()
-    print(f"\033[0;36m{'═' * width}\033[0m")
-    print(f"\033[0;36m  {title}\033[0m")
-    print(f"\033[0;36m{'═' * width}\033[0m")
+    print(file=sys.stderr)
+    print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr)
+    print(f"\033[0;36m  {title}\033[0m", file=sys.stderr)
+    print(f"\033[0;36m{'═' * width}\033[0m", file=sys.stderr)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -221,7 +221,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         log_info(f"Task ID: {ctx.config.task_id}")
         log_info(f"Repository: {ctx.repo_root}")
         log_info(f"Title: {ctx.issue_title}")
-        print()
+        print(file=sys.stderr)
 
         # Report started milestone
         ctx.report_milestone("started", issue=ctx.config.issue, mode=ctx.config.mode.value)
@@ -443,11 +443,11 @@ def orchestrate(ctx: ShepherdContext) -> int:
             ctx.report_milestone("completed")
 
         _print_phase_header("SHEPHERD ORCHESTRATION COMPLETE")
-        print()
+        print(file=sys.stderr)
         log_info(f"Issue: #{ctx.config.issue} - {ctx.issue_title}")
         log_info(f"Mode: {ctx.config.mode.value}")
         log_info(f"Duration: {duration}s")
-        print()
+        print(file=sys.stderr)
         if phase_durations:
             log_info("Phase timing:")
             for phase_name, phase_secs in phase_durations.items():
@@ -456,8 +456,8 @@ def orchestrate(ctx: ShepherdContext) -> int:
         else:
             log_info("Phases completed:")
             for phase in completed_phases:
-                print(f"  - {phase}")
-        print()
+                print(f"  - {phase}", file=sys.stderr)
+        print(file=sys.stderr)
         log_success("Orchestration complete!")
 
         return 0
@@ -549,7 +549,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Print header
     _print_phase_header("SHEPHERD ORCHESTRATION STARTED")
-    print()
+    print(file=sys.stderr)
 
     try:
         return orchestrate(ctx)
