@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -11,6 +14,9 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from loom_tools.shepherd.context import ShepherdContext
+
+# How often (in seconds) to poll the progress file during agent-wait-bg.sh
+_HEARTBEAT_POLL_INTERVAL = 5
 
 
 class PhaseStatus(Enum):
@@ -75,6 +81,35 @@ class PhaseRunner(Protocol):
         ...
 
 
+def _read_heartbeats(progress_file: Path) -> list[dict[str, Any]]:
+    """Read heartbeat milestones from a shepherd progress file.
+
+    Returns a list of heartbeat milestone dicts, each with
+    ``timestamp`` and ``data.action`` keys.
+    """
+    try:
+        data = json.loads(progress_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    return [
+        m
+        for m in data.get("milestones", [])
+        if m.get("event") == "heartbeat"
+    ]
+
+
+def _print_heartbeat(action: str) -> None:
+    """Print a heartbeat status line to stderr.
+
+    Uses dim/gray ANSI to differentiate from cyan phase headers.
+    Format: ``[HH:MM:SS] ⟳ action``
+    """
+    ts = time.strftime("%H:%M:%S")
+    # \033[2m = dim, \033[0m = reset
+    print(f"\033[2m[{ts}] \u27f3 {action}\033[0m", file=sys.stderr)
+
+
 def run_worker_phase(
     ctx: ShepherdContext,
     *,
@@ -89,6 +124,8 @@ def run_worker_phase(
     """Run a phase worker and wait for completion.
 
     This wraps the agent-spawn.sh → agent-wait-bg.sh → agent-destroy.sh flow.
+    While waiting, polls the shepherd progress file for heartbeat milestones
+    and prints them to stderr so the operator can see ongoing activity.
 
     Args:
         ctx: Shepherd context
@@ -169,19 +206,36 @@ def run_worker_phase(
     env = os.environ.copy()
     env["LOOM_STUCK_ACTION"] = "retry"
 
-    # Wait for completion
-    # Redirect to DEVNULL to suppress output - agent logs are captured to
-    # .loom/logs/<session>.log for debugging purposes
-    wait_result = subprocess.run(
+    # Launch wait process (non-blocking) so we can poll for heartbeats
+    wait_proc = subprocess.Popen(
         wait_cmd,
         cwd=ctx.repo_root,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        check=False,
         env=env,
     )
 
-    wait_exit = wait_result.returncode
+    # Poll progress file for heartbeat updates while waiting
+    progress_file = ctx.progress_dir / f"shepherd-{ctx.config.task_id}.json"
+    seen_heartbeats = 0
+
+    while wait_proc.poll() is None:
+        heartbeats = _read_heartbeats(progress_file)
+        for hb in heartbeats[seen_heartbeats:]:
+            action = hb.get("data", {}).get("action", "")
+            if action:
+                _print_heartbeat(action)
+        seen_heartbeats = len(heartbeats)
+        time.sleep(_HEARTBEAT_POLL_INTERVAL)
+
+    # Check for any final heartbeats written before process exit
+    heartbeats = _read_heartbeats(progress_file)
+    for hb in heartbeats[seen_heartbeats:]:
+        action = hb.get("data", {}).get("action", "")
+        if action:
+            _print_heartbeat(action)
+
+    wait_exit = wait_proc.returncode
 
     # Clean up the worker session
     destroy_cmd = [str(scripts_dir / "agent-destroy.sh"), name, "--force"]
