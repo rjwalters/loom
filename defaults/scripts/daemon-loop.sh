@@ -642,6 +642,48 @@ while true; do
         ./.loom/scripts/health-check.sh --collect >> "$LOG_FILE" 2>&1 || true
     fi
 
+    # Extract WARN: codes from summary and persist to daemon-state.json
+    warn_codes=()
+    if [[ "$summary" == *"WARN:"* ]]; then
+        # Extract all WARN:code tokens from the summary line
+        for token in $summary; do
+            if [[ "$token" == WARN:* ]]; then
+                warn_codes+=("${token#WARN:}")
+            fi
+        done
+    fi
+
+    # Persist warnings to daemon-state.json if any WARN: codes found
+    if [[ ${#warn_codes[@]} -gt 0 ]] && [[ -f "$STATE_FILE" ]]; then
+        warn_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        warnings_json="["
+        first=true
+        for code in "${warn_codes[@]}"; do
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                warnings_json+=","
+            fi
+            warnings_json+="{\"time\":\"$warn_timestamp\",\"type\":\"$code\",\"severity\":\"warning\",\"message\":\"Detected by daemon iteration $iteration\",\"context\":{},\"acknowledged\":false}"
+        done
+        warnings_json+="]"
+
+        temp_warn_file=$(mktemp)
+        if jq --argjson warnings "$warnings_json" '.warnings = $warnings' "$STATE_FILE" > "$temp_warn_file" 2>/dev/null; then
+            mv "$temp_warn_file" "$STATE_FILE"
+        else
+            rm -f "$temp_warn_file"
+        fi
+    elif [[ -f "$STATE_FILE" ]]; then
+        # Clear warnings when no WARN: codes present (healthy state)
+        temp_warn_file=$(mktemp)
+        if jq '.warnings = []' "$STATE_FILE" > "$temp_warn_file" 2>/dev/null; then
+            mv "$temp_warn_file" "$STATE_FILE"
+        else
+            rm -f "$temp_warn_file"
+        fi
+    fi
+
     # Log the summary and track success/failure for backoff
     if [[ "$summary" == *"SHUTDOWN"* ]]; then
         log "${YELLOW}Iteration $iteration: $summary${NC}"
