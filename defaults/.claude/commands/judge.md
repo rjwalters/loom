@@ -462,6 +462,105 @@ gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 
 **Always verify `gh pr checks` before approving.**
 
+## Fast-Track Review (Conflict-Only Resolution)
+
+When Doctor resolves **only merge conflicts** without making substantive code changes, they signal this with a special marker. This enables an abbreviated review process that significantly reduces re-review time.
+
+### Detecting Fast-Track Eligibility
+
+**Step 1: Check for the conflict-only marker in PR comments**
+
+```bash
+# Look for the conflict-only marker in recent comments
+gh pr view <PR_NUMBER> --comments | grep -l "<!-- loom:conflict-only -->"
+```
+
+If the marker is found, the PR is eligible for fast-track review.
+
+### Fast-Track Review Process
+
+When the `<!-- loom:conflict-only -->` marker is present:
+
+**1. Verify the diff is truly conflict-resolution-only:**
+
+```bash
+# Compare the new commit(s) against the previous review point
+# Look for ONLY these types of changes:
+# - Merge conflict markers resolved
+# - Package lock regeneration
+# - Import reordering
+# - Whitespace normalization
+gh pr diff <PR_NUMBER>
+```
+
+**2. Check for unexpected changes:**
+
+Red flags that should trigger a full review instead:
+- New logic or functionality
+- Modified test assertions
+- Changed function signatures
+- New error handling
+- Documentation updates beyond conflict resolution
+
+**3. Verify CI passes:**
+
+```bash
+gh pr checks <PR_NUMBER>
+gh pr view <PR_NUMBER> --json mergeStateStatus --jq '.mergeStateStatus'
+```
+
+**4. Approve with fast-track audit trail:**
+
+```bash
+gh pr comment <PR_NUMBER> --body "$(cat <<'EOF'
+✅ **Approved (Fast-Track Review)**
+
+This re-review used the abbreviated fast-track process because:
+- Doctor signaled conflict-only resolution (`<!-- loom:conflict-only -->`)
+- Diff verified to contain only merge resolution changes
+- All CI checks pass
+- No unexpected code changes detected
+
+<!-- loom:fast-track-review -->
+EOF
+)"
+gh pr edit <PR_NUMBER> --remove-label "loom:review-requested" --add-label "loom:pr"
+```
+
+### Escalation to Full Review
+
+If the fast-track check reveals unexpected changes:
+
+```bash
+gh pr comment <PR_NUMBER> --body "$(cat <<'EOF'
+⚠️ **Full Review Required**
+
+Fast-track review was requested but unexpected changes were detected:
+- [List unexpected changes here]
+
+Proceeding with full code review instead of fast-track approval.
+
+<!-- loom:fast-track-escalated -->
+EOF
+)"
+# Then continue with standard full review process
+```
+
+### Why Fast-Track Matters
+
+| Metric | Full Review | Fast-Track |
+|--------|-------------|------------|
+| Typical duration | 123+ seconds | ~30 seconds |
+| Code analysis depth | Full | Diff verification only |
+| CI verification | Required | Required |
+| Use case | New code, logic changes | Conflict resolution only |
+
+**Benefits:**
+- Reduces Doctor→Judge→Merge cycle time by ~75%
+- Frees Judge capacity for PRs that need deep review
+- Maintains audit trail of review approach used
+- Automatic fallback to full review if issues detected
+
 ## Review Focus Areas
 
 ### PR Description and Issue Linking (CRITICAL)

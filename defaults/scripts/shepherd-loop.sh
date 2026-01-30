@@ -401,6 +401,15 @@ add_label_pr() {
     gh pr edit "$pr" --add-label "$label" >/dev/null 2>&1
 }
 
+# Check if PR has conflict-only marker in comments (for fast-track review)
+# Returns 0 if marker found, 1 otherwise
+has_conflict_only_marker() {
+    local pr="$1"
+    local comments
+    comments=$($GH pr view "$pr" --comments --json comments --jq '.comments[].body' 2>/dev/null) || return 1
+    echo "$comments" | grep -q "<!-- loom:conflict-only -->"
+}
+
 remove_label_pr() {
     local pr="$1"
     local label="$2"
@@ -1214,8 +1223,14 @@ main() {
                 fail_with_reason "doctor" "validation failed"
             fi
 
-            completed_phases+=("Doctor (fixes applied)")
-            log_success "Doctor applied fixes"
+            # Check if Doctor signaled conflict-only resolution (enables fast-track review)
+            if has_conflict_only_marker "$pr_number"; then
+                completed_phases+=("Doctor (conflict-only)")
+                log_success "Doctor applied fixes (conflict-only - eligible for fast-track review)"
+            else
+                completed_phases+=("Doctor (fixes applied)")
+                log_success "Doctor applied fixes"
+            fi
         else
             log_error "Unexpected state: PR has neither loom:pr nor loom:changes-requested"
             fail_with_reason "judge" "PR has neither loom:pr nor loom:changes-requested"
