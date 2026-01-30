@@ -54,8 +54,8 @@ elif command -v loom-shepherd &>/dev/null; then
     # System-installed
     exec loom-shepherd "${args[@]}"
 else
-    # Fallback to shell script
+    # Fallback to shell script (deprecated)
     # Note: Shell script uses --merge/-m directly, so pass original args
-    echo "[WARN] Python shepherd not available, falling back to shell script" >&2
-    exec "$SCRIPT_DIR/shepherd-loop.sh" "$@"
+    echo "[WARN] Python shepherd not available, falling back to shell script (deprecated)" >&2
+    exec "$SCRIPT_DIR/deprecated/shepherd-loop.sh" "$@"
 fi
