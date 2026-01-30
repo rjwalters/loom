@@ -166,6 +166,9 @@ class ShepherdContext:
         if state != "OPEN":
             raise IssueClosedError(issue, state)
 
+        # Check for stale remote branch
+        self._check_stale_branch(issue)
+
         # Pre-populate label cache
         labels = {label["name"] for label in meta.get("labels", [])}
         self.label_cache.set_issue_labels(issue, labels)
@@ -180,6 +183,33 @@ class ShepherdContext:
         self.issue_title = meta.get("title", f"Issue #{issue}")
 
         return meta
+
+    def _check_stale_branch(self, issue: int) -> None:
+        """Check for existing remote branch and log a warning if found.
+
+        A stale remote branch ``feature/issue-N`` may indicate a previous
+        attempt that left artifacts behind.  We warn but always proceed
+        so orchestration is not blocked.
+        """
+        logger = logging.getLogger(__name__)
+        branch_name = f"feature/issue-{issue}"
+        try:
+            result = subprocess.run(
+                ["git", "ls-remote", "--heads", "origin", branch_name],
+                cwd=self.repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                logger.warning(
+                    "Stale branch %s exists on remote. "
+                    "Previous attempt may have left artifacts.",
+                    branch_name,
+                )
+        except OSError:
+            # git not available or other OS error — skip the check
+            pass
 
     def has_issue_label(self, label: str) -> bool:
         """Check if the issue has a specific label."""
