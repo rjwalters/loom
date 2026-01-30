@@ -9,6 +9,9 @@ description = "Shared Python utilities for Loom orchestration scripts"
 requires-python = ">=3.10"
 license = "MIT"
 
+[project.scripts]
+loom-shepherd = "loom_tools.shepherd.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
