@@ -22,7 +22,6 @@ if [[ -t 1 ]]; then
     GREEN='\033[0;32m'
     YELLOW='\033[1;33m'
     BLUE='\033[0;34m'
-    GRAY='\033[0;90m'
     BOLD='\033[1m'
     NC='\033[0m'
 else
@@ -30,7 +29,6 @@ else
     GREEN=''
     YELLOW=''
     BLUE=''
-    GRAY=''
     BOLD=''
     NC=''
 fi
