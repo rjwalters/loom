@@ -17,7 +17,7 @@
 #   "proposals": { architect, hermit, curated },
 #   "prs": { review_requested, changes_requested, ready_to_merge },
 #   "usage": { session_percent, ... },
-#   "computed": { total_ready, needs_work_generation, ... },
+#   "computed": { total_ready, needs_work_generation, health_status, health_warnings, ... },
 #   "config": { issue_threshold, max_shepherds, ... }
 # }
 
@@ -138,8 +138,21 @@ OUTPUT:
     - prs: PR state lists
     - usage: Session usage from claude-monitor (if available)
     - tmux_pool: tmux agent pool status (if available)
-    - computed: Pre-computed decision values (includes execution_mode)
+    - computed: Pre-computed decision values (includes execution_mode,
+                health_status, and health_warnings)
     - config: Current threshold configuration
+
+    Health fields in computed:
+    - health_status: "healthy" | "degraded" | "stalled"
+    - health_warnings: Array of {code, level, message} objects
+
+    Warning codes:
+    - pipeline_stalled (warning): ready=0, building=0, blocked>0
+    - proposal_backlog (info): ready=0, building=0, proposals>0
+    - no_work_available (info): pipeline completely empty
+    - stale_heartbeats (warning): shepherd(s) with stale heartbeats
+    - orphaned_issues (warning): orphaned shepherds detected
+    - session_budget_low (warning): session usage nearing limit
 
 EXAMPLE OUTPUT:
     {
@@ -163,7 +176,9 @@ EXAMPLE OUTPUT:
         "total_ready": 1,
         "needs_work_generation": false,
         "execution_mode": "tmux",
-        "recommended_actions": ["spawn_shepherds"]
+        "recommended_actions": ["spawn_shepherds"],
+        "health_status": "healthy",
+        "health_warnings": []
       }
     }
 EOF
@@ -863,6 +878,66 @@ if [[ "$INVALID_TASK_ID_COUNT" -gt 0 ]]; then
     ACTIONS=$(echo "$ACTIONS" | jq '. + ["validate_state"]')
 fi
 
+# Compute health warnings and status
+# Each warning has: code, level (warning|info), message
+HEALTH_WARNINGS="[]"
+
+# pipeline_stalled: ready=0 AND building=0 AND blocked>0
+if [[ $READY_COUNT -eq 0 ]] && [[ $BUILDING_COUNT -eq 0 ]] && [[ $BLOCKED_COUNT -gt 0 ]]; then
+    HEALTH_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq \
+        --argjson blocked "$BLOCKED_COUNT" \
+        '. + [{"code": "pipeline_stalled", "level": "warning", "message": ("0 ready, " + ($blocked | tostring) + " blocked, 0 building — pipeline has no actionable work")}]')
+fi
+
+# proposal_backlog: ready=0 AND building=0 AND total_proposals>0
+if [[ $READY_COUNT -eq 0 ]] && [[ $BUILDING_COUNT -eq 0 ]] && [[ $TOTAL_PROPOSALS -gt 0 ]]; then
+    HEALTH_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq \
+        --argjson proposals "$TOTAL_PROPOSALS" \
+        '. + [{"code": "proposal_backlog", "level": "info", "message": (($proposals | tostring) + " proposals awaiting approval, pipeline empty")}]')
+fi
+
+# no_work_available: ready=0 AND building=0 AND blocked=0 AND total_proposals=0
+if [[ $READY_COUNT -eq 0 ]] && [[ $BUILDING_COUNT -eq 0 ]] && [[ $BLOCKED_COUNT -eq 0 ]] && [[ $TOTAL_PROPOSALS -eq 0 ]]; then
+    HEALTH_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq \
+        '. + [{"code": "no_work_available", "level": "info", "message": "No ready, building, blocked, or proposed issues — pipeline is empty"}]')
+fi
+
+# stale_heartbeats: stale_heartbeat_count>0
+if [[ $STALE_HEARTBEAT_COUNT -gt 0 ]]; then
+    HEALTH_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq \
+        --argjson count "$STALE_HEARTBEAT_COUNT" \
+        '. + [{"code": "stale_heartbeats", "level": "warning", "message": (($count | tostring) + " shepherd(s) with stale heartbeats — may be stuck")}]')
+fi
+
+# orphaned_issues: orphaned_count>0
+if [[ $ORPHANED_COUNT -gt 0 ]]; then
+    HEALTH_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq \
+        --argjson count "$ORPHANED_COUNT" \
+        '. + [{"code": "orphaned_issues", "level": "warning", "message": (($count | tostring) + " orphaned shepherd(s) detected — recovery needed")}]')
+fi
+
+# session_budget_low: usage_healthy=false
+if [[ "$USAGE_HEALTHY" == "false" ]]; then
+    HEALTH_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq \
+        --arg pct "$SESSION_PERCENT" \
+        '. + [{"code": "session_budget_low", "level": "warning", "message": ("Session usage at " + $pct + "% — nearing budget limit")}]')
+fi
+
+# Derive health_status from warnings:
+# - "healthy" = no warnings at all
+# - "degraded" = only info-level warnings
+# - "stalled" = any warning-level warnings present
+HAS_WARNING_LEVEL=$(echo "$HEALTH_WARNINGS" | jq '[.[] | select(.level == "warning")] | length')
+HAS_ANY_WARNINGS=$(echo "$HEALTH_WARNINGS" | jq 'length')
+
+if [[ $HAS_WARNING_LEVEL -gt 0 ]]; then
+    HEALTH_STATUS="stalled"
+elif [[ $HAS_ANY_WARNINGS -gt 0 ]]; then
+    HEALTH_STATUS="degraded"
+else
+    HEALTH_STATUS="healthy"
+fi
+
 # Build the final JSON output
 TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -939,6 +1014,8 @@ OUTPUT=$(jq -n \
     --arg hermit_status "$HERMIT_STATUS" \
     --argjson invalid_task_ids "$INVALID_TASK_IDS" \
     --argjson invalid_task_id_count "$INVALID_TASK_ID_COUNT" \
+    --arg health_status "$HEALTH_STATUS" \
+    --argjson health_warnings "$HEALTH_WARNINGS" \
     '{
         timestamp: $timestamp,
         pipeline: {
@@ -1038,7 +1115,9 @@ OUTPUT=$(jq -n \
             judge_demand: $judge_demand,
             execution_mode: $tmux_execution_mode,
             tmux_available: $tmux_available,
-            tmux_shepherd_count: $tmux_shepherd_count
+            tmux_shepherd_count: $tmux_shepherd_count,
+            health_status: $health_status,
+            health_warnings: $health_warnings
         },
         config: {
             issue_threshold: $issue_threshold,

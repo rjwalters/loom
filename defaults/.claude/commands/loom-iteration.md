@@ -126,6 +126,28 @@ def loom_iterate(force_mode=False, debug_mode=False):
     # 9. Stuck detection
     stuck_count = check_stuck_agents(state, debug_mode)
 
+    # 9b. Health warnings: emit WARN: codes from snapshot health data
+    health_warnings = snapshot_data["computed"].get("health_warnings", [])
+    health_status = snapshot_data["computed"].get("health_status", "healthy")
+    debug(f"Health status: {health_status}, warnings: {len(health_warnings)}")
+
+    # 9c. LLM-side systematic failure detection
+    # When pipeline is stalled (blocked>0 and ready=0), inspect blocked issue
+    # details for shared error patterns. This complex pattern matching is
+    # natural for the LLM but hard to express in shell.
+    if snapshot_data["computed"]["total_blocked"] > 0 and snapshot_data["computed"]["total_ready"] == 0:
+        systematic_failure = detect_systematic_failure(snapshot_data, state, debug_mode)
+        if systematic_failure:
+            health_warnings.append({
+                "code": "systematic_failure",
+                "level": "warning",
+                "message": systematic_failure["message"]
+            })
+            debug(f"Systematic failure detected: {systematic_failure['message']}")
+
+    # 9d. Populate daemon-state.json warnings array (fulfills existing schema)
+    state["warnings"] = format_state_warnings(health_warnings)
+
     # 10. Orphan recovery (every 5 iterations) - catches crashed shepherds mid-session
     recovered_count = 0
     if state.get("iteration", 0) % 5 == 0:
@@ -157,7 +179,8 @@ def loom_iterate(force_mode=False, debug_mode=False):
     save_daemon_state(state)
 
     # 12. Return compact summary (ONE LINE)
-    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, ensured_roles, demand_spawned, promoted_count, stuck_count, recovered_count)
+    # Include WARN: codes from health_warnings at the end of the summary line
+    summary = format_iteration_summary(snapshot_data, spawned_shepherds, triggered_generation, ensured_roles, demand_spawned, promoted_count, stuck_count, recovered_count, health_warnings)
     debug(f"Iteration {iteration} completed - {summary}")
     return summary
 ```
@@ -190,6 +213,16 @@ ready=5 building=2 shepherds=2/3 +shepherd=#123 +architect
 - `completed=#N` - Issue completed this iteration (if any)
 - `recovered=N` - Stale building issues recovered (if any)
 - `spawn-fail=N` - Task spawns that failed verification (if any)
+- `WARN:code` - Health warnings from snapshot (if any, appended at end)
+
+**Health warning codes** (from `computed.health_warnings` in snapshot):
+- `WARN:pipeline_stalled` - 0 ready, 0 building, >0 blocked
+- `WARN:proposal_backlog` - Proposals exist but pipeline empty
+- `WARN:no_work_available` - Pipeline completely empty
+- `WARN:stale_heartbeats` - Shepherd(s) with stale heartbeats
+- `WARN:orphaned_issues` - Orphaned shepherds detected
+- `WARN:session_budget_low` - Session usage nearing limit
+- `WARN:systematic_failure` - Multiple shepherds failed with same cause (LLM-detected)
 
 **Example summaries:**
 ```
@@ -199,6 +232,9 @@ ready=0 building=1 shepherds=1/3 +architect +hermit
 ready=2 building=2 shepherds=2/3 stuck=1
 ready=2 building=2 shepherds=2/3 spawn-fail=1
 ready=3 building=0 shepherds=0/3 promoted=3
+ready=0 building=0 shepherds=0/3 WARN:pipeline_stalled
+ready=0 building=0 shepherds=0/3 WARN:pipeline_stalled WARN:proposal_backlog
+ready=0 building=0 shepherds=0/3 WARN:no_work_available
 SHUTDOWN_SIGNAL
 ```
 
@@ -245,7 +281,9 @@ fi
     "total_ready": 3,
     "needs_work_generation": false,
     "available_shepherd_slots": 2,
-    "recommended_actions": ["spawn_shepherds", "check_stuck"]
+    "recommended_actions": ["spawn_shepherds", "check_stuck"],
+    "health_status": "healthy",
+    "health_warnings": []
   },
   "config": { "issue_threshold": 3, "max_shepherds": 3 }
 }
@@ -949,6 +987,90 @@ def check_stale_building(state, debug_mode=False):
         return len(recovered)
 
     return 0
+```
+
+### Systematic Failure Detection (LLM-Side)
+
+When the pipeline is stalled with blocked issues but no ready work, the iteration subagent
+inspects recent shepherd errors and blocked issue details for shared patterns. This is complex
+pattern matching that is natural for the LLM but hard to express in shell.
+
+```python
+def detect_systematic_failure(snapshot_data, state, debug_mode=False):
+    """Detect systematic failure patterns across recent shepherds.
+
+    Analyzes blocked issues and recent shepherd errors for shared root causes.
+    Returns a warning dict if a systematic pattern is detected, None otherwise.
+    """
+
+    def debug(msg):
+        if debug_mode:
+            print(f"[DEBUG] {msg}")
+
+    blocked_issues = snapshot_data.get("pipeline", {}).get("blocked_issues", [])
+    if len(blocked_issues) < 2:
+        return None  # Need at least 2 blocked issues for a pattern
+
+    # Check recent shepherd completions in state for shared error patterns
+    shepherds = state.get("shepherds", {})
+    recent_errors = []
+    for name, info in shepherds.items():
+        if info.get("last_error"):
+            recent_errors.append(info["last_error"])
+
+    # Also check spawn_retry_queue for repeated failures
+    retry_queue = state.get("spawn_retry_queue", {})
+    for issue_key, retry_info in retry_queue.items():
+        if retry_info.get("last_error"):
+            recent_errors.append(retry_info["last_error"])
+
+    if len(recent_errors) < 2:
+        return None
+
+    # Look for common error substring patterns (basic deduplication)
+    # The LLM should analyze whether the errors share a root cause
+    # such as: same test failure, same build error, same dependency issue
+    debug(f"Analyzing {len(recent_errors)} recent errors for systematic pattern")
+    debug(f"Blocked issues: {[i.get('number') for i in blocked_issues]}")
+    debug(f"Recent errors: {recent_errors[:3]}")
+
+    # Count distinct error patterns by taking first 50 chars as signature
+    error_signatures = {}
+    for err in recent_errors:
+        sig = err[:50] if len(err) > 50 else err
+        error_signatures[sig] = error_signatures.get(sig, 0) + 1
+
+    # If any single error pattern appears in majority of errors, it's systematic
+    for sig, count in error_signatures.items():
+        if count >= 2 and count >= len(recent_errors) * 0.5:
+            return {
+                "code": "systematic_failure",
+                "message": f"{count} shepherds failed with similar cause: {sig}"
+            }
+
+    return None
+
+
+def format_state_warnings(health_warnings):
+    """Convert health_warnings list to daemon-state.json warnings format.
+
+    The daemon-state.json warnings array uses a different schema than the
+    snapshot health_warnings. This function maps between the two formats.
+    """
+    state_warnings = []
+    now_iso = now()
+
+    for w in health_warnings:
+        state_warnings.append({
+            "time": now_iso,
+            "type": w["code"],
+            "severity": w["level"],
+            "message": w["message"],
+            "context": {},
+            "acknowledged": False
+        })
+
+    return state_warnings
 ```
 
 ### Orphan Recovery (In-Session)
