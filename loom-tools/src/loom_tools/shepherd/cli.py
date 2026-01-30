@@ -87,10 +87,16 @@ EXAMPLES:
     parser.add_argument(
         "--force",
         "-f",
+        action="store_true",
+        dest="force",
+        help="Auto-approve, resolve conflicts, auto-merge after approval",
+    )
+    parser.add_argument(
         "--merge",
         "-m",
         action="store_true",
-        help="Auto-approve, resolve conflicts, auto-merge after approval",
+        dest="force",
+        help="Alias for --force (matches bash shepherd-loop.sh)",
     )
 
     parser.add_argument(
