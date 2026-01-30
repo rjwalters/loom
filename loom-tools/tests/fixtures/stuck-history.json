@@ -1,0 +1,60 @@
+{
+  "created_at": "2026-01-24T18:21:48Z",
+  "entries": [
+    {
+      "detected_at": "2026-01-24T18:21:48Z",
+      "detection": {
+        "agent_id": "shepherd-1",
+        "issue": 1075,
+        "status": "working",
+        "stuck": true,
+        "severity": "elevated",
+        "suggested_intervention": "clarify",
+        "indicators": [
+          "no_progress:759s",
+          "error_spike:59"
+        ],
+        "metrics": {
+          "idle_seconds": 759,
+          "working_seconds": -27972,
+          "loop_count": 1,
+          "error_count": 59
+        },
+        "thresholds": {
+          "idle": 600,
+          "working": 1800,
+          "loop": 3,
+          "error_spike": 5
+        },
+        "checked_at": "2026-01-24T18:21:48Z"
+      }
+    },
+    {
+      "detected_at": "2026-01-24T18:21:49Z",
+      "detection": {
+        "agent_id": "shepherd-2",
+        "issue": 1076,
+        "status": "working",
+        "stuck": true,
+        "severity": "elevated",
+        "suggested_intervention": "clarify",
+        "indicators": [
+          "error_spike:26"
+        ],
+        "metrics": {
+          "idle_seconds": 365,
+          "working_seconds": -28392,
+          "loop_count": 1,
+          "error_count": 26
+        },
+        "thresholds": {
+          "idle": 600,
+          "working": 1800,
+          "loop": 3,
+          "error_spike": 5
+        },
+        "checked_at": "2026-01-24T18:21:49Z"
+      }
+    }
+  ]
+}

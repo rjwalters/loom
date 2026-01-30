@@ -1,0 +1,61 @@
+{
+  "task_id": "00d085c",
+  "issue": 1618,
+  "mode": "force-merge",
+  "started_at": "2026-01-30T16:48:16Z",
+  "current_phase": "judge",
+  "last_heartbeat": "2026-01-30T16:53:37Z",
+  "status": "completed",
+  "milestones": [
+    {
+      "event": "started",
+      "timestamp": "2026-01-30T16:48:16Z",
+      "data": {
+        "issue": 1618,
+        "mode": "force-merge"
+      }
+    },
+    {
+      "event": "phase_entered",
+      "timestamp": "2026-01-30T16:48:22Z",
+      "data": {
+        "phase": "builder"
+      }
+    },
+    {
+      "event": "worktree_created",
+      "timestamp": "2026-01-30T16:48:26Z",
+      "data": {
+        "path": ".loom/worktrees/issue-1618"
+      }
+    },
+    {
+      "event": "heartbeat",
+      "timestamp": "2026-01-30T16:49:29Z",
+      "data": {
+        "action": "builder running (1m elapsed)"
+      }
+    },
+    {
+      "event": "pr_created",
+      "timestamp": "2026-01-30T16:50:07Z",
+      "data": {
+        "pr_number": 1631
+      }
+    },
+    {
+      "event": "phase_entered",
+      "timestamp": "2026-01-30T16:50:08Z",
+      "data": {
+        "phase": "judge"
+      }
+    },
+    {
+      "event": "completed",
+      "timestamp": "2026-01-30T16:53:37Z",
+      "data": {
+        "pr_merged": true
+      }
+    }
+  ]
+}

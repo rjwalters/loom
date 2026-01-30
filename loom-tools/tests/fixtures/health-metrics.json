@@ -1,0 +1,35 @@
+{
+  "initialized_at": "2026-01-26T16:49:51Z",
+  "retention_hours": 24,
+  "metrics": [
+    {
+      "timestamp": "2026-01-26T16:53:45Z",
+      "throughput": {
+        "issues_per_hour": 0,
+        "prs_per_hour": 0
+      },
+      "latency": {
+        "avg_iteration_seconds": 0
+      },
+      "queue_depths": {
+        "ready": 0,
+        "building": 3,
+        "review_requested": 0,
+        "changes_requested": 1,
+        "ready_to_merge": 0
+      },
+      "error_rates": {
+        "consecutive_failures": 0,
+        "success_rate": 100,
+        "stuck_agents": 0
+      },
+      "resource_usage": {
+        "active_shepherds": 0,
+        "session_percent": 40.0
+      }
+    }
+  ],
+  "health_score": 100,
+  "health_status": "excellent",
+  "last_updated": "2026-01-26T16:53:45Z"
+}

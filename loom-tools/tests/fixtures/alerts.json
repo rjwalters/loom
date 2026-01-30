@@ -1,0 +1,32 @@
+{
+  "initialized_at": "2026-01-26T16:49:51Z",
+  "alerts": [
+    {
+      "id": "alert-001",
+      "type": "stuck_agents",
+      "severity": "warning",
+      "message": "Shepherd shepherd-1 appears stuck on issue #1075",
+      "timestamp": "2026-01-24T18:21:48Z",
+      "acknowledged": false,
+      "context": {
+        "agent_id": "shepherd-1",
+        "issue": 1075
+      }
+    }
+  ],
+  "acknowledged": [
+    {
+      "id": "alert-000",
+      "type": "queue_growth",
+      "severity": "info",
+      "message": "Ready queue grew to 10 items",
+      "timestamp": "2026-01-24T16:00:00Z",
+      "acknowledged": true,
+      "acknowledged_at": "2026-01-24T16:05:00Z",
+      "context": {
+        "queue": "ready",
+        "size": 10
+      }
+    }
+  ]
+}
