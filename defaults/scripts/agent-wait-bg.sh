@@ -69,15 +69,23 @@ DEFAULT_HEARTBEAT_INTERVAL=60
 # Default idle timeout (seconds) before checking phase contract via GitHub state
 DEFAULT_IDLE_TIMEOUT=60
 
-# Default interval (seconds) for proactive phase contract checking
-# Checks the phase contract periodically during the poll loop rather than
-# waiting for idle timeout. This detects completion much faster for phases
-# like builder where the signal is on GitHub (PR exists) rather than in logs.
-# Set to 0 to disable proactive checking (fall back to idle timeout only).
-# Note: The idle timeout (DEFAULT_IDLE_TIMEOUT=60) still provides faster
-# detection when the agent is actually idle, so this interval can be longer
-# without significantly impacting completion detection latency.
-DEFAULT_CONTRACT_INTERVAL=90
+# Adaptive contract checking intervals (see issue #1678)
+# Contract checks are expensive (GitHub API calls), so we start with longer
+# intervals and decrease them over time as completion becomes more likely.
+#
+# Interval schedule based on elapsed time:
+#   0-180s:   No contract checks (wait for initial processing)
+#   180-270s: 90s interval (agent still early in work)
+#   270-330s: 60s interval (agent progressing)
+#   330-360s: 30s interval (likely nearing completion)
+#   360s+:    10s interval (final detection mode)
+#
+# Set CONTRACT_INTERVAL_OVERRIDE > 0 to use a fixed interval instead of adaptive.
+# Set to 0 to disable proactive checking entirely (fall back to idle timeout only).
+CONTRACT_INTERVAL_OVERRIDE=${LOOM_CONTRACT_INTERVAL_OVERRIDE:-0}
+
+# Initial delay before first contract check (seconds)
+CONTRACT_INITIAL_DELAY=180
 
 # Stuck detection thresholds (configurable via environment variables)
 STUCK_WARNING_THRESHOLD=${LOOM_STUCK_WARNING:-300}   # 5 min default
@@ -98,6 +106,41 @@ PROCESSING_INDICATORS='esc to interrupt'
 # Progress tracking file prefix
 PROGRESS_DIR="/tmp/loom-agent-progress"
 
+# Get adaptive contract check interval based on elapsed time since agent started.
+# Returns the appropriate interval in seconds, or 0 if we should skip this check.
+#
+# The schedule balances detection latency against API cost:
+#   0-180s:   Skip checks (return 0) - agent still processing initial work
+#   180-270s: 90s interval - early work phase
+#   270-330s: 60s interval - mid work phase
+#   330-360s: 30s interval - likely nearing completion
+#   360s+:    10s interval - final rapid detection mode
+#
+# If CONTRACT_INTERVAL_OVERRIDE is set > 0, returns that fixed value instead.
+# Returns 0 to signal "skip this check" (used during initial delay period).
+get_adaptive_contract_interval() {
+    local elapsed=$1
+
+    # Allow override for testing or specific use cases
+    if [[ "${CONTRACT_INTERVAL_OVERRIDE:-0}" -gt 0 ]]; then
+        echo "$CONTRACT_INTERVAL_OVERRIDE"
+        return
+    fi
+
+    # Adaptive schedule based on elapsed time
+    if [[ "$elapsed" -lt 180 ]]; then
+        echo "0"  # No check yet - wait for initial delay
+    elif [[ "$elapsed" -lt 270 ]]; then
+        echo "90"
+    elif [[ "$elapsed" -lt 330 ]]; then
+        echo "60"
+    elif [[ "$elapsed" -lt 360 ]]; then
+        echo "30"
+    else
+        echo "10"
+    fi
+}
+
 show_help() {
     cat <<EOF
 ${BLUE}agent-wait-bg.sh - Wait for agent with shutdown signal checking${NC}
@@ -116,7 +159,7 @@ ${YELLOW}OPTIONS:${NC}
     --pr <N>                   PR number for judge/doctor phase validation
     --grace-period <seconds>   Deprecated (no-op). Agent is terminated immediately on completion detection.
     --idle-timeout <seconds>   Time without output before checking phase contract (default: $DEFAULT_IDLE_TIMEOUT)
-    --contract-interval <s>    Seconds between proactive phase contract checks (default: $DEFAULT_CONTRACT_INTERVAL, 0=disable)
+    --contract-interval <s>    Override adaptive interval with fixed value (default: adaptive, 0=disable)
     --json                     Output result as JSON
     --help                     Show this help message
 
@@ -134,9 +177,14 @@ ${YELLOW}SIGNALS CHECKED:${NC}
 ${YELLOW}COMPLETION DETECTION:${NC}
     Primary: Proactive phase contract checking (when --phase provided)
     - Checks actual GitHub labels/PRs rather than parsing log output
-    - Proactively checked every --contract-interval seconds (default: ${DEFAULT_CONTRACT_INTERVAL}s)
+    - Uses adaptive intervals that decrease as agent runs longer (issue #1678):
+        0-180s:   No checks (initial processing delay)
+        180-270s: 90s interval
+        270-330s: 60s interval
+        330-360s: 30s interval
+        360s+:    10s interval (final rapid detection)
     - Uses validate-phase.sh --check-only for safe, side-effect-free verification
-    - Detects completion within one interval of actual work finishing
+    - Override with --contract-interval <seconds> or LOOM_CONTRACT_INTERVAL_OVERRIDE env var
 
     Secondary: Idle-triggered phase contract check (when --phase provided)
     - Triggers when agent is idle (no output for --idle-timeout seconds)
@@ -719,7 +767,7 @@ main() {
     local issue=""
     local task_id=""
     local idle_timeout="$DEFAULT_IDLE_TIMEOUT"
-    local contract_interval="$DEFAULT_CONTRACT_INTERVAL"
+    local contract_interval_override=""  # Empty = use adaptive, 0 = disable, >0 = fixed
     local phase=""
     local worktree=""
     local pr_number=""
@@ -761,7 +809,7 @@ main() {
                 shift 2
                 ;;
             --contract-interval)
-                contract_interval="$2"
+                contract_interval_override="$2"
                 shift 2
                 ;;
             --phase)
@@ -795,12 +843,23 @@ main() {
         esac
     done
 
+    # Apply contract interval override from CLI arg or environment variable
+    if [[ -n "$contract_interval_override" ]]; then
+        CONTRACT_INTERVAL_OVERRIDE="$contract_interval_override"
+    fi
+
     log_info "Waiting for agent '$name' with signal checking (poll: ${poll_interval}s, timeout: ${timeout}s)"
     if [[ -n "$task_id" ]]; then
         log_info "Heartbeat emission: every ${DEFAULT_HEARTBEAT_INTERVAL}s (task-id: $task_id)"
     fi
-    if [[ -n "$phase" ]] && [[ "$contract_interval" -gt 0 ]]; then
-        log_info "Proactive contract checking: every ${contract_interval}s for phase '$phase'"
+    if [[ -n "$phase" ]]; then
+        if [[ "${CONTRACT_INTERVAL_OVERRIDE:-0}" -eq 0 ]]; then
+            log_info "Proactive contract checking: adaptive intervals for phase '$phase' (initial delay: ${CONTRACT_INITIAL_DELAY}s)"
+        elif [[ "${CONTRACT_INTERVAL_OVERRIDE:-0}" -gt 0 ]]; then
+            log_info "Proactive contract checking: fixed ${CONTRACT_INTERVAL_OVERRIDE}s interval for phase '$phase'"
+        else
+            log_info "Proactive contract checking: disabled for phase '$phase'"
+        fi
     fi
     log_info "Stuck detection: warning=${STUCK_WARNING_THRESHOLD}s, critical=${STUCK_CRITICAL_THRESHOLD}s, action=${STUCK_ACTION}"
     log_info "Prompt stuck detection: threshold=${PROMPT_STUCK_THRESHOLD}s"
@@ -965,23 +1024,32 @@ main() {
             fi
         fi
 
-        # Proactive phase contract checking: check periodically regardless of idle state
-        # This detects completion within one contract_interval of actual work finishing,
-        # rather than waiting for the idle timeout to trigger (see issue #1581)
-        if [[ "$completion_detected" != "true" ]] && [[ -n "$phase" ]] && [[ "$contract_interval" -gt 0 ]]; then
+        # Proactive phase contract checking with adaptive intervals (issue #1678)
+        # This detects completion within one interval of actual work finishing,
+        # rather than waiting for the idle timeout to trigger (see issue #1581).
+        # Intervals start long (90s) and decrease over time (down to 10s) to balance
+        # detection latency against GitHub API cost.
+        if [[ "$completion_detected" != "true" ]] && [[ -n "$phase" ]]; then
             local now
             now=$(date +%s)
-            local since_last_check=$((now - last_contract_check))
+            local elapsed=$((now - start_time))
+            local adaptive_interval
+            adaptive_interval=$(get_adaptive_contract_interval "$elapsed")
 
-            if [[ "$since_last_check" -ge "$contract_interval" ]]; then
-                last_contract_check=$now
+            # adaptive_interval of 0 means "skip this check" (during initial delay)
+            if [[ "$adaptive_interval" -gt 0 ]]; then
+                local since_last_check=$((now - last_contract_check))
 
-                if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
-                    completion_detected=true
-                    COMPLETION_REASON="phase_contract_satisfied"
+                if [[ "$since_last_check" -ge "$adaptive_interval" ]]; then
+                    last_contract_check=$now
 
-                    log_info "Phase contract satisfied ($CONTRACT_STATUS) via proactive check"
-                    log_info "Agent completed work but didn't exit - terminating session"
+                    if check_phase_contract "$phase" "$issue" "$worktree" "$pr_number" "check_only"; then
+                        completion_detected=true
+                        COMPLETION_REASON="phase_contract_satisfied"
+
+                        log_info "Phase contract satisfied ($CONTRACT_STATUS) via proactive check (interval: ${adaptive_interval}s)"
+                        log_info "Agent completed work but didn't exit - terminating session"
+                    fi
                 fi
             fi
         fi
