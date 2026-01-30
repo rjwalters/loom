@@ -908,7 +908,7 @@ main() {
                     COMPLETION_REASON="phase_contract_satisfied"
 
                     log_info "Phase contract satisfied ($CONTRACT_STATUS) via proactive check"
-                    log_warn "Agent completed work but didn't exit - waiting ${grace_period}s grace period"
+                    log_info "Agent completed work but didn't exit - terminating session"
                 fi
             fi
         fi
