@@ -134,7 +134,7 @@ ${YELLOW}EXAMPLES:${NC}
     ./.loom/scripts/signal.sh stop shepherd-1
 
 ${YELLOW}ENVIRONMENT:${NC}
-    LOOM_SPAWN_VERIFY_TIMEOUT - Timeout for processing verification in seconds (default: 30)
+    LOOM_SPAWN_VERIFY_TIMEOUT - Timeout for process existence check in seconds (default: 10)
     LOOM_STUCK_SESSION_THRESHOLD - Seconds before idle session is considered stuck (default: 300)
 
 ${YELLOW}TMUX ARCHITECTURE:${NC}
@@ -509,44 +509,71 @@ EOF
     log_info "Starting Claude CLI with command: $role_cmd"
     tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$claude_cmd" C-m
 
-    # Verify the command is being processed.
-    # Since we pass the command at launch, Claude should start processing immediately
-    # after startup. We poll for processing indicators to confirm.
+    # Verify spawn succeeded by checking process existence.
+    # We do NOT poll for visible output (spinners, etc.) because Claude CLI
+    # startup time is highly variable (network, model load, context size).
+    # The agent-wait script handles all timing concerns including slow starts.
     #
-    # Pattern for detecting Claude is processing a command:
-    # - Spinner characters (Claude thinking)
-    # - Progress/status text
-    # - Tool use indicators
-    local PROCESSING_INDICATORS='⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'
+    # Spawn verification checks:
+    # 1. tmux session still exists
+    # 2. Shell has started a child process (claude-wrapper or claude)
+    #
+    # This separates concerns:
+    # - spawn = session created, process started (fast, reliable)
+    # - wait = handle startup, processing, completion (agent-wait-bg.sh)
 
-    # Configurable verify parameters (via environment or defaults)
-    local verify_timeout="${LOOM_SPAWN_VERIFY_TIMEOUT:-30}"  # Total time to wait for processing
-
-    local command_processed=false
+    local verify_timeout="${LOOM_SPAWN_VERIFY_TIMEOUT:-10}"  # Time to wait for process to start
     local elapsed=0
 
-    log_info "Waiting for Claude to start processing (up to ${verify_timeout}s)..."
+    log_info "Verifying Claude process started (up to ${verify_timeout}s)..."
 
     while [[ $elapsed -lt $verify_timeout ]]; do
-        local pane_content
-        pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+        # Check session still exists
+        if ! tmux -L "$TMUX_SOCKET" has-session -t "$session_name" 2>/dev/null; then
+            log_error "tmux session disappeared: $session_name"
+            return 1
+        fi
 
-        if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
-            command_processed=true
-            log_info "Claude started processing after ${elapsed}s"
-            break
+        # Get the shell PID from the tmux pane
+        local shell_pid
+        shell_pid=$(tmux -L "$TMUX_SOCKET" list-panes -t "$session_name" -F '#{pane_pid}' 2>/dev/null | head -1)
+
+        if [[ -n "$shell_pid" ]]; then
+            # Check if claude process is running (child or grandchild of shell)
+            local claude_running=false
+
+            # Direct child: shell -> claude or shell -> claude-wrapper
+            if pgrep -P "$shell_pid" -f "claude" >/dev/null 2>&1; then
+                claude_running=true
+            else
+                # Grandchild: shell -> claude-wrapper -> claude
+                local children
+                children=$(pgrep -P "$shell_pid" 2>/dev/null || true)
+                for child in $children; do
+                    if pgrep -P "$child" -f "claude" >/dev/null 2>&1; then
+                        claude_running=true
+                        break
+                    fi
+                done
+            fi
+
+            if [[ "$claude_running" == "true" ]]; then
+                log_info "Claude process detected after ${elapsed}s"
+                break
+            fi
         fi
 
         sleep 1
         elapsed=$((elapsed + 1))
     done
 
-    # Fail spawn if command wasn't processed
-    if [[ "$command_processed" != "true" ]]; then
-        log_error "Claude did not start processing within ${verify_timeout}s"
+    # Verify we found the claude process
+    if [[ $elapsed -ge $verify_timeout ]]; then
+        log_error "Claude process not detected within ${verify_timeout}s"
         log_error "Session: $session_name"
-        log_error "Killing session to allow shepherd retry"
-        tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+        log_error "The tmux session exists but no claude process is running."
+        log_error "Check: tmux -L $TMUX_SOCKET attach -t $session_name"
+        # Don't kill the session - leave it for debugging
         return 1
     fi
 
