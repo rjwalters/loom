@@ -517,9 +517,48 @@ report_final_status() {
 trap 'report_final_status' EXIT
 
 # Helper to record failure reason before exiting
+# This function:
+#   1. Records the failure phase/reason for the exit handler
+#   2. Transitions issue from loom:building to loom:blocked (if issue has loom:building)
+#   3. Records structured error metadata via record-blocked-reason.sh
+#   4. Updates systematic failure tracking via detect-systematic-failure.sh
 fail_with_reason() {
-    LAST_FAILURE_PHASE="$1"
-    LAST_FAILURE_REASON="$2"
+    local phase="$1"
+    local reason="$2"
+
+    LAST_FAILURE_PHASE="$phase"
+    LAST_FAILURE_REASON="$reason"
+
+    # Map phase/reason to error class for structured tracking
+    local error_class="unknown"
+    case "${phase}:${reason}" in
+        builder:*"rate limit"*)           error_class="rate_limited" ;;
+        builder:*"worktree"*)             error_class="worktree_failed" ;;
+        builder:*"validation"*)           error_class="builder_validation" ;;
+        builder:*"could not find PR"*)    error_class="builder_validation" ;;
+        judge:*"validation"*)             error_class="judge_validation" ;;
+        doctor:*"validation"*)            error_class="doctor_validation" ;;
+        curator:*"validation"*)           error_class="unknown" ;;  # Curator failures are non-blocking
+        *)                                error_class="unknown" ;;
+    esac
+
+    # Only transition to blocked if issue currently has loom:building
+    # This prevents double-transitions and handles edge cases where issue
+    # may not be claimed yet (e.g., rate limit before worktree creation)
+    if has_label "$ISSUE" "loom:building"; then
+        # Atomic transition: loom:building -> loom:blocked
+        gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
+
+        # Record structured error metadata (for daemon retry classification)
+        "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" \
+            --error-class "$error_class" \
+            --phase "$phase" \
+            --details "$reason" 2>/dev/null || true
+
+        # Update systematic failure tracking
+        "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
+    fi
+
     exit 1
 }
 
