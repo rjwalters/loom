@@ -544,14 +544,13 @@ EOF
     # the input handler is ready, so we may have sent the command too early.
     # Poll for processing indicators to confirm the command is being handled.
     #
-    # IMPORTANT: We do NOT re-send Enter if the command text is still visible.
-    # The command text often remains visible in terminal scrollback even after
-    # Claude has started processing (it appears in conversation history). Re-sending
-    # Enter mid-processing can cause issues. If the command wasn't consumed, the
-    # session will show no processing indicators and we log a warning.
+    # If verification fails, we retry the command once before failing the spawn.
+    # This ensures stuck agents are detected quickly (<2 minutes) rather than
+    # after the stuck session threshold (~10 minutes).
     local verify_elapsed=0
     local verify_max=5
     local command_processed=false
+    local retry_attempted=false
 
     sleep 3  # Grace period: Claude needs time to parse skill and load context
 
@@ -572,9 +571,49 @@ EOF
         verify_elapsed=$((verify_elapsed + 1))
     done
 
-    # Only warn if we truly couldn't confirm processing after all attempts
+    # If command processing wasn't confirmed, retry the command dispatch
     if [[ "$command_processed" != "true" ]]; then
-        log_warn "Could not confirm command processing within $((verify_max + 3))s (agent may still be starting)"
+        log_warn "Command not processed after $((verify_max + 3))s, attempting retry..."
+        retry_attempted=true
+
+        # Wait additional time for TUI to be fully ready
+        sleep 5
+
+        # Re-send the full command + Enter
+        log_info "Retrying role command: $role_cmd"
+        tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "$role_cmd" C-m
+
+        # Re-verify with shorter window
+        sleep 3
+        local retry_verify_elapsed=0
+        local retry_verify_max=5
+
+        while [[ $retry_verify_elapsed -lt $retry_verify_max ]]; do
+            local pane_content
+            pane_content=$(tmux -L "$TMUX_SOCKET" capture-pane -t "$session_name" -p 2>/dev/null || true)
+
+            if echo "$pane_content" | grep -qE '⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏|Beaming|Loading|● |✓ |◐|◓|◑|◒|thinking|streaming'; then
+                command_processed=true
+                log_success "Command processed successfully after retry"
+                break
+            fi
+
+            sleep 1
+            retry_verify_elapsed=$((retry_verify_elapsed + 1))
+        done
+    fi
+
+    # Fail spawn if command still wasn't processed after retry
+    if [[ "$command_processed" != "true" ]]; then
+        log_error "Command dispatch failed after retry - agent may be stuck at prompt"
+        log_error "Session: $session_name"
+        log_error "Killing session to allow shepherd retry"
+        tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+        return 1
+    fi
+
+    if [[ "$retry_attempted" == "true" ]]; then
+        log_info "Note: Command required retry to process (initial dispatch may have been too early)"
     fi
 
     log_success "Agent spawned successfully"
