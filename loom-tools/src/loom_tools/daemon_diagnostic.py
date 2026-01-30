@@ -579,8 +579,8 @@ def format_human_output(report: HealthReport) -> str:
     lines = []
 
     lines.append("")
-    lines.append("LOOM DAEMON HEALTH CHECK")
-    lines.append("========================")
+    lines.append("LOOM DAEMON DIAGNOSTIC")
+    lines.append("======================")
     lines.append("")
 
     # State File section
@@ -711,11 +711,11 @@ def format_human_output(report: HealthReport) -> str:
 
     # Summary
     if report.exit_code == 0:
-        lines.append("Health: OK - No issues detected")
+        lines.append("Diagnostic: OK - No issues detected")
     elif report.exit_code == 1:
-        lines.append(f"Health: WARNINGS - {len(report.warnings)} warning(s) detected")
+        lines.append(f"Diagnostic: WARNINGS - {len(report.warnings)} warning(s) detected")
     else:
-        lines.append(f"Health: CRITICAL - {len(report.criticals)} critical issue(s), {len(report.warnings)} warning(s)")
+        lines.append(f"Diagnostic: CRITICAL - {len(report.criticals)} critical issue(s), {len(report.warnings)} warning(s)")
 
     lines.append("")
 
@@ -723,7 +723,7 @@ def format_human_output(report: HealthReport) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Main entry point for the health check CLI."""
+    """Main entry point for the daemon diagnostic CLI."""
     parser = argparse.ArgumentParser(
         description="Diagnostic health check for Loom daemon",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -745,7 +745,7 @@ Environment Variables:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Output health report as JSON",
+        help="Output diagnostic report as JSON",
     )
 
     args = parser.parse_args(argv)

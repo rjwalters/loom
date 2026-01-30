@@ -1,4 +1,4 @@
-"""Tests for the health_check module."""
+"""Tests for the daemon_diagnostic module."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import tempfile
 
 import pytest
 
-from loom_tools.health_check import (
+from loom_tools.daemon_diagnostic import (
     HealthReport,
     PipelineState,
     ShepherdDetail,
