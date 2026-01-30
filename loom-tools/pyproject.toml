@@ -10,6 +10,7 @@ requires-python = ">=3.10"
 license = "MIT"
 
 [project.scripts]
+loom-shepherd = "loom_tools.shepherd.cli:main"
 loom-agent-monitor = "loom_tools.agent_monitor:main"
 loom-daemon-diagnostic = "loom_tools.daemon_diagnostic:main"
 loom-daemon-loop = "loom_tools.daemon:main"
