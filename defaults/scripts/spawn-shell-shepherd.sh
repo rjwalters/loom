@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# spawn-shell-shepherd.sh - Spawn a shell-based shepherd in a tmux session
+# spawn-shell-shepherd.sh - Spawn a shepherd in a tmux session
 #
-# This script spawns the shell-based shepherd-loop.sh in a tmux session,
-# providing the same interface as agent-spawn.sh but using the deterministic
-# shell script instead of launching Claude Code with the /shepherd role.
+# This script spawns the shepherd (via loom-shepherd.sh wrapper) in a tmux session,
+# providing the same interface as agent-spawn.sh but using the standalone script
+# instead of launching Claude Code with the /shepherd role.
 #
 # Usage:
 #   spawn-shell-shepherd.sh <issue-number> [options]
@@ -219,14 +219,14 @@ REPO_ROOT=$(find_repo_root) || {
 
 FULL_SESSION_NAME="${SESSION_PREFIX}${SESSION_NAME}"
 LOG_FILE="$REPO_ROOT/.loom/logs/${FULL_SESSION_NAME}.log"
-SHEPHERD_SCRIPT="$REPO_ROOT/.loom/scripts/shepherd-loop.sh"
+SHEPHERD_SCRIPT="$REPO_ROOT/.loom/scripts/loom-shepherd.sh"
 
 # Check if shepherd script exists
 if [[ ! -x "$SHEPHERD_SCRIPT" ]]; then
     if [[ "$JSON_OUTPUT" == "true" ]]; then
-        echo '{"status":"error","error":"shepherd-loop.sh not found or not executable"}'
+        echo '{"status":"error","error":"loom-shepherd.sh not found or not executable"}'
     else
-        log_error "shepherd-loop.sh not found at $SHEPHERD_SCRIPT"
+        log_error "loom-shepherd.sh not found at $SHEPHERD_SCRIPT"
     fi
     exit 1
 fi
