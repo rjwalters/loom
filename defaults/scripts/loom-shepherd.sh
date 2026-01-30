@@ -41,6 +41,16 @@ for arg in "$@"; do
     esac
 done
 
+# Pre-flight: check for unmerged files (merge conflicts)
+# Without this check, conflict markers in Python files cause confusing SyntaxError messages
+unmerged=$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | grep '^UU' | cut -c4- || true)
+if [[ -n "$unmerged" ]]; then
+    echo "[ERROR] Cannot run shepherd: repository has unmerged files:" >&2
+    echo "$unmerged" | sed 's/^/  /' >&2
+    echo "Resolve merge conflicts before running shepherd." >&2
+    exit 1
+fi
+
 # Try Python implementation first
 # Priority order:
 #   1. Virtual environment in loom-tools (development setup)
