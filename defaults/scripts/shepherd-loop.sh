@@ -585,6 +585,12 @@ run_phase() {
 
     if [[ -n "$phase" ]]; then
         wait_args+=(--phase "$phase")
+        # Work-producing roles (builder, doctor) need longer idle thresholds
+        # to avoid false positives during skill loading, permission prompts,
+        # and initial codebase exploration (see issue #1623)
+        case "$phase" in
+            builder|doctor) wait_args+=(--min-idle-elapsed 120) ;;
+        esac
     fi
     if [[ -n "$worktree" ]]; then
         wait_args+=(--worktree "$worktree")

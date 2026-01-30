@@ -107,6 +107,7 @@ ${YELLOW}OPTIONS:${NC}
     --issue <N>                Issue number for per-issue abort checking
     --task-id <id>             Shepherd task ID for heartbeat emission during long waits
     --phase <phase>            Phase name (curator, builder, judge, doctor) for contract checking
+    --min-idle-elapsed <secs>  Override idle prompt detection threshold for agent-wait.sh (default: 10)
     --worktree <path>          Worktree path for builder phase recovery
     --pr <N>                   PR number for judge/doctor phase validation
     --grace-period <seconds>   Deprecated (no-op). Agent is terminated immediately on completion detection.
@@ -718,6 +719,7 @@ main() {
     local phase=""
     local worktree=""
     local pr_number=""
+    local min_idle_elapsed=""
     local json_output=false
 
     if [[ $# -lt 1 ]]; then
@@ -762,6 +764,10 @@ main() {
                 phase="$2"
                 shift 2
                 ;;
+            --min-idle-elapsed)
+                min_idle_elapsed="$2"
+                shift 2
+                ;;
             --worktree)
                 worktree="$2"
                 shift 2
@@ -796,7 +802,11 @@ main() {
     log_info "Prompt stuck detection: threshold=${PROMPT_STUCK_THRESHOLD}s"
 
     # Launch agent-wait.sh in the background
-    "${SCRIPT_DIR}/agent-wait.sh" "$name" --timeout "$timeout" --poll-interval "$poll_interval" --json &
+    local wait_cmd=("${SCRIPT_DIR}/agent-wait.sh" "$name" --timeout "$timeout" --poll-interval "$poll_interval" --json)
+    if [[ -n "$min_idle_elapsed" ]]; then
+        wait_cmd+=(--min-idle-elapsed "$min_idle_elapsed")
+    fi
+    "${wait_cmd[@]}" &
     local wait_pid=$!
 
     local start_time
