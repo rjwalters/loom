@@ -280,7 +280,7 @@ def collect_current_metrics(repo_root: Path) -> MetricEntry:
 def calculate_health_score(metrics: HealthMetrics) -> int:
     """Calculate health score from recent metrics.
 
-    Returns 0-100 based on 7 factors:
+    Returns 0-100 based on 8 factors:
     - Factor 1: Error rate (0-25 points deduction)
     - Factor 2: Consecutive failures (0-15 points deduction)
     - Factor 3: Stuck agents (0-20 points deduction)
