@@ -43,6 +43,14 @@
   description: "PR requires changes before re-review (Judge requested modifications)"
   color: "F59E0B"  # amber-500 - matches other "action required" labels
 
+- name: loom:merge-conflict
+  description: "PR has merge conflicts requiring resolution"
+  color: "DC2626"  # red-600 - indicates broken state
+
+- name: loom:ci-failure
+  description: "PR has failing CI checks"
+  color: "DC2626"  # red-600 - indicates broken state
+
 - name: loom:pr
   description: PR approved by Judge, ready for human to merge
   color: "3B82F6"  # blue-500

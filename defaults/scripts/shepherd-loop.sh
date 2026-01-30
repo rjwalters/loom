@@ -1144,7 +1144,20 @@ main() {
             log_success "PR #$pr_number approved by Judge"
         elif has_label_pr "$pr_number" "loom:changes-requested"; then
             log_warn "Judge requested changes on PR #$pr_number"
-            completed_phases+=("Judge (changes requested)")
+
+            # Detect specific issue type for logging (helps with debugging and routing)
+            local issue_type="code_quality"
+            if has_label_pr "$pr_number" "loom:merge-conflict"; then
+                issue_type="merge_conflict"
+                log_info "Issue type: merge conflicts detected"
+            elif has_label_pr "$pr_number" "loom:ci-failure"; then
+                issue_type="ci_failure"
+                log_info "Issue type: CI checks failing"
+            else
+                log_info "Issue type: code quality/other changes requested"
+            fi
+
+            completed_phases+=("Judge (changes requested: $issue_type)")
 
             doctor_attempts=$((doctor_attempts + 1))
 
@@ -1152,15 +1165,15 @@ main() {
                 log_error "Doctor max retries ($DOCTOR_MAX_RETRIES) exceeded"
                 # Atomic transition: loom:building -> loom:blocked (mutually exclusive states)
                 gh issue edit "$ISSUE" --remove-label "loom:building" --add-label "loom:blocked" >/dev/null 2>&1 || true
-                "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "doctor_exhausted" --phase "doctor" --details "max retries ($DOCTOR_MAX_RETRIES) exceeded" 2>/dev/null || true
+                "$REPO_ROOT/.loom/scripts/record-blocked-reason.sh" "$ISSUE" --error-class "doctor_exhausted" --phase "doctor" --details "max retries ($DOCTOR_MAX_RETRIES) exceeded, issue type: $issue_type" 2>/dev/null || true
                 "$REPO_ROOT/.loom/scripts/detect-systematic-failure.sh" --update 2>/dev/null || true
-                gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor could not resolve Judge feedback after $DOCTOR_MAX_RETRIES attempts." >/dev/null 2>&1 || true
+                gh issue comment "$ISSUE" --body "**Shepherd blocked**: Doctor could not resolve Judge feedback after $DOCTOR_MAX_RETRIES attempts. Issue type: $issue_type." >/dev/null 2>&1 || true
                 fail_with_reason "doctor" "max retries ($DOCTOR_MAX_RETRIES) exceeded"
             fi
 
             # ─── Doctor Phase ─────────────────────────────────────────────
 
-            log_phase "PHASE 5: DOCTOR (attempt $doctor_attempts)"
+            log_phase "PHASE 5: DOCTOR (attempt $doctor_attempts) - $issue_type"
 
             if check_shutdown; then
                 handle_shutdown "doctor"
