@@ -566,21 +566,25 @@ class StuckDetectionRunner:
         stuck = False
 
         # Calculate metrics for output
-        idle_seconds = self._get_idle_seconds(agent_state)
         heartbeat_age = self._get_heartbeat_age(agent_state)
         working_seconds = self._get_working_seconds(agent_state)
         loop_count = self._get_loop_count(agent_state)
         error_count = self._get_error_count(agent_state)
 
-        # Prefer heartbeat-based idle detection if available
-        if heartbeat_age >= 0 and heartbeat_age >= self.thresholds.heartbeat_stale:
+        # Prefer heartbeat-based idle detection if available (matches bash behavior)
+        # When heartbeat is available, use it as idle_seconds and compare against idle threshold
+        if heartbeat_age >= 0:
+            idle_seconds = heartbeat_age
+        else:
+            idle_seconds = self._get_idle_seconds(agent_state)
+
+        # Check idle threshold (using heartbeat age if available, else output file timestamp)
+        if idle_seconds >= self.thresholds.idle:
             stuck = True
-            indicators.append(f"stale_heartbeat:{heartbeat_age}s")
-            severity = "warning"
-            suggested_intervention = "alert"
-        elif idle_seconds >= self.thresholds.idle:
-            stuck = True
-            indicators.append(f"no_progress:{idle_seconds}s")
+            if heartbeat_age >= 0:
+                indicators.append(f"stale_heartbeat:{idle_seconds}s")
+            else:
+                indicators.append(f"no_progress:{idle_seconds}s")
             severity = "warning"
             suggested_intervention = "alert"
 

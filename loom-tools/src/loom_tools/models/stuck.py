@@ -27,17 +27,15 @@ class StuckMetrics:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        # Always include all fields to match bash script output format
+        return {
             "idle_seconds": self.idle_seconds,
             "working_seconds": self.working_seconds,
             "loop_count": self.loop_count,
             "error_count": self.error_count,
+            "heartbeat_age": self.heartbeat_age if self.heartbeat_age is not None else -1,
+            "current_phase": self.current_phase if self.current_phase is not None else "unknown",
         }
-        if self.heartbeat_age is not None:
-            d["heartbeat_age"] = self.heartbeat_age
-        if self.current_phase is not None:
-            d["current_phase"] = self.current_phase
-        return d
 
 
 @dataclass
@@ -97,8 +95,11 @@ class StuckDetection:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        # Always include all fields to match bash script output format
+        # Note: issue comes before status in bash output for working agents
+        return {
             "agent_id": self.agent_id,
+            "issue": self.issue,  # Always include, may be None/null
             "status": self.status,
             "stuck": self.stuck,
             "severity": self.severity,
@@ -108,9 +109,6 @@ class StuckDetection:
             "thresholds": self.thresholds.to_dict(),
             "checked_at": self.checked_at,
         }
-        if self.issue is not None:
-            d["issue"] = self.issue
-        return d
 
 
 @dataclass
