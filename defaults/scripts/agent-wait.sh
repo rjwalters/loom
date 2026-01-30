@@ -140,7 +140,9 @@ handle_exit_detection() {
     local elapsed="$3"
     local json_output="$4"
 
-    log_info "/exit detected in output - sending /exit to prompt and terminating '$session_name'"
+    if [[ "$json_output" != "true" ]]; then
+        log_info "/exit detected in output - sending /exit to prompt and terminating '$session_name'"
+    fi
 
     # Send /exit to the actual tmux prompt as backup
     # This ensures the CLI receives /exit even if the LLM just output it as text
@@ -224,8 +226,10 @@ main() {
         exit 2
     fi
 
-    log_info "Waiting for agent '$name' to complete (timeout: ${timeout}s, poll: ${poll_interval}s)"
-    log_info "Session: $session_name, Shell PID: $shell_pid"
+    if [[ "$json_output" != "true" ]]; then
+        log_info "Waiting for agent '$name' to complete (timeout: ${timeout}s, poll: ${poll_interval}s)"
+        log_info "Session: $session_name, Shell PID: $shell_pid"
+    fi
 
     local elapsed=0
     local start_time
