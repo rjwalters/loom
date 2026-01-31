@@ -11,7 +11,7 @@ You are the Layer 2 Loom Daemon running in ITERATION MODE in the {{workspace}} r
 In iteration mode, you:
 1. Load state from JSON
 2. Check shutdown signal
-3. Assess system state via `daemon-snapshot.sh`
+3. Assess system state via `loom-tools snapshot`
 4. Check shepherd completions (process-tree + progress files)
 5. Auto-promote proposals (if force mode)
 6. Spawn shepherds for ready issues (via agent-spawn.sh)
@@ -35,7 +35,7 @@ The daemon uses **tmux-based agent execution** exclusively. All workers run in e
 
 ## Iteration Execution
 
-**CRITICAL**: The iteration MUST use `daemon-snapshot.sh` for state assessment and act on its `recommended_actions`. This ensures deterministic behavior and proper work generation triggering.
+**CRITICAL**: The iteration MUST use `python3 -m loom_tools.snapshot` (or `loom-tools snapshot`) for state assessment and act on its `recommended_actions`. This ensures deterministic behavior and proper work generation triggering.
 
 ```python
 def loom_iterate(force_mode=False, debug_mode=False):
@@ -66,9 +66,9 @@ def loom_iterate(force_mode=False, debug_mode=False):
         debug("Shutdown signal detected")
         return "SHUTDOWN_SIGNAL"
 
-    # 3. CRITICAL: Get system state via daemon-snapshot.sh
+    # 3. CRITICAL: Get system state via loom-tools snapshot
     # This is the CANONICAL source for all state and recommended actions
-    snapshot = run("./.loom/scripts/daemon-snapshot.sh")
+    snapshot = run("python3 -m loom_tools.snapshot")
     snapshot_data = json.loads(snapshot)
 
     # Extract computed decisions (these are authoritative)
@@ -238,13 +238,13 @@ ready=0 building=0 shepherds=0/3 WARN:no_work_available
 SHUTDOWN_SIGNAL
 ```
 
-## Using daemon-snapshot.sh for State Assessment
+## Using loom-tools snapshot for State Assessment
 
-The `daemon-snapshot.sh` script consolidates all state queries into a single tool call, replacing 10+ individual `gh` commands:
+The `loom-tools snapshot` command consolidates all state queries into a single tool call, replacing 10+ individual `gh` commands:
 
 ```bash
 # Get complete system state in one call
-snapshot=$(./.loom/scripts/daemon-snapshot.sh)
+snapshot=$(python3 -m loom_tools.snapshot)
 
 # Parse the JSON output
 ready_count=$(echo "$snapshot" | jq '.computed.total_ready')
@@ -262,7 +262,7 @@ if echo "$actions" | grep -q "spawn_shepherds"; then
 fi
 ```
 
-**Benefits of daemon-snapshot.sh:**
+**Benefits of loom-tools snapshot:**
 - **Single tool call**: Replaces 10+ individual `gh` commands
 - **Parallel queries**: Runs all `gh` queries concurrently for efficiency
 - **Pre-computed decisions**: Includes `computed.recommended_actions` for immediate use
@@ -308,7 +308,7 @@ def auto_spawn_shepherds(state, snapshot_data, debug_mode=False):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    # daemon-snapshot.sh returns issues pre-sorted by LOOM_ISSUE_STRATEGY:
+    # loom-tools snapshot returns issues pre-sorted by LOOM_ISSUE_STRATEGY:
     # - loom:urgent issues always first (regardless of strategy)
     # - Then sorted by: fifo (oldest first), lifo (newest first), or priority
     ready_issues = snapshot_data["pipeline"]["ready_issues"]
@@ -537,7 +537,7 @@ This {proposal_type} proposal has been automatically promoted to `loom:issue` by
 
 ## Trigger Work Generation
 
-**CRITICAL**: Work generation keeps the pipeline fed. When `daemon-snapshot.sh` includes `trigger_architect` or `trigger_hermit` in `recommended_actions`, the iteration MUST spawn these roles.
+**CRITICAL**: Work generation keeps the pipeline fed. When `loom-tools snapshot` includes `trigger_architect` or `trigger_hermit` in `recommended_actions`, the iteration MUST spawn these roles.
 
 **Note**: `trigger_architect_role()` and `trigger_hermit_role()` have been removed. Architect and
 hermit now use the unified `trigger_support_role()` function (same as guide, champion, doctor,
@@ -677,7 +677,7 @@ def auto_ensure_support_roles(state, snapshot_data, recommended_actions, debug_m
     debug(f"Demand-spawned: {demand_spawned}")
 
     # Define which roles to check and their trigger actions
-    # Architect and hermit use trigger_architect/trigger_hermit actions from daemon-snapshot.sh
+    # Architect and hermit use trigger_architect/trigger_hermit actions from loom-tools snapshot
     role_checks = [
         ("guide", "trigger_guide", "Guide backlog triage", False),
         ("champion", "trigger_champion", "Champion PR merge", demand_spawned.get("champion", False)),
@@ -943,7 +943,7 @@ def check_stuck_agents(state, debug_mode=False):
         if debug_mode:
             print(f"[DEBUG] {msg}")
 
-    result = run("./.loom/scripts/stuck-detection.sh check --json")
+    result = run("loom-stuck-detection check --json")
 
     if result.exit_code == 2:  # Stuck agents found
         stuck_data = json.loads(result.stdout)
@@ -1152,7 +1152,7 @@ def handle_empty_backlog(state, debug_mode):
         print("  Backlog empty - checking work generation triggers...")
 
         # Work generation is handled by acting on recommended_actions
-        # daemon-snapshot.sh includes trigger_architect/trigger_hermit when appropriate
+        # loom-tools snapshot includes trigger_architect/trigger_hermit when appropriate
 
         # Report what human can do (informational only)
         if curated_count > 0:

@@ -29,7 +29,7 @@ The daemon relies on deterministic bash scripts for critical operations. These s
 
 | Script | Purpose |
 |--------|---------|
-| `daemon-snapshot.sh` | Pipeline state assessment (replaces 10+ gh commands) |
+| `loom-tools snapshot` | Pipeline state assessment (replaces 10+ gh commands) |
 | `validate-daemon-state.sh` | Validates state file |
 | `agent-spawn.sh` | Spawn tmux agent sessions |
 | `agent-wait.sh` | Detect when tmux agents complete |
@@ -221,9 +221,9 @@ def check_for_existing_daemon():
         result = run(f"kill -0 {pid} 2>/dev/null && echo alive || echo dead")
         if result.strip() == "alive":
             print(f"ERROR: Daemon loop already running (PID: {pid})")
-            print(f"  The shell wrapper daemon-loop.sh is active.")
+            print(f"  Another daemon loop is active.")
             print(f"  Stop it first: touch .loom/stop-daemon")
-            print(f"  Or check status: ./.loom/scripts/daemon-loop.sh --status")
+            print(f"  Or check status: loom-daemon-diagnostic")
             return False
         else:
             print(f"Warning: Removing stale PID file (PID {pid} is not running)")

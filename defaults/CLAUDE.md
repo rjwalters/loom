@@ -186,31 +186,6 @@ Launch the Loom desktop application for automated orchestration with visual term
 
 Run the Loom daemon for fully autonomous system orchestration.
 
-**Two options for running the daemon:**
-
-| Option | Command | Best For |
-|--------|---------|----------|
-| **Shell Wrapper** (recommended) | `./.loom/scripts/daemon-loop.sh` | Production, long-running sessions |
-| **LLM-interpreted** | `/loom` | Development, debugging, testing |
-
-**Option A: Shell Wrapper (Recommended for Production)**
-
-```bash
-# Start daemon with shell wrapper
-./.loom/scripts/daemon-loop.sh
-
-# Start in force mode
-./.loom/scripts/daemon-loop.sh --merge
-
-# Run in background
-nohup ./.loom/scripts/daemon-loop.sh --merge > /dev/null 2>&1 &
-
-# Custom poll interval (default: 120s)
-LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
-```
-
-**Option B: LLM-interpreted (For Development/Testing)**
-
 ```bash
 # Start the daemon (runs continuously)
 /loom
@@ -225,9 +200,7 @@ LOOM_POLL_INTERVAL=60 ./.loom/scripts/daemon-loop.sh
 # 4. Ensure Guide and Champion keep running
 ```
 
-**Note**: The `/loom` command relies on the LLM correctly implementing the two-tier architecture (parent loop spawning iteration subagents). While this generally works, the shell wrapper provides more deterministic behavior for production use.
-
-**Dual Daemon Prevention**: Both `daemon-loop.sh` and `/loom` use PID-based locking and session ID tracking to prevent multiple daemon instances from running simultaneously. If a second daemon is started, it will detect the conflict and refuse to start. The `daemon_session_id` field in `daemon-state.json` (format: `timestamp-PID`) enables each daemon to verify it still owns the state file before writing updates. This prevents state corruption when Claude Code sessions are auto-continued.
+**Dual Daemon Prevention**: `/loom` uses session ID tracking to prevent multiple daemon instances from running simultaneously. If a second daemon is started, it will detect the conflict and refuse to start. The `daemon_session_id` field in `daemon-state.json` (format: `timestamp-PID`) enables each daemon to verify it still owns the state file before writing updates. This prevents state corruption when Claude Code sessions are auto-continued.
 
 **Merge Mode** (`--merge`):
 
@@ -1002,27 +975,27 @@ This merges via the GitHub API (no local checkout), deletes the remote branch, a
 
 **Cleaning Up Stale Worktrees and Branches**:
 
-Use the `clean.sh` helper script to restore your repository to a clean state:
+Use the `loom-clean` command to restore your repository to a clean state:
 
 ```bash
 # Interactive mode - prompts for confirmation (default)
-./.loom/scripts/clean.sh
+loom-clean
 
 # Preview mode - shows what would be cleaned without making changes
-./.loom/scripts/clean.sh --dry-run
+loom-clean --dry-run
 
 # Non-interactive mode - auto-confirms all prompts (for CI/automation)
-./.loom/scripts/clean.sh --force
+loom-clean --force
 
 # Deep clean - also removes build artifacts (target/, node_modules/)
-./.loom/scripts/clean.sh --deep
+loom-clean --deep
 
 # Combine flags
-./.loom/scripts/clean.sh --deep --force  # Non-interactive deep clean
-./.loom/scripts/clean.sh --deep --dry-run  # Preview deep clean
+loom-clean --deep --force  # Non-interactive deep clean
+loom-clean --deep --dry-run  # Preview deep clean
 ```
 
-**What clean.sh does**:
+**What loom-clean does**:
 - Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
 - Deletes local feature branches for closed issues
 - Cleans up Loom tmux sessions
@@ -1030,7 +1003,7 @@ Use the `clean.sh` helper script to restore your repository to a clean state:
 
 **IMPORTANT**: For **CI pipelines and automation**, always use `--force` flag to prevent hanging on prompts:
 ```bash
-./.loom/scripts/clean.sh --force  # Non-interactive, safe for automation
+loom-clean --force  # Non-interactive, safe for automation
 ```
 
 **Manual cleanup** (if needed):
@@ -1139,29 +1112,29 @@ The Loom daemon automatically detects stuck or struggling agents and can trigger
 **Check for stuck agents**:
 ```bash
 # Run stuck detection check
-./.loom/scripts/stuck-detection.sh check
+loom-stuck-detection check
 
 # Check with JSON output
-./.loom/scripts/stuck-detection.sh check --json
+loom-stuck-detection check --json
 
 # Check specific agent
-./.loom/scripts/stuck-detection.sh check-agent shepherd-1
+loom-stuck-detection check-agent shepherd-1
 ```
 
 **View stuck detection status**:
 ```bash
 # Show status summary
-./.loom/scripts/stuck-detection.sh status
+loom-stuck-detection status
 
 # View intervention history
-./.loom/scripts/stuck-detection.sh history
-./.loom/scripts/stuck-detection.sh history shepherd-1
+loom-stuck-detection history
+loom-stuck-detection history shepherd-1
 ```
 
 **Configure stuck detection thresholds**:
 ```bash
 # Adjust thresholds
-./.loom/scripts/stuck-detection.sh configure \
+loom-stuck-detection configure \
   --idle-threshold 900 \
   --working-threshold 2400 \
   --intervention-mode escalate
@@ -1172,10 +1145,10 @@ The Loom daemon automatically detects stuck or struggling agents and can trigger
 **Handle stuck agents**:
 ```bash
 # Clear intervention for specific agent
-./.loom/scripts/stuck-detection.sh clear shepherd-1
+loom-stuck-detection clear shepherd-1
 
 # Clear all interventions
-./.loom/scripts/stuck-detection.sh clear all
+loom-stuck-detection clear all
 
 # Resume a paused agent
 ./.loom/scripts/signal.sh clear shepherd-1
@@ -1248,8 +1221,8 @@ jq '.shepherds["shepherd-1"] = {"issue": null, "idle_since": "'$(date -u +%Y-%m-
 When the pipeline is empty but Architect/Hermit are not being triggered, diagnose with:
 
 ```bash
-# 1. Check pipeline state via daemon-snapshot.sh (authoritative source)
-./.loom/scripts/daemon-snapshot.sh --pretty | jq '{
+# 1. Check pipeline state via loom-tools snapshot (authoritative source)
+python3 -m loom_tools.snapshot | jq '{
   ready: .computed.total_ready,
   needs_work_gen: .computed.needs_work_generation,
   architect_cooldown_ok: .computed.architect_cooldown_ok,
