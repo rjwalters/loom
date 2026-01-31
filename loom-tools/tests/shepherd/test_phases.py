@@ -21,6 +21,7 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import _print_heartbeat, _read_heartbeats
+from loom_tools.shepherd.phases.judge import APPROVAL_PATTERNS, NEGATIVE_PREFIXES
 
 
 @pytest.fixture
@@ -72,7 +73,9 @@ class TestApprovalPhase:
         skip, reason = approval.should_skip(mock_context)
         assert skip is False
 
-    def test_returns_success_when_already_approved(self, mock_context: MagicMock) -> None:
+    def test_returns_success_when_already_approved(
+        self, mock_context: MagicMock
+    ) -> None:
         """Should return success when issue already has loom:issue."""
         mock_context.check_shutdown.return_value = False
         mock_context.has_issue_label.return_value = True
@@ -114,7 +117,9 @@ class TestBuilderPhase:
         """Builder should be skipped when PR already exists."""
         builder = BuilderPhase()
 
-        with patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=100):
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=100
+        ):
             skip, reason = builder.should_skip(mock_context)
 
         assert skip is True
@@ -125,12 +130,16 @@ class TestBuilderPhase:
         """Builder should not be skipped when no PR exists."""
         builder = BuilderPhase()
 
-        with patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None):
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+        ):
             skip, reason = builder.should_skip(mock_context)
 
         assert skip is False
 
-    def test_worktree_failure_includes_error_detail(self, mock_context: MagicMock) -> None:
+    def test_worktree_failure_includes_error_detail(
+        self, mock_context: MagicMock
+    ) -> None:
         """Worktree creation failure should include subprocess error output."""
         mock_context.check_shutdown.return_value = False
         wt_mock = MagicMock()
@@ -146,7 +155,9 @@ class TestBuilderPhase:
         builder = BuilderPhase()
 
         with (
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
         ):
@@ -157,7 +168,9 @@ class TestBuilderPhase:
         assert "branch already exists" in result.message
         assert result.data.get("error_detail") == "fatal: branch already exists"
 
-    def test_worktree_failure_minimal_when_no_output(self, mock_context: MagicMock) -> None:
+    def test_worktree_failure_minimal_when_no_output(
+        self, mock_context: MagicMock
+    ) -> None:
         """Worktree creation failure with no subprocess output stays concise."""
         mock_context.check_shutdown.return_value = False
         wt_mock = MagicMock()
@@ -173,7 +186,9 @@ class TestBuilderPhase:
         builder = BuilderPhase()
 
         with (
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
         ):
@@ -198,10 +213,16 @@ class TestBuilderPhase:
         }
 
         with (
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", side_effect=[None, None, None]),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                side_effect=[None, None, None],
+            ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
             patch.object(builder, "validate", return_value=True),
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(builder, "_create_worktree_marker"),
@@ -214,7 +235,9 @@ class TestBuilderPhase:
         assert "worktree exists" in result.message
         assert result.data.get("diagnostics") == fake_diag
 
-    def test_validation_failure_includes_diagnostics(self, mock_context: MagicMock) -> None:
+    def test_validation_failure_includes_diagnostics(
+        self, mock_context: MagicMock
+    ) -> None:
         """Validation failure should include diagnostic context."""
         mock_context.check_shutdown.return_value = False
         wt_mock = MagicMock()
@@ -228,10 +251,15 @@ class TestBuilderPhase:
         }
 
         with (
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
             patch.object(builder, "validate", return_value=False),
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(builder, "_create_worktree_marker"),
@@ -245,7 +273,9 @@ class TestBuilderPhase:
         assert "worktree does not exist" in result.message
         assert result.data.get("diagnostics") == fake_diag
 
-    def test_unexpected_exit_code_includes_diagnostics(self, mock_context: MagicMock) -> None:
+    def test_unexpected_exit_code_includes_diagnostics(
+        self, mock_context: MagicMock
+    ) -> None:
         """Non-zero/non-special exit codes should include diagnostics."""
         mock_context.check_shutdown.return_value = False
         wt_mock = MagicMock()
@@ -254,13 +284,20 @@ class TestBuilderPhase:
         mock_context.worktree_path = wt_mock
 
         builder = BuilderPhase()
-        fake_diag = {"summary": "worktree exists; remote branch exists; labels=[loom:building]; log=/fake/log"}
+        fake_diag = {
+            "summary": "worktree exists; remote branch exists; labels=[loom:building]; log=/fake/log"
+        }
 
         with (
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=1),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=1,
+            ),
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(builder, "_create_worktree_marker"),
         ):
@@ -282,10 +319,15 @@ class TestBuilderPhase:
         builder = BuilderPhase()
 
         with (
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=4),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=4,
+            ),
             patch.object(builder, "_mark_issue_blocked"),
             patch.object(builder, "_create_worktree_marker"),
         ):
@@ -299,7 +341,9 @@ class TestBuilderPhase:
 class TestBuilderDiagnostics:
     """Test BuilderPhase._gather_diagnostics helper."""
 
-    def test_diagnostics_when_worktree_exists(self, mock_context: MagicMock, tmp_path: Path) -> None:
+    def test_diagnostics_when_worktree_exists(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
         """Should report worktree state when worktree directory exists."""
         # Create a real worktree dir so is_dir() works
         wt_dir = tmp_path / "worktree"
@@ -319,7 +363,9 @@ class TestBuilderDiagnostics:
         # Mock git and gh subprocess calls
         def fake_run(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
-            result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
             if "rev-parse" in cmd_str:
                 result.stdout = "feature/issue-42\n"
             elif "log" in cmd_str and "main..HEAD" in cmd_str:
@@ -332,7 +378,9 @@ class TestBuilderDiagnostics:
                 result.stdout = "loom:building"
             return result
 
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
             diag = builder._gather_diagnostics(mock_context)
 
         assert diag["worktree_exists"] is True
@@ -345,7 +393,9 @@ class TestBuilderDiagnostics:
         assert "worktree exists" in diag["summary"]
         assert "remote branch exists" in diag["summary"]
 
-    def test_diagnostics_when_worktree_missing(self, mock_context: MagicMock, tmp_path: Path) -> None:
+    def test_diagnostics_when_worktree_missing(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
         """Should report worktree missing when directory doesn't exist."""
         mock_context.worktree_path = tmp_path / "nonexistent"
         mock_context.config = ShepherdConfig(issue=99)
@@ -354,9 +404,13 @@ class TestBuilderDiagnostics:
         builder = BuilderPhase()
 
         def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr=""
+            )
 
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
             diag = builder._gather_diagnostics(mock_context)
 
         assert diag["worktree_exists"] is False
@@ -368,7 +422,9 @@ class TestBuilderDiagnostics:
         assert "worktree does not exist" in diag["summary"]
         assert "remote branch missing" in diag["summary"]
 
-    def test_diagnostics_log_tail_truncated(self, mock_context: MagicMock, tmp_path: Path) -> None:
+    def test_diagnostics_log_tail_truncated(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
         """Should include only last 20 lines of log when file is large."""
         mock_context.worktree_path = tmp_path / "nonexistent"
         mock_context.config = ShepherdConfig(issue=42)
@@ -383,9 +439,13 @@ class TestBuilderDiagnostics:
         builder = BuilderPhase()
 
         def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr=""
+            )
 
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
             diag = builder._gather_diagnostics(mock_context)
 
         assert len(diag["log_tail"]) == 20
@@ -398,7 +458,9 @@ class TestBuilderDiagnostics:
         path = builder._get_log_path(mock_context)
         assert path == Path("/fake/repo/.loom/logs/loom-builder-issue-42.log")
 
-    def test_diagnostics_summary_format(self, mock_context: MagicMock, tmp_path: Path) -> None:
+    def test_diagnostics_summary_format(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
         """Summary should contain all key diagnostic sections."""
         mock_context.worktree_path = tmp_path / "nonexistent"
         mock_context.config = ShepherdConfig(issue=42)
@@ -409,10 +471,19 @@ class TestBuilderDiagnostics:
         def fake_run(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
             if "gh" in cmd_str:
-                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="loom:building, loom:curated", stderr="")
-            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout="loom:building, loom:curated",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=1, stdout="", stderr=""
+            )
 
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
             diag = builder._gather_diagnostics(mock_context)
 
         summary = diag["summary"]
@@ -432,9 +503,14 @@ class TestBuilderQualityValidation:
         """Should return issue body on successful gh call."""
         builder = BuilderPhase()
         completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="## Acceptance Criteria\n- [ ] Works\n", stderr=""
+            args=[],
+            returncode=0,
+            stdout="## Acceptance Criteria\n- [ ] Works\n",
+            stderr="",
         )
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
             body = builder._fetch_issue_body(mock_context)
 
         assert body is not None
@@ -446,7 +522,9 @@ class TestBuilderQualityValidation:
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="error"
         )
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
             body = builder._fetch_issue_body(mock_context)
 
         assert body is None
@@ -472,7 +550,9 @@ class TestBuilderQualityValidation:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=body, stderr=""
         )
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
             builder._run_quality_validation(mock_context)
 
         # Should have reported a heartbeat milestone
@@ -500,7 +580,9 @@ Modify `builder.py` to add validation.
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=body, stderr=""
         )
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
             builder._run_quality_validation(mock_context)
 
         # Should NOT have reported a heartbeat milestone
@@ -514,7 +596,9 @@ Modify `builder.py` to add validation.
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="error"
         )
-        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
             # Should not raise
             builder._run_quality_validation(mock_context)
 
@@ -590,7 +674,9 @@ class TestBuilderTestVerification:
         result = builder._detect_test_command(tmp_path)
         assert result is None
 
-    def test_detect_test_command_empty_package_json_scripts(self, tmp_path: Path) -> None:
+    def test_detect_test_command_empty_package_json_scripts(
+        self, tmp_path: Path
+    ) -> None:
         """Should return None when package.json has no test scripts."""
         builder = BuilderPhase()
         pkg = {"scripts": {"build": "tsc"}}
@@ -648,13 +734,21 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         mock_context.worktree_path = worktree_mock
 
         completed = subprocess.CompletedProcess(
-            args=[], returncode=0,
+            args=[],
+            returncode=0,
             stdout="Tests  5 passed\nDuration 0.1s\n",
             stderr="",
         )
         with (
-            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
-            patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed),
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ),
         ):
             result = builder._run_test_verification(mock_context)
 
@@ -670,13 +764,21 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         mock_context.worktree_path = worktree_mock
 
         completed = subprocess.CompletedProcess(
-            args=[], returncode=1,
+            args=[],
+            returncode=1,
             stdout="FAIL src/foo.test.ts\nTests  2 failed, 3 passed\n",
             stderr="",
         )
         with (
-            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
-            patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed),
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ),
         ):
             result = builder._run_test_verification(mock_context)
 
@@ -693,7 +795,11 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         mock_context.worktree_path = worktree_mock
 
         with (
-            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
@@ -713,7 +819,9 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         result = builder._run_test_verification(mock_context)
         assert result is None
 
-    def test_run_test_verification_no_test_runner(self, mock_context: MagicMock) -> None:
+    def test_run_test_verification_no_test_runner(
+        self, mock_context: MagicMock
+    ) -> None:
         """Should return None when no test runner detected."""
         builder = BuilderPhase()
         worktree_mock = MagicMock()
@@ -733,7 +841,11 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         mock_context.worktree_path = worktree_mock
 
         with (
-            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
                 side_effect=OSError("pnpm not found"),
@@ -856,7 +968,9 @@ class TestBuilderEnsureDependencies:
 class TestJudgePhase:
     """Test JudgePhase."""
 
-    def test_should_skip_when_from_merge_and_approved(self, mock_context: MagicMock) -> None:
+    def test_should_skip_when_from_merge_and_approved(
+        self, mock_context: MagicMock
+    ) -> None:
         """Judge should be skipped when --from merge and PR is approved."""
         mock_context.config = ShepherdConfig(issue=42, start_from=Phase.MERGE)
         mock_context.pr_number = 100
@@ -881,7 +995,9 @@ class TestJudgePhase:
 
         assert skip is False
 
-    def test_validation_retries_on_race_condition(self, mock_context: MagicMock) -> None:
+    def test_validation_retries_on_race_condition(
+        self, mock_context: MagicMock
+    ) -> None:
         """Validation should retry and succeed when label appears on second attempt.
 
         Simulates the race condition from issue #1764 where the judge worker
@@ -895,7 +1011,9 @@ class TestJudgePhase:
         # First validate() call fails (label not yet applied), second succeeds
         with (
             patch.object(judge, "validate", side_effect=[False, True]) as mock_validate,
-            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
             patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
         ):
             result = judge.run(mock_context)
@@ -907,7 +1025,9 @@ class TestJudgePhase:
         # Cache should be invalidated before first attempt and before retry
         assert mock_context.label_cache.invalidate_pr.call_count >= 2
 
-    def test_validation_fails_after_retries_exhausted(self, mock_context: MagicMock) -> None:
+    def test_validation_fails_after_retries_exhausted(
+        self, mock_context: MagicMock
+    ) -> None:
         """Validation should fail after all retry attempts are exhausted.
 
         When the label never appears (e.g., judge truly failed), all 3 attempts
@@ -919,7 +1039,9 @@ class TestJudgePhase:
         judge = JudgePhase()
         with (
             patch.object(judge, "validate", return_value=False) as mock_validate,
-            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
             patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
         ):
             result = judge.run(mock_context)
@@ -954,7 +1076,9 @@ class TestJudgePhase:
 
         with (
             patch.object(judge, "validate", side_effect=track_validate),
-            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
         ):
             result = judge.run(mock_context)
 
@@ -963,7 +1087,9 @@ class TestJudgePhase:
         assert call_order[0] == "invalidate"
         assert call_order[1] == "validate"
 
-    def test_validation_succeeds_on_first_attempt(self, mock_context: MagicMock) -> None:
+    def test_validation_succeeds_on_first_attempt(
+        self, mock_context: MagicMock
+    ) -> None:
         """When validation succeeds on first attempt, no retries or sleeps happen."""
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
@@ -972,7 +1098,9 @@ class TestJudgePhase:
         judge = JudgePhase()
         with (
             patch.object(judge, "validate", return_value=True) as mock_validate,
-            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
             patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
         ):
             result = judge.run(mock_context)
@@ -980,6 +1108,477 @@ class TestJudgePhase:
         assert result.status == PhaseStatus.SUCCESS
         assert mock_validate.call_count == 1
         mock_sleep.assert_not_called()
+
+
+class TestJudgeFallbackApproval:
+    """Test force-mode fallback approval detection in JudgePhase."""
+
+    def _make_force_context(self, mock_context: MagicMock) -> MagicMock:
+        """Set up a mock context for force-mode judge tests."""
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        return mock_context
+
+    def test_fallback_activates_in_force_mode_with_approval_and_checks(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should succeed when force mode + approval comment + passing checks."""
+        ctx = self._make_force_context(mock_context)
+        # After fallback applies loom:pr, the label check should find it
+        ctx.has_pr_label.return_value = True
+
+        judge = JudgePhase()
+
+        gh_run_results = [
+            # _has_approval_comment: gh pr view --json comments
+            MagicMock(returncode=0, stdout="LGTM, looks good!\n"),
+            # _pr_checks_passing: gh pr view --json statusCheckRollup,mergeable
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps({"mergeable": "MERGEABLE", "statusCheckRollup": []}),
+            ),
+            # _try_fallback_approval: gh pr edit --add-label loom:pr
+            MagicMock(returncode=0),
+        ]
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                side_effect=gh_run_results,
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("approved") is True
+
+    def test_fallback_does_not_activate_in_default_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should NOT activate when not in force mode."""
+        mock_context.config = ShepherdConfig(issue=42)  # Default mode
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "validation failed" in result.message
+
+    def test_fallback_denied_without_approval_comment(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should fail when no approval comment is found."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # No approval comment
+            patch.object(judge, "_has_approval_comment", return_value=False),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+
+    def test_fallback_denied_without_passing_checks(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should fail when PR checks are not passing."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_has_approval_comment", return_value=True),
+            # Checks not passing
+            patch.object(judge, "_pr_checks_passing", return_value=False),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+
+    def test_fallback_applies_loom_pr_label(self, mock_context: MagicMock) -> None:
+        """Fallback should apply loom:pr label via gh pr edit."""
+        ctx = self._make_force_context(mock_context)
+        ctx.has_pr_label.return_value = True
+
+        judge = JudgePhase()
+
+        add_label_call = MagicMock(returncode=0)
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=add_label_call,
+            ) as mock_run,
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Verify the label was applied
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "gh" in call_args[0]
+        assert "--add-label" in call_args
+        assert "loom:pr" in call_args
+
+    def test_fallback_invalidates_cache_after_label_applied(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should invalidate PR label cache after applying label."""
+        ctx = self._make_force_context(mock_context)
+        ctx.has_pr_label.return_value = True
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Cache should have been invalidated (multiple times: before validation retries + after fallback)
+        assert ctx.label_cache.invalidate_pr.call_count >= 2
+
+    def test_fallback_fails_when_label_application_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should fail if gh pr edit to apply label returns non-zero."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=MagicMock(returncode=1),  # label application fails
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+
+
+class TestHasApprovalComment:
+    """Test _has_approval_comment with various comment patterns."""
+
+    def _make_context(self, mock_context: MagicMock) -> MagicMock:
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+        return mock_context
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "Approved",
+            "approved",
+            "APPROVED",
+            "This PR is approved.",
+            "LGTM",
+            "lgtm",
+            "Lgtm, looks great!",
+            "Ship it",
+            "ship it!",
+            "\u2705 All good",
+            "\U0001f44d",
+        ],
+    )
+    def test_recognizes_approval_patterns(
+        self, mock_context: MagicMock, comment: str
+    ) -> None:
+        """Should detect approval in various comment formats."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=comment + "\n"),
+        ):
+            assert judge._has_approval_comment(ctx) is True
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "Not approved",
+            "not approved yet",
+            "I don't approve this",
+            "Don't approve yet",
+            "Never approve without tests",
+            "Can't approve this",
+            "No approval from me",
+        ],
+    )
+    def test_rejects_negated_approval_patterns(
+        self, mock_context: MagicMock, comment: str
+    ) -> None:
+        """Should reject comments with negation before approval pattern."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=comment + "\n"),
+        ):
+            assert judge._has_approval_comment(ctx) is False
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "Please fix the tests",
+            "Needs more work",
+            "This is a nice PR but has issues",
+            "Changes requested",
+            "",
+        ],
+    )
+    def test_rejects_non_approval_comments(
+        self, mock_context: MagicMock, comment: str
+    ) -> None:
+        """Should return False for comments without approval signals."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=comment + "\n"),
+        ):
+            assert judge._has_approval_comment(ctx) is False
+
+    def test_returns_false_on_gh_failure(self, mock_context: MagicMock) -> None:
+        """Should return False when gh command fails."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            assert judge._has_approval_comment(ctx) is False
+
+    def test_returns_false_on_empty_comments(self, mock_context: MagicMock) -> None:
+        """Should return False when PR has no comments."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=""),
+        ):
+            assert judge._has_approval_comment(ctx) is False
+
+
+class TestPrChecksPassing:
+    """Test _pr_checks_passing with various PR states."""
+
+    def _make_context(self, mock_context: MagicMock) -> MagicMock:
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+        return mock_context
+
+    def test_passes_when_mergeable_and_no_checks(self, mock_context: MagicMock) -> None:
+        """Should pass when PR is mergeable with no required checks."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"mergeable": "MERGEABLE", "statusCheckRollup": []}),
+            ),
+        ):
+            assert judge._pr_checks_passing(ctx) is True
+
+    def test_passes_with_successful_checks(self, mock_context: MagicMock) -> None:
+        """Should pass when all checks have succeeded."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        checks = [
+            {"conclusion": "SUCCESS", "status": "COMPLETED"},
+            {"conclusion": "NEUTRAL", "status": "COMPLETED"},
+            {"conclusion": "SKIPPED", "status": "COMPLETED"},
+        ]
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"mergeable": "MERGEABLE", "statusCheckRollup": checks}
+                ),
+            ),
+        ):
+            assert judge._pr_checks_passing(ctx) is True
+
+    def test_passes_with_in_progress_checks(self, mock_context: MagicMock) -> None:
+        """Should pass when checks are still in progress."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        checks = [{"conclusion": "", "status": "IN_PROGRESS"}]
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"mergeable": "MERGEABLE", "statusCheckRollup": checks}
+                ),
+            ),
+        ):
+            assert judge._pr_checks_passing(ctx) is True
+
+    def test_fails_with_failed_check(self, mock_context: MagicMock) -> None:
+        """Should fail when any check has failed."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        checks = [
+            {"conclusion": "SUCCESS", "status": "COMPLETED"},
+            {"conclusion": "FAILURE", "status": "COMPLETED"},
+        ]
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"mergeable": "MERGEABLE", "statusCheckRollup": checks}
+                ),
+            ),
+        ):
+            assert judge._pr_checks_passing(ctx) is False
+
+    def test_fails_when_not_mergeable(self, mock_context: MagicMock) -> None:
+        """Should fail when PR has merge conflicts."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps(
+                    {"mergeable": "CONFLICTING", "statusCheckRollup": []}
+                ),
+            ),
+        ):
+            assert judge._pr_checks_passing(ctx) is False
+
+    def test_passes_with_unknown_mergeable_state(self, mock_context: MagicMock) -> None:
+        """Should pass when mergeable state is UNKNOWN (GitHub hasn't computed it yet)."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(
+                returncode=0,
+                stdout=json.dumps({"mergeable": "UNKNOWN", "statusCheckRollup": []}),
+            ),
+        ):
+            assert judge._pr_checks_passing(ctx) is True
+
+    def test_fails_on_gh_failure(self, mock_context: MagicMock) -> None:
+        """Should fail when gh command fails."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            assert judge._pr_checks_passing(ctx) is False
+
+    def test_fails_on_invalid_json(self, mock_context: MagicMock) -> None:
+        """Should fail when gh returns invalid JSON."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout="not json"),
+        ):
+            assert judge._pr_checks_passing(ctx) is False
+
+
+class TestApprovalPatterns:
+    """Test the module-level APPROVAL_PATTERNS and NEGATIVE_PREFIXES constants."""
+
+    def test_approval_patterns_are_compiled(self) -> None:
+        """Approval patterns should be compiled regex objects."""
+        for pattern in APPROVAL_PATTERNS:
+            assert hasattr(pattern, "search")
+
+    def test_negative_prefixes_are_compiled(self) -> None:
+        """Negative prefixes should be compiled regex objects."""
+        for pattern in NEGATIVE_PREFIXES:
+            assert hasattr(pattern, "search")
+
+    def test_approved_matches_word_boundary(self) -> None:
+        """'approved' pattern should match whole words only."""
+        pattern = APPROVAL_PATTERNS[0]  # \bapproved?\b
+        assert pattern.search("Approved") is not None
+        assert pattern.search("approve") is not None
+        # Word boundaries prevent matching inside compound words
+        assert pattern.search("unapproved") is None
+        assert pattern.search("preapproved") is None
+
+    def test_lgtm_case_insensitive(self) -> None:
+        """LGTM pattern should be case-insensitive."""
+        pattern = APPROVAL_PATTERNS[1]
+        assert pattern.search("LGTM") is not None
+        assert pattern.search("lgtm") is not None
+        assert pattern.search("Lgtm") is not None
 
 
 class TestMergePhase:
@@ -1073,7 +1672,9 @@ class TestStaleBranchDetection:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=ls_remote_output, stderr=""
         )
-        with patch("loom_tools.shepherd.context.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.context.subprocess.run", return_value=completed
+        ):
             with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
                 ShepherdContext._check_stale_branch(mock_context, 42)
 
@@ -1086,7 +1687,9 @@ class TestStaleBranchDetection:
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout="", stderr=""
         )
-        with patch("loom_tools.shepherd.context.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.context.subprocess.run", return_value=completed
+        ):
             with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
                 ShepherdContext._check_stale_branch(mock_context, 42)
 
@@ -1099,7 +1702,9 @@ class TestStaleBranchDetection:
         completed = subprocess.CompletedProcess(
             args=[], returncode=128, stdout="", stderr="fatal: error"
         )
-        with patch("loom_tools.shepherd.context.subprocess.run", return_value=completed):
+        with patch(
+            "loom_tools.shepherd.context.subprocess.run", return_value=completed
+        ):
             with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
                 ShepherdContext._check_stale_branch(mock_context, 42)
 
@@ -1133,7 +1738,11 @@ class TestReadHeartbeats:
                     "timestamp": "t1",
                     "data": {"action": "builder running (1m elapsed)"},
                 },
-                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "judge"}},
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t2",
+                    "data": {"phase": "judge"},
+                },
                 {
                     "event": "heartbeat",
                     "timestamp": "t3",
@@ -1172,7 +1781,11 @@ class TestReadHeartbeats:
         progress = {
             "milestones": [
                 {"event": "started", "timestamp": "t0", "data": {}},
-                {"event": "phase_entered", "timestamp": "t1", "data": {"phase": "builder"}},
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t1",
+                    "data": {"phase": "builder"},
+                },
             ],
         }
         f = tmp_path / "no-hb.json"
@@ -1184,13 +1797,41 @@ class TestReadHeartbeats:
         progress = {
             "task_id": "abc123",
             "milestones": [
-                {"event": "phase_entered", "timestamp": "t0", "data": {"phase": "curator"}},
-                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "curator running (1m elapsed)"}},
-                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "builder"}},
-                {"event": "heartbeat", "timestamp": "t3", "data": {"action": "builder running (1m elapsed)"}},
-                {"event": "heartbeat", "timestamp": "t4", "data": {"action": "builder running (2m elapsed)"}},
-                {"event": "phase_entered", "timestamp": "t5", "data": {"phase": "judge"}},
-                {"event": "heartbeat", "timestamp": "t6", "data": {"action": "judge running (1m elapsed)"}},
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t0",
+                    "data": {"phase": "curator"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t1",
+                    "data": {"action": "curator running (1m elapsed)"},
+                },
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t2",
+                    "data": {"phase": "builder"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t3",
+                    "data": {"action": "builder running (1m elapsed)"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t4",
+                    "data": {"action": "builder running (2m elapsed)"},
+                },
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t5",
+                    "data": {"phase": "judge"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t6",
+                    "data": {"action": "judge running (1m elapsed)"},
+                },
             ],
         }
         f = tmp_path / "shepherd-abc123.json"
@@ -1216,10 +1857,26 @@ class TestReadHeartbeats:
         """Without phase filter, all heartbeats should be returned (backward compat)."""
         progress = {
             "milestones": [
-                {"event": "phase_entered", "timestamp": "t0", "data": {"phase": "curator"}},
-                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "curator running"}},
-                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "judge"}},
-                {"event": "heartbeat", "timestamp": "t3", "data": {"action": "judge running"}},
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t0",
+                    "data": {"phase": "curator"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t1",
+                    "data": {"action": "curator running"},
+                },
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t2",
+                    "data": {"phase": "judge"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t3",
+                    "data": {"action": "judge running"},
+                },
             ],
         }
         f = tmp_path / "progress.json"
@@ -1232,8 +1889,16 @@ class TestReadHeartbeats:
         """When phase has no phase_entered milestone, return all heartbeats."""
         progress = {
             "milestones": [
-                {"event": "heartbeat", "timestamp": "t0", "data": {"action": "running"}},
-                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "still running"}},
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t0",
+                    "data": {"action": "running"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t1",
+                    "data": {"action": "still running"},
+                },
             ],
         }
         f = tmp_path / "progress.json"
@@ -1246,10 +1911,26 @@ class TestReadHeartbeats:
         """When a phase is entered multiple times, use the most recent entry."""
         progress = {
             "milestones": [
-                {"event": "phase_entered", "timestamp": "t0", "data": {"phase": "builder"}},
-                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "first attempt"}},
-                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "builder"}},
-                {"event": "heartbeat", "timestamp": "t3", "data": {"action": "second attempt"}},
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t0",
+                    "data": {"phase": "builder"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t1",
+                    "data": {"action": "first attempt"},
+                },
+                {
+                    "event": "phase_entered",
+                    "timestamp": "t2",
+                    "data": {"phase": "builder"},
+                },
+                {
+                    "event": "heartbeat",
+                    "timestamp": "t3",
+                    "data": {"action": "second attempt"},
+                },
             ],
         }
         f = tmp_path / "progress.json"

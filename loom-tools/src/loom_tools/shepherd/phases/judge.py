@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import time
 
+from loom_tools.common.logging import log_info, log_warning
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import (
@@ -18,6 +21,29 @@ from loom_tools.shepherd.phases.base import (
 # validation can race between them (see issue #1764).
 VALIDATION_MAX_RETRIES = 3
 VALIDATION_RETRY_DELAY_SECONDS = 2
+
+# Patterns that indicate an approval comment from the judge.
+# Matched case-insensitively against the full comment body.
+# Only standalone approval signals count — negation prefixes are excluded
+# in _has_approval_comment() via NEGATIVE_PREFIXES.
+APPROVAL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bapproved?\b", re.IGNORECASE),
+    re.compile(r"\blgtm\b", re.IGNORECASE),
+    re.compile(r"\bship\s*it\b", re.IGNORECASE),
+    re.compile(r"\u2705"),  # ✅
+    re.compile(r"\U0001f44d"),  # 👍
+]
+
+# If an approval pattern match is preceded by one of these prefixes
+# (within the same line), the match is considered a false positive.
+NEGATIVE_PREFIXES: list[re.Pattern[str]] = [
+    re.compile(r"\bnot\s+", re.IGNORECASE),
+    re.compile(r"\bnot\b", re.IGNORECASE),
+    re.compile(r"\bdon'?t\s+", re.IGNORECASE),
+    re.compile(r"\bnever\s+", re.IGNORECASE),
+    re.compile(r"\bcan'?t\s+", re.IGNORECASE),
+    re.compile(r"\bno\s+", re.IGNORECASE),
+]
 
 
 class JudgePhase:
@@ -118,11 +144,17 @@ class JudgePhase:
                 ctx.label_cache.invalidate_pr(ctx.pr_number)
 
         if not validated:
-            return PhaseResult(
-                status=PhaseStatus.FAILED,
-                message="judge phase validation failed",
-                phase_name="judge",
-            )
+            # In force mode, attempt fallback approval detection before giving up.
+            # This handles the case where the judge worker approved the PR but
+            # failed to apply the loom:pr label (e.g., GitHub API error).
+            if ctx.config.is_force_mode and self._try_fallback_approval(ctx):
+                validated = True
+            else:
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message="judge phase validation failed",
+                    phase_name="judge",
+                )
 
         # Check result — cache was already invalidated above, but
         # invalidate once more to ensure the label checks below
@@ -173,6 +205,173 @@ class JudgePhase:
             return True
         except subprocess.CalledProcessError:
             return False
+
+    def _try_fallback_approval(self, ctx: ShepherdContext) -> bool:
+        """Attempt fallback approval detection in force mode.
+
+        When the standard label-based validation fails in force mode, check
+        for approval signals in PR comments combined with healthy PR status
+        (CI checks passing and mergeable state). If both conditions are met,
+        apply the loom:pr label and return True.
+
+        This handles the scenario where the judge worker approved the PR
+        (left an approval comment) but failed to apply the label due to a
+        GitHub API error or timing issue.
+
+        Returns:
+            True if fallback approval was detected and label applied.
+        """
+        assert ctx.pr_number is not None
+
+        log_warning(
+            f"[force-mode] Label validation failed for PR #{ctx.pr_number}, "
+            "attempting fallback approval detection"
+        )
+
+        has_approval = self._has_approval_comment(ctx)
+        checks_ok = self._pr_checks_passing(ctx)
+
+        if not has_approval:
+            log_info("[force-mode] No approval comment found in PR — fallback denied")
+            return False
+
+        if not checks_ok:
+            log_info("[force-mode] PR checks not passing — fallback denied")
+            return False
+
+        # Both signals present — apply the label for consistency
+        log_warning(
+            f"[force-mode] Fallback approval: PR #{ctx.pr_number} has approval "
+            "comment and passing checks — applying loom:pr label"
+        )
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "edit",
+                str(ctx.pr_number),
+                "--add-label",
+                "loom:pr",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            log_warning("[force-mode] Failed to apply loom:pr label via fallback")
+            return False
+
+        ctx.label_cache.invalidate_pr(ctx.pr_number)
+        return True
+
+    def _has_approval_comment(self, ctx: ShepherdContext) -> bool:
+        """Check PR comments for approval signals.
+
+        Searches the most recent comments for patterns indicating the judge
+        approved the PR (e.g., "Approved", "LGTM", checkmark emoji).
+        Rejects false positives where the match is preceded by a negation
+        (e.g., "Not approved").
+
+        Returns:
+            True if an approval comment was found.
+        """
+        assert ctx.pr_number is not None
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "comments",
+                "--jq",
+                ".comments[-5:][].body",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+
+        comment_text = result.stdout
+
+        for line in comment_text.splitlines():
+            for pattern in APPROVAL_PATTERNS:
+                match = pattern.search(line)
+                if match is None:
+                    continue
+                # Check for negation prefix on the same line
+                prefix_text = line[: match.start()]
+                if any(neg.search(prefix_text) for neg in NEGATIVE_PREFIXES):
+                    continue
+                return True
+
+        return False
+
+    def _pr_checks_passing(self, ctx: ShepherdContext) -> bool:
+        """Check if PR status checks are passing and PR is mergeable.
+
+        Uses ``gh pr view`` to inspect the overall status check rollup
+        and the mergeable state.
+
+        Returns:
+            True if checks are passing (or no checks configured) and
+            the PR is in a mergeable state.
+        """
+        assert ctx.pr_number is not None
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "statusCheckRollup,mergeable",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return False
+
+        # Check mergeable state
+        mergeable = data.get("mergeable", "")
+        if mergeable not in ("MERGEABLE", "UNKNOWN"):
+            # CONFLICTING or other non-mergeable states
+            return False
+
+        # Check status checks
+        checks = data.get("statusCheckRollup", [])
+        if not checks:
+            # No checks configured — treat as passing
+            return True
+
+        for check in checks:
+            conclusion = check.get("conclusion", "")
+            status = check.get("status", "")
+            # A check is OK if it has concluded successfully or is still pending
+            if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED", ""):
+                continue
+            if status == "IN_PROGRESS":
+                continue
+            # Any failure/error means checks aren't passing
+            return False
+
+        return True
 
     def _mark_issue_blocked(
         self, ctx: ShepherdContext, error_class: str, details: str
