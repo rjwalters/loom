@@ -241,25 +241,53 @@ fi
 
 # Create pull request and capture the URL
 # Redirect stderr to stdout to capture the full output, then extract the URL
+# Use || to prevent set -e from exiting before we can report the error
+GH_PR_EXIT=0
 GH_PR_OUTPUT=$(gh pr create \
   -R "$REPO" \
   --base "$BASE_BRANCH" \
   --title "$PR_TITLE" \
   --body "$PR_BODY" \
-  --label "loom:pr" 2>&1)
+  --label "loom:pr" 2>&1) || GH_PR_EXIT=$?
 
-# Extract URL from output (gh CLI outputs the PR URL as the last line)
-PR_URL=$(echo "$GH_PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+if [[ $GH_PR_EXIT -ne 0 ]]; then
+  # Check if a PR already exists for this branch
+  if echo "$GH_PR_OUTPUT" | grep -qi "already exists"; then
+    warning "A pull request already exists for this branch"
+    info "Looking up existing PR..."
 
-# Validate the URL
-if [[ -z "$PR_URL" ]] || [[ ! "$PR_URL" =~ ^https://github\.com/[^[:space:]]+/pull/[0-9]+$ ]]; then
-  echo "Error: Failed to create PR or invalid URL returned" >&2
-  echo "gh output was:" >&2
-  echo "$GH_PR_OUTPUT" >&2
-  exit 1
+    # Find the existing PR URL
+    EXISTING_PR=$(gh pr list -R "$REPO" --head "$BRANCH_NAME" --base "$BASE_BRANCH" --json url --jq '.[0].url' 2>/dev/null || true)
+
+    if [[ -n "$EXISTING_PR" ]]; then
+      success "Found existing PR: $EXISTING_PR"
+      PR_URL="$EXISTING_PR"
+    else
+      echo "Error: PR already exists but could not find its URL" >&2
+      echo "gh output was:" >&2
+      echo "$GH_PR_OUTPUT" >&2
+      exit 1
+    fi
+  else
+    echo "Error: Failed to create pull request" >&2
+    echo "gh output was:" >&2
+    echo "$GH_PR_OUTPUT" >&2
+    exit 1
+  fi
+else
+  # Extract URL from output (gh CLI outputs the PR URL as the last line)
+  PR_URL=$(echo "$GH_PR_OUTPUT" | grep -oE 'https://github\.com/[^[:space:]]+/pull/[0-9]+' | head -1 | tr -d '[:space:]')
+
+  # Validate the URL
+  if [[ -z "$PR_URL" ]] || [[ ! "$PR_URL" =~ ^https://github\.com/[^[:space:]]+/pull/[0-9]+$ ]]; then
+    echo "Error: Failed to create PR or invalid URL returned" >&2
+    echo "gh output was:" >&2
+    echo "$GH_PR_OUTPUT" >&2
+    exit 1
+  fi
+
+  success "Pull request created: $PR_URL"
 fi
-
-success "Pull request created: $PR_URL"
 
 # ============================================================================
 # Attempt to merge the PR (only when FORCE_AUTO_MERGE is enabled)

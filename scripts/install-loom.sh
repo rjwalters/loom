@@ -736,8 +736,10 @@ if [[ ! -x "$LOOM_ROOT/scripts/install/create-pr.sh" ]]; then
   error "Installation script not found: create-pr.sh"
 fi
 
-PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$BASE_BRANCH") || \
-  error "Failed to create pull request"
+PR_URL_RAW=$("$LOOM_ROOT/scripts/install/create-pr.sh" "$TARGET_PATH/$WORKTREE_PATH" "$BASE_BRANCH") || {
+  # create-pr.sh prints detailed error info to stderr (visible above)
+  error "Failed to create pull request (see details above)"
+}
 
 # Check if installation was already complete (no changes needed)
 # IMPORTANT: Check this BEFORE trying to parse as URL
