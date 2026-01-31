@@ -389,8 +389,41 @@ check_untracked_building() {
                         progress_status=$(jq -r '.status // "unknown"' "$progress_file" 2>/dev/null || echo "unknown")
 
                         if [[ "$progress_issue" == "$issue_num" && "$progress_status" == "working" ]]; then
+                            # Don't trust status alone — verify heartbeat is fresh
+                            local last_heartbeat
+                            last_heartbeat=$(jq -r '.last_heartbeat // ""' "$progress_file" 2>/dev/null || echo "")
+
+                            if [[ -z "$last_heartbeat" || "$last_heartbeat" == "null" ]]; then
+                                # No heartbeat field — treat as stale (can't verify liveness)
+                                log_verbose "  Progress file for issue #$issue_num has no heartbeat — not trusted"
+                                continue
+                            fi
+
+                            local hb_epoch
+                            if [[ "$(uname)" == "Darwin" ]]; then
+                                hb_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+                            else
+                                hb_epoch=$(date -d "$last_heartbeat" "+%s" 2>/dev/null || echo "0")
+                            fi
+
+                            if [[ "$hb_epoch" == "0" ]]; then
+                                # Failed to parse heartbeat timestamp — treat as stale
+                                log_verbose "  Progress file for issue #$issue_num has unparseable heartbeat — not trusted"
+                                continue
+                            fi
+
+                            local now_epoch
+                            now_epoch=$(date +%s)
+                            local hb_age=$(( now_epoch - hb_epoch ))
+
+                            if (( hb_age > HEARTBEAT_STALE_THRESHOLD )); then
+                                # Heartbeat is stale — don't trust this progress file
+                                log_verbose "  Progress file for issue #$issue_num has stale heartbeat (${hb_age}s old) — not trusted"
+                                continue
+                            fi
+
                             has_progress=true
-                            log_verbose "  Found active progress file for issue #$issue_num"
+                            log_verbose "  Found active progress file for issue #$issue_num (heartbeat ${hb_age}s old)"
                             break
                         fi
                     fi
