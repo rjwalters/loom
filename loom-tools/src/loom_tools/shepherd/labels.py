@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+from typing import Literal
+
+# Entity type for generic label operations
+EntityType = Literal["issue", "pr"]
 
 
 class LabelCache:
@@ -15,8 +19,7 @@ class LabelCache:
     """
 
     def __init__(self, repo_root: Path | None = None) -> None:
-        self._issue_labels: dict[int, set[str]] = {}
-        self._pr_labels: dict[int, set[str]] = {}
+        self._labels: dict[tuple[EntityType, int], set[str]] = {}
         self._repo_root = repo_root
         self._gh_cmd = self._find_gh_cmd()
 
@@ -38,23 +41,89 @@ class LabelCache:
             return ""
         return result.stdout.strip()
 
-    def _fetch_issue_labels(self, issue: int) -> set[str]:
-        """Fetch labels for an issue from GitHub."""
+    def _fetch_labels(self, entity_type: EntityType, number: int) -> set[str]:
+        """Fetch labels for an issue or PR from GitHub."""
         output = self._run_gh(
-            ["issue", "view", str(issue), "--json", "labels", "--jq", ".labels[].name"]
+            [
+                entity_type,
+                "view",
+                str(number),
+                "--json",
+                "labels",
+                "--jq",
+                ".labels[].name",
+            ]
         )
         if not output:
             return set()
         return set(output.splitlines())
 
+    def get_labels(
+        self, entity_type: EntityType, number: int, *, refresh: bool = False
+    ) -> set[str]:
+        """Get labels for an entity, using cache if available.
+
+        Args:
+            entity_type: "issue" or "pr"
+            number: Issue or PR number
+            refresh: Force refresh from API (default False)
+
+        Returns:
+            Set of label names
+        """
+        key = (entity_type, number)
+        if refresh or key not in self._labels:
+            self._labels[key] = self._fetch_labels(entity_type, number)
+        return self._labels[key]
+
+    def has_label(self, entity_type: EntityType, number: int, label: str) -> bool:
+        """Check if an entity has a specific label."""
+        return label in self.get_labels(entity_type, number)
+
+    def set_labels(
+        self, entity_type: EntityType, number: int, labels: set[str]
+    ) -> None:
+        """Pre-populate cache with labels (e.g., from initial metadata fetch)."""
+        self._labels[(entity_type, number)] = labels
+
+    def invalidate_entity(
+        self, entity_type: EntityType, number: int | None = None
+    ) -> None:
+        """Invalidate cached labels for entities of a given type.
+
+        Args:
+            entity_type: "issue" or "pr"
+            number: Specific entity to invalidate, or None for all of that type
+        """
+        if number is not None:
+            self._labels.pop((entity_type, number), None)
+        else:
+            # Remove all entries of this type
+            keys_to_remove = [k for k in self._labels if k[0] == entity_type]
+            for key in keys_to_remove:
+                del self._labels[key]
+
+    def invalidate(self) -> None:
+        """Invalidate all cached labels."""
+        self._labels.clear()
+
+    # -------------------------------------------------------------------------
+    # Backward-compatible convenience methods
+    # -------------------------------------------------------------------------
+
+    def _fetch_issue_labels(self, issue: int) -> set[str]:
+        """Fetch labels for an issue from GitHub.
+
+        Deprecated: Use _fetch_labels("issue", issue) instead.
+        """
+        return self._fetch_labels("issue", issue)
+
     def _fetch_pr_labels(self, pr: int) -> set[str]:
-        """Fetch labels for a PR from GitHub."""
-        output = self._run_gh(
-            ["pr", "view", str(pr), "--json", "labels", "--jq", ".labels[].name"]
-        )
-        if not output:
-            return set()
-        return set(output.splitlines())
+        """Fetch labels for a PR from GitHub.
+
+        Deprecated: Use _fetch_labels("pr", pr) instead.
+        """
+        return self._fetch_labels("pr", pr)
 
     def get_issue_labels(self, issue: int, *, refresh: bool = False) -> set[str]:
         """Get labels for an issue, using cache if available.
@@ -66,9 +135,7 @@ class LabelCache:
         Returns:
             Set of label names
         """
-        if refresh or issue not in self._issue_labels:
-            self._issue_labels[issue] = self._fetch_issue_labels(issue)
-        return self._issue_labels[issue]
+        return self.get_labels("issue", issue, refresh=refresh)
 
     def get_pr_labels(self, pr: int, *, refresh: bool = False) -> set[str]:
         """Get labels for a PR, using cache if available.
@@ -80,21 +147,19 @@ class LabelCache:
         Returns:
             Set of label names
         """
-        if refresh or pr not in self._pr_labels:
-            self._pr_labels[pr] = self._fetch_pr_labels(pr)
-        return self._pr_labels[pr]
+        return self.get_labels("pr", pr, refresh=refresh)
 
     def has_issue_label(self, issue: int, label: str) -> bool:
         """Check if an issue has a specific label."""
-        return label in self.get_issue_labels(issue)
+        return self.has_label("issue", issue, label)
 
     def has_pr_label(self, pr: int, label: str) -> bool:
         """Check if a PR has a specific label."""
-        return label in self.get_pr_labels(pr)
+        return self.has_label("pr", pr, label)
 
     def set_issue_labels(self, issue: int, labels: set[str]) -> None:
         """Pre-populate cache with labels (e.g., from initial metadata fetch)."""
-        self._issue_labels[issue] = labels
+        self.set_labels("issue", issue, labels)
 
     def invalidate_issue(self, issue: int | None = None) -> None:
         """Invalidate cached issue labels.
@@ -102,10 +167,7 @@ class LabelCache:
         Args:
             issue: Specific issue to invalidate, or None for all
         """
-        if issue is not None:
-            self._issue_labels.pop(issue, None)
-        else:
-            self._issue_labels.clear()
+        self.invalidate_entity("issue", issue)
 
     def invalidate_pr(self, pr: int | None = None) -> None:
         """Invalidate cached PR labels.
@@ -113,15 +175,77 @@ class LabelCache:
         Args:
             pr: Specific PR to invalidate, or None for all
         """
-        if pr is not None:
-            self._pr_labels.pop(pr, None)
-        else:
-            self._pr_labels.clear()
+        self.invalidate_entity("pr", pr)
 
-    def invalidate(self) -> None:
-        """Invalidate all cached labels."""
-        self._issue_labels.clear()
-        self._pr_labels.clear()
+    # -------------------------------------------------------------------------
+    # Internal backward compatibility for tests
+    # -------------------------------------------------------------------------
+
+    @property
+    def _issue_labels(self) -> dict[int, set[str]]:
+        """Backward-compatible view of issue labels for tests.
+
+        This property provides a dict-like interface mapping issue numbers
+        to their labels, built from the unified cache.
+        """
+        return _EntityLabelView(self, "issue")
+
+    @property
+    def _pr_labels(self) -> dict[int, set[str]]:
+        """Backward-compatible view of PR labels for tests.
+
+        This property provides a dict-like interface mapping PR numbers
+        to their labels, built from the unified cache.
+        """
+        return _EntityLabelView(self, "pr")
+
+
+class _EntityLabelView:
+    """Dict-like view into LabelCache for backward compatibility.
+
+    This class provides a dict-like interface (getitem, setitem, contains, pop, clear)
+    that maps entity numbers to labels, filtering by entity type.
+    """
+
+    def __init__(self, cache: LabelCache, entity_type: EntityType) -> None:
+        self._cache = cache
+        self._entity_type = entity_type
+
+    def __getitem__(self, number: int) -> set[str]:
+        key = (self._entity_type, number)
+        return self._cache._labels[key]
+
+    def __setitem__(self, number: int, labels: set[str]) -> None:
+        key = (self._entity_type, number)
+        self._cache._labels[key] = labels
+
+    def __contains__(self, number: int) -> bool:
+        key = (self._entity_type, number)
+        return key in self._cache._labels
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            return self._to_dict() == other
+        return NotImplemented
+
+    def _to_dict(self) -> dict[int, set[str]]:
+        """Convert to a regular dict."""
+        return {
+            num: labels
+            for (etype, num), labels in self._cache._labels.items()
+            if etype == self._entity_type
+        }
+
+    def pop(self, number: int, *args: set[str]) -> set[str]:
+        key = (self._entity_type, number)
+        if args:
+            return self._cache._labels.pop(key, args[0])
+        return self._cache._labels.pop(key)
+
+    def clear(self) -> None:
+        keys_to_remove = [k for k in self._cache._labels if k[0] == self._entity_type]
+        for key in keys_to_remove:
+            del self._cache._labels[key]
 
 
 def add_issue_label(issue: int, label: str, repo_root: Path | None = None) -> bool:
@@ -129,11 +253,7 @@ def add_issue_label(issue: int, label: str, repo_root: Path | None = None) -> bo
 
     Returns True if successful.
     """
-    cmd = ["gh", "issue", "edit", str(issue), "--add-label", label]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False, cwd=repo_root
-    )
-    return result.returncode == 0
+    return add_label("issue", issue, label, repo_root)
 
 
 def remove_issue_label(issue: int, label: str, repo_root: Path | None = None) -> bool:
@@ -141,10 +261,7 @@ def remove_issue_label(issue: int, label: str, repo_root: Path | None = None) ->
 
     Returns True if successful (or label didn't exist).
     """
-    cmd = ["gh", "issue", "edit", str(issue), "--remove-label", label]
-    subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=repo_root)
-    # Always return True - label may not have existed
-    return True
+    return remove_label("issue", issue, label, repo_root)
 
 
 def add_pr_label(pr: int, label: str, repo_root: Path | None = None) -> bool:
@@ -152,11 +269,7 @@ def add_pr_label(pr: int, label: str, repo_root: Path | None = None) -> bool:
 
     Returns True if successful.
     """
-    cmd = ["gh", "pr", "edit", str(pr), "--add-label", label]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False, cwd=repo_root
-    )
-    return result.returncode == 0
+    return add_label("pr", pr, label, repo_root)
 
 
 def remove_pr_label(pr: int, label: str, repo_root: Path | None = None) -> bool:
@@ -164,7 +277,45 @@ def remove_pr_label(pr: int, label: str, repo_root: Path | None = None) -> bool:
 
     Returns True if successful (or label didn't exist).
     """
-    cmd = ["gh", "pr", "edit", str(pr), "--remove-label", label]
+    return remove_label("pr", pr, label, repo_root)
+
+
+def add_label(
+    entity_type: EntityType, number: int, label: str, repo_root: Path | None = None
+) -> bool:
+    """Add a label to an issue or PR.
+
+    Args:
+        entity_type: "issue" or "pr"
+        number: Issue or PR number
+        label: Label name to add
+        repo_root: Repository root path (optional)
+
+    Returns:
+        True if successful
+    """
+    cmd = ["gh", entity_type, "edit", str(number), "--add-label", label]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, cwd=repo_root
+    )
+    return result.returncode == 0
+
+
+def remove_label(
+    entity_type: EntityType, number: int, label: str, repo_root: Path | None = None
+) -> bool:
+    """Remove a label from an issue or PR.
+
+    Args:
+        entity_type: "issue" or "pr"
+        number: Issue or PR number
+        label: Label name to remove
+        repo_root: Repository root path (optional)
+
+    Returns:
+        True if successful (or label didn't exist)
+    """
+    cmd = ["gh", entity_type, "edit", str(number), "--remove-label", label]
     subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=repo_root)
     # Always return True - label may not have existed
     return True
