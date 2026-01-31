@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+import shutil
+
 from loom_tools.common.github import gh_parallel_queries
 from loom_tools.common.logging import log_warning
 from loom_tools.common.repo import find_repo_root
@@ -895,6 +897,69 @@ def compute_health(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight environment checks
+# ---------------------------------------------------------------------------
+
+def run_preflight_checks(
+    repo_root: pathlib.Path,
+    *,
+    _check_import: bool | None = None,
+    _check_gh: bool | None = None,
+) -> dict[str, Any]:
+    """Run pre-flight environment checks and return status dict.
+
+    Parameters starting with ``_`` are for testing injection.
+
+    Returns a dict with keys like ``loom_tools_available``,
+    ``gh_authenticated``, ``python_available``, each mapping to a bool.
+    """
+    result: dict[str, Any] = {}
+
+    # Check 1: Python interpreter available
+    result["python_available"] = shutil.which("python3") is not None or shutil.which("python") is not None
+
+    # Check 2: loom_tools importable
+    if _check_import is not None:
+        result["loom_tools_available"] = _check_import
+    else:
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", "import loom_tools"],
+                capture_output=True,
+                timeout=10,
+            )
+            result["loom_tools_available"] = proc.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            result["loom_tools_available"] = False
+
+    # Check 3: gh CLI available and authenticated
+    if _check_gh is not None:
+        result["gh_authenticated"] = _check_gh
+    else:
+        if not shutil.which("gh"):
+            result["gh_authenticated"] = False
+        else:
+            try:
+                proc = subprocess.run(
+                    ["gh", "auth", "status"],
+                    capture_output=True,
+                    timeout=10,
+                )
+                result["gh_authenticated"] = proc.returncode == 0
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                result["gh_authenticated"] = False
+
+    # Check 4: claude CLI available
+    result["claude_cli_available"] = shutil.which("claude") is not None
+
+    # Check 5: loom-tools install path exists
+    loom_tools_dir = repo_root / "loom-tools"
+    result["loom_tools_dir_exists"] = loom_tools_dir.exists()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Top-level orchestrator
 # ---------------------------------------------------------------------------
 
@@ -905,6 +970,7 @@ def build_snapshot(
     _now: datetime | None = None,
     _pipeline_data: dict[str, Any] | None = None,
     _tmux_pool: TmuxPool | None = None,
+    _preflight: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the full snapshot dict.
 
@@ -1069,7 +1135,10 @@ def build_snapshot(
             d["demand_trigger"] = demand.get(f"{role}_demand", False)
         support_roles_out[role] = d
 
-    # 19. Build final output (exact schema match with shell)
+    # 19. Pre-flight environment checks
+    preflight = _preflight if _preflight is not None else run_preflight_checks(repo_root)
+
+    # 20. Build final output (exact schema match with shell)
     usage_out = dict(usage) if isinstance(usage, dict) else {"error": "no data"}
     usage_out["healthy"] = usage_healthy
 
@@ -1118,6 +1187,7 @@ def build_snapshot(
             "cooldown_remaining_seconds": sf_state.cooldown_remaining_seconds,
             "probes_exhausted": sf_state.probes_exhausted,
         },
+        "preflight": preflight,
         "usage": usage_out,
         "tmux_pool": tmux_pool.to_dict(),
         "computed": {

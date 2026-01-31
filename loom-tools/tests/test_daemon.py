@@ -6,8 +6,11 @@ import json
 import pathlib
 
 
+from unittest import mock
+
 from loom_tools.daemon import (
     DaemonConfig,
+    DaemonLoop,
     DaemonMetrics,
     IterationResult,
 )
@@ -485,5 +488,93 @@ class TestOrchestrationDelegation:
 
         # Both use same stop signal file
         assert STOP_SIGNAL == ".loom/stop-daemon"
+
+
+class TestPreflightChecks:
+    """Tests for daemon pre-flight dependency checks."""
+
+    def _make_daemon(self, tmp_path: pathlib.Path) -> DaemonLoop:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True, exist_ok=True)
+        config = DaemonConfig()
+        return DaemonLoop(config, tmp_path)
+
+    def test_all_checks_pass(self, tmp_path: pathlib.Path) -> None:
+        """When all dependencies are available, no failures returned."""
+        daemon = self._make_daemon(tmp_path)
+        (tmp_path / "loom-tools").mkdir()
+
+        with mock.patch("shutil.which", return_value="/usr/bin/fake"):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value = mock.MagicMock(returncode=0, stderr="")
+                failures = daemon.run_preflight_checks()
+
+        assert failures == []
+
+    def test_missing_claude_cli(self, tmp_path: pathlib.Path) -> None:
+        """When claude CLI is missing, appropriate error returned."""
+        daemon = self._make_daemon(tmp_path)
+
+        def which_side_effect(name: str) -> str | None:
+            if name == "claude":
+                return None
+            return "/usr/bin/fake"
+
+        with mock.patch("shutil.which", side_effect=which_side_effect):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value = mock.MagicMock(returncode=0, stderr="")
+                failures = daemon.run_preflight_checks()
+
+        assert any("claude" in f.lower() for f in failures)
+
+    def test_loom_tools_not_importable(self, tmp_path: pathlib.Path) -> None:
+        """When loom_tools is not importable, appropriate error returned."""
+        daemon = self._make_daemon(tmp_path)
+
+        def run_side_effect(args, **kw):
+            if "-c" in args and "import loom_tools" in args:
+                return mock.MagicMock(returncode=1, stderr="ModuleNotFoundError")
+            return mock.MagicMock(returncode=0, stderr="")
+
+        with mock.patch("shutil.which", return_value="/usr/bin/fake"):
+            with mock.patch("subprocess.run", side_effect=run_side_effect):
+                failures = daemon.run_preflight_checks()
+
+        assert any("loom_tools" in f for f in failures)
+
+    def test_gh_not_authenticated(self, tmp_path: pathlib.Path) -> None:
+        """When gh is not authenticated, appropriate error returned."""
+        daemon = self._make_daemon(tmp_path)
+
+        call_count = 0
+
+        def run_side_effect(args, **kw):
+            nonlocal call_count
+            call_count += 1
+            if "auth" in args:
+                return mock.MagicMock(returncode=1, stderr="Not authenticated")
+            return mock.MagicMock(returncode=0, stderr="")
+
+        with mock.patch("shutil.which", return_value="/usr/bin/fake"):
+            with mock.patch("subprocess.run", side_effect=run_side_effect):
+                failures = daemon.run_preflight_checks()
+
+        assert any("gh" in f.lower() and "authenticated" in f.lower() for f in failures)
+
+    def test_missing_gh_cli(self, tmp_path: pathlib.Path) -> None:
+        """When gh CLI is missing entirely, appropriate error returned."""
+        daemon = self._make_daemon(tmp_path)
+
+        def which_side_effect(name: str) -> str | None:
+            if name == "gh":
+                return None
+            return "/usr/bin/fake"
+
+        with mock.patch("shutil.which", side_effect=which_side_effect):
+            with mock.patch("subprocess.run") as mock_run:
+                mock_run.return_value = mock.MagicMock(returncode=0, stderr="")
+                failures = daemon.run_preflight_checks()
+
+        assert any("gh" in f.lower() and "not found" in f.lower() for f in failures)
 
 

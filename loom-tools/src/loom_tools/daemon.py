@@ -324,6 +324,57 @@ class DaemonLoop:
                 f"{self.config.slow_iteration_multiplier}x average ({avg}s, threshold: {threshold}s)"
             )
 
+    def run_preflight_checks(self) -> list[str]:
+        """Run pre-flight dependency checks before starting the daemon loop.
+
+        Returns a list of error messages. Empty list means all checks passed.
+        """
+        failures: list[str] = []
+
+        # Check 1: claude CLI available
+        if not shutil.which("claude"):
+            failures.append("Error: 'claude' CLI not found in PATH")
+            failures.append("Install Claude Code CLI: https://claude.ai/code")
+
+        # Check 2: loom_tools module importable
+        # This catches PEP 668 managed environments and missing installations
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", "import loom_tools"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                failures.append("Error: 'loom_tools' Python module not importable")
+                failures.append(
+                    f"Run: pip install -e {self.repo_root / 'loom-tools'}"
+                )
+                if result.stderr.strip():
+                    failures.append(f"Details: {result.stderr.strip()[:200]}")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            failures.append("Error: Failed to verify loom_tools module (Python not available)")
+
+        # Check 3: gh CLI available and authenticated
+        if not shutil.which("gh"):
+            failures.append("Error: 'gh' CLI not found in PATH")
+            failures.append("Install GitHub CLI: https://cli.github.com/")
+        else:
+            try:
+                result = subprocess.run(
+                    ["gh", "auth", "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    failures.append("Error: 'gh' CLI not authenticated")
+                    failures.append("Run: gh auth login")
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                failures.append("Warning: Could not verify gh authentication")
+
+        return failures
+
     def run_iteration(self) -> IterationResult:
         """Run a single daemon iteration via Claude CLI."""
         start_time = time.time()
@@ -624,10 +675,11 @@ class DaemonLoop:
         # Write PID file
         self.pid_file.write_text(str(os.getpid()))
 
-        # Check for claude CLI
-        if not shutil.which("claude"):
-            print("Error: 'claude' CLI not found in PATH")
-            print("Install Claude Code CLI: https://claude.ai/code")
+        # Pre-flight dependency checks
+        preflight_failures = self.run_preflight_checks()
+        if preflight_failures:
+            for msg in preflight_failures:
+                print(msg)
             self.pid_file.unlink(missing_ok=True)
             return 1
 
