@@ -17,6 +17,9 @@
 #   Local mode (remove files in working directory, no worktree/PR):
 #     ./scripts/uninstall-loom.sh --yes --local /path/to/target-repo
 #
+#   Clean mode (remove all files including unknown, for clean reinstall):
+#     ./scripts/uninstall-loom.sh --yes --local --clean /path/to/target-repo
+#
 #   What this script does:
 #     1. Validates target repository (must be a Git repo with Loom installed)
 #     2. Creates uninstall worktree (.loom/worktrees/loom-uninstall)
@@ -35,6 +38,7 @@ set -euo pipefail
 NON_INTERACTIVE=false
 FORCE_AUTO_MERGE=false
 LOCAL_MODE=false
+CLEAN_MODE=false
 TARGET_PATH=""
 
 while [[ $# -gt 0 ]]; do
@@ -51,6 +55,10 @@ while [[ $# -gt 0 ]]; do
       LOCAL_MODE=true
       shift
       ;;
+    --clean)
+      CLEAN_MODE=true
+      shift
+      ;;
     -h|--help)
       echo "Usage: $0 [OPTIONS] /path/to/target-repo"
       echo ""
@@ -58,6 +66,7 @@ while [[ $# -gt 0 ]]; do
       echo "  -y, --yes    Non-interactive mode (preserve unknown files)"
       echo "  -f, --force  Auto-merge the uninstall PR after creation"
       echo "  -l, --local  Remove files in working directory (no worktree, no PR)"
+      echo "  --clean      Remove all files in managed directories (including unknown files)"
       echo "  -h, --help   Show this help message"
       exit 0
       ;;
@@ -473,7 +482,18 @@ fi
 # Handle unknown files
 REMOVE_UNKNOWN_FILES=()
 if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
-  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+  if [[ "$CLEAN_MODE" == "true" ]]; then
+    # Clean mode: remove all unknown files (user explicitly requested clean reinstall)
+    REMOVE_UNKNOWN_FILES=("${UNKNOWN_FILES[@]}")
+    if [[ ${#UNKNOWN_FILES[@]} -le 20 ]]; then
+      info "Unknown files in Loom directories (removing in clean mode):"
+      for f in "${UNKNOWN_FILES[@]}"; do
+        echo "  - $f (will remove)"
+      done
+    else
+      info "${#UNKNOWN_FILES[@]} unknown files in Loom directories (removing in clean mode)"
+    fi
+  elif [[ "$NON_INTERACTIVE" == "true" ]]; then
     if [[ ${#UNKNOWN_FILES[@]} -le 20 ]]; then
       info "Unknown files in Loom directories (preserved in non-interactive mode):"
       for f in "${UNKNOWN_FILES[@]}"; do
