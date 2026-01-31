@@ -34,6 +34,17 @@ APPROVAL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\U0001f44d"),  # 👍
 ]
 
+# Patterns that indicate a rejection / changes-requested comment from the judge.
+# Matched case-insensitively against the full comment body.
+# Only standalone rejection signals count — negation prefixes are excluded
+# in _has_rejection_comment() via NEGATIVE_PREFIXES.
+REJECTION_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bchanges\s+requested\b", re.IGNORECASE),
+    re.compile(r"\brequest\s+changes\b", re.IGNORECASE),
+    re.compile(r"\bneeds?\s+(?:changes|fixes|work)\b", re.IGNORECASE),
+    re.compile(r"\u274c"),  # ❌
+]
+
 # If an approval pattern match is preceded by one of these prefixes
 # (within the same line), the match is considered a false positive.
 NEGATIVE_PREFIXES: list[re.Pattern[str]] = [
@@ -144,11 +155,20 @@ class JudgePhase:
                 ctx.label_cache.invalidate_pr(ctx.pr_number)
 
         if not validated:
-            # In force mode, attempt fallback approval detection before giving up.
-            # This handles the case where the judge worker approved the PR but
-            # failed to apply the loom:pr label (e.g., GitHub API error).
+            # In force mode, attempt fallback detection before giving up.
+            # First try approval (judge approved but failed to apply loom:pr label),
+            # then try changes-requested (judge rejected but failed to apply
+            # loom:changes-requested label).
             if ctx.config.is_force_mode and self._try_fallback_approval(ctx):
                 validated = True
+            elif ctx.config.is_force_mode and self._try_fallback_changes_requested(ctx):
+                # Fallback detected changes-requested — route to doctor loop
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=f"[force-mode] Fallback detected changes requested on PR #{ctx.pr_number}",
+                    phase_name="judge",
+                    data={"changes_requested": True},
+                )
             else:
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
@@ -261,6 +281,68 @@ class JudgePhase:
         ctx.label_cache.invalidate_pr(ctx.pr_number)
         return True
 
+    def _try_fallback_changes_requested(self, ctx: ShepherdContext) -> bool:
+        """Attempt fallback changes-requested detection in force mode.
+
+        When the standard label-based validation fails in force mode, check
+        for rejection signals in PR comments or a CHANGES_REQUESTED review
+        state. If either condition is met, apply the loom:changes-requested
+        label and return True so the caller can route to the doctor loop.
+
+        This handles the scenario where the judge worker requested changes
+        but failed to apply the label due to a GitHub API error or timing
+        issue.
+
+        Returns:
+            True if fallback changes-requested was detected and label applied.
+        """
+        assert ctx.pr_number is not None
+
+        log_warning(
+            f"[force-mode] Approval fallback failed for PR #{ctx.pr_number}, "
+            "attempting fallback changes-requested detection"
+        )
+
+        has_rejection = self._has_rejection_comment(ctx)
+        has_cr_review = self._has_changes_requested_review(ctx)
+
+        if not has_rejection and not has_cr_review:
+            log_info(
+                "[force-mode] No rejection comment or CHANGES_REQUESTED review "
+                "found — fallback denied"
+            )
+            return False
+
+        signal = (
+            "rejection comment" if has_rejection else "CHANGES_REQUESTED review state"
+        )
+        log_warning(
+            f"[force-mode] Fallback changes-requested: PR #{ctx.pr_number} has "
+            f"{signal} — applying loom:changes-requested label"
+        )
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "edit",
+                str(ctx.pr_number),
+                "--add-label",
+                "loom:changes-requested",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            log_warning(
+                "[force-mode] Failed to apply loom:changes-requested label via fallback"
+            )
+            return False
+
+        ctx.label_cache.invalidate_pr(ctx.pr_number)
+        return True
+
     def _has_approval_comment(self, ctx: ShepherdContext) -> bool:
         """Check PR comments for approval signals.
 
@@ -308,6 +390,86 @@ class JudgePhase:
                 return True
 
         return False
+
+    def _has_rejection_comment(self, ctx: ShepherdContext) -> bool:
+        """Check PR comments for rejection / changes-requested signals.
+
+        Searches the most recent comments for patterns indicating the judge
+        requested changes (e.g., "changes requested", "needs fixes", ❌ emoji).
+        Rejects false positives where the match is preceded by a negation
+        (e.g., "no changes requested").
+
+        Returns:
+            True if a rejection comment was found.
+        """
+        assert ctx.pr_number is not None
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "comments",
+                "--jq",
+                ".comments[-5:][].body",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+
+        comment_text = result.stdout
+
+        for line in comment_text.splitlines():
+            for pattern in REJECTION_PATTERNS:
+                match = pattern.search(line)
+                if match is None:
+                    continue
+                # Check for negation prefix on the same line
+                prefix_text = line[: match.start()]
+                if any(neg.search(prefix_text) for neg in NEGATIVE_PREFIXES):
+                    continue
+                return True
+
+        return False
+
+    def _has_changes_requested_review(self, ctx: ShepherdContext) -> bool:
+        """Check if PR has a CHANGES_REQUESTED review state.
+
+        Uses ``gh pr view --json reviews`` to inspect review states.
+
+        Returns:
+            True if any review has a CHANGES_REQUESTED state.
+        """
+        assert ctx.pr_number is not None
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "reviews",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        data = parse_command_output(result)
+        if not isinstance(data, dict):
+            return False
+
+        reviews = data.get("reviews", [])
+        return any(r.get("state") == "CHANGES_REQUESTED" for r in reviews)
 
     def _pr_checks_passing(self, ctx: ShepherdContext) -> bool:
         """Check if PR status checks are passing and PR is mergeable.
