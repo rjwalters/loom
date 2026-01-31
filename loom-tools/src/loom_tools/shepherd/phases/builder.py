@@ -316,6 +316,48 @@ class BuilderPhase:
             action=f"issue quality: {len(result.warnings)} warning(s), {len(result.infos)} info(s)",
         )
 
+    def _ensure_dependencies(self, worktree: Path) -> bool:
+        """Ensure project dependencies are installed in the worktree.
+
+        Checks for package.json with missing node_modules and runs
+        ``pnpm install --frozen-lockfile`` when needed.
+
+        Returns True if dependencies are ready (already present or
+        successfully installed), False if installation failed.
+        Installation failure is non-fatal -- callers should continue
+        gracefully.
+        """
+        pkg_json = worktree / "package.json"
+        node_modules = worktree / "node_modules"
+
+        if not pkg_json.is_file() or node_modules.is_dir():
+            return True
+
+        log_info("node_modules missing, running pnpm install --frozen-lockfile")
+        try:
+            result = subprocess.run(
+                ["pnpm", "install", "--frozen-lockfile"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode == 0:
+                log_success("Dependencies installed successfully")
+                return True
+            log_warning(
+                f"pnpm install failed (exit code {result.returncode}): "
+                f"{(result.stderr or result.stdout or '').strip()[:200]}"
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            log_warning("pnpm install timed out after 120s")
+            return False
+        except OSError as e:
+            log_warning(f"Could not run pnpm install: {e}")
+            return False
+
     def _detect_test_command(self, worktree: Path) -> tuple[list[str], str] | None:
         """Detect the appropriate test command for the project in the worktree.
 
@@ -380,6 +422,9 @@ class BuilderPhase:
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return None
+
+        # Ensure dependencies are installed before running tests
+        self._ensure_dependencies(ctx.worktree_path)
 
         test_info = self._detect_test_command(ctx.worktree_path)
         if test_info is None:
