@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from loom_tools.common.logging import log_info, log_warning
 from loom_tools.shepherd.config import Phase
@@ -24,6 +26,8 @@ from loom_tools.shepherd.phases.base import (
     PhaseStatus,
     run_phase_with_retry,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class BuilderPhase:
@@ -130,11 +134,16 @@ class BuilderPhase:
                     capture=True,
                 )
                 ctx.report_milestone("worktree_created", path=str(ctx.worktree_path))
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or "").strip()
+                msg = "failed to create worktree"
+                if detail:
+                    msg = f"{msg}: {detail}"
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
-                    message="failed to create worktree",
+                    message=msg,
                     phase_name="builder",
+                    data={"error_detail": detail},
                 )
 
         # Create marker to prevent premature cleanup
@@ -170,25 +179,48 @@ class BuilderPhase:
                 status=PhaseStatus.STUCK,
                 message="builder stuck after retry",
                 phase_name="builder",
+                data={"log_file": str(self._get_log_path(ctx))},
+            )
+
+        if exit_code not in (0, 3, 4):
+            # Unexpected non-zero exit from builder subprocess
+            diag = self._gather_diagnostics(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    f"builder subprocess exited with code {exit_code}: "
+                    f"{diag['summary']}"
+                ),
+                phase_name="builder",
+                data={"exit_code": exit_code, "diagnostics": diag},
             )
 
         # Validate phase
         if not self.validate(ctx):
             # Cleanup stale worktree
+            diag = self._gather_diagnostics(ctx)
             self._cleanup_stale_worktree(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
-                message="builder phase validation failed",
+                message=(
+                    f"builder phase validation failed: {diag['summary']}"
+                ),
                 phase_name="builder",
+                data={"diagnostics": diag},
             )
 
         # Get PR number
         pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
         if pr is None:
+            diag = self._gather_diagnostics(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
-                message=f"could not find PR for issue #{ctx.config.issue}",
+                message=(
+                    f"could not find PR for issue #{ctx.config.issue}: "
+                    f"{diag['summary']}"
+                ),
                 phase_name="builder",
+                data={"diagnostics": diag},
             )
 
         ctx.pr_number = pr
@@ -294,6 +326,138 @@ class BuilderPhase:
             return float(session_pct) >= ctx.config.rate_limit_threshold
         except (json.JSONDecodeError, ValueError):
             return False
+
+    def _get_log_path(self, ctx: ShepherdContext) -> Path:
+        """Return the expected builder log file path."""
+        return (
+            ctx.repo_root
+            / ".loom"
+            / "logs"
+            / f"loom-builder-issue-{ctx.config.issue}.log"
+        )
+
+    def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
+        """Collect diagnostic info about the builder environment.
+
+        Inspects worktree state, remote branch, issue labels, and the
+        builder log file.  The returned dict is safe to include in
+        ``PhaseResult.data`` and its ``"summary"`` key provides a
+        human-readable string for error messages.
+
+        All git/gh commands are best-effort; failures are recorded but
+        never raised.
+        """
+        diag: dict[str, Any] = {}
+
+        # -- Log file -------------------------------------------------------
+        log_path = self._get_log_path(ctx)
+        diag["log_file"] = str(log_path)
+        diag["log_exists"] = log_path.is_file()
+        if log_path.is_file():
+            try:
+                lines = log_path.read_text().splitlines()
+                diag["log_tail"] = lines[-20:] if len(lines) > 20 else lines
+            except OSError:
+                diag["log_tail"] = []
+        else:
+            diag["log_tail"] = []
+
+        # -- Worktree state --------------------------------------------------
+        wt = ctx.worktree_path
+        diag["worktree_exists"] = bool(wt and wt.is_dir())
+        if wt and wt.is_dir():
+            # Current branch
+            branch_res = subprocess.run(
+                ["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            diag["branch"] = (
+                branch_res.stdout.strip() if branch_res.returncode == 0 else None
+            )
+
+            # Commits ahead of main
+            log_res = subprocess.run(
+                ["git", "-C", str(wt), "log", "--oneline", "main..HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            commits = (
+                log_res.stdout.strip().splitlines()
+                if log_res.returncode == 0 and log_res.stdout.strip()
+                else []
+            )
+            diag["commits_ahead"] = len(commits)
+
+            # Uncommitted changes
+            status_res = subprocess.run(
+                ["git", "-C", str(wt), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            diag["has_uncommitted_changes"] = bool(
+                status_res.returncode == 0 and status_res.stdout.strip()
+            )
+        else:
+            diag["branch"] = None
+            diag["commits_ahead"] = 0
+            diag["has_uncommitted_changes"] = False
+
+        # -- Remote branch ---------------------------------------------------
+        branch_name = f"feature/issue-{ctx.config.issue}"
+        ls_res = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", branch_name],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diag["remote_branch_exists"] = bool(
+            ls_res.returncode == 0 and ls_res.stdout.strip()
+        )
+
+        # -- Issue labels ----------------------------------------------------
+        label_res = subprocess.run(
+            [
+                "gh",
+                "issue",
+                "view",
+                str(ctx.config.issue),
+                "--json",
+                "labels",
+                "--jq",
+                "[.labels[].name] | join(\", \")",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diag["issue_labels"] = (
+            label_res.stdout.strip() if label_res.returncode == 0 else "unknown"
+        )
+
+        # -- Human-readable summary -----------------------------------------
+        parts: list[str] = []
+        if diag["worktree_exists"]:
+            parts.append(
+                f"worktree exists (branch={diag['branch']}, "
+                f"commits_ahead={diag['commits_ahead']}, "
+                f"uncommitted={diag['has_uncommitted_changes']})"
+            )
+        else:
+            parts.append("worktree does not exist")
+        parts.append(
+            f"remote branch {'exists' if diag['remote_branch_exists'] else 'missing'}"
+        )
+        parts.append(f"labels=[{diag['issue_labels']}]")
+        parts.append(f"log={diag['log_file']}")
+        diag["summary"] = "; ".join(parts)
+
+        return diag
 
     def _create_worktree_marker(self, ctx: ShepherdContext) -> None:
         """Create marker file to prevent premature cleanup."""

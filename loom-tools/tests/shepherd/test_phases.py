@@ -130,6 +130,298 @@ class TestBuilderPhase:
 
         assert skip is False
 
+    def test_worktree_failure_includes_error_detail(self, mock_context: MagicMock) -> None:
+        """Worktree creation failure should include subprocess error output."""
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = False
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        exc = subprocess.CalledProcessError(1, "worktree.sh")
+        exc.stderr = "fatal: branch already exists"
+        exc.stdout = ""
+        mock_context.run_script.side_effect = exc
+
+        builder = BuilderPhase()
+
+        with (
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "failed to create worktree" in result.message
+        assert "branch already exists" in result.message
+        assert result.data.get("error_detail") == "fatal: branch already exists"
+
+    def test_worktree_failure_minimal_when_no_output(self, mock_context: MagicMock) -> None:
+        """Worktree creation failure with no subprocess output stays concise."""
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = False
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        exc = subprocess.CalledProcessError(1, "worktree.sh")
+        exc.stderr = ""
+        exc.stdout = ""
+        mock_context.run_script.side_effect = exc
+
+        builder = BuilderPhase()
+
+        with (
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.message == "failed to create worktree"
+        assert result.data.get("error_detail") == ""
+
+    def test_pr_not_found_includes_diagnostics(self, mock_context: MagicMock) -> None:
+        """PR-not-found failure should include diagnostic context."""
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree exists (branch=feature/issue-42, commits_ahead=2, uncommitted=False); remote branch exists; labels=[loom:building]; log=/fake/log",
+            "worktree_exists": True,
+        }
+
+        with (
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", side_effect=[None, None, None]),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=0),
+            patch.object(builder, "validate", return_value=True),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "could not find PR for issue #42" in result.message
+        assert "worktree exists" in result.message
+        assert result.data.get("diagnostics") == fake_diag
+
+    def test_validation_failure_includes_diagnostics(self, mock_context: MagicMock) -> None:
+        """Validation failure should include diagnostic context."""
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": "worktree does not exist; remote branch missing; labels=[loom:building]; log=/fake/log",
+        }
+
+        with (
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=0),
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_cleanup_stale_worktree"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "builder phase validation failed" in result.message
+        assert "worktree does not exist" in result.message
+        assert result.data.get("diagnostics") == fake_diag
+
+    def test_unexpected_exit_code_includes_diagnostics(self, mock_context: MagicMock) -> None:
+        """Non-zero/non-special exit codes should include diagnostics."""
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {"summary": "worktree exists; remote branch exists; labels=[loom:building]; log=/fake/log"}
+
+        with (
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=1),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "exited with code 1" in result.message
+        assert result.data.get("exit_code") == 1
+        assert result.data.get("diagnostics") == fake_diag
+
+    def test_stuck_builder_includes_log_path(self, mock_context: MagicMock) -> None:
+        """Builder stuck (exit 4) should include log file path in data."""
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+
+        with (
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.run_phase_with_retry", return_value=4),
+            patch.object(builder, "_mark_issue_blocked"),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.STUCK
+        assert "log_file" in result.data
+        assert "loom-builder-issue-42.log" in result.data["log_file"]
+
+
+class TestBuilderDiagnostics:
+    """Test BuilderPhase._gather_diagnostics helper."""
+
+    def test_diagnostics_when_worktree_exists(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Should report worktree state when worktree directory exists."""
+        # Create a real worktree dir so is_dir() works
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        # Create a log file
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("line1\nline2\nline3\n")
+
+        builder = BuilderPhase()
+
+        # Mock git and gh subprocess calls
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = "abc1234 commit 1\ndef5678 commit 2\n"
+            elif "status --porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = "abc123\trefs/heads/feature/issue-42\n"
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["worktree_exists"] is True
+        assert diag["branch"] == "feature/issue-42"
+        assert diag["commits_ahead"] == 2
+        assert diag["has_uncommitted_changes"] is False
+        assert diag["remote_branch_exists"] is True
+        assert diag["log_exists"] is True
+        assert diag["log_tail"] == ["line1", "line2", "line3"]
+        assert "worktree exists" in diag["summary"]
+        assert "remote branch exists" in diag["summary"]
+
+    def test_diagnostics_when_worktree_missing(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Should report worktree missing when directory doesn't exist."""
+        mock_context.worktree_path = tmp_path / "nonexistent"
+        mock_context.config = ShepherdConfig(issue=99)
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["worktree_exists"] is False
+        assert diag["branch"] is None
+        assert diag["commits_ahead"] == 0
+        assert diag["has_uncommitted_changes"] is False
+        assert diag["remote_branch_exists"] is False
+        assert diag["log_exists"] is False
+        assert "worktree does not exist" in diag["summary"]
+        assert "remote branch missing" in diag["summary"]
+
+    def test_diagnostics_log_tail_truncated(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Should include only last 20 lines of log when file is large."""
+        mock_context.worktree_path = tmp_path / "nonexistent"
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        lines = [f"line {i}" for i in range(50)]
+        log_file.write_text("\n".join(lines))
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert len(diag["log_tail"]) == 20
+        assert diag["log_tail"][0] == "line 30"
+        assert diag["log_tail"][-1] == "line 49"
+
+    def test_get_log_path(self, mock_context: MagicMock) -> None:
+        """Should return correct log path based on issue number."""
+        builder = BuilderPhase()
+        path = builder._get_log_path(mock_context)
+        assert path == Path("/fake/repo/.loom/logs/loom-builder-issue-42.log")
+
+    def test_diagnostics_summary_format(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Summary should contain all key diagnostic sections."""
+        mock_context.worktree_path = tmp_path / "nonexistent"
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "gh" in cmd_str:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="loom:building, loom:curated", stderr="")
+            return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="")
+
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run):
+            diag = builder._gather_diagnostics(mock_context)
+
+        summary = diag["summary"]
+        # Should have 4 semicolon-separated sections
+        parts = summary.split("; ")
+        assert len(parts) == 4
+        assert "worktree" in parts[0]
+        assert "remote branch" in parts[1]
+        assert "labels=" in parts[2]
+        assert "log=" in parts[3]
+
 
 class TestBuilderQualityValidation:
     """Test pre-flight quality validation in BuilderPhase."""
