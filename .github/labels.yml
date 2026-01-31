@@ -81,6 +81,10 @@
   color: "10B981"  # emerald-500
 
 # Status Labels
+- name: loom:needs-fix
+  description: Builder test verification failed, worktree preserved for Doctor/Builder to fix
+  color: "F97316"  # orange-500 - action needed but work is partially done
+
 - name: loom:blocked
   description: Implementation blocked, needs help or clarification
   color: "EF4444"  # red-500

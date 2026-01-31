@@ -204,8 +204,8 @@ class BuilderPhase:
         # Run test verification in worktree
         test_result = self._run_test_verification(ctx)
         if test_result is not None and test_result.status == PhaseStatus.FAILED:
-            # Clean up worktree on test failure to prevent blocking future attempts
-            self._cleanup_on_failure(ctx)
+            # Preserve worktree and push branch so Doctor/Builder can fix tests
+            self._preserve_on_test_failure(ctx, test_result)
             return test_result
 
         # Validate phase
@@ -524,6 +524,7 @@ class BuilderPhase:
                 status=PhaseStatus.FAILED,
                 message=f"test verification timed out after {elapsed}s ({display_name})",
                 phase_name="builder",
+                data={"test_failure": True},
             )
         except OSError as e:
             log_warning(f"Could not run tests ({display_name}): {e}")
@@ -607,6 +608,7 @@ class BuilderPhase:
             status=PhaseStatus.FAILED,
             message=f"test verification failed ({display_name}, exit code {result.returncode})",
             phase_name="builder",
+            data={"test_failure": True},
         )
 
     def _is_rate_limited(self, ctx: ShepherdContext) -> bool:
@@ -896,9 +898,9 @@ class BuilderPhase:
     def _cleanup_on_failure(self, ctx: ShepherdContext) -> None:
         """Clean up worktree and revert labels when builder fails.
 
-        This method is called when the builder phase fails (e.g., test verification
-        failure) to ensure the worktree is removed so subsequent attempts don't
-        encounter branch conflicts.
+        This method is called when the builder phase fails in ways other than
+        test verification failure (e.g., validation failure without commits).
+        For test failures, use ``_preserve_on_test_failure`` instead.
 
         The cleanup:
         1. Removes the worktree marker
@@ -918,3 +920,93 @@ class BuilderPhase:
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
         log_info(f"Cleaned up worktree and reverted labels for issue #{ctx.config.issue}")
+
+    def _push_branch(self, ctx: ShepherdContext) -> bool:
+        """Push the current branch to remote.
+
+        Returns True if the push succeeded or the branch was already pushed.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        branch_name = NamingConventions.branch_name(ctx.config.issue)
+
+        # Push branch to remote (create upstream tracking)
+        result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "push", "-u", "origin", branch_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            log_info(f"Pushed branch {branch_name} to remote")
+            return True
+
+        # May already be pushed or have no commits
+        log_warning(
+            f"Could not push branch {branch_name}: "
+            f"{(result.stderr or result.stdout or '').strip()[:200]}"
+        )
+        return False
+
+    def _preserve_on_test_failure(
+        self, ctx: ShepherdContext, test_result: PhaseResult
+    ) -> None:
+        """Preserve worktree and branch when builder tests fail.
+
+        Instead of cleaning up, this method:
+        1. Keeps the worktree intact (with marker for protection)
+        2. Pushes existing commits to remote
+        3. Labels the issue ``loom:needs-fix`` so Doctor/Builder can continue
+        4. Adds a comment with test failure context
+        """
+        # Push whatever commits exist to remote
+        self._push_branch(ctx)
+
+        # Transition label: loom:building -> loom:needs-fix
+        remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
+        add_issue_label(ctx.config.issue, "loom:needs-fix", ctx.repo_root)
+        ctx.label_cache.invalidate_issue(ctx.config.issue)
+
+        # Add comment with failure context
+        failure_msg = test_result.message or "test verification failed"
+        branch_name = NamingConventions.branch_name(ctx.config.issue)
+        worktree_rel = (
+            f".loom/worktrees/issue-{ctx.config.issue}"
+            if ctx.worktree_path
+            else "unknown"
+        )
+
+        comment = (
+            f"**Shepherd**: Builder test verification failed. "
+            f"Worktree and branch preserved for Doctor/Builder to fix.\n\n"
+            f"- **Failure**: {failure_msg}\n"
+            f"- **Branch**: `{branch_name}`\n"
+            f"- **Worktree**: `{worktree_rel}`\n\n"
+            f"The Doctor or a subsequent Builder can pick this up and fix "
+            f"the failing tests without starting from scratch."
+        )
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                str(ctx.config.issue),
+                "--body",
+                comment,
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+
+        ctx.report_milestone(
+            "blocked",
+            reason="test_failure",
+            details=failure_msg,
+        )
+
+        log_info(
+            f"Preserved worktree for issue #{ctx.config.issue} "
+            f"(test failure, labeled loom:needs-fix)"
+        )
