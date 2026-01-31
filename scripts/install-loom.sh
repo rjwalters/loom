@@ -283,7 +283,8 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     # Build uninstall flags from current flags
     # Always use --local so removal happens in working directory (not a worktree)
     # This way the install worktree captures both removals and additions in one PR
-    UNINSTALL_FLAGS="--local"
+    # Always use --clean so unknown files in managed directories are removed
+    UNINSTALL_FLAGS="--local --clean"
     if [[ "$NON_INTERACTIVE" == "true" ]]; then
       UNINSTALL_FLAGS="$UNINSTALL_FLAGS --yes"
     fi
