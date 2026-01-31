@@ -1669,23 +1669,35 @@ class TestJudgePhase:
         """Validation should fail after all retry attempts are exhausted.
 
         When the label never appears (e.g., judge truly failed), all 3 attempts
-        should fail and return FAILED status.
+        should fail and return FAILED status. Failure message should include
+        diagnostic context from the worker.
         """
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
+        fake_diag = {
+            "summary": "no reviews submitted; no loom labels on PR; log file not found",
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": False,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
         with (
             patch.object(judge, "validate", return_value=False) as mock_validate,
             patch(
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
         assert "validation failed" in result.message
+        assert "no reviews submitted" in result.message
+        assert result.data == fake_diag
         assert mock_validate.call_count == 3
         # Should sleep between attempts (2 sleeps for 3 attempts)
         assert mock_sleep.call_count == 2
@@ -1805,6 +1817,7 @@ class TestJudgeFallbackApproval:
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -1812,6 +1825,7 @@ class TestJudgeFallbackApproval:
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(mock_context)
 
@@ -1825,6 +1839,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -1838,6 +1853,7 @@ class TestJudgeFallbackApproval:
             # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_has_changes_requested_review", return_value=False),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
 
@@ -1850,6 +1866,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -1863,6 +1880,7 @@ class TestJudgeFallbackApproval:
             # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_has_changes_requested_review", return_value=False),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
 
@@ -1935,6 +1953,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -1948,10 +1967,192 @@ class TestJudgeFallbackApproval:
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=MagicMock(returncode=1),  # label application fails
             ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
 
         assert result.status == PhaseStatus.FAILED
+
+
+class TestJudgeDiagnostics:
+    """Test _gather_diagnostics for judge validation failures."""
+
+    def _make_context(self, mock_context: MagicMock) -> MagicMock:
+        mock_context.pr_number = 100
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = Path("/fake/repo")
+        return mock_context
+
+    def test_includes_log_tail_when_log_exists(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should include last 20 lines of judge log when file exists."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        # Create a log file with content
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        lines = [f"log line {i}" for i in range(30)]
+        log_file.write_text("\n".join(lines))
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["log_exists"] is True
+        assert len(diag["log_tail"]) == 20
+        assert diag["log_tail"][-1] == "log line 29"
+        assert "last output: 'log line 29'" in diag["summary"]
+
+    def test_handles_missing_log_file(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should handle missing log file gracefully."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["log_exists"] is False
+        assert diag["log_tail"] == []
+        assert "log file not found" in diag["summary"]
+
+    def test_handles_empty_log_file(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should handle empty log file gracefully."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text("")
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["log_exists"] is True
+        assert diag["log_tail"] == []
+        assert "log file empty" in diag["summary"]
+
+    def test_includes_pr_review_state(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should include PR review state from GitHub."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        judge = JudgePhase()
+
+        review_data = json.dumps({
+            "reviews": [{"state": "COMMENTED", "author": "bot"}],
+            "labels": ["loom:review-requested"],
+        })
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=review_data),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["pr_reviews"] == [{"state": "COMMENTED", "author": "bot"}]
+        assert "loom:review-requested" in diag["pr_labels"]
+        assert "reviews=[COMMENTED]" in diag["summary"]
+        assert "labels=[loom:review-requested]" in diag["summary"]
+
+    def test_handles_gh_command_failure(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should handle gh command failures gracefully."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["pr_reviews"] == []
+        assert diag["pr_labels"] == []
+        assert "no reviews submitted" in diag["summary"]
+
+    def test_failure_message_includes_diagnostics(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When judge validation fails, the PhaseResult message should include diagnostics."""
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+
+        judge = JudgePhase()
+        fake_diag = {
+            "summary": "no reviews submitted; no loom labels on PR; last output: 'session ended'",
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": ["session ended"],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "judge phase validation failed:" in result.message
+        assert "no reviews submitted" in result.message
+        assert "session ended" in result.message
+        assert result.data == fake_diag
+
+    def test_short_log_returns_all_lines(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When log has fewer than 20 lines, all lines should be included."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        lines = ["line 1", "line 2", "line 3"]
+        log_file.write_text("\n".join(lines))
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert len(diag["log_tail"]) == 3
+        assert diag["log_tail"] == ["line 1", "line 2", "line 3"]
 
 
 class TestHasApprovalComment:
