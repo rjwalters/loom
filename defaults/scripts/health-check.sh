@@ -16,4 +16,9 @@
 
 set -euo pipefail
 
-exec loom-health-monitor "$@"
+# Try the installed Python entry point first, fall back to module invocation
+if command -v loom-health-monitor >/dev/null 2>&1; then
+    exec loom-health-monitor "$@"
+else
+    exec python3 -m loom_tools.health_monitor "$@"
+fi

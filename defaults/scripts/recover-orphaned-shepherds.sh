@@ -12,4 +12,9 @@
 
 set -euo pipefail
 
-exec loom-recover-orphans "$@"
+# Try the installed Python entry point first, fall back to module invocation
+if command -v loom-recover-orphans >/dev/null 2>&1; then
+    exec loom-recover-orphans "$@"
+else
+    exec python3 -m loom_tools.orphan_recovery "$@"
+fi

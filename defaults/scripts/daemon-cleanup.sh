@@ -15,4 +15,9 @@
 
 set -euo pipefail
 
-exec loom-daemon-cleanup "$@"
+# Try the installed Python entry point first, fall back to module invocation
+if command -v loom-daemon-cleanup >/dev/null 2>&1; then
+    exec loom-daemon-cleanup "$@"
+else
+    exec python3 -m loom_tools.daemon_cleanup "$@"
+fi
