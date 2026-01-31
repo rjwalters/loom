@@ -33,17 +33,18 @@ EXPECTED_CLI_COMMANDS = [
     "loom-check-completions",
     "loom-clean",
     "loom-worktree",
+    "loom-daemon-cleanup",
 ]
 
 # Wrapper scripts that should route to Python implementations
 PYTHON_ROUTING_SCRIPTS = [
     "loom-shepherd.sh",
+    "daemon-cleanup.sh",
 ]
 
 # Wrapper scripts that call Python internally (not exec replacement)
 PYTHON_INTEGRATION_SCRIPTS = [
     "health-check.sh",
-    "daemon-cleanup.sh",
 ]
 
 # Files that loom-daemon init should create/manage
@@ -185,16 +186,16 @@ class TestWrapperScriptRouting:
             "health-check.sh doesn't check for venv Python"
         )
 
-    def test_daemon_cleanup_uses_loom_clean(
+    def test_daemon_cleanup_delegates_to_python(
         self, defaults_dir: pathlib.Path
     ) -> None:
-        """daemon-cleanup.sh should use Python loom-clean command."""
+        """daemon-cleanup.sh should delegate to Python loom-daemon-cleanup."""
         script = defaults_dir / "scripts" / "daemon-cleanup.sh"
         assert script.exists(), "daemon-cleanup.sh not found"
 
         content = script.read_text()
-        assert ".venv/bin/loom-clean" in content, (
-            "daemon-cleanup.sh doesn't check for venv loom-clean"
+        assert "loom-daemon-cleanup" in content, (
+            "daemon-cleanup.sh doesn't delegate to loom-daemon-cleanup"
         )
 
     def test_cli_wrapper_health_routes_to_python(
