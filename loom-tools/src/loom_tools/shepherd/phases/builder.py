@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import RateLimitError, WorktreeError
@@ -837,8 +838,20 @@ class BuilderPhase:
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
     def _cleanup_stale_worktree(self, ctx: ShepherdContext) -> None:
-        """Clean up worktree if it has no commits or changes."""
+        """Clean up worktree if it has no commits or changes.
+
+        Performs safety checks before removal to prevent destroying active sessions:
+        - Checks for .loom-in-use marker (shepherd is actively using worktree)
+        - Checks for active processes with CWD in the worktree
+        - Checks if worktree is within grace period (default 5 minutes)
+        """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return
+
+        # Safety check: ensure worktree is safe to remove
+        safety = is_worktree_safe_to_remove(ctx.worktree_path)
+        if not safety.safe_to_remove:
+            log_info(f"Worktree cannot be removed: {safety.reason}")
             return
 
         # Check for commits

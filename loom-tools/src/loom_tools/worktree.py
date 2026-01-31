@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
 
 
 @dataclass
@@ -176,10 +177,22 @@ def _pull_latest_main(json_output: bool = False) -> bool:
 def _check_stale_worktree(worktree_path: pathlib.Path, json_output: bool = False) -> bool:
     """Check if a worktree is stale and should be removed.
 
+    Performs safety checks before removal to prevent destroying active sessions:
+    - Checks for .loom-in-use marker (shepherd is actively using worktree)
+    - Checks for active processes with CWD in the worktree
+    - Checks if worktree is within grace period (default 5 minutes)
+
     Returns:
         True if worktree is stale and was removed, False otherwise.
     """
     try:
+        # Safety check: ensure worktree is safe to remove
+        safety = is_worktree_safe_to_remove(worktree_path)
+        if not safety.safe_to_remove:
+            if not json_output:
+                log_info(f"Worktree cannot be removed: {safety.reason}")
+            return False
+
         # Check commits ahead of main
         result = _run_git(
             ["rev-list", "--count", "origin/main..HEAD"],
