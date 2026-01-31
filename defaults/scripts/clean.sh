@@ -1,22 +1,22 @@
-#!/usr/bin/env bash
-# Backwards-compatible wrapper for loom-clean
-# Routes to loom-clean (Python) from loom-tools package.
-# Use "loom-clean" directly if available in PATH.
+#!/bin/bash
+# clean.sh - Backwards-compatible wrapper for loom-clean
+#
+# This is a thin stub that delegates to the Python implementation.
+# See loom-tools/src/loom_tools/clean.py for the full implementation.
+#
+# Usage:
+#   clean.sh             # Interactive cleanup
+#   clean.sh --force     # Non-interactive cleanup
+#   clean.sh --dry-run   # Preview what would be cleaned
+#   clean.sh --deep      # Also remove build artifacts
+#   clean.sh --help      # Show help
 
 set -euo pipefail
 
-# Priority order:
-#   1. loom-clean in PATH (pip install -e ./loom-tools)
-#   2. Python module invocation (fallback)
-if command -v loom-clean &>/dev/null; then
-  exec loom-clean "$@"
-elif python3 -c "import loom_tools.clean" &>/dev/null 2>&1; then
-  exec python3 -m loom_tools.clean "$@"
-else
-  echo "Error: loom-clean not available. Install loom-tools:" >&2
-  echo "  pip install -e ./loom-tools" >&2
-  echo "" >&2
-  echo "Or with uv:" >&2
-  echo "  uv pip install -e ./loom-tools" >&2
-  exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source shared loom-tools helper
+source "$SCRIPT_DIR/lib/loom-tools.sh"
+
+# Run the command with proper fallback chain
+run_loom_tool "clean" "clean" "$@"
