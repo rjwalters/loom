@@ -32,6 +32,7 @@ class ApprovalPhase:
                 status=PhaseStatus.SUCCESS,
                 message="issue already approved (has loom:issue label)",
                 phase_name="approval",
+                data={"summary": "already approved"},
             )
 
         # In force mode, auto-approve
@@ -42,6 +43,7 @@ class ApprovalPhase:
                 status=PhaseStatus.SUCCESS,
                 message="issue auto-approved (force mode)",
                 phase_name="approval",
+                data={"summary": "force mode"},
             )
 
         # Wait for human approval
@@ -53,6 +55,7 @@ class ApprovalPhase:
                     status=PhaseStatus.SUCCESS,
                     message="issue approved by human",
                     phase_name="approval",
+                    data={"summary": "human approved"},
                 )
 
             # Check for shutdown

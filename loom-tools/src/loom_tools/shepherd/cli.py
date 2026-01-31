@@ -271,7 +271,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
             raise ShutdownSignal(result.message)
 
         phase_durations["Approval"] = elapsed
-        completed_phases.append(f"Approval ({result.message.split('(')[-1].rstrip(')')}")
+        completed_phases.append(f"Approval ({result.data.get('summary', result.message)})")
         if result.status == PhaseStatus.SUCCESS:
             log_success(f"{result.message} ({elapsed}s)")
             ctx.report_milestone(
