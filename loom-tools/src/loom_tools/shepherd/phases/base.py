@@ -81,8 +81,17 @@ class PhaseRunner(Protocol):
         ...
 
 
-def _read_heartbeats(progress_file: Path) -> list[dict[str, Any]]:
+def _read_heartbeats(
+    progress_file: Path, *, phase: str | None = None
+) -> list[dict[str, Any]]:
     """Read heartbeat milestones from a shepherd progress file.
+
+    Args:
+        progress_file: Path to the shepherd progress JSON file.
+        phase: If provided, only return heartbeats that occurred after
+            the most recent ``phase_entered`` milestone for this phase.
+            This prevents stale heartbeats from earlier phases from
+            being displayed.
 
     Returns a list of heartbeat milestone dicts, each with
     ``timestamp`` and ``data.action`` keys.
@@ -92,9 +101,34 @@ def _read_heartbeats(progress_file: Path) -> list[dict[str, Any]]:
     except (json.JSONDecodeError, OSError):
         return []
 
+    milestones = data.get("milestones", [])
+
+    # Find the index of the most recent phase_entered milestone for this phase.
+    # Only heartbeats between that point and the next phase_entered belong to
+    # the current phase, preventing stale heartbeats from earlier phases from
+    # being displayed during later phases.
+    start_index = 0
+    if phase:
+        for i, m in enumerate(milestones):
+            if (
+                m.get("event") == "phase_entered"
+                and m.get("data", {}).get("phase") == phase
+            ):
+                start_index = i + 1
+
+    # Find the end boundary: the next phase_entered after start_index
+    # (for any phase). During live polling, this boundary won't exist yet
+    # so end_index == len(milestones), which is the common case.
+    end_index = len(milestones)
+    if phase and start_index > 0:
+        for i in range(start_index, len(milestones)):
+            if milestones[i].get("event") == "phase_entered":
+                end_index = i
+                break
+
     return [
         m
-        for m in data.get("milestones", [])
+        for m in milestones[start_index:end_index]
         if m.get("event") == "heartbeat"
     ]
 
@@ -220,7 +254,7 @@ def run_worker_phase(
     seen_heartbeats = 0
 
     while wait_proc.poll() is None:
-        heartbeats = _read_heartbeats(progress_file)
+        heartbeats = _read_heartbeats(progress_file, phase=phase)
         for hb in heartbeats[seen_heartbeats:]:
             action = hb.get("data", {}).get("action", "")
             if action:
@@ -229,7 +263,7 @@ def run_worker_phase(
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 
     # Check for any final heartbeats written before process exit
-    heartbeats = _read_heartbeats(progress_file)
+    heartbeats = _read_heartbeats(progress_file, phase=phase)
     for hb in heartbeats[seen_heartbeats:]:
         action = hb.get("data", {}).get("action", "")
         if action:

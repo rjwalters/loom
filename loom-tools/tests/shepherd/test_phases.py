@@ -1086,6 +1086,86 @@ class TestReadHeartbeats:
         f.write_text(json.dumps(progress))
         assert _read_heartbeats(f) == []
 
+    def test_filters_heartbeats_by_phase(self, tmp_path: Path) -> None:
+        """Should only return heartbeats after the most recent phase_entered for the given phase."""
+        progress = {
+            "task_id": "abc123",
+            "milestones": [
+                {"event": "phase_entered", "timestamp": "t0", "data": {"phase": "curator"}},
+                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "curator running (1m elapsed)"}},
+                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "builder"}},
+                {"event": "heartbeat", "timestamp": "t3", "data": {"action": "builder running (1m elapsed)"}},
+                {"event": "heartbeat", "timestamp": "t4", "data": {"action": "builder running (2m elapsed)"}},
+                {"event": "phase_entered", "timestamp": "t5", "data": {"phase": "judge"}},
+                {"event": "heartbeat", "timestamp": "t6", "data": {"action": "judge running (1m elapsed)"}},
+            ],
+        }
+        f = tmp_path / "shepherd-abc123.json"
+        f.write_text(json.dumps(progress))
+
+        # Only judge heartbeats when filtering by judge phase
+        result = _read_heartbeats(f, phase="judge")
+        assert len(result) == 1
+        assert result[0]["data"]["action"] == "judge running (1m elapsed)"
+
+        # Only builder heartbeats when filtering by builder phase
+        result = _read_heartbeats(f, phase="builder")
+        assert len(result) == 2
+        assert result[0]["data"]["action"] == "builder running (1m elapsed)"
+        assert result[1]["data"]["action"] == "builder running (2m elapsed)"
+
+        # Only curator heartbeats when filtering by curator phase
+        result = _read_heartbeats(f, phase="curator")
+        assert len(result) == 1
+        assert result[0]["data"]["action"] == "curator running (1m elapsed)"
+
+    def test_no_phase_filter_returns_all(self, tmp_path: Path) -> None:
+        """Without phase filter, all heartbeats should be returned (backward compat)."""
+        progress = {
+            "milestones": [
+                {"event": "phase_entered", "timestamp": "t0", "data": {"phase": "curator"}},
+                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "curator running"}},
+                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "judge"}},
+                {"event": "heartbeat", "timestamp": "t3", "data": {"action": "judge running"}},
+            ],
+        }
+        f = tmp_path / "progress.json"
+        f.write_text(json.dumps(progress))
+
+        result = _read_heartbeats(f)
+        assert len(result) == 2
+
+    def test_phase_filter_with_no_matching_phase_entered(self, tmp_path: Path) -> None:
+        """When phase has no phase_entered milestone, return all heartbeats."""
+        progress = {
+            "milestones": [
+                {"event": "heartbeat", "timestamp": "t0", "data": {"action": "running"}},
+                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "still running"}},
+            ],
+        }
+        f = tmp_path / "progress.json"
+        f.write_text(json.dumps(progress))
+
+        result = _read_heartbeats(f, phase="builder")
+        assert len(result) == 2
+
+    def test_phase_filter_uses_latest_phase_entered(self, tmp_path: Path) -> None:
+        """When a phase is entered multiple times, use the most recent entry."""
+        progress = {
+            "milestones": [
+                {"event": "phase_entered", "timestamp": "t0", "data": {"phase": "builder"}},
+                {"event": "heartbeat", "timestamp": "t1", "data": {"action": "first attempt"}},
+                {"event": "phase_entered", "timestamp": "t2", "data": {"phase": "builder"}},
+                {"event": "heartbeat", "timestamp": "t3", "data": {"action": "second attempt"}},
+            ],
+        }
+        f = tmp_path / "progress.json"
+        f.write_text(json.dumps(progress))
+
+        result = _read_heartbeats(f, phase="builder")
+        assert len(result) == 1
+        assert result[0]["data"]["action"] == "second attempt"
+
 
 class TestPrintHeartbeat:
     """Test _print_heartbeat output formatting."""
