@@ -1,5 +1,6 @@
 """Data models for Loom orchestration state files."""
 
+from loom_tools.models.base import SerializableMixin
 from loom_tools.models.agent_wait import (
     CompletionReason,
     ContractCheckResult,
@@ -28,6 +29,8 @@ from loom_tools.models.stuck import (
 )
 
 __all__ = [
+    # base
+    "SerializableMixin",
     # agent_wait
     "CompletionReason",
     "ContractCheckResult",
