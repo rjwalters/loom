@@ -28,6 +28,10 @@ from loom_tools.common.logging import log_error, log_info, log_success, log_warn
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.common.time_utils import parse_iso_timestamp
+from loom_tools.common.worktree_safety import (
+    find_processes_using_directory,
+    is_worktree_safe_to_remove,
+)
 
 # Default grace period: 10 minutes in seconds
 DEFAULT_GRACE_PERIOD = 600
@@ -327,6 +331,14 @@ def clean_worktrees(
                 log_info("  Worktree in use - preserving")
             stats.skipped_in_use += 1
             continue
+
+        # Check for active processes using the worktree (unless force mode)
+        if not force:
+            active_pids = find_processes_using_directory(worktree_path)
+            if active_pids:
+                log_info(f"  Active process(es) using worktree: {active_pids} - preserving")
+                stats.skipped_in_use += 1
+                continue
 
         # Check issue state via GitHub CLI
         try:
