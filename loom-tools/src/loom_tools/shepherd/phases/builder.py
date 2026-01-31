@@ -203,6 +203,8 @@ class BuilderPhase:
         # Run test verification in worktree
         test_result = self._run_test_verification(ctx)
         if test_result is not None and test_result.status == PhaseStatus.FAILED:
+            # Clean up worktree on test failure to prevent blocking future attempts
+            self._cleanup_on_failure(ctx)
             return test_result
 
         # Validate phase
@@ -895,3 +897,29 @@ class BuilderPhase:
                     capture_output=True,
                     check=False,
                 )
+
+    def _cleanup_on_failure(self, ctx: ShepherdContext) -> None:
+        """Clean up worktree and revert labels when builder fails.
+
+        This method is called when the builder phase fails (e.g., test verification
+        failure) to ensure the worktree is removed so subsequent attempts don't
+        encounter branch conflicts.
+
+        The cleanup:
+        1. Removes the worktree marker
+        2. Removes the worktree (if safe)
+        3. Deletes the local branch (if empty)
+        4. Reverts issue labels: loom:building -> loom:issue
+        """
+        # Remove worktree marker first
+        self._remove_worktree_marker(ctx)
+
+        # Clean up the worktree
+        self._cleanup_stale_worktree(ctx)
+
+        # Revert issue label so it can be picked up again
+        remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
+        add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
+        ctx.label_cache.invalidate_issue(ctx.config.issue)
+
+        log_info(f"Cleaned up worktree and reverted labels for issue #{ctx.config.issue}")
