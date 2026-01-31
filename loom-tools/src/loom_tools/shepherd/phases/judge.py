@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
@@ -11,6 +12,12 @@ from loom_tools.shepherd.phases.base import (
     PhaseStatus,
     run_phase_with_retry,
 )
+
+# Retry settings for post-judge validation.
+# The judge worker applies comment and label in two separate API calls;
+# validation can race between them (see issue #1764).
+VALIDATION_MAX_RETRIES = 3
+VALIDATION_RETRY_DELAY_SECONDS = 2
 
 
 class JudgePhase:
@@ -93,15 +100,33 @@ class JudgePhase:
                 phase_name="judge",
             )
 
-        # Validate phase
-        if not self.validate(ctx):
+        # Invalidate caches BEFORE validation so the first attempt
+        # fetches fresh data instead of stale cached labels.
+        ctx.label_cache.invalidate_pr(ctx.pr_number)
+
+        # Retry validation with backoff to handle the race condition
+        # where the judge applies comment and label in separate API calls
+        # (see issue #1764).
+        validated = False
+        for attempt in range(VALIDATION_MAX_RETRIES):
+            if self.validate(ctx):
+                validated = True
+                break
+            if attempt < VALIDATION_MAX_RETRIES - 1:
+                time.sleep(VALIDATION_RETRY_DELAY_SECONDS)
+                # Re-invalidate cache before each retry to get fresh data
+                ctx.label_cache.invalidate_pr(ctx.pr_number)
+
+        if not validated:
             return PhaseResult(
                 status=PhaseStatus.FAILED,
                 message="judge phase validation failed",
                 phase_name="judge",
             )
 
-        # Check result
+        # Check result — cache was already invalidated above, but
+        # invalidate once more to ensure the label checks below
+        # reflect the latest state.
         ctx.label_cache.invalidate_pr(ctx.pr_number)
 
         if ctx.has_pr_label("loom:pr"):
