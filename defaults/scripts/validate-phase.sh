@@ -16,37 +16,10 @@
 
 set -euo pipefail
 
-# Find the repository root (works from any subdirectory including worktrees)
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
-            if [[ -f "$dir/.git" ]]; then
-                local gitdir
-                gitdir=$(cat "$dir/.git" | sed 's/^gitdir: //')
-                if [[ "$gitdir" == /* ]]; then
-                    dirname "$(dirname "$(dirname "$gitdir")")"
-                else
-                    dirname "$(dirname "$(dirname "$dir/$gitdir")")"
-                fi
-            else
-                echo "$dir"
-            fi
-            return 0
-        fi
-        dir="$(dirname "$dir")"
-    done
-    echo "$PWD"
-}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-REPO_ROOT="$(find_repo_root)"
-LOOM_TOOLS="$REPO_ROOT/loom-tools"
+# Source shared loom-tools helper
+source "$SCRIPT_DIR/lib/loom-tools.sh"
 
-# Try venv binary first, then PATH, then python3 -m fallback
-if [[ -x "$LOOM_TOOLS/.venv/bin/loom-validate-phase" ]]; then
-    exec "$LOOM_TOOLS/.venv/bin/loom-validate-phase" "$@"
-elif command -v loom-validate-phase >/dev/null 2>&1; then
-    exec loom-validate-phase "$@"
-else
-    exec python3 -m loom_tools.validate_phase "$@"
-fi
+# Run the command with proper fallback chain
+run_loom_tool "validate-phase" "validate_phase" "$@"

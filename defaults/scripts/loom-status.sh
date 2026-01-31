@@ -12,9 +12,10 @@
 
 set -euo pipefail
 
-# Try the installed Python entry point first, fall back to module invocation
-if command -v loom-status >/dev/null 2>&1; then
-    exec loom-status "$@"
-else
-    exec python3 -m loom_tools.status "$@"
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source shared loom-tools helper
+source "$SCRIPT_DIR/lib/loom-tools.sh"
+
+# Run the command with proper fallback chain
+run_loom_tool "status" "status" "$@"
