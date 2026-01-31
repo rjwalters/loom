@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 from dataclasses import dataclass, field
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from loom_tools.common.repo import find_repo_root
+from loom_tools.common.state import read_json_file, safe_parse_json
 from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.errors import (
     IssueBlockedError,
@@ -61,9 +61,8 @@ class ShepherdContext:
 
         issue = self.config.issue
         for progress_file in progress_dir.glob("shepherd-*.json"):
-            try:
-                data = json.loads(progress_file.read_text())
-            except (json.JSONDecodeError, OSError):
+            data = read_json_file(progress_file)
+            if not isinstance(data, dict):
                 continue
 
             if data.get("issue") != issue:
@@ -151,9 +150,8 @@ class ShepherdContext:
         if result.returncode != 0 or not result.stdout.strip():
             raise IssueNotFoundError(issue)
 
-        try:
-            meta = json.loads(result.stdout)
-        except json.JSONDecodeError:
+        meta = safe_parse_json(result.stdout)
+        if not isinstance(meta, dict):
             raise IssueNotFoundError(issue)
 
         # Verify it's an issue, not a PR

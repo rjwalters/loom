@@ -17,7 +17,6 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import pathlib
 import subprocess
@@ -367,11 +366,10 @@ def handle_shepherd_complete(
         log_info(f"No PR found for issue #{issue_number}, skipping cleanup")
         return
 
-    try:
-        pr_data = json.loads(pr_info)
-        merged_at = pr_data.get("mergedAt")
-    except (json.JSONDecodeError, AttributeError):
-        merged_at = None
+    from loom_tools.common.state import safe_parse_json
+
+    pr_data = safe_parse_json(pr_info)
+    merged_at = pr_data.get("mergedAt") if isinstance(pr_data, dict) else None
 
     state_path = repo_root / ".loom" / "daemon-state.json"
 

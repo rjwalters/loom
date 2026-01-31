@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.state import parse_command_output, read_json_file
 from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
-from loom_tools.shepherd.errors import RateLimitError, WorktreeError
 from loom_tools.shepherd.issue_quality import (
     Severity,
     validate_issue_quality,
@@ -367,8 +367,8 @@ class BuilderPhase:
         is detected.
         """
         if (worktree / "package.json").is_file():
-            try:
-                pkg = json.loads((worktree / "package.json").read_text())
+            pkg = read_json_file(worktree / "package.json")
+            if isinstance(pkg, dict):
                 scripts = pkg.get("scripts", {})
                 # Prefer check:ci:lite > check:ci > test > check
                 if "check:ci:lite" in scripts:
@@ -379,8 +379,6 @@ class BuilderPhase:
                     return (["pnpm", "test"], "pnpm test")
                 if "check" in scripts:
                     return (["pnpm", "check"], "pnpm check")
-            except (json.JSONDecodeError, OSError):
-                pass
 
         if (worktree / "Cargo.toml").is_file():
             return (["cargo", "test", "--workspace"], "cargo test --workspace")
@@ -618,16 +616,16 @@ class BuilderPhase:
 
         try:
             result = ctx.run_script("check-usage.sh", [], check=False)
-            if result.returncode != 0 or not result.stdout.strip():
+            data = parse_command_output(result)
+            if not isinstance(data, dict):
                 return False
 
-            data = json.loads(result.stdout)
             session_pct = data.get("session_percent", 0)
             if session_pct is None:
                 return False
 
             return float(session_pct) >= ctx.config.rate_limit_threshold
-        except (json.JSONDecodeError, ValueError):
+        except ValueError:
             return False
 
     def _get_log_path(self, ctx: ShepherdContext) -> Path:

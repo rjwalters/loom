@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
+
+from loom_tools.common.state import parse_command_output
 
 
 def _gh_cmd() -> str:
@@ -56,7 +57,8 @@ def gh_issue_list(
         args.extend(["--label", ",".join(labels)])
 
     result = gh_run(args)
-    return json.loads(result.stdout) if result.stdout.strip() else []
+    parsed = parse_command_output(result, default=[])
+    return parsed if isinstance(parsed, list) else []
 
 
 def gh_pr_list(
@@ -73,7 +75,8 @@ def gh_pr_list(
         args.extend(["--label", ",".join(labels)])
 
     result = gh_run(args)
-    return json.loads(result.stdout) if result.stdout.strip() else []
+    parsed = parse_command_output(result, default=[])
+    return parsed if isinstance(parsed, list) else []
 
 
 def gh_parallel_queries(
@@ -89,9 +92,8 @@ def gh_parallel_queries(
 
     def _run(args: Sequence[str]) -> list[dict[str, Any]]:
         result = gh_run(args, check=False)
-        if result.returncode != 0 or not result.stdout.strip():
-            return []
-        return json.loads(result.stdout)
+        parsed = parse_command_output(result, default=[])
+        return parsed if isinstance(parsed, list) else []
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(_run, q[0] if isinstance(q, tuple) else q) for q in queries]
@@ -114,11 +116,8 @@ def gh_get_default_branch_ci_status() -> dict[str, Any]:
              "name,conclusion,status,headBranch"],
             check=False,
         )
-        if result.returncode != 0 or not result.stdout.strip():
-            return {"status": "unknown", "failed_runs": [], "total_runs": 0, "message": "Unable to check CI status"}
-
-        runs = json.loads(result.stdout)
-        if not runs:
+        runs = parse_command_output(result, default=[])
+        if not isinstance(runs, list) or not runs:
             return {"status": "unknown", "failed_runs": [], "total_runs": 0, "message": "No recent workflow runs found"}
 
         # Group by workflow name, keep only the most recent run for each workflow
@@ -153,5 +152,5 @@ def gh_get_default_branch_ci_status() -> dict[str, Any]:
             "message": "CI passing on main",
         }
 
-    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError):
         return {"status": "unknown", "failed_runs": [], "total_runs": 0, "message": "Error checking CI status"}
