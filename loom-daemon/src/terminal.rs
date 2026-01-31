@@ -479,6 +479,66 @@ impl TerminalManager {
         Ok(())
     }
 
+    /// Clean up stale tmux sessions from previous daemon runs.
+    /// Lists all loom-* sessions and kills any that weren't restored
+    /// into the terminal registry by `restore_from_tmux()`.
+    pub fn clean_stale_sessions(&self) -> Result<usize> {
+        let output = Command::new("tmux")
+            .args(["-L", "loom"])
+            .args(["list-sessions", "-F", "#{session_name}"])
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("no server running") || stderr.contains("no sessions") {
+                return Ok(0);
+            }
+            log::warn!("Failed to list tmux sessions for cleanup: {stderr}");
+            return Ok(0);
+        }
+
+        let sessions = String::from_utf8_lossy(&output.stdout);
+
+        // Build a set of tmux session names that are tracked in the registry
+        let tracked_sessions: std::collections::HashSet<&str> = self
+            .terminals
+            .values()
+            .map(|t| t.tmux_session.as_str())
+            .collect();
+
+        let mut cleaned = 0;
+        for session in sessions.lines() {
+            if !session.starts_with("loom-") {
+                continue;
+            }
+
+            if tracked_sessions.contains(session) {
+                continue;
+            }
+
+            log::info!("Cleaning stale tmux session: {session}");
+            let result = Command::new("tmux")
+                .args(["-L", "loom"])
+                .args(["kill-session", "-t", session])
+                .output();
+
+            match result {
+                Ok(out) if out.status.success() => {
+                    cleaned += 1;
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    log::warn!("Failed to kill stale session {session}: {stderr}");
+                }
+                Err(e) => {
+                    log::warn!("Failed to kill stale session {session}: {e}");
+                }
+            }
+        }
+
+        Ok(cleaned)
+    }
+
     /// Check if a tmux session exists for the given terminal ID
     pub fn has_tmux_session(&self, id: &TerminalId) -> Result<bool> {
         log::info!("🔍 has_tmux_session called for terminal id: '{id}'");
