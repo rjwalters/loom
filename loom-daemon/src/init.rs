@@ -168,8 +168,8 @@ pub fn is_loom_source_repo(workspace_path: &Path) -> bool {
     // Method 3: Check git remote for known Loom repositories
     if let Some((owner, repo)) = extract_repo_info(workspace_path) {
         // Match various Loom repository locations
-        let is_loom_repo = (owner == "rjwalters" && repo == "loom")
-            || repo == "loom" && workspace_path.join("src-tauri").is_dir();
+        let is_loom_repo =
+            (workspace_path.join("src-tauri").is_dir() || owner == "rjwalters") && repo == "loom";
 
         if is_loom_repo {
             return true;
@@ -1227,6 +1227,7 @@ fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::uninlined_format_args)]
 mod tests {
     use super::*;
     use std::fs;

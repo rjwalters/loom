@@ -67,7 +67,7 @@ pub struct PromptAnalysis {
 /// A detected issue with a prompt
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PromptIssue {
-    /// Issue type: "too_short", "too_long", "vague", "missing_context", etc.
+    /// Issue type: "`too_short`", "`too_long`", "vague", "`missing_context`", etc.
     pub issue_type: String,
     /// Human-readable description
     pub description: String,
@@ -276,7 +276,9 @@ pub fn analyze_prompt(workspace_path: &str, prompt: &str) -> Result<PromptAnalys
     let _conn = open_optimization_db(workspace_path)
         .map_err(|e| format!("Failed to open database: {e}"))?;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let word_count = prompt.split_whitespace().count() as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let char_count = prompt.chars().count() as i32;
 
     // Detect category based on keywords
@@ -474,7 +476,10 @@ fn calculate_specificity_score(prompt: &str) -> f64 {
         .iter()
         .filter(|w| prompt.to_lowercase().contains(*w))
         .count();
-    score += (technical_count as f64 * 0.03).min(0.15);
+    #[allow(clippy::cast_precision_loss)]
+    {
+        score += (technical_count as f64 * 0.03).min(0.15);
+    }
 
     // Negative indicators
     let vague_words = [
@@ -490,7 +495,10 @@ fn calculate_specificity_score(prompt: &str) -> f64 {
         .iter()
         .filter(|w| prompt.to_lowercase().contains(*w))
         .count();
-    score -= vague_count as f64 * 0.05;
+    #[allow(clippy::cast_precision_loss)]
+    {
+        score -= vague_count as f64 * 0.05;
+    }
 
     score.clamp(0.0, 1.0)
 }
@@ -504,7 +512,7 @@ fn calculate_structure_score(prompt: &str) -> f64 {
     // Optimal length (10-50 words)
     if (10..=50).contains(&word_count) {
         score += 0.15;
-    } else if word_count < 5 || word_count > 100 {
+    } else if !(5..=100).contains(&word_count) {
         score -= 0.15;
     }
 
@@ -588,6 +596,7 @@ pub fn generate_optimization_suggestions(
         .map_err(|e| format!("Failed to collect rules: {e}"))?;
 
     for (_rule_id, rule_name, rule_type, condition, template, expected_improvement) in rules {
+        #[allow(clippy::cast_sign_loss)]
         if suggestions.len() >= max_suggestions as usize {
             break;
         }
@@ -605,6 +614,7 @@ pub fn generate_optimization_suggestions(
     }
 
     // Try to find matching successful patterns
+    #[allow(clippy::cast_sign_loss)]
     if suggestions.len() < max_suggestions as usize {
         if let Some(pattern_suggestion) = find_pattern_based_suggestion(&conn, prompt, &analysis) {
             suggestions.push(pattern_suggestion);
@@ -612,6 +622,7 @@ pub fn generate_optimization_suggestions(
     }
 
     // Sort by confidence
+    #[allow(clippy::unwrap_used)]
     suggestions.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
     // Store suggestions in database
@@ -652,7 +663,9 @@ fn apply_rule(
     // Check if rule applies based on type
     let applies = match rule_type {
         "length" => {
+            #[allow(clippy::cast_possible_truncation)]
             let min_words = condition_json.get("min_words")?.as_i64()? as i32;
+            #[allow(clippy::cast_possible_truncation)]
             let max_words = condition_json.get("max_words")?.as_i64()? as i32;
             analysis.word_count >= min_words && analysis.word_count <= max_words
         }
@@ -667,12 +680,11 @@ fn apply_rule(
                 let lacks = condition_json
                     .get("lacks")
                     .and_then(|l| l.as_array())
-                    .map(|arr| {
+                    .map_or(true, |arr| {
                         !arr.iter()
                             .filter_map(|k| k.as_str())
                             .any(|k| prompt.to_lowercase().contains(k))
-                    })
-                    .unwrap_or(true);
+                    });
 
                 has_keywords && lacks
             } else {
@@ -718,7 +730,7 @@ fn apply_rule(
 
     Some(OptimizationSuggestion {
         id: None,
-        original_prompt: prompt.to_string(),
+        original_prompt: prompt.clone(),
         optimized_prompt: optimized.clone(),
         optimization_type: rule_type.to_string(),
         reasoning: format!(
@@ -840,7 +852,7 @@ fn get_reasoning_for_rule(rule_type: &str, analysis: &PromptAnalysis) -> String 
 fn find_pattern_based_suggestion(
     conn: &Connection,
     prompt: &str,
-    analysis: &PromptAnalysis,
+    _analysis: &PromptAnalysis,
 ) -> Option<OptimizationSuggestion> {
     // Normalize prompt for matching
     let normalized = normalize_prompt(prompt);
@@ -908,8 +920,7 @@ fn find_pattern_based_suggestion(
 fn normalize_prompt(prompt: &str) -> String {
     // Replace issue/PR numbers with placeholder
     let pattern = regex::Regex::new(r"#\d+")
-        .map(|re| re.replace_all(prompt, "#N").to_string())
-        .unwrap_or_else(|_| prompt.to_string());
+        .map_or_else(|_| prompt.to_string(), |re| re.replace_all(prompt, "#N").to_string());
 
     // Normalize whitespace
     let pattern = regex::Regex::new(r"\s+")
@@ -925,6 +936,7 @@ fn normalize_prompt(prompt: &str) -> String {
 
 /// Record that a suggestion was accepted or rejected
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn record_suggestion_decision(
     workspace_path: String,
     suggestion_id: i64,
@@ -951,6 +963,7 @@ pub fn record_suggestion_decision(
 
 /// Record the outcome of an accepted suggestion
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn record_suggestion_outcome(
     workspace_path: String,
     suggestion_id: i64,
@@ -1065,7 +1078,7 @@ pub fn get_optimization_stats(workspace_path: &str) -> Result<OptimizationStats,
     // Acceptance rate
     let decided = accepted_suggestions + rejected_suggestions;
     let acceptance_rate = if decided > 0 {
-        accepted_suggestions as f64 / decided as f64
+        f64::from(accepted_suggestions) / f64::from(decided)
     } else {
         0.0
     };
@@ -1200,6 +1213,7 @@ pub fn get_optimization_rules(workspace_path: &str) -> Result<Vec<OptimizationRu
 
 /// Toggle a rule's active status
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn toggle_optimization_rule(
     workspace_path: String,
     rule_id: i64,

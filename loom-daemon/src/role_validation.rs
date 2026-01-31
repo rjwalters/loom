@@ -30,6 +30,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt::Write;
 
 /// Validation mode for role completeness checks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -196,7 +197,7 @@ pub fn validate_role_completeness(config_json: &str, mode: ValidationMode) -> Va
         }
     };
 
-    let role_set: HashSet<&str> = configured_roles.iter().map(|s| s.as_str()).collect();
+    let role_set: HashSet<&str> = configured_roles.iter().map(String::as_str).collect();
     let mut warnings = Vec::new();
 
     // Check each dependency
@@ -236,18 +237,19 @@ pub fn format_validation_result(result: &ValidationResult, verbose: bool) -> Str
     let mut output = String::new();
 
     if verbose {
-        output.push_str(&format!("Configured roles: {}\n", result.configured_roles.join(", ")));
+        let _ = writeln!(output, "Configured roles: {}", result.configured_roles.join(", "));
     }
 
     if !result.warnings.is_empty() {
         output.push_str("\nROLE CONFIGURATION WARNINGS:\n");
         for warning in &result.warnings {
-            output.push_str(&format!(
-                "  - {} -> {}: {}\n",
+            let _ = writeln!(
+                output,
+                "  - {} -> {}: {}",
                 warning.role.to_uppercase(),
                 warning.missing_dependency.to_uppercase(),
                 warning.message
-            ));
+            );
         }
         output.push_str("\nThe daemon will continue, but some workflows may get stuck.\n");
         output.push_str("Consider adding the missing roles to .loom/config.json\n");
@@ -258,7 +260,7 @@ pub fn format_validation_result(result: &ValidationResult, verbose: bool) -> Str
     if !result.errors.is_empty() {
         output.push_str("\nROLE CONFIGURATION ERRORS:\n");
         for error in &result.errors {
-            output.push_str(&format!("  - {error}\n"));
+            let _ = writeln!(output, "  - {error}");
         }
     }
 
@@ -266,6 +268,7 @@ pub fn format_validation_result(result: &ValidationResult, verbose: bool) -> Str
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

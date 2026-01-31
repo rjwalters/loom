@@ -7,7 +7,7 @@
 //! Features:
 //! - Cluster similar successful prompts
 //! - Extract common structure and identify variable slots
-//! - Generate templates with placeholders (e.g., {file}, {issue_number})
+//! - Generate templates with placeholders (e.g., {file}, {`issue_number`})
 //! - Track template usage and effectiveness
 //! - Retire underperforming templates automatically
 
@@ -24,7 +24,7 @@ use std::path::Path;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PromptTemplate {
     pub id: Option<i64>,
-    /// The template text with placeholders like {file}, {issue_number}
+    /// The template text with placeholders like {file}, {`issue_number`}
     pub template_text: String,
     /// Category of prompts this template applies to
     pub category: String,
@@ -69,6 +69,7 @@ pub struct TemplateGenerationResult {
 #[derive(Debug)]
 struct PatternCluster {
     patterns: Vec<(i64, String, f64, i32)>, // (id, pattern_text, success_rate, times_used)
+    #[allow(dead_code)]
     category: String,
 }
 
@@ -183,6 +184,7 @@ fn open_template_db(workspace_path: &str) -> SqliteResult<Connection> {
 /// 3. Identifies variable parts and creates placeholders
 /// 4. Generates templates with usage examples
 #[tauri::command]
+#[allow(clippy::too_many_lines)]
 pub fn generate_templates_from_patterns(
     workspace_path: &str,
     min_cluster_size: Option<i32>,
@@ -228,14 +230,21 @@ pub fn generate_templates_from_patterns(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect patterns: {e}"))?;
 
-        patterns_analyzed += patterns.len() as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        {
+            patterns_analyzed += patterns.len() as i32;
+        }
 
         // Cluster similar patterns
         let clusters = cluster_patterns(&patterns, 0.5);
-        clusters_found += clusters.len() as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        {
+            clusters_found += clusters.len() as i32;
+        }
 
         // Generate templates from each cluster
         for cluster in clusters {
+            #[allow(clippy::cast_sign_loss)]
             if cluster.patterns.len() < min_cluster_size as usize {
                 continue;
             }
@@ -246,11 +255,11 @@ pub fn generate_templates_from_patterns(
                 let total_successes: f64 = cluster
                     .patterns
                     .iter()
-                    .map(|(_, _, rate, uses)| rate * (*uses as f64))
+                    .map(|(_, _, rate, uses)| rate * f64::from(*uses))
                     .sum();
                 let total_uses: i32 = cluster.patterns.iter().map(|(_, _, _, uses)| uses).sum();
                 let combined_success_rate = if total_uses > 0 {
-                    total_successes / (total_uses as f64)
+                    total_successes / f64::from(total_uses)
                 } else {
                     0.0
                 };
@@ -271,6 +280,9 @@ pub fn generate_templates_from_patterns(
                     )
                     .ok();
 
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                let pattern_count = cluster.patterns.len() as i32;
+
                 let template_id = if let Some(id) = existing {
                     // Update existing template
                     conn.execute(
@@ -282,7 +294,7 @@ pub fn generate_templates_from_patterns(
                             example = ?5
                          WHERE id = ?6",
                         params![
-                            cluster.patterns.len() as i32,
+                            pattern_count,
                             combined_success_rate,
                             placeholders_json,
                             description,
@@ -304,7 +316,7 @@ pub fn generate_templates_from_patterns(
                             template_text,
                             category,
                             placeholders_json,
-                            cluster.patterns.len() as i32,
+                            pattern_count,
                             combined_success_rate,
                             description,
                             example
@@ -398,9 +410,11 @@ fn calculate_pattern_similarity(a: &str, b: &str) -> f64 {
     }
 
     // Jaccard similarity
+    #[allow(clippy::cast_precision_loss)]
     let jaccard = intersection as f64 / union as f64;
 
     // Also consider structural similarity (same length = bonus)
+    #[allow(clippy::cast_precision_loss)]
     let length_similarity = 1.0
         - ((words_a.len() as f64 - words_b.len() as f64).abs()
             / (words_a.len().max(words_b.len()) as f64));
@@ -423,17 +437,17 @@ fn extract_template(cluster: &PatternCluster) -> Option<(String, Vec<String>, St
         .collect();
 
     // Find the median length
-    let mut lengths: Vec<usize> = tokenized.iter().map(|t| t.len()).collect();
+    let mut lengths: Vec<usize> = tokenized.iter().map(Vec::len).collect();
     lengths.sort_unstable();
     let median_len = lengths[lengths.len() / 2];
 
     // Find patterns closest to median length as reference
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let reference_idx = tokenized
         .iter()
         .enumerate()
         .min_by_key(|(_, t)| (t.len() as i32 - median_len as i32).abs())
-        .map(|(i, _)| i)
-        .unwrap_or(0);
+        .map_or(0, |(i, _)| i);
 
     let reference = &tokenized[reference_idx];
     let mut template_tokens: Vec<String> = Vec::new();
@@ -447,6 +461,7 @@ fn extract_template(cluster: &PatternCluster) -> Option<(String, Vec<String>, St
             .filter(|t| t.get(pos) == Some(&word))
             .count();
 
+        #[allow(clippy::cast_precision_loss)]
         let match_ratio = matches as f64 / tokenized.len() as f64;
 
         if match_ratio >= 0.6 {
@@ -458,7 +473,7 @@ fn extract_template(cluster: &PatternCluster) -> Option<(String, Vec<String>, St
             if !placeholders.contains(&placeholder) {
                 placeholders.push(placeholder.clone());
             }
-            template_tokens.push(format!("{{{}}}", placeholder));
+            template_tokens.push(format!("{{{placeholder}}}"));
         }
     }
 
@@ -492,7 +507,7 @@ fn detect_placeholder_type(word: &str, _position: usize, _total_length: usize) -
 
     // Check for function/method names (camelCase or snake_case)
     if word.contains('_')
-        || (word.chars().any(|c| c.is_lowercase()) && word.chars().any(|c| c.is_uppercase()))
+        || (word.chars().any(char::is_lowercase) && word.chars().any(char::is_uppercase))
     {
         return "function_name".to_string();
     }
@@ -508,7 +523,7 @@ fn detect_placeholder_type(word: &str, _position: usize, _total_length: usize) -
 
 /// Generate a human-readable description for a template
 fn generate_template_description(
-    template: &str,
+    _template: &str,
     category: &str,
     placeholders: &[String],
 ) -> String {
@@ -528,13 +543,13 @@ fn generate_template_description(
             " Variables: {}",
             placeholders
                 .iter()
-                .map(|p| format!("{{{}}}", p))
+                .map(|p| format!("{{{p}}}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     };
 
-    format!("{} based on template pattern.{}", action, placeholder_desc)
+    format!("{action} based on template pattern.{placeholder_desc}")
 }
 
 // ============================================================================
@@ -555,45 +570,43 @@ pub fn get_templates(
     let active_only = active_only.unwrap_or(true);
     let limit = limit.unwrap_or(50);
 
-    let (query, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = match category {
-        Some(cat) => {
-            let q = "SELECT id, template_text, category, placeholders, source_pattern_count,
-                            source_success_rate, times_used, success_rate, success_count,
-                            failure_count, active, retirement_threshold, created_at,
-                            last_used_at, description, example
-                     FROM prompt_templates
-                     WHERE category = ?1 AND (?2 = 0 OR active = 1)
-                     ORDER BY success_rate DESC, times_used DESC
-                     LIMIT ?3"
-                .to_string();
-            (
-                q,
-                vec![
-                    Box::new(cat.to_string()),
-                    Box::new(if active_only { 1 } else { 0 }),
-                    Box::new(limit),
-                ],
-            )
-        }
-        None => {
-            let q = "SELECT id, template_text, category, placeholders, source_pattern_count,
-                            source_success_rate, times_used, success_rate, success_count,
-                            failure_count, active, retirement_threshold, created_at,
-                            last_used_at, description, example
-                     FROM prompt_templates
-                     WHERE ?1 = 0 OR active = 1
-                     ORDER BY success_rate DESC, times_used DESC
-                     LIMIT ?2"
-                .to_string();
-            (q, vec![Box::new(if active_only { 1 } else { 0 }), Box::new(limit)])
-        }
+    let (query, params_vec): (String, Vec<Box<dyn rusqlite::ToSql>>) = if let Some(cat) = category {
+        let q = "SELECT id, template_text, category, placeholders, source_pattern_count,
+                        source_success_rate, times_used, success_rate, success_count,
+                        failure_count, active, retirement_threshold, created_at,
+                        last_used_at, description, example
+                 FROM prompt_templates
+                 WHERE category = ?1 AND (?2 = 0 OR active = 1)
+                 ORDER BY success_rate DESC, times_used DESC
+                 LIMIT ?3"
+            .to_string();
+        (
+            q,
+            vec![
+                Box::new(cat.to_string()),
+                Box::new(i32::from(active_only)),
+                Box::new(limit),
+            ],
+        )
+    } else {
+        let q = "SELECT id, template_text, category, placeholders, source_pattern_count,
+                        source_success_rate, times_used, success_rate, success_count,
+                        failure_count, active, retirement_threshold, created_at,
+                        last_used_at, description, example
+                 FROM prompt_templates
+                 WHERE ?1 = 0 OR active = 1
+                 ORDER BY success_rate DESC, times_used DESC
+                 LIMIT ?2"
+            .to_string();
+        (q, vec![Box::new(i32::from(active_only)), Box::new(limit)])
     };
 
     let mut stmt = conn
         .prepare(&query)
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
-    let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params_vec.iter().map(std::convert::AsRef::as_ref).collect();
 
     let templates = stmt
         .query_map(params_refs.as_slice(), |row| {
@@ -682,7 +695,7 @@ pub fn find_matching_template(
     prompt: &str,
     category: Option<&str>,
 ) -> Result<Option<PromptTemplate>, String> {
-    let conn =
+    let _conn =
         open_template_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
 
     // Get candidate templates
@@ -742,7 +755,7 @@ pub fn instantiate_template(
     let mut result = template.template_text.clone();
 
     for (key, value) in values {
-        let placeholder = format!("{{{}}}", key);
+        let placeholder = format!("{{{key}}}");
         result = result.replace(&placeholder, &value);
     }
 
@@ -755,6 +768,7 @@ pub fn instantiate_template(
 
 /// Record that a template was used
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn record_template_usage(
     workspace_path: String,
     template_id: i64,
@@ -788,6 +802,7 @@ pub fn record_template_usage(
 
 /// Record the outcome of a template usage
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn record_template_outcome(
     workspace_path: String,
     usage_id: i64,
@@ -862,11 +877,13 @@ pub fn retire_underperforming_templates(
         )
         .map_err(|e| format!("Failed to retire templates: {e}"))?;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     Ok(retired as i32)
 }
 
 /// Reactivate a retired template
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn reactivate_template(workspace_path: String, template_id: i64) -> Result<(), String> {
     let conn =
         open_template_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;

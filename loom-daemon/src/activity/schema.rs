@@ -319,6 +319,7 @@ fn create_tuning_schema(conn: &Connection) {
 /// - GitHub issue (`cost_by_issue`)
 /// - PR (`cost_by_pr`)
 /// - Time period (`cost_by_day`, `cost_by_week`, `cost_by_month`)
+#[allow(clippy::too_many_lines)]
 fn create_cost_analytics_views(conn: &Connection) {
     // Cost by role view - aggregates costs from resource_usage joined with agent_inputs
     let views: [(&str, &str); 6] = [

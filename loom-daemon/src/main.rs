@@ -286,6 +286,7 @@ fn setup_logging() -> Result<()> {
 }
 
 /// Handle CLI commands (init, stats, validate modes)
+#[allow(clippy::too_many_lines)]
 fn handle_cli_command(command: Commands) -> Result<()> {
     match command {
         Commands::Validate {
@@ -679,7 +680,7 @@ fn handle_validate_command(
         ValidationMode::Warn
     };
 
-    let result = validate_from_file(&config_path, mode).map_err(|e| anyhow!("{}", e))?;
+    let result = validate_from_file(&config_path, mode).map_err(|e| anyhow!("{e}"))?;
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&result)?);

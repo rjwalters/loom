@@ -88,6 +88,7 @@ fn get_db_connection(workspace_path: &str) -> Result<Connection, String> {
 
 /// Save a weekly report to the reports directory
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn save_weekly_report(workspace_path: String, report_json: String) -> Result<(), String> {
     // Parse the report to get the ID
     let report: serde_json::Value = serde_json::from_str(&report_json)
@@ -109,6 +110,7 @@ pub fn save_weekly_report(workspace_path: String, report_json: String) -> Result
 
 /// Get a specific report by ID
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_weekly_report(
     workspace_path: String,
     report_id: String,
@@ -128,6 +130,7 @@ pub fn get_weekly_report(
 
 /// Get the latest weekly report
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_latest_weekly_report(workspace_path: String) -> Result<Option<String>, String> {
     let reports_dir = get_reports_dir(&workspace_path)?;
 
@@ -139,14 +142,13 @@ pub fn get_latest_weekly_report(workspace_path: String) -> Result<Option<String>
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json") {
+        if path.extension().map_or(false, |ext| ext == "json") {
             if let Ok(metadata) = entry.metadata() {
                 if let Ok(modified) = metadata.modified() {
                     if latest.is_none()
                         || latest
                             .as_ref()
-                            .map(|(m, _)| m.modified().map(|t| t < modified).unwrap_or(true))
-                            .unwrap_or(true)
+                            .map_or(true, |(m, _)| m.modified().map_or(true, |t| t < modified))
                     {
                         latest = Some((metadata, path));
                     }
@@ -167,6 +169,7 @@ pub fn get_latest_weekly_report(workspace_path: String) -> Result<Option<String>
 
 /// Get report history (last N reports)
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_weekly_report_history(
     workspace_path: String,
     limit: i32,
@@ -180,7 +183,7 @@ pub fn get_weekly_report_history(
         .flatten()
     {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "json") {
+        if path.extension().map_or(false, |ext| ext == "json") {
             if let Ok(metadata) = entry.metadata() {
                 if let Ok(modified) = metadata.modified() {
                     entries.push((modified, path));
@@ -193,6 +196,7 @@ pub fn get_weekly_report_history(
     entries.sort_by(|a, b| b.0.cmp(&a.0));
 
     // Take the requested limit
+    #[allow(clippy::cast_sign_loss)]
     let entries: Vec<_> = entries.into_iter().take(limit as usize).collect();
 
     let mut history = Vec::new();
@@ -227,16 +231,17 @@ pub fn get_weekly_report_history(
                     .to_string();
 
                 // Extract summary data
+                #[allow(clippy::cast_possible_truncation)]
                 let summary_features = report
                     .get("summary")
                     .and_then(|s| s.get("features_completed"))
-                    .and_then(|v| v.as_i64())
+                    .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0) as i32;
 
                 let summary_cost = report
                     .get("summary")
                     .and_then(|s| s.get("total_cost"))
-                    .and_then(|v| v.as_f64())
+                    .and_then(serde_json::Value::as_f64)
                     .unwrap_or(0.0);
 
                 history.push(ReportHistoryEntry {
@@ -257,6 +262,7 @@ pub fn get_weekly_report_history(
 
 /// Mark a report as viewed
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn mark_weekly_report_viewed(workspace_path: String, report_id: String) -> Result<(), String> {
     let reports_dir = get_reports_dir(&workspace_path)?;
     let report_path = reports_dir.join(format!("{report_id}.json"));
@@ -291,6 +297,7 @@ pub fn mark_weekly_report_viewed(workspace_path: String, report_id: String) -> R
 
 /// Get the current report schedule
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_weekly_report_schedule(workspace_path: String) -> Result<ReportSchedule, String> {
     let schedule_path = get_schedule_path(&workspace_path);
 
@@ -306,6 +313,7 @@ pub fn get_weekly_report_schedule(workspace_path: String) -> Result<ReportSchedu
 
 /// Save the report schedule
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn save_weekly_report_schedule(
     workspace_path: String,
     schedule_json: String,
@@ -328,6 +336,7 @@ pub fn save_weekly_report_schedule(
 
 /// Get metrics for the previous week (for week-over-week comparison)
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_previous_week_metrics(workspace_path: String) -> Result<PreviousWeekMetrics, String> {
     let conn = get_db_connection(&workspace_path)?;
 
@@ -382,6 +391,7 @@ pub fn get_previous_week_metrics(workspace_path: String) -> Result<PreviousWeekM
         .unwrap_or(0);
 
     // Calculate cost (approximate: $0.00001 per token average)
+    #[allow(clippy::cast_precision_loss)]
     let total_cost = (total_tokens as f64) * 0.00001;
 
     // Calculate success rate
@@ -406,7 +416,7 @@ pub fn get_previous_week_metrics(workspace_path: String) -> Result<PreviousWeekM
         .unwrap_or(0);
 
     let success_rate = if total_outcomes > 0 {
-        (successful_outcomes as f64) / (total_outcomes as f64)
+        f64::from(successful_outcomes) / f64::from(total_outcomes)
     } else {
         0.0
     };
@@ -434,6 +444,7 @@ pub struct PreviousWeekMetrics {
 
 /// Get count of PRs stuck in review beyond threshold
 #[command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_stuck_pr_count(workspace_path: String, hours_threshold: i32) -> Result<i32, String> {
     let conn = get_db_connection(&workspace_path)?;
 

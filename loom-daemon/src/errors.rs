@@ -418,6 +418,7 @@ impl From<anyhow::Error> for DaemonError {
 pub type DaemonResult<T> = Result<T, DaemonError>;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

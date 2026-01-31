@@ -141,7 +141,7 @@ fn migrate_v1_to_v2(conn: &Connection) -> SqliteResult<()> {
 }
 
 /// Migrate schema from v2 to v3
-/// Adds prompt_github table for linking prompts to GitHub entities
+/// Adds `prompt_github` table for linking prompts to GitHub entities
 fn migrate_v2_to_v3(conn: &Connection) -> SqliteResult<()> {
     // Create prompt_github table for correlating prompts with GitHub entities
     conn.execute(
@@ -188,7 +188,7 @@ fn migrate_v2_to_v3(conn: &Connection) -> SqliteResult<()> {
 }
 
 /// Migrate schema from v3 to v4
-/// Adds velocity_snapshots table for daily velocity tracking
+/// Adds `velocity_snapshots` table for daily velocity tracking
 fn migrate_v3_to_v4(conn: &Connection) -> SqliteResult<()> {
     // Create velocity_snapshots table for daily metrics
     conn.execute(
@@ -214,7 +214,7 @@ fn migrate_v3_to_v4(conn: &Connection) -> SqliteResult<()> {
 }
 
 /// Migrate schema from v4 to v5
-/// Adds prompt_patterns and pattern_matches tables for pattern catalog
+/// Adds `prompt_patterns` and `pattern_matches` tables for pattern catalog
 fn migrate_v4_to_v5(conn: &Connection) -> SqliteResult<()> {
     // Create prompt_patterns table for storing extracted patterns
     conn.execute(
@@ -279,7 +279,7 @@ fn migrate_v4_to_v5(conn: &Connection) -> SqliteResult<()> {
 }
 
 /// Migrate schema from v5 to v6
-/// Adds recommendations and recommendation_rules tables for the recommendation engine
+/// Adds recommendations and `recommendation_rules` tables for the recommendation engine
 fn migrate_v5_to_v6(conn: &Connection) -> SqliteResult<()> {
     // Create recommendations table for storing generated recommendations
     conn.execute(
@@ -762,11 +762,11 @@ pub struct AgentMetrics {
     pub total_tokens: i64,
     /// Estimated cost in USD (based on token pricing)
     pub total_cost: f64,
-    /// Success rate (work_completed / total where work_found)
+    /// Success rate (`work_completed` / total where `work_found`)
     pub success_rate: f64,
-    /// Number of PRs created (from github_events)
+    /// Number of PRs created (from `github_events`)
     pub prs_created: i32,
-    /// Number of issues closed (from github_events)
+    /// Number of issues closed (from `github_events`)
     pub issues_closed: i32,
 }
 
@@ -785,6 +785,7 @@ const INPUT_TOKEN_PRICE_PER_1K: f64 = 0.003;
 const OUTPUT_TOKEN_PRICE_PER_1K: f64 = 0.015;
 
 /// Calculate estimated cost from token counts
+#[allow(clippy::cast_precision_loss)]
 fn calculate_cost(prompt_tokens: i64, completion_tokens: i64) -> f64 {
     let input_cost = (prompt_tokens as f64 / 1000.0) * INPUT_TOKEN_PRICE_PER_1K;
     let output_cost = (completion_tokens as f64 / 1000.0) * OUTPUT_TOKEN_PRICE_PER_1K;
@@ -822,7 +823,7 @@ pub fn get_agent_metrics(
         .map_err(|e| format!("Failed to query activity metrics: {e}"))?;
 
     let success_rate = if with_work > 0 {
-        (completed as f64) / (with_work as f64)
+        f64::from(completed) / f64::from(with_work)
     } else {
         0.0
     };
@@ -914,7 +915,7 @@ pub fn get_metrics_by_role(
             let with_work: i32 = row.get(6)?;
 
             let success_rate = if with_work > 0 {
-                (completed as f64) / (with_work as f64)
+                f64::from(completed) / f64::from(with_work)
             } else {
                 0.0
             };
@@ -936,6 +937,7 @@ pub fn get_metrics_by_role(
 
 /// Log a GitHub event (PR created, issue closed, etc.)
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn log_github_event(
     workspace_path: String,
     event_type: String,
@@ -963,6 +965,7 @@ pub fn log_github_event(
 
 /// GitHub event types for prompt correlation
 /// These map to specific GitHub CLI operations detected in terminal output
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptGitHubEventType {
@@ -1010,6 +1013,7 @@ impl std::fmt::Display for PromptGitHubEventType {
 }
 
 /// Entry for prompt-GitHub correlation
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PromptGitHubEntry {
     pub id: Option<i64>,
@@ -1023,6 +1027,7 @@ pub struct PromptGitHubEntry {
 }
 
 /// Log a prompt-GitHub correlation entry
+#[allow(dead_code)]
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn log_prompt_github(
@@ -1056,6 +1061,7 @@ pub fn log_prompt_github(
 }
 
 /// Query prompt-GitHub correlations for a specific issue
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_prompts_for_issue(
     workspace_path: &str,
@@ -1094,6 +1100,7 @@ pub fn get_prompts_for_issue(
 }
 
 /// Query prompt-GitHub correlations for a specific PR
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_prompts_for_pr(
     workspace_path: &str,
@@ -1132,6 +1139,7 @@ pub fn get_prompts_for_pr(
 }
 
 /// Issue resolution cost summary
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IssueCostSummary {
     pub issue_number: i32,
@@ -1146,6 +1154,7 @@ pub struct IssueCostSummary {
 }
 
 /// Get cost and metrics for resolving a specific issue
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_issue_resolution_cost(
     workspace_path: &str,
@@ -1170,7 +1179,7 @@ pub fn get_issue_resolution_cost(
     // Build comma-separated list for IN clause
     let id_list = activity_ids
         .iter()
-        .map(|id| id.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
 
@@ -1242,6 +1251,7 @@ pub fn get_issue_resolution_cost(
 }
 
 /// Label transition record for tracking workflow state changes
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LabelTransition {
     pub timestamp: String,
@@ -1254,6 +1264,7 @@ pub struct LabelTransition {
 }
 
 /// Get label transition history for tracking workflow state changes
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_label_transitions(
     workspace_path: &str,
@@ -1302,6 +1313,7 @@ pub fn get_label_transitions(
 }
 
 /// PR cycle time analysis
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PRCycleTime {
     pub pr_number: i32,
@@ -1318,6 +1330,7 @@ pub struct PRCycleTime {
 }
 
 /// Get PR cycle time analysis for recent PRs
+#[allow(dead_code, clippy::too_many_lines)]
 #[tauri::command]
 pub fn get_pr_cycle_times(
     workspace_path: &str,
@@ -1371,8 +1384,7 @@ pub fn get_pr_cycle_times(
         let created_at = events
             .iter()
             .find(|(t, _, _)| t == "pr_created")
-            .map(|(_, time, _)| time.clone())
-            .unwrap_or_else(|| events[0].1.clone());
+            .map_or_else(|| events[0].1.clone(), |(_, time, _)| time.clone());
 
         let merged_at = events
             .iter()
@@ -1429,6 +1441,7 @@ pub fn get_pr_cycle_times(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Failed to collect activity IDs: {e}"))?;
 
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let prompt_count = activity_ids.len() as i32;
 
         // Calculate total cost
@@ -1437,7 +1450,7 @@ pub fn get_pr_cycle_times(
         } else {
             let id_list = activity_ids
                 .iter()
-                .map(|id| id.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
 
@@ -1475,6 +1488,7 @@ pub fn get_pr_cycle_times(
 }
 
 /// Average cost per issue resolved
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AverageIssueCost {
     pub issues_resolved: i32,
@@ -1486,6 +1500,7 @@ pub struct AverageIssueCost {
 }
 
 /// Get average cost to resolve issues over a time range
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_average_issue_cost(
     workspace_path: &str,
@@ -1529,12 +1544,13 @@ pub fn get_average_issue_cost(
         });
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let issues_resolved = resolved_issues.len() as i32;
 
     // Calculate totals across all resolved issues
     let issue_list = resolved_issues
         .iter()
-        .map(|id| id.to_string())
+        .map(std::string::ToString::to_string)
         .collect::<Vec<_>>()
         .join(",");
 
@@ -1549,6 +1565,7 @@ pub fn get_average_issue_cost(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect activity IDs: {e}"))?;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let total_prompts = activity_ids.len() as i32;
 
     let total_cost = if activity_ids.is_empty() {
@@ -1556,7 +1573,7 @@ pub fn get_average_issue_cost(
     } else {
         let id_list = activity_ids
             .iter()
-            .map(|id| id.to_string())
+            .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
             .join(",");
 
@@ -2233,6 +2250,7 @@ pub fn compare_velocity_periods(
 // ============================================================================
 
 /// Prompt pattern categories based on agent roles and task types
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum PatternCategory {
@@ -2272,6 +2290,7 @@ impl std::fmt::Display for PatternCategory {
 
 impl PatternCategory {
     /// Infer category from role name
+    #[allow(dead_code)]
     fn from_role(role: &str) -> Self {
         match role.to_lowercase().as_str() {
             "builder" => Self::Build,
@@ -2286,6 +2305,7 @@ impl PatternCategory {
 }
 
 /// A prompt pattern extracted from activity data
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PromptPattern {
     pub id: Option<i64>,
@@ -2303,6 +2323,7 @@ pub struct PromptPattern {
 }
 
 /// A match between a pattern and an activity
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PatternMatch {
     pub id: Option<i64>,
@@ -2313,6 +2334,7 @@ pub struct PatternMatch {
 }
 
 /// Summary of pattern extraction results
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PatternExtractionResult {
     pub patterns_created: i32,
@@ -2325,11 +2347,11 @@ pub struct PatternExtractionResult {
 /// - Strips issue/PR numbers (e.g., #123 -> #N)
 /// - Normalizes whitespace
 /// - Lowercases for comparison
+#[allow(dead_code)]
 fn normalize_prompt_to_pattern(prompt: &str) -> String {
     // Replace issue/PR numbers with placeholder
     let pattern = regex::Regex::new(r"#\d+")
-        .map(|re| re.replace_all(prompt, "#N").to_string())
-        .unwrap_or_else(|_| prompt.to_string());
+        .map_or_else(|_| prompt.to_string(), |re| re.replace_all(prompt, "#N").to_string());
 
     // Normalize whitespace
     let pattern = regex::Regex::new(r"\s+")
@@ -2341,6 +2363,7 @@ fn normalize_prompt_to_pattern(prompt: &str) -> String {
 }
 
 /// Extract patterns from historical activity data
+#[allow(dead_code, clippy::too_many_lines)]
 #[tauri::command]
 pub fn extract_prompt_patterns(workspace_path: &str) -> Result<PatternExtractionResult, String> {
     let conn =
@@ -2363,6 +2386,7 @@ pub fn extract_prompt_patterns(workspace_path: &str) -> Result<PatternExtraction
         )
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
+    #[allow(clippy::type_complexity)]
     let activities: Vec<(i64, String, String, bool, Option<bool>, Option<i32>, i64, i64, i64)> =
         stmt.query_map([], |row| {
             Ok((
@@ -2451,17 +2475,21 @@ pub fn extract_prompt_patterns(workspace_path: &str) -> Result<PatternExtraction
             } else {
                 success_count
             };
-            let new_failure_count = if !is_success {
-                failure_count + 1
-            } else {
+            let new_failure_count = if is_success {
                 failure_count
+            } else {
+                failure_count + 1
             };
             let new_success_rate = f64::from(new_success_count) / f64::from(new_times_used);
+            #[allow(clippy::cast_possible_truncation)]
             let new_total_cost_cents = total_cost_cents + (cost * 100.0) as i64;
+            #[allow(clippy::cast_precision_loss)]
             let new_avg_cost = (new_total_cost_cents as f64 / 100.0) / f64::from(new_times_used);
             let new_total_duration = total_duration + i64::from(duration_ms.unwrap_or(0) / 1000);
+            #[allow(clippy::cast_possible_truncation)]
             let new_avg_duration = (new_total_duration / i64::from(new_times_used)) as i32;
             let new_total_tokens = total_tok + total_tokens;
+            #[allow(clippy::cast_possible_truncation)]
             let new_avg_tokens = (new_total_tokens / i64::from(new_times_used)) as i32;
 
             conn.execute(
@@ -2492,10 +2520,12 @@ pub fn extract_prompt_patterns(workspace_path: &str) -> Result<PatternExtraction
             id
         } else {
             // Create new pattern
-            let success_count = if is_success { 1 } else { 0 };
-            let failure_count = if !is_success { 1 } else { 0 };
+            let success_count = i32::from(is_success);
+            let failure_count = i32::from(!is_success);
             let success_rate = if is_success { 1.0 } else { 0.0 };
 
+            #[allow(clippy::cast_possible_truncation)]
+            let total_tokens_i32 = total_tokens as i32;
             conn.execute(
                 "INSERT INTO prompt_patterns (
                     pattern_text, category, times_used, success_count, failure_count,
@@ -2509,7 +2539,7 @@ pub fn extract_prompt_patterns(workspace_path: &str) -> Result<PatternExtraction
                     success_rate,
                     cost,
                     duration_ms.unwrap_or(0) / 1000,
-                    total_tokens as i32
+                    total_tokens_i32
                 ],
             )
             .map_err(|e| format!("Failed to insert pattern: {e}"))?;
@@ -2549,6 +2579,7 @@ pub fn extract_prompt_patterns(workspace_path: &str) -> Result<PatternExtraction
 }
 
 /// Get patterns by category
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_patterns_by_category(
     workspace_path: &str,
@@ -2596,6 +2627,7 @@ pub fn get_patterns_by_category(
 }
 
 /// Get top patterns sorted by a specific metric
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_top_patterns(
     workspace_path: &str,
@@ -2607,6 +2639,7 @@ pub fn get_top_patterns(
 
     let limit = limit.unwrap_or(20);
 
+    #[allow(clippy::match_same_arms)]
     let order_clause = match sort_by {
         "success_rate" => "success_rate DESC, times_used DESC",
         "times_used" => "times_used DESC, success_rate DESC",
@@ -2654,6 +2687,7 @@ pub fn get_top_patterns(
 }
 
 /// Find patterns similar to a given prompt text
+#[allow(dead_code)]
 #[tauri::command]
 pub fn find_similar_patterns(
     workspace_path: &str,
@@ -2724,6 +2758,7 @@ pub fn find_similar_patterns(
 }
 
 /// Get pattern catalog statistics
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PatternCatalogStats {
     pub total_patterns: i32,
@@ -2735,6 +2770,7 @@ pub struct PatternCatalogStats {
 }
 
 /// Category count for statistics
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CategoryCount {
     pub category: String,
@@ -2743,6 +2779,7 @@ pub struct CategoryCount {
 }
 
 /// Get statistics about the pattern catalog
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_pattern_catalog_stats(workspace_path: &str) -> Result<PatternCatalogStats, String> {
     let conn =
@@ -2822,6 +2859,7 @@ pub fn get_pattern_catalog_stats(workspace_path: &str) -> Result<PatternCatalogS
 }
 
 /// Record that a pattern was used (for tracking when patterns are applied)
+#[allow(dead_code, clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn record_pattern_usage(
     workspace_path: String,
@@ -2873,6 +2911,7 @@ pub fn record_pattern_usage(
 // ============================================================================
 
 /// Recommendation types based on what kind of suggestion is being made
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecommendationType {
@@ -2902,6 +2941,7 @@ impl std::fmt::Display for RecommendationType {
 }
 
 /// A generated recommendation
+#[allow(dead_code, clippy::struct_field_names)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Recommendation {
     pub id: Option<i64>,
@@ -2918,6 +2958,7 @@ pub struct Recommendation {
 }
 
 /// A recommendation rule configuration
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecommendationRule {
     pub id: Option<i64>,
@@ -2934,6 +2975,7 @@ pub struct RecommendationRule {
 }
 
 /// Result of recommendation generation
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecommendationGenerationResult {
     pub recommendations_created: i32,
@@ -2942,6 +2984,7 @@ pub struct RecommendationGenerationResult {
 }
 
 /// Get all active (non-dismissed) recommendations
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_active_recommendations(
     workspace_path: &str,
@@ -2986,6 +3029,7 @@ pub fn get_active_recommendations(
 }
 
 /// Get recommendations filtered by context (role and/or task type)
+#[allow(dead_code, clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn get_recommendations_for_context(
     workspace_path: &str,
@@ -3035,6 +3079,7 @@ pub fn get_recommendations_for_context(
 }
 
 /// Dismiss a recommendation
+#[allow(dead_code, clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn dismiss_recommendation(
     workspace_path: String,
@@ -3053,6 +3098,7 @@ pub fn dismiss_recommendation(
 }
 
 /// Mark a recommendation as acted upon
+#[allow(dead_code, clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn mark_recommendation_acted_on(
     workspace_path: String,
@@ -3068,6 +3114,7 @@ pub fn mark_recommendation_acted_on(
 }
 
 /// Get all recommendation rules
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_recommendation_rules(workspace_path: &str) -> Result<Vec<RecommendationRule>, String> {
     let conn =
@@ -3105,6 +3152,7 @@ pub fn get_recommendation_rules(workspace_path: &str) -> Result<Vec<Recommendati
 }
 
 /// Update a recommendation rule
+#[allow(dead_code, clippy::needless_pass_by_value)]
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn update_recommendation_rule(
@@ -3146,7 +3194,7 @@ pub fn update_recommendation_rule(
     if let Some(e) = enabled {
         conn.execute(
             "UPDATE recommendation_rules SET enabled = ?1, updated_at = datetime('now') WHERE id = ?2",
-            params![if e { 1 } else { 0 }, rule_id],
+            params![i32::from(e), rule_id],
         )
         .map_err(|e| format!("Failed to update enabled: {e}"))?;
     }
@@ -3156,6 +3204,7 @@ pub fn update_recommendation_rule(
 
 /// Generate recommendations from analytics data
 /// Evaluates all enabled rules against current data and creates new recommendations
+#[allow(dead_code, clippy::too_many_lines)]
 #[tauri::command]
 pub fn generate_recommendations(
     workspace_path: &str,
@@ -3168,6 +3217,7 @@ pub fn generate_recommendations(
     let mut patterns_analyzed = 0;
 
     // Get all enabled rules
+    #[allow(clippy::type_complexity)]
     let rules: Vec<(i64, String, String, Option<f64>, Option<i32>, String)> = conn
         .prepare(
             "SELECT id, name, rule_type, threshold_value, threshold_count, recommendation_template
@@ -3249,7 +3299,7 @@ pub fn generate_recommendations(
                     .to_string();
 
                     // Confidence based on number of uses (more data = higher confidence)
-                    let confidence = (1.0 - success_rate) * (times_used as f64 / 20.0).min(1.0);
+                    let confidence = (1.0 - success_rate) * (f64::from(times_used) / 20.0).min(1.0);
 
                     conn.execute(
                         "INSERT INTO recommendations (type, title, description, confidence, evidence, created_at)
@@ -3287,6 +3337,7 @@ pub fn generate_recommendations(
                     continue;
                 }
 
+                #[allow(clippy::cast_precision_loss)]
                 let overall_avg: f64 =
                     avg_costs.iter().map(|(_, c, _)| c).sum::<f64>() / avg_costs.len() as f64;
 
@@ -3325,7 +3376,7 @@ pub fn generate_recommendations(
                         .to_string();
 
                         let confidence = ((actual_multiplier - 1.0) / cost_multiplier).min(1.0)
-                            * (*count as f64 / 50.0).min(1.0);
+                            * (f64::from(*count) / 50.0).min(1.0);
 
                         conn.execute(
                             "INSERT INTO recommendations (type, title, description, confidence, evidence, context_role, created_at)
@@ -3403,7 +3454,7 @@ pub fn generate_recommendations(
                     })
                     .to_string();
 
-                    let confidence = success_rate * (times_used as f64 / 10.0).min(1.0);
+                    let confidence = success_rate * (f64::from(times_used) / 10.0).min(1.0);
 
                     conn.execute(
                         "INSERT INTO recommendations (type, title, description, confidence, evidence, context_task_type, created_at)
@@ -3451,7 +3502,7 @@ pub fn generate_recommendations(
                     .unwrap_or((0, 1));
 
                 let overall_rate = if total_with_work > 0 {
-                    total_success as f64 / total_with_work as f64
+                    f64::from(total_success) / f64::from(total_with_work)
                 } else {
                     0.0
                 };
@@ -3487,7 +3538,7 @@ pub fn generate_recommendations(
                         })
                         .to_string();
 
-                        let confidence = success_rate * (count as f64 / 20.0).min(1.0);
+                        let confidence = success_rate * (f64::from(count) / 20.0).min(1.0);
 
                         conn.execute(
                             "INSERT INTO recommendations (type, title, description, confidence, evidence, context_role, created_at)
@@ -3545,6 +3596,7 @@ pub fn generate_recommendations(
                     if !exists {
                         let start_hour = peak_hours.iter().map(|(h, _, _)| *h).min().unwrap_or(9);
                         let end_hour = peak_hours.iter().map(|(h, _, _)| *h).max().unwrap_or(17);
+                        #[allow(clippy::cast_precision_loss)]
                         let avg_success: f64 = peak_hours.iter().map(|(_, sr, _)| *sr).sum::<f64>()
                             / peak_hours.len() as f64;
 
@@ -3565,6 +3617,7 @@ pub fn generate_recommendations(
                         })
                         .to_string();
 
+                        #[allow(clippy::cast_precision_loss)]
                         let confidence = avg_success * (peak_hours.len() as f64 / 8.0).min(1.0);
 
                         conn.execute(
@@ -3592,6 +3645,7 @@ pub fn generate_recommendations(
 }
 
 /// Get recommendation statistics
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecommendationStats {
     pub total_recommendations: i32,
@@ -3603,6 +3657,7 @@ pub struct RecommendationStats {
 }
 
 /// Type count for statistics
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TypeCount {
     pub recommendation_type: String,
@@ -3611,6 +3666,7 @@ pub struct TypeCount {
 }
 
 /// Get statistics about recommendations
+#[allow(dead_code)]
 #[tauri::command]
 pub fn get_recommendation_stats(workspace_path: &str) -> Result<RecommendationStats, String> {
     let conn =
@@ -3747,6 +3803,7 @@ pub fn get_budget_config(workspace_path: &str) -> Result<BudgetConfig, String> {
 }
 
 /// Save the budget configuration
+#[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn save_budget_config(workspace_path: &str, config: BudgetConfig) -> Result<(), String> {
     let config_path = get_budget_config_path(workspace_path);
@@ -3869,6 +3926,7 @@ pub struct TimelineEntry {
 
 /// Get activity timeline for playback visualization
 /// Supports filtering by issue, PR, role, and date range
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 #[tauri::command]
 pub fn get_activity_timeline(
     workspace_path: &str,

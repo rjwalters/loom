@@ -238,6 +238,7 @@ pub struct TuningSummary {
 // ============================================================================
 
 /// Create tuning-related database tables
+#[allow(clippy::too_many_lines)]
 pub fn create_tuning_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         r"
@@ -797,6 +798,7 @@ pub fn analyze_and_propose(
 
     // Get recent effectiveness snapshots
     let snapshots = get_effectiveness_history(conn, 7)?;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     if snapshots.len() < config.min_sample_size as usize {
         log::info!(
             "Insufficient data for tuning analysis: {} samples (need {})",
@@ -807,6 +809,7 @@ pub fn analyze_and_propose(
     }
 
     // Calculate trends
+    #[allow(clippy::cast_precision_loss)]
     let recent_success_rate = snapshots
         .iter()
         .take(3)
@@ -814,6 +817,7 @@ pub fn analyze_and_propose(
         .sum::<f64>()
         / 3.0_f64.min(snapshots.len() as f64);
 
+    #[allow(clippy::cast_precision_loss)]
     let older_success_rate = snapshots
         .iter()
         .skip(3)
@@ -863,6 +867,7 @@ fn analyze_parameter(
         }
         "review_threshold" => {
             // Adjust review threshold based on rework rates
+            #[allow(clippy::cast_precision_loss)]
             let avg_rework =
                 snapshots.iter().map(|s| s.avg_rework_count).sum::<f64>() / snapshots.len() as f64;
             if avg_rework > 2.0 {
@@ -886,7 +891,11 @@ fn analyze_parameter(
                 .skip(3)
                 .map(|s| s.avg_cost_per_task)
                 .sum::<f64>()
-                / (snapshots.len() - 3).max(1) as f64;
+                / {
+                    #[allow(clippy::cast_precision_loss)]
+                    let d = (snapshots.len() - 3).max(1) as f64;
+                    d
+                };
 
             if recent_cost > older_cost * 1.2 {
                 // Costs increasing significantly, might need more iterations

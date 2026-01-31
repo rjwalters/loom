@@ -148,11 +148,13 @@ fn open_correlation_db(workspace_path: &str) -> SqliteResult<Connection> {
 // ============================================================================
 
 /// Calculate Pearson correlation coefficient between two numeric vectors
+#[allow(clippy::many_single_char_names)]
 fn pearson_correlation(x: &[f64], y: &[f64]) -> (f64, f64) {
     if x.len() != y.len() || x.len() < 3 {
         return (0.0, 1.0); // Not enough data
     }
 
+    #[allow(clippy::cast_precision_loss)]
     let n = x.len() as f64;
 
     // Calculate means
@@ -202,12 +204,12 @@ fn normal_cdf(x: f64) -> f64 {
 /// Error function approximation
 fn erf(x: f64) -> f64 {
     // Horner form approximation
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
+    let a1 = 0.254_829_592;
+    let a2 = -0.284_496_736;
+    let a3 = 1.421_413_741;
+    let a4 = -1.453_152_027;
+    let a5 = 1.061_405_429;
+    let p = 0.327_591_1;
 
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -218,6 +220,7 @@ fn erf(x: f64) -> f64 {
 }
 
 /// Calculate chi-square statistic for categorical data
+#[allow(dead_code)]
 fn chi_square_test(observed: &[[i32; 2]; 2]) -> (f64, f64) {
     let total: i32 = observed.iter().flat_map(|row| row.iter()).sum();
 
@@ -238,9 +241,9 @@ fn chi_square_test(observed: &[[i32; 2]; 2]) -> (f64, f64) {
 
     for i in 0..2 {
         for j in 0..2 {
-            let expected = (row_totals[i] * col_totals[j]) as f64 / total as f64;
+            let expected = f64::from(row_totals[i] * col_totals[j]) / f64::from(total);
             if expected > 0.0 {
-                let diff = observed[i][j] as f64 - expected;
+                let diff = f64::from(observed[i][j]) - expected;
                 chi_sq += (diff * diff) / expected;
             }
         }
@@ -253,14 +256,17 @@ fn chi_square_test(observed: &[[i32; 2]; 2]) -> (f64, f64) {
 }
 
 /// Chi-square CDF approximation
+#[allow(dead_code, clippy::float_cmp)]
 fn chi_square_cdf(x: f64, df: f64) -> f64 {
     if x <= 0.0 {
         return 0.0;
     }
 
     // Use incomplete gamma function approximation
-    let k = df / 2.0;
-    let z = x / 2.0;
+    #[allow(clippy::no_effect_underscore_binding)]
+    let _k = df / 2.0;
+    #[allow(clippy::no_effect_underscore_binding)]
+    let _z = x / 2.0;
 
     // Simple approximation for df=1
     if df == 1.0 {
@@ -304,6 +310,7 @@ pub fn extract_success_factors(workspace_path: &str) -> Result<i32, String> {
         )
         .map_err(|e| format!("Failed to extract success factors: {e}"))?;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     Ok(extracted as i32)
 }
 
@@ -327,7 +334,7 @@ pub fn analyze_hour_success_correlation(workspace_path: &str) -> Result<Correlat
         .map_err(|e| format!("Failed to prepare query: {e}"))?;
 
     let data: Vec<(f64, f64)> = stmt
-        .query_map([], |row| Ok((row.get::<_, i32>(0)? as f64, row.get(1)?)))
+        .query_map([], |row| Ok((f64::from(row.get::<_, i32>(0)?), row.get(1)?)))
         .map_err(|e| format!("Failed to query data: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect data: {e}"))?;
@@ -354,16 +361,17 @@ pub fn analyze_hour_success_correlation(workspace_path: &str) -> Result<Correlat
         factor_b: "success".to_string(),
         correlation_coefficient: r,
         p_value,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         sample_size: hours.len() as i32,
         analysis_date: chrono::Utc::now().to_rfc3339(),
-        notes: Some(format!(
-            "{}",
-            if p_value < 0.05 {
+        notes: Some(
+            (if p_value < 0.05 {
                 "Statistically significant"
             } else {
                 "Not statistically significant"
-            }
-        )),
+            })
+            .to_string(),
+        ),
     };
 
     // Store the result
@@ -416,7 +424,7 @@ pub fn analyze_role_success_correlation(
                 total_count: total,
                 success_count,
                 success_rate: if total > 0 {
-                    success_count as f64 / total as f64
+                    f64::from(success_count) / f64::from(total)
                 } else {
                     0.0
                 },
@@ -471,7 +479,7 @@ pub fn analyze_time_of_day_success(
                 total_count: total,
                 success_count,
                 success_rate: if total > 0 {
-                    success_count as f64 / total as f64
+                    f64::from(success_count) / f64::from(total)
                 } else {
                     0.0
                 },
@@ -523,7 +531,7 @@ pub fn analyze_day_of_week_success(
                 total_count: total,
                 success_count,
                 success_rate: if total > 0 {
-                    success_count as f64 / total as f64
+                    f64::from(success_count) / f64::from(total)
                 } else {
                     0.0
                 },
@@ -623,6 +631,7 @@ pub fn get_success_factors_for_role(
 
 /// Run a full correlation analysis and return a summary with insights
 #[tauri::command]
+#[allow(clippy::too_many_lines)]
 pub fn run_correlation_analysis(workspace_path: &str) -> Result<CorrelationSummary, String> {
     let conn =
         open_correlation_db(workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
@@ -642,7 +651,7 @@ pub fn run_correlation_analysis(workspace_path: &str) -> Result<CorrelationSumma
         .unwrap_or((0, 0));
 
     let success_rate = if total_samples > 0 {
-        success_count as f64 / total_samples as f64
+        f64::from(success_count) / f64::from(total_samples)
     } else {
         0.0
     };
@@ -665,7 +674,11 @@ pub fn run_correlation_analysis(workspace_path: &str) -> Result<CorrelationSumma
         if let Some(best) = time_results
             .iter()
             .filter(|r| r.total_count >= 5)
-            .max_by(|a, b| a.success_rate.partial_cmp(&b.success_rate).unwrap())
+            .max_by(|a, b| {
+                a.success_rate
+                    .partial_cmp(&b.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         {
             insights.push(CorrelationInsight {
                 factor: "time_of_day".to_string(),
@@ -695,7 +708,11 @@ pub fn run_correlation_analysis(workspace_path: &str) -> Result<CorrelationSumma
         if let Some(best) = role_results
             .iter()
             .filter(|r| r.total_count >= 5)
-            .max_by(|a, b| a.success_rate.partial_cmp(&b.success_rate).unwrap())
+            .max_by(|a, b| {
+                a.success_rate
+                    .partial_cmp(&b.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         {
             insights.push(CorrelationInsight {
                 factor: "role".to_string(),
@@ -725,7 +742,11 @@ pub fn run_correlation_analysis(workspace_path: &str) -> Result<CorrelationSumma
         if let Some(best) = day_results
             .iter()
             .filter(|r| r.total_count >= 3)
-            .max_by(|a, b| a.success_rate.partial_cmp(&b.success_rate).unwrap())
+            .max_by(|a, b| {
+                a.success_rate
+                    .partial_cmp(&b.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         {
             insights.push(CorrelationInsight {
                 factor: "day_of_week".to_string(),
@@ -840,7 +861,7 @@ pub fn predict_success(
 
     // Normalize adjustment if multiple factors used
     if factors_used > 1 {
-        adjustment /= factors_used as f64;
+        adjustment /= f64::from(factors_used);
     }
 
     // Return predicted success rate, clamped to valid probability range
@@ -849,6 +870,7 @@ pub fn predict_success(
 
 /// Log a success factor entry manually
 #[tauri::command]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn log_success_factor(
     workspace_path: String,
     input_id: i64,
@@ -870,7 +892,7 @@ pub fn log_success_factor(
             prompt_length,
             hour_of_day,
             day_of_week,
-            has_tests_first.map(|b| if b { 1 } else { 0 }),
+            has_tests_first.map(i32::from),
             review_cycles,
             outcome
         ],
@@ -890,5 +912,6 @@ pub fn clear_correlation_results(workspace_path: &str) -> Result<i32, String> {
         .execute("DELETE FROM correlation_results", [])
         .map_err(|e| format!("Failed to clear correlation results: {e}"))?;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     Ok(deleted as i32)
 }

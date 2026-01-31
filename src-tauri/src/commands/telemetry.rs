@@ -1,6 +1,6 @@
 //! Telemetry commands for performance monitoring, error tracking, and usage analytics.
 //!
-//! All telemetry data is stored locally in SQLite databases within the ~/.loom directory.
+//! All telemetry data is stored locally in `SQLite` databases within the ~/.loom directory.
 //! This module provides commands for logging and querying telemetry data.
 
 use rusqlite::{params, Connection, Result as SqliteResult};
@@ -170,6 +170,7 @@ pub fn log_performance_metric(metric: PerformanceMetric) -> Result<(), String> {
 
 /// Get performance metrics with optional filters
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_performance_metrics(
     category: Option<String>,
     since: Option<String>,
@@ -462,6 +463,7 @@ pub fn log_usage_event(event: UsageEvent) -> Result<(), String> {
 
 /// Get usage events with optional filters
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_usage_events(
     category: Option<String>,
     since: Option<String>,
