@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
-from loom_tools.shepherd.labels import add_issue_label, remove_issue_label
+from loom_tools.shepherd.labels import remove_issue_label
 from loom_tools.shepherd.phases.base import (
     BasePhase,
     PhaseResult,
@@ -73,19 +73,15 @@ class CuratorPhase(BasePhase):
     def validate(self, ctx: ShepherdContext) -> bool:
         """Validate curator phase contract.
 
-        Curator must add loom:curated label.
-        If missing, attempt recovery by adding the label.
+        Calls the Python validate_phase module directly for consistent
+        validation with recovery across all phases.
         """
-        # Refresh cache
-        ctx.label_cache.invalidate_issue(ctx.config.issue)
+        from loom_tools.validate_phase import validate_phase
 
-        if ctx.has_issue_label("loom:curated"):
-            return True
-
-        # Attempt recovery: apply loom:curated label
-        remove_issue_label(ctx.config.issue, "loom:curating", ctx.repo_root)
-        if add_issue_label(ctx.config.issue, "loom:curated", ctx.repo_root):
-            ctx.report_milestone("heartbeat", action="recovery: applied loom:curated label")
-            return True
-
-        return False
+        result = validate_phase(
+            phase="curator",
+            issue=ctx.config.issue,
+            repo_root=ctx.repo_root,
+            task_id=ctx.config.task_id,
+        )
+        return result.satisfied
