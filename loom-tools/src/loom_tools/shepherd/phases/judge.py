@@ -386,23 +386,20 @@ class JudgePhase:
             check=False,
         )
 
-        # Record blocked reason
-        ctx.run_script(
-            "record-blocked-reason.sh",
-            [
-                str(ctx.config.issue),
-                "--error-class",
-                error_class,
-                "--phase",
-                "judge",
-                "--details",
-                details,
-            ],
-            check=False,
+        # Record blocked reason and update systematic failure tracking
+        from loom_tools.common.systematic_failure import (
+            detect_systematic_failure,
+            record_blocked_reason,
         )
 
-        # Update systematic failure tracking
-        ctx.run_script("detect-systematic-failure.sh", ["--update"], check=False)
+        record_blocked_reason(
+            ctx.repo_root,
+            ctx.config.issue,
+            error_class=error_class,
+            phase="judge",
+            details=details,
+        )
+        detect_systematic_failure(ctx.repo_root)
 
         # Add comment
         subprocess.run(

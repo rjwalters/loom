@@ -512,23 +512,20 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
         check=False,
     )
 
-    # Record blocked reason
-    ctx.run_script(
-        "record-blocked-reason.sh",
-        [
-            str(ctx.config.issue),
-            "--error-class",
-            "doctor_exhausted",
-            "--phase",
-            "doctor",
-            "--details",
-            f"max retries ({ctx.config.doctor_max_retries}) exceeded",
-        ],
-        check=False,
+    # Record blocked reason and update systematic failure tracking
+    from loom_tools.common.systematic_failure import (
+        detect_systematic_failure,
+        record_blocked_reason,
     )
 
-    # Update systematic failure tracking
-    ctx.run_script("detect-systematic-failure.sh", ["--update"], check=False)
+    record_blocked_reason(
+        ctx.repo_root,
+        ctx.config.issue,
+        error_class="doctor_exhausted",
+        phase="doctor",
+        details=f"max retries ({ctx.config.doctor_max_retries}) exceeded",
+    )
+    detect_systematic_failure(ctx.repo_root)
 
     # Add comment
     subprocess.run(
