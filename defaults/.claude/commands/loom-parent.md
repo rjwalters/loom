@@ -301,7 +301,67 @@ def detect_continuation():
 
 ## Startup Validation
 
-Before entering the main loop, validate role configuration:
+### Toolchain Validation
+
+Before entering the main loop, validate that essential loom-tools commands are available:
+
+```python
+def validate_toolchain():
+    """Validate loom-tools commands are installed.
+
+    Critical commands must exist for daemon to start.
+    Optional commands allow degraded functionality.
+
+    Returns True if all critical commands available, False otherwise.
+    """
+    result = run("./scripts/validate-toolchain.sh --json")
+    validation = json.loads(result)
+
+    if validation["status"] == "critical":
+        print("=" * 60)
+        print("  TOOLCHAIN VALIDATION FAILED")
+        print("=" * 60)
+        print()
+        print("  Critical commands missing:")
+        for cmd in validation["critical"]["missing"]:
+            print(f"    - {cmd}")
+        print()
+        print("  The daemon cannot start without these commands.")
+        print()
+        print("  To install loom-tools:")
+        print("    pip install -e ./loom-tools")
+        print()
+        print("  Or with uv:")
+        print("    uv pip install -e ./loom-tools")
+        print("=" * 60)
+        return False
+
+    if validation["status"] == "degraded":
+        print("TOOLCHAIN WARNING: Optional commands missing")
+        for cmd in validation["optional"]["missing"]:
+            print(f"  - {cmd} (degraded functionality)")
+        print()
+        print("  Daemon will continue with reduced capabilities.")
+
+    print(f"  Toolchain validated in {validation['duration_ms']}ms")
+    return True
+```
+
+**Critical Commands** (daemon cannot start without):
+- `loom-daemon-cleanup` - Cleanup stale artifacts at daemon startup
+- `loom-recover-orphans` - Recover orphaned shepherds after crash
+- `loom-snapshot` - Generate pipeline snapshot for iteration decisions
+
+**Optional Commands** (degraded functionality without):
+- `loom-stuck-detection` - Detect stuck agents
+- `loom-status` - Show daemon status
+- `loom-health-monitor` - Health monitoring
+- `loom-agent-wait` - Wait for agent completion
+- `loom-agent-spawn` - Spawn agent sessions
+
+### Role Validation
+
+Validate role configuration:
 
 ```python
 def validate_at_startup():
@@ -331,6 +391,10 @@ def start_daemon(force_mode=False, debug_mode=False):
         return  # Don't start - continuation of previous session detected
     if not check_for_existing_daemon():
         return  # Don't start - another daemon is running
+
+    # 0b. CRITICAL: Validate toolchain before any operations
+    if not validate_toolchain():
+        return  # Don't start - essential tools missing
 
     # 1. Rotate existing state file to preserve session history
     run("./.loom/scripts/rotate-daemon-state.sh")
