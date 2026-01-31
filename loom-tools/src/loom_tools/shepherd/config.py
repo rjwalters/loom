@@ -96,7 +96,7 @@ class ShepherdConfig:
 
     # Rate limiting
     rate_limit_threshold: int = field(
-        default_factory=lambda: _get_env_int("LOOM_RATE_LIMIT_THRESHOLD", 90)
+        default_factory=lambda: _get_env_int("LOOM_RATE_LIMIT_THRESHOLD", 99)
     )
 
     # Worktree marker file name
