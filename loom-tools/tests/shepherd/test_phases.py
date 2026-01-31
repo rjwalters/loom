@@ -760,6 +760,99 @@ tests/test_bar.py ....                                                  [100%]
         assert "12 passed" in result
 
 
+class TestBuilderEnsureDependencies:
+    """Test builder phase dependency installation."""
+
+    def test_installs_when_node_modules_missing(self, tmp_path: Path) -> None:
+        """Should run pnpm install when package.json exists but node_modules is missing."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=completed,
+        ) as mock_run:
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is True
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert call_args[0][0] == ["pnpm", "install", "--frozen-lockfile"]
+        assert call_args[1]["cwd"] == tmp_path
+
+    def test_noop_when_node_modules_exists(self, tmp_path: Path) -> None:
+        """Should be a no-op when node_modules already exists."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+        (tmp_path / "node_modules").mkdir()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is True
+        mock_run.assert_not_called()
+
+    def test_noop_when_no_package_json(self, tmp_path: Path) -> None:
+        """Should be a no-op when no package.json exists (non-JS project)."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is True
+        mock_run.assert_not_called()
+
+    def test_handles_install_failure(self, tmp_path: Path) -> None:
+        """Should return False on install failure without raising."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="", stderr="ERR_PNPM_FROZEN_LOCKFILE_WITH_OUTDATED_LOCKFILE"
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=completed,
+        ):
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is False
+
+    def test_handles_timeout(self, tmp_path: Path) -> None:
+        """Should return False on timeout without raising."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="pnpm install", timeout=120),
+        ):
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is False
+
+    def test_handles_os_error(self, tmp_path: Path) -> None:
+        """Should return False on OSError (pnpm not installed) without raising."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=OSError("pnpm not found"),
+        ):
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is False
+
+
 class TestJudgePhase:
     """Test JudgePhase."""
 
