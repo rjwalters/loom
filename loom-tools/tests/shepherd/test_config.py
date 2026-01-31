@@ -168,7 +168,19 @@ class TestShepherdConfig:
         """Default retry limits should be set."""
         config = ShepherdConfig(issue=42)
         assert config.doctor_max_retries == 3
+        assert config.judge_max_retries == 1
         assert config.stuck_max_retries == 1
+
+    def test_judge_max_retries_env_override(self) -> None:
+        """LOOM_JUDGE_MAX_RETRIES env var should override default."""
+        with patch.dict(os.environ, {"LOOM_JUDGE_MAX_RETRIES": "3"}):
+            config = ShepherdConfig(issue=42)
+            assert config.judge_max_retries == 3
+
+    def test_judge_max_retries_explicit(self) -> None:
+        """judge_max_retries can be explicitly set."""
+        config = ShepherdConfig(issue=42, judge_max_retries=5)
+        assert config.judge_max_retries == 5
 
     def test_worktree_marker_file(self) -> None:
         """Worktree marker file should have default value."""
