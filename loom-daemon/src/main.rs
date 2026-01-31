@@ -422,8 +422,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  📁 .github/        - GitHub workflow templates");
                     println!("  📄 .gitignore      - Updated with Loom patterns");
 
-                    // Print report of what was added vs preserved
-                    if !report.added.is_empty() || !report.preserved.is_empty() {
+                    // Print report of what was added vs preserved vs removed
+                    if !report.added.is_empty()
+                        || !report.preserved.is_empty()
+                        || !report.removed.is_empty()
+                    {
                         println!();
                         if !report.added.is_empty() {
                             println!("Files added ({}):", report.added.len());
@@ -445,6 +448,12 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             println!("\nFiles updated ({}):", report.updated.len());
                             for file in &report.updated {
                                 println!("  ~ {file}");
+                            }
+                        }
+                        if !report.removed.is_empty() {
+                            println!("\nFiles removed ({}):", report.removed.len());
+                            for file in &report.removed {
+                                println!("  - {file}");
                             }
                         }
                         if !report.verification_failures.is_empty() {

@@ -34,6 +34,8 @@ pub struct InitReport {
     pub preserved: Vec<String>,
     /// Files that were updated (existed before, overwritten on reinstall)
     pub updated: Vec<String>,
+    /// Files that were removed (existed in destination but not in source, cleaned on reinstall)
+    pub removed: Vec<String>,
     /// Files that failed post-copy verification (destination doesn't match source)
     pub verification_failures: Vec<String>,
     /// Whether this was a self-installation (Loom source repo)
@@ -402,42 +404,36 @@ pub fn initialize_workspace(
         }
     }
 
-    // Copy roles/ directory - always update default roles, preserve custom roles
+    // Copy roles/ directory
     // - Fresh install: copy all from defaults
-    // - Reinstall: always force-merge (update defaults, preserve custom)
+    // - Reinstall: clean directory first to remove stale files, then copy fresh
     //
-    // This ensures role updates from loom propagate to target repos while
-    // preserving any custom roles the project has added.
+    // On reinstall, the entire managed directory is cleaned before copying.
+    // This ensures files removed from defaults (e.g., scripts ported to Python)
+    // don't linger in the target repo and confuse agents.
     let roles_src = defaults.join("roles");
     let roles_dst = loom_path.join("roles");
     if roles_src.exists() {
         if is_reinstall {
-            // Reinstall: always force-merge to update default roles
-            // Custom roles (files not in defaults) are preserved
-            force_merge_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
-                .map_err(|e| format!("Failed to force-merge roles directory: {e}"))?;
-        } else {
-            // Fresh install: copy all
-            copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
-                .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
+            // Reinstall: clean stale files then copy fresh from defaults
+            clean_managed_dir(&roles_dst, ".loom/roles", &mut report)
+                .map_err(|e| format!("Failed to clean roles directory: {e}"))?;
         }
+        copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
+            .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
     }
 
-    // Copy scripts/ directory - always update default scripts, preserve custom scripts
-    // Same logic as roles
+    // Copy scripts/ directory - same clean-then-copy logic as roles
     let scripts_src = defaults.join("scripts");
     let scripts_dst = loom_path.join("scripts");
     if scripts_src.exists() {
         if is_reinstall {
-            // Reinstall: always force-merge to update default scripts
-            // Custom scripts (files not in defaults) are preserved
-            force_merge_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
-                .map_err(|e| format!("Failed to force-merge scripts directory: {e}"))?;
-        } else {
-            // Fresh install: copy all
-            copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
-                .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
+            // Reinstall: clean stale files then copy fresh from defaults
+            clean_managed_dir(&scripts_dst, ".loom/scripts", &mut report)
+                .map_err(|e| format!("Failed to clean scripts directory: {e}"))?;
         }
+        copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
+            .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
     }
 
     // Verify copied files match their sources
@@ -744,6 +740,36 @@ fn merge_dir_with_report(
             // File doesn't exist - add it
             fs::copy(&src_path, &dst_path)?;
             report.added.push(rel_path);
+        }
+    }
+
+    Ok(())
+}
+
+/// Clean a managed directory by removing all files before re-copying from defaults
+///
+/// Removes all files (and subdirectories) in the destination directory, recording
+/// each removed file in `report.removed`. The directory itself is preserved (it gets
+/// repopulated by the subsequent copy step). This ensures stale files that no longer
+/// exist in defaults are cleaned up on reinstall.
+fn clean_managed_dir(dst: &Path, prefix: &str, report: &mut InitReport) -> io::Result<()> {
+    if !dst.exists() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(dst)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let file_name = entry.file_name();
+        let entry_path = entry.path();
+        let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
+
+        if file_type.is_dir() {
+            clean_managed_dir(&entry_path, &rel_path, report)?;
+            fs::remove_dir(&entry_path)?;
+        } else {
+            fs::remove_file(&entry_path)?;
+            report.removed.push(rel_path);
         }
     }
 
@@ -1557,9 +1583,10 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
-    fn test_roles_always_updated_on_reinstall() {
-        // Roles should always be force-merged on reinstall (without --force flag)
-        // This ensures role updates propagate while custom roles are preserved
+    fn test_roles_cleaned_and_updated_on_reinstall() {
+        // On reinstall, managed directories (roles/, scripts/) are cleaned first
+        // to remove stale files, then fresh defaults are copied in.
+        // Custom files that aren't in defaults are removed (not preserved).
         let temp_dir = TempDir::new().unwrap();
         let workspace = temp_dir.path();
         let defaults = temp_dir.path().join("defaults");
@@ -1580,7 +1607,7 @@ mod tests {
             "old builder content v1",
         )
         .unwrap();
-        fs::write(workspace.join(".loom").join("roles").join("custom-role.md"), "my custom role")
+        fs::write(workspace.join(".loom").join("roles").join("stale-role.md"), "stale role")
             .unwrap();
 
         // Run initialization WITHOUT force flag (simulates normal reinstall)
@@ -1593,7 +1620,7 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
 
-        // Verify: builder.md was UPDATED (default role updated)
+        // Verify: builder.md has new content from defaults
         let builder =
             fs::read_to_string(workspace.join(".loom").join("roles").join("builder.md")).unwrap();
         assert_eq!(builder, "new builder content v2");
@@ -1603,20 +1630,132 @@ mod tests {
             fs::read_to_string(workspace.join(".loom").join("roles").join("judge.md")).unwrap();
         assert_eq!(judge, "new judge content");
 
-        // Verify: custom-role.md was PRESERVED (custom role not in defaults)
-        let custom =
-            fs::read_to_string(workspace.join(".loom").join("roles").join("custom-role.md"))
-                .unwrap();
-        assert_eq!(custom, "my custom role");
+        // Verify: stale-role.md was REMOVED (not in defaults)
+        assert!(
+            !workspace
+                .join(".loom")
+                .join("roles")
+                .join("stale-role.md")
+                .exists(),
+            "Stale role file should have been removed on reinstall"
+        );
 
-        // Verify report reflects the changes
-        assert!(report
-            .updated
-            .contains(&".loom/roles/builder.md".to_string()));
+        // Verify report reflects the removal
+        assert!(
+            report
+                .removed
+                .contains(&".loom/roles/stale-role.md".to_string()),
+            "Report should list stale-role.md as removed, got: {:?}",
+            report.removed
+        );
+
+        // Both files from defaults should be reported as added (directory was cleaned first)
+        assert!(report.added.contains(&".loom/roles/builder.md".to_string()));
         assert!(report.added.contains(&".loom/roles/judge.md".to_string()));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_reinstall_removes_stale_files() {
+        // Verifies that files in destination but not in source are removed on reinstall
+        // This is the core behavior change for issue #1798
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        // Setup git repo
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with scripts (simulates Python port: old shell scripts removed)
+        fs::create_dir_all(defaults.join("scripts")).unwrap();
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("scripts").join("worktree.sh"), "#!/bin/bash\n# kept").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder role").unwrap();
+
+        // Create existing .loom with stale scripts (simulates pre-port state)
+        fs::create_dir_all(workspace.join(".loom").join("scripts")).unwrap();
+        fs::create_dir_all(workspace.join(".loom").join("roles")).unwrap();
+        fs::write(
+            workspace.join(".loom").join("scripts").join("worktree.sh"),
+            "#!/bin/bash\n# old",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .join(".loom")
+                .join("scripts")
+                .join("validate-phase.sh"),
+            "#!/bin/bash\n# ported to python",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .join(".loom")
+                .join("scripts")
+                .join("agent-metrics.sh"),
+            "#!/bin/bash\n# ported to python",
+        )
+        .unwrap();
+        fs::write(workspace.join(".loom").join("roles").join("builder.md"), "old builder").unwrap();
+        fs::write(workspace.join(".loom").join("roles").join("obsolete.md"), "removed role")
+            .unwrap();
+
+        // Run reinstall
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Stale scripts should be removed
+        assert!(
+            !workspace
+                .join(".loom")
+                .join("scripts")
+                .join("validate-phase.sh")
+                .exists(),
+            "validate-phase.sh should have been removed"
+        );
+        assert!(
+            !workspace
+                .join(".loom")
+                .join("scripts")
+                .join("agent-metrics.sh")
+                .exists(),
+            "agent-metrics.sh should have been removed"
+        );
+
+        // Stale role should be removed
+        assert!(
+            !workspace
+                .join(".loom")
+                .join("roles")
+                .join("obsolete.md")
+                .exists(),
+            "obsolete.md should have been removed"
+        );
+
+        // Current files should exist with fresh content
+        let worktree =
+            fs::read_to_string(workspace.join(".loom").join("scripts").join("worktree.sh"))
+                .unwrap();
+        assert_eq!(worktree, "#!/bin/bash\n# kept");
+
+        let builder =
+            fs::read_to_string(workspace.join(".loom").join("roles").join("builder.md")).unwrap();
+        assert_eq!(builder, "builder role");
+
+        // Report should track removals
         assert!(report
-            .preserved
-            .contains(&".loom/roles/custom-role.md".to_string()));
+            .removed
+            .contains(&".loom/scripts/validate-phase.sh".to_string()));
+        assert!(report
+            .removed
+            .contains(&".loom/scripts/agent-metrics.sh".to_string()));
+        assert!(report
+            .removed
+            .contains(&".loom/roles/obsolete.md".to_string()));
     }
 
     #[test]
