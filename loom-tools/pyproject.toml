@@ -21,6 +21,7 @@ loom-clean = "loom_tools.clean:main"
 loom-worktree = "loom_tools.worktree:main"
 loom-recover-orphans = "loom_tools.orphan_recovery:main"
 loom-validate-state = "loom_tools.validate_state:main"
+loom-status = "loom_tools.status:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
