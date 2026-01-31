@@ -2658,6 +2658,7 @@ class TestJudgeFallbackChangesRequested:
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2665,6 +2666,7 @@ class TestJudgeFallbackChangesRequested:
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(mock_context)
 
@@ -2678,6 +2680,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2691,6 +2694,7 @@ class TestJudgeFallbackChangesRequested:
             # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_has_changes_requested_review", return_value=False),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
 
@@ -2771,6 +2775,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2788,6 +2793,7 @@ class TestJudgeFallbackChangesRequested:
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=MagicMock(returncode=1),  # label application fails
             ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
 
@@ -2800,6 +2806,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
+        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
 
         call_order: list[str] = []
 
@@ -2823,6 +2830,7 @@ class TestJudgeFallbackChangesRequested:
             patch.object(
                 judge, "_try_fallback_changes_requested", side_effect=track_rejection
             ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
 
