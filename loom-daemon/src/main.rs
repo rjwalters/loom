@@ -152,10 +152,16 @@ async fn main() -> Result<()> {
 
     let activity_db = Arc::new(Mutex::new(activity_db));
 
-    // Initialize terminal manager
+    // Initialize terminal manager and clean up stale sessions
     let mut tm = TerminalManager::new();
     tm.restore_from_tmux()?;
     log::info!("Restored {} terminals", tm.list_terminals().len());
+
+    match tm.clean_stale_sessions() {
+        Ok(0) => log::debug!("No stale tmux sessions to clean"),
+        Ok(count) => log::info!("Cleaned {count} stale tmux session(s) from previous run"),
+        Err(e) => log::warn!("Failed to clean stale tmux sessions: {e}"),
+    }
 
     let tm = Arc::new(Mutex::new(tm));
 
