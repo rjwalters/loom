@@ -63,6 +63,7 @@ export function Toaster({ children }: { children?: React.ReactNode }) {
             <Toast.Close className="absolute right-2 top-2 rounded-md p-1 text-foreground/50 opacity-0 transition-opacity hover:text-foreground focus:opacity-100 focus:outline-none focus:ring-2 group-hover:opacity-100">
               <span className="sr-only">Close</span>
               <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <title>Close</title>
                 <path
                   strokeLinecap="round"
                   strokeLinejoin="round"

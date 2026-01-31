@@ -45,11 +45,13 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             <div>
-              <label className="text-sm font-medium">Theme</label>
+              <label htmlFor="theme-selector" className="text-sm font-medium">
+                Theme
+              </label>
               <p className="text-sm text-muted-foreground mb-3">
                 Select your preferred color scheme
               </p>
-              <div className="flex gap-2">
+              <div id="theme-selector" className="flex gap-2">
                 <Button
                   variant={theme === "light" ? "default" : "outline"}
                   onClick={() => setTheme("light")}
@@ -85,12 +87,17 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             <div>
-              <label className="text-sm font-medium">App Data Directory</label>
+              <label htmlFor="app-data-dir" className="text-sm font-medium">
+                App Data Directory
+              </label>
               <p className="text-sm text-muted-foreground mb-2">
                 SQLite database and application settings
               </p>
               <div className="flex gap-2">
-                <code className="flex-1 rounded-md bg-muted px-3 py-2 text-sm font-mono overflow-x-auto">
+                <code
+                  id="app-data-dir"
+                  className="flex-1 rounded-md bg-muted px-3 py-2 text-sm font-mono overflow-x-auto"
+                >
                   {appDataDir || "Loading..."}
                 </code>
                 <Button

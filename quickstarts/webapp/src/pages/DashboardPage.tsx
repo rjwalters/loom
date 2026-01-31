@@ -25,6 +25,7 @@ export function DashboardPage() {
               strokeWidth="2"
               className="h-4 w-4 text-muted-foreground"
             >
+              <title>Total projects</title>
               <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
               <circle cx="9" cy="7" r="4" />
               <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
@@ -48,6 +49,7 @@ export function DashboardPage() {
               strokeWidth="2"
               className="h-4 w-4 text-muted-foreground"
             >
+              <title>Active tasks</title>
               <rect width="20" height="14" x="2" y="5" rx="2" />
               <path d="M2 10h20" />
             </svg>
@@ -70,6 +72,7 @@ export function DashboardPage() {
               strokeWidth="2"
               className="h-4 w-4 text-muted-foreground"
             >
+              <title>Completed</title>
               <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
             </svg>
           </CardHeader>
@@ -91,6 +94,7 @@ export function DashboardPage() {
               strokeWidth="2"
               className="h-4 w-4 text-muted-foreground"
             >
+              <title>Uptime</title>
               <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
             </svg>
           </CardHeader>
@@ -114,8 +118,8 @@ export function DashboardPage() {
                 { action: "Deployed to production", time: "4 hours ago" },
                 { action: "Updated database schema", time: "Yesterday" },
                 { action: "Added new team member", time: "2 days ago" },
-              ].map((item, i) => (
-                <div key={i} className="flex items-center">
+              ].map((item) => (
+                <div key={item.action} className="flex items-center">
                   <div className="h-2 w-2 rounded-full bg-primary mr-3" />
                   <div className="flex-1">
                     <p className="text-sm font-medium">{item.action}</p>
@@ -132,16 +136,28 @@ export function DashboardPage() {
             <CardDescription>Common tasks and shortcuts</CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
-            <button className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors">
+            <button
+              type="button"
+              className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors"
+            >
               Create new project
             </button>
-            <button className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors">
+            <button
+              type="button"
+              className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors"
+            >
               Deploy changes
             </button>
-            <button className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors">
+            <button
+              type="button"
+              className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors"
+            >
               View analytics
             </button>
-            <button className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors">
+            <button
+              type="button"
+              className="w-full text-left px-4 py-2 rounded-md hover:bg-accent transition-colors"
+            >
               Manage team
             </button>
           </CardContent>

@@ -23,12 +23,6 @@ interface Project {
   updated_at: string;
 }
 
-interface Session {
-  id: string;
-  user_id: string;
-  expires_at: string;
-}
-
 // Session configuration
 const SESSION_COOKIE_NAME = "loom-session";
 const SESSION_DURATION_MS = 7 * 24 * 60 * 60 * 1000; // 7 days

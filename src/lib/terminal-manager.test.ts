@@ -60,7 +60,6 @@ let nextFitDimensions = { cols: 80, rows: 24 };
 
 vi.mock("@xterm/xterm", () => {
   // Create a proper constructor function that can be called with `new`
-  // biome-ignore lint/complexity/useArrowFunction: Must use function for constructor behavior
   const MockTerminal = function (this: typeof mockTerminalInstance) {
     Object.assign(this, mockTerminalInstance);
     return this;
