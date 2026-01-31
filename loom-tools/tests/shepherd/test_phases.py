@@ -19,6 +19,7 @@ from loom_tools.shepherd.phases import (
     CuratorPhase,
     JudgePhase,
     MergePhase,
+    PhaseResult,
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import _print_heartbeat, _read_heartbeats
@@ -1126,6 +1127,248 @@ tests/test_bar.py ....                                                  [100%]
         result = builder._parse_test_summary(output)
         assert result is not None
         assert "12 passed" in result
+
+
+class TestBuilderRunTestFailureIntegration:
+    """Test that builder run() preserves worktree on test failure."""
+
+    def test_run_calls_preserve_on_test_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should call _preserve_on_test_failure instead of _cleanup_on_failure."""
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.return_value = False
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        test_failure_result = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed (pnpm test, exit code 1)",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        with (
+            patch.object(builder, "_is_rate_limited", return_value=False),
+            patch.object(builder, "_run_quality_validation"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_run_test_verification", return_value=test_failure_result
+            ),
+            patch.object(builder, "_preserve_on_test_failure") as mock_preserve,
+            patch.object(builder, "_cleanup_on_failure") as mock_cleanup,
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("test_failure") is True
+        mock_preserve.assert_called_once()
+        mock_cleanup.assert_not_called()
+
+
+class TestBuilderPreserveOnTestFailure:
+    """Test builder phase worktree preservation on test failure."""
+
+    def test_preserve_pushes_branch_and_labels_needs_fix(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should push branch, label needs-fix, and add comment on test failure."""
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        mock_context.repo_root = Path("/fake/repo")
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        worktree_mock.__str__ = lambda self: "/fake/repo/.loom/worktrees/issue-42"
+        mock_context.worktree_path = worktree_mock
+
+        test_result = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed (pnpm test, exit code 1)",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        ) as mock_run:
+            builder._preserve_on_test_failure(mock_context, test_result)
+
+        # Should have called push, label remove, label add, and comment
+        calls = mock_run.call_args_list
+        # git push call
+        push_calls = [c for c in calls if "push" in str(c)]
+        assert len(push_calls) >= 1
+
+        # gh issue comment call
+        comment_calls = [c for c in calls if "comment" in str(c)]
+        assert len(comment_calls) >= 1
+
+        # Should have called remove_issue_label and add_issue_label via labels module
+        # (Those are patched separately in the mock_context)
+
+        # Report milestone should be called with blocked reason
+        mock_context.report_milestone.assert_called()
+
+    def test_preserve_keeps_worktree_marker(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should NOT remove the worktree marker (preserving the worktree)."""
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        mock_context.repo_root = Path("/fake/repo")
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        test_result = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr=""
+                ),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.remove_issue_label",
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.add_issue_label",
+            ),
+        ):
+            builder._preserve_on_test_failure(mock_context, test_result)
+
+        # _remove_worktree_marker should NOT have been called
+        # The marker protects the worktree from premature cleanup
+
+    def test_test_failure_result_includes_flag(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Test verification failure result should include test_failure flag."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/foo.test.ts\nTests  2 failed, 3 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("test_failure") is True
+
+    def test_test_timeout_result_includes_flag(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Test verification timeout result should include test_failure flag."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("test_failure") is True
+
+
+class TestBuilderPushBranch:
+    """Test builder phase branch pushing."""
+
+    def test_push_branch_success(self, mock_context: MagicMock) -> None:
+        """Should push branch to remote and return True."""
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        worktree_mock.__str__ = lambda self: "/fake/repo/.loom/worktrees/issue-42"
+        mock_context.worktree_path = worktree_mock
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        ):
+            result = builder._push_branch(mock_context)
+
+        assert result is True
+
+    def test_push_branch_failure(self, mock_context: MagicMock) -> None:
+        """Should return False when push fails."""
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        worktree_mock.__str__ = lambda self: "/fake/repo/.loom/worktrees/issue-42"
+        mock_context.worktree_path = worktree_mock
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=1, stdout="", stderr="error: failed to push"
+            ),
+        ):
+            result = builder._push_branch(mock_context)
+
+        assert result is False
+
+    def test_push_branch_no_worktree(self, mock_context: MagicMock) -> None:
+        """Should return False when worktree doesn't exist."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+
+        result = builder._push_branch(mock_context)
+        assert result is False
 
 
 class TestBuilderBaselineTests:
