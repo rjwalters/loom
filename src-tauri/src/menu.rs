@@ -165,6 +165,7 @@ pub fn build_menu<R: tauri::Runtime>(
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 pub fn handle_menu_event<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     event: tauri::menu::MenuEvent,

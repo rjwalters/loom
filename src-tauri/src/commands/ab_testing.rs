@@ -10,7 +10,6 @@
 
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::Path;
 
 // ============================================================================
@@ -18,6 +17,7 @@ use std::path::Path;
 // ============================================================================
 
 /// Experiment status
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExperimentStatus {
@@ -50,6 +50,7 @@ impl std::fmt::Display for ExperimentStatus {
 }
 
 /// Target metric for optimization
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TargetMetric {
@@ -79,6 +80,7 @@ impl std::fmt::Display for TargetMetric {
 }
 
 /// Direction of improvement
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TargetDirection {
@@ -307,27 +309,28 @@ fn chi_square_test(successes: &[i32], totals: &[i32]) -> (f64, f64) {
         return (0.0, 1.0);
     }
 
-    let expected_rate = total_success as f64 / total_n as f64;
+    let expected_rate = f64::from(total_success) / f64::from(total_n);
     let mut chi_sq = 0.0;
 
     for (i, &n) in totals.iter().enumerate() {
         if n > 0 {
-            let expected_success = n as f64 * expected_rate;
-            let expected_failure = n as f64 * (1.0 - expected_rate);
+            let expected_success = f64::from(n) * expected_rate;
+            let expected_failure = f64::from(n) * (1.0 - expected_rate);
 
             if expected_success > 0.0 {
-                let diff = successes[i] as f64 - expected_success;
+                let diff = f64::from(successes[i]) - expected_success;
                 chi_sq += (diff * diff) / expected_success;
             }
             if expected_failure > 0.0 {
                 let failures = n - successes[i];
-                let diff = failures as f64 - expected_failure;
+                let diff = f64::from(failures) - expected_failure;
                 chi_sq += (diff * diff) / expected_failure;
             }
         }
     }
 
     // Degrees of freedom = (rows - 1) = 1 for 2x2 contingency
+    #[allow(clippy::cast_precision_loss)]
     let df = (successes.len() - 1) as f64;
     let p_value = chi_square_p_value(chi_sq, df);
 
@@ -354,12 +357,12 @@ fn normal_cdf(x: f64) -> f64 {
 
 /// Error function approximation
 fn erf(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
+    let a1 = 0.254_829_592;
+    let a2 = -0.284_496_736;
+    let a3 = 1.421_413_741;
+    let a4 = -1.453_152_027;
+    let a5 = 1.061_405_429;
+    let p = 0.327_591_1;
 
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs();
@@ -375,8 +378,8 @@ fn t_test(means: &[f64], std_devs: &[f64], sizes: &[i32]) -> (f64, f64) {
         return (0.0, 1.0);
     }
 
-    let n1 = sizes[0] as f64;
-    let n2 = sizes[1] as f64;
+    let n1 = f64::from(sizes[0]);
+    let n2 = f64::from(sizes[1]);
 
     if n1 < 2.0 || n2 < 2.0 {
         return (0.0, 1.0);
@@ -395,7 +398,7 @@ fn t_test(means: &[f64], std_devs: &[f64], sizes: &[i32]) -> (f64, f64) {
     let t = mean_diff / pooled_se;
 
     // Welch-Satterthwaite degrees of freedom
-    let df = ((var1 / n1 + var2 / n2).powi(2))
+    let _df = ((var1 / n1 + var2 / n2).powi(2))
         / ((var1 / n1).powi(2) / (n1 - 1.0) + (var2 / n2).powi(2) / (n2 - 1.0));
 
     // Approximate p-value using normal distribution for large samples
@@ -406,9 +409,9 @@ fn t_test(means: &[f64], std_devs: &[f64], sizes: &[i32]) -> (f64, f64) {
 
 /// Calculate Cohen's d effect size
 fn cohens_d(mean1: f64, mean2: f64, std1: f64, std2: f64, n1: i32, n2: i32) -> f64 {
-    let pooled_std = (((n1 - 1) as f64 * std1 * std1 + (n2 - 1) as f64 * std2 * std2)
-        / (n1 + n2 - 2) as f64)
-        .sqrt();
+    let pooled_std = ((f64::from(n1 - 1) * std1 * std1 + f64::from(n2 - 1) * std2 * std2)
+        / f64::from(n1 + n2 - 2))
+    .sqrt();
 
     if pooled_std == 0.0 {
         return 0.0;
@@ -423,9 +426,9 @@ fn proportion_ci(successes: i32, total: i32) -> (f64, f64) {
         return (0.0, 1.0);
     }
 
-    let p = successes as f64 / total as f64;
+    let p = f64::from(successes) / f64::from(total);
     let z = 1.96; // 95% confidence
-    let se = (p * (1.0 - p) / total as f64).sqrt();
+    let se = (p * (1.0 - p) / f64::from(total)).sqrt();
 
     ((p - z * se).max(0.0), (p + z * se).min(1.0))
 }
@@ -436,6 +439,7 @@ fn proportion_ci(successes: i32, total: i32) -> (f64, f64) {
 
 /// Create a new experiment
 #[tauri::command]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn create_experiment(
     workspace_path: &str,
     name: &str,
@@ -472,6 +476,7 @@ pub fn create_experiment(
 
 /// Add a variant to an experiment
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn add_experiment_variant(
     workspace_path: &str,
     experiment_id: i64,
@@ -581,6 +586,7 @@ pub fn cancel_experiment(workspace_path: &str, experiment_id: i64) -> Result<(),
 
 /// Assign a variant to an issue (or get existing assignment)
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn assign_experiment_variant(
     workspace_path: &str,
     experiment_name: &str,
@@ -613,12 +619,12 @@ pub fn assign_experiment_variant(
                 })
             },
         )
-        .map_err(|_| format!("Experiment '{}' not found", experiment_name))?;
+        .map_err(|_| format!("Experiment '{experiment_name}' not found"))?;
 
     if experiment.status != "active" {
         return Err(format!(
-            "Experiment '{}' is not active (status: {})",
-            experiment_name, experiment.status
+            "Experiment '{experiment_name}' is not active (status: {})",
+            experiment.status
         ));
     }
 
@@ -676,7 +682,7 @@ pub fn assign_experiment_variant(
 
     // Weighted random selection
     let total_weight: f64 = variants.iter().map(|v| v.weight).sum();
-    let mut rng_value = rand_simple();
+    let rng_value = rand_simple();
     let mut cumulative = 0.0;
 
     let selected = variants
@@ -700,13 +706,14 @@ pub fn assign_experiment_variant(
 }
 
 /// Simple pseudo-random number generator (0.0 to 1.0)
+#[allow(clippy::unwrap_used)]
 fn rand_simple() -> f64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .subsec_nanos();
-    (nanos as f64 / u32::MAX as f64).fract()
+    (f64::from(nanos) / f64::from(u32::MAX)).fract()
 }
 
 /// Get assignment for an issue
@@ -771,8 +778,7 @@ pub fn record_experiment_result(
         )
         .map_err(|_| {
             format!(
-                "No assignment found for issue {} in experiment '{}'",
-                issue_number, experiment_name
+                "No assignment found for issue {issue_number} in experiment '{experiment_name}'"
             )
         })?;
 
@@ -809,8 +815,7 @@ pub fn record_experiment_result_with_factor(
         )
         .map_err(|_| {
             format!(
-                "No assignment found for issue {} in experiment '{}'",
-                issue_number, experiment_name
+                "No assignment found for issue {issue_number} in experiment '{experiment_name}'"
             )
         })?;
 
@@ -830,6 +835,7 @@ pub fn record_experiment_result_with_factor(
 
 /// Analyze an experiment and calculate statistical results
 #[tauri::command]
+#[allow(clippy::too_many_lines)]
 pub fn analyze_experiment(
     workspace_path: &str,
     experiment_id: i64,
@@ -881,6 +887,7 @@ pub fn analyze_experiment(
         )
         .map_err(|e| format!("Failed to prepare stats query: {e}"))?;
 
+    #[allow(clippy::type_complexity)]
     let stats: Vec<(i64, String, i32, i32, Option<f64>, Option<f64>)> = stmt
         .query_map([experiment_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?))
@@ -899,7 +906,7 @@ pub fn analyze_experiment(
 
     for (id, name, sample_size, successes, avg_metric, std_dev) in &stats {
         let success_rate = if *sample_size > 0 {
-            *successes as f64 / *sample_size as f64
+            f64::from(*successes) / f64::from(*sample_size)
         } else {
             0.0
         };
@@ -969,9 +976,11 @@ pub fn analyze_experiment(
     // Determine winner
     let (winner, winner_variant_id) = if p_value < 0.05 && !variant_stats.is_empty() {
         let best = if experiment.target_metric == "success_rate" {
-            variant_stats
-                .iter()
-                .max_by(|a, b| a.success_rate.partial_cmp(&b.success_rate).unwrap())
+            variant_stats.iter().max_by(|a, b| {
+                a.success_rate
+                    .partial_cmp(&b.success_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
         } else if experiment.target_direction == "higher" {
             variant_stats.iter().max_by(|a, b| {
                 a.avg_metric_value
@@ -986,8 +995,7 @@ pub fn analyze_experiment(
             })
         };
 
-        best.map(|v| (Some(v.variant_name.clone()), Some(v.variant_id)))
-            .unwrap_or((None, None))
+        best.map_or((None, None), |v| (Some(v.variant_name.clone()), Some(v.variant_id)))
     } else {
         (None, None)
     };
@@ -1026,8 +1034,7 @@ pub fn analyze_experiment(
         }
     } else {
         format!(
-            "No significant difference detected (p={:.4}). Consider continuing or concluding as inconclusive.",
-            p_value
+            "No significant difference detected (p={p_value:.4}). Consider continuing or concluding as inconclusive."
         )
     };
 
@@ -1058,7 +1065,7 @@ pub fn analyze_experiment_by_name(
         .query_row("SELECT id FROM experiments WHERE name = ?1", [experiment_name], |row| {
             row.get(0)
         })
-        .map_err(|_| format!("Experiment '{}' not found", experiment_name))?;
+        .map_err(|_| format!("Experiment '{experiment_name}' not found"))?;
 
     analyze_experiment(workspace_path, experiment_id)
 }
@@ -1098,6 +1105,7 @@ pub fn check_experiments_for_conclusion(workspace_path: &str) -> Result<Vec<i64>
 
 /// Get experiments, optionally filtered by status
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_experiments(
     workspace_path: &str,
     status: Option<String>,

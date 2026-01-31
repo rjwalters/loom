@@ -1128,6 +1128,7 @@ impl ActivityDb {
         )?;
 
         let (total_cost, request_count, total_input_tokens, total_output_tokens) = result;
+        #[allow(clippy::cast_precision_loss)]
         let avg_cost_per_request = if request_count > 0 {
             total_cost / request_count as f64
         } else {
@@ -1357,6 +1358,7 @@ impl ActivityDb {
             f64::INFINITY
         };
 
+        #[allow(clippy::cast_possible_truncation)]
         let exhaustion_date = if avg_daily_cost > 0.0 && days_remaining.is_finite() {
             Some(period_start + chrono::Duration::days(days_remaining as i64))
         } else {
@@ -1947,6 +1949,11 @@ impl StatsQueries for ActivityDb {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::panic,
+    clippy::unwrap_used,
+    clippy::redundant_closure_for_method_calls
+)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;

@@ -46,7 +46,7 @@ pub struct PredictionResult {
 /// A factor that influenced the prediction
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PredictionFactor {
-    /// Name of the factor (e.g., "prompt_length", "role_history")
+    /// Name of the factor (e.g., "`prompt_length`", "`role_history`")
     pub name: String,
     /// How much this factor contributed to the prediction (-1.0 to 1.0)
     pub contribution: f64,
@@ -239,6 +239,7 @@ fn extract_features(
         "make",
     ];
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let imperative_count = words
         .iter()
         .filter(|w| imperative_verbs.contains(&w.to_lowercase().as_str()))
@@ -257,6 +258,7 @@ fn extract_features(
             || prompt.contains(".json"));
 
     // Count questions
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let question_count = prompt.matches('?').count() as i32;
 
     // Detect intent category
@@ -264,18 +266,22 @@ fn extract_features(
 
     // Get time context
     let now = chrono::Local::now();
+    #[allow(clippy::cast_possible_truncation)]
     let hour_of_day = context
         .and_then(|c| c.get("hour_of_day"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| now.hour() as i64) as i32;
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| i64::from(now.hour())) as i32;
+    #[allow(clippy::cast_possible_truncation)]
     let day_of_week = context
         .and_then(|c| c.get("day_of_week"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or_else(|| now.weekday().num_days_from_sunday() as i64)
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_else(|| i64::from(now.weekday().num_days_from_sunday()))
         as i32;
 
     PromptFeatures {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         length: prompt.len() as i32,
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         word_count: words.len() as i32,
         has_code_block,
         has_specific_file_refs: has_file_refs,
@@ -375,12 +381,12 @@ fn sigmoid(x: f64) -> f64 {
 /// Calculate prediction using logistic regression
 fn calculate_prediction(features: &PromptFeatures, coefficients: &ModelCoefficients) -> f64 {
     // Normalize features
-    let length_norm = (features.length as f64).min(5000.0) / 5000.0;
-    let word_count_norm = (features.word_count as f64).min(500.0) / 500.0;
-    let question_count_norm = (features.question_count as f64).min(10.0) / 10.0;
-    let imperative_norm = (features.imperative_verb_count as f64).min(10.0) / 10.0;
-    let hour_norm = (features.hour_of_day as f64 - 12.0) / 12.0; // Center around noon
-    let day_norm = (features.day_of_week as f64 - 3.0) / 3.0; // Center around Wednesday
+    let length_norm = f64::from(features.length).min(5000.0) / 5000.0;
+    let word_count_norm = f64::from(features.word_count).min(500.0) / 500.0;
+    let question_count_norm = f64::from(features.question_count).min(10.0) / 10.0;
+    let imperative_norm = f64::from(features.imperative_verb_count).min(10.0) / 10.0;
+    let hour_norm = (f64::from(features.hour_of_day) - 12.0) / 12.0; // Center around noon
+    let day_norm = (f64::from(features.day_of_week) - 3.0) / 3.0; // Center around Wednesday
 
     // Calculate linear combination
     let z = coefficients.intercept
@@ -409,7 +415,7 @@ fn calculate_confidence_interval(probability: f64, sample_size: i32) -> (f64, f6
         return (0.1, 0.9);
     }
 
-    let n = sample_size as f64;
+    let n = f64::from(sample_size);
     let z = 1.96; // 95% confidence level
     let p = probability;
 
@@ -489,7 +495,7 @@ fn build_key_factors(
     let mut factors = Vec::new();
 
     // Role history
-    if features.role_avg_success_rate != 0.5 {
+    if (features.role_avg_success_rate - 0.5).abs() > f64::EPSILON {
         let contribution =
             (features.role_avg_success_rate - 0.5) * coefficients.role_success_rate_coef;
         factors.push(PredictionFactor {
@@ -550,7 +556,7 @@ fn build_key_factors(
         factors.push(PredictionFactor {
             name: "question_count".to_string(),
             contribution: coefficients.question_count_coef
-                * (features.question_count as f64 / 10.0),
+                * (f64::from(features.question_count) / 10.0),
             direction: "negative".to_string(),
             explanation: "Multiple questions may indicate unclear requirements".to_string(),
         });
@@ -561,13 +567,14 @@ fn build_key_factors(
         factors.push(PredictionFactor {
             name: "intent_clarity".to_string(),
             contribution: coefficients.imperative_verb_coef
-                * (features.imperative_verb_count as f64 / 10.0),
+                * (f64::from(features.imperative_verb_count) / 10.0),
             direction: "positive".to_string(),
             explanation: "Clear action verbs help define the task".to_string(),
         });
     }
 
     // Sort by absolute contribution
+    #[allow(clippy::unwrap_used)]
     factors.sort_by(|a, b| {
         b.contribution
             .abs()
@@ -585,6 +592,7 @@ fn build_key_factors(
 
 /// Predict success likelihood for a prompt
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn predict_prompt_success(
     workspace_path: String,
     request: PredictionRequest,
@@ -634,8 +642,7 @@ pub fn predict_prompt_success(
     // Add warning if applicable
     let warning = if sample_size < 50 {
         Some(format!(
-            "Prediction based on limited data ({} samples). Accuracy may improve with more usage.",
-            sample_size
+            "Prediction based on limited data ({sample_size} samples). Accuracy may improve with more usage.",
         ))
     } else {
         None
@@ -661,6 +668,7 @@ pub fn predict_prompt_success(
 
 /// Train or retrain the prediction model
 #[tauri::command]
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, String> {
     let conn =
         open_prediction_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
@@ -697,6 +705,7 @@ pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, 
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("Failed to collect data: {e}"))?;
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let samples_used = training_data.len() as i32;
 
     if samples_used < 10 {
@@ -738,9 +747,9 @@ pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, 
             let role_rate = *role_rates.get(role).unwrap_or(&0.5);
 
             // Normalize features
-            let length_norm = (*length as f64).min(5000.0) / 5000.0;
-            let hour_norm = (*hour as f64 - 12.0) / 12.0;
-            let day_norm = (*day as f64 - 3.0) / 3.0;
+            let length_norm = f64::from(*length).min(5000.0) / 5000.0;
+            let hour_norm = (f64::from(*hour) - 12.0) / 12.0;
+            let day_norm = (f64::from(*day) - 3.0) / 3.0;
 
             // Calculate prediction
             let z = coefficients.intercept
@@ -761,6 +770,7 @@ pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, 
         }
 
         // Update coefficients
+        #[allow(clippy::cast_precision_loss)]
         let n = training_data.len() as f64;
         coefficients.intercept -= learning_rate * gradient.intercept / n;
         coefficients.length_coef -= learning_rate * gradient.length_coef / n;
@@ -777,9 +787,9 @@ pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, 
 
     for (length, hour, day, role, success) in &training_data {
         let role_rate = *role_rates.get(role).unwrap_or(&0.5);
-        let length_norm = (*length as f64).min(5000.0) / 5000.0;
-        let hour_norm = (*hour as f64 - 12.0) / 12.0;
-        let day_norm = (*day as f64 - 3.0) / 3.0;
+        let length_norm = f64::from(*length).min(5000.0) / 5000.0;
+        let hour_norm = (f64::from(*hour) - 12.0) / 12.0;
+        let day_norm = (f64::from(*day) - 3.0) / 3.0;
 
         let z = coefficients.intercept
             + coefficients.length_coef * length_norm
@@ -803,14 +813,14 @@ pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, 
         }
     }
 
-    let accuracy = correct as f64 / samples_used as f64;
+    let accuracy = f64::from(correct) / f64::from(samples_used);
     let precision = if true_positives + false_positives > 0 {
-        true_positives as f64 / (true_positives + false_positives) as f64
+        f64::from(true_positives) / f64::from(true_positives + false_positives)
     } else {
         0.0
     };
     let recall = if true_positives + false_negatives > 0 {
-        true_positives as f64 / (true_positives + false_negatives) as f64
+        f64::from(true_positives) / f64::from(true_positives + false_negatives)
     } else {
         0.0
     };
@@ -859,6 +869,7 @@ pub fn train_prediction_model(workspace_path: String) -> Result<TrainingResult, 
 
 /// Get statistics about the prediction model
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn get_prediction_model_stats(workspace_path: String) -> Result<ModelStats, String> {
     let conn =
         open_prediction_db(&workspace_path).map_err(|e| format!("Failed to open database: {e}"))?;
@@ -925,6 +936,7 @@ pub fn get_prediction_model_stats(workspace_path: String) -> Result<ModelStats, 
 
 /// Record actual outcome for a previous prediction (for model improvement)
 #[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
 pub fn record_prediction_outcome(
     workspace_path: String,
     prompt_text: String,
@@ -956,7 +968,7 @@ pub fn record_prediction_outcome(
             "UPDATE prediction_history
              SET actual_outcome = ?1, was_correct = ?2
              WHERE id = ?3",
-            params![actual_outcome, was_correct as i32, id],
+            params![actual_outcome, i32::from(was_correct), id],
         )
         .map_err(|e| format!("Failed to record outcome: {e}"))?;
     }

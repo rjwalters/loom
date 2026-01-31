@@ -2,6 +2,7 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::panic)]
 #![allow(clippy::manual_assert)]
+#![allow(clippy::too_many_lines)]
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::fs;
