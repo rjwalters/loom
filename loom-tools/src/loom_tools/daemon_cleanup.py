@@ -167,13 +167,14 @@ def _run_loom_clean(
     dry_run: bool = False,
     grace_period: int | None = None,
 ) -> None:
-    """Run ``loom-clean --safe --worktrees-only``."""
+    """Run ``loom-clean --safe --worktrees-only --force``."""
     loom_clean = _find_loom_clean(repo_root)
     if loom_clean is None:
         log_warning("loom-clean not found (install loom-tools)")
         return
 
-    cmd = [loom_clean, "--safe", "--worktrees-only"]
+    # Always include --force for non-interactive daemon operation
+    cmd = [loom_clean, "--safe", "--worktrees-only", "--force"]
     if dry_run:
         cmd.append("--dry-run")
     if grace_period is not None:
