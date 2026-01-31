@@ -368,7 +368,9 @@ class BuilderPhase:
             try:
                 pkg = json.loads((worktree / "package.json").read_text())
                 scripts = pkg.get("scripts", {})
-                # Prefer check:ci > test > check
+                # Prefer check:ci:lite > check:ci > test > check
+                if "check:ci:lite" in scripts:
+                    return (["pnpm", "check:ci:lite"], "pnpm check:ci:lite")
                 if "check:ci" in scripts:
                     return (["pnpm", "check:ci"], "pnpm check:ci")
                 if "test" in scripts:

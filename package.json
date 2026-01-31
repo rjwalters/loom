@@ -48,6 +48,7 @@
     "test:e2e:install": "playwright install --with-deps chromium",
     "check:all": "pnpm lint && pnpm format:rust && pnpm clippy && pnpm check && pnpm build && pnpm test:unit",
     "check:ci": "pnpm lint && pnpm format:rust && pnpm clippy:locked && pnpm check && pnpm build && pnpm test && pnpm test:unit:coverage",
+    "check:ci:lite": "pnpm lint && pnpm format:rust && cargo clippy --workspace --exclude app --all-targets --all-features --locked -- -D warnings && cargo check --workspace --exclude app && cargo test --workspace --exclude app --locked --all-features --no-fail-fast -- --nocapture && pnpm test:unit:coverage",
     "worktree": "./scripts/worktree.sh",
     "worktree:return": "./.loom/scripts/worktree-return.sh",
     "clean": "./clean.sh",
