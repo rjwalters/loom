@@ -56,11 +56,11 @@ Pipeline Check:
 
 ### Verifying Work Generation
 
-Use `daemon-snapshot.sh` to check work generation state:
+Use `loom-tools snapshot` to check work generation state:
 
 ```bash
 # Check if work generation should trigger
-./.loom/scripts/daemon-snapshot.sh --pretty | jq '{
+python3 -m loom_tools.snapshot --pretty | jq '{
   ready: .computed.total_ready,
   needs_work_gen: .computed.needs_work_generation,
   architect_cooldown_ok: .computed.architect_cooldown_ok,

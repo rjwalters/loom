@@ -279,7 +279,7 @@ class TestEdgeCases:
     def test_orphaned_detection_only_counts_working_status(self) -> None:
         """Verify only 'working' status counts for orphan detection like bash.
 
-        Bash (daemon-health.sh line 368):
+        Legacy bash (daemon-health.sh, now removed) used:
         - select(.value.status == "working")
         """
         daemon_state = DaemonState(

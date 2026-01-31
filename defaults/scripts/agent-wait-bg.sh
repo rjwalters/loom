@@ -64,7 +64,7 @@ log_warn() { echo -e "${YELLOW}[$(date '+%H:%M:%S')] ⚠${NC} $*" >&2; }
 DEFAULT_SIGNAL_POLL=5
 
 # Default interval (seconds) for emitting shepherd heartbeats during long waits.
-# Keeps progress files fresh so daemon-snapshot.sh and stuck-detection.sh don't
+# Keeps progress files fresh so the snapshot and stuck-detection systems don't
 # falsely flag actively building shepherds as stale (see issue #1586).
 DEFAULT_HEARTBEAT_INTERVAL=60
 
@@ -962,7 +962,7 @@ main() {
         fi
 
         # Check shepherd progress file for errored status (fast error detection)
-        # When shepherd-loop.sh reports an error milestone, the progress file status
+        # When loom-shepherd reports an error milestone, the progress file status
         # is set to "errored". Detecting this here terminates the session within one
         # poll cycle (~5s) rather than waiting for idle heuristics (issue #1619).
         if [[ -n "$task_id" ]]; then
@@ -1255,8 +1255,8 @@ main() {
 
         # Emit periodic heartbeat to keep shepherd progress file fresh (issue #1586).
         # Without this, long-running phases (builder, doctor) cause the progress file's
-        # last_heartbeat to go stale, triggering false positives in daemon-snapshot.sh
-        # and stuck-detection.sh which use a 120s stale threshold.
+        # last_heartbeat to go stale, triggering false positives in the snapshot
+        # and stuck-detection systems which use a 120s stale threshold.
         if [[ -n "$task_id" ]] && [[ -x "$SCRIPT_DIR/report-milestone.sh" ]]; then
             local now
             now=$(date +%s)

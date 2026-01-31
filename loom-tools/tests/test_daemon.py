@@ -306,7 +306,7 @@ class TestDocumentedDivergences:
         Python CLI uses:
         - --force/-f as primary flag (internal representation)
 
-        The wrapper script (daemon-loop.sh) maps:
+        The wrapper script (loom-daemon-loop) maps:
         - --merge/-m -> --force
 
         This difference is ACCEPTABLE:
@@ -315,7 +315,7 @@ class TestDocumentedDivergences:
         - Internal consistency maintained
         """
         # The wrapper script maps --merge to --force for backward compatibility
-        # This is documented in daemon-loop.sh lines 37-49
+        # This is documented in loom-daemon-loop
         pass
 
     def test_color_output_differs(self) -> None:
@@ -418,7 +418,7 @@ class TestOrchestrationDelegation:
 
         Issue selection (fifo, lifo, priority) is handled by:
         - .loom/roles/loom-iteration.md
-        - daemon-snapshot.sh (for status reporting)
+        - python3 -m loom_tools.snapshot (for status reporting)
 
         The daemon (both bash and Python) just runs the iteration
         and processes the result. It does NOT implement selection logic.

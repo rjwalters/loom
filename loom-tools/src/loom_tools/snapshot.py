@@ -1,6 +1,6 @@
 """Consolidated daemon state snapshot.
 
-Replaces ``daemon-snapshot.sh`` (1,056 lines, 91 jq invocations) with
+Replaces the former ``daemon-snapshot.sh`` (removed in #1745) with
 typed Python objects and ``concurrent.futures`` for parallel GitHub API
 queries.
 
@@ -1210,7 +1210,7 @@ DESCRIPTION:
     Consolidates all daemon state queries into a single JSON output.
     Runs GitHub API queries in parallel for efficiency.
 
-    Python port of daemon-snapshot.sh with identical output schema.
+    Produces the same output schema as the former daemon-snapshot.sh.
 
 ENVIRONMENT VARIABLES:
     LOOM_ISSUE_THRESHOLD     Threshold for work generation (default: 3)

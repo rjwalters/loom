@@ -441,27 +441,27 @@ If setup fails, it's usually due to:
 
 **Cleaning Up Stale Worktrees and Branches**:
 
-Use the `clean.sh` helper script to restore your repository to a clean state:
+Use the `loom-clean` command to restore your repository to a clean state:
 
 ```bash
 # Interactive mode - prompts for confirmation (default)
-./.loom/scripts/clean.sh
+loom-clean
 
 # Preview mode - shows what would be cleaned without making changes
-./.loom/scripts/clean.sh --dry-run
+loom-clean --dry-run
 
 # Non-interactive mode - auto-confirms all prompts (for CI/automation)
-./.loom/scripts/clean.sh --force
+loom-clean --force
 
 # Deep clean - also removes build artifacts (target/, node_modules/)
-./.loom/scripts/clean.sh --deep
+loom-clean --deep
 
 # Combine flags
-./.loom/scripts/clean.sh --deep --force  # Non-interactive deep clean
-./.loom/scripts/clean.sh --deep --dry-run  # Preview deep clean
+loom-clean --deep --force  # Non-interactive deep clean
+loom-clean --deep --dry-run  # Preview deep clean
 ```
 
-**What clean.sh does**:
+**What loom-clean does**:
 - Removes worktrees for closed GitHub issues (prompts per worktree in interactive mode)
 - Deletes local feature branches for closed issues
 - Cleans up Loom tmux sessions
@@ -469,7 +469,7 @@ Use the `clean.sh` helper script to restore your repository to a clean state:
 
 **IMPORTANT**: For **CI pipelines and automation**, always use `--force` flag to prevent hanging on prompts:
 ```bash
-./.loom/scripts/clean.sh --force  # Non-interactive, safe for automation
+loom-clean --force  # Non-interactive, safe for automation
 ```
 
 **Manual cleanup** (if needed):

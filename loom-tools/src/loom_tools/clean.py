@@ -1,9 +1,9 @@
 """Loom unified cleanup - restore repository to clean state.
 
-Consolidates functionality from:
-    - clean.sh (general cleanup with UI polish)
-    - cleanup.sh (build artifacts and worktree cleanup)
-    - safe-worktree-cleanup.sh (safe cleanup with grace period and merge checks)
+Consolidates functionality formerly in:
+    - clean.sh (removed in #1745)
+    - cleanup.sh (removed in #1745)
+    - safe-worktree-cleanup.sh (removed in #1745)
 
 Exit codes:
     0 - Success

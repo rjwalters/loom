@@ -12,7 +12,7 @@
 #
 # Analyzes the recent_failures array in daemon-state.json to detect when N consecutive
 # shepherd failures share the same error_class. When detected, sets the systematic_failure
-# field in daemon-state.json which causes daemon-snapshot.sh to pause shepherd spawning.
+# field in daemon-state.json which causes the snapshot system to pause shepherd spawning.
 #
 # Auto-clear mechanism:
 #   After a cooldown period (default 30min), the daemon can spawn a probe shepherd.

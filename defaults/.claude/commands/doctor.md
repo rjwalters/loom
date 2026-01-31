@@ -251,7 +251,7 @@ CI Failures Found:
    - button.test.ts: outdated snapshot
    - ...
 2. Shellcheck (3 warnings)
-   - scripts/clean.sh:45 - SC2086 word splitting
+   - scripts/worktree.sh:45 - SC2086 word splitting
    - scripts/worktree.sh:12 - SC2164 cd without || exit
 3. TypeScript Type Check (1 error)
    - src/hooks/useTerminal.ts:34 - Type 'null' not assignable
@@ -303,7 +303,7 @@ $ gh run view 12345 --log-failed | tail -50
 
 # 3. Document the plan
 # - 21 test failures: need to update mocks after useConfig refactor
-# - 3 shellcheck warnings: quote variables in clean.sh
+# - 3 shellcheck warnings: quote variables in scripts
 # - npm audit: update lodash to fix CVE-2024-xxxxx
 
 # 4. Fix ALL issues

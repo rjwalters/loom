@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Safe worktree cleanup - WRAPPER (backwards compatibility)
 #
-# This script is a thin wrapper around defaults/scripts/clean.sh for backwards compatibility.
-# The unified clean.sh now handles all cleanup functionality with --safe mode.
+# This script is a thin wrapper around loom-clean for backwards compatibility.
+# The loom-clean Python tool handles all cleanup functionality with --safe mode.
 #
-# DEPRECATED: Use defaults/scripts/clean.sh --safe instead:
-#   ./defaults/scripts/clean.sh --safe              # Equivalent to safe-worktree-cleanup.sh
-#   ./defaults/scripts/clean.sh --safe --force      # Equivalent to safe-worktree-cleanup.sh --force
+# DEPRECATED: Use loom-clean --safe instead:
+#   loom-clean --safe              # Equivalent to safe-worktree-cleanup.sh
+#   loom-clean --safe --force      # Equivalent to safe-worktree-cleanup.sh --force
 #
 # What this wrapper does:
-#   Maps safe-worktree-cleanup.sh arguments to clean.sh --safe equivalents
+#   Maps safe-worktree-cleanup.sh arguments to loom-clean --safe equivalents
 #   Always includes --safe and --worktrees-only
 
 set -euo pipefail
@@ -17,6 +17,7 @@ set -euo pipefail
 # Find script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOOM_TOOLS="$PROJECT_ROOT/loom-tools"
 
 # Map arguments - safe-worktree-cleanup.sh is worktrees-only with safe mode
 ARGS=("--safe" "--worktrees-only")
@@ -36,8 +37,8 @@ for arg in "$@"; do
       cat <<EOF
 Safe worktree cleanup - DEPRECATED WRAPPER
 
-This script is a thin wrapper around clean.sh --safe for backwards compatibility.
-Please use defaults/scripts/clean.sh --safe directly for more options.
+This script is a thin wrapper around loom-clean --safe for backwards compatibility.
+Please use loom-clean --safe directly for more options.
 
 Usage: ./scripts/safe-worktree-cleanup.sh [options]
 
@@ -60,10 +61,10 @@ Cleanup Criteria:
   3. Grace period has passed since merge
   4. No uncommitted changes exist (unless --force)
 
-Equivalent clean.sh commands:
-  ./scripts/safe-worktree-cleanup.sh             ->  ./defaults/scripts/clean.sh --safe --worktrees-only
-  ./scripts/safe-worktree-cleanup.sh --force     ->  ./defaults/scripts/clean.sh --safe --worktrees-only --force
-  ./scripts/safe-worktree-cleanup.sh --dry-run   ->  ./defaults/scripts/clean.sh --safe --worktrees-only --dry-run
+Equivalent loom-clean commands:
+  ./scripts/safe-worktree-cleanup.sh             ->  loom-clean --safe --worktrees-only
+  ./scripts/safe-worktree-cleanup.sh --force     ->  loom-clean --safe --worktrees-only --force
+  ./scripts/safe-worktree-cleanup.sh --dry-run   ->  loom-clean --safe --worktrees-only --dry-run
 EOF
       exit 0
       ;;
@@ -73,5 +74,13 @@ EOF
   esac
 done
 
-# Call the unified clean.sh from defaults/scripts/
-exec "$PROJECT_ROOT/defaults/scripts/clean.sh" "${ARGS[@]}"
+# Route to loom-clean (Python replacement)
+if [[ -x "$LOOM_TOOLS/.venv/bin/loom-clean" ]]; then
+  exec "$LOOM_TOOLS/.venv/bin/loom-clean" "${ARGS[@]}"
+elif command -v loom-clean &>/dev/null; then
+  exec loom-clean "${ARGS[@]}"
+else
+  echo "Error: loom-clean not available. Install loom-tools:" >&2
+  echo "  cd loom-tools && pip install -e ." >&2
+  exit 1
+fi

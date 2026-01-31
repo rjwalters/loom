@@ -13,7 +13,7 @@ Arguments provided: `{{ARGUMENTS}}`
 ```
 IF arguments contain "health":
     -> Execute HEALTH CHECK (immediate command)
-    -> Run: ./.loom/scripts/daemon-health.sh
+    -> Run: loom-daemon-diagnostic
     -> Display formatted health report and EXIT
     -> DO NOT start daemon loop
 
@@ -62,7 +62,7 @@ ELSE (no "iterate" in arguments, e.g., "/loom" or "/loom --merge"):
 
 Before proceeding, check the arguments: `{{ARGUMENTS}}`
 
-- Contains "health"? -> Run `./.loom/scripts/daemon-health.sh` and report results, then EXIT
+- Contains "health"? -> Run `loom-daemon-diagnostic` and report results, then EXIT
 - Contains "iterate"? -> Read `.claude/commands/loom-iteration.md` and execute iteration mode
 - No "iterate"? -> Read `.claude/commands/loom-parent.md` and execute parent loop mode
 
