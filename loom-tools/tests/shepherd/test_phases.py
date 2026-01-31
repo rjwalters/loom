@@ -520,6 +520,244 @@ Modify `builder.py` to add validation.
         mock_context.report_milestone.assert_not_called()
 
 
+class TestBuilderTestVerification:
+    """Test builder phase test verification."""
+
+    def test_detect_test_command_pnpm_check_ci(self, tmp_path: Path) -> None:
+        """Should detect pnpm check:ci when available in package.json."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"check:ci": "pnpm lint && pnpm test", "test": "vitest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result == (["pnpm", "check:ci"], "pnpm check:ci")
+
+    def test_detect_test_command_pnpm_test(self, tmp_path: Path) -> None:
+        """Should detect pnpm test when no check:ci available."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"test": "vitest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result == (["pnpm", "test"], "pnpm test")
+
+    def test_detect_test_command_pnpm_check(self, tmp_path: Path) -> None:
+        """Should detect pnpm check when no test or check:ci available."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"check": "cargo check"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result == (["pnpm", "check"], "pnpm check")
+
+    def test_detect_test_command_cargo(self, tmp_path: Path) -> None:
+        """Should detect cargo test for Rust projects."""
+        builder = BuilderPhase()
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result == (["cargo", "test", "--workspace"], "cargo test --workspace")
+
+    def test_detect_test_command_pytest(self, tmp_path: Path) -> None:
+        """Should detect pytest for Python projects."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result == (["python", "-m", "pytest"], "pytest")
+
+    def test_detect_test_command_prefers_pnpm_over_cargo(self, tmp_path: Path) -> None:
+        """Should prefer package.json over Cargo.toml when both exist."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"test": "vitest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result[1] == "pnpm test"
+
+    def test_detect_test_command_none(self, tmp_path: Path) -> None:
+        """Should return None when no test runner detected."""
+        builder = BuilderPhase()
+        result = builder._detect_test_command(tmp_path)
+        assert result is None
+
+    def test_detect_test_command_empty_package_json_scripts(self, tmp_path: Path) -> None:
+        """Should return None when package.json has no test scripts."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"build": "tsc"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is None
+
+    def test_detect_test_command_invalid_package_json(self, tmp_path: Path) -> None:
+        """Should handle invalid package.json gracefully."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text("not json")
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is None
+
+    def test_parse_test_summary_vitest(self) -> None:
+        """Should extract vitest test summary."""
+        builder = BuilderPhase()
+        output = """
+ ✓ src/foo.test.ts (3 tests)
+ ✓ src/bar.test.ts (5 tests)
+
+ Tests  8 passed (2 suites)
+ Duration  0.42s
+"""
+        result = builder._parse_test_summary(output)
+        assert result is not None
+        assert "8 passed" in result
+
+    def test_parse_test_summary_cargo(self) -> None:
+        """Should extract cargo test summary."""
+        builder = BuilderPhase()
+        output = """
+running 17 tests
+...
+test result: ok. 17 passed; 0 failed; 0 ignored
+"""
+        result = builder._parse_test_summary(output)
+        assert result is not None
+        assert "17 passed" in result
+        assert result.startswith("test result:")
+
+    def test_parse_test_summary_none(self) -> None:
+        """Should return None for unrecognized output."""
+        builder = BuilderPhase()
+        result = builder._parse_test_summary("Build complete.\nDone.")
+        assert result is None
+
+    def test_run_test_verification_passes(self, mock_context: MagicMock) -> None:
+        """Should return None when tests pass."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Tests  5 passed\nDuration 0.1s\n",
+            stderr="",
+        )
+        with (
+            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
+            patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is None
+        # Should have reported milestones
+        assert mock_context.report_milestone.call_count >= 1
+
+    def test_run_test_verification_fails(self, mock_context: MagicMock) -> None:
+        """Should return FAILED result when tests fail."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="FAIL src/foo.test.ts\nTests  2 failed, 3 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
+            patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "test verification failed" in result.message
+        assert "pnpm test" in result.message
+
+    def test_run_test_verification_timeout(self, mock_context: MagicMock) -> None:
+        """Should return FAILED result on timeout."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "timed out" in result.message
+
+    def test_run_test_verification_no_worktree(self, mock_context: MagicMock) -> None:
+        """Should return None when no worktree path."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+
+        result = builder._run_test_verification(mock_context)
+        assert result is None
+
+    def test_run_test_verification_no_test_runner(self, mock_context: MagicMock) -> None:
+        """Should return None when no test runner detected."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with patch.object(builder, "_detect_test_command", return_value=None):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is None
+
+    def test_run_test_verification_os_error(self, mock_context: MagicMock) -> None:
+        """Should return None on OSError (test runner not installed)."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(builder, "_detect_test_command", return_value=(["pnpm", "test"], "pnpm test")),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=OSError("pnpm not found"),
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is None
+
+    def test_parse_test_summary_pytest(self) -> None:
+        """Should extract pytest summary."""
+        builder = BuilderPhase()
+        output = """
+============================= test session starts ==============================
+collected 12 items
+
+tests/test_foo.py ........                                              [ 66%]
+tests/test_bar.py ....                                                  [100%]
+
+============================== 12 passed in 0.03s ==============================
+"""
+        result = builder._parse_test_summary(output)
+        assert result is not None
+        assert "12 passed" in result
+
+
 class TestJudgePhase:
     """Test JudgePhase."""
 
