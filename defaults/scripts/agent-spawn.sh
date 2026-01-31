@@ -13,4 +13,9 @@
 
 set -euo pipefail
 
-exec loom-agent-spawn "$@"
+# Try the installed Python entry point first, fall back to module invocation
+if command -v loom-agent-spawn >/dev/null 2>&1; then
+    exec loom-agent-spawn "$@"
+else
+    exec python3 -m loom_tools.agent_spawn "$@"
+fi

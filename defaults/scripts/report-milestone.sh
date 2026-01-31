@@ -13,4 +13,9 @@
 
 set -euo pipefail
 
-exec loom-milestone "$@"
+# Try the installed Python entry point first, fall back to module invocation
+if command -v loom-milestone >/dev/null 2>&1; then
+    exec loom-milestone "$@"
+else
+    exec python3 -m loom_tools.milestones "$@"
+fi

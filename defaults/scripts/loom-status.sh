@@ -12,4 +12,9 @@
 
 set -euo pipefail
 
-exec loom-status "$@"
+# Try the installed Python entry point first, fall back to module invocation
+if command -v loom-status >/dev/null 2>&1; then
+    exec loom-status "$@"
+else
+    exec python3 -m loom_tools.status "$@"
+fi
