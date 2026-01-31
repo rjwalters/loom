@@ -75,15 +75,15 @@ class TestRateLimitError:
 
     def test_stores_usage_and_threshold(self) -> None:
         """Error should store usage and threshold values."""
-        err = RateLimitError(95.5, 90.0)
-        assert err.usage_percent == 95.5
-        assert err.threshold == 90.0
+        err = RateLimitError(99.5, 99.0)
+        assert err.usage_percent == 99.5
+        assert err.threshold == 99.0
 
     def test_formats_message(self) -> None:
         """Error message should include usage percentage."""
-        err = RateLimitError(95.5, 90.0)
-        assert "95.5%" in str(err)
-        assert "90.0%" in str(err)
+        err = RateLimitError(99.5, 99.0)
+        assert "99.5%" in str(err)
+        assert "99.0%" in str(err)
 
 
 class TestIssueNotFoundError:
