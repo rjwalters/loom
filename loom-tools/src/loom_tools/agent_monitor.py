@@ -645,41 +645,24 @@ class AgentMonitor:
         return result.satisfied
 
     def _check_phase_contract(self, check_only: bool = False) -> ContractCheckResult:
-        """Check phase contract via validate-phase.sh."""
+        """Check phase contract via the Python validate_phase module."""
         if not self.config.phase or not self.config.issue:
             return ContractCheckResult(satisfied=False)
 
-        script_path = self.repo_root / ".loom" / "scripts" / "validate-phase.sh"
-        if not script_path.exists():
-            return ContractCheckResult(satisfied=False)
-
-        args = [
-            str(script_path),
-            self.config.phase,
-            str(self.config.issue),
-        ]
-        if self.config.worktree:
-            args.extend(["--worktree", self.config.worktree])
-        if self.config.pr_number:
-            args.extend(["--pr", str(self.config.pr_number)])
-        if check_only:
-            args.append("--check-only")
-        args.append("--json")
-
         try:
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout)
-                return ContractCheckResult.from_json(data)
-        except Exception:
-            pass
+            from loom_tools.validate_phase import validate_phase
 
-        return ContractCheckResult(satisfied=False)
+            result = validate_phase(
+                phase=self.config.phase,
+                issue=self.config.issue,
+                repo_root=self.repo_root,
+                worktree=self.config.worktree,
+                pr_number=self.config.pr_number,
+                check_only=check_only,
+            )
+            return ContractCheckResult.from_json(result.to_dict())
+        except Exception:
+            return ContractCheckResult(satisfied=False)
 
     def _get_log_idle_time(self) -> int:
         """Get seconds since log file was last modified."""

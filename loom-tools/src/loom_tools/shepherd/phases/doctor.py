@@ -89,25 +89,21 @@ class DoctorPhase:
         """Validate doctor phase contract.
 
         Doctor must re-request review (loom:review-requested on PR).
-        Uses validate-phase.sh for comprehensive validation.
+        Calls the Python validate_phase module directly.
         """
         if ctx.pr_number is None:
             return False
 
-        args = [
-            "doctor",
-            str(ctx.config.issue),
-            "--pr",
-            str(ctx.pr_number),
-            "--task-id",
-            ctx.config.task_id,
-        ]
+        from loom_tools.validate_phase import validate_phase
 
-        try:
-            ctx.run_script("validate-phase.sh", args, check=True)
-            return True
-        except subprocess.CalledProcessError:
-            return False
+        result = validate_phase(
+            phase="doctor",
+            issue=ctx.config.issue,
+            repo_root=ctx.repo_root,
+            pr_number=ctx.pr_number,
+            task_id=ctx.config.task_id,
+        )
+        return result.satisfied
 
     def _mark_issue_blocked(
         self, ctx: ShepherdContext, error_class: str, details: str

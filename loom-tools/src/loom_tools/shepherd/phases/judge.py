@@ -186,25 +186,21 @@ class JudgePhase:
     def validate(self, ctx: ShepherdContext) -> bool:
         """Validate judge phase contract.
 
-        Uses validate-phase.sh for comprehensive validation.
+        Calls the Python validate_phase module directly.
         """
         if ctx.pr_number is None:
             return False
 
-        args = [
-            "judge",
-            str(ctx.config.issue),
-            "--pr",
-            str(ctx.pr_number),
-            "--task-id",
-            ctx.config.task_id,
-        ]
+        from loom_tools.validate_phase import validate_phase
 
-        try:
-            ctx.run_script("validate-phase.sh", args, check=True)
-            return True
-        except subprocess.CalledProcessError:
-            return False
+        result = validate_phase(
+            phase="judge",
+            issue=ctx.config.issue,
+            repo_root=ctx.repo_root,
+            pr_number=ctx.pr_number,
+            task_id=ctx.config.task_id,
+        )
+        return result.satisfied
 
     def _try_fallback_approval(self, ctx: ShepherdContext) -> bool:
         """Attempt fallback approval detection in force mode.
