@@ -415,6 +415,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         # ─── PHASE 4/5: Judge/Doctor Loop ─────────────────────────────────
         doctor_attempts = 0
+        judge_retries = 0
         pr_approved = False
 
         # Check for --from merge skip
@@ -441,8 +442,34 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 raise ShutdownSignal(result.message)
 
             if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
-                log_error(result.message)
+                # Judge returned FAILED/STUCK with no label outcome.
+                # Retry the judge phase before giving up (defense-in-depth
+                # for cases where the judge worker silently fails without
+                # submitting a review, leaving no loom:pr or
+                # loom:changes-requested label).
+                if judge_retries < ctx.config.judge_max_retries:
+                    judge_retries += 1
+                    log_warning(
+                        f"Judge phase failed ({result.message}), "
+                        f"retrying ({judge_retries}/{ctx.config.judge_max_retries})"
+                    )
+                    ctx.report_milestone(
+                        "judge_retry",
+                        attempt=judge_retries,
+                        max_retries=ctx.config.judge_max_retries,
+                        reason=result.message,
+                    )
+                    continue
+
+                log_error(
+                    f"Judge phase failed after {judge_retries} "
+                    f"retry attempt(s): {result.message}"
+                )
+                _mark_judge_exhausted(ctx, judge_retries)
                 return 1
+
+            # Judge succeeded — reset retry counter for this loop iteration
+            judge_retries = 0
 
             if result.data.get("approved"):
                 pr_approved = True
@@ -496,7 +523,27 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     status="success",
                 )
             else:
-                log_error(result.message)
+                # Unexpected result — neither approved, changes_requested,
+                # nor FAILED/STUCK. Treat as a judge failure and retry.
+                if judge_retries < ctx.config.judge_max_retries:
+                    judge_retries += 1
+                    log_warning(
+                        f"Judge returned unexpected result ({result.message}), "
+                        f"retrying ({judge_retries}/{ctx.config.judge_max_retries})"
+                    )
+                    ctx.report_milestone(
+                        "judge_retry",
+                        attempt=judge_retries,
+                        max_retries=ctx.config.judge_max_retries,
+                        reason=result.message,
+                    )
+                    continue
+
+                log_error(
+                    f"Judge phase returned unexpected result after {judge_retries} "
+                    f"retry attempt(s): {result.message}"
+                )
+                _mark_judge_exhausted(ctx, judge_retries)
                 return 1
 
         # Print skipped header if Doctor never ran (Judge approved first try)
@@ -690,6 +737,60 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
             str(ctx.config.issue),
             "--body",
             f"**Shepherd blocked**: Doctor could not resolve Judge feedback after {ctx.config.doctor_max_retries} attempts.",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
+    """Mark issue as blocked due to judge retry exhaustion."""
+    import subprocess
+
+    # Atomic transition: loom:building -> loom:blocked
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "edit",
+            str(ctx.config.issue),
+            "--remove-label",
+            "loom:building",
+            "--add-label",
+            "loom:blocked",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    # Record blocked reason and update systematic failure tracking
+    from loom_tools.common.systematic_failure import (
+        detect_systematic_failure,
+        record_blocked_reason,
+    )
+
+    record_blocked_reason(
+        ctx.repo_root,
+        ctx.config.issue,
+        error_class="judge_exhausted",
+        phase="judge",
+        details=f"judge failed after {retries} retry attempt(s)",
+    )
+    detect_systematic_failure(ctx.repo_root)
+
+    # Add comment
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(ctx.config.issue),
+            "--body",
+            f"**Shepherd blocked**: Judge phase failed after {retries} retry attempt(s). "
+            "No approval or changes-requested outcome was produced. "
+            "This may indicate a judge worker failure — see #1908 for related diagnostics.",
         ],
         cwd=ctx.repo_root,
         capture_output=True,

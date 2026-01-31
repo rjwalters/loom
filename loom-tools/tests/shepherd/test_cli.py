@@ -9,7 +9,13 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from loom_tools.shepherd.cli import _create_config, _parse_args, main, orchestrate
+from loom_tools.shepherd.cli import (
+    _create_config,
+    _mark_judge_exhausted,
+    _parse_args,
+    main,
+    orchestrate,
+)
 from loom_tools.shepherd.config import ExecutionMode, Phase, ShepherdConfig
 from loom_tools.shepherd.phases import PhaseResult, PhaseStatus
 
@@ -745,3 +751,376 @@ class TestApprovalPhaseSummary:
         )
         new_output = f"Approval ({result.data.get('summary', result.message)})"
         assert new_output == "Approval (human approved)"  # correct
+
+
+def _failed_result(phase: str = "", message: str = "phase failed") -> PhaseResult:
+    """Create a failed PhaseResult."""
+    return PhaseResult(status=PhaseStatus.FAILED, message=message, phase_name=phase)
+
+
+class TestJudgeRetry:
+    """Test judge retry logic when judge phase fails (issue #1909)."""
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_judge_failure_triggers_retry_then_succeeds(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Judge FAILED on first call, SUCCESS with approved on second — should complete."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (fails)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Judge attempt 2 (succeeds with approved)
+            10,    # judge phase_start
+            20,    # judge elapsed
+            # Merge
+            20,    # merge phase_start
+            25,    # merge elapsed
+            25,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        # Default judge_max_retries=1, so 1 retry allowed
+        assert ctx.config.judge_max_retries == 1
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: first call fails, second approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _failed_result("judge", "judge phase validation failed"),
+            _success_result("judge", approved=True),
+        ]
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Verify judge_retry milestone was reported
+        retry_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "judge_retry"
+        ]
+        assert len(retry_calls) == 1
+        assert retry_calls[0].kwargs["attempt"] == 1
+
+    @patch("loom_tools.shepherd.cli._mark_judge_exhausted")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_judge_retry_exhaustion_marks_blocked(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        mock_mark_exhausted: MagicMock,
+    ) -> None:
+        """Judge always fails — should call _mark_judge_exhausted and return 1."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (fails — triggers retry)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Judge attempt 2 (fails again — retries exhausted)
+            10,    # judge phase_start
+            15,    # judge elapsed
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: always fails
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _failed_result("judge", "validation failed")
+
+        result = orchestrate(ctx)
+        assert result == 1
+
+        # Verify _mark_judge_exhausted was called with retry count (1):
+        # first fail triggers retry (judge_retries=1), second fail exhausts retries
+        mock_mark_exhausted.assert_called_once_with(ctx, 1)
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_approved_path_unchanged_with_retry_logic(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Approved outcome on first try should work identically to before."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # judge phase_start
+            15,    # judge elapsed
+            15,    # merge phase_start
+            20,    # merge elapsed
+            20,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # No retry milestones should be reported
+        retry_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "judge_retry"
+        ]
+        assert len(retry_calls) == 0
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_changes_requested_path_unchanged_with_retry_logic(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockDoctor: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Changes-requested -> doctor -> approved flow should work as before."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge 1: changes requested
+            5,     # judge phase_start
+            15,    # judge elapsed
+            # Doctor
+            15,    # doctor phase_start
+            25,    # doctor elapsed
+            # Judge 2: approved
+            25,    # judge phase_start
+            35,    # judge elapsed
+            # Merge
+            35,    # merge phase_start
+            40,    # merge elapsed
+            40,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _success_result("judge", changes_requested=True),
+            _success_result("judge", approved=True),
+        ]
+
+        MockDoctor.return_value.run.return_value = _success_result("doctor")
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # No judge retry milestones
+        retry_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "judge_retry"
+        ]
+        assert len(retry_calls) == 0
+
+        # Doctor milestone should be present
+        doctor_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "phase_completed" and c.kwargs.get("phase") == "doctor"
+        ]
+        assert len(doctor_calls) == 1
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_judge_failure_retry_reports_milestones(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Judge retry milestone should include attempt count and reason."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (fails)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Judge attempt 2 (approves)
+            10,    # judge phase_start
+            20,    # judge elapsed
+            # Merge
+            20,    # merge phase_start
+            25,    # merge elapsed
+            25,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _failed_result("judge", "validation failed"),
+            _success_result("judge", approved=True),
+        ]
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Verify milestone content
+        retry_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "judge_retry"
+        ]
+        assert len(retry_calls) == 1
+        assert retry_calls[0].kwargs["attempt"] == 1
+        assert retry_calls[0].kwargs["max_retries"] == 1
+        assert "validation failed" in retry_calls[0].kwargs["reason"]
+
+
+class TestMarkJudgeExhausted:
+    """Test _mark_judge_exhausted helper function."""
+
+    @patch("subprocess.run")
+    def test_transitions_labels(self, mock_run: MagicMock) -> None:
+        """Should run gh command to transition loom:building -> loom:blocked."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = "/fake/repo"
+
+        with patch("loom_tools.common.systematic_failure.record_blocked_reason"), \
+             patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
+            _mark_judge_exhausted(ctx, 1)
+
+        # First subprocess call should be the label transition
+        label_call = mock_run.call_args_list[0]
+        cmd = label_call[0][0]
+        assert "gh" in cmd
+        assert "--remove-label" in cmd
+        assert "loom:building" in cmd
+        assert "--add-label" in cmd
+        assert "loom:blocked" in cmd
+
+    @patch("subprocess.run")
+    def test_records_blocked_reason(self, mock_run: MagicMock) -> None:
+        """Should record judge_exhausted as the blocked reason."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = "/fake/repo"
+
+        with patch("loom_tools.common.systematic_failure.record_blocked_reason") as mock_record, \
+             patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
+            _mark_judge_exhausted(ctx, 2)
+
+        mock_record.assert_called_once_with(
+            "/fake/repo",
+            42,
+            error_class="judge_exhausted",
+            phase="judge",
+            details="judge failed after 2 retry attempt(s)",
+        )
+
+    @patch("subprocess.run")
+    def test_adds_diagnostic_comment(self, mock_run: MagicMock) -> None:
+        """Should add a comment with diagnostic info."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = "/fake/repo"
+
+        with patch("loom_tools.common.systematic_failure.record_blocked_reason"), \
+             patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
+            _mark_judge_exhausted(ctx, 1)
+
+        # Second subprocess call should be the comment
+        comment_call = mock_run.call_args_list[1]
+        cmd = comment_call[0][0]
+        assert "comment" in cmd
+        body_idx = cmd.index("--body") + 1
+        assert "Shepherd blocked" in cmd[body_idx]
+        assert "1 retry" in cmd[body_idx]
