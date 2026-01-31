@@ -129,6 +129,103 @@ class TestBuilderPhase:
         assert skip is False
 
 
+class TestBuilderQualityValidation:
+    """Test pre-flight quality validation in BuilderPhase."""
+
+    def test_fetch_issue_body_success(self, mock_context: MagicMock) -> None:
+        """Should return issue body on successful gh call."""
+        builder = BuilderPhase()
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="## Acceptance Criteria\n- [ ] Works\n", stderr=""
+        )
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+            body = builder._fetch_issue_body(mock_context)
+
+        assert body is not None
+        assert "Acceptance Criteria" in body
+
+    def test_fetch_issue_body_failure(self, mock_context: MagicMock) -> None:
+        """Should return None when gh call fails."""
+        builder = BuilderPhase()
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="error"
+        )
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+            body = builder._fetch_issue_body(mock_context)
+
+        assert body is None
+
+    def test_fetch_issue_body_os_error(self, mock_context: MagicMock) -> None:
+        """Should return None when subprocess raises OSError."""
+        builder = BuilderPhase()
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=OSError("gh not found"),
+        ):
+            body = builder._fetch_issue_body(mock_context)
+
+        assert body is None
+
+    def test_run_quality_validation_logs_warnings(
+        self, mock_context: MagicMock, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Should log warnings for low-quality issues."""
+        builder = BuilderPhase()
+        # Issue with no AC, no test plan, no file refs
+        body = "Just a vague description."
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=body, stderr=""
+        )
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+            builder._run_quality_validation(mock_context)
+
+        # Should have reported a heartbeat milestone
+        mock_context.report_milestone.assert_called()
+        call_args = mock_context.report_milestone.call_args
+        assert call_args[0][0] == "heartbeat"
+        assert "warning" in call_args[1]["action"]
+
+    def test_run_quality_validation_no_warnings_for_good_issue(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should not report milestone for good quality issue."""
+        builder = BuilderPhase()
+        body = """## Acceptance Criteria
+
+- [ ] Validation function works
+- [ ] Warnings logged
+
+## Test Plan
+
+- [ ] Unit test
+
+Modify `builder.py` to add validation.
+"""
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=body, stderr=""
+        )
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+            builder._run_quality_validation(mock_context)
+
+        # Should NOT have reported a heartbeat milestone
+        mock_context.report_milestone.assert_not_called()
+
+    def test_run_quality_validation_handles_fetch_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should silently skip validation when issue body fetch fails."""
+        builder = BuilderPhase()
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="error"
+        )
+        with patch("loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed):
+            # Should not raise
+            builder._run_quality_validation(mock_context)
+
+        # Should not have reported any milestone
+        mock_context.report_milestone.assert_not_called()
+
+
 class TestJudgePhase:
     """Test JudgePhase."""
 
