@@ -194,6 +194,45 @@ else
 fi
 echo ""
 
+# Test 12: Validate toolchain script exists and runs
+echo "Test 12: Validate toolchain script"
+if [ -x "./scripts/validate-toolchain.sh" ]; then
+  pass "validate-toolchain.sh exists and is executable"
+else
+  fail "validate-toolchain.sh not found or not executable"
+fi
+
+# Test 12b: --help works
+if ./scripts/validate-toolchain.sh --help > /dev/null 2>&1; then
+  pass "validate-toolchain.sh --help works"
+else
+  fail "validate-toolchain.sh --help failed"
+fi
+
+# Test 12c: --json produces valid JSON
+OUTPUT=$(./scripts/validate-toolchain.sh --json 2>/dev/null || true)
+if echo "$OUTPUT" | jq . > /dev/null 2>&1; then
+  pass "validate-toolchain.sh --json produces valid JSON"
+else
+  fail "validate-toolchain.sh --json did not produce valid JSON"
+fi
+
+# Test 12d: --quick is faster than full validation
+START=$(date +%s%N 2>/dev/null || date +%s)
+./scripts/validate-toolchain.sh --quick --json > /dev/null 2>&1 || true
+END=$(date +%s%N 2>/dev/null || date +%s)
+if [[ "$START" =~ ^[0-9]{10,}$ ]]; then
+  DURATION_MS=$(( (END - START) / 1000000 ))
+else
+  DURATION_MS=$(( (END - START) * 1000 ))
+fi
+if [ "$DURATION_MS" -lt 1000 ]; then
+  pass "validate-toolchain.sh --quick completes in <1s (${DURATION_MS}ms)"
+else
+  fail "validate-toolchain.sh --quick took too long (${DURATION_MS}ms)"
+fi
+echo ""
+
 # Final cleanup
 cleanup
 
