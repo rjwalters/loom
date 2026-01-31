@@ -4,10 +4,54 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Detect which file groups changed to skip irrelevant jobs on PRs
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      pull-requests: read
+    outputs:
+      frontend: ${{ steps.filter.outputs.frontend }}
+      backend: ${{ steps.filter.outputs.backend }}
+      mcp: ${{ steps.filter.outputs.mcp }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            frontend:
+              - 'src/**'
+              - 'e2e/**'
+              - 'defaults/**/*.ts'
+              - 'defaults/**/*.js'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'tsconfig.json'
+              - 'biome.json'
+              - '.github/workflows/ci.yml'
+            backend:
+              - 'src-tauri/**'
+              - 'loom-daemon/**'
+              - 'loom-api/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
+            mcp:
+              - 'mcp-loom/**'
+              - '.github/workflows/ci.yml'
+
   frontend-lint:
     name: Frontend Linting
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.frontend == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,6 +67,8 @@ jobs:
 
   frontend-typecheck:
     name: TypeScript Type Checking
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.frontend == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,6 +84,8 @@ jobs:
 
   frontend-tests:
     name: Frontend Unit Tests
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.frontend == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,10 +98,11 @@ jobs:
           cache: "pnpm"
       - run: pnpm install --frozen-lockfile
       - run: pnpm test:unit
-      # Vitest unit tests only, no Rust tests needed here
 
-  backend-lint:
-    name: Rust Linting
+  backend-lint-and-check:
+    name: Rust Linting & Build Check
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,9 +121,12 @@ jobs:
           # Create platform-specific symlink expected by Tauri
           ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
       - run: cargo clippy --package loom-daemon --package loom-api -- -D warnings -A clippy::cast_precision_loss -A clippy::cast_possible_truncation -A clippy::cast_sign_loss -A clippy::too_many_lines -A clippy::panic -A clippy::unwrap_used -A clippy::nonminimal_bool -A clippy::redundant_closure -A clippy::redundant_closure_for_method_calls -A clippy::format_push_string -A clippy::uninlined_format_args
+      - run: cargo check --workspace --all-targets
 
   backend-tests:
     name: Rust Unit Tests
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.backend == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +145,8 @@ jobs:
 
   mcp-build:
     name: MCP Server Build
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.mcp == 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -103,21 +157,3 @@ jobs:
         run: cd mcp-loom && npm install && npm run build
       - name: Verify build output
         run: test -f mcp-loom/dist/index.js
-
-  backend-build:
-    name: Daemon Build Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update || true
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev librsvg2-dev libappindicator3-dev patchelf
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Build daemon binary (required for Tauri app)
-        run: |
-          cargo build --package loom-daemon --release
-          # Create platform-specific symlink expected by Tauri
-          ln -sf loom-daemon target/release/loom-daemon-x86_64-unknown-linux-gnu
-      - run: cargo check --workspace --all-targets
