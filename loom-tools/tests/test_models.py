@@ -110,6 +110,35 @@ class TestSupportRoleEntry:
         assert out["task_id"] == "22"
         assert "last_completed" not in out
 
+    def test_round_trip_with_tmux_session(self) -> None:
+        """Test tmux_session field (used by agent-spawn.sh execution model)."""
+        data = {
+            "status": "running",
+            "tmux_session": "loom-guide",
+            "started": "2026-01-27T04:18:07Z",
+        }
+        entry = SupportRoleEntry.from_dict(data)
+        assert entry.tmux_session == "loom-guide"
+        out = entry.to_dict()
+        assert out["status"] == "running"
+        assert out["tmux_session"] == "loom-guide"
+        assert "task_id" not in out  # task_id is None, should not appear
+
+    def test_both_task_id_and_tmux_session(self) -> None:
+        """Test that both identifiers can coexist (backward compatibility)."""
+        data = {
+            "status": "running",
+            "task_id": "abc1234",
+            "tmux_session": "loom-guide",
+            "started": "2026-01-27T04:18:07Z",
+        }
+        entry = SupportRoleEntry.from_dict(data)
+        assert entry.task_id == "abc1234"
+        assert entry.tmux_session == "loom-guide"
+        out = entry.to_dict()
+        assert out["task_id"] == "abc1234"
+        assert out["tmux_session"] == "loom-guide"
+
 
 class TestWarning:
     def test_round_trip(self) -> None:
