@@ -45,6 +45,5 @@ Run this command now. Report the exit status when complete.
 
 For detailed orchestration workflow, phase definitions, and troubleshooting:
 - **Lifecycle details**: `.claude/commands/shepherd-lifecycle.md`
-- **Wrapper script**: `.loom/scripts/loom-shepherd.sh` (routes to Python or shell)
+- **Wrapper script**: `.loom/scripts/loom-shepherd.sh` (routes to Python)
 - **Python implementation**: `loom-tools/src/loom_tools/shepherd/`
-- **Shell script (fallback)**: `.loom/scripts/deprecated/shepherd-loop.sh`

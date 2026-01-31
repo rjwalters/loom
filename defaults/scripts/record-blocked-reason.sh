@@ -5,7 +5,7 @@
 #   record-blocked-reason.sh <issue-number> --error-class <class> [--phase <phase>] [--details <msg>]
 #
 # Records structured failure metadata in daemon-state.json for retry classification.
-# Called by shepherd-loop.sh when transitioning issues to loom:blocked.
+# Called by loom-shepherd when transitioning issues to loom:blocked.
 #
 # Error classes:
 #   builder_validation    - Builder phase validation failed

@@ -258,7 +258,7 @@ export async function loadConfig(): Promise<LoomConfig> {
           `1. Downgrade to a Loom version before this change\n` +
           `2. Open your workspace (this will auto-migrate to v2)\n` +
           `3. Upgrade to this version\n\n` +
-          `Or use factory reset: ./.loom/scripts/clean.sh --deep`
+          `Or use factory reset: loom-clean --deep`
       );
     }
 

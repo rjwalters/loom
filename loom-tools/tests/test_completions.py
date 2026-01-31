@@ -276,7 +276,7 @@ class TestIntentionalDifferences:
         - Action taken
         - Timestamp
 
-        Python uses "loom-check-completions" as the source identifier vs bash "check-completions.sh"
+        Python uses "loom-check-completions" as the source identifier vs legacy bash "check-completions.sh"
         This is an acceptable difference for tool identification.
         """
         # This is a documentation test - the recovery comment format

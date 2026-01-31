@@ -602,7 +602,6 @@ LOOM_SHELL_SHEPHERDS=true /loom --merge
 | Mode | Script | Description |
 |------|--------|-------------|
 | Python (recommended) | `loom-shepherd.sh` (via Python) | Deterministic orchestration, ~80% token reduction |
-| Shell (fallback) | `deprecated/shepherd-loop.sh` | Legacy shell implementation (auto-fallback) |
 | LLM (default) | `/shepherd` role | LLM-interpreted orchestration, more flexible but higher cost |
 
 Script-based shepherds provide:

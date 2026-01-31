@@ -962,7 +962,7 @@ main() {
         fi
 
         # Check shepherd progress file for errored status (fast error detection)
-        # When shepherd-loop.sh reports an error milestone, the progress file status
+        # When loom-shepherd reports an error milestone, the progress file status
         # is set to "errored". Detecting this here terminates the session within one
         # poll cycle (~5s) rather than waiting for idle heuristics (issue #1619).
         if [[ -n "$task_id" ]]; then
