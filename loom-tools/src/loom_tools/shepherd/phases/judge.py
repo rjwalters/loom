@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 import time
 
 from loom_tools.common.logging import log_info, log_warning
+from loom_tools.common.state import parse_command_output
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import (
@@ -336,12 +336,8 @@ class JudgePhase:
             check=False,
         )
 
-        if result.returncode != 0 or not result.stdout.strip():
-            return False
-
-        try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
+        data = parse_command_output(result)
+        if not isinstance(data, dict):
             return False
 
         # Check mergeable state

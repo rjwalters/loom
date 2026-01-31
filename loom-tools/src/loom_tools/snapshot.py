@@ -31,7 +31,11 @@ import shutil
 from loom_tools.common.github import gh_parallel_queries, gh_get_default_branch_ci_status
 from loom_tools.common.logging import log_warning
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_daemon_state, read_progress_files
+from loom_tools.common.state import (
+    parse_command_output,
+    read_daemon_state,
+    read_progress_files,
+)
 from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
 from loom_tools.models.daemon_state import DaemonState, SupportRoleEntry
 
@@ -286,10 +290,11 @@ def _collect_usage(repo_root: pathlib.Path) -> dict[str, Any]:
             [str(script)],
             capture_output=True, text=True, timeout=30,
         )
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
+        parsed = parse_command_output(result, default={"error": "invalid response"})
+        if isinstance(parsed, dict) and "error" not in parsed:
+            return parsed
         return {"error": "invalid response"}
-    except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+    except (subprocess.TimeoutExpired, OSError):
         return {"error": "no data"}
 
 

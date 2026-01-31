@@ -13,25 +13,20 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
-import json
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
 
 from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_json_file, write_json_file
+from loom_tools.common.state import read_json_file, safe_parse_json, write_json_file
 from loom_tools.common.time_utils import parse_iso_timestamp
-from loom_tools.common.worktree_safety import (
-    find_processes_using_directory,
-    is_worktree_safe_to_remove,
-)
+from loom_tools.common.worktree_safety import find_processes_using_directory
 
 # Default grace period: 10 minutes in seconds
 DEFAULT_GRACE_PERIOD = 600
@@ -111,7 +106,9 @@ def check_pr_merged(issue_num: int) -> PRStatus:
         if not pr_info:
             return PRStatus(status="NO_PR")
 
-        data = json.loads(pr_info)
+        data = safe_parse_json(pr_info)
+        if not isinstance(data, dict):
+            return PRStatus(status="UNKNOWN")
         state = data.get("state", "UNKNOWN")
         merged_at = data.get("mergedAt")
 

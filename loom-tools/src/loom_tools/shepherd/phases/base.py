@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import sys
@@ -11,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
+
+from loom_tools.common.state import read_json_file
 
 if TYPE_CHECKING:
     from loom_tools.shepherd.context import ShepherdContext
@@ -96,9 +97,8 @@ def _read_heartbeats(
     Returns a list of heartbeat milestone dicts, each with
     ``timestamp`` and ``data.action`` keys.
     """
-    try:
-        data = json.loads(progress_file.read_text())
-    except (json.JSONDecodeError, OSError):
+    data = read_json_file(progress_file)
+    if not isinstance(data, dict):
         return []
 
     milestones = data.get("milestones", [])

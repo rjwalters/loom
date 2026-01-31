@@ -22,7 +22,7 @@ from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import write_json_file
+from loom_tools.common.state import safe_parse_json, write_json_file
 
 # Valid status values
 VALID_SHEPHERD_STATUSES = {"working", "idle", "errored", "paused"}
@@ -226,19 +226,24 @@ Examples:
     # Parse JSON
     try:
         raw_text = state_path.read_text()
-        data = json.loads(raw_text)
-    except json.JSONDecodeError:
+    except OSError:
         if args.json_output:
-            print(json.dumps({"valid": False, "error": "invalid_json", "file": str(state_path)}))
+            print(json.dumps({"valid": False, "error": "file_not_readable", "file": str(state_path)}))
         else:
-            log_error(f"Invalid JSON in {state_path}")
-        return 1
+            log_error(f"Could not read {state_path}")
+        return 2
 
-    if not isinstance(data, dict):
+    # Use safe_parse_json with a sentinel to detect parse failure
+    sentinel: dict[str, Any] = {"__parse_failed__": True}
+    data = safe_parse_json(raw_text, default=sentinel)
+    if data is sentinel or not isinstance(data, dict):
         if args.json_output:
             print(json.dumps({"valid": False, "error": "invalid_json", "file": str(state_path)}))
         else:
-            log_error(f"Expected JSON object, got {type(data).__name__}")
+            if data is sentinel:
+                log_error(f"Invalid JSON in {state_path}")
+            else:
+                log_error(f"Expected JSON object, got {type(data).__name__}")
         return 1
 
     # Validate

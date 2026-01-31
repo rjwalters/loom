@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
+from loom_tools.common.state import read_json_file
 from loom_tools.models.agent_wait import (
     CompletionReason,
     ContractCheckResult,
@@ -406,11 +407,8 @@ class AgentMonitor:
         if not progress_file.exists():
             return False
 
-        try:
-            data = json.loads(progress_file.read_text())
-            return data.get("status") == "errored"
-        except Exception:
-            return False
+        data = read_json_file(progress_file)
+        return data.get("status") == "errored" if isinstance(data, dict) else False
 
     def _check_and_resolve_prompts(self) -> bool:
         """Check for and auto-resolve interactive prompts (e.g., plan mode)."""
