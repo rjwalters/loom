@@ -337,6 +337,24 @@ else
   MISSING_DEPS+=("cargo")
 fi
 
+# Check for Python 3.10+ (needed for loom-tools)
+PYTHON_FOUND=false
+for py in python3.12 python3.11 python3.10 python3; do
+  if command -v "$py" &>/dev/null; then
+    version=$("$py" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    major=$(echo "$version" | cut -d. -f1)
+    minor=$(echo "$version" | cut -d. -f2)
+    if [[ "$major" -ge 3 ]] && [[ "$minor" -ge 10 ]]; then
+      success "python: $("$py" --version 2>&1)"
+      PYTHON_FOUND=true
+      break
+    fi
+  fi
+done
+if [[ "$PYTHON_FOUND" != "true" ]]; then
+  MISSING_DEPS+=("python3.10+")
+fi
+
 echo ""
 
 # Report missing dependencies
@@ -354,6 +372,9 @@ if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
         ;;
       cargo)
         echo "  • Rust/Cargo: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        ;;
+      python3.10+)
+        echo "  • Python 3.10+: brew install python@3.12 (or https://python.org/)"
         ;;
     esac
   done
@@ -503,6 +524,29 @@ fi
 "$LOOM_ROOT/target/release/loom-daemon" init $INIT_FLAGS --defaults "$LOOM_ROOT/defaults" . || \
   error "loom-daemon init failed"
 
+echo ""
+
+# Set up Python tools (loom-tools package)
+# This creates a virtual environment in loom-tools/.venv and installs loom-shepherd, etc.
+info "Setting up Python tools..."
+if [[ -x "$LOOM_ROOT/scripts/install/setup-python-tools.sh" ]]; then
+  if "$LOOM_ROOT/scripts/install/setup-python-tools.sh" --loom-root "$LOOM_ROOT"; then
+    success "Python tools installed"
+  else
+    warning "Python tools setup failed (non-fatal for installation)"
+    info "Run manually: $LOOM_ROOT/scripts/install/setup-python-tools.sh --loom-root $LOOM_ROOT"
+    info "Without Python tools, /shepherd and some scripts will not work."
+  fi
+else
+  warning "Python setup script not found"
+  info "Python tools (loom-shepherd, etc.) may not be available."
+fi
+
+# Store Loom source repository path for wrapper scripts
+# This enables scripts in the target repo to find loom-tools in the source repo
+info "Recording Loom source path..."
+echo "$LOOM_ROOT" > .loom/loom-source-path
+success "Loom source path recorded"
 echo ""
 
 # Verify expected files were created
