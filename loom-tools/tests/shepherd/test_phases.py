@@ -788,6 +788,106 @@ class TestJudgePhase:
 
         assert skip is False
 
+    def test_validation_retries_on_race_condition(self, mock_context: MagicMock) -> None:
+        """Validation should retry and succeed when label appears on second attempt.
+
+        Simulates the race condition from issue #1764 where the judge worker
+        applies the label after the first validation check runs.
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_pr_label.return_value = True  # loom:pr found after retry
+
+        judge = JudgePhase()
+        # First validate() call fails (label not yet applied), second succeeds
+        with (
+            patch.object(judge, "validate", side_effect=[False, True]) as mock_validate,
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "approved" in result.message
+        assert mock_validate.call_count == 2
+        mock_sleep.assert_called_once_with(2)
+        # Cache should be invalidated before first attempt and before retry
+        assert mock_context.label_cache.invalidate_pr.call_count >= 2
+
+    def test_validation_fails_after_retries_exhausted(self, mock_context: MagicMock) -> None:
+        """Validation should fail after all retry attempts are exhausted.
+
+        When the label never appears (e.g., judge truly failed), all 3 attempts
+        should fail and return FAILED status.
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+
+        judge = JudgePhase()
+        with (
+            patch.object(judge, "validate", return_value=False) as mock_validate,
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "validation failed" in result.message
+        assert mock_validate.call_count == 3
+        # Should sleep between attempts (2 sleeps for 3 attempts)
+        assert mock_sleep.call_count == 2
+
+    def test_cache_invalidated_before_validation(self, mock_context: MagicMock) -> None:
+        """Cache should be invalidated BEFORE validation, not after.
+
+        This ensures the first validation attempt uses fresh data from the API
+        instead of stale cached labels (fixes the gh-cached staleness issue).
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_pr_label.return_value = True
+
+        judge = JudgePhase()
+        call_order: list[str] = []
+
+        def track_invalidate(pr: int | None = None) -> None:
+            call_order.append("invalidate")
+
+        def track_validate(ctx: ShepherdContext) -> bool:
+            call_order.append("validate")
+            return True
+
+        mock_context.label_cache.invalidate_pr.side_effect = track_invalidate
+
+        with (
+            patch.object(judge, "validate", side_effect=track_validate),
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # The first two calls should be: invalidate, then validate
+        assert call_order[0] == "invalidate"
+        assert call_order[1] == "validate"
+
+    def test_validation_succeeds_on_first_attempt(self, mock_context: MagicMock) -> None:
+        """When validation succeeds on first attempt, no retries or sleeps happen."""
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_pr_label.return_value = True
+
+        judge = JudgePhase()
+        with (
+            patch.object(judge, "validate", return_value=True) as mock_validate,
+            patch("loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0),
+            patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert mock_validate.call_count == 1
+        mock_sleep.assert_not_called()
+
 
 class TestMergePhase:
     """Test MergePhase."""
