@@ -336,7 +336,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
             _print_phase_header("PHASE 3b: DOCTOR (test failure recovery)")
 
             phase_start = time.time()
-            doctor = DoctorPhase()
 
             # Restore loom:building label for Doctor phase
             remove_issue_label(ctx.config.issue, "loom:needs-fix", ctx.repo_root)
@@ -363,6 +362,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if exit_code not in (0, 3):
                 log_error(f"Doctor test fix failed (exit code {exit_code})")
                 completed_phases.append("Doctor test fix (failed)")
+                _mark_test_fix_failed(ctx)
                 return 1
 
             # Re-run test verification after Doctor fix
