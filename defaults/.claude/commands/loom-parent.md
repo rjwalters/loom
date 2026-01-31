@@ -97,15 +97,22 @@ fi
 
 ### Subagent Delegation Pattern
 
-The parent loop uses the **Skill tool** to spawn iteration subagents:
+The parent loop uses the **Task tool** to spawn iteration subagents with isolated context:
 
 ```python
-# Parent spawns iteration subagent (uses Skill so iteration gets its role prompt)
-Skill(skill="loom-iteration", args="--merge --debug")
+# Parent spawns iteration subagent via Task (context isolation)
+result = Task(
+    description=f"Daemon iteration {iteration}",
+    prompt=f'Execute the Loom daemon iteration by invoking: Skill(skill="loom", args="iterate {flags}")',
+    subagent_type="general-purpose",
+    model="sonnet"
+)
 ```
 
-**Why Skill for parent→iteration**: The parent wants the iteration subagent to receive
-its full role prompt (`loom-iteration.md`) so it can execute the complete iteration logic.
+**Why Task for parent→iteration**: The Task tool creates a fresh subagent with its own context.
+The subagent then invokes the `loom-iteration` Skill internally to get the full role prompt.
+This two-level pattern keeps iteration context (gh outputs, snapshot data, spawn results)
+isolated from the parent, which accumulates only the ~100-byte summary returned by each Task.
 
 **Iteration→role spawning** (shepherds, support roles) happens in `loom-iteration.md` and
 uses **tmux agent-spawn.sh** to create ephemeral tmux sessions:
@@ -131,7 +138,8 @@ uses **tmux agent-spawn.sh** to create ephemeral tmux sessions:
 
 | Delegation | Pattern | Reason |
 |------------|---------|--------|
-| parent → iteration | `Skill(skill="loom-iteration")` | Need iteration's full role prompt |
+| parent → iteration | `Task(subagent_type="general-purpose")` | Context isolation from parent |
+| iteration (internal) | `Skill(skill="loom", args="iterate")` | Load iteration role prompt |
 | iteration → shepherd | `agent-spawn.sh --role shepherd` | Ephemeral tmux session, attachable |
 | iteration → support role | `agent-spawn.sh --role guide` | Ephemeral tmux session, attachable |
 | shepherd → builder | `agent-spawn.sh --role builder` | Ephemeral tmux session, attachable |
