@@ -745,6 +745,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
                 "_detect_test_command",
                 return_value=(["pnpm", "test"], "pnpm test"),
             ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
                 return_value=completed,
@@ -756,8 +757,10 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         # Should have reported milestones
         assert mock_context.report_milestone.call_count >= 1
 
-    def test_run_test_verification_fails(self, mock_context: MagicMock) -> None:
-        """Should return FAILED result when tests fail."""
+    def test_run_test_verification_fails_no_baseline(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return FAILED when tests fail and no baseline available."""
         builder = BuilderPhase()
         worktree_mock = MagicMock()
         worktree_mock.is_dir.return_value = True
@@ -775,6 +778,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
                 "_detect_test_command",
                 return_value=(["pnpm", "test"], "pnpm test"),
             ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
                 return_value=completed,
@@ -786,6 +790,131 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         assert result.status == PhaseStatus.FAILED
         assert "test verification failed" in result.message
         assert "pnpm test" in result.message
+
+    def test_run_test_verification_preexisting_failures(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None (warn) when failures are pre-existing on main."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Both baseline and worktree have the same failure
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/foo.test.ts\nTests  2 failed, 3 passed\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/foo.test.ts\nTests  2 failed, 3 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is None
+
+    def test_run_test_verification_new_failures_on_top_of_baseline(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should FAIL when worktree adds new failures beyond baseline."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Baseline has one failure
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/foo.test.ts\nTests  1 failed, 4 passed\n",
+            stderr="",
+        )
+        # Worktree has the old failure plus a new one
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/foo.test.ts\nFAIL src/bar.test.ts\nTests  2 failed, 3 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+
+    def test_run_test_verification_baseline_passes_worktree_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should FAIL when baseline passes but worktree introduces failures."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Baseline passes
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Tests  5 passed\n",
+            stderr="",
+        )
+        # Worktree fails
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/foo.test.ts\nTests  1 failed, 4 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "test verification failed" in result.message
 
     def test_run_test_verification_timeout(self, mock_context: MagicMock) -> None:
         """Should return FAILED result on timeout."""
@@ -800,6 +929,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
                 "_detect_test_command",
                 return_value=(["pnpm", "test"], "pnpm test"),
             ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
                 side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
@@ -846,6 +976,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
                 "_detect_test_command",
                 return_value=(["pnpm", "test"], "pnpm test"),
             ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
                 side_effect=OSError("pnpm not found"),
@@ -870,6 +1001,141 @@ tests/test_bar.py ....                                                  [100%]
         result = builder._parse_test_summary(output)
         assert result is not None
         assert "12 passed" in result
+
+
+class TestBuilderBaselineTests:
+    """Test builder phase baseline test comparison."""
+
+    def test_run_baseline_returns_result(self, mock_context: MagicMock) -> None:
+        """Should return CompletedProcess when baseline runs successfully."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="FAIL foo\n", stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "check:ci"], "pnpm check:ci"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "check:ci"], "pnpm check:ci"
+            )
+
+        assert result is not None
+        assert result.returncode == 1
+
+    def test_run_baseline_no_repo_root(self, mock_context: MagicMock) -> None:
+        """Should return None when repo root is not available."""
+        builder = BuilderPhase()
+        mock_context.repo_root = None
+
+        result = builder._run_baseline_tests(
+            mock_context, ["pnpm", "test"], "pnpm test"
+        )
+        assert result is None
+
+    def test_run_baseline_timeout(self, mock_context: MagicMock) -> None:
+        """Should return None when baseline times out."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
+            ),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is None
+
+    def test_run_baseline_os_error(self, mock_context: MagicMock) -> None:
+        """Should return None on OSError."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=OSError("not found"),
+            ),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is None
+
+    def test_run_baseline_no_test_runner_at_root(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when no test runner detected at repo root."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        with patch.object(builder, "_detect_test_command", return_value=None):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is None
+
+
+class TestBuilderExtractErrorLines:
+    """Test builder phase error line extraction."""
+
+    def test_extracts_fail_lines(self) -> None:
+        """Should extract lines containing FAIL."""
+        builder = BuilderPhase()
+        output = "PASS src/ok.test.ts\nFAIL src/bad.test.ts\nDone.\n"
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 1
+        assert "FAIL src/bad.test.ts" in lines[0]
+
+    def test_extracts_error_lines(self) -> None:
+        """Should extract lines containing error."""
+        builder = BuilderPhase()
+        output = "Error: module not found\nCompiled successfully.\n"
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 1
+        assert "Error: module not found" in lines[0]
+
+    def test_empty_output(self) -> None:
+        """Should return empty list for empty output."""
+        builder = BuilderPhase()
+        assert builder._extract_error_lines("") == []
+        assert builder._extract_error_lines("\n\n") == []
+
+    def test_no_errors(self) -> None:
+        """Should return empty list when no error indicators present."""
+        builder = BuilderPhase()
+        output = "PASS src/ok.test.ts\nAll tests passed.\nDone.\n"
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 0
 
 
 class TestBuilderEnsureDependencies:

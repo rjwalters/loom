@@ -414,11 +414,72 @@ class BuilderPhase:
 
         return None
 
+    def _extract_error_lines(self, output: str) -> list[str]:
+        """Extract error-indicator lines from test output for comparison.
+
+        Returns a list of normalized lines that indicate failures (FAIL, ERROR,
+        error messages, etc.). Used to diff baseline vs worktree output to
+        detect new regressions.
+        """
+        error_indicators = ("fail", "error", "✗", "✕", "×", "not ok")
+        lines = []
+        for raw_line in output.splitlines():
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            lower = stripped.lower()
+            if any(indicator in lower for indicator in error_indicators):
+                lines.append(stripped)
+        return lines
+
+    def _run_baseline_tests(
+        self,
+        ctx: ShepherdContext,
+        test_cmd: list[str],
+        display_name: str,
+    ) -> subprocess.CompletedProcess[str] | None:
+        """Run tests against main branch (repo root) to establish a baseline.
+
+        Returns the CompletedProcess result from running tests at the repo root,
+        or None if the baseline cannot be obtained (timeout, OSError, or no
+        repo root available).
+        """
+        if not ctx.repo_root or not ctx.repo_root.is_dir():
+            return None
+
+        # Detect test command at repo root (may differ from worktree)
+        baseline_test_info = self._detect_test_command(ctx.repo_root)
+        if baseline_test_info is None:
+            return None
+
+        baseline_cmd, _ = baseline_test_info
+        log_info(f"Running baseline tests on main: {display_name}")
+
+        try:
+            return subprocess.run(
+                baseline_cmd,
+                cwd=ctx.repo_root,
+                text=True,
+                capture_output=True,
+                timeout=_TEST_VERIFY_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            log_warning("Baseline test run timed out, skipping comparison")
+            return None
+        except OSError as e:
+            log_warning(f"Could not run baseline tests: {e}")
+            return None
+
     def _run_test_verification(self, ctx: ShepherdContext) -> PhaseResult | None:
         """Run test verification in the worktree after builder completes.
 
+        Uses baseline comparison: runs tests against main first, then against
+        the worktree. Only fails if the worktree introduces NEW errors not
+        present in the baseline.
+
         Returns None if tests pass or cannot be run (no test runner detected).
-        Returns a PhaseResult with FAILED status if tests fail.
+        Returns a PhaseResult with FAILED status if tests introduce new failures.
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return None
@@ -432,6 +493,10 @@ class BuilderPhase:
             return None
 
         test_cmd, display_name = test_info
+
+        # Run baseline tests on main to detect pre-existing failures
+        baseline_result = self._run_baseline_tests(ctx, test_cmd, display_name)
+
         log_info(f"Running tests: {display_name}")
         ctx.report_milestone("heartbeat", action=f"verifying tests: {display_name}")
 
@@ -477,11 +542,49 @@ class BuilderPhase:
             )
             return None
 
-        # Tests failed
+        # Tests failed — check if these are pre-existing failures
+        if baseline_result is not None and baseline_result.returncode != 0:
+            # Baseline also fails. Compare error output to determine if
+            # the worktree introduced new failures.
+            baseline_errors = set(
+                self._extract_error_lines(
+                    baseline_result.stdout + "\n" + baseline_result.stderr
+                )
+            )
+            worktree_errors = set(
+                self._extract_error_lines(
+                    result.stdout + "\n" + result.stderr
+                )
+            )
+            new_errors = worktree_errors - baseline_errors
+
+            if not new_errors:
+                # All failures are pre-existing on main
+                summary = self._parse_test_summary(
+                    result.stdout + "\n" + result.stderr
+                )
+                msg = f"pre-existing on main (exit code {result.returncode})"
+                if summary:
+                    msg = f"pre-existing on main ({summary})"
+                log_warning(
+                    f"Tests failed but all failures are pre-existing: {msg}"
+                )
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=f"tests have pre-existing failures ({elapsed}s)",
+                )
+                return None
+
+            # New errors introduced by the worktree
+            log_warning(
+                f"Baseline also fails but worktree introduces "
+                f"{len(new_errors)} new error(s)"
+            )
+
+        # Tests failed with new errors (or no baseline available)
         summary = self._parse_test_summary(
             result.stdout + "\n" + result.stderr
         )
-        # Log last few lines of output for context
         combined = (result.stdout + "\n" + result.stderr).strip()
         tail_lines = combined.splitlines()[-10:]
         tail_text = "\n".join(tail_lines)
