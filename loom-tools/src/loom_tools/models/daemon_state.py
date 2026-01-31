@@ -55,6 +55,7 @@ class ShepherdEntry:
 class SupportRoleEntry:
     status: str = "idle"
     task_id: str | None = None
+    tmux_session: str | None = None
     started: str | None = None
     last_completed: str | None = None
 
@@ -63,13 +64,14 @@ class SupportRoleEntry:
         return cls(
             status=data.get("status", "idle"),
             task_id=data.get("task_id"),
+            tmux_session=data.get("tmux_session"),
             started=data.get("started"),
             last_completed=data.get("last_completed"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"status": self.status}
-        for k in ("task_id", "started", "last_completed"):
+        for k in ("task_id", "tmux_session", "started", "last_completed"):
             v = getattr(self, k)
             if v is not None:
                 d[k] = v
