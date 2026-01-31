@@ -85,7 +85,9 @@ class TestTmuxHelpers:
         assert result == "pane content"
 
     def test_send_keys_success(self) -> None:
-        with mock.patch("subprocess.run") as mock_run:
+        mock_result = mock.Mock()
+        mock_result.returncode = 0
+        with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
             result = send_keys("test-session", "hello")
         assert result is True
         mock_run.assert_called_once()

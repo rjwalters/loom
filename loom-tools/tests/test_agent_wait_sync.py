@@ -105,18 +105,18 @@ class TestSessionExists:
     def test_session_exists_true(self) -> None:
         mock_result = mock.Mock()
         mock_result.returncode = 0
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert session_exists("loom-test") is True
 
     def test_session_exists_false(self) -> None:
         mock_result = mock.Mock()
         mock_result.returncode = 1
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert session_exists("loom-test") is False
 
     def test_session_exists_exception(self) -> None:
         with mock.patch(
-            "loom_tools.agent_wait.subprocess.run",
+            "subprocess.run",
             side_effect=Exception("tmux not found"),
         ):
             assert session_exists("loom-test") is False
@@ -130,7 +130,7 @@ class TestGetSessionAge:
         import time
 
         mock_result.stdout = str(int(time.time()) - 30) + "\n"
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             age = get_session_age("loom-test")
         assert 28 <= age <= 32  # Allow small variance
 
@@ -138,19 +138,19 @@ class TestGetSessionAge:
         mock_result = mock.Mock()
         mock_result.returncode = 1
         mock_result.stdout = ""
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert get_session_age("loom-test") == -1
 
     def test_zero_timestamp(self) -> None:
         mock_result = mock.Mock()
         mock_result.returncode = 0
         mock_result.stdout = "0\n"
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert get_session_age("loom-test") == -1
 
     def test_exception(self) -> None:
         with mock.patch(
-            "loom_tools.agent_wait.subprocess.run",
+            "subprocess.run",
             side_effect=Exception("error"),
         ):
             assert get_session_age("loom-test") == -1
@@ -161,26 +161,26 @@ class TestGetSessionShellPid:
         mock_result = mock.Mock()
         mock_result.returncode = 0
         mock_result.stdout = "12345\n"
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert get_session_shell_pid("loom-test") == "12345"
 
     def test_multiple_panes(self) -> None:
         mock_result = mock.Mock()
         mock_result.returncode = 0
         mock_result.stdout = "12345\n67890\n"
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert get_session_shell_pid("loom-test") == "12345"
 
     def test_no_pid(self) -> None:
         mock_result = mock.Mock()
         mock_result.returncode = 1
         mock_result.stdout = ""
-        with mock.patch("loom_tools.agent_wait.subprocess.run", return_value=mock_result):
+        with mock.patch("subprocess.run", return_value=mock_result):
             assert get_session_shell_pid("loom-test") == ""
 
     def test_exception(self) -> None:
         with mock.patch(
-            "loom_tools.agent_wait.subprocess.run",
+            "subprocess.run",
             side_effect=Exception("error"),
         ):
             assert get_session_shell_pid("loom-test") == ""
@@ -400,7 +400,7 @@ class TestWaitForAgent:
                     with mock.patch(
                         "loom_tools.agent_wait.check_exit_command", return_value=True
                     ):
-                        with mock.patch("loom_tools.agent_wait._tmux_run"):
+                        with mock.patch("loom_tools.agent_wait.TmuxSession"):
                             with mock.patch("loom_tools.agent_wait.time.sleep"):
                                 result = wait_for_agent(config)
 

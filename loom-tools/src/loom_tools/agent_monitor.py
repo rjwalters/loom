@@ -20,6 +20,11 @@ from dataclasses import dataclass, field
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file
+from loom_tools.common.tmux_session import (
+    PROCESSING_INDICATORS,
+    SESSION_PREFIX,
+    TmuxSession,
+)
 from loom_tools.models.agent_wait import (
     CompletionReason,
     ContractCheckResult,
@@ -29,13 +34,6 @@ from loom_tools.models.agent_wait import (
     WaitResult,
     WaitStatus,
 )
-
-# tmux configuration (must match agent-spawn.sh)
-TMUX_SOCKET = "loom"
-SESSION_PREFIX = "loom-"
-
-# Pattern for detecting Claude is processing (from agent-wait-bg.sh)
-PROCESSING_INDICATORS = "esc to interrupt"
 
 # Progress tracking directory
 PROGRESS_DIR = pathlib.Path("/tmp/loom-agent-progress")
@@ -113,55 +111,22 @@ class ProgressTracker:
 
 def capture_pane(session_name: str) -> str:
     """Capture current tmux pane content."""
-    try:
-        result = subprocess.run(
-            ["tmux", "-L", TMUX_SOCKET, "capture-pane", "-t", session_name, "-p"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        return result.stdout if result.returncode == 0 else ""
-    except Exception:
-        return ""
+    return TmuxSession(session_name).capture_pane()
 
 
 def send_keys(session_name: str, keys: str) -> bool:
     """Send keys to tmux session."""
-    try:
-        subprocess.run(
-            ["tmux", "-L", TMUX_SOCKET, "send-keys", "-t", session_name, keys],
-            check=True,
-            capture_output=True,
-        )
-        return True
-    except Exception:
-        return False
+    return TmuxSession(session_name).send_keys(keys)
 
 
 def kill_session(session_name: str) -> bool:
     """Kill a tmux session."""
-    try:
-        subprocess.run(
-            ["tmux", "-L", TMUX_SOCKET, "kill-session", "-t", session_name],
-            check=False,
-            capture_output=True,
-        )
-        return True
-    except Exception:
-        return False
+    return TmuxSession(session_name).kill()
 
 
 def session_exists(session_name: str) -> bool:
     """Check if tmux session exists."""
-    try:
-        result = subprocess.run(
-            ["tmux", "-L", TMUX_SOCKET, "has-session", "-t", session_name],
-            capture_output=True,
-            check=False,
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    return TmuxSession(session_name).exists()
 
 
 class AgentMonitor:
@@ -534,7 +499,7 @@ class AgentMonitor:
         """Extract the likely role command from the session name for retry."""
         name = self.config.name
         if name.startswith("builder-issue-"):
-            issue_num = name[len("builder-issue-") :]
+            issue_num = name[len("builder-issue-"):]
             return f"/builder {issue_num}"
         return ""
 
