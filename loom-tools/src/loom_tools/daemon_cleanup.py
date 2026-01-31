@@ -26,6 +26,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from loom_tools.common.config import env_bool, env_int
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file, write_json_file
@@ -62,34 +63,23 @@ class CleanupConfig:
 def load_config() -> CleanupConfig:
     """Build a :class:`CleanupConfig` from environment variables."""
     return CleanupConfig(
-        cleanup_enabled=os.environ.get("LOOM_CLEANUP_ENABLED", "true").lower()
-        == "true",
-        archive_logs=os.environ.get("LOOM_ARCHIVE_LOGS", "true").lower() == "true",
-        retention_days=_env_int("LOOM_RETENTION_DAYS", RETENTION_DAYS_DEFAULT),
-        grace_period=_env_int("LOOM_GRACE_PERIOD", GRACE_PERIOD_DEFAULT),
-        max_archived_sessions=_env_int(
+        cleanup_enabled=env_bool("LOOM_CLEANUP_ENABLED", CLEANUP_ENABLED_DEFAULT),
+        archive_logs=env_bool("LOOM_ARCHIVE_LOGS", ARCHIVE_LOGS_DEFAULT),
+        retention_days=env_int("LOOM_RETENTION_DAYS", RETENTION_DAYS_DEFAULT),
+        grace_period=env_int("LOOM_GRACE_PERIOD", GRACE_PERIOD_DEFAULT),
+        max_archived_sessions=env_int(
             "LOOM_MAX_ARCHIVED_SESSIONS", MAX_ARCHIVED_SESSIONS_DEFAULT
         ),
-        progress_stale_hours=_env_int(
+        progress_stale_hours=env_int(
             "LOOM_PROGRESS_STALE_HOURS", PROGRESS_STALE_HOURS_DEFAULT
         ),
-        startup_cleanup_max_files=_env_int(
+        startup_cleanup_max_files=env_int(
             "LOOM_STARTUP_CLEANUP_MAX_FILES", STARTUP_CLEANUP_MAX_FILES_DEFAULT
         ),
-        startup_cleanup_timeout=_env_int(
+        startup_cleanup_timeout=env_int(
             "LOOM_STARTUP_CLEANUP_TIMEOUT", STARTUP_CLEANUP_TIMEOUT_DEFAULT
         ),
     )
-
-
-def _env_int(name: str, default: int) -> int:
-    val = os.environ.get(name)
-    if val is not None:
-        try:
-            return int(val)
-        except ValueError:
-            pass
-    return default
 
 
 # ---------------------------------------------------------------------------

@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from loom_tools.common.config import env_int
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file, write_json_file
@@ -38,13 +39,13 @@ from loom_tools.common.time_utils import now_utc
 
 
 # Configuration defaults from environment
-POLL_INTERVAL = int(os.environ.get("LOOM_POLL_INTERVAL", "120"))
-ITERATION_TIMEOUT = int(os.environ.get("LOOM_ITERATION_TIMEOUT", "300"))
-MAX_BACKOFF = int(os.environ.get("LOOM_MAX_BACKOFF", "1800"))
-BACKOFF_MULTIPLIER = int(os.environ.get("LOOM_BACKOFF_MULTIPLIER", "2"))
-BACKOFF_THRESHOLD = int(os.environ.get("LOOM_BACKOFF_THRESHOLD", "3"))
-SLOW_ITERATION_THRESHOLD_MULTIPLIER = int(
-    os.environ.get("LOOM_SLOW_ITERATION_THRESHOLD_MULTIPLIER", "2")
+POLL_INTERVAL = env_int("LOOM_POLL_INTERVAL", 120)
+ITERATION_TIMEOUT = env_int("LOOM_ITERATION_TIMEOUT", 300)
+MAX_BACKOFF = env_int("LOOM_MAX_BACKOFF", 1800)
+BACKOFF_MULTIPLIER = env_int("LOOM_BACKOFF_MULTIPLIER", 2)
+BACKOFF_THRESHOLD = env_int("LOOM_BACKOFF_THRESHOLD", 3)
+SLOW_ITERATION_THRESHOLD_MULTIPLIER = env_int(
+    "LOOM_SLOW_ITERATION_THRESHOLD_MULTIPLIER", 2
 )
 
 # File paths relative to repo root

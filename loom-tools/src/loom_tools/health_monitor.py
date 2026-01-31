@@ -34,6 +34,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from loom_tools.common.config import env_int
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import (
     read_alerts,
@@ -65,13 +66,11 @@ from loom_tools.models.health import (
 # Configuration (env-overridable thresholds)
 # ---------------------------------------------------------------------------
 
-RETENTION_HOURS = int(os.environ.get("LOOM_HEALTH_RETENTION_HOURS", "24"))
-THROUGHPUT_DECLINE_THRESHOLD = int(
-    os.environ.get("LOOM_THROUGHPUT_DECLINE_THRESHOLD", "50")
-)
-QUEUE_GROWTH_THRESHOLD = int(os.environ.get("LOOM_QUEUE_GROWTH_THRESHOLD", "5"))
-STUCK_AGENT_THRESHOLD = int(os.environ.get("LOOM_STUCK_AGENT_THRESHOLD", "10"))
-ERROR_RATE_THRESHOLD = int(os.environ.get("LOOM_ERROR_RATE_THRESHOLD", "20"))
+RETENTION_HOURS = env_int("LOOM_HEALTH_RETENTION_HOURS", 24)
+THROUGHPUT_DECLINE_THRESHOLD = env_int("LOOM_THROUGHPUT_DECLINE_THRESHOLD", 50)
+QUEUE_GROWTH_THRESHOLD = env_int("LOOM_QUEUE_GROWTH_THRESHOLD", 5)
+STUCK_AGENT_THRESHOLD = env_int("LOOM_STUCK_AGENT_THRESHOLD", 10)
+ERROR_RATE_THRESHOLD = env_int("LOOM_ERROR_RATE_THRESHOLD", 20)
 
 # Maximum alerts to retain
 MAX_ALERTS = 100

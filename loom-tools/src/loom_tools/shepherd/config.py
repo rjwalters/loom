@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import secrets
 from dataclasses import dataclass, field
 from enum import Enum
+
+from loom_tools.common.config import env_int
 
 
 class Phase(Enum):
@@ -41,17 +42,6 @@ def _generate_task_id() -> str:
     return secrets.token_hex(4)[:7]
 
 
-def _get_env_int(key: str, default: int) -> int:
-    """Get integer from environment variable."""
-    value = os.environ.get(key)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
-
-
 @dataclass
 class ShepherdConfig:
     """Configuration for shepherd orchestration."""
@@ -71,32 +61,32 @@ class ShepherdConfig:
 
     # Timeouts (seconds) - loaded from environment or defaults
     curator_timeout: int = field(
-        default_factory=lambda: _get_env_int("LOOM_CURATOR_TIMEOUT", 300)
+        default_factory=lambda: env_int("LOOM_CURATOR_TIMEOUT", 300)
     )
     builder_timeout: int = field(
-        default_factory=lambda: _get_env_int("LOOM_BUILDER_TIMEOUT", 1800)
+        default_factory=lambda: env_int("LOOM_BUILDER_TIMEOUT", 1800)
     )
     judge_timeout: int = field(
-        default_factory=lambda: _get_env_int("LOOM_JUDGE_TIMEOUT", 600)
+        default_factory=lambda: env_int("LOOM_JUDGE_TIMEOUT", 600)
     )
     doctor_timeout: int = field(
-        default_factory=lambda: _get_env_int("LOOM_DOCTOR_TIMEOUT", 900)
+        default_factory=lambda: env_int("LOOM_DOCTOR_TIMEOUT", 900)
     )
     poll_interval: int = field(
-        default_factory=lambda: _get_env_int("LOOM_POLL_INTERVAL", 5)
+        default_factory=lambda: env_int("LOOM_POLL_INTERVAL", 5)
     )
 
     # Retry limits
     doctor_max_retries: int = field(
-        default_factory=lambda: _get_env_int("LOOM_DOCTOR_MAX_RETRIES", 3)
+        default_factory=lambda: env_int("LOOM_DOCTOR_MAX_RETRIES", 3)
     )
     stuck_max_retries: int = field(
-        default_factory=lambda: _get_env_int("LOOM_STUCK_MAX_RETRIES", 1)
+        default_factory=lambda: env_int("LOOM_STUCK_MAX_RETRIES", 1)
     )
 
     # Rate limiting
     rate_limit_threshold: int = field(
-        default_factory=lambda: _get_env_int("LOOM_RATE_LIMIT_THRESHOLD", 99)
+        default_factory=lambda: env_int("LOOM_RATE_LIMIT_THRESHOLD", 99)
     )
 
     # Worktree marker file name
