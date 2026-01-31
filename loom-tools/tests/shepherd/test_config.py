@@ -7,12 +7,12 @@ from unittest.mock import patch
 
 import pytest
 
+from loom_tools.common.config import env_int
 from loom_tools.shepherd.config import (
     ExecutionMode,
     Phase,
     ShepherdConfig,
     _generate_task_id,
-    _get_env_int,
 )
 
 
@@ -36,21 +36,21 @@ class TestTaskIdGeneration:
 
 
 class TestEnvInt:
-    """Test environment variable integer parsing."""
+    """Test environment variable integer parsing (via common.config)."""
 
     def test_returns_default_when_not_set(self) -> None:
         """Should return default when env var not set."""
-        assert _get_env_int("NONEXISTENT_VAR_12345", 42) == 42
+        assert env_int("NONEXISTENT_VAR_12345", 42) == 42
 
     def test_returns_env_value_when_set(self) -> None:
         """Should return env value when set."""
         with patch.dict(os.environ, {"TEST_VAR": "100"}):
-            assert _get_env_int("TEST_VAR", 42) == 100
+            assert env_int("TEST_VAR", 42) == 100
 
     def test_returns_default_on_invalid(self) -> None:
         """Should return default when env var is not a valid int."""
         with patch.dict(os.environ, {"TEST_VAR": "not_an_int"}):
-            assert _get_env_int("TEST_VAR", 42) == 42
+            assert env_int("TEST_VAR", 42) == 42
 
 
 class TestPhase:
