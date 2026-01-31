@@ -18,6 +18,7 @@ import sys
 from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.paths import LoomPaths
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.common.time_utils import now_utc
@@ -67,11 +68,11 @@ def _validate_task_id(task_id: str) -> None:
 
 
 def _progress_path(repo_root: pathlib.Path, task_id: str) -> pathlib.Path:
-    return repo_root / ".loom" / "progress" / f"shepherd-{task_id}.json"
+    return LoomPaths(repo_root).progress_file(task_id)
 
 
 def _ensure_progress_dir(repo_root: pathlib.Path) -> None:
-    (repo_root / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+    LoomPaths(repo_root).progress_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _build_milestone_data(event: str, **kwargs: Any) -> dict[str, Any]:

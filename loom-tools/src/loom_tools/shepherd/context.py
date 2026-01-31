@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file, safe_parse_json
 from loom_tools.shepherd.config import ShepherdConfig
@@ -42,9 +43,8 @@ class ShepherdContext:
     def __post_init__(self) -> None:
         self.label_cache = LabelCache(self.repo_root)
         # Set worktree path based on issue number
-        self.worktree_path = (
-            self.repo_root / ".loom" / "worktrees" / f"issue-{self.config.issue}"
-        )
+        self._paths = LoomPaths(self.repo_root)
+        self.worktree_path = self._paths.worktree_path(self.config.issue)
         self._cleanup_stale_progress_for_issue()
 
     def _cleanup_stale_progress_for_issue(self) -> None:
@@ -55,12 +55,11 @@ class ShepherdContext:
         stale data from interfering with the new run.
         """
         logger = logging.getLogger(__name__)
-        progress_dir = self.repo_root / ".loom" / "progress"
-        if not progress_dir.is_dir():
+        if not self._paths.progress_dir.is_dir():
             return
 
         issue = self.config.issue
-        for progress_file in progress_dir.glob("shepherd-*.json"):
+        for progress_file in self._paths.progress_dir.glob("shepherd-*.json"):
             data = read_json_file(progress_file)
             if not isinstance(data, dict):
                 continue
@@ -86,12 +85,12 @@ class ShepherdContext:
     @property
     def scripts_dir(self) -> Path:
         """Path to .loom/scripts directory."""
-        return self.repo_root / ".loom" / "scripts"
+        return self._paths.scripts_dir
 
     @property
     def progress_dir(self) -> Path:
         """Path to .loom/progress directory."""
-        return self.repo_root / ".loom" / "progress"
+        return self._paths.progress_dir
 
     def run_script(
         self,
@@ -190,7 +189,7 @@ class ShepherdContext:
         so orchestration is not blocked.
         """
         logger = logging.getLogger(__name__)
-        branch_name = f"feature/issue-{issue}"
+        branch_name = NamingConventions.branch_name(issue)
         try:
             result = subprocess.run(
                 ["git", "ls-remote", "--heads", "origin", branch_name],
@@ -228,8 +227,7 @@ class ShepherdContext:
         Returns True if shutdown requested.
         """
         # Check for global shutdown signal
-        stop_file = self.repo_root / ".loom" / "stop-shepherds"
-        if stop_file.exists():
+        if self._paths.stop_shepherds_file.exists():
             return True
 
         # Check for issue-specific abort

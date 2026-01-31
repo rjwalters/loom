@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from typing import Any, TypeVar
 
+from loom_tools.common.paths import LoomPaths
 from loom_tools.models.daemon_state import DaemonState
 from loom_tools.models.health import AlertsFile, HealthMetrics
 from loom_tools.models.progress import ShepherdProgress
@@ -137,7 +138,8 @@ def write_json_file(
 
 def read_daemon_state(repo_root: pathlib.Path) -> DaemonState:
     """Load ``.loom/daemon-state.json`` into a :class:`DaemonState`."""
-    data = read_json_file(repo_root / ".loom" / "daemon-state.json")
+    paths = LoomPaths(repo_root)
+    data = read_json_file(paths.daemon_state_file)
     if isinstance(data, list):
         return DaemonState()
     return DaemonState.from_dict(data)
@@ -145,11 +147,11 @@ def read_daemon_state(repo_root: pathlib.Path) -> DaemonState:
 
 def read_progress_files(repo_root: pathlib.Path) -> list[ShepherdProgress]:
     """Load all ``.loom/progress/shepherd-*.json`` files."""
-    progress_dir = repo_root / ".loom" / "progress"
-    if not progress_dir.is_dir():
+    paths = LoomPaths(repo_root)
+    if not paths.progress_dir.is_dir():
         return []
     results: list[ShepherdProgress] = []
-    for p in sorted(progress_dir.glob("shepherd-*.json")):
+    for p in sorted(paths.progress_dir.glob("shepherd-*.json")):
         data = read_json_file(p)
         if isinstance(data, dict):
             results.append(ShepherdProgress.from_dict(data))
@@ -158,7 +160,8 @@ def read_progress_files(repo_root: pathlib.Path) -> list[ShepherdProgress]:
 
 def read_health_metrics(repo_root: pathlib.Path) -> HealthMetrics:
     """Load ``.loom/health-metrics.json`` into a :class:`HealthMetrics`."""
-    data = read_json_file(repo_root / ".loom" / "health-metrics.json")
+    paths = LoomPaths(repo_root)
+    data = read_json_file(paths.health_metrics_file)
     if isinstance(data, list):
         return HealthMetrics()
     return HealthMetrics.from_dict(data)
@@ -166,7 +169,8 @@ def read_health_metrics(repo_root: pathlib.Path) -> HealthMetrics:
 
 def read_alerts(repo_root: pathlib.Path) -> AlertsFile:
     """Load ``.loom/alerts.json`` into an :class:`AlertsFile`."""
-    data = read_json_file(repo_root / ".loom" / "alerts.json")
+    paths = LoomPaths(repo_root)
+    data = read_json_file(paths.alerts_file)
     if isinstance(data, list):
         return AlertsFile()
     return AlertsFile.from_dict(data)
@@ -174,7 +178,8 @@ def read_alerts(repo_root: pathlib.Path) -> AlertsFile:
 
 def read_stuck_history(repo_root: pathlib.Path) -> StuckHistory:
     """Load ``.loom/stuck-history.json`` into a :class:`StuckHistory`."""
-    data = read_json_file(repo_root / ".loom" / "stuck-history.json")
+    paths = LoomPaths(repo_root)
+    data = read_json_file(paths.stuck_history_file)
     if isinstance(data, list):
         return StuckHistory()
     return StuckHistory.from_dict(data)

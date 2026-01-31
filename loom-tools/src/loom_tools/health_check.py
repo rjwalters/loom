@@ -42,6 +42,7 @@ from typing import Any
 
 from loom_tools.common.github import gh_parallel_queries, gh_pr_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.paths import LoomPaths
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_daemon_state, read_json_file
 from loom_tools.common.time_utils import elapsed_seconds, format_duration, now_utc
@@ -417,11 +418,11 @@ def run_health_check() -> HealthReport:
         report.add_critical("Not in a git repository with .loom directory")
         return report
 
-    state_file_path = repo_root / ".loom" / "daemon-state.json"
-    report.state_file_path = str(state_file_path)
+    paths = LoomPaths(repo_root)
+    report.state_file_path = str(paths.daemon_state_file)
 
     # 1. Validate state file
-    report.validation = validate_state_file(str(state_file_path))
+    report.validation = validate_state_file(str(paths.daemon_state_file))
 
     if not report.validation.valid:
         if report.validation.status == "missing":
