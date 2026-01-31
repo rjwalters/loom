@@ -19,6 +19,7 @@ loom-claim = "loom_tools.claim:main"
 loom-check-completions = "loom_tools.completions:main"
 loom-clean = "loom_tools.clean:main"
 loom-worktree = "loom_tools.worktree:main"
+loom-recover-orphans = "loom_tools.orphan_recovery:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
