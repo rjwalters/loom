@@ -14,6 +14,7 @@ from loom_tools.shepherd.config import ExecutionMode, Phase, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases import (
     ApprovalPhase,
+    BasePhase,
     BuilderPhase,
     CuratorPhase,
     JudgePhase,
@@ -35,6 +36,116 @@ def mock_context() -> MagicMock:
     ctx.pr_number = None
     ctx.label_cache = MagicMock()
     return ctx
+
+
+class TestBasePhase:
+    """Test BasePhase helper methods."""
+
+    def test_result_creates_phase_result_with_phase_name(self) -> None:
+        """result() should create PhaseResult with the phase's name."""
+
+        class MyPhase(BasePhase):
+            phase_name = "my_phase"
+
+        phase = MyPhase()
+        result = phase.result(PhaseStatus.SUCCESS, "test message", {"key": "value"})
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.message == "test message"
+        assert result.phase_name == "my_phase"
+        assert result.data == {"key": "value"}
+
+    def test_result_with_defaults(self) -> None:
+        """result() should use empty defaults for message and data."""
+
+        class MyPhase(BasePhase):
+            phase_name = "test"
+
+        phase = MyPhase()
+        result = phase.result(PhaseStatus.FAILED)
+
+        assert result.message == ""
+        assert result.data == {}
+
+    def test_success_helper(self) -> None:
+        """success() should create SUCCESS PhaseResult."""
+
+        class MyPhase(BasePhase):
+            phase_name = "test_phase"
+
+        phase = MyPhase()
+        result = phase.success("done", {"count": 42})
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.message == "done"
+        assert result.phase_name == "test_phase"
+        assert result.data == {"count": 42}
+
+    def test_failed_helper(self) -> None:
+        """failed() should create FAILED PhaseResult."""
+
+        class MyPhase(BasePhase):
+            phase_name = "test_phase"
+
+        phase = MyPhase()
+        result = phase.failed("error occurred", {"error": "details"})
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.message == "error occurred"
+        assert result.phase_name == "test_phase"
+        assert result.data == {"error": "details"}
+
+    def test_skipped_helper(self) -> None:
+        """skipped() should create SKIPPED PhaseResult."""
+
+        class MyPhase(BasePhase):
+            phase_name = "test_phase"
+
+        phase = MyPhase()
+        result = phase.skipped("not needed")
+
+        assert result.status == PhaseStatus.SKIPPED
+        assert result.message == "not needed"
+        assert result.phase_name == "test_phase"
+
+    def test_shutdown_helper(self) -> None:
+        """shutdown() should create SHUTDOWN PhaseResult."""
+
+        class MyPhase(BasePhase):
+            phase_name = "test_phase"
+
+        phase = MyPhase()
+        result = phase.shutdown("signal received")
+
+        assert result.status == PhaseStatus.SHUTDOWN
+        assert result.message == "signal received"
+        assert result.phase_name == "test_phase"
+
+    def test_stuck_helper(self) -> None:
+        """stuck() should create STUCK PhaseResult."""
+
+        class MyPhase(BasePhase):
+            phase_name = "test_phase"
+
+        phase = MyPhase()
+        result = phase.stuck("agent blocked", {"attempts": 3})
+
+        assert result.status == PhaseStatus.STUCK
+        assert result.message == "agent blocked"
+        assert result.phase_name == "test_phase"
+        assert result.data == {"attempts": 3}
+
+    def test_curator_phase_inherits_basephase(self) -> None:
+        """CuratorPhase should properly inherit from BasePhase."""
+        curator = CuratorPhase()
+
+        assert curator.phase_name == "curator"
+        assert isinstance(curator, BasePhase)
+
+        # Helpers should work and set correct phase_name
+        result = curator.success("test")
+        assert result.phase_name == "curator"
+        assert result.status == PhaseStatus.SUCCESS
 
 
 class TestCuratorPhase:

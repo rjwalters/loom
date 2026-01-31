@@ -81,6 +81,120 @@ class PhaseRunner(Protocol):
         ...
 
 
+class BasePhase:
+    """Base class for phase runners with helper methods for creating PhaseResults.
+
+    Subclasses should set the ``phase_name`` class attribute to the name of
+    the phase (e.g., "builder", "judge"). This name is automatically used
+    in all PhaseResult objects created via the helper methods.
+
+    Example usage::
+
+        class MyPhase(BasePhase):
+            phase_name = "my_phase"
+
+            def run(self, ctx: ShepherdContext) -> PhaseResult:
+                if some_error:
+                    return self.failed("something went wrong", {"detail": "info"})
+                return self.success("phase completed")
+    """
+
+    phase_name: str = ""
+
+    def result(
+        self,
+        status: PhaseStatus,
+        message: str = "",
+        data: dict[str, Any] | None = None,
+    ) -> PhaseResult:
+        """Create a PhaseResult with this phase's name.
+
+        Args:
+            status: The status of the phase result.
+            message: A human-readable message describing the result.
+            data: Optional dictionary of additional data.
+
+        Returns:
+            A PhaseResult with the phase_name set automatically.
+        """
+        return PhaseResult(
+            status=status,
+            message=message,
+            phase_name=self.phase_name,
+            data=data or {},
+        )
+
+    def success(
+        self, message: str = "", data: dict[str, Any] | None = None
+    ) -> PhaseResult:
+        """Create a successful PhaseResult.
+
+        Args:
+            message: A human-readable message describing the success.
+            data: Optional dictionary of additional data.
+
+        Returns:
+            A PhaseResult with SUCCESS status.
+        """
+        return self.result(PhaseStatus.SUCCESS, message, data)
+
+    def failed(
+        self, message: str = "", data: dict[str, Any] | None = None
+    ) -> PhaseResult:
+        """Create a failed PhaseResult.
+
+        Args:
+            message: A human-readable message describing the failure.
+            data: Optional dictionary of additional data.
+
+        Returns:
+            A PhaseResult with FAILED status.
+        """
+        return self.result(PhaseStatus.FAILED, message, data)
+
+    def skipped(
+        self, message: str = "", data: dict[str, Any] | None = None
+    ) -> PhaseResult:
+        """Create a skipped PhaseResult.
+
+        Args:
+            message: A human-readable message describing why skipped.
+            data: Optional dictionary of additional data.
+
+        Returns:
+            A PhaseResult with SKIPPED status.
+        """
+        return self.result(PhaseStatus.SKIPPED, message, data)
+
+    def shutdown(
+        self, message: str = "", data: dict[str, Any] | None = None
+    ) -> PhaseResult:
+        """Create a shutdown PhaseResult.
+
+        Args:
+            message: A human-readable message describing the shutdown.
+            data: Optional dictionary of additional data.
+
+        Returns:
+            A PhaseResult with SHUTDOWN status.
+        """
+        return self.result(PhaseStatus.SHUTDOWN, message, data)
+
+    def stuck(
+        self, message: str = "", data: dict[str, Any] | None = None
+    ) -> PhaseResult:
+        """Create a stuck PhaseResult.
+
+        Args:
+            message: A human-readable message describing the stuck state.
+            data: Optional dictionary of additional data.
+
+        Returns:
+            A PhaseResult with STUCK status.
+        """
+        return self.result(PhaseStatus.STUCK, message, data)
+
+
 def _read_heartbeats(
     progress_file: Path, *, phase: str | None = None
 ) -> list[dict[str, Any]]:
