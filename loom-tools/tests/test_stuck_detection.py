@@ -22,9 +22,12 @@ from loom_tools.stuck_detection import (
     StaleHeartbeatDetector,
     StuckDetectionConfig,
     StuckDetectionRunner,
+)
+from loom_tools.stuck_formatting import (
     format_agent_json,
     format_check_human,
     format_check_json,
+    format_intervention_summary,
     format_status_human,
 )
 
@@ -536,6 +539,54 @@ class TestFormatFunctions:
         assert "STUCK DETECTION STATUS" in output
         assert "Configuration:" in output
         assert "Active Interventions:" in output
+
+    def test_format_intervention_summary_alert(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        detection = StuckDetection(
+            agent_id="shepherd-1",
+            issue=42,
+            stuck=True,
+            severity="warning",
+            suggested_intervention="alert",
+            indicators=["no_progress:600s"],
+        )
+        output = format_intervention_summary(detection, "2026-01-30T12:00:00Z", loom_dir)
+
+        assert "STUCK AGENT INTERVENTION" in output
+        assert "shepherd-1" in output
+        assert "#42" in output
+        assert "warning" in output
+        assert "alert" in output
+        assert "Review agent output" in output
+
+    def test_format_intervention_summary_pause(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        detection = StuckDetection(
+            agent_id="shepherd-2",
+            issue=99,
+            stuck=True,
+            severity="critical",
+            suggested_intervention="pause",
+            indicators=["looping:5x"],
+        )
+        output = format_intervention_summary(detection, "2026-01-30T12:00:00Z", loom_dir)
+
+        assert "paused automatically" in output
+        assert "signal.sh clear shepherd-2" in output
+
+    def test_format_intervention_summary_no_issue(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        detection = StuckDetection(
+            agent_id="shepherd-3",
+            stuck=True,
+            severity="warning",
+            suggested_intervention="escalate",
+            indicators=["stale_heartbeat:300s"],
+        )
+        output = format_intervention_summary(detection, "2026-01-30T12:00:00Z", loom_dir)
+
+        assert "Issue:       none" in output
+        assert "ESCALATION" in output
 
 
 class TestSeverityEscalation:
