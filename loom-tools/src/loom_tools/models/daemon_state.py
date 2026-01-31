@@ -191,12 +191,43 @@ class SystematicFailure:
 
 
 @dataclass
+class RecentFailure:
+    """A single failure entry in the recent_failures sliding window."""
+
+    issue: int = 0
+    error_class: str = "unknown"
+    phase: str = ""
+    timestamp: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RecentFailure:
+        return cls(
+            issue=data.get("issue", 0),
+            error_class=data.get("error_class", "unknown"),
+            phase=data.get("phase", ""),
+            timestamp=data.get("timestamp", ""),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "issue": self.issue,
+            "error_class": self.error_class,
+            "phase": self.phase,
+            "timestamp": self.timestamp,
+        }
+
+
+@dataclass
 class BlockedIssueRetry:
     """Retry metadata for a single blocked issue."""
 
     retry_count: int = 0
     last_retry_at: str | None = None
     retry_exhausted: bool = False
+    error_class: str = "unknown"
+    last_blocked_at: str | None = None
+    last_blocked_phase: str = ""
+    last_blocked_details: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> BlockedIssueRetry:
@@ -204,15 +235,24 @@ class BlockedIssueRetry:
             retry_count=data.get("retry_count", 0),
             last_retry_at=data.get("last_retry_at"),
             retry_exhausted=data.get("retry_exhausted", False),
+            error_class=data.get("error_class", "unknown"),
+            last_blocked_at=data.get("last_blocked_at"),
+            last_blocked_phase=data.get("last_blocked_phase", ""),
+            last_blocked_details=data.get("last_blocked_details", ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "retry_count": self.retry_count,
             "retry_exhausted": self.retry_exhausted,
+            "error_class": self.error_class,
+            "last_blocked_phase": self.last_blocked_phase,
+            "last_blocked_details": self.last_blocked_details,
         }
         if self.last_retry_at is not None:
             d["last_retry_at"] = self.last_retry_at
+        if self.last_blocked_at is not None:
+            d["last_blocked_at"] = self.last_blocked_at
         return d
 
 
@@ -235,6 +275,7 @@ class DaemonState:
     last_hermit_trigger: str | None = None
     systematic_failure: SystematicFailure = field(default_factory=SystematicFailure)
     blocked_issue_retries: dict[str, BlockedIssueRetry] = field(default_factory=dict)
+    recent_failures: list[RecentFailure] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DaemonState:
@@ -259,6 +300,10 @@ class DaemonState:
             for k, v in retries_raw.items()
         }
 
+        recent_failures = [
+            RecentFailure.from_dict(f) for f in data.get("recent_failures", [])
+        ]
+
         return cls(
             started_at=data.get("started_at"),
             last_poll=data.get("last_poll"),
@@ -277,6 +322,7 @@ class DaemonState:
             last_hermit_trigger=data.get("last_hermit_trigger"),
             systematic_failure=systematic_failure,
             blocked_issue_retries=blocked_issue_retries,
+            recent_failures=recent_failures,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -295,6 +341,7 @@ class DaemonState:
             "blocked_issue_retries": {
                 k: v.to_dict() for k, v in self.blocked_issue_retries.items()
             },
+            "recent_failures": [f.to_dict() for f in self.recent_failures],
         }
         for k in (
             "started_at", "last_poll", "daemon_session_id",
