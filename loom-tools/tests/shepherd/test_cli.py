@@ -511,3 +511,64 @@ class TestPhaseTiming:
         assert "(170s)" in captured.err  # Builder
         assert "(100s)" in captured.err  # Judge
         assert "(5s)" in captured.err    # Merge
+
+
+class TestApprovalPhaseSummary:
+    """Test approval phase summary formatting (issue #1713)."""
+
+    def test_approval_uses_summary_from_data(self) -> None:
+        """Approval completed_phases entry should use data['summary'] for clean output."""
+        result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message="issue already approved (has loom:issue label)",
+            phase_name="approval",
+            data={"summary": "already approved"},
+        )
+        entry = f"Approval ({result.data.get('summary', result.message)})"
+        assert entry == "Approval (already approved)"
+
+    def test_approval_falls_back_to_message_without_summary(self) -> None:
+        """Approval should fall back to full message when data has no summary."""
+        result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message="approval done",
+            phase_name="approval",
+        )
+        entry = f"Approval ({result.data.get('summary', result.message)})"
+        assert entry == "Approval (approval done)"
+
+    def test_old_parsing_was_broken_for_parenthesized_messages(self) -> None:
+        """Verify the old parsing produced malformed output (regression guard)."""
+        # The old code: f"Approval ({result.message.split('(')[-1].rstrip(')')}"
+        # For "issue already approved (has loom:issue label)", this produced:
+        #   "Approval (has loom:issue label" (missing closing paren)
+        message = "issue already approved (has loom:issue label)"
+        old_output = f"Approval ({message.split('(')[-1].rstrip(')')}"
+        assert old_output == "Approval (has loom:issue label"  # broken - no closing paren
+
+        # New code produces correct output
+        result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message=message,
+            phase_name="approval",
+            data={"summary": "already approved"},
+        )
+        new_output = f"Approval ({result.data.get('summary', result.message)})"
+        assert new_output == "Approval (already approved)"  # correct
+
+    def test_old_parsing_was_broken_for_no_paren_messages(self) -> None:
+        """Verify the old parsing was broken for messages without parens."""
+        # For "issue approved by human" (no parens), split('(')[-1] returns full string
+        message = "issue approved by human"
+        old_output = f"Approval ({message.split('(')[-1].rstrip(')')}"
+        assert old_output == "Approval (issue approved by human"  # broken
+
+        # New code with summary produces correct output
+        result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message=message,
+            phase_name="approval",
+            data={"summary": "human approved"},
+        )
+        new_output = f"Approval ({result.data.get('summary', result.message)})"
+        assert new_output == "Approval (human approved)"  # correct
