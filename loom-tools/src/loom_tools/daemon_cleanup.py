@@ -17,6 +17,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import subprocess
@@ -89,15 +90,6 @@ def has_active_shepherds(daemon_state: dict[str, Any]) -> bool:
     shepherds = daemon_state.get("shepherds", {})
     for entry in shepherds.values():
         if isinstance(entry, dict) and entry.get("issue") is not None:
-            return True
-    return False
-
-
-def is_issue_being_worked(daemon_state: dict[str, Any], issue_num: int) -> bool:
-    """Return ``True`` if *issue_num* is assigned to a working shepherd."""
-    shepherds = daemon_state.get("shepherds", {})
-    for entry in shepherds.values():
-        if isinstance(entry, dict) and entry.get("issue") == issue_num:
             return True
     return False
 
@@ -374,12 +366,10 @@ def handle_shepherd_complete(
         log_info(f"No PR found for issue #{issue_number}, skipping cleanup")
         return
 
-    import json as _json
-
     try:
-        pr_data = _json.loads(pr_info)
+        pr_data = json.loads(pr_info)
         merged_at = pr_data.get("mergedAt")
-    except (_json.JSONDecodeError, AttributeError):
+    except (json.JSONDecodeError, AttributeError):
         merged_at = None
 
     state_path = repo_root / ".loom" / "daemon-state.json"
