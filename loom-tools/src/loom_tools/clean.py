@@ -21,11 +21,11 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from loom_tools.common.github import gh_run
+from loom_tools.common.github import gh_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_json_file, safe_parse_json, write_json_file
+from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.common.time_utils import parse_iso_timestamp
 from loom_tools.common.worktree_safety import find_processes_using_directory
 
@@ -65,51 +65,30 @@ def check_pr_merged(issue_num: int) -> PRStatus:
     """
     branch_name = NamingConventions.branch_name(issue_num)
 
-    # Find PR by head branch
     try:
-        result = gh_run(
-            [
-                "pr",
-                "list",
-                "--head",
-                branch_name,
-                "--state",
-                "all",
-                "--json",
-                "number,state,mergedAt",
-                "--jq",
-                ".[0] // empty",
-            ],
-            check=False,
+        # Find PR by head branch
+        prs = gh_list(
+            "pr",
+            head=branch_name,
+            state="all",
+            fields=["number", "state", "mergedAt"],
+            limit=1,
         )
 
-        pr_info = result.stdout.strip() if result.returncode == 0 else ""
-
-        if not pr_info:
+        if not prs:
             # Try searching by issue reference
-            result = gh_run(
-                [
-                    "pr",
-                    "list",
-                    "--search",
-                    f"Closes #{issue_num}",
-                    "--state",
-                    "all",
-                    "--json",
-                    "number,state,mergedAt",
-                    "--jq",
-                    ".[0] // empty",
-                ],
-                check=False,
+            prs = gh_list(
+                "pr",
+                search=f"Closes #{issue_num}",
+                state="all",
+                fields=["number", "state", "mergedAt"],
+                limit=1,
             )
-            pr_info = result.stdout.strip() if result.returncode == 0 else ""
 
-        if not pr_info:
+        if not prs:
             return PRStatus(status="NO_PR")
 
-        data = safe_parse_json(pr_info)
-        if not isinstance(data, dict):
-            return PRStatus(status="UNKNOWN")
+        data = prs[0]
         state = data.get("state", "UNKNOWN")
         merged_at = data.get("mergedAt")
 

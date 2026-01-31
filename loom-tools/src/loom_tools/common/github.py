@@ -5,9 +5,11 @@ from __future__ import annotations
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence
 
 from loom_tools.common.state import parse_command_output
+
+EntityType = Literal["issue", "pr"]
 
 
 def _gh_cmd() -> str:
@@ -43,22 +45,69 @@ def gh_run(
     )
 
 
+def gh_list(
+    entity_type: EntityType,
+    *,
+    labels: Sequence[str] | None = None,
+    state: str = "open",
+    fields: Sequence[str] | None = None,
+    search: str | None = None,
+    head: str | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """List issues or PRs via ``gh`` CLI with unified interface.
+
+    Parameters
+    ----------
+    entity_type:
+        Either ``"issue"`` or ``"pr"``.
+    labels:
+        Filter by labels (comma-joined).
+    state:
+        Filter by state (``open``, ``closed``, ``all``).
+    fields:
+        JSON fields to return (default: ``number``, ``title``, ``labels``, ``state``).
+    search:
+        GitHub search query (for PRs).
+    head:
+        Filter PRs by head branch.
+    limit:
+        Maximum results to return.
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        List of matching issues/PRs, or empty list on error.
+    """
+    default_fields = ["number", "title", "labels", "state"]
+    field_list = ",".join(fields or default_fields)
+
+    args = [entity_type, "list", "--json", field_list, "--state", state]
+
+    if labels:
+        args.extend(["--label", ",".join(labels)])
+    if search:
+        args.extend(["--search", search])
+    if head:
+        args.extend(["--head", head])
+    if limit is not None:
+        args.extend(["--limit", str(limit)])
+
+    result = gh_run(args, check=False)
+    parsed = parse_command_output(result, default=[])
+    return parsed if isinstance(parsed, list) else []
+
+
 def gh_issue_list(
     labels: Sequence[str] | None = None,
     state: str = "open",
     fields: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """List issues via ``gh issue list --json``."""
-    default_fields = ["number", "title", "labels", "state"]
-    field_list = ",".join(fields or default_fields)
+    """List issues via ``gh issue list --json``.
 
-    args = ["issue", "list", "--json", field_list, "--state", state]
-    if labels:
-        args.extend(["--label", ",".join(labels)])
-
-    result = gh_run(args)
-    parsed = parse_command_output(result, default=[])
-    return parsed if isinstance(parsed, list) else []
+    Thin wrapper around :func:`gh_list`.
+    """
+    return gh_list("issue", labels=labels, state=state, fields=fields)
 
 
 def gh_pr_list(
@@ -66,17 +115,11 @@ def gh_pr_list(
     state: str = "open",
     fields: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """List pull requests via ``gh pr list --json``."""
-    default_fields = ["number", "title", "labels", "state"]
-    field_list = ",".join(fields or default_fields)
+    """List pull requests via ``gh pr list --json``.
 
-    args = ["pr", "list", "--json", field_list, "--state", state]
-    if labels:
-        args.extend(["--label", ",".join(labels)])
-
-    result = gh_run(args)
-    parsed = parse_command_output(result, default=[])
-    return parsed if isinstance(parsed, list) else []
+    Thin wrapper around :func:`gh_list`.
+    """
+    return gh_list("pr", labels=labels, state=state, fields=fields)
 
 
 def gh_parallel_queries(
