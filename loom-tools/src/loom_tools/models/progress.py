@@ -53,15 +53,13 @@ class ShepherdProgress:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {
+        return {
             "task_id": self.task_id,
             "issue": self.issue,
             "mode": self.mode,
             "started_at": self.started_at,
             "current_phase": self.current_phase,
+            "last_heartbeat": self.last_heartbeat,
             "status": self.status,
             "milestones": [m.to_dict() for m in self.milestones],
         }
-        if self.last_heartbeat is not None:
-            d["last_heartbeat"] = self.last_heartbeat
-        return d

@@ -914,26 +914,18 @@ class AgentMonitor:
 
         self._last_heartbeat_time = now
 
-        script_path = self.repo_root / ".loom" / "scripts" / "report-milestone.sh"
-        if not script_path.exists():
-            return
-
         elapsed_min = self.elapsed // 60
         phase_desc = self.config.phase or "agent"
 
         try:
-            subprocess.run(
-                [
-                    str(script_path),
-                    "heartbeat",
-                    "--task-id",
-                    self.config.task_id,
-                    "--action",
-                    f"{phase_desc} running ({elapsed_min}m elapsed)",
-                    "--quiet",
-                ],
-                capture_output=True,
-                check=False,
+            from loom_tools.milestones import report_milestone
+
+            report_milestone(
+                self.repo_root,
+                self.config.task_id,
+                "heartbeat",
+                quiet=True,
+                action=f"{phase_desc} running ({elapsed_min}m elapsed)",
             )
         except Exception:
             pass

@@ -254,26 +254,11 @@ class ShepherdContext:
         Returns:
             True if milestone was reported successfully
         """
-        script = self.scripts_dir / "report-milestone.sh"
-        if not script.is_file():
-            return False
-
-        args = [event, "--task-id", self.config.task_id]
-
-        if quiet:
-            args.append("--quiet")
-
-        # Add event-specific arguments
-        for key, value in kwargs.items():
-            arg_name = f"--{key.replace('_', '-')}"
-            if isinstance(value, bool):
-                if value:
-                    args.append(arg_name)
-            else:
-                args.extend([arg_name, str(value)])
+        from loom_tools.milestones import report_milestone as _report
 
         try:
-            self.run_script("report-milestone.sh", args, check=False)
-            return True
+            return _report(
+                self.repo_root, self.config.task_id, event, quiet=quiet, **kwargs
+            )
         except Exception:
             return False
