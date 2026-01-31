@@ -24,10 +24,12 @@ from dataclasses import dataclass
 
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
-
-# tmux configuration (must match agent-spawn.sh)
-TMUX_SOCKET = "loom"
-SESSION_PREFIX = "loom-"
+from loom_tools.common.tmux_session import (
+    PROCESSING_INDICATORS,
+    SESSION_PREFIX,
+    TMUX_SOCKET,
+    TmuxSession,
+)
 
 # Defaults matching agent-wait.sh
 DEFAULT_TIMEOUT = 3600
@@ -36,9 +38,6 @@ DEFAULT_MIN_IDLE_ELAPSED = 10
 
 # Consecutive idle observations required before declaring completion
 IDLE_PROMPT_CONFIRM_COUNT = 2
-
-# Claude Code shows this in the status bar when actively processing
-PROCESSING_INDICATORS = "esc to interrupt"
 
 
 @dataclass
@@ -75,23 +74,9 @@ class WaitResult:
         return d
 
 
-def _tmux_run(*args: str) -> subprocess.CompletedProcess:
-    """Run a tmux command on the loom socket."""
-    return subprocess.run(
-        ["tmux", "-L", TMUX_SOCKET, *args],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-
 def session_exists(session_name: str) -> bool:
     """Check if a tmux session exists."""
-    try:
-        result = _tmux_run("has-session", "-t", session_name)
-        return result.returncode == 0
-    except Exception:
-        return False
+    return TmuxSession(session_name).exists()
 
 
 def get_session_age(session_name: str) -> int:
@@ -99,29 +84,12 @@ def get_session_age(session_name: str) -> int:
 
     Returns -1 if the session doesn't exist or age can't be determined.
     """
-    try:
-        result = _tmux_run(
-            "display-message", "-t", session_name, "-p", "#{session_created}"
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            return -1
-        created_at = int(result.stdout.strip())
-        if created_at == 0:
-            return -1
-        return int(time.time()) - created_at
-    except Exception:
-        return -1
+    return TmuxSession(session_name).get_session_age()
 
 
 def get_session_shell_pid(session_name: str) -> str:
     """Get the shell PID for a tmux session's first pane."""
-    try:
-        result = _tmux_run("list-panes", "-t", session_name, "-F", "#{pane_pid}")
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip().split("\n")[0]
-    except Exception:
-        pass
-    return ""
+    return TmuxSession(session_name).get_shell_pid() or ""
 
 
 def claude_is_running(shell_pid: str) -> bool:
@@ -165,11 +133,7 @@ def claude_is_running(shell_pid: str) -> bool:
 
 def capture_pane(session_name: str) -> str:
     """Capture the current visible content of a tmux pane."""
-    try:
-        result = _tmux_run("capture-pane", "-t", session_name, "-p")
-        return result.stdout if result.returncode == 0 else ""
-    except Exception:
-        return ""
+    return TmuxSession(session_name).capture_pane()
 
 
 def check_exit_command(session_name: str, repo_root: str) -> bool:
@@ -225,6 +189,8 @@ def handle_exit_detection(
     session_name: str, name: str, elapsed: int, json_output: bool
 ) -> WaitResult:
     """Handle /exit detection: send /exit to prompt and destroy session."""
+    session = TmuxSession(session_name)
+
     if not json_output:
         log_info(
             f"/exit detected in output - sending /exit to prompt "
@@ -232,18 +198,12 @@ def handle_exit_detection(
         )
 
     # Send /exit to the tmux prompt as backup
-    try:
-        _tmux_run("send-keys", "-t", session_name, "/exit", "C-m")
-    except Exception:
-        pass
+    session.send_keys("/exit", "C-m")
 
     time.sleep(1)
 
     # Destroy the tmux session
-    try:
-        _tmux_run("kill-session", "-t", session_name)
-    except Exception:
-        pass
+    session.kill()
 
     if not json_output:
         log_success(f"Agent '{name}' completed (explicit /exit after {elapsed}s)")
