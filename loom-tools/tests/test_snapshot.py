@@ -35,6 +35,7 @@ from loom_tools.snapshot import (
     detect_orphaned_shepherds,
     detect_tmux_pool,
     main,
+    run_preflight_checks,
     sort_issues_by_strategy,
     validate_task_ids,
 )
@@ -1041,7 +1042,7 @@ class TestBuildSnapshot:
             "timestamp", "pipeline", "proposals", "prs",
             "shepherds", "validation", "support_roles",
             "pipeline_health", "systematic_failure",
-            "usage", "tmux_pool", "computed", "config",
+            "preflight", "usage", "tmux_pool", "computed", "config",
         }
         assert set(snapshot.keys()) == expected_sections
 
@@ -1231,3 +1232,108 @@ class TestEnvironmentVariables:
         assert cfg.systematic_failure_threshold == 4
         assert cfg.systematic_failure_cooldown == 3600
         assert cfg.systematic_failure_max_probes == 5
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+
+
+class TestPreflightChecks:
+    def test_all_checks_pass_with_injection(self, tmp_path: pathlib.Path) -> None:
+        """With injected True values, all checks pass."""
+        (tmp_path / "loom-tools").mkdir()
+        result = run_preflight_checks(tmp_path, _check_import=True, _check_gh=True)
+        assert result["loom_tools_available"] is True
+        assert result["gh_authenticated"] is True
+        assert result["loom_tools_dir_exists"] is True
+        assert "python_available" in result
+        assert "claude_cli_available" in result
+
+    def test_loom_tools_unavailable(self, tmp_path: pathlib.Path) -> None:
+        """When loom_tools import fails, flag is False."""
+        result = run_preflight_checks(tmp_path, _check_import=False, _check_gh=True)
+        assert result["loom_tools_available"] is False
+
+    def test_gh_not_authenticated(self, tmp_path: pathlib.Path) -> None:
+        """When gh auth fails, flag is False."""
+        result = run_preflight_checks(tmp_path, _check_import=True, _check_gh=False)
+        assert result["gh_authenticated"] is False
+
+    def test_loom_tools_dir_missing(self, tmp_path: pathlib.Path) -> None:
+        """When loom-tools directory doesn't exist, flag is False."""
+        result = run_preflight_checks(tmp_path, _check_import=True, _check_gh=True)
+        assert result["loom_tools_dir_exists"] is False
+
+    def test_loom_tools_dir_exists(self, tmp_path: pathlib.Path) -> None:
+        """When loom-tools directory exists, flag is True."""
+        (tmp_path / "loom-tools").mkdir()
+        result = run_preflight_checks(tmp_path, _check_import=True, _check_gh=True)
+        assert result["loom_tools_dir_exists"] is True
+
+    def test_all_expected_keys_present(self, tmp_path: pathlib.Path) -> None:
+        """Preflight result has all expected keys."""
+        result = run_preflight_checks(tmp_path, _check_import=True, _check_gh=True)
+        expected_keys = {
+            "python_available",
+            "loom_tools_available",
+            "gh_authenticated",
+            "claude_cli_available",
+            "loom_tools_dir_exists",
+        }
+        assert set(result.keys()) == expected_keys
+
+
+class TestBuildSnapshotPreflight:
+    def _mock_pipeline(self) -> dict:
+        return {
+            "ready_issues": [],
+            "building_issues": [],
+            "blocked_issues": [],
+            "architect_proposals": [],
+            "hermit_proposals": [],
+            "curated_issues": [],
+            "review_requested": [],
+            "changes_requested": [],
+            "ready_to_merge": [],
+            "usage": {"session_percent": 50},
+        }
+
+    def test_snapshot_includes_preflight(self, tmp_path: pathlib.Path) -> None:
+        """Snapshot output includes preflight section."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data=self._mock_pipeline(),
+            _tmux_pool=TmuxPool(),
+            _preflight={"loom_tools_available": True, "gh_authenticated": True},
+        )
+        assert "preflight" in snapshot
+        assert snapshot["preflight"]["loom_tools_available"] is True
+        assert snapshot["preflight"]["gh_authenticated"] is True
+
+    def test_snapshot_preflight_injected(self, tmp_path: pathlib.Path) -> None:
+        """Injected preflight data is used as-is."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        injected = {
+            "loom_tools_available": False,
+            "gh_authenticated": False,
+            "custom_field": "test",
+        }
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data=self._mock_pipeline(),
+            _tmux_pool=TmuxPool(),
+            _preflight=injected,
+        )
+        assert snapshot["preflight"] == injected
