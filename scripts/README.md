@@ -137,17 +137,29 @@ The stop script handles this automatically by checking if the PID is still alive
 
 ## Maintenance Scripts
 
-### cleanup.sh
-**Removes build artifacts and orphaned worktrees**
+### clean.sh / loom-clean
+**Unified cleanup for stale worktrees, branches, and build artifacts**
 
 Cleans up:
-- `target/` - Rust build artifacts
-- `node_modules/` - Node dependencies
-- Orphaned git worktrees (with confirmation)
+- Stale git worktrees (for closed/merged issues)
+- Merged local feature branches
+- Loom tmux sessions
+- Build artifacts (`target/`, `node_modules/`) with `--deep`
+
+Flags:
+- `--force` — Non-interactive mode (auto-confirm all prompts)
+- `--deep` — Include build artifacts (target/, node_modules/)
+- `--dry-run` — Show what would be cleaned without making changes
+- `--safe` — Only remove worktrees with merged PRs
 
 Usage:
 ```bash
-./scripts/cleanup.sh
+./clean.sh                  # Interactive standard cleanup
+./clean.sh --force          # Non-interactive cleanup
+./clean.sh --deep           # Include build artifacts
+./clean.sh --dry-run        # Preview only
+./clean.sh --safe --force   # Safe mode, non-interactive
+loom-clean                  # Direct invocation (requires loom-tools venv)
 ```
 
 ### cleanup-branches.sh
