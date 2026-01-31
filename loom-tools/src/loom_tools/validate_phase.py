@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+from loom_tools.common.logging import log_warning
 
 
 class ValidationStatus(Enum):
@@ -409,8 +412,11 @@ def validate_builder(
             capture_output=True, text=True, check=False,
         )
         if r.returncode == 0 and r.stdout.strip():
-            # Log violation but continue with validation
-            pass
+            log_warning(
+                f"WORKFLOW VIOLATION: Builder appears to have worked on main "
+                f"instead of in worktree '{worktree}'. "
+                f"Uncommitted changes on main: {r.stdout.strip()[:200]}"
+            )
 
     # Check if issue is already closed
     r = _run_gh(
@@ -774,7 +780,6 @@ def _ensure_pr_body_references_issue(
     )
     body = r.stdout.strip() if r.returncode == 0 else ""
 
-    import re
     if re.search(rf"(Closes|Fixes|Resolves)\s+#{issue}", body):
         return
 
