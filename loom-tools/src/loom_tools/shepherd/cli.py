@@ -398,6 +398,11 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 log_error(result.message)
                 return 1
 
+        # Print skipped header if Doctor never ran (Judge approved first try)
+        if doctor_attempts == 0 and not skip:
+            _print_phase_header("PHASE 5: DOCTOR (skipped - no changes requested)")
+            completed_phases.append("Doctor (skipped)")
+
         if judge_total_elapsed > 0:
             phase_durations["Judge"] = judge_total_elapsed
         if doctor_total_elapsed > 0:

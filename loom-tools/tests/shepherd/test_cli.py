@@ -513,6 +513,179 @@ class TestPhaseTiming:
         assert "(5s)" in captured.err    # Merge
 
 
+class TestDoctorSkippedHeader:
+    """Test Doctor phase skipped header when Judge approves first try (issue #1767)."""
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_skipped_header_when_judge_approves_first_try(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Should print 'PHASE 5: DOCTOR (skipped)' when Judge approves without changes."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # curator phase_start
+            10,    # curator elapsed
+            10,    # approval phase_start
+            15,    # approval elapsed
+            15,    # builder phase_start
+            100,   # builder elapsed
+            100,   # judge phase_start
+            150,   # judge elapsed
+            150,   # merge phase_start
+            160,   # merge elapsed
+            160,   # duration calc
+        ])
+
+        ctx = _make_ctx()
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (False, "")
+        curator_inst.run.return_value = _success_result("curator")
+
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = _success_result("builder")
+
+        # Judge approves on first attempt - no changes requested
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        captured = capsys.readouterr()
+        assert "PHASE 5: DOCTOR (skipped - no changes requested)" in captured.err
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_no_skipped_header_when_doctor_runs(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockDoctor: MagicMock,
+        MockMerge: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Should NOT print skipped header when Doctor actually runs."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # judge attempt 1 phase_start
+            50,    # judge attempt 1 elapsed
+            50,    # doctor phase_start
+            100,   # doctor elapsed
+            100,   # judge attempt 2 phase_start
+            150,   # judge attempt 2 elapsed
+            150,   # merge phase_start
+            160,   # merge elapsed
+            160,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: first requests changes, second approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _success_result("judge", changes_requested=True),
+            _success_result("judge", approved=True),
+        ]
+
+        MockDoctor.return_value.run.return_value = _success_result("doctor")
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        captured = capsys.readouterr()
+        # Should see Doctor phase header with attempt number, NOT skipped
+        assert "PHASE 5: DOCTOR (attempt 1)" in captured.err
+        assert "PHASE 5: DOCTOR (skipped" not in captured.err
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_no_skipped_header_when_judge_skipped(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Should NOT print Doctor skipped header when Judge itself was skipped."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # merge phase_start
+            10,    # merge elapsed
+            10,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.MERGE)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: skipped entirely
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (True, "skipped via --from")
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        captured = capsys.readouterr()
+        # Neither Doctor header should appear when Judge was skipped
+        assert "PHASE 5: DOCTOR" not in captured.err
+
+
 class TestApprovalPhaseSummary:
     """Test approval phase summary formatting (issue #1713)."""
 
