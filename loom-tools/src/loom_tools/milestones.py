@@ -5,8 +5,8 @@ entry point (``main()``) registered as ``loom-milestone``.
 
 Events
 ------
-started, phase_entered, worktree_created, first_commit, pr_created,
-heartbeat, completed, blocked, error
+started, phase_entered, phase_completed, worktree_created, first_commit,
+pr_created, heartbeat, completed, blocked, error
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ VALID_EVENTS = frozenset(
     {
         "started",
         "phase_entered",
+        "phase_completed",
         "worktree_created",
         "first_commit",
         "pr_created",
@@ -43,6 +44,7 @@ VALID_EVENTS = frozenset(
 _REQUIRED: dict[str, set[str]] = {
     "started": {"issue"},
     "phase_entered": {"phase"},
+    "phase_completed": {"phase"},
     "worktree_created": {"path"},
     "first_commit": {"sha"},
     "pr_created": {"pr_number"},
@@ -80,6 +82,12 @@ def _build_milestone_data(event: str, **kwargs: Any) -> dict[str, Any]:
         data["mode"] = kwargs.get("mode", "")
     elif event == "phase_entered":
         data["phase"] = kwargs["phase"]
+    elif event == "phase_completed":
+        data["phase"] = kwargs["phase"]
+        if "duration_seconds" in kwargs:
+            data["duration_seconds"] = int(kwargs["duration_seconds"])
+        if "status" in kwargs:
+            data["status"] = kwargs["status"]
     elif event == "worktree_created":
         data["path"] = kwargs["path"]
     elif event == "first_commit":
@@ -225,6 +233,11 @@ def _log_event(event: str, data: dict[str, Any]) -> None:
     """Emit a coloured log line appropriate for *event*."""
     if event == "phase_entered":
         log_info(f"Phase: {data['phase']}")
+    elif event == "phase_completed":
+        duration = data.get("duration_seconds", "")
+        status = data.get("status", "")
+        suffix = f" ({duration}s, {status})" if duration and status else ""
+        log_success(f"Phase completed: {data['phase']}{suffix}")
     elif event == "worktree_created":
         log_info(f"Worktree created: {data['path']}")
     elif event == "first_commit":
@@ -253,6 +266,7 @@ def main(argv: list[str] | None = None) -> int:
 Events:
   started             --task-id ID --issue NUM [--mode MODE]
   phase_entered       --task-id ID --phase PHASE
+  phase_completed     --task-id ID --phase PHASE [--duration-seconds N] [--status S]
   worktree_created    --task-id ID --path PATH
   first_commit        --task-id ID --sha SHA
   pr_created          --task-id ID --pr-number NUM
@@ -264,6 +278,7 @@ Events:
 Examples:
   loom-milestone started --task-id abc1234 --issue 42 --mode force-pr
   loom-milestone phase_entered --task-id abc1234 --phase builder
+  loom-milestone phase_completed --task-id abc1234 --phase builder --duration-seconds 120 --status success
   loom-milestone heartbeat --task-id abc1234 --action "running tests"
   loom-milestone completed --task-id abc1234 --pr-merged
   loom-milestone error --task-id abc1234 --error "build failed" --will-retry
@@ -276,10 +291,22 @@ Examples:
         choices=sorted(VALID_EVENTS),
         help="Milestone event type",
     )
-    parser.add_argument("--task-id", required=False, help="Shepherd task ID (7 hex chars)")
+    parser.add_argument(
+        "--task-id", required=False, help="Shepherd task ID (7 hex chars)"
+    )
     parser.add_argument("--issue", type=int, help="Issue number (for 'started')")
     parser.add_argument("--mode", help="Orchestration mode (for 'started')")
-    parser.add_argument("--phase", help="Phase name (for 'phase_entered')")
+    parser.add_argument(
+        "--phase", help="Phase name (for 'phase_entered', 'phase_completed')"
+    )
+    parser.add_argument(
+        "--duration-seconds",
+        type=int,
+        help="Phase duration in seconds (for 'phase_completed')",
+    )
+    parser.add_argument(
+        "--status", help="Phase completion status (for 'phase_completed')"
+    )
     parser.add_argument("--path", help="Worktree path (for 'worktree_created')")
     parser.add_argument("--sha", help="Commit SHA (for 'first_commit')")
     parser.add_argument("--pr-number", type=int, help="PR number (for 'pr_created')")
@@ -321,6 +348,10 @@ Examples:
         kwargs["mode"] = args.mode
     if args.phase is not None:
         kwargs["phase"] = args.phase
+    if args.duration_seconds is not None:
+        kwargs["duration_seconds"] = args.duration_seconds
+    if args.status is not None:
+        kwargs["status"] = args.status
     if args.path is not None:
         kwargs["path"] = args.path
     if args.sha is not None:

@@ -134,6 +134,45 @@ class TestPhaseEntered:
         assert not ok
 
 
+# ── phase_completed ─────────────────────────────────────────────
+
+
+class TestPhaseCompleted:
+    def test_records_phase_completion(self, repo: pathlib.Path) -> None:
+        report_milestone(repo, "abc1234", "started", issue=42)
+        report_milestone(
+            repo,
+            "abc1234",
+            "phase_completed",
+            phase="builder",
+            duration_seconds=120,
+            status="success",
+        )
+
+        data = _read_progress(repo, "abc1234")
+        milestone = data["milestones"][-1]
+        assert milestone["event"] == "phase_completed"
+        assert milestone["data"]["phase"] == "builder"
+        assert milestone["data"]["duration_seconds"] == 120
+        assert milestone["data"]["status"] == "success"
+
+    def test_optional_fields(self, repo: pathlib.Path) -> None:
+        report_milestone(repo, "abc1234", "started", issue=42)
+        ok = report_milestone(repo, "abc1234", "phase_completed", phase="curator")
+        assert ok
+
+        data = _read_progress(repo, "abc1234")
+        milestone = data["milestones"][-1]
+        assert milestone["data"]["phase"] == "curator"
+        assert "duration_seconds" not in milestone["data"]
+        assert "status" not in milestone["data"]
+
+    def test_missing_phase_returns_false(self, repo: pathlib.Path) -> None:
+        report_milestone(repo, "abc1234", "started", issue=42)
+        ok = report_milestone(repo, "abc1234", "phase_completed")
+        assert not ok
+
+
 # ── completed ────────────────────────────────────────────────────
 
 
@@ -266,7 +305,9 @@ class TestConcurrentWrites:
             except Exception as e:
                 errors.append(e)
 
-        threads = [threading.Thread(target=send_heartbeat, args=(i,)) for i in range(10)]
+        threads = [
+            threading.Thread(target=send_heartbeat, args=(i,)) for i in range(10)
+        ]
         for t in threads:
             t.start()
         for t in threads:
@@ -292,7 +333,9 @@ class TestCLI:
     def test_invalid_task_id_returns_one(self) -> None:
         assert main(["started", "--task-id", "INVALID"]) == 1
 
-    def test_started_via_cli(self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_started_via_cli(
+        self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.chdir(repo)
         clear_repo_cache()
         rc = main(["started", "--task-id", "abc1234", "--issue", "42", "--quiet"])
@@ -300,14 +343,46 @@ class TestCLI:
         data = _read_progress(repo, "abc1234")
         assert data["issue"] == 42
 
-    def test_phase_entered_via_cli(self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_phase_entered_via_cli(
+        self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.chdir(repo)
         clear_repo_cache()
         main(["started", "--task-id", "abc1234", "--issue", "42", "--quiet"])
-        rc = main(["phase_entered", "--task-id", "abc1234", "--phase", "builder", "--quiet"])
+        rc = main(
+            ["phase_entered", "--task-id", "abc1234", "--phase", "builder", "--quiet"]
+        )
         assert rc == 0
         data = _read_progress(repo, "abc1234")
         assert data["current_phase"] == "builder"
+
+    def test_phase_completed_via_cli(
+        self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(repo)
+        clear_repo_cache()
+        main(["started", "--task-id", "abc1234", "--issue", "42", "--quiet"])
+        rc = main(
+            [
+                "phase_completed",
+                "--task-id",
+                "abc1234",
+                "--phase",
+                "builder",
+                "--duration-seconds",
+                "120",
+                "--status",
+                "success",
+                "--quiet",
+            ]
+        )
+        assert rc == 0
+        data = _read_progress(repo, "abc1234")
+        milestone = data["milestones"][-1]
+        assert milestone["event"] == "phase_completed"
+        assert milestone["data"]["phase"] == "builder"
+        assert milestone["data"]["duration_seconds"] == 120
+        assert milestone["data"]["status"] == "success"
 
 
 # ── JSON output compatibility ────────────────────────────────────
