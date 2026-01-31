@@ -37,7 +37,7 @@ from loom_tools.common.state import (
 )
 from loom_tools.common.time_utils import elapsed_seconds, format_duration, now_utc
 from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
-from loom_tools.models.progress import Milestone, ShepherdProgress
+from loom_tools.models.progress import ShepherdProgress
 
 # Default heartbeat stale threshold (5 minutes for orphan recovery)
 # This is intentionally higher than stuck_detection's 120s because

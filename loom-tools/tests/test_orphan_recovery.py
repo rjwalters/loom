@@ -11,7 +11,7 @@ import pytest
 
 from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
-from loom_tools.models.progress import Milestone, ShepherdProgress
+from loom_tools.models.progress import ShepherdProgress
 from loom_tools.orphan_recovery import (
     DEFAULT_HEARTBEAT_STALE_THRESHOLD,
     OrphanEntry,
