@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
-from loom_tools.common.logging import log_info, log_warning
+from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import RateLimitError, WorktreeError
@@ -28,6 +29,9 @@ from loom_tools.shepherd.phases.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Default timeout for test verification (seconds)
+_TEST_VERIFY_TIMEOUT = 300
 
 
 class BuilderPhase:
@@ -195,6 +199,11 @@ class BuilderPhase:
                 data={"exit_code": exit_code, "diagnostics": diag},
             )
 
+        # Run test verification in worktree
+        test_result = self._run_test_verification(ctx)
+        if test_result is not None and test_result.status == PhaseStatus.FAILED:
+            return test_result
+
         # Validate phase
         if not self.validate(ctx):
             # Cleanup stale worktree
@@ -305,6 +314,148 @@ class BuilderPhase:
         ctx.report_milestone(
             "heartbeat",
             action=f"issue quality: {len(result.warnings)} warning(s), {len(result.infos)} info(s)",
+        )
+
+    def _detect_test_command(self, worktree: Path) -> tuple[list[str], str] | None:
+        """Detect the appropriate test command for the project in the worktree.
+
+        Returns a tuple of (command_args, display_name) or None if no test runner
+        is detected.
+        """
+        if (worktree / "package.json").is_file():
+            try:
+                pkg = json.loads((worktree / "package.json").read_text())
+                scripts = pkg.get("scripts", {})
+                # Prefer check:ci > test > check
+                if "check:ci" in scripts:
+                    return (["pnpm", "check:ci"], "pnpm check:ci")
+                if "test" in scripts:
+                    return (["pnpm", "test"], "pnpm test")
+                if "check" in scripts:
+                    return (["pnpm", "check"], "pnpm check")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        if (worktree / "Cargo.toml").is_file():
+            return (["cargo", "test", "--workspace"], "cargo test --workspace")
+
+        if (worktree / "pyproject.toml").is_file():
+            return (["python", "-m", "pytest"], "pytest")
+
+        return None
+
+    def _parse_test_summary(self, output: str) -> str | None:
+        """Extract a brief test summary from command output.
+
+        Looks for common test result patterns and returns a compact summary.
+        Returns None if no recognizable pattern is found.
+        """
+        lines = output.strip().splitlines()
+
+        # Search from the end for summary lines (most test runners put summary last)
+        for line in reversed(lines):
+            stripped = line.strip()
+            # Strip leading/trailing decoration characters (pytest uses = borders)
+            cleaned = stripped.strip("= ").strip()
+
+            # vitest/jest: "Tests  N passed" or "Test Suites: N passed"
+            if "passed" in stripped.lower() and "test" in stripped.lower():
+                return stripped
+
+            # cargo test: "test result: ok. N passed; 0 failed"
+            if stripped.startswith("test result:"):
+                return stripped
+
+            # pytest: "N passed in Xs" or "N passed, N failed" (with = border)
+            if cleaned and "passed" in cleaned and ("in " in cleaned or "failed" in cleaned):
+                return cleaned
+
+        return None
+
+    def _run_test_verification(self, ctx: ShepherdContext) -> PhaseResult | None:
+        """Run test verification in the worktree after builder completes.
+
+        Returns None if tests pass or cannot be run (no test runner detected).
+        Returns a PhaseResult with FAILED status if tests fail.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return None
+
+        test_info = self._detect_test_command(ctx.worktree_path)
+        if test_info is None:
+            log_info("No test runner detected in worktree, skipping test verification")
+            return None
+
+        test_cmd, display_name = test_info
+        log_info(f"Running tests: {display_name}")
+        ctx.report_milestone("heartbeat", action=f"verifying tests: {display_name}")
+
+        test_start = time.time()
+        try:
+            result = subprocess.run(
+                test_cmd,
+                cwd=ctx.worktree_path,
+                text=True,
+                capture_output=True,
+                timeout=_TEST_VERIFY_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = int(time.time() - test_start)
+            log_error(f"Tests timed out after {elapsed}s ({display_name})")
+            ctx.report_milestone(
+                "heartbeat",
+                action=f"test verification timed out after {elapsed}s",
+            )
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=f"test verification timed out after {elapsed}s ({display_name})",
+                phase_name="builder",
+            )
+        except OSError as e:
+            log_warning(f"Could not run tests ({display_name}): {e}")
+            return None
+
+        elapsed = int(time.time() - test_start)
+
+        if result.returncode == 0:
+            summary = self._parse_test_summary(
+                result.stdout + "\n" + result.stderr
+            )
+            if summary:
+                log_success(f"Tests passed ({summary}, {elapsed}s)")
+            else:
+                log_success(f"Tests passed ({elapsed}s)")
+            ctx.report_milestone(
+                "heartbeat",
+                action=f"tests passed ({elapsed}s)",
+            )
+            return None
+
+        # Tests failed
+        summary = self._parse_test_summary(
+            result.stdout + "\n" + result.stderr
+        )
+        # Log last few lines of output for context
+        combined = (result.stdout + "\n" + result.stderr).strip()
+        tail_lines = combined.splitlines()[-10:]
+        tail_text = "\n".join(tail_lines)
+
+        if summary:
+            log_error(f"Tests failed ({summary}, {elapsed}s)")
+        else:
+            log_error(f"Tests failed (exit code {result.returncode}, {elapsed}s)")
+
+        log_info(f"Test output (last 10 lines):\n{tail_text}")
+        ctx.report_milestone(
+            "heartbeat",
+            action=f"test verification failed ({elapsed}s)",
+        )
+
+        return PhaseResult(
+            status=PhaseStatus.FAILED,
+            message=f"test verification failed ({display_name}, exit code {result.returncode})",
+            phase_name="builder",
         )
 
     def _is_rate_limited(self, ctx: ShepherdContext) -> bool:
