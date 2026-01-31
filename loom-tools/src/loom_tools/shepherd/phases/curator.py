@@ -6,14 +6,16 @@ from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.labels import add_issue_label, remove_issue_label
 from loom_tools.shepherd.phases.base import (
+    BasePhase,
     PhaseResult,
-    PhaseStatus,
     run_phase_with_retry,
 )
 
 
-class CuratorPhase:
+class CuratorPhase(BasePhase):
     """Phase 1: Curator - Enhance issue with implementation guidance."""
+
+    phase_name = "curator"
 
     def should_skip(self, ctx: ShepherdContext) -> tuple[bool, str]:
         """Check if curator phase should be skipped.
@@ -36,11 +38,7 @@ class CuratorPhase:
         """Run curator phase."""
         # Check for shutdown
         if ctx.check_shutdown():
-            return PhaseResult(
-                status=PhaseStatus.SHUTDOWN,
-                message="shutdown signal detected",
-                phase_name="curator",
-            )
+            return self.shutdown("shutdown signal detected")
 
         # Report phase entry
         ctx.report_milestone("phase_entered", phase="curator")
@@ -57,36 +55,20 @@ class CuratorPhase:
         )
 
         if exit_code == 3:
-            return PhaseResult(
-                status=PhaseStatus.SHUTDOWN,
-                message="shutdown signal detected during curator",
-                phase_name="curator",
-            )
+            return self.shutdown("shutdown signal detected during curator")
 
         if exit_code == 4:
             # Curator stuck - not critical, can proceed
-            return PhaseResult(
-                status=PhaseStatus.SKIPPED,
-                message="curator stuck after retry - skipping curation",
-                phase_name="curator",
-            )
+            return self.skipped("curator stuck after retry - skipping curation")
 
         # Validate phase
         if not self.validate(ctx):
-            return PhaseResult(
-                status=PhaseStatus.FAILED,
-                message="curator phase validation failed",
-                phase_name="curator",
-            )
+            return self.failed("curator phase validation failed")
 
         # Belt-and-suspenders: ensure loom:curating is removed
         remove_issue_label(ctx.config.issue, "loom:curating", ctx.repo_root)
 
-        return PhaseResult(
-            status=PhaseStatus.SUCCESS,
-            message="curator phase complete",
-            phase_name="curator",
-        )
+        return self.success("curator phase complete")
 
     def validate(self, ctx: ShepherdContext) -> bool:
         """Validate curator phase contract.
