@@ -609,8 +609,22 @@ Modify `builder.py` to add validation.
 class TestBuilderTestVerification:
     """Test builder phase test verification."""
 
+    def test_detect_test_command_pnpm_check_ci_lite(self, tmp_path: Path) -> None:
+        """Should prefer pnpm check:ci:lite over check:ci when both available."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {
+            "check:ci:lite": "pnpm lint && pnpm test",
+            "check:ci": "pnpm lint && pnpm build && pnpm test",
+            "test": "vitest",
+        }}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        assert result == (["pnpm", "check:ci:lite"], "pnpm check:ci:lite")
+
     def test_detect_test_command_pnpm_check_ci(self, tmp_path: Path) -> None:
-        """Should detect pnpm check:ci when available in package.json."""
+        """Should detect pnpm check:ci when check:ci:lite not available."""
         builder = BuilderPhase()
         pkg = {"scripts": {"check:ci": "pnpm lint && pnpm test", "test": "vitest"}}
         (tmp_path / "package.json").write_text(json.dumps(pkg))
@@ -620,7 +634,7 @@ class TestBuilderTestVerification:
         assert result == (["pnpm", "check:ci"], "pnpm check:ci")
 
     def test_detect_test_command_pnpm_test(self, tmp_path: Path) -> None:
-        """Should detect pnpm test when no check:ci available."""
+        """Should detect pnpm test when no check:ci or check:ci:lite available."""
         builder = BuilderPhase()
         pkg = {"scripts": {"test": "vitest"}}
         (tmp_path / "package.json").write_text(json.dumps(pkg))
