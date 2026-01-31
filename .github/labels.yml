@@ -47,6 +47,10 @@
   description: "PR has merge conflicts requiring resolution"
   color: "DC2626"  # red-600 - indicates broken state
 
+- name: loom:auto-merge-ok
+  description: Override size limit for auto-merge (applied by Judge or human)
+  color: "10B981"  # emerald-500 - signals safe to proceed
+
 - name: loom:ci-failure
   description: "PR has failing CI checks"
   color: "DC2626"  # red-600 - indicates broken state
