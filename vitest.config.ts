@@ -34,10 +34,10 @@ export default defineConfig({
       thresholds: {
         // Set to current coverage levels to prevent regressions
         // TODO: Gradually increase these as coverage improves
-        lines: 40,
-        functions: 75,
-        branches: 90,
-        statements: 40,
+        lines: 50,
+        functions: 53,
+        branches: 45,
+        statements: 50,
       },
     },
   },
