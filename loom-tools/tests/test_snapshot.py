@@ -953,6 +953,51 @@ class TestHealth:
         assert status == "degraded"
         assert all(w["level"] == "info" for w in warnings)
 
+    def test_ci_failing(self) -> None:
+        """CI failing generates a warning."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            ci_status={"status": "failing", "failed_runs": ["CI"], "message": "CI failing on main"},
+        )
+        assert status == "stalled"
+        assert any(w["code"] == "ci_failing" for w in warnings)
+        assert any("CI failing" in w["message"] for w in warnings)
+
+    def test_ci_passing_no_warning(self) -> None:
+        """CI passing does not generate a warning."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            ci_status={"status": "passing", "failed_runs": [], "message": "CI passing"},
+        )
+        assert status == "healthy"
+        assert not any(w["code"] == "ci_failing" for w in warnings)
+
+    def test_ci_unknown_no_warning(self) -> None:
+        """Unknown CI status does not generate a warning."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            ci_status={"status": "unknown", "message": "Unable to check"},
+        )
+        assert status == "healthy"
+        assert not any(w["code"] == "ci_failing" for w in warnings)
+
+    def test_ci_none_no_warning(self) -> None:
+        """None CI status does not generate a warning."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            ci_status=None,
+        )
+        assert status == "healthy"
+        assert not any(w["code"] == "ci_failing" for w in warnings)
+
 
 # ---------------------------------------------------------------------------
 # Tmux pool detection
@@ -1042,7 +1087,7 @@ class TestBuildSnapshot:
             "timestamp", "pipeline", "proposals", "prs",
             "shepherds", "validation", "support_roles",
             "pipeline_health", "systematic_failure",
-            "preflight", "usage", "tmux_pool", "computed", "config",
+            "preflight", "usage", "ci_status", "tmux_pool", "computed", "config",
         }
         assert set(snapshot.keys()) == expected_sections
 

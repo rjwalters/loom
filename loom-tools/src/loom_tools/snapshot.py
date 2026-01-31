@@ -28,7 +28,7 @@ from typing import Any, Sequence
 
 import shutil
 
-from loom_tools.common.github import gh_parallel_queries
+from loom_tools.common.github import gh_parallel_queries, gh_get_default_branch_ci_status
 from loom_tools.common.logging import log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_daemon_state, read_progress_files
@@ -65,6 +65,8 @@ class SnapshotConfig:
     # Systematic failure auto-clear configuration
     systematic_failure_cooldown: int = 1800  # 30 minutes before probe
     systematic_failure_max_probes: int = 3  # Max probes before giving up
+    # CI health check configuration
+    ci_health_check_enabled: bool = True  # Enable CI status monitoring
 
     @classmethod
     def from_env(cls) -> SnapshotConfig:
@@ -97,6 +99,7 @@ class SnapshotConfig:
             systematic_failure_threshold=_int("LOOM_SYSTEMATIC_FAILURE_THRESHOLD", 3),
             systematic_failure_cooldown=_int("LOOM_SYSTEMATIC_FAILURE_COOLDOWN", 1800),
             systematic_failure_max_probes=_int("LOOM_SYSTEMATIC_FAILURE_MAX_PROBES", 3),
+            ci_health_check_enabled=os.environ.get("LOOM_CI_HEALTH_CHECK", "true").lower() not in ("false", "0", "no"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,6 +201,8 @@ _PR_FIELDS = ["number", "title", "labels", "headRefName"]
 
 def collect_pipeline_data(
     repo_root: pathlib.Path,
+    *,
+    ci_health_check_enabled: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     """Run 9 parallel ``gh`` queries and return raw pipeline data.
 
@@ -205,7 +210,7 @@ def collect_pipeline_data(
         ready_issues, building_issues, blocked_issues,
         architect_proposals, hermit_proposals, curated_issues,
         review_requested, changes_requested, ready_to_merge,
-        usage
+        usage, ci_status
     """
     issue_field_str = ",".join(_ISSUE_FIELDS)
     pr_field_str = ",".join(_PR_FIELDS)
@@ -243,6 +248,11 @@ def collect_pipeline_data(
     # Run usage check separately (it's a script, not a gh query)
     usage = _collect_usage(repo_root)
 
+    # Run CI health check if enabled
+    ci_status: dict[str, Any] = {"status": "unknown", "message": "CI health check disabled"}
+    if ci_health_check_enabled:
+        ci_status = gh_get_default_branch_ci_status()
+
     return {
         "ready_issues": results[0],
         "building_issues": results[1],
@@ -254,6 +264,7 @@ def collect_pipeline_data(
         "changes_requested": results[7],
         "ready_to_merge": results[8],
         "usage": usage,
+        "ci_status": ci_status,
     }
 
 
@@ -829,6 +840,7 @@ def compute_health(
     orphaned_count: int,
     usage_healthy: bool,
     session_percent: float,
+    ci_status: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     """Compute health status and warnings.
 
@@ -882,6 +894,15 @@ def compute_health(
             "code": "session_budget_low",
             "level": "warning",
             "message": f"Session usage at {session_percent}% — nearing budget limit",
+        })
+
+    # ci_failing - CI is broken on the default branch
+    if ci_status and ci_status.get("status") == "failing":
+        failed_runs = ci_status.get("failed_runs", [])
+        warnings.append({
+            "code": "ci_failing",
+            "level": "warning",
+            "message": ci_status.get("message", f"CI failing on main: {len(failed_runs)} workflow(s) failed"),
         })
 
     # Derive status
@@ -986,7 +1007,9 @@ def build_snapshot(
     timestamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     # 1. Collect pipeline data
-    pipeline = _pipeline_data if _pipeline_data is not None else collect_pipeline_data(repo_root)
+    pipeline = _pipeline_data if _pipeline_data is not None else collect_pipeline_data(
+        repo_root, ci_health_check_enabled=cfg.ci_health_check_enabled
+    )
 
     # 2. Sort ready issues
     ready_issues = sort_issues_by_strategy(pipeline["ready_issues"], cfg.issue_strategy)
@@ -999,6 +1022,7 @@ def build_snapshot(
     changes_requested = pipeline["changes_requested"]
     ready_to_merge = pipeline["ready_to_merge"]
     usage = pipeline.get("usage", {"error": "no data"})
+    ci_status = pipeline.get("ci_status", {"status": "unknown", "message": "CI health check not available"})
 
     # 3. Read daemon state
     daemon_state = read_daemon_state(repo_root)
@@ -1119,6 +1143,7 @@ def build_snapshot(
         orphaned_count=orphaned_count,
         usage_healthy=usage_healthy,
         session_percent=session_percent,
+        ci_status=ci_status,
     )
 
     # 18. Build support_roles output (schema matches shell)
@@ -1189,6 +1214,7 @@ def build_snapshot(
         },
         "preflight": preflight,
         "usage": usage_out,
+        "ci_status": ci_status,
         "tmux_pool": tmux_pool.to_dict(),
         "computed": {
             "total_ready": ready_count,
@@ -1218,6 +1244,7 @@ def build_snapshot(
             "systematic_failure_active": sf.active,
             "health_status": health_status,
             "health_warnings": health_warnings,
+            "ci_failing": ci_status.get("status") == "failing",
         },
         "config": cfg.to_dict(),
     }
@@ -1303,6 +1330,7 @@ ENVIRONMENT VARIABLES:
     LOOM_SYSTEMATIC_FAILURE_THRESHOLD  Consecutive failures to suppress (default: 3)
     LOOM_SYSTEMATIC_FAILURE_COOLDOWN   Seconds before first probe attempt (default: 1800)
     LOOM_SYSTEMATIC_FAILURE_MAX_PROBES Maximum probe attempts (default: 3)
+    LOOM_CI_HEALTH_CHECK               Enable CI status monitoring (default: true)
 """
 
 
