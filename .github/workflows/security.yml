@@ -4,8 +4,17 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'Cargo.lock'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/security.yml'
   schedule:
     - cron: '0 0 * * 0'  # Weekly on Sunday
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   cargo-audit:
@@ -34,6 +43,8 @@ jobs:
 
   codeql:
     name: CodeQL Analysis
+    # Only run on push to main and weekly schedule, not on PRs
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
     permissions:
       security-events: write
