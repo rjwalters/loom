@@ -18,6 +18,7 @@ loom-stuck-detection = "loom_tools.stuck_detection:main"
 loom-claim = "loom_tools.claim:main"
 loom-check-completions = "loom_tools.completions:main"
 loom-clean = "loom_tools.clean:main"
+loom-milestone = "loom_tools.milestones:main"
 loom-worktree = "loom_tools.worktree:main"
 
 [tool.setuptools.packages.find]
