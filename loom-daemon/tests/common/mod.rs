@@ -350,10 +350,23 @@ pub fn cleanup_all_loom_sessions() {
     }
 }
 
+/// Helper: Check if the tmux server is running
+#[allow(dead_code)]
+pub fn tmux_server_running() -> bool {
+    Command::new("tmux")
+        .args(["-L", "loom", "list-sessions"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 /// Helper: Capture terminal output using tmux capture-pane
 ///
 /// Uses tmux's built-in capture mechanism to read the terminal's pane content.
 /// Returns the captured output as a String.
+///
+/// This function includes retry logic to handle transient tmux server state
+/// issues that can occur during test setup/teardown.
 ///
 /// # Arguments
 /// * `session_name` - The tmux session name to capture from
@@ -362,14 +375,38 @@ pub fn cleanup_all_loom_sessions() {
 /// * `Result<String>` - The captured output or an error message
 #[allow(dead_code)]
 pub fn capture_terminal_output(session_name: &str) -> Result<String> {
-    let output = Command::new("tmux")
-        .args(["-L", "loom", "capture-pane", "-t", session_name, "-p"])
-        .output()
-        .context("Failed to execute tmux capture-pane")?;
+    const MAX_RETRIES: u32 = 3;
+    const RETRY_DELAY_MS: u64 = 100;
 
-    if !output.status.success() {
-        anyhow::bail!("tmux capture-pane failed: {}", String::from_utf8_lossy(&output.stderr));
+    let mut last_error = String::new();
+
+    for attempt in 0..MAX_RETRIES {
+        // First verify the session exists
+        if !tmux_session_exists(session_name) {
+            last_error = format!("tmux session '{session_name}' does not exist");
+            if attempt < MAX_RETRIES - 1 {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+                continue;
+            }
+            anyhow::bail!("{last_error}");
+        }
+
+        let output = Command::new("tmux")
+            .args(["-L", "loom", "capture-pane", "-t", session_name, "-p"])
+            .output()
+            .context("Failed to execute tmux capture-pane")?;
+
+        if output.status.success() {
+            return String::from_utf8(output.stdout).context("Invalid UTF-8 in captured output");
+        }
+
+        last_error = String::from_utf8_lossy(&output.stderr).to_string();
+
+        // If this is not the last attempt, wait and retry
+        if attempt < MAX_RETRIES - 1 {
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+        }
     }
 
-    String::from_utf8(output.stdout).context("Invalid UTF-8 in captured output")
+    anyhow::bail!("tmux capture-pane failed after {MAX_RETRIES} attempts: {last_error}")
 }
