@@ -35,6 +35,25 @@ DEFAULT_POLL_INTERVAL=5
 MIN_IDLE_ELAPSED=10             # Minimum seconds before idle prompt detection activates
 IDLE_PROMPT_CONFIRM_COUNT=2     # Consecutive idle observations required before declaring completion
 
+# Get the age of a tmux session in seconds (time since creation).
+# Returns the age, or -1 if the session doesn't exist or age can't be determined.
+get_session_age() {
+    local session_name="$1"
+
+    # tmux session_created gives epoch timestamp of when the session was created
+    local created_at
+    created_at=$(tmux -L "$TMUX_SOCKET" display-message -t "$session_name" -p '#{session_created}' 2>/dev/null || echo "")
+
+    if [[ -z "$created_at" ]] || [[ "$created_at" == "0" ]]; then
+        echo "-1"
+        return
+    fi
+
+    local now
+    now=$(date +%s)
+    echo $((now - created_at))
+}
+
 # Find repository root (for log file access)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -354,13 +373,26 @@ main() {
         #   triggering on a brief prompt flash between tool calls
         #
         # Special case: --timeout 0 (non-blocking mode)
-        #   The daemon calls with --timeout 0 long after the agent started, so the
-        #   per-invocation elapsed guard and confirmation count are unnecessary.
-        #   A single idle prompt observation is sufficient.
+        #   A single idle prompt observation is sufficient, but we still enforce
+        #   MIN_IDLE_ELAPSED against the tmux session's creation time to prevent
+        #   false positives on freshly created/restarted sessions (issue #1792).
         elapsed=$(( $(date +%s) - start_time ))
         if [[ "$timeout" -eq 0 ]]; then
-            # Non-blocking: single check, no guards (daemon already ensured agent ran)
-            if check_idle_prompt "$session_name"; then
+            # Non-blocking: single check with session-age guard.
+            # Even though the caller may invoke --timeout 0 long after spawn, the
+            # session itself may be freshly created (e.g., after a restart). Check
+            # the tmux session's age to avoid false-positive idle detection on a
+            # session that hasn't had time to start processing yet (issue #1792).
+            local session_age
+            session_age=$(get_session_age "$session_name")
+
+            if [[ "$session_age" -ge 0 ]] && [[ "$session_age" -lt "$MIN_IDLE_ELAPSED" ]]; then
+                # Session is too young - prompt may be visible before agent starts processing
+                if [[ "$json_output" != "true" ]]; then
+                    log_info "Session '$session_name' is only ${session_age}s old (< ${MIN_IDLE_ELAPSED}s) - skipping idle check"
+                fi
+                # Fall through to timeout check below (which exits immediately for --timeout 0)
+            elif check_idle_prompt "$session_name"; then
                 if [[ "$json_output" == "true" ]]; then
                     echo "{\"status\":\"completed\",\"name\":\"$name\",\"reason\":\"idle_prompt\",\"elapsed\":$elapsed}"
                 else
