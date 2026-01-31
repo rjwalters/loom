@@ -135,17 +135,6 @@ command_exists() {
     return 1
 }
 
-# Get command location (for verbose output)
-get_command_location() {
-    local cmd="$1"
-
-    if command -v "$cmd" >/dev/null 2>&1; then
-        command -v "$cmd"
-    else
-        echo "python3 -m <module>"
-    fi
-}
-
 # Main validation
 main() {
     # Parse arguments
@@ -244,42 +233,42 @@ main() {
 }
 
 output_json() {
-    local status="$1"
-    local duration_ms="$2"
-    local critical_found="$3"
-    local critical_missing="$4"
-    local optional_found="$5"
-    local optional_missing="$6"
+    local j_status="$1"
+    local j_duration_ms="$2"
+    local cf_json="$3"
+    local cm_json="$4"
+    local of_json="$5"
+    local om_json="$6"
 
     # Handle empty arrays
-    [[ -z "$critical_found" || "$critical_found" == "[]" ]] && critical_found="[]"
-    [[ -z "$critical_missing" || "$critical_missing" == "[]" ]] && critical_missing="[]"
-    [[ -z "$optional_found" || "$optional_found" == "[]" ]] && optional_found="[]"
-    [[ -z "$optional_missing" || "$optional_missing" == "[]" ]] && optional_missing="[]"
+    [[ -z "$cf_json" || "$cf_json" == "[]" ]] && cf_json="[]"
+    [[ -z "$cm_json" || "$cm_json" == "[]" ]] && cm_json="[]"
+    [[ -z "$of_json" || "$of_json" == "[]" ]] && of_json="[]"
+    [[ -z "$om_json" || "$om_json" == "[]" ]] && om_json="[]"
 
     cat << EOF
 {
-  "status": "$status",
-  "duration_ms": $duration_ms,
+  "status": "$j_status",
+  "duration_ms": $j_duration_ms,
   "critical": {
-    "found": $critical_found,
-    "missing": $critical_missing
+    "found": $cf_json,
+    "missing": $cm_json
   },
   "optional": {
-    "found": $optional_found,
-    "missing": $optional_missing
+    "found": $of_json,
+    "missing": $om_json
   }
 }
 EOF
 }
 
 output_text() {
-    local status="$1"
-    local duration_ms="$2"
-    local critical_found="$3"
-    local critical_missing="$4"
-    local optional_found="$5"
-    local optional_missing="$6"
+    local t_status="$1"
+    local t_duration_ms="$2"
+    local cf_str="$3"
+    local cm_str="$4"
+    local of_str="$5"
+    local om_str="$6"
 
     echo "Loom Toolchain Validation"
     echo "========================="
@@ -287,13 +276,13 @@ output_text() {
 
     # Critical commands
     echo "Critical commands:"
-    if [[ -n "$critical_found" ]]; then
-        for cmd in $critical_found; do
+    if [[ -n "$cf_str" ]]; then
+        for cmd in $cf_str; do
             echo -e "  ${GREEN}✓${NC} $cmd"
         done
     fi
-    if [[ -n "$critical_missing" ]]; then
-        for cmd in $critical_missing; do
+    if [[ -n "$cm_str" ]]; then
+        for cmd in $cm_str; do
             echo -e "  ${RED}✗${NC} $cmd (MISSING)"
         done
     fi
@@ -302,13 +291,13 @@ output_text() {
     # Optional commands (if checked)
     if [[ "$QUICK_MODE" != "true" ]]; then
         echo "Optional commands:"
-        if [[ -n "$optional_found" ]]; then
-            for cmd in $optional_found; do
+        if [[ -n "$of_str" ]]; then
+            for cmd in $of_str; do
                 echo -e "  ${GREEN}✓${NC} $cmd"
             done
         fi
-        if [[ -n "$optional_missing" ]]; then
-            for cmd in $optional_missing; do
+        if [[ -n "$om_str" ]]; then
+            for cmd in $om_str; do
                 echo -e "  ${YELLOW}○${NC} $cmd (optional, degraded functionality)"
             done
         fi
@@ -317,9 +306,9 @@ output_text() {
 
     # Summary
     echo "---"
-    echo "Validation completed in ${duration_ms}ms"
+    echo "Validation completed in ${t_duration_ms}ms"
 
-    case "$status" in
+    case "$t_status" in
         ok)
             echo -e "${GREEN}Status: OK${NC} - All commands available"
             ;;
