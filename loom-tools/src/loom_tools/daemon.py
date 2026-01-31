@@ -577,20 +577,112 @@ class DaemonLoop:
             except Exception:
                 pass
 
+    def _rotate_state_python(self) -> None:
+        """Python-native state rotation fallback when shell script fails."""
+        loom_dir = self.repo_root / ".loom"
+        max_archived = int(os.environ.get("LOOM_MAX_ARCHIVED_SESSIONS", "10"))
+
+        # Check if state file has meaningful content
+        try:
+            data = read_json_file(self.state_file)
+        except Exception:
+            self.log("State file unreadable, skipping rotation")
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        # Skip if file is too small or has no useful data
+        file_size = self.state_file.stat().st_size
+        if file_size < 50:
+            self.log(f"State file too small ({file_size} bytes), skipping rotation")
+            return
+
+        iteration = data.get("iteration", 0)
+        has_shepherds = any(
+            isinstance(v, dict) and v.get("issue") is not None
+            for v in data.get("shepherds", {}).values()
+        )
+        has_completed = len(data.get("completed_issues", []))
+
+        if iteration == 0 and not has_shepherds and has_completed == 0:
+            self.log("State file has no useful data, skipping rotation")
+            return
+
+        # Find next session number
+        session_num = 0
+        while (loom_dir / f"{session_num:02d}-daemon-state.json").exists():
+            session_num += 1
+            if session_num >= 100:
+                session_num = 0
+                break
+
+        # Prune old sessions to enforce limit
+        archives = sorted(loom_dir.glob("[0-9][0-9]-daemon-state.json"))
+        to_delete = len(archives) - max_archived + 1
+        if to_delete > 0:
+            for archive in archives[:to_delete]:
+                archive.unlink(missing_ok=True)
+                self.log(f"Pruned old archive: {archive.name}")
+
+        # Add session summary before archiving
+        timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        data["session_summary"] = {
+            "session_id": session_num,
+            "archived_at": timestamp,
+            "issues_completed": has_completed,
+            "prs_merged": data.get("total_prs_merged", 0),
+            "total_iterations": iteration,
+        }
+        write_json_file(self.state_file, data)
+
+        # Rename to archive
+        archive_name = f"{session_num:02d}-daemon-state.json"
+        archive_path = loom_dir / archive_name
+        self.state_file.rename(archive_path)
+        self.log(f"Archived: daemon-state.json -> {archive_name}")
+
     def rotate_state_file(self) -> None:
         """Rotate existing state file if present."""
+        if not self.state_file.exists():
+            return
+
+        self.log("Rotating previous daemon state...")
+
+        # Try shell script first
         rotate_script = self.repo_root / ".loom" / "scripts" / "rotate-daemon-state.sh"
-        if rotate_script.exists() and self.state_file.exists():
-            self.log("Rotating previous daemon state...")
+        if rotate_script.exists():
             try:
-                subprocess.run(
+                result = subprocess.run(
                     [str(rotate_script)],
                     capture_output=True,
                     timeout=30,
                     cwd=self.repo_root,
                 )
+                if result.returncode == 0:
+                    self.log("State rotation complete (shell)")
+                    return
+                stderr = result.stderr.decode("utf-8", errors="replace").strip()
+                self.log(f"Shell rotation failed (exit {result.returncode}): {stderr}")
+            except subprocess.TimeoutExpired:
+                self.log("Shell rotation timed out")
+            except Exception as exc:
+                self.log(f"Shell rotation error: {exc}")
+
+        # Fallback to Python-native rotation
+        self.log("Using Python fallback for state rotation...")
+        try:
+            self._rotate_state_python()
+        except Exception as exc:
+            self.log(f"Python rotation also failed: {exc}")
+            # Last resort: copy state file with timestamp so it's not lost
+            try:
+                timestamp = now_utc().strftime("%Y%m%d-%H%M%S")
+                backup = self.repo_root / ".loom" / f"daemon-state-{timestamp}.json.bak"
+                shutil.copy2(self.state_file, backup)
+                self.log(f"Emergency backup saved: {backup.name}")
             except Exception:
-                pass
+                self.log("WARNING: Could not preserve previous daemon state")
 
     def archive_metrics_file(self) -> None:
         """Archive metrics file if it has meaningful data."""
