@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 
 from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file, safe_parse_json, write_json_file
 from loom_tools.common.time_utils import parse_iso_timestamp
@@ -62,7 +63,7 @@ def check_pr_merged(issue_num: int) -> PRStatus:
     Returns:
         PRStatus with status and optional merged_at timestamp.
     """
-    branch_name = f"feature/issue-{issue_num}"
+    branch_name = NamingConventions.branch_name(issue_num)
 
     # Find PR by head branch
     try:
@@ -186,16 +187,17 @@ def update_cleanup_state(
         issue_num: Issue number.
         status: One of "cleaned", "pending", "error".
     """
-    state_file = repo_root / ".loom" / "daemon-state.json"
+    paths = LoomPaths(repo_root)
 
-    if not state_file.exists():
+    if not paths.daemon_state_file.exists():
         return
 
-    data = read_json_file(state_file)
+    data = read_json_file(paths.daemon_state_file)
     if not isinstance(data, dict):
         return
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    worktree_name = NamingConventions.worktree_name(issue_num)
 
     # Initialize cleanup section if needed
     if "cleanup" not in data:
@@ -209,19 +211,19 @@ def update_cleanup_state(
     cleanup = data["cleanup"]
 
     if status == "cleaned":
-        cleanup["lastCleaned"] = cleanup.get("lastCleaned", []) + [f"issue-{issue_num}"]
+        cleanup["lastCleaned"] = cleanup.get("lastCleaned", []) + [worktree_name]
         cleanup["lastRun"] = timestamp
     elif status == "pending":
         pending = cleanup.get("pendingCleanup", [])
-        if f"issue-{issue_num}" not in pending:
-            pending.append(f"issue-{issue_num}")
+        if worktree_name not in pending:
+            pending.append(worktree_name)
         cleanup["pendingCleanup"] = pending
     elif status == "error":
         errors = cleanup.get("errors", [])
         errors.append({"issue": issue_num, "timestamp": timestamp})
         cleanup["errors"] = errors
 
-    write_json_file(state_file, data)
+    write_json_file(paths.daemon_state_file, data)
 
 
 def cleanup_worktree(
@@ -235,7 +237,7 @@ def cleanup_worktree(
     Returns:
         True if cleanup succeeded, False otherwise.
     """
-    branch_name = f"feature/issue-{issue_num}"
+    branch_name = NamingConventions.branch_name(issue_num)
 
     if dry_run:
         log_info(f"Would remove: {worktree_path}")
@@ -296,22 +298,20 @@ def clean_worktrees(
     grace_period: int = DEFAULT_GRACE_PERIOD,
 ) -> None:
     """Clean up worktrees for closed issues."""
-    worktrees_dir = repo_root / ".loom" / "worktrees"
+    paths = LoomPaths(repo_root)
 
-    if not worktrees_dir.is_dir():
+    if not paths.worktrees_dir.is_dir():
         log_info("No worktrees directory found")
         return
 
-    for worktree_dir in sorted(worktrees_dir.glob("issue-*")):
+    for worktree_dir in sorted(paths.worktrees_dir.glob(f"{NamingConventions.WORKTREE_PREFIX}*")):
         if not worktree_dir.is_dir():
             continue
 
         # Extract issue number
-        match = re.match(r"issue-(\d+)", worktree_dir.name)
-        if not match:
+        issue_num = NamingConventions.issue_from_worktree(worktree_dir.name)
+        if issue_num is None:
             continue
-
-        issue_num = int(match.group(1))
         worktree_path = worktree_dir.resolve()
 
         print(f"Checking worktree: issue-{issue_num}")
@@ -475,7 +475,7 @@ def clean_branches(
     feature_branches = []
     for branch in branches:
         branch = branch.strip().lstrip("* ")
-        if branch.startswith("feature/issue-"):
+        if branch.startswith(NamingConventions.BRANCH_PREFIX):
             feature_branches.append(branch)
 
     if not feature_branches:
@@ -484,11 +484,9 @@ def clean_branches(
 
     for branch in feature_branches:
         # Extract issue number
-        match = re.search(r"issue-(\d+)", branch)
-        if not match:
+        issue_num = NamingConventions.issue_from_branch(branch)
+        if issue_num is None:
             continue
-
-        issue_num = int(match.group(1))
 
         # Check issue status
         try:

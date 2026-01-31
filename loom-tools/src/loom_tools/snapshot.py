@@ -30,6 +30,7 @@ import shutil
 
 from loom_tools.common.github import gh_parallel_queries, gh_get_default_branch_ci_status
 from loom_tools.common.logging import log_warning
+from loom_tools.common.paths import LoomPaths
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import (
     parse_command_output,
@@ -282,7 +283,8 @@ def _has_label(item: dict[str, Any], label: str) -> bool:
 
 def _collect_usage(repo_root: pathlib.Path) -> dict[str, Any]:
     """Run check-usage.sh and return its JSON output."""
-    script = repo_root / ".loom" / "scripts" / "check-usage.sh"
+    paths = LoomPaths(repo_root)
+    script = paths.scripts_dir / "check-usage.sh"
     if not script.exists():
         return {"error": "check-usage.sh not found"}
     try:

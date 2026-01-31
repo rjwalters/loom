@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.state import parse_command_output, read_json_file
 from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
 from loom_tools.shepherd.config import Phase
@@ -630,12 +631,8 @@ class BuilderPhase:
 
     def _get_log_path(self, ctx: ShepherdContext) -> Path:
         """Return the expected builder log file path."""
-        return (
-            ctx.repo_root
-            / ".loom"
-            / "logs"
-            / f"loom-builder-issue-{ctx.config.issue}.log"
-        )
+        paths = LoomPaths(ctx.repo_root)
+        return paths.builder_log_file(ctx.config.issue)
 
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info about the builder environment.
@@ -708,7 +705,7 @@ class BuilderPhase:
             diag["has_uncommitted_changes"] = False
 
         # -- Remote branch ---------------------------------------------------
-        branch_name = f"feature/issue-{ctx.config.issue}"
+        branch_name = NamingConventions.branch_name(ctx.config.issue)
         ls_res = subprocess.run(
             ["git", "ls-remote", "--heads", "origin", branch_name],
             cwd=ctx.repo_root,
