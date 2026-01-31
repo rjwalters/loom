@@ -205,6 +205,7 @@ class TestBuilderPhase:
             patch.object(builder, "validate", return_value=True),
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_run_test_verification", return_value=None),
         ):
             result = builder.run(mock_context)
 
@@ -235,6 +236,7 @@ class TestBuilderPhase:
             patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
             patch.object(builder, "_create_worktree_marker"),
             patch.object(builder, "_cleanup_stale_worktree"),
+            patch.object(builder, "_run_test_verification", return_value=None),
         ):
             result = builder.run(mock_context)
 
