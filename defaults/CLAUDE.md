@@ -393,6 +393,9 @@ Agents coordinate work through GitHub labels. This enables autonomous operation 
 - **`loom:auditor`**: Bug discovered by Auditor during main branch validation
 - **`loom:curated`**: Issue enhanced by Curator, awaiting Champion evaluation
 
+**Override Labels**:
+- **`loom:auto-merge-ok`**: Override size limit for auto-merge (applied by Judge or human)
+
 **Status Labels**:
 - **`loom:blocked`**: Implementation blocked, needs help or clarification
 - **`loom:urgent`**: Critical issue requiring immediate attention
@@ -572,9 +575,20 @@ Configuration is stored in `.loom/config.json` (gitignored, local to your machin
         "intervalPrompt": ""
       }
     }
-  ]
+  ],
+  "champion": {
+    "auto_merge_max_lines": 500
+  }
 }
 ```
+
+**Champion Configuration**:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `champion.auto_merge_max_lines` | 200 | Maximum total lines changed (additions + deletions) for auto-merge in normal mode. Set higher to allow larger PRs to auto-merge without resorting to force mode. |
+
+The size limit can also be bypassed per-PR by adding the `loom:auto-merge-ok` label (applied by Judge or human to signal a large PR is safe to auto-merge). In force mode (`--merge`), the size limit is waived entirely.
 
 ### Daemon Configuration (Layer 2)
 
