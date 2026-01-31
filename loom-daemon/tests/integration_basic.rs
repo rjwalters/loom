@@ -66,9 +66,9 @@ async fn test_create_terminal() {
         .await
         .expect("Failed to connect");
 
-    // Create terminal
+    // Create terminal with unique ID to avoid conflicts with concurrent test binaries
     let terminal_id = client
-        .create_terminal("test-terminal", None)
+        .create_terminal_with_unique_id("test-terminal", None)
         .await
         .expect("Failed to create terminal");
 
@@ -99,9 +99,9 @@ async fn test_create_terminal_with_working_dir() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let working_dir = temp_dir.path().to_str().unwrap().to_string();
 
-    // Create terminal with working directory
+    // Create terminal with unique ID to avoid conflicts with concurrent test binaries
     let terminal_id = client
-        .create_terminal("test-terminal-wd", Some(working_dir.clone()))
+        .create_terminal_with_unique_id("test-terminal-wd", Some(working_dir.clone()))
         .await
         .expect("Failed to create terminal");
 
@@ -155,17 +155,17 @@ async fn test_list_terminals() {
         .expect("Failed to list terminals");
     assert_eq!(terminals.len(), 0, "Should start with no terminals");
 
-    // Create 3 terminals
+    // Create 3 terminals with unique IDs to avoid conflicts with concurrent test binaries
     let id1 = client
-        .create_terminal("terminal-1", None)
+        .create_terminal_with_unique_id("terminal-1", None)
         .await
         .expect("Failed to create terminal 1");
     let id2 = client
-        .create_terminal("terminal-2", None)
+        .create_terminal_with_unique_id("terminal-2", None)
         .await
         .expect("Failed to create terminal 2");
     let id3 = client
-        .create_terminal("terminal-3", None)
+        .create_terminal_with_unique_id("terminal-3", None)
         .await
         .expect("Failed to create terminal 3");
 
@@ -210,9 +210,9 @@ async fn test_destroy_terminal() {
         .await
         .expect("Failed to connect");
 
-    // Create terminal
+    // Create terminal with unique ID to avoid conflicts with concurrent test binaries
     let terminal_id = client
-        .create_terminal("test-terminal", None)
+        .create_terminal_with_unique_id("test-terminal", None)
         .await
         .expect("Failed to create terminal");
 
@@ -273,9 +273,9 @@ async fn test_send_input() {
         .await
         .expect("Failed to connect");
 
-    // Create terminal
+    // Create terminal with unique ID to avoid conflicts with concurrent test binaries
     let terminal_id = client
-        .create_terminal("test-terminal", None)
+        .create_terminal_with_unique_id("test-terminal", None)
         .await
         .expect("Failed to create terminal");
 
@@ -323,17 +323,17 @@ async fn test_multiple_clients() {
     client2.ping().await.expect("Client 2 ping failed");
     client3.ping().await.expect("Client 3 ping failed");
 
-    // Each client creates a terminal
+    // Each client creates a terminal with unique IDs to avoid conflicts
     let id1 = client1
-        .create_terminal("terminal-1", None)
+        .create_terminal_with_unique_id("terminal-1", None)
         .await
         .expect("Client 1 create failed");
     let id2 = client2
-        .create_terminal("terminal-2", None)
+        .create_terminal_with_unique_id("terminal-2", None)
         .await
         .expect("Client 2 create failed");
     let id3 = client3
-        .create_terminal("terminal-3", None)
+        .create_terminal_with_unique_id("terminal-3", None)
         .await
         .expect("Client 3 create failed");
 
