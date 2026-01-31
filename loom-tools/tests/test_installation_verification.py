@@ -179,9 +179,11 @@ class TestWrapperScriptRouting:
         assert script.exists(), "health-check.sh not found"
 
         content = script.read_text()
-        assert "loom-health-monitor" in content, (
-            "health-check.sh doesn't delegate to loom-health-monitor"
-        )
+        # Accept either direct command reference or run_loom_tool helper
+        assert (
+            "loom-health-monitor" in content
+            or 'run_loom_tool "health-monitor"' in content
+        ), "health-check.sh doesn't delegate to loom-health-monitor"
 
     def test_daemon_cleanup_delegates_to_python(
         self, defaults_dir: pathlib.Path
@@ -191,9 +193,11 @@ class TestWrapperScriptRouting:
         assert script.exists(), "daemon-cleanup.sh not found"
 
         content = script.read_text()
-        assert "loom-daemon-cleanup" in content, (
-            "daemon-cleanup.sh doesn't delegate to loom-daemon-cleanup"
-        )
+        # Accept either direct command reference or run_loom_tool helper
+        assert (
+            "loom-daemon-cleanup" in content
+            or 'run_loom_tool "daemon-cleanup"' in content
+        ), "daemon-cleanup.sh doesn't delegate to loom-daemon-cleanup"
 
     def test_cli_wrapper_health_routes_to_python(
         self, defaults_dir: pathlib.Path
