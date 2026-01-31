@@ -171,19 +171,16 @@ class TestWrapperScriptRouting:
             "loom-shepherd.sh doesn't check PATH for system-installed command"
         )
 
-    def test_health_check_uses_python_snapshot(
+    def test_health_check_delegates_to_python(
         self, defaults_dir: pathlib.Path
     ) -> None:
-        """health-check.sh should use Python loom_tools.snapshot."""
+        """health-check.sh should delegate to Python loom-health-monitor."""
         script = defaults_dir / "scripts" / "health-check.sh"
         assert script.exists(), "health-check.sh not found"
 
         content = script.read_text()
-        assert "loom_tools.snapshot" in content, (
-            "health-check.sh doesn't reference loom_tools.snapshot"
-        )
-        assert "loom-tools/.venv/bin/python3" in content, (
-            "health-check.sh doesn't check for venv Python"
+        assert "loom-health-monitor" in content, (
+            "health-check.sh doesn't delegate to loom-health-monitor"
         )
 
     def test_daemon_cleanup_delegates_to_python(
