@@ -247,20 +247,19 @@ class BuilderPhase:
     def validate(self, ctx: ShepherdContext) -> bool:
         """Validate builder phase contract.
 
-        Uses validate-phase.sh for comprehensive validation with recovery.
+        Calls the Python validate_phase module directly for comprehensive
+        validation with recovery.
         """
-        args = ["builder", str(ctx.config.issue)]
+        from loom_tools.validate_phase import validate_phase
 
-        if ctx.worktree_path:
-            args.extend(["--worktree", str(ctx.worktree_path)])
-
-        args.extend(["--task-id", ctx.config.task_id])
-
-        try:
-            ctx.run_script("validate-phase.sh", args, check=True)
-            return True
-        except subprocess.CalledProcessError:
-            return False
+        result = validate_phase(
+            phase="builder",
+            issue=ctx.config.issue,
+            repo_root=ctx.repo_root,
+            worktree=str(ctx.worktree_path) if ctx.worktree_path else None,
+            task_id=ctx.config.task_id,
+        )
+        return result.satisfied
 
     def _fetch_issue_body(self, ctx: ShepherdContext) -> str | None:
         """Fetch the issue body from GitHub.
