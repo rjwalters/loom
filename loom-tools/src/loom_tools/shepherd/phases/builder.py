@@ -6,9 +6,14 @@ import json
 import subprocess
 from pathlib import Path
 
+from loom_tools.common.logging import log_info, log_warning
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import RateLimitError, WorktreeError
+from loom_tools.shepherd.issue_quality import (
+    Severity,
+    validate_issue_quality,
+)
 from loom_tools.shepherd.labels import (
     add_issue_label,
     get_pr_for_issue,
@@ -112,6 +117,9 @@ class BuilderPhase:
         add_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
+        # Pre-flight issue quality validation (informational only)
+        self._run_quality_validation(ctx)
+
         # Create worktree
         if ctx.worktree_path and not ctx.worktree_path.is_dir():
             try:
@@ -212,6 +220,60 @@ class BuilderPhase:
             return True
         except subprocess.CalledProcessError:
             return False
+
+    def _fetch_issue_body(self, ctx: ShepherdContext) -> str | None:
+        """Fetch the issue body from GitHub.
+
+        Returns the issue body text, or None if the fetch fails.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    str(ctx.config.issue),
+                    "--json",
+                    "body",
+                    "--jq",
+                    ".body",
+                ],
+                cwd=ctx.repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return result.stdout
+        except OSError:
+            pass
+        return None
+
+    def _run_quality_validation(self, ctx: ShepherdContext) -> None:
+        """Run pre-flight quality validation on the issue body.
+
+        Logs warnings for quality issues but never blocks the builder.
+        """
+        body = self._fetch_issue_body(ctx)
+        if body is None:
+            return
+
+        result = validate_issue_quality(body)
+
+        if not result.findings:
+            log_info(f"Issue #{ctx.config.issue} passed pre-flight quality checks")
+            return
+
+        for finding in result.findings:
+            if finding.severity == Severity.WARNING:
+                log_warning(f"Issue #{ctx.config.issue} quality: {finding.message}")
+            else:
+                log_info(f"Issue #{ctx.config.issue} quality: {finding.message}")
+
+        ctx.report_milestone(
+            "heartbeat",
+            action=f"issue quality: {len(result.warnings)} warning(s), {len(result.infos)} info(s)",
+        )
 
     def _is_rate_limited(self, ctx: ShepherdContext) -> bool:
         """Check if Claude API usage is too high."""
