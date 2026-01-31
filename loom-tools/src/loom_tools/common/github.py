@@ -96,3 +96,62 @@ def gh_parallel_queries(
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = [pool.submit(_run, q[0] if isinstance(q, tuple) else q) for q in queries]
         return [f.result() for f in futures]
+
+
+def gh_get_default_branch_ci_status() -> dict[str, Any]:
+    """Get CI status for the default branch's latest workflow runs.
+
+    Returns a dict with:
+        - status: "passing", "failing", or "unknown"
+        - failed_runs: list of failed workflow run names
+        - total_runs: total recent workflow runs checked
+        - message: human-readable summary
+    """
+    try:
+        # Get recent workflow runs on the default branch
+        result = gh_run(
+            ["run", "list", "--branch", "main", "--limit", "5", "--json",
+             "name,conclusion,status,headBranch"],
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return {"status": "unknown", "failed_runs": [], "total_runs": 0, "message": "Unable to check CI status"}
+
+        runs = json.loads(result.stdout)
+        if not runs:
+            return {"status": "unknown", "failed_runs": [], "total_runs": 0, "message": "No recent workflow runs found"}
+
+        # Group by workflow name, keep only the most recent run for each workflow
+        latest_by_name: dict[str, dict[str, Any]] = {}
+        for run in runs:
+            name = run.get("name", "Unknown")
+            if name not in latest_by_name:
+                latest_by_name[name] = run
+
+        # Check for failures (excluding in-progress runs)
+        failed_runs = []
+        for name, run in latest_by_name.items():
+            conclusion = run.get("conclusion", "")
+            status = run.get("status", "")
+            # Only count completed runs that failed
+            if status == "completed" and conclusion == "failure":
+                failed_runs.append(name)
+
+        total_runs = len(latest_by_name)
+        if failed_runs:
+            return {
+                "status": "failing",
+                "failed_runs": failed_runs,
+                "total_runs": total_runs,
+                "message": f"CI failing: {len(failed_runs)} workflow(s) failed on main",
+            }
+
+        return {
+            "status": "passing",
+            "failed_runs": [],
+            "total_runs": total_runs,
+            "message": "CI passing on main",
+        }
+
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        return {"status": "unknown", "failed_runs": [], "total_runs": 0, "message": "Error checking CI status"}
