@@ -45,13 +45,16 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             <div>
-              <label htmlFor="theme-selector" className="text-sm font-medium">
+              <label className="text-sm font-medium" htmlFor="theme-selector">
                 Theme
               </label>
               <p className="text-sm text-muted-foreground mb-3">
                 Select your preferred color scheme
               </p>
-              <div id="theme-selector" className="flex gap-2">
+              <fieldset
+                id="theme-selector"
+                className="flex gap-2 border-0 p-0 m-0"
+              >
                 <Button
                   variant={theme === "light" ? "default" : "outline"}
                   onClick={() => setTheme("light")}
@@ -70,7 +73,7 @@ export function SettingsPage() {
                 >
                   System
                 </Button>
-              </div>
+              </fieldset>
               <p className="mt-2 text-xs text-muted-foreground">
                 Currently using: {resolvedTheme} mode
               </p>
@@ -87,7 +90,7 @@ export function SettingsPage() {
           </CardHeader>
           <CardContent className="space-y-4">
             <div>
-              <label htmlFor="app-data-dir" className="text-sm font-medium">
+              <label className="text-sm font-medium" htmlFor="app-data-dir">
                 App Data Directory
               </label>
               <p className="text-sm text-muted-foreground mb-2">
