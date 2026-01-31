@@ -925,7 +925,10 @@ function setupCreateEventHandlers(modal: ModalBuilder, workspacePath: string): v
     if (container) {
       const newVariant = document.createElement("div");
       newVariant.innerHTML = createVariantInput(variantCount, `Variant ${variantCount + 1}`, "");
-      container.appendChild(newVariant.firstElementChild!);
+      const firstChild = newVariant.firstElementChild;
+      if (firstChild) {
+        container.appendChild(firstChild);
+      }
       variantCount++;
 
       // Add remove handler for the new variant
