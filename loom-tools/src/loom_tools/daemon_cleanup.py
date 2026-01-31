@@ -536,9 +536,19 @@ def handle_daemon_shutdown(
             if dry_run:
                 cmd.append("--dry-run")
             try:
-                subprocess.run(cmd, capture_output=True, timeout=60, cwd=repo_root)
-            except Exception:
-                log_warning("session-reflection.sh failed")
+                result = subprocess.run(
+                    cmd, capture_output=True, timeout=60, cwd=repo_root
+                )
+                if result.returncode != 0:
+                    stderr = result.stderr.decode("utf-8", errors="replace").strip()
+                    log_warning(
+                        f"session-reflection.sh failed (exit {result.returncode})"
+                        f"{': ' + stderr if stderr else ''}"
+                    )
+            except subprocess.TimeoutExpired:
+                log_warning("session-reflection.sh timed out after 60s")
+            except Exception as exc:
+                log_warning(f"session-reflection.sh error: {exc}")
             break
 
     if not dry_run:

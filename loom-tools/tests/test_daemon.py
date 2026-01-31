@@ -271,6 +271,173 @@ class TestSessionOwnershipValidation:
         assert file_session_id != our_session_id  # Different session - ownership invalid
 
 
+class TestStateRotation:
+    """Tests for daemon state rotation and archival."""
+
+    def _make_daemon(self, tmp_path: pathlib.Path) -> DaemonLoop:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True, exist_ok=True)
+        config = DaemonConfig()
+        return DaemonLoop(config, tmp_path)
+
+    def test_rotate_skips_when_no_state_file(self, tmp_path: pathlib.Path) -> None:
+        """rotate_state_file should be a no-op when state file doesn't exist."""
+        daemon = self._make_daemon(tmp_path)
+        daemon.rotate_state_file()
+        # No archives created
+        archives = list((tmp_path / ".loom").glob("[0-9][0-9]-daemon-state.json"))
+        assert archives == []
+
+    def test_python_fallback_archives_meaningful_state(self, tmp_path: pathlib.Path) -> None:
+        """Python fallback should archive state with session summary."""
+        daemon = self._make_daemon(tmp_path)
+        state_data = {
+            "iteration": 10,
+            "completed_issues": [100, 101],
+            "total_prs_merged": 2,
+            "running": False,
+        }
+        daemon.state_file.write_text(json.dumps(state_data))
+
+        daemon._rotate_state_python()
+
+        # Original state file should be gone (renamed)
+        assert not daemon.state_file.exists()
+
+        # Archive should exist
+        archive = tmp_path / ".loom" / "00-daemon-state.json"
+        assert archive.exists()
+
+        archived_data = json.loads(archive.read_text())
+        assert "session_summary" in archived_data
+        assert archived_data["session_summary"]["session_id"] == 0
+        assert archived_data["session_summary"]["issues_completed"] == 2
+        assert archived_data["session_summary"]["prs_merged"] == 2
+        assert archived_data["session_summary"]["total_iterations"] == 10
+
+    def test_python_fallback_skips_empty_state(self, tmp_path: pathlib.Path) -> None:
+        """Python fallback should skip rotation for tiny state files."""
+        daemon = self._make_daemon(tmp_path)
+        daemon.state_file.write_text("{}")  # < 50 bytes
+
+        daemon._rotate_state_python()
+
+        # State file should still exist (not rotated)
+        assert daemon.state_file.exists()
+        archives = list((tmp_path / ".loom").glob("[0-9][0-9]-daemon-state.json"))
+        assert archives == []
+
+    def test_python_fallback_skips_no_useful_data(self, tmp_path: pathlib.Path) -> None:
+        """Python fallback should skip rotation when iteration=0 and no work done."""
+        daemon = self._make_daemon(tmp_path)
+        state_data = {
+            "iteration": 0,
+            "completed_issues": [],
+            "shepherds": {},
+            "padding": "x" * 100,
+        }
+        daemon.state_file.write_text(json.dumps(state_data))
+
+        daemon._rotate_state_python()
+
+        # State file should still exist (not rotated)
+        assert daemon.state_file.exists()
+
+    def test_python_fallback_increments_session_number(self, tmp_path: pathlib.Path) -> None:
+        """Python fallback should find next available session number."""
+        daemon = self._make_daemon(tmp_path)
+
+        # Create existing archives
+        (tmp_path / ".loom" / "00-daemon-state.json").write_text("{}")
+        (tmp_path / ".loom" / "01-daemon-state.json").write_text("{}")
+
+        state_data = {
+            "iteration": 5,
+            "completed_issues": [200],
+            "total_prs_merged": 1,
+        }
+        daemon.state_file.write_text(json.dumps(state_data))
+
+        daemon._rotate_state_python()
+
+        # Should be archived as 02
+        assert (tmp_path / ".loom" / "02-daemon-state.json").exists()
+        assert not daemon.state_file.exists()
+
+    def test_python_fallback_prunes_old_archives(self, tmp_path: pathlib.Path) -> None:
+        """Python fallback should prune old archives to enforce limit."""
+        daemon = self._make_daemon(tmp_path)
+
+        # Create 10 existing archives (at max)
+        for i in range(10):
+            (tmp_path / ".loom" / f"{i:02d}-daemon-state.json").write_text(
+                json.dumps({"session_id": i})
+            )
+
+        state_data = {
+            "iteration": 5,
+            "completed_issues": [300],
+            "total_prs_merged": 1,
+        }
+        daemon.state_file.write_text(json.dumps(state_data))
+
+        daemon._rotate_state_python()
+
+        # Should have pruned oldest to make room
+        archives = sorted((tmp_path / ".loom").glob("[0-9][0-9]-daemon-state.json"))
+        assert len(archives) <= 10
+
+    def test_rotate_uses_shell_when_available(self, tmp_path: pathlib.Path) -> None:
+        """rotate_state_file should try shell script first."""
+        daemon = self._make_daemon(tmp_path)
+
+        state_data = {"iteration": 5, "completed_issues": [1]}
+        daemon.state_file.write_text(json.dumps(state_data))
+
+        # Create a fake shell script that succeeds
+        script_dir = tmp_path / ".loom" / "scripts"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        script = script_dir / "rotate-daemon-state.sh"
+        script.write_text("#!/bin/bash\nexit 0\n")
+        script.chmod(0o755)
+
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(returncode=0)
+            daemon.rotate_state_file()
+
+        mock_run.assert_called_once()
+
+    def test_rotate_falls_back_to_python_on_shell_failure(self, tmp_path: pathlib.Path) -> None:
+        """rotate_state_file should fall back to Python when shell fails."""
+        daemon = self._make_daemon(tmp_path)
+
+        state_data = {
+            "iteration": 5,
+            "completed_issues": [1],
+            "total_prs_merged": 1,
+        }
+        daemon.state_file.write_text(json.dumps(state_data))
+
+        # Create a fake shell script
+        script_dir = tmp_path / ".loom" / "scripts"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        script = script_dir / "rotate-daemon-state.sh"
+        script.write_text("#!/bin/bash\nexit 1\n")
+        script.chmod(0o755)
+
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = mock.MagicMock(
+                returncode=1,
+                stderr=b"Error: Not in a git repository",
+            )
+            daemon.rotate_state_file()
+
+        # State should have been rotated by Python fallback
+        assert not daemon.state_file.exists()
+        archives = list((tmp_path / ".loom").glob("[0-9][0-9]-daemon-state.json"))
+        assert len(archives) == 1
+
+
 class TestDocumentedDivergences:
     """Tests documenting intentional behavioral differences between bash and Python.
 
