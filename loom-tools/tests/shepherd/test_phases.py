@@ -23,7 +23,11 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import _print_heartbeat, _read_heartbeats
-from loom_tools.shepherd.phases.judge import APPROVAL_PATTERNS, NEGATIVE_PREFIXES
+from loom_tools.shepherd.phases.judge import (
+    APPROVAL_PATTERNS,
+    NEGATIVE_PREFIXES,
+    REJECTION_PATTERNS,
+)
 
 
 @pytest.fixture
@@ -1831,6 +1835,9 @@ class TestJudgeFallbackApproval:
             # No approval comment
             patch.object(judge, "_has_approval_comment", return_value=False),
             patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback also fails — no signals
+            patch.object(judge, "_has_rejection_comment", return_value=False),
+            patch.object(judge, "_has_changes_requested_review", return_value=False),
         ):
             result = judge.run(ctx)
 
@@ -1853,6 +1860,9 @@ class TestJudgeFallbackApproval:
             patch.object(judge, "_has_approval_comment", return_value=True),
             # Checks not passing
             patch.object(judge, "_pr_checks_passing", return_value=False),
+            # Rejection fallback also fails — no signals
+            patch.object(judge, "_has_rejection_comment", return_value=False),
+            patch.object(judge, "_has_changes_requested_review", return_value=False),
         ):
             result = judge.run(ctx)
 
@@ -2213,6 +2223,410 @@ class TestApprovalPatterns:
         assert pattern.search("LGTM") is not None
         assert pattern.search("lgtm") is not None
         assert pattern.search("Lgtm") is not None
+
+
+class TestRejectionPatterns:
+    """Test the module-level REJECTION_PATTERNS constant."""
+
+    def test_rejection_patterns_are_compiled(self) -> None:
+        """Rejection patterns should be compiled regex objects."""
+        for pattern in REJECTION_PATTERNS:
+            assert hasattr(pattern, "search")
+
+    def test_changes_requested_case_insensitive(self) -> None:
+        """'changes requested' pattern should be case-insensitive."""
+        pattern = REJECTION_PATTERNS[0]  # \bchanges\s+requested\b
+        assert pattern.search("Changes Requested") is not None
+        assert pattern.search("changes requested") is not None
+        assert pattern.search("CHANGES REQUESTED") is not None
+
+    def test_request_changes_case_insensitive(self) -> None:
+        """'request changes' pattern should be case-insensitive."""
+        pattern = REJECTION_PATTERNS[1]  # \brequest\s+changes\b
+        assert pattern.search("Request Changes") is not None
+        assert pattern.search("request changes") is not None
+
+    def test_needs_changes_pattern(self) -> None:
+        """'needs changes/fixes/work' pattern should match variants."""
+        pattern = REJECTION_PATTERNS[2]  # \bneeds?\s+(?:changes|fixes|work)\b
+        assert pattern.search("needs changes") is not None
+        assert pattern.search("need fixes") is not None
+        assert pattern.search("needs work") is not None
+        assert pattern.search("Needs Changes") is not None
+
+    def test_cross_mark_emoji(self) -> None:
+        """Cross mark emoji pattern should match."""
+        pattern = REJECTION_PATTERNS[3]  # \u274c
+        assert pattern.search("\u274c") is not None
+        assert pattern.search("\u274c Not good") is not None
+
+
+class TestHasRejectionComment:
+    """Test _has_rejection_comment with various comment patterns."""
+
+    def _make_context(self, mock_context: MagicMock) -> MagicMock:
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+        return mock_context
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "Changes requested",
+            "changes requested",
+            "CHANGES REQUESTED",
+            "I request changes on this PR",
+            "Request changes",
+            "Needs changes",
+            "needs fixes",
+            "needs work",
+            "\u274c",
+            "\u274c This needs work",
+        ],
+    )
+    def test_recognizes_rejection_patterns(
+        self, mock_context: MagicMock, comment: str
+    ) -> None:
+        """Should detect rejection in various comment formats."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=comment + "\n"),
+        ):
+            assert judge._has_rejection_comment(ctx) is True
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "No changes requested",
+            "not changes requested",
+            "Don't request changes",
+            "no need changes",
+        ],
+    )
+    def test_rejects_negated_rejection_patterns(
+        self, mock_context: MagicMock, comment: str
+    ) -> None:
+        """Should reject comments with negation before rejection pattern."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=comment + "\n"),
+        ):
+            assert judge._has_rejection_comment(ctx) is False
+
+    @pytest.mark.parametrize(
+        "comment",
+        [
+            "Approved",
+            "LGTM",
+            "Looks great, ship it",
+            "This PR is perfect",
+            "",
+        ],
+    )
+    def test_rejects_non_rejection_comments(
+        self, mock_context: MagicMock, comment: str
+    ) -> None:
+        """Should return False for comments without rejection signals."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=comment + "\n"),
+        ):
+            assert judge._has_rejection_comment(ctx) is False
+
+    def test_returns_false_on_gh_failure(self, mock_context: MagicMock) -> None:
+        """Should return False when gh command fails."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            assert judge._has_rejection_comment(ctx) is False
+
+    def test_returns_false_on_empty_comments(self, mock_context: MagicMock) -> None:
+        """Should return False when PR has no comments."""
+        ctx = self._make_context(mock_context)
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=""),
+        ):
+            assert judge._has_rejection_comment(ctx) is False
+
+
+class TestJudgeFallbackChangesRequested:
+    """Test force-mode fallback changes-requested detection in JudgePhase."""
+
+    def _make_force_context(self, mock_context: MagicMock) -> MagicMock:
+        """Set up a mock context for force-mode judge tests."""
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        return mock_context
+
+    def test_fallback_activates_in_force_mode_with_rejection_comment(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should succeed when force mode + rejection comment detected."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        gh_run_results = [
+            # _try_fallback_approval -> _has_approval_comment: no approval
+            MagicMock(returncode=0, stdout="Changes requested\n"),
+            # _try_fallback_approval -> _pr_checks_passing
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps({"mergeable": "MERGEABLE", "statusCheckRollup": []}),
+            ),
+            # _try_fallback_changes_requested -> _has_rejection_comment
+            MagicMock(returncode=0, stdout="Changes requested\n"),
+            # _try_fallback_changes_requested -> _has_changes_requested_review
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps({"reviews": []}),
+            ),
+            # _try_fallback_changes_requested -> gh pr edit --add-label
+            MagicMock(returncode=0),
+        ]
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                side_effect=gh_run_results,
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("changes_requested") is True
+
+    def test_fallback_activates_via_review_state(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should succeed via CHANGES_REQUESTED review state."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # Approval fallback fails (no approval comment)
+            patch.object(judge, "_has_approval_comment", return_value=False),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback: no rejection comment but CHANGES_REQUESTED review
+            patch.object(judge, "_has_rejection_comment", return_value=False),
+            patch.object(judge, "_has_changes_requested_review", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("changes_requested") is True
+
+    def test_fallback_does_not_activate_in_default_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should NOT activate when not in force mode."""
+        mock_context.config = ShepherdConfig(issue=42)  # Default mode
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "validation failed" in result.message
+
+    def test_fallback_denied_without_rejection_signals(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should fail when no rejection comment and no CHANGES_REQUESTED review."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # Approval fallback fails
+            patch.object(judge, "_has_approval_comment", return_value=False),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback also fails — no signals
+            patch.object(judge, "_has_rejection_comment", return_value=False),
+            patch.object(judge, "_has_changes_requested_review", return_value=False),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+
+    def test_fallback_applies_changes_requested_label(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should apply loom:changes-requested label via gh pr edit."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        add_label_call = MagicMock(returncode=0)
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # Approval fallback fails
+            patch.object(judge, "_has_approval_comment", return_value=False),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback succeeds
+            patch.object(judge, "_has_rejection_comment", return_value=True),
+            patch.object(judge, "_has_changes_requested_review", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=add_label_call,
+            ) as mock_run,
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Verify the label was applied
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "gh" in call_args[0]
+        assert "--add-label" in call_args
+        assert "loom:changes-requested" in call_args
+
+    def test_fallback_invalidates_cache(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should invalidate PR label cache after applying label."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # Approval fallback fails
+            patch.object(judge, "_has_approval_comment", return_value=False),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback succeeds
+            patch.object(judge, "_has_rejection_comment", return_value=True),
+            patch.object(judge, "_has_changes_requested_review", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Cache should have been invalidated (before validation retries + after fallback)
+        assert ctx.label_cache.invalidate_pr.call_count >= 2
+
+    def test_fallback_fails_when_label_application_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback should fail if gh pr edit to apply label returns non-zero."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # Approval fallback fails
+            patch.object(judge, "_has_approval_comment", return_value=False),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback: signals present but label application fails
+            patch.object(judge, "_has_rejection_comment", return_value=True),
+            patch.object(judge, "_has_changes_requested_review", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=MagicMock(returncode=1),  # label application fails
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+
+    def test_run_uses_rejection_fallback_before_failing(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should try approval fallback first, then rejection fallback, then fail."""
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        call_order: list[str] = []
+
+        def track_approval(*args: object, **kwargs: object) -> bool:
+            call_order.append("approval")
+            return False
+
+        def track_rejection(*args: object, **kwargs: object) -> bool:
+            call_order.append("rejection")
+            return False
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(
+                judge, "_try_fallback_approval", side_effect=track_approval
+            ),
+            patch.object(
+                judge, "_try_fallback_changes_requested", side_effect=track_rejection
+            ),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+        assert call_order == ["approval", "rejection"]
 
 
 class TestMergePhase:
