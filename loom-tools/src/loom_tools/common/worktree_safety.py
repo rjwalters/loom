@@ -23,6 +23,41 @@ from loom_tools.common.state import read_json_file
 DEFAULT_GRACE_PERIOD_SECONDS = 300
 
 
+def check_cwd_inside_worktree(worktree_path: pathlib.Path) -> bool:
+    """Check if the current process's CWD is inside the target worktree.
+
+    This is the simplest and most direct safety check - if we're running from
+    inside the worktree, we definitely shouldn't remove it or the shell will
+    become non-functional.
+
+    Args:
+        worktree_path: Path to the worktree directory.
+
+    Returns:
+        True if current CWD is exactly the worktree or a subdirectory of it.
+    """
+    try:
+        # Resolve both paths to follow symlinks and get absolute paths
+        current_cwd = pathlib.Path.cwd().resolve()
+        worktree_resolved = worktree_path.resolve()
+
+        # Check if CWD is the worktree itself
+        if current_cwd == worktree_resolved:
+            return True
+
+        # Check if CWD is a subdirectory of the worktree
+        # Use is_relative_to() for clean path comparison
+        try:
+            current_cwd.relative_to(worktree_resolved)
+            return True
+        except ValueError:
+            return False
+
+    except OSError:
+        # If we can't resolve paths, be conservative and assume not inside
+        return False
+
+
 @dataclass
 class WorktreeSafetyResult:
     """Result of a worktree safety check.
@@ -34,6 +69,7 @@ class WorktreeSafetyResult:
         active_pids: List of PIDs with CWD in the worktree.
         within_grace_period: Whether worktree is within creation grace period.
         marker_data: Parsed contents of .loom-in-use marker (if present).
+        cwd_inside: Whether the current process's CWD is inside the worktree.
     """
 
     safe_to_remove: bool
@@ -42,6 +78,7 @@ class WorktreeSafetyResult:
     active_pids: list[int] | None = None
     within_grace_period: bool = False
     marker_data: dict[str, Any] | None = None
+    cwd_inside: bool = False
 
 
 def check_in_use_marker(
@@ -231,12 +268,14 @@ def is_worktree_safe_to_remove(
     check_marker: bool = True,
     check_processes: bool = True,
     check_grace: bool = True,
+    check_cwd: bool = True,
     marker_name: str = ".loom-in-use",
     grace_seconds: int = DEFAULT_GRACE_PERIOD_SECONDS,
 ) -> WorktreeSafetyResult:
     """Check if a worktree is safe to remove.
 
     Performs multiple safety checks to prevent destroying active sessions:
+    0. Current shell's CWD inside worktree (most direct check)
     1. In-use marker file (.loom-in-use)
     2. Active processes with CWD in the worktree
     3. Grace period since worktree creation
@@ -246,6 +285,7 @@ def is_worktree_safe_to_remove(
         check_marker: Whether to check for in-use marker (default: True).
         check_processes: Whether to check for active processes (default: True).
         check_grace: Whether to check grace period (default: True).
+        check_cwd: Whether to check if current CWD is inside worktree (default: True).
         marker_name: Name of the marker file (default: .loom-in-use).
         grace_seconds: Grace period in seconds (default: 300 = 5 minutes).
 
@@ -259,6 +299,17 @@ def is_worktree_safe_to_remove(
             safe_to_remove=True,
             reason="worktree directory does not exist",
         )
+
+    # Check 0: Current shell's CWD inside worktree (simplest and most direct check)
+    cwd_inside = False
+    if check_cwd:
+        cwd_inside = check_cwd_inside_worktree(worktree_path)
+        if cwd_inside:
+            return WorktreeSafetyResult(
+                safe_to_remove=False,
+                reason="current shell CWD is inside worktree",
+                cwd_inside=True,
+            )
 
     # Check 1: In-use marker
     marker_present = False
@@ -309,6 +360,7 @@ def is_worktree_safe_to_remove(
         marker_data=marker_data,
         active_pids=active_pids or [],
         within_grace_period=within_grace,
+        cwd_inside=cwd_inside,
     )
 
 

@@ -180,10 +180,39 @@ check_grace_period() {
     fi
 }
 
+# Function to check if current shell's CWD is inside a worktree
+check_cwd_inside_worktree() {
+    local worktree_path="$1"
+    local current_cwd
+    local abs_worktree_path
+
+    # Get current working directory (resolved, follows symlinks)
+    current_cwd=$(pwd -P 2>/dev/null || pwd)
+
+    # Get absolute path of worktree (resolved)
+    abs_worktree_path=$(cd "$worktree_path" 2>/dev/null && pwd -P || echo "$worktree_path")
+
+    # Check if current CWD is exactly the worktree or inside it
+    if [[ "$current_cwd" == "$abs_worktree_path" || "$current_cwd" == "$abs_worktree_path/"* ]]; then
+        return 0  # CWD is inside worktree
+    else
+        return 1  # CWD is not inside worktree
+    fi
+}
+
 # Function to check if worktree is safe to remove
 is_worktree_safe_to_remove() {
     local worktree_path="$1"
     local reason=""
+
+    # Check 0: Current shell's CWD inside worktree (simplest and most direct check)
+    if check_cwd_inside_worktree "$worktree_path"; then
+        reason="current shell CWD is inside worktree"
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "  $reason - preserving"
+        fi
+        return 1
+    fi
 
     # Check 1: In-use marker
     if check_in_use_marker "$worktree_path"; then
@@ -517,6 +546,63 @@ if [[ -d "$WORKTREE_PATH" ]]; then
                 echo ""
             fi
             # Fall through to create fresh worktree below
+        elif [[ "$local_commits_ahead" == "0" && "$local_commits_behind" == "0" && -z "$local_uncommitted" ]]; then
+            # Worktree at same commit as main, no commits, no uncommitted changes
+            # Check if remote branch exists - if not, this is an abandoned worktree
+            if ! git ls-remote --heads origin "$BRANCH_NAME" 2>/dev/null | grep -q .; then
+                # No commits + no remote = abandoned worktree, safe to clean
+                if ! is_worktree_safe_to_remove "$WORKTREE_PATH"; then
+                    # Safety check failed - reuse the worktree instead of removing
+                    if [[ "$JSON_OUTPUT" != "true" ]]; then
+                        print_info "Worktree appears abandoned but cannot be safely removed - reusing"
+                        echo ""
+                        print_info "To use this worktree: cd $WORKTREE_PATH"
+                    fi
+                    exit 0
+                fi
+
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_warning "Abandoned worktree detected (0 commits, at same commit as main, no remote branch)"
+                    print_info "Removing abandoned worktree and recreating from current main..."
+                fi
+
+                # Remove the abandoned worktree (safety checks passed)
+                ABS_WORKTREE="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
+                REPO_DIR="$(pwd -P)"
+                local_branch=$(git -C "$ABS_WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || local_branch=""
+                git -C "$REPO_DIR" worktree remove "$ABS_WORKTREE" --force 2>/dev/null || {
+                    print_error "Failed to remove abandoned worktree"
+                    exit 1
+                }
+
+                # Delete the empty branch if it exists
+                if [[ -n "$local_branch" && "$local_branch" != "main" ]]; then
+                    if git branch -d "$local_branch" 2>/dev/null; then
+                        if [[ "$JSON_OUTPUT" != "true" ]]; then
+                            print_info "Removed empty branch: $local_branch"
+                        fi
+                    else
+                        if [[ "$JSON_OUTPUT" != "true" ]]; then
+                            print_warning "Could not delete branch $local_branch (may have upstream references)"
+                        fi
+                    fi
+                fi
+
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_success "Abandoned worktree cleaned up"
+                    echo ""
+                fi
+                # Fall through to create fresh worktree below
+            else
+                # Remote branch exists - preserve worktree
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_info "Worktree is registered with git"
+                    print_info "Remote branch exists - preserving worktree"
+                    echo ""
+                    print_info "To use this worktree: cd $WORKTREE_PATH"
+                fi
+                exit 0
+            fi
         else
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_info "Worktree is registered with git"
