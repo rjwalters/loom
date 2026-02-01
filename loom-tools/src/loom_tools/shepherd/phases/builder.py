@@ -426,10 +426,17 @@ class BuilderPhase:
         vitest/jest to extract the failure count. Returns 0 when a
         test summary indicates all tests passed with no failures.
         Returns None if no recognizable pattern is found.
+
+        For multi-command pipeline output (e.g., cargo test followed by
+        vitest), scans ALL lines and returns the worst result (highest
+        failure count) when multiple test summaries are present.
         """
         lines = output.strip().splitlines()
 
-        for line in reversed(lines):
+        failure_counts: list[int] = []
+        found_any_summary = False
+
+        for line in lines:
             stripped = line.strip()
             cleaned = stripped.strip("= ").strip()
 
@@ -438,33 +445,47 @@ class BuilderPhase:
             # Treat target-level failures as 1 failure for comparison purposes.
             m = re.match(r"error:\s+(\d+)\s+targets?\s+failed", stripped)
             if m:
-                return int(m.group(1))
+                failure_counts.append(int(m.group(1)))
+                found_any_summary = True
+                continue
 
             # pytest: "1 failed, 12 passed in 0.03s" or "1 failed"
             m = re.search(r"(\d+)\s+failed", cleaned)
             if m and ("passed" in cleaned or "failed" in cleaned):
-                return int(m.group(1))
+                failure_counts.append(int(m.group(1)))
+                found_any_summary = True
+                continue
 
             # cargo test: "test result: ok. 14 passed; 0 failed; 0 ignored"
             # or "test result: FAILED. 0 passed; 1 failed; 0 ignored"
             if stripped.startswith("test result:"):
                 m = re.search(r"(\d+)\s+failed", stripped)
                 if m:
-                    return int(m.group(1))
+                    failure_counts.append(int(m.group(1)))
+                    found_any_summary = True
+                    continue
 
             # vitest/jest: "Tests  2 failed, 3 passed"
             if "test" in stripped.lower() and "failed" in stripped.lower():
                 m = re.search(r"(\d+)\s+failed", stripped)
                 if m:
-                    return int(m.group(1))
+                    failure_counts.append(int(m.group(1)))
+                    found_any_summary = True
+                    continue
 
             # vitest/jest all-pass: "Tests  N passed" (no "failed" keyword)
             # pytest all-pass: "N passed in Xs"
             # These indicate 0 failures when no "failed" appears in the line.
             if re.search(r"\d+\s+passed", cleaned) and "failed" not in cleaned.lower():
-                return 0
+                failure_counts.append(0)
+                found_any_summary = True
+                continue
 
-        return None
+        if not found_any_summary:
+            return None
+
+        # Return worst result (highest failure count)
+        return max(failure_counts)
 
     def _extract_failing_test_names(self, output: str) -> set[str]:
         """Extract individual failing test names from test output.

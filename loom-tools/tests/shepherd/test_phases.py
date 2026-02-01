@@ -1965,6 +1965,74 @@ class TestBuilderParseFailureCount:
         )
         assert builder._parse_failure_count(output) == 0
 
+    def test_pipeline_passing_cargo_then_failing_vitest(self) -> None:
+        """Should return failures when cargo passes but vitest fails."""
+        builder = BuilderPhase()
+        # Simulates `pnpm check:ci:lite` where cargo succeeds then vitest fails
+        output = (
+            "running 14 tests\n"
+            "test daemon::tests::test_config ... ok\n"
+            "test daemon::tests::test_state ... ok\n"
+            "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured\n"
+            "\n"
+            " FAIL  src/components/Terminal.test.tsx > renders correctly\n"
+            " Tests  2 failed, 45 passed\n"
+        )
+        assert builder._parse_failure_count(output) == 2
+
+    def test_pipeline_failing_cargo_then_passing_pnpm(self) -> None:
+        """Should return failures when cargo fails but pnpm tests pass."""
+        builder = BuilderPhase()
+        # Simulates pipeline where cargo fails then later tests pass
+        output = (
+            "running 8 tests\n"
+            "test utils::tests::test_parse ... FAILED\n"
+            "test result: FAILED. 7 passed; 1 failed; 0 ignored\n"
+            "\n"
+            " Tests  50 passed\n"
+        )
+        assert builder._parse_failure_count(output) == 1
+
+    def test_interleaved_cargo_binaries_mixed_results(self) -> None:
+        """Should return worst result from interleaved cargo test binaries."""
+        builder = BuilderPhase()
+        # Multiple cargo test binaries with mixed pass/fail
+        output = (
+            "running 5 tests\n"
+            "test result: ok. 5 passed; 0 failed; 0 ignored\n"
+            "\n"
+            "running 8 tests\n"
+            "test integration::test_api ... FAILED\n"
+            "test result: FAILED. 6 passed; 2 failed; 0 ignored\n"
+            "\n"
+            "running 3 tests\n"
+            "test result: ok. 3 passed; 0 failed; 0 ignored\n"
+        )
+        assert builder._parse_failure_count(output) == 2
+
+    def test_multiple_failure_counts_returns_max(self) -> None:
+        """Should return highest failure count when multiple summaries differ."""
+        builder = BuilderPhase()
+        # Different test runners with different failure counts
+        output = (
+            "test result: FAILED. 10 passed; 3 failed; 0 ignored\n"
+            "========================= 5 failed, 7 passed in 2.45s ========================\n"
+            " Tests  1 failed, 20 passed\n"
+        )
+        assert builder._parse_failure_count(output) == 5
+
+    def test_all_stages_pass_in_pipeline(self) -> None:
+        """Should return 0 when all stages in pipeline pass."""
+        builder = BuilderPhase()
+        output = (
+            "test result: ok. 14 passed; 0 failed; 0 ignored\n"
+            "\n"
+            " Tests  50 passed\n"
+            "\n"
+            "========================= 20 passed in 1.23s ========================\n"
+        )
+        assert builder._parse_failure_count(output) == 0
+
 
 class TestBuilderExtractFailingTestNames:
     """Test builder phase failing test name extraction."""
