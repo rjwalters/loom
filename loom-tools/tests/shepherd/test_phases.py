@@ -2341,6 +2341,119 @@ class TestBuilderCompareTestResults:
         worktree = "Tests  1 failed, 1074 passed\n"
         assert builder._compare_test_results(baseline, worktree) is True
 
+    def test_higher_count_but_same_test_names_returns_none(self) -> None:
+        """Higher count but identical test names -> count discrepancy is noise."""
+        builder = BuilderPhase()
+        baseline = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        )
+        worktree = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "========================= 2 failed, 13 passed in 2.51s ========================\n"
+        )
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_higher_count_with_new_test_name_returns_true(self) -> None:
+        """Higher count with genuinely new test name -> new failures."""
+        builder = BuilderPhase()
+        baseline = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        )
+        worktree = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "FAILED tests/test_baz.py::test_qux - ValueError\n"
+            "========================= 2 failed, 13 passed in 2.51s ========================\n"
+        )
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_regression_2006_different_test_names(self) -> None:
+        """Regression test for #2006: different tests failing should be detected.
+
+        Baseline fails test_cli_wrapper_health, worktree fails integration_basic.
+        The name-based comparison should detect integration_basic as new.
+        """
+        builder = BuilderPhase()
+        baseline = (
+            "test utils::tests::test_cli_wrapper_health ... FAILED\n"
+            "test result: FAILED. 8 passed; 1 failed; 0 ignored\n"
+        )
+        worktree = (
+            "test utils::tests::test_cli_wrapper_health ... FAILED\n"
+            "test integration::tests::integration_basic ... FAILED\n"
+            "test result: FAILED. 7 passed; 2 failed; 0 ignored\n"
+        )
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_flaky_test_swap_same_count(self) -> None:
+        """Flaky test swap: baseline {A}, worktree {B} with same count.
+
+        Count comparison says <= so returns None (pre-existing). This is
+        correct behavior — same count means no increase in failures.
+        The name-based refinement only triggers when worktree_count > baseline_count.
+        """
+        builder = BuilderPhase()
+        baseline = (
+            "FAILED tests/test_a.py::test_alpha - Error\n"
+            "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        )
+        worktree = (
+            "FAILED tests/test_b.py::test_beta - Error\n"
+            "========================= 1 failed, 14 passed in 2.51s ========================\n"
+        )
+        # Same count -> returns None via the <= check (before name comparison)
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_name_extraction_fails_one_side_trusts_counts(self) -> None:
+        """When name extraction fails for one side, fall back to count comparison."""
+        builder = BuilderPhase()
+        # Baseline has no parseable test names, just a summary
+        baseline = (
+            "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        )
+        # Worktree has parseable test names
+        worktree = (
+            "FAILED tests/test_foo.py::test_bar - Error\n"
+            "FAILED tests/test_baz.py::test_qux - Error\n"
+            "========================= 2 failed, 13 passed in 2.51s ========================\n"
+        )
+        # Baseline names empty -> can't do name comparison -> trusts counts
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_name_extraction_fails_both_sides_trusts_counts(self) -> None:
+        """When name extraction fails for both sides, fall back to count comparison."""
+        builder = BuilderPhase()
+        baseline = (
+            "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        )
+        worktree = (
+            "========================= 2 failed, 13 passed in 2.51s ========================\n"
+        )
+        # Neither side has parseable names -> trusts counts -> True
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_multi_runner_pytest_and_vitest(self) -> None:
+        """Multi-runner output: pytest + vitest names don't collide."""
+        builder = BuilderPhase()
+        baseline = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "========================= 1 failed, 4 passed in 1.2s ========================\n"
+            "FAIL src/foo.test.ts\n"
+            " Tests  1 failed, 10 passed\n"
+        )
+        worktree = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "========================= 1 failed, 4 passed in 1.3s ========================\n"
+            "FAIL src/foo.test.ts\n"
+            "FAIL src/bar.test.ts\n"
+            " Tests  2 failed, 9 passed\n"
+        )
+        # Baseline: 2 total failures (1 pytest + 1 vitest)
+        # Worktree: 3 total failures (1 pytest + 2 vitest)
+        # New failure: src/bar.test.ts
+        assert builder._compare_test_results(baseline, worktree) is True
+
 
 class TestBuilderFallbackComparison:
     """Test that fallback to line-based comparison works when parsing fails."""
