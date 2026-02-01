@@ -8,6 +8,7 @@ import subprocess
 from unittest.mock import Mock
 
 from loom_tools.common.state import (
+    find_progress_for_issue,
     parse_command_output,
     read_json_file,
     safe_parse_json,
@@ -207,3 +208,96 @@ def test_read_json_file_corrupt_with_custom_default(tmp_path: pathlib.Path) -> N
     p.write_text("{invalid json")
     result = read_json_file(p, default={"error": "fallback"})
     assert result == {"error": "fallback"}
+
+
+# ---------------------------------------------------------------------------
+# Tests for find_progress_for_issue
+# ---------------------------------------------------------------------------
+
+
+def test_find_progress_for_issue_no_progress_dir(tmp_path: pathlib.Path) -> None:
+    """Returns None when progress directory doesn't exist."""
+    result = find_progress_for_issue(tmp_path, 42)
+    assert result is None
+
+
+def test_find_progress_for_issue_no_matching_files(tmp_path: pathlib.Path) -> None:
+    """Returns None when no progress files match the issue."""
+    progress_dir = tmp_path / ".loom" / "progress"
+    progress_dir.mkdir(parents=True)
+    # Create a progress file for a different issue
+    (progress_dir / "shepherd-abc123.json").write_text(
+        json.dumps({
+            "task_id": "abc123",
+            "issue": 100,
+            "started_at": "2026-01-01T10:00:00Z",
+            "current_phase": "builder",
+        })
+    )
+    result = find_progress_for_issue(tmp_path, 42)
+    assert result is None
+
+
+def test_find_progress_for_issue_finds_matching_file(tmp_path: pathlib.Path) -> None:
+    """Returns progress when a matching file exists."""
+    progress_dir = tmp_path / ".loom" / "progress"
+    progress_dir.mkdir(parents=True)
+    (progress_dir / "shepherd-def456.json").write_text(
+        json.dumps({
+            "task_id": "def456",
+            "issue": 42,
+            "started_at": "2026-01-01T10:00:00Z",
+            "current_phase": "builder",
+            "status": "working",
+        })
+    )
+    result = find_progress_for_issue(tmp_path, 42)
+    assert result is not None
+    assert result.issue == 42
+    assert result.task_id == "def456"
+    assert result.current_phase == "builder"
+
+
+def test_find_progress_for_issue_returns_most_recent(tmp_path: pathlib.Path) -> None:
+    """Returns the most recent progress file when multiple exist for same issue."""
+    progress_dir = tmp_path / ".loom" / "progress"
+    progress_dir.mkdir(parents=True)
+    # Older attempt
+    (progress_dir / "shepherd-old.json").write_text(
+        json.dumps({
+            "task_id": "old",
+            "issue": 42,
+            "started_at": "2026-01-01T09:00:00Z",
+            "current_phase": "curator",
+        })
+    )
+    # Newer attempt
+    (progress_dir / "shepherd-new.json").write_text(
+        json.dumps({
+            "task_id": "new",
+            "issue": 42,
+            "started_at": "2026-01-01T10:00:00Z",
+            "current_phase": "builder",
+        })
+    )
+    result = find_progress_for_issue(tmp_path, 42)
+    assert result is not None
+    assert result.task_id == "new"  # Most recent by started_at
+
+
+def test_find_progress_for_issue_handles_corrupt_file(tmp_path: pathlib.Path) -> None:
+    """Skips corrupt JSON files without crashing."""
+    progress_dir = tmp_path / ".loom" / "progress"
+    progress_dir.mkdir(parents=True)
+    (progress_dir / "shepherd-corrupt.json").write_text("{invalid json")
+    (progress_dir / "shepherd-valid.json").write_text(
+        json.dumps({
+            "task_id": "valid",
+            "issue": 42,
+            "started_at": "2026-01-01T10:00:00Z",
+            "current_phase": "builder",
+        })
+    )
+    result = find_progress_for_issue(tmp_path, 42)
+    assert result is not None
+    assert result.task_id == "valid"

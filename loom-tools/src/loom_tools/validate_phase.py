@@ -22,8 +22,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from loom_tools.common.logging import log_warning
+from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
+from loom_tools.common.state import find_progress_for_issue
 
 
 class ValidationStatus(Enum):
@@ -382,6 +383,14 @@ def _gather_builder_diagnostics(
     if wt.is_dir():
         diag.worktree_exists = True
 
+        # Get worktree modification time
+        try:
+            mtime = wt.stat().st_mtime
+            mtime_dt = datetime.fromtimestamp(mtime, tz=timezone.utc)
+            diag.worktree_mtime = mtime_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except OSError:
+            pass
+
         r = subprocess.run(
             ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True, text=True, check=False,
@@ -415,6 +424,19 @@ def _gather_builder_diagnostics(
         )
         diag.has_remote_tracking = r.returncode == 0
 
+    # Look up progress file for this issue
+    progress = find_progress_for_issue(repo_root, issue)
+    if progress:
+        diag.progress_status = progress.current_phase
+        diag.progress_started_at = progress.started_at
+        diag.progress_last_heartbeat = progress.last_heartbeat or ""
+        # Format milestones as human-readable strings
+        if progress.milestones:
+            diag.progress_milestones = [
+                f"{m.event} at {m.timestamp}" + (f" ({m.data})" if m.data else "")
+                for m in progress.milestones
+            ]
+
     # Session log
     session_name = f"loom-builder-issue-{issue}"
     log_patterns = [
@@ -426,7 +448,9 @@ def _gather_builder_diagnostics(
             diag.log_path = path
             try:
                 lines = Path(path).read_text().splitlines()
-                diag.log_tail = "\n".join(lines[-15:])
+                raw_tail = "\n".join(lines[-15:])
+                # Strip ANSI escape sequences for human readability
+                diag.log_tail = strip_ansi(raw_tail)
             except OSError:
                 pass
             break

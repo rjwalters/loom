@@ -20,6 +20,7 @@ from loom_tools.validate_phase import (
     validate_phase,
     main,
     _parse_args,
+    _gather_builder_diagnostics,
     VALID_PHASES,
 )
 
@@ -129,6 +130,180 @@ class TestBuilderDiagnostics:
         md = d.to_markdown()
         assert "feature/issue-42" in md
         assert "configured" in md
+
+    def test_to_markdown_with_progress_info(self):
+        """Verify previous attempt section is rendered with progress info."""
+        d = BuilderDiagnostics(
+            worktree_path="/tmp/wt",
+            worktree_exists=True,
+            branch="feature/issue-42",
+            commits_ahead="0",
+            issue=42,
+            worktree_mtime="2026-01-15T10:30:00Z",
+            progress_status="builder",
+            progress_started_at="2026-01-15T10:00:00Z",
+            progress_last_heartbeat="2026-01-15T10:25:00Z",
+            progress_milestones=[
+                "started at 2026-01-15T10:00:00Z ({'issue': 42})",
+                "phase_entered at 2026-01-15T10:01:00Z ({'phase': 'curator'})",
+                "phase_entered at 2026-01-15T10:05:00Z ({'phase': 'builder'})",
+            ],
+        )
+        md = d.to_markdown()
+        assert "### Previous Attempt" in md
+        assert "**Started**: 2026-01-15T10:00:00Z" in md
+        assert "**Worktree last modified**: 2026-01-15T10:30:00Z" in md
+        assert "**Last phase**: `builder`" in md
+        assert "**Last heartbeat**: 2026-01-15T10:25:00Z" in md
+        assert "**Recent milestones**:" in md
+        assert "phase_entered at 2026-01-15T10:05:00Z" in md
+
+    def test_to_markdown_with_partial_progress_info(self):
+        """Verify partial progress info is rendered correctly."""
+        d = BuilderDiagnostics(
+            worktree_path="/tmp/wt",
+            worktree_exists=True,
+            issue=42,
+            worktree_mtime="2026-01-15T10:30:00Z",
+            # No progress file found
+            progress_status="",
+            progress_started_at="",
+        )
+        md = d.to_markdown()
+        # Should still show Previous Attempt section with worktree mtime
+        assert "### Previous Attempt" in md
+        assert "**Worktree last modified**: 2026-01-15T10:30:00Z" in md
+        # But not the progress-specific fields
+        assert "**Last phase**" not in md
+
+    def test_to_markdown_milestones_limited_to_last_five(self):
+        """Verify only last 5 milestones are shown."""
+        d = BuilderDiagnostics(
+            worktree_path="/tmp/wt",
+            issue=42,
+            progress_started_at="2026-01-15T10:00:00Z",
+            progress_milestones=[
+                f"event_{i} at time_{i}" for i in range(10)
+            ],
+        )
+        md = d.to_markdown()
+        # Should show last 5 only
+        assert "event_5" in md
+        assert "event_9" in md
+        assert "event_0" not in md
+        assert "event_4" not in md
+
+
+# ---------------------------------------------------------------------------
+# _gather_builder_diagnostics
+# ---------------------------------------------------------------------------
+
+
+class TestGatherBuilderDiagnostics:
+    def test_populates_worktree_mtime(self, tmp_path: Path):
+        """Verify worktree modification time is captured."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        with patch("loom_tools.validate_phase._run_gh") as mock_gh:
+            mock_gh.return_value = _completed(stdout="loom:building\n")
+            diag = _gather_builder_diagnostics(42, str(wt), repo)
+
+        assert diag.worktree_exists is True
+        assert diag.worktree_mtime != ""
+        # Should be ISO format
+        assert "T" in diag.worktree_mtime
+        assert "Z" in diag.worktree_mtime
+
+    def test_populates_progress_info(self, tmp_path: Path):
+        """Verify progress file info is captured."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        # Create progress file
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc123.json").write_text(
+            json.dumps({
+                "task_id": "abc123",
+                "issue": 42,
+                "started_at": "2026-01-15T10:00:00Z",
+                "current_phase": "builder",
+                "last_heartbeat": "2026-01-15T10:25:00Z",
+                "milestones": [
+                    {"event": "started", "timestamp": "2026-01-15T10:00:00Z", "data": {"issue": 42}},
+                    {"event": "phase_entered", "timestamp": "2026-01-15T10:05:00Z", "data": {"phase": "builder"}},
+                ],
+            })
+        )
+
+        with patch("loom_tools.validate_phase._run_gh") as mock_gh:
+            mock_gh.return_value = _completed(stdout="loom:building\n")
+            diag = _gather_builder_diagnostics(42, str(wt), repo)
+
+        assert diag.progress_status == "builder"
+        assert diag.progress_started_at == "2026-01-15T10:00:00Z"
+        assert diag.progress_last_heartbeat == "2026-01-15T10:25:00Z"
+        assert diag.progress_milestones is not None
+        assert len(diag.progress_milestones) == 2
+        assert "started at 2026-01-15T10:00:00Z" in diag.progress_milestones[0]
+
+    def test_strips_ansi_from_log_tail(self, tmp_path: Path):
+        """Verify ANSI sequences are stripped from log output."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        # Create a log file with ANSI sequences
+        log_path = Path("/tmp/loom-loom-builder-issue-42.out")
+        log_content = "\x1b[31mError:\x1b[0m Something failed\n\x1b[32mInfo:\x1b[0m Trying again"
+        log_path.write_text(log_content)
+
+        try:
+            with patch("loom_tools.validate_phase._run_gh") as mock_gh:
+                mock_gh.return_value = _completed(stdout="loom:building\n")
+                diag = _gather_builder_diagnostics(42, str(wt), repo)
+
+            # ANSI codes should be stripped
+            assert "\x1b[" not in diag.log_tail
+            assert "Error: Something failed" in diag.log_tail
+            assert "Info: Trying again" in diag.log_tail
+        finally:
+            log_path.unlink(missing_ok=True)
+
+    def test_handles_missing_progress_file(self, tmp_path: Path):
+        """Verify graceful handling when no progress file exists."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        with patch("loom_tools.validate_phase._run_gh") as mock_gh:
+            mock_gh.return_value = _completed(stdout="loom:building\n")
+            diag = _gather_builder_diagnostics(42, str(wt), repo)
+
+        # Should have empty progress fields
+        assert diag.progress_status == ""
+        assert diag.progress_started_at == ""
+        assert diag.progress_milestones is None
+
+    def test_handles_missing_worktree(self, tmp_path: Path):
+        """Verify graceful handling when worktree doesn't exist."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        # Don't create worktree
+
+        with patch("loom_tools.validate_phase._run_gh") as mock_gh:
+            mock_gh.return_value = _completed(stdout="loom:building\n")
+            diag = _gather_builder_diagnostics(42, str(wt), repo)
+
+        assert diag.worktree_exists is False
+        assert diag.worktree_mtime == ""
 
 
 # ---------------------------------------------------------------------------
