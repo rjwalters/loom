@@ -22,6 +22,7 @@ import pytest
 from loom_tools.common.worktree_safety import (
     DEFAULT_GRACE_PERIOD_SECONDS,
     WorktreeSafetyResult,
+    check_cwd_inside_worktree,
     check_grace_period,
     check_in_use_marker,
     find_processes_using_directory,
