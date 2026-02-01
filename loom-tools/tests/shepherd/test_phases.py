@@ -1629,6 +1629,38 @@ class TestBuilderExtractErrorLines:
         lines = builder._extract_error_lines(output)
         assert len(lines) == 0
 
+    def test_excludes_coverage_threshold_lines(self) -> None:
+        """Should exclude vitest/istanbul coverage threshold violation lines."""
+        builder = BuilderPhase()
+        output = (
+            "Tests  1075 passed\n"
+            "ERROR: Coverage for functions (56.83%) does not meet global threshold (75%)\n"
+            "ERROR: Coverage for lines (42%) does not meet global threshold (50%)\n"
+            "ERROR: Coverage for branches (38%) does not meet global threshold (45%)\n"
+        )
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 0
+
+    def test_excludes_coverage_but_keeps_real_errors(self) -> None:
+        """Coverage lines filtered but actual test errors preserved."""
+        builder = BuilderPhase()
+        output = (
+            "FAIL src/bad.test.ts\n"
+            "Error: expected true to be false\n"
+            "ERROR: Coverage for functions (56.83%) does not meet global threshold (75%)\n"
+        )
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 2
+        assert any("FAIL" in line for line in lines)
+        assert any("expected true to be false" in line for line in lines)
+
+    def test_excludes_coverage_threshold_generic(self) -> None:
+        """Should exclude generic coverage threshold lines."""
+        builder = BuilderPhase()
+        output = "Coverage threshold not met for src/lib\n"
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 0
+
 
 class TestBuilderNormalizeErrorLine:
     """Test builder phase error line normalization."""
@@ -1772,6 +1804,45 @@ class TestBuilderParseFailureCount:
         builder = BuilderPhase()
         assert builder._parse_failure_count("") is None
 
+    def test_cargo_multi_target_failure(self) -> None:
+        """Should parse cargo multi-target failure count."""
+        builder = BuilderPhase()
+        output = (
+            "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured\n"
+            "\n"
+            "error: 1 target failed:\n"
+            "    `-p loom-daemon --test integration_basic`\n"
+        )
+        assert builder._parse_failure_count(output) == 1
+
+    def test_cargo_multi_target_plural(self) -> None:
+        """Should parse cargo multi-target failure with plural 'targets'."""
+        builder = BuilderPhase()
+        output = "error: 3 targets failed:\n    `target1`\n    `target2`\n    `target3`\n"
+        assert builder._parse_failure_count(output) == 3
+
+    def test_vitest_all_pass(self) -> None:
+        """Should return 0 for vitest all-pass output (no 'failed' keyword)."""
+        builder = BuilderPhase()
+        output = "Tests  14 passed\n"
+        assert builder._parse_failure_count(output) == 0
+
+    def test_pytest_all_pass(self) -> None:
+        """Should return 0 for pytest all-pass output."""
+        builder = BuilderPhase()
+        output = "========================= 14 passed in 2.45s ========================\n"
+        assert builder._parse_failure_count(output) == 0
+
+    def test_vitest_all_pass_with_coverage_errors(self) -> None:
+        """Should return 0 when all tests pass but coverage lines have 'error'."""
+        builder = BuilderPhase()
+        output = (
+            " Tests  1075 passed\n"
+            "ERROR: Coverage for functions (56.83%) does not meet global threshold (75%)\n"
+            "ERROR: Coverage for lines (42%) does not meet global threshold (50%)\n"
+        )
+        assert builder._parse_failure_count(output) == 0
+
 
 class TestBuilderExtractFailingTestNames:
     """Test builder phase failing test name extraction."""
@@ -1869,6 +1940,39 @@ class TestBuilderCompareTestResults:
         baseline = "Tests  2 failed, 3 passed\n"
         worktree = "Tests  2 failed, 3 passed\n"
         assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_cargo_multi_target_same_count(self) -> None:
+        """Cargo multi-target with same failure count -> pre-existing."""
+        builder = BuilderPhase()
+        # Typical cargo output when integration tests fail but unit tests pass
+        cargo_output = (
+            "test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured\n"
+            "\n"
+            "error: 1 target failed:\n"
+            "    `-p loom-daemon --test integration_basic`\n"
+        )
+        assert builder._compare_test_results(cargo_output, cargo_output) is None
+
+    def test_both_all_pass_coverage_only_failure(self) -> None:
+        """Both sides all-pass with coverage errors -> no new failures (structured path)."""
+        builder = BuilderPhase()
+        baseline = (
+            " Tests  1075 passed\n"
+            "ERROR: Coverage for functions (56.83%) does not meet global threshold (75%)\n"
+        )
+        worktree = (
+            " Tests  1075 passed\n"
+            "ERROR: Coverage for functions (55.12%) does not meet global threshold (75%)\n"
+        )
+        # Both parse to 0 failures -> structured comparison returns None (no new failures)
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_all_pass_vs_new_failures(self) -> None:
+        """Baseline all-pass, worktree has failures -> new failures detected."""
+        builder = BuilderPhase()
+        baseline = " Tests  1075 passed\n"
+        worktree = "Tests  1 failed, 1074 passed\n"
+        assert builder._compare_test_results(baseline, worktree) is True
 
 
 class TestBuilderFallbackComparison:

@@ -423,8 +423,9 @@ class BuilderPhase:
         """Extract the number of test failures from command output.
 
         Parses structured summary lines from pytest, cargo test, and
-        vitest/jest to extract the failure count. Returns None if no
-        recognizable pattern is found.
+        vitest/jest to extract the failure count. Returns 0 when a
+        test summary indicates all tests passed with no failures.
+        Returns None if no recognizable pattern is found.
         """
         lines = output.strip().splitlines()
 
@@ -432,12 +433,20 @@ class BuilderPhase:
             stripped = line.strip()
             cleaned = stripped.strip("= ").strip()
 
+            # cargo multi-target: "error: 1 target failed:"
+            # This appears when one cargo test binary fails but others pass.
+            # Treat target-level failures as 1 failure for comparison purposes.
+            m = re.match(r"error:\s+(\d+)\s+targets?\s+failed", stripped)
+            if m:
+                return int(m.group(1))
+
             # pytest: "1 failed, 12 passed in 0.03s" or "1 failed"
             m = re.search(r"(\d+)\s+failed", cleaned)
             if m and ("passed" in cleaned or "failed" in cleaned):
                 return int(m.group(1))
 
-            # cargo test: "test result: FAILED. 0 passed; 1 failed; 0 ignored"
+            # cargo test: "test result: ok. 14 passed; 0 failed; 0 ignored"
+            # or "test result: FAILED. 0 passed; 1 failed; 0 ignored"
             if stripped.startswith("test result:"):
                 m = re.search(r"(\d+)\s+failed", stripped)
                 if m:
@@ -448,6 +457,12 @@ class BuilderPhase:
                 m = re.search(r"(\d+)\s+failed", stripped)
                 if m:
                     return int(m.group(1))
+
+            # vitest/jest all-pass: "Tests  N passed" (no "failed" keyword)
+            # pytest all-pass: "N passed in Xs"
+            # These indicate 0 failures when no "failed" appears in the line.
+            if re.search(r"\d+\s+passed", cleaned) and "failed" not in cleaned.lower():
+                return 0
 
         return None
 
@@ -559,6 +574,29 @@ class BuilderPhase:
             result = pattern.sub(replacement, result)
         return result
 
+    # Patterns for coverage threshold output lines that should be excluded
+    # from error-line extraction. These lines contain "ERROR" or "fail" but
+    # represent coverage threshold violations, not actual test failures.
+    _COVERAGE_EXCLUSION_PATTERNS: list[re.Pattern[str]] = [
+        # vitest/istanbul: "ERROR: Coverage for functions (56.83%) does not meet global threshold (75%)"
+        re.compile(r"coverage for .+ does not meet", re.IGNORECASE),
+        # Generic: "Coverage threshold not met" or "coverage below minimum"
+        re.compile(r"coverage\s+threshold", re.IGNORECASE),
+        # Jest: "coverage below minimum" or "coverage not met"
+        re.compile(r"coverage\s+(below|not met)", re.IGNORECASE),
+    ]
+
+    def _is_coverage_line(self, line: str) -> bool:
+        """Check if a line is a coverage threshold output line.
+
+        Coverage threshold violations look like errors (contain "ERROR", "fail")
+        but represent coverage shortfalls, not actual test failures. Filtering
+        these prevents false positives in the error-line diff comparison.
+        """
+        return any(
+            pattern.search(line) for pattern in self._COVERAGE_EXCLUSION_PATTERNS
+        )
+
     def _extract_error_lines(self, output: str) -> list[str]:
         """Extract error-indicator lines from test output for comparison.
 
@@ -569,6 +607,9 @@ class BuilderPhase:
         Lines are normalized to replace non-deterministic content (timestamps,
         error IDs, hex hashes, etc.) with stable placeholders so that the same
         logical error matches across runs.
+
+        Coverage threshold violation lines are excluded since they represent
+        coverage shortfalls rather than actual test failures.
         """
         error_indicators = ("fail", "error", "✗", "✕", "×", "not ok")
         lines = []
@@ -578,6 +619,8 @@ class BuilderPhase:
                 continue
             lower = stripped.lower()
             if any(indicator in lower for indicator in error_indicators):
+                if self._is_coverage_line(stripped):
+                    continue
                 lines.append(self._normalize_error_line(stripped))
         return lines
 
