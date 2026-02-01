@@ -419,7 +419,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     fi
 
     # Run loom-daemon init
-    "$LOOM_ROOT/target/release/loom-daemon" init "$TARGET_PATH" || \
+    "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
     echo ""
     success "Quick reinstallation complete!"
