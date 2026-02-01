@@ -161,10 +161,11 @@ class TestShepherdConfig:
     def test_default_timeouts(self) -> None:
         """Default timeouts should be set from environment or defaults."""
         config = ShepherdConfig(issue=42)
-        assert config.curator_timeout == 300
-        assert config.builder_timeout == 3600
-        assert config.judge_timeout == 600
-        assert config.doctor_timeout == 900
+        # Note: Timeouts set high to avoid killing agents mid-work (see issue #2001)
+        assert config.curator_timeout == 3600
+        assert config.builder_timeout == 14400
+        assert config.judge_timeout == 3600
+        assert config.doctor_timeout == 3600
         assert config.poll_interval == 5
 
     def test_default_retry_limits(self) -> None:
