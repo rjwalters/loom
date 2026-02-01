@@ -15,8 +15,10 @@ use activity::{ActivityDb, StatsQueries};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use ipc::IpcServer;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use terminal::TerminalManager;
@@ -152,9 +154,24 @@ async fn main() -> Result<()> {
 
     let activity_db = Arc::new(Mutex::new(activity_db));
 
+    // Load configured terminal IDs for config-based session filtering (Issue #1952)
+    // This prevents importing stale sessions from crashed daemons or other instances
+    let workspace_from_env = std::env::var("LOOM_WORKSPACE").ok();
+    let configured_ids = workspace_from_env
+        .as_ref()
+        .and_then(|workspace| extract_configured_terminal_ids(Path::new(workspace)));
+
     // Initialize terminal manager and clean up stale sessions
     let mut tm = TerminalManager::new();
-    tm.restore_from_tmux()?;
+
+    // Use config-based filtering if workspace config is available
+    if let Some(ref ids) = configured_ids {
+        tm.restore_from_tmux_with_filter(Some(ids))?;
+    } else {
+        // Fall back to legacy behavior (import all) when no config available
+        log::warn!("No workspace config found - using legacy restore (all sessions)");
+        tm.restore_from_tmux()?;
+    }
     log::info!("Restored {} terminals", tm.list_terminals().len());
 
     match tm.clean_stale_sessions() {
@@ -174,8 +191,7 @@ async fn main() -> Result<()> {
     }
 
     // Start GitHub metrics collection (if workspace is set)
-    // Workspace can be set via LOOM_WORKSPACE environment variable
-    let workspace_from_env = std::env::var("LOOM_WORKSPACE").ok();
+    // Workspace can be set via LOOM_WORKSPACE environment variable (reuse variable from above)
     let db_path_str = db_path.to_str().map(std::string::ToString::to_string);
 
     if let (Some(workspace), Some(db_path_string)) = (workspace_from_env.as_deref(), db_path_str) {
@@ -727,4 +743,49 @@ fn handle_validate_command(
     }
 
     Ok(())
+}
+
+/// Extract configured terminal IDs from workspace config.json
+///
+/// Reads the workspace's `.loom/config.json` and extracts the `id` field from
+/// each terminal entry. This enables configuration-based session filtering
+/// during `restore_from_tmux()` (Issue #1952).
+///
+/// Returns None if config file doesn't exist or can't be parsed.
+fn extract_configured_terminal_ids(workspace: &Path) -> Option<HashSet<String>> {
+    let config_path = workspace.join(".loom").join("config.json");
+
+    let config_str = match fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("Could not read config at {}: {e}", config_path.display());
+            return None;
+        }
+    };
+
+    // Parse JSON to extract terminal IDs
+    // Config structure: { "terminals": [{ "id": "terminal-1", ... }, ...] }
+    let config: serde_json::Value = match serde_json::from_str(&config_str) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Could not parse config at {}: {e}", config_path.display());
+            return None;
+        }
+    };
+
+    let terminals = config.get("terminals")?.as_array()?;
+
+    let ids: HashSet<String> = terminals
+        .iter()
+        .filter_map(|t| t.get("id")?.as_str().map(String::from))
+        .collect();
+
+    if ids.is_empty() {
+        log::debug!("No terminal IDs found in config");
+        return None;
+    }
+
+    log::info!("📋 Loaded {} configured terminal IDs from {}", ids.len(), config_path.display());
+
+    Some(ids)
 }
