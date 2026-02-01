@@ -602,13 +602,14 @@ class TestBuilderDiagnostics:
             diag = builder._gather_diagnostics(mock_context)
 
         summary = diag["summary"]
-        # Should have 4 semicolon-separated sections
+        # Should have 5 semicolon-separated sections
         parts = summary.split("; ")
-        assert len(parts) == 4
+        assert len(parts) == 5
         assert "worktree" in parts[0]
         assert "remote branch" in parts[1]
-        assert "labels=" in parts[2]
-        assert "log=" in parts[3]
+        assert "PR" in parts[2] or "no PR" in parts[2]
+        assert "labels=" in parts[3]
+        assert "log=" in parts[4]
 
 
 class TestBuilderQualityValidation:
@@ -4928,3 +4929,490 @@ class TestDoctorTestFixMode:
 
         result = doctor.run_test_fix(mock_context, {})
         assert result.status == PhaseStatus.SHUTDOWN
+
+
+class TestBuilderDiagnoseRemainingSteps:
+    """Test _diagnose_remaining_steps for targeted completion instructions."""
+
+    def test_uncommitted_changes_need_all_steps(self) -> None:
+        """Uncommitted changes with no remote should need commit, push, and PR."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == ["stage_and_commit", "push_branch", "create_pr"]
+
+    def test_commits_ahead_no_remote_needs_push_and_pr(self) -> None:
+        """Commits ahead but no remote should need push and PR."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 3,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == ["push_branch", "create_pr"]
+
+    def test_remote_exists_no_pr_needs_pr_only(self) -> None:
+        """Remote branch exists but no PR should need PR creation only."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == ["create_pr"]
+
+    def test_pr_exists_missing_label(self) -> None:
+        """PR exists but missing label should need label only."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+            "pr_has_review_label": False,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == ["add_review_label"]
+
+    def test_pr_exists_with_label_no_steps(self) -> None:
+        """PR with label should need no steps."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+            "pr_has_review_label": True,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == []
+
+    def test_commits_ahead_with_remote_needs_pr(self) -> None:
+        """Commits ahead with remote already pushed needs PR."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        steps = builder._diagnose_remaining_steps(diag, 42)
+        assert steps == ["create_pr"]
+
+
+class TestBuilderHasIncompleteWork:
+    """Test _has_incomplete_work with expanded state detection."""
+
+    def test_no_worktree_returns_false(self) -> None:
+        builder = BuilderPhase()
+        diag = {"worktree_exists": False}
+        assert builder._has_incomplete_work(diag) is False
+
+    def test_uncommitted_changes_returns_true(self) -> None:
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_commits_ahead_returns_true(self) -> None:
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_remote_exists_no_pr_returns_true(self) -> None:
+        """Remote branch pushed but no PR should be incomplete."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_pr_missing_label_returns_true(self) -> None:
+        """PR exists but missing loom:review-requested should be incomplete."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_fully_complete_returns_false(self) -> None:
+        """Everything done (PR with label) should not be incomplete."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+            "pr_has_review_label": True,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
+    def test_no_work_no_remote_no_pr_returns_false(self) -> None:
+        """Worktree exists but nothing done should return False."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
+
+class TestBuilderDirectCompletion:
+    """Test _direct_completion for mechanical fallback operations."""
+
+    def test_push_only(self, mock_context: MagicMock) -> None:
+        """Should push branch directly when that's the only step."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with patch.object(builder, "_push_branch", return_value=True):
+            # push_branch is mechanical but create_pr is not
+            result = builder._direct_completion(mock_context, diag)
+
+        # Should return False because "create_pr" is not mechanical
+        assert result is False
+
+    def test_add_label_only(self, mock_context: MagicMock) -> None:
+        """Should add label directly when that's the only step."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+            "pr_has_review_label": False,
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        # Verify gh pr edit was called
+        call_args = mock_run.call_args[0][0]
+        assert "gh" in call_args
+        assert "pr" in call_args
+        assert "edit" in call_args
+        assert "100" in call_args
+        assert "--add-label" in call_args
+
+    def test_non_mechanical_steps_returns_false(self, mock_context: MagicMock) -> None:
+        """Should return False when non-mechanical steps remain."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        result = builder._direct_completion(mock_context, diag)
+        assert result is False
+
+    def test_push_failure_returns_false(self, mock_context: MagicMock) -> None:
+        """Should return False when push fails."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            # push_branch is only step (remote missing, but also need PR)
+        }
+        # No steps because commits_ahead is 0 and no remote — falls through
+        result = builder._direct_completion(mock_context, diag)
+        # No steps to complete
+        assert result is False
+
+    def test_empty_steps_returns_false(self, mock_context: MagicMock) -> None:
+        """Should return False when no steps remain."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+            "pr_has_review_label": True,
+        }
+        result = builder._direct_completion(mock_context, diag)
+        assert result is False
+
+
+class TestBuilderCompletionRetryDefault:
+    """Test that builder_completion_retries defaults to 2."""
+
+    def test_default_is_two(self) -> None:
+        config = ShepherdConfig(issue=1)
+        assert config.builder_completion_retries == 2
+
+
+class TestBuilderDiagnosticsPRDetection:
+    """Test PR detection in _gather_diagnostics."""
+
+    def test_pr_number_detected(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should detect PR number and label state."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        # Create log file
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("log line\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = "abc1234 commit\n"
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = "abc1234\trefs/heads/feature/issue-42\n"
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = '{"number": 200, "labels": [{"name": "loom:review-requested"}]}\n'
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["pr_number"] == 200
+        assert diag["pr_has_review_label"] is True
+        assert "PR #200" in diag["summary"]
+        assert "with loom:review-requested" in diag["summary"]
+
+    def test_no_pr_detected(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should report no PR when none exists."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("log line\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["pr_number"] is None
+        assert diag["pr_has_review_label"] is False
+        assert "no PR" in diag["summary"]
+
+    def test_pr_missing_label(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should detect PR that's missing loom:review-requested."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("log line\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = "abc\trefs/heads/feature/issue-42\n"
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = '{"number": 150, "labels": [{"name": "loom:building"}]}\n'
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["pr_number"] == 150
+        assert diag["pr_has_review_label"] is False
+        assert "missing loom:review-requested" in diag["summary"]
+
+
+class TestBuilderCompletionPhaseTargetedInstructions:
+    """Test that _run_completion_phase sends targeted instructions."""
+
+    def test_attempt_2_uses_explicit_commands(self, mock_context: MagicMock) -> None:
+        """Later attempts should use explicit git/gh commands."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=2)
+
+        # Check the args passed to the worker contain explicit commands
+        call_kwargs = mock_run.call_args[1]
+        assert "git add -A" in call_kwargs["args"]
+        assert "gh pr create" in call_kwargs["args"]
+
+    def test_attempt_1_uses_general_instructions(self, mock_context: MagicMock) -> None:
+        """First attempt should use general instructions."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=1)
+
+        call_kwargs = mock_run.call_args[1]
+        assert "Stage and commit" in call_kwargs["args"]
+        # Not explicit git commands on first attempt
+        assert "git add -A" not in call_kwargs["args"]
+
+    def test_label_only_step(self, mock_context: MagicMock) -> None:
+        """When only label is missing, instructions should target label."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 200,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=1)
+
+        call_kwargs = mock_run.call_args[1]
+        assert "gh pr edit 200 --add-label loom:review-requested" in call_kwargs["args"]
+        # Should not include commit or push instructions
+        assert "commit" not in call_kwargs["args"].lower()
+        assert "push" not in call_kwargs["args"].lower()
