@@ -935,8 +935,6 @@ def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
     """
     import subprocess
 
-    from loom_tools.shepherd.phases import PhaseResult  # noqa: F811
-
     issue_tracking = result.data.get("issue_tracking", "")
     failing_tests = result.data.get("failing_tests", [])
 
