@@ -261,10 +261,35 @@ class BuilderDiagnostics:
     issue_labels: str = ""
     main_uncommitted: str = ""
     issue: int = 0
+    # New fields for enhanced diagnostics
+    worktree_mtime: str = ""  # ISO timestamp of worktree last modification
+    progress_status: str = ""  # Current phase from progress file
+    progress_started_at: str = ""  # When shepherd started (ISO timestamp)
+    progress_last_heartbeat: str = ""  # Last heartbeat time (ISO timestamp)
+    progress_milestones: list[str] | None = None  # Recent milestone events
 
     def to_markdown(self) -> str:
         parts: list[str] = ["<details>\n<summary>Diagnostic Information</summary>\n"]
 
+        # Previous attempt timing section
+        if self.progress_started_at or self.worktree_mtime:
+            parts.append("### Previous Attempt")
+            if self.progress_started_at:
+                parts.append(f"**Started**: {self.progress_started_at}")
+            if self.worktree_mtime:
+                parts.append(f"**Worktree last modified**: {self.worktree_mtime}")
+            if self.progress_status:
+                parts.append(f"**Last phase**: `{self.progress_status}`")
+            if self.progress_last_heartbeat:
+                parts.append(f"**Last heartbeat**: {self.progress_last_heartbeat}")
+            if self.progress_milestones:
+                parts.append("**Recent milestones**:")
+                for ms in self.progress_milestones[-5:]:  # Show last 5
+                    parts.append(f"  - {ms}")
+            parts.append("")
+
+        # Worktree state section
+        parts.append("### Worktree State")
         if self.worktree_exists:
             parts.append(f"**Worktree**: `{self.worktree_path}` exists")
             parts.append(f"**Branch**: `{self.branch}`")
@@ -293,7 +318,7 @@ class BuilderDiagnostics:
             )
 
         # Possible causes
-        parts.append("\n**Possible causes**:")
+        parts.append("\n### Possible Causes")
         if not self.worktree_exists:
             parts.append("- Worktree was never created (agent may have failed early)")
             parts.append("- Worktree creation script failed")
@@ -307,15 +332,25 @@ class BuilderDiagnostics:
 
         issue = self.issue
         parts.append(f"""
-**Recovery options**:
+### Recovery Options
 
-**Option A: Retry with shepherd** (recommended)
+**Option A: Clean worktree and retry** (recommended if worktree has no valuable changes)
+```bash
+# Remove stale worktree
+git worktree remove .loom/worktrees/issue-{issue} --force 2>/dev/null || true
+git branch -D feature/issue-{issue} 2>/dev/null || true
+# Reset labels and retry
+gh issue edit {issue} --remove-label loom:blocked --add-label loom:issue
+./.loom/scripts/loom-shepherd.sh {issue} --merge
+```
+
+**Option B: Retry preserving worktree** (if worktree may have partial work)
 ```bash
 gh issue edit {issue} --remove-label loom:blocked --add-label loom:issue
 ./.loom/scripts/loom-shepherd.sh {issue} --merge
 ```
 
-**Option B: Complete manually**
+**Option C: Complete manually**
 1. Create worktree: `./.loom/scripts/worktree.sh {issue}`
 2. Navigate: `cd .loom/worktrees/issue-{issue}`
 3. Implement the fix, commit changes
@@ -326,10 +361,10 @@ gh issue edit {issue} --remove-label loom:blocked --add-label loom:issue
    ```
 5. Remove blocked label: `gh issue edit {issue} --remove-label loom:blocked`
 
-**Diagnostics**:
+### Investigation Tips
 - Check the issue description for clarity - is it actionable?
 - Review any curator comments for implementation guidance
-- Consider adding more detail to the issue if it was unclear
+- If log file is large, use: `cat {self.log_path} | ./.loom/scripts/strip-ansi.sh | tail -100`
 
 </details>""")
         return "\n".join(parts)

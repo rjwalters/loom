@@ -158,6 +158,42 @@ def read_progress_files(repo_root: pathlib.Path) -> list[ShepherdProgress]:
     return results
 
 
+def find_progress_for_issue(
+    repo_root: pathlib.Path, issue: int
+) -> ShepherdProgress | None:
+    """Find the most recent progress file for a specific issue.
+
+    Searches all ``.loom/progress/shepherd-*.json`` files and returns
+    the one with the matching issue number. If multiple files exist
+    for the same issue (e.g., from retries), returns the most recent
+    one based on ``started_at`` timestamp.
+
+    Args:
+        repo_root: Repository root path.
+        issue: Issue number to search for.
+
+    Returns:
+        ShepherdProgress for the issue if found, None otherwise.
+    """
+    paths = LoomPaths(repo_root)
+    if not paths.progress_dir.is_dir():
+        return None
+
+    candidates: list[ShepherdProgress] = []
+    for p in paths.progress_dir.glob("shepherd-*.json"):
+        data = read_json_file(p)
+        if isinstance(data, dict):
+            progress = ShepherdProgress.from_dict(data)
+            if progress.issue == issue:
+                candidates.append(progress)
+
+    if not candidates:
+        return None
+
+    # Return most recent by started_at (ISO format sorts lexicographically)
+    return max(candidates, key=lambda p: p.started_at or "")
+
+
 def read_health_metrics(repo_root: pathlib.Path) -> HealthMetrics:
     """Load ``.loom/health-metrics.json`` into a :class:`HealthMetrics`."""
     paths = LoomPaths(repo_root)
