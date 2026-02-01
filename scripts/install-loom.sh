@@ -496,20 +496,11 @@ CURRENT_STEP="Initialize Loom"
 header "Step 3: Initializing Loom Configuration"
 echo ""
 
-# Check if loom-daemon is built
-if [[ ! -f "$LOOM_ROOT/target/release/loom-daemon" ]]; then
-  warning "loom-daemon binary not found"
-  info "Building loom-daemon (this may take a minute)..."
-
-  # Check if pnpm is available
-  if ! command -v pnpm &> /dev/null; then
-    error "pnpm is required to build loom-daemon but not found in PATH\n       Install from: https://pnpm.io/installation"
-  fi
-
-  cd "$LOOM_ROOT"
-  pnpm daemon:build || error "Failed to build loom-daemon"
-  echo ""
-fi
+# Build loom-daemon (always rebuild to ensure binary matches current source)
+# Cargo's incremental compilation makes this fast (~1-2s) when nothing changed
+info "Building loom-daemon..."
+cd "$LOOM_ROOT"
+pnpm daemon:build || error "Failed to build loom-daemon"
 
 success "loom-daemon binary ready"
 
