@@ -2383,7 +2383,11 @@ class TestBuilderFallbackComparison:
     def test_fallback_new_errors_detected(
         self, mock_context: MagicMock
     ) -> None:
-        """Fallback: new error lines in worktree -> FAILED."""
+        """Fallback: new error lines in worktree -> FAILED.
+
+        Uses 7 error lines in worktree vs 1 in baseline (diff=6) to exceed
+        the _ERROR_LINE_TOLERANCE of 5, ensuring new errors are detected.
+        """
         builder = BuilderPhase()
         worktree_mock = MagicMock()
         worktree_mock.is_dir.return_value = True
@@ -2392,10 +2396,12 @@ class TestBuilderFallbackComparison:
         baseline_result = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="Error: old bug\n", stderr=""
         )
+        # 7 error lines total (1 original + 6 new) exceeds tolerance of 5
+        new_errors = "".join(f"Error: new regression {i}\n" for i in range(6))
         worktree_result = subprocess.CompletedProcess(
             args=[],
             returncode=1,
-            stdout="Error: old bug\nError: new regression\n",
+            stdout=f"Error: old bug\n{new_errors}",
             stderr="",
         )
         with (
