@@ -285,6 +285,7 @@ Safety Features:
   ✓ Prevents nested worktrees
   ✓ Non-interactive (safe for AI agents)
   ✓ Reuses existing branches automatically
+  ✓ Symlinks node_modules from main (avoids pnpm install)
   ✓ Runs project-specific hooks after creation
   ✓ Stashes/restores local changes during pull
 
@@ -711,10 +712,33 @@ if git worktree add "${CREATE_ARGS[@]}"; then
         cd - > /dev/null
     fi
 
+    # Symlink node_modules from main workspace if available
+    # This avoids expensive pnpm install on every worktree (30-60s savings)
+    MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
+    MAIN_NODE_MODULES="$MAIN_WORKSPACE_DIR/node_modules"
+    WORKTREE_NODE_MODULES="$ABS_WORKTREE_PATH/node_modules"
+    WORKTREE_PACKAGE_JSON="$ABS_WORKTREE_PATH/package.json"
+
+    if [[ -d "$MAIN_NODE_MODULES" && -f "$WORKTREE_PACKAGE_JSON" && ! -e "$WORKTREE_NODE_MODULES" ]]; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "Symlinking node_modules from main workspace..."
+        fi
+
+        if ln -s "$MAIN_NODE_MODULES" "$WORKTREE_NODE_MODULES" 2>/dev/null; then
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_success "node_modules symlinked (skipping pnpm install)"
+            fi
+        else
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Could not symlink node_modules (will install on first build)"
+            fi
+        fi
+    fi
+
     # Run project-specific post-worktree hook if it exists
     # This allows projects to add custom setup steps (e.g., pnpm install, lake exe cache get)
     # The hook is stored in .loom/hooks/ which is NOT overwritten by Loom upgrades
-    MAIN_WORKSPACE_DIR=$(git rev-parse --show-toplevel 2>/dev/null)
+    # Note: MAIN_WORKSPACE_DIR is already set by node_modules symlink section above
     POST_WORKTREE_HOOK="$MAIN_WORKSPACE_DIR/.loom/hooks/post-worktree.sh"
     if [[ -x "$POST_WORKTREE_HOOK" ]]; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then

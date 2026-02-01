@@ -2688,6 +2688,28 @@ class TestBuilderEnsureDependencies:
         assert result is True
         mock_run.assert_not_called()
 
+    def test_noop_when_node_modules_is_symlink(self, tmp_path: Path) -> None:
+        """Should be a no-op when node_modules is a symlink to a directory.
+
+        Worktree creation symlinks node_modules from main workspace to avoid
+        expensive pnpm install on every worktree (30-60s savings).
+        """
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text('{"name": "test"}')
+
+        # Create source node_modules directory and symlink to it
+        main_node_modules = tmp_path / "main_node_modules"
+        main_node_modules.mkdir()
+        (tmp_path / "node_modules").symlink_to(main_node_modules)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            result = builder._ensure_dependencies(tmp_path)
+
+        assert result is True
+        mock_run.assert_not_called()
+
     def test_noop_when_no_package_json(self, tmp_path: Path) -> None:
         """Should be a no-op when no package.json exists (non-JS project)."""
         builder = BuilderPhase()
