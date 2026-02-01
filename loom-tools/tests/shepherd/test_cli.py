@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from io import StringIO
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from loom_tools.shepherd.cli import (
+    _auto_navigate_out_of_worktree,
     _create_config,
     _mark_judge_exhausted,
     _parse_args,
@@ -133,22 +136,175 @@ class TestCreateConfig:
         assert config.task_id == "abc1234"
 
 
+class TestAutoNavigateOutOfWorktree:
+    """Test _auto_navigate_out_of_worktree function (issue #1957)."""
+
+    def test_navigates_when_cwd_is_inside_worktree(self, tmp_path: Path) -> None:
+        """Should change CWD to repo root when inside worktree."""
+        # Setup: create mock repo structure
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".loom").mkdir()
+        worktree_dir = repo_root / ".loom" / "worktrees" / "issue-42"
+        worktree_dir.mkdir(parents=True)
+
+        # Save original CWD
+        original_cwd = os.getcwd()
+
+        try:
+            # Set CWD to inside worktree
+            os.chdir(worktree_dir)
+
+            # Call the function
+            with patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+                _auto_navigate_out_of_worktree(repo_root)
+
+            # Verify CWD changed to repo root
+            assert Path.cwd().resolve() == repo_root.resolve()
+
+            # Verify warning was logged
+            mock_warn.assert_called_once()
+            call_arg = mock_warn.call_args[0][0]
+            assert "inside worktree" in call_arg.lower()
+            assert str(worktree_dir) in call_arg
+
+        finally:
+            # Restore original CWD
+            os.chdir(original_cwd)
+
+    def test_no_change_when_cwd_is_repo_root(self, tmp_path: Path) -> None:
+        """Should not change CWD when already at repo root."""
+        # Setup: create mock repo structure
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".loom").mkdir()
+        (repo_root / ".loom" / "worktrees").mkdir(parents=True)
+
+        # Save original CWD
+        original_cwd = os.getcwd()
+
+        try:
+            # Set CWD to repo root
+            os.chdir(repo_root)
+
+            # Call the function
+            with patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+                _auto_navigate_out_of_worktree(repo_root)
+
+            # Verify CWD unchanged
+            assert Path.cwd().resolve() == repo_root.resolve()
+
+            # Verify no warning was logged
+            mock_warn.assert_not_called()
+
+        finally:
+            # Restore original CWD
+            os.chdir(original_cwd)
+
+    def test_no_change_when_cwd_is_outside_repo(self, tmp_path: Path) -> None:
+        """Should not change CWD when outside repo entirely."""
+        # Setup: create mock repo structure
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".loom").mkdir()
+        (repo_root / ".loom" / "worktrees").mkdir(parents=True)
+
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+
+        # Save original CWD
+        original_cwd = os.getcwd()
+
+        try:
+            # Set CWD to outside repo
+            os.chdir(other_dir)
+
+            # Call the function
+            with patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+                _auto_navigate_out_of_worktree(repo_root)
+
+            # Verify CWD unchanged
+            assert Path.cwd().resolve() == other_dir.resolve()
+
+            # Verify no warning was logged
+            mock_warn.assert_not_called()
+
+        finally:
+            # Restore original CWD
+            os.chdir(original_cwd)
+
+    def test_handles_nested_worktree_subdirectory(self, tmp_path: Path) -> None:
+        """Should navigate out even when CWD is nested inside worktree."""
+        # Setup: create mock repo structure with nested dirs
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        (repo_root / ".loom").mkdir()
+        worktree_dir = repo_root / ".loom" / "worktrees" / "issue-42"
+        nested_dir = worktree_dir / "src" / "components"
+        nested_dir.mkdir(parents=True)
+
+        # Save original CWD
+        original_cwd = os.getcwd()
+
+        try:
+            # Set CWD to nested directory inside worktree
+            os.chdir(nested_dir)
+
+            # Call the function
+            with patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+                _auto_navigate_out_of_worktree(repo_root)
+
+            # Verify CWD changed to repo root
+            assert Path.cwd().resolve() == repo_root.resolve()
+
+            # Verify warning was logged
+            mock_warn.assert_called_once()
+
+        finally:
+            # Restore original CWD
+            os.chdir(original_cwd)
+
+
 class TestMain:
     """Test main entry point."""
 
     def test_returns_int(self) -> None:
         """main should return an int exit code."""
-        with patch("loom_tools.shepherd.cli.orchestrate", return_value=0):
-            with patch("loom_tools.shepherd.cli.ShepherdContext"):
-                result = main(["42"])
-                assert isinstance(result, int)
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=0), \
+             patch("loom_tools.shepherd.cli.ShepherdContext"), \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"):
+            result = main(["42"])
+            assert isinstance(result, int)
 
     def test_passes_exit_code_from_orchestrate(self) -> None:
         """main should return orchestrate's exit code."""
-        with patch("loom_tools.shepherd.cli.orchestrate", return_value=1):
-            with patch("loom_tools.shepherd.cli.ShepherdContext"):
-                result = main(["42"])
-                assert result == 1
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=1), \
+             patch("loom_tools.shepherd.cli.ShepherdContext"), \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"):
+            result = main(["42"])
+            assert result == 1
+
+    def test_calls_auto_navigate_before_context(self) -> None:
+        """main should call _auto_navigate_out_of_worktree before creating context."""
+        call_order = []
+
+        def track_navigate(repo_root: Path) -> None:
+            call_order.append("navigate")
+
+        def track_context(*args: object, **kwargs: object) -> MagicMock:
+            call_order.append("context")
+            return MagicMock()
+
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=0), \
+             patch("loom_tools.shepherd.cli.ShepherdContext", side_effect=track_context), \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree", side_effect=track_navigate):
+            main(["42"])
+
+        # Navigate must be called before context is created
+        assert call_order == ["navigate", "context"]
 
 
 def _make_ctx(

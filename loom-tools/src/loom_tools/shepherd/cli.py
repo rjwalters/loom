@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 from loom_tools.common.git import get_commit_count
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.repo import find_repo_root
 from loom_tools.shepherd.config import ExecutionMode, Phase, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import (
@@ -146,6 +148,30 @@ EXAMPLES:
     )
 
     return parser.parse_args(argv)
+
+
+def _auto_navigate_out_of_worktree(repo_root: Path) -> None:
+    """Navigate to repo root if CWD is inside a worktree.
+
+    This prevents issues where shepherd deletes a worktree that
+    contains its own shell session's CWD, causing "No such file
+    or directory" errors when the worktree is recreated.
+
+    Args:
+        repo_root: The resolved repository root path
+    """
+    cwd = Path.cwd().resolve()
+    worktrees_dir = repo_root / ".loom" / "worktrees"
+
+    try:
+        # Check if CWD is inside .loom/worktrees/
+        cwd.relative_to(worktrees_dir)
+        # If we get here, CWD is inside worktrees dir
+        log_warning(f"CWD is inside worktree ({cwd}), navigating to {repo_root}")
+        os.chdir(repo_root)
+    except ValueError:
+        # Not inside worktrees - nothing to do
+        pass
 
 
 def _create_config(args: argparse.Namespace) -> ShepherdConfig:
@@ -887,6 +913,13 @@ def main(argv: list[str] | None = None) -> int:
     """Main entry point for loom-shepherd CLI."""
     args = _parse_args(argv)
     config = _create_config(args)
+
+    # Auto-navigate out of worktree before creating context.
+    # This prevents issues where shepherd deletes a worktree that
+    # contains its own shell session's CWD.
+    repo_root = find_repo_root()
+    _auto_navigate_out_of_worktree(repo_root)
+
     ctx = ShepherdContext(config=config)
 
     # Print header
