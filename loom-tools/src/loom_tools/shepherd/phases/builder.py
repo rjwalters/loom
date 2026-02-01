@@ -255,47 +255,63 @@ class BuilderPhase:
             if self.validate(ctx):
                 break  # Validation passed
 
+            # Re-diagnose on each iteration to detect partial progress
             diag = self._gather_diagnostics(ctx)
 
             # Check if this is incomplete work that could be completed
-            if (
-                completion_attempts < max_completion_attempts
-                and self._has_incomplete_work(diag)
-            ):
-                completion_attempts += 1
-                log_warning(
-                    f"Builder left incomplete work (attempt {completion_attempts}/{max_completion_attempts}): "
-                    f"{diag['summary']}"
+            if not self._has_incomplete_work(diag):
+                # No incomplete work pattern — nothing to retry
+                self._cleanup_stale_worktree(ctx)
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"builder phase validation failed: {diag['summary']}"
+                    ),
+                    phase_name="builder",
+                    data={"diagnostics": diag, "completion_attempts": completion_attempts},
                 )
 
-                # Run completion phase
-                completion_exit = self._run_completion_phase(ctx, diag)
-
-                if completion_exit == 3:
-                    # Shutdown during completion
-                    return PhaseResult(
-                        status=PhaseStatus.SHUTDOWN,
-                        message="shutdown signal detected during completion phase",
-                        phase_name="builder",
-                    )
-
-                if completion_exit == 0:
-                    log_info("Completion phase finished, re-validating")
+            if completion_attempts >= max_completion_attempts:
+                # Retries exhausted — try direct fallback for mechanical ops
+                if self._direct_completion(ctx, diag):
+                    log_success("Direct completion succeeded")
                     continue  # Re-validate
 
-                log_warning(f"Completion phase failed with exit code {completion_exit}")
-                # Fall through to failure
+                self._cleanup_stale_worktree(ctx)
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"builder phase validation failed: {diag['summary']}"
+                    ),
+                    phase_name="builder",
+                    data={"diagnostics": diag, "completion_attempts": completion_attempts},
+                )
 
-            # No incomplete work pattern or retries exhausted
-            self._cleanup_stale_worktree(ctx)
-            return PhaseResult(
-                status=PhaseStatus.FAILED,
-                message=(
-                    f"builder phase validation failed: {diag['summary']}"
-                ),
-                phase_name="builder",
-                data={"diagnostics": diag, "completion_attempts": completion_attempts},
+            completion_attempts += 1
+            log_warning(
+                f"Builder left incomplete work (attempt {completion_attempts}/{max_completion_attempts}): "
+                f"{diag['summary']}"
             )
+
+            # Run completion phase with attempt number for progressive simplification
+            completion_exit = self._run_completion_phase(
+                ctx, diag, attempt=completion_attempts
+            )
+
+            if completion_exit == 3:
+                # Shutdown during completion
+                return PhaseResult(
+                    status=PhaseStatus.SHUTDOWN,
+                    message="shutdown signal detected during completion phase",
+                    phase_name="builder",
+                )
+
+            if completion_exit == 0:
+                log_info("Completion phase finished, re-validating")
+                continue  # Re-validate
+
+            log_warning(f"Completion phase failed with exit code {completion_exit}")
+            # Loop back to re-diagnose and potentially retry
 
         # Get PR number
         pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
@@ -1155,6 +1171,40 @@ class BuilderPhase:
             ls_res.returncode == 0 and ls_res.stdout.strip()
         )
 
+        # -- Existing PR -----------------------------------------------------
+        branch_name_for_pr = NamingConventions.branch_name(ctx.config.issue)
+        pr_res = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--head",
+                branch_name_for_pr,
+                "--state",
+                "open",
+                "--json",
+                "number,labels",
+                "--jq",
+                ".[0] // empty",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        diag["pr_number"] = None
+        diag["pr_has_review_label"] = False
+        if pr_res.returncode == 0 and pr_res.stdout.strip():
+            try:
+                pr_data = json.loads(pr_res.stdout.strip())
+                diag["pr_number"] = pr_data.get("number")
+                pr_labels = [
+                    lbl.get("name", "") for lbl in pr_data.get("labels", [])
+                ]
+                diag["pr_has_review_label"] = "loom:review-requested" in pr_labels
+            except (json.JSONDecodeError, TypeError):
+                pass
+
         # -- Issue labels ----------------------------------------------------
         label_res = subprocess.run(
             [
@@ -1189,6 +1239,15 @@ class BuilderPhase:
         parts.append(
             f"remote branch {'exists' if diag['remote_branch_exists'] else 'missing'}"
         )
+        if diag["pr_number"] is not None:
+            label_note = (
+                "with loom:review-requested"
+                if diag["pr_has_review_label"]
+                else "missing loom:review-requested"
+            )
+            parts.append(f"PR #{diag['pr_number']} ({label_note})")
+        else:
+            parts.append("no PR")
         parts.append(f"labels=[{diag['issue_labels']}]")
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
@@ -1272,10 +1331,11 @@ class BuilderPhase:
     def _has_incomplete_work(self, diag: dict[str, Any]) -> bool:
         """Check if diagnostics indicate incomplete work that could be completed.
 
-        Returns True if:
-        - Worktree exists
-        - Has uncommitted changes OR commits ahead of main
-        - Remote branch doesn't exist (work not pushed)
+        Returns True if the worktree exists and any of these conditions hold:
+        - Has uncommitted changes (needs: stage, commit, push, PR)
+        - Has commits ahead of main (needs: push, PR)
+        - Remote branch exists but no PR (needs: PR creation)
+        - PR exists but missing loom:review-requested label (needs: label)
 
         This pattern suggests the builder made progress but didn't complete
         the commit/push/PR workflow.
@@ -1283,20 +1343,111 @@ class BuilderPhase:
         if not diag.get("worktree_exists"):
             return False
 
-        has_work = (
+        has_local_work = (
             diag.get("has_uncommitted_changes", False)
             or diag.get("commits_ahead", 0) > 0
         )
 
-        if not has_work:
+        if has_local_work:
+            return True
+
+        # Remote branch exists but no PR — just needs PR creation
+        if diag.get("remote_branch_exists") and diag.get("pr_number") is None:
+            return True
+
+        # PR exists but missing the review label
+        if (
+            diag.get("pr_number") is not None
+            and not diag.get("pr_has_review_label", False)
+        ):
+            return True
+
+        return False
+
+    def _diagnose_remaining_steps(self, diag: dict[str, Any], issue: int) -> list[str]:
+        """Determine exactly which steps remain to complete the workflow.
+
+        Returns a list of step identifiers like "stage_and_commit",
+        "push_branch", "create_pr", or "add_review_label".
+        """
+        steps: list[str] = []
+
+        if diag.get("has_uncommitted_changes"):
+            steps.append("stage_and_commit")
+
+        if diag.get("commits_ahead", 0) > 0 and not diag.get("remote_branch_exists"):
+            steps.append("push_branch")
+        elif not diag.get("remote_branch_exists") and diag.get("has_uncommitted_changes"):
+            # Will need push after committing
+            steps.append("push_branch")
+
+        if diag.get("pr_number") is None:
+            if diag.get("remote_branch_exists") or "push_branch" in steps:
+                steps.append("create_pr")
+        elif not diag.get("pr_has_review_label", False):
+            steps.append("add_review_label")
+
+        return steps
+
+    def _direct_completion(
+        self, ctx: ShepherdContext, diag: dict[str, Any]
+    ) -> bool:
+        """Attempt to complete mechanical operations directly in Python.
+
+        Handles simple operations (push branch, add label) without spawning
+        a full agent. Returns True if all remaining steps were completed.
+        """
+        steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
+
+        # Only handle purely mechanical steps directly
+        mechanical_steps = {"push_branch", "add_review_label"}
+        if not steps or not set(steps).issubset(mechanical_steps):
             return False
 
-        # If remote branch exists, work was pushed - may just need PR
-        # If no remote, definitely incomplete
+        log_info(
+            f"Attempting direct completion for issue #{ctx.config.issue}: "
+            f"{steps}"
+        )
+
+        for step in steps:
+            if step == "push_branch":
+                if not self._push_branch(ctx):
+                    log_warning("Direct completion: push failed")
+                    return False
+                log_success("Direct completion: branch pushed")
+
+            elif step == "add_review_label":
+                pr_num = diag.get("pr_number")
+                if pr_num is None:
+                    return False
+                result = subprocess.run(
+                    [
+                        "gh",
+                        "pr",
+                        "edit",
+                        str(pr_num),
+                        "--add-label",
+                        "loom:review-requested",
+                    ],
+                    cwd=ctx.repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    log_warning(
+                        f"Direct completion: failed to add label to PR #{pr_num}"
+                    )
+                    return False
+                log_success(f"Direct completion: added loom:review-requested to PR #{pr_num}")
+
         return True
 
     def _run_completion_phase(
-        self, ctx: ShepherdContext, diag: dict[str, Any]
+        self,
+        ctx: ShepherdContext,
+        diag: dict[str, Any],
+        attempt: int = 1,
     ) -> int:
         """Run a focused completion phase to finish incomplete work.
 
@@ -1306,30 +1457,60 @@ class BuilderPhase:
         Args:
             ctx: Shepherd context
             diag: Diagnostics from _gather_diagnostics
+            attempt: Current attempt number (1-based), used for
+                progressive instruction simplification
 
         Returns:
             Exit code from the completion worker (0=success)
         """
         from loom_tools.shepherd.phases.base import run_worker_phase
 
-        # Build completion instructions based on current state
+        steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
+
+        # Build targeted completion instructions based on remaining steps
         instructions: list[str] = []
 
-        if diag.get("has_uncommitted_changes"):
-            instructions.append("- Stage and commit all changes")
+        if "stage_and_commit" in steps:
+            if attempt >= 2:
+                instructions.append(
+                    "- Run: git add -A && git commit -m 'Implement changes for issue "
+                    f"#{ctx.config.issue}'"
+                )
+            else:
+                instructions.append("- Stage and commit all changes")
 
-        if not diag.get("remote_branch_exists"):
+        if "push_branch" in steps:
             branch = diag.get("branch", f"feature/issue-{ctx.config.issue}")
-            instructions.append(f"- Push branch to remote: git push -u origin {branch}")
+            instructions.append(
+                f"- Push branch to remote: git push -u origin {branch}"
+            )
 
-        instructions.append(
-            f"- Create PR with loom:review-requested label using 'Closes #{ctx.config.issue}' in body"
-        )
-        instructions.append("- Verify PR was created successfully with gh pr view")
+        if "create_pr" in steps:
+            if attempt >= 2:
+                instructions.append(
+                    f"- Run: gh pr create --title 'Issue #{ctx.config.issue}' "
+                    f"--label loom:review-requested "
+                    f"--body 'Closes #{ctx.config.issue}'"
+                )
+            else:
+                instructions.append(
+                    f"- Create PR with loom:review-requested label "
+                    f"using 'Closes #{ctx.config.issue}' in body"
+                )
+
+        if "add_review_label" in steps:
+            pr_num = diag.get("pr_number")
+            instructions.append(
+                f"- Run: gh pr edit {pr_num} --add-label loom:review-requested"
+            )
+
+        if not instructions:
+            instructions.append("- Verify PR was created successfully with gh pr view")
 
         instruction_text = "\n".join(instructions)
 
-        log_info(f"Running completion phase for issue #{ctx.config.issue}")
+        log_info(f"Running completion phase for issue #{ctx.config.issue} (attempt {attempt})")
+        log_info(f"Remaining steps: {steps}")
         log_info(f"Instructions:\n{instruction_text}")
 
         # Use a special completion prompt as args
