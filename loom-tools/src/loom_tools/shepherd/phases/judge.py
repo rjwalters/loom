@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from loom_tools.common.logging import log_info, log_warning
+from loom_tools.common.logging import log_info, log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import parse_command_output
 from loom_tools.shepherd.config import Phase
@@ -24,6 +24,14 @@ from loom_tools.shepherd.phases.base import (
 # validation can race between them (see issue #1764).
 VALIDATION_MAX_RETRIES = 3
 VALIDATION_RETRY_DELAY_SECONDS = 2
+
+# Minimum threshold (in characters) for meaningful agent output.
+# If the log file contains fewer non-ANSI characters than this after
+# stripping escape sequences, the agent likely didn't produce any
+# substantive work (e.g., only terminal control sequences like
+# "\x1b[?2026l" for disabling bracketed paste).
+# See issue #1978 for details on the failure mode this detects.
+MINIMUM_MEANINGFUL_OUTPUT_CHARS = 100
 
 # Patterns that indicate an approval comment from the judge.
 # Matched case-insensitively against the full comment body.
@@ -538,6 +546,35 @@ class JudgePhase:
         """Return the expected judge worker log file path."""
         paths = LoomPaths(ctx.repo_root)
         return paths.worker_log_file("judge", ctx.config.issue)
+
+    def _has_meaningful_output(self, log_path: Path) -> bool:
+        """Check if log file contains substantive content beyond control sequences.
+
+        When the judge agent spawns but fails to produce meaningful output,
+        the log file may contain only terminal control sequences like
+        "\\x1b[?2026l" (disable bracketed paste). This helper detects that
+        failure mode by stripping ANSI escape sequences and checking if
+        at least MINIMUM_MEANINGFUL_OUTPUT_CHARS of content remain.
+
+        Args:
+            log_path: Path to the judge worker log file.
+
+        Returns:
+            True if the log contains meaningful content (>= threshold chars
+            after stripping ANSI sequences), False otherwise.
+
+        See issue #1978 for details on the failure mode this detects.
+        """
+        if not log_path.is_file():
+            return False
+        try:
+            content = log_path.read_text()
+            # Strip ANSI escape sequences to get actual content
+            stripped = strip_ansi(content)
+            # Check if remaining content meets minimum threshold
+            return len(stripped.strip()) >= MINIMUM_MEANINGFUL_OUTPUT_CHARS
+        except OSError:
+            return False
 
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info when judge validation fails.
