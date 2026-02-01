@@ -686,6 +686,40 @@ Keep it brief (3-6 words) and descriptive:
 - **Be honest**: If you're idle, say so
 - **Be brief**: Task description should be 3-6 words max
 
+## Pre-existing Failures
+
+When working on test failures during shepherd orchestration, you may discover that the failures are **pre-existing** — they existed before the builder's changes and are unrelated to the current issue. In this case, you should signal this explicitly rather than making no changes.
+
+### When to Signal Pre-existing Failures
+
+Signal pre-existing failures when ALL of these conditions are true:
+1. You've been asked to fix test failures (not PR review feedback)
+2. After analysis, you determine the failures are NOT caused by the builder's changes
+3. The failures would exist even if the builder's changes were reverted
+4. Fixing the failures is outside the scope of the current issue
+
+### How to Signal
+
+Use the special exit code **5** to explicitly communicate that failures are pre-existing:
+
+```bash
+# After determining failures are pre-existing, exit with code 5
+exit 5
+```
+
+### Benefits of Explicit Signaling
+
+- **Faster pipeline**: Shepherd immediately continues to PR creation
+- **Clear audit trail**: Logs show "Doctor determined failures are pre-existing (exit code 5)"
+- **Better observability**: Explicit signal vs. inferred from no commits
+- **Reduced ambiguity**: No guessing whether Doctor attempted a fix or decided not to
+
+### What NOT to Do
+
+- **Don't exit 5 if you made any commits** — the shepherd will verify and may fail
+- **Don't exit 5 for failures you could reasonably fix** — only for truly unrelated issues
+- **Don't exit 5 for PR review feedback** — this is only for test failure recovery
+
 ## Completion
 
 **Work completion is detected automatically.**

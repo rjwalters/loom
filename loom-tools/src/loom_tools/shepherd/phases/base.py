@@ -290,6 +290,7 @@ def run_worker_phase(
         - 0: Success
         - 3: Shutdown signal
         - 4: Agent stuck after retry
+        - 5: Failures are pre-existing (Doctor only)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir

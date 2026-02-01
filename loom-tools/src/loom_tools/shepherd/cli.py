@@ -394,56 +394,78 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 if exit_code == 3:
                     raise ShutdownSignal("shutdown signal detected during doctor test fix")
 
-                if exit_code not in (0, 3):
+                if exit_code == 5:
+                    # Doctor explicitly signaled failures are pre-existing
+                    log_info("Doctor determined failures are pre-existing (exit code 5)")
+                    completed_phases.append(f"Doctor test fix (pre-existing — explicit signal, {elapsed}s)")
+                    ctx.report_milestone(
+                        "phase_completed",
+                        phase="doctor_testfix",
+                        duration_seconds=elapsed,
+                        status="preexisting_explicit",
+                    )
+                    # Check for existing PR or let the builder create one
+                    pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+                    if pr is not None:
+                        ctx.pr_number = pr
+                    # Skip re-verification and continue to PR creation
+                    test_failure_recovery = False
+                elif exit_code not in (0, 3, 5):
                     log_error(f"Doctor test fix failed (exit code {exit_code})")
                     completed_phases.append("Doctor test fix (failed)")
                     _mark_test_fix_failed(ctx)
                     return 1
 
-                # Check if Doctor actually made any commits
-                commits_after = get_commit_count(cwd=ctx.worktree_path)
-                doctor_made_changes = commits_after > commits_before
-
-                if not doctor_made_changes:
-                    # Doctor made no commits — failures are pre-existing.
-                    # Skip re-verification to avoid non-deterministic comparison
-                    # producing worse results (see #1935, #1937).
-                    log_warning(
-                        "Doctor made no commits — treating test failures as "
-                        "pre-existing (skipping re-verification)"
-                    )
-                    completed_phases.append(f"Doctor test fix (no changes — pre-existing failures, {elapsed}s)")
-                    ctx.report_milestone(
-                        "phase_completed",
-                        phase="doctor_testfix",
-                        duration_seconds=elapsed,
-                        status="no_changes",
-                    )
+                # Check if Doctor actually made any commits (fallback for exit code 0)
+                if exit_code == 0:
+                    commits_after = get_commit_count(cwd=ctx.worktree_path)
+                    doctor_made_changes = commits_after > commits_before
                 else:
-                    # Re-run test verification after Doctor fix
-                    retest_result = builder_phase._run_test_verification(ctx)
+                    # For exit code 5, we already handled it above
+                    doctor_made_changes = False
 
-                    if retest_result is not None and retest_result.status == PhaseStatus.FAILED:
-                        log_error(f"Tests still failing after Doctor fix: {retest_result.message}")
-                        completed_phases.append("Doctor test fix (tests still failing)")
-                        # Mark blocked since Doctor couldn't fix it
-                        _mark_test_fix_failed(ctx)
-                        return 1
+                # Only process exit code 0 (explicit pre-existing handled above)
+                if exit_code == 0:
+                    if not doctor_made_changes:
+                        # Doctor made no commits — failures are pre-existing.
+                        # Skip re-verification to avoid non-deterministic comparison
+                        # producing worse results (see #1935, #1937).
+                        log_warning(
+                            "Doctor made no commits — treating test failures as "
+                            "pre-existing (skipping re-verification)"
+                        )
+                        completed_phases.append(f"Doctor test fix (no changes — pre-existing failures, {elapsed}s)")
+                        ctx.report_milestone(
+                            "phase_completed",
+                            phase="doctor_testfix",
+                            duration_seconds=elapsed,
+                            status="no_changes",
+                        )
+                    else:
+                        # Re-run test verification after Doctor fix
+                        retest_result = builder_phase._run_test_verification(ctx)
 
-                    completed_phases.append(f"Doctor test fix (tests fixed, {elapsed}s)")
-                    log_success(f"Doctor fixed failing tests ({elapsed}s)")
-                    ctx.report_milestone(
-                        "phase_completed", phase="doctor_testfix", duration_seconds=elapsed, status="success"
-                    )
+                        if retest_result is not None and retest_result.status == PhaseStatus.FAILED:
+                            log_error(f"Tests still failing after Doctor fix: {retest_result.message}")
+                            completed_phases.append("Doctor test fix (tests still failing)")
+                            # Mark blocked since Doctor couldn't fix it
+                            _mark_test_fix_failed(ctx)
+                            return 1
 
-                # Validate and find/create PR
-                if not builder_phase.validate(ctx):
-                    log_warning("Builder validation failed after Doctor test fix — running builder to create PR")
+                        completed_phases.append(f"Doctor test fix (tests fixed, {elapsed}s)")
+                        log_success(f"Doctor fixed failing tests ({elapsed}s)")
+                        ctx.report_milestone(
+                            "phase_completed", phase="doctor_testfix", duration_seconds=elapsed, status="success"
+                        )
 
-                # Check for PR
-                pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
-                if pr is not None:
-                    ctx.pr_number = pr
+                    # Validate and find/create PR
+                    if not builder_phase.validate(ctx):
+                        log_warning("Builder validation failed after Doctor test fix — running builder to create PR")
+
+                    # Check for PR
+                    pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+                    if pr is not None:
+                        ctx.pr_number = pr
 
             # If no PR exists yet and Doctor actually ran, the builder
             # didn't get that far. Re-run builder to create the PR.
