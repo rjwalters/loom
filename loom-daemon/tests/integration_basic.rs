@@ -5,14 +5,17 @@
 mod common;
 
 use common::{
-    capture_terminal_output, cleanup_test_sessions, tmux_session_exists, TestClient, TestDaemon,
+    capture_terminal_output, cleanup_all_loom_sessions, cleanup_test_sessions, tmux_session_exists,
+    TestClient, TestDaemon,
 };
 use serial_test::serial;
 
 /// Cleanup helper to run before/after tests.
-/// Only cleans up sessions belonging to the current test binary.
+/// Cleans ALL loom sessions to prevent the daemon from restoring orphan sessions
+/// from other test binaries or previous runs. This is necessary because the daemon
+/// calls `restore_from_tmux()` on startup which imports any existing loom-* sessions.
 fn setup() {
-    cleanup_test_sessions();
+    cleanup_all_loom_sessions();
 }
 
 /// Test 1.1: Basic Ping/Pong communication

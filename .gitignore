@@ -55,6 +55,7 @@ Thumbs.db
 .loom/progress/
 .loom/diagnostics/
 .loom/guide-docs-state.json
+.loom/metrics_state.json
 
 # Loom workspace config (DO commit for team sharing)
 # - config.json: Persistent terminal configurations (roles, themes, intervals)
