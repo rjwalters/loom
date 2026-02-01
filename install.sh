@@ -552,7 +552,7 @@ case "$METHOD" in
         error "Uninstall failed - aborting clean install"
       echo ""
       info "Uninstall complete, proceeding with fresh install..."
-      "$LOOM_ROOT/target/release/loom-daemon" init --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
+      "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     else
       # Run loom-daemon init

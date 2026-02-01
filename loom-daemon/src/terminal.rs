@@ -226,7 +226,7 @@ impl TerminalManager {
                     let repo_root = path
                         .ancestors()
                         .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
-                        .map(|p| p.to_path_buf());
+                        .map(std::path::Path::to_path_buf);
 
                     // First try to remove the worktree via git
                     let mut cmd = Command::new("git");
