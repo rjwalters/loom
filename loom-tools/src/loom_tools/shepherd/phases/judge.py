@@ -596,6 +596,9 @@ class JudgePhase:
         log_path = self._get_log_path(ctx)
         diag["log_file"] = str(log_path)
         diag["log_exists"] = log_path.is_file()
+        # Check for meaningful output (issue #1978) - detects agents that spawn
+        # but produce only terminal escape sequences like "\x1b[?2026l"
+        diag["has_meaningful_output"] = self._has_meaningful_output(log_path)
         if log_path.is_file():
             try:
                 lines = log_path.read_text().splitlines()
@@ -652,6 +655,9 @@ class JudgePhase:
         # Categorize the failure to help with debugging
         if not diag["log_exists"]:
             diag["failure_mode"] = "agent_never_ran"
+        elif diag["log_exists"] and not diag["has_meaningful_output"]:
+            # Issue #1978: Agent spawned but only produced terminal escape sequences
+            diag["failure_mode"] = "agent_started_no_meaningful_output"
         elif not has_reviewing_label and not has_outcome_label:
             diag["failure_mode"] = "agent_started_no_work"
         elif has_reviewing_label and not has_outcome_label:
@@ -704,6 +710,7 @@ class JudgePhase:
         failure_mode = diag.get("failure_mode", "unknown")
         mode_explanations = {
             "agent_never_ran": "Judge agent did not start (no log file created)",
+            "agent_started_no_meaningful_output": "Judge agent spawned but produced only terminal escape sequences (likely timeout or prompt failure)",
             "agent_started_no_work": "Judge started but did not claim the PR (no loom:reviewing label)",
             "comment_exists_label_missing": "Judge left a comment but failed to apply the label (API failure?)",
             "started_reviewing_incomplete": "Judge claimed PR (loom:reviewing) but did not complete (timeout?)",
@@ -758,7 +765,7 @@ class JudgePhase:
                 "comment",
                 str(ctx.config.issue),
                 "--body",
-                f"**Shepherd blocked**: Judge agent was stuck and did not recover after retry. Diagnostics saved to `.loom/diagnostics/`.",
+                "**Shepherd blocked**: Judge agent was stuck and did not recover after retry. Diagnostics saved to `.loom/diagnostics/`.",
             ],
             cwd=ctx.repo_root,
             capture_output=True,
