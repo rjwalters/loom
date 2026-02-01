@@ -531,6 +531,16 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     log_success(f"PR #{ctx.pr_number} created after test fix ({elapsed}s)")
 
         # ─── PHASE 4/5: Judge/Doctor Loop ─────────────────────────────────
+
+        # Precondition: PR must exist before entering Judge phase.
+        # If builder failed without creating a PR (e.g., unexpected error,
+        # timeout, or manual interruption), we cannot proceed to Judge.
+        # This is a precondition failure, not a retryable error.
+        if ctx.pr_number is None:
+            log_error("Cannot enter Judge phase: no PR was created during Builder phase")
+            _mark_builder_no_pr(ctx)
+            return 1
+
         doctor_attempts = 0
         judge_retries = 0
         pr_approved = False
@@ -908,6 +918,67 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
             f"**Shepherd blocked**: Judge phase failed after {retries} retry attempt(s). "
             "No approval or changes-requested outcome was produced. "
             "This may indicate a judge worker failure — see #1908 for related diagnostics.",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
+    """Mark issue as blocked because Builder did not create a PR.
+
+    This handles the case where Builder completes without creating a PR,
+    which is a precondition failure for the Judge phase. This is distinct
+    from test failure recovery (handled separately) — this covers unexpected
+    errors, timeouts, or manual interruptions that leave no PR behind.
+    """
+    import subprocess
+
+    # Atomic transition: loom:building -> loom:blocked
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "edit",
+            str(ctx.config.issue),
+            "--remove-label",
+            "loom:building",
+            "--add-label",
+            "loom:blocked",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    # Record blocked reason and update systematic failure tracking
+    from loom_tools.common.systematic_failure import (
+        detect_systematic_failure,
+        record_blocked_reason,
+    )
+
+    record_blocked_reason(
+        ctx.repo_root,
+        ctx.config.issue,
+        error_class="builder_no_pr",
+        phase="builder",
+        details="Builder phase completed but no PR was created",
+    )
+    detect_systematic_failure(ctx.repo_root)
+
+    # Add comment
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(ctx.config.issue),
+            "--body",
+            "**Shepherd blocked**: Builder phase completed but no PR was created. "
+            "Cannot proceed to Judge phase without a PR to review. "
+            "This may indicate builder failure, timeout, or manual interruption. "
+            "Worktree and branch may be preserved for manual investigation.",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
