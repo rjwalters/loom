@@ -29,6 +29,7 @@ from loom_tools.shepherd.phases import (
     JudgePhase,
     MergePhase,
     PhaseStatus,
+    PreflightPhase,
 )
 # Note: run_phase_with_retry is no longer used after removing test failure
 # auto-recovery (Phase 3b/3c). Kept import commented for reference.
@@ -378,6 +379,30 @@ def orchestrate(ctx: ShepherdContext) -> int:
         if ctx.config.stop_after == "approved":
             _print_phase_header("STOPPING: Reached --to approved")
             return 0
+
+        # ─── PRE-FLIGHT: Baseline Health Check ───────────────────────────
+        # This is a lightweight cache lookup (no subprocess, no timing needed).
+        preflight = PreflightPhase()
+        skip, reason = preflight.should_skip(ctx)
+
+        if skip:
+            log_info(f"Skipping preflight check ({reason})")
+        else:
+            result = preflight.run(ctx)
+
+            if result.status == PhaseStatus.FAILED:
+                _print_phase_header("PRE-FLIGHT: BASELINE HEALTH CHECK")
+                log_warning(f"Preflight: {result.message}")
+                ctx.report_milestone(
+                    "blocked",
+                    reason="baseline_failing",
+                    details=result.message,
+                )
+                _mark_baseline_blocked(ctx, result)
+                return 1
+
+            # Log result inline (no header for passing checks)
+            log_info(f"Baseline health: {result.message}")
 
         # ─── PHASE 3: Builder ─────────────────────────────────────────────
         builder = BuilderPhase()
@@ -899,6 +924,85 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
         capture_output=True,
         check=False,
     )
+
+
+def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
+    """Mark issue as blocked due to failing baseline tests on main.
+
+    Instead of proceeding to the builder phase where the shepherd would
+    independently discover the same baseline failures, we block early
+    and add a comment explaining the situation.
+    """
+    import subprocess
+
+    issue_tracking = result.data.get("issue_tracking", "")
+    failing_tests = result.data.get("failing_tests", [])
+
+    # Atomic transition: loom:building -> loom:blocked
+    # (issue may or may not have loom:building at this point)
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "edit",
+            str(ctx.config.issue),
+            "--remove-label",
+            "loom:building",
+            "--add-label",
+            "loom:blocked",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    # Build comment
+    test_list = ""
+    if failing_tests:
+        test_items = "\n".join(f"- `{t}`" for t in failing_tests)
+        test_list = f"\n\n**Failing tests:**\n{test_items}"
+
+    tracking_ref = ""
+    if issue_tracking:
+        tracking_ref = f"\n\n**Tracking issue:** {issue_tracking}"
+
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            str(ctx.config.issue),
+            "--body",
+            f"**Blocked: main branch tests failing**\n\n"
+            f"Pre-flight health check detected that baseline tests on main "
+            f"are currently failing. Blocking builder to avoid redundant "
+            f"failure discovery.{test_list}{tracking_ref}\n\n"
+            f"This issue will be unblocked automatically when the Auditor "
+            f"confirms main is healthy again, or you can override with:\n"
+            f"```bash\n"
+            f"gh issue edit {ctx.config.issue} --remove-label loom:blocked "
+            f"--add-label loom:issue\n"
+            f"```",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    # Record blocked reason
+    from loom_tools.common.systematic_failure import (
+        detect_systematic_failure,
+        record_blocked_reason,
+    )
+
+    record_blocked_reason(
+        ctx.repo_root,
+        ctx.config.issue,
+        error_class="baseline_failing",
+        phase="preflight",
+        details=result.message,
+    )
+    detect_systematic_failure(ctx.repo_root)
 
 
 def main(argv: list[str] | None = None) -> int:
