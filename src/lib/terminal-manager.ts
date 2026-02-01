@@ -422,6 +422,105 @@ export class TerminalManager {
     }
   }
 
+  // ============================================================================
+  // Single-Session Mode Methods
+  // ============================================================================
+  // These methods provide convenience wrappers for the single-session model
+  // where only one Claude Code session is managed (SESSION_ID = "claude-session")
+
+  /** Session ID constant for single-session mode */
+  private static readonly SESSION_ID = "claude-session";
+
+  /**
+   * Get the terminal for the single session
+   *
+   * Convenience method for single-session mode. Returns the terminal
+   * instance for the hardcoded session ID.
+   *
+   * @returns The session terminal, or null if not created
+   */
+  getSessionTerminal(): ManagedTerminal | null {
+    return this.terminals.get(TerminalManager.SESSION_ID) ?? null;
+  }
+
+  /**
+   * Destroy the single session terminal
+   *
+   * Convenience method for single-session mode. Destroys the terminal
+   * for the hardcoded session ID.
+   */
+  destroySession(): void {
+    this.destroyTerminal(TerminalManager.SESSION_ID);
+  }
+
+  /**
+   * Show the single session terminal
+   *
+   * Convenience method for single-session mode.
+   */
+  showSession(): void {
+    this.showTerminal(TerminalManager.SESSION_ID);
+  }
+
+  /**
+   * Hide the single session terminal
+   *
+   * Convenience method for single-session mode.
+   */
+  hideSession(): void {
+    this.hideTerminal(TerminalManager.SESSION_ID);
+  }
+
+  /**
+   * Adjust font size for the single session terminal
+   *
+   * Convenience method for single-session mode.
+   */
+  adjustSessionFontSize(delta: number): void {
+    this.adjustFontSize(TerminalManager.SESSION_ID, delta);
+  }
+
+  /**
+   * Reset font size for the single session terminal
+   *
+   * Convenience method for single-session mode.
+   */
+  resetSessionFontSize(): void {
+    const managed = this.terminals.get(TerminalManager.SESSION_ID);
+    if (managed) {
+      managed.terminal.options.fontSize = 14;
+      this.scheduleResize(TerminalManager.SESSION_ID);
+      localStorage.removeItem("terminal-font-size");
+    }
+  }
+
+  /**
+   * Write data to the single session terminal
+   *
+   * Convenience method for single-session mode.
+   */
+  writeToSession(data: string): void {
+    this.writeToTerminal(TerminalManager.SESSION_ID, data);
+  }
+
+  /**
+   * Clear and write to the single session terminal
+   *
+   * Convenience method for single-session mode.
+   */
+  clearAndWriteSession(data: string): void {
+    this.clearAndWriteTerminal(TerminalManager.SESSION_ID, data);
+  }
+
+  /**
+   * Get the session ID constant
+   *
+   * Returns the fixed session ID used in single-session mode.
+   */
+  static getSessionId(): string {
+    return TerminalManager.SESSION_ID;
+  }
+
   /**
    * Adjust font size for a specific terminal
    */

@@ -142,6 +142,78 @@ export class OutputPoller {
     }
   }
 
+  // ============================================================================
+  // Single-Session Mode Methods
+  // ============================================================================
+  // These methods provide convenience wrappers for the single-session model
+  // where only one Claude Code session is managed (SESSION_ID = "claude-session")
+
+  /** Session ID constant for single-session mode */
+  private static readonly SESSION_ID = "claude-session";
+
+  /**
+   * Start polling for the single session's output
+   *
+   * Convenience method for single-session mode.
+   */
+  startSession(): void {
+    this.startPolling(OutputPoller.SESSION_ID);
+  }
+
+  /**
+   * Pause polling for the single session
+   *
+   * Convenience method for single-session mode.
+   */
+  pauseSession(): void {
+    this.pausePolling(OutputPoller.SESSION_ID);
+  }
+
+  /**
+   * Resume polling for the single session
+   *
+   * Convenience method for single-session mode.
+   */
+  resumeSession(): void {
+    this.resumePolling(OutputPoller.SESSION_ID);
+  }
+
+  /**
+   * Stop polling for the single session
+   *
+   * Convenience method for single-session mode.
+   */
+  stopSession(): void {
+    this.stopPolling(OutputPoller.SESSION_ID);
+  }
+
+  /**
+   * Check if the single session is being polled
+   *
+   * Convenience method for single-session mode.
+   */
+  isSessionPolling(): boolean {
+    return this.isPolling(OutputPoller.SESSION_ID);
+  }
+
+  /**
+   * Get error state for the single session
+   *
+   * Convenience method for single-session mode.
+   */
+  getSessionErrorState(): { consecutiveErrors: number; lastErrorTime: number | null } | null {
+    return this.getErrorState(OutputPoller.SESSION_ID);
+  }
+
+  /**
+   * Get the session ID constant
+   *
+   * Returns the fixed session ID used in single-session mode.
+   */
+  static getSessionId(): string {
+    return OutputPoller.SESSION_ID;
+  }
+
   /**
    * Check if currently polling a terminal
    */
