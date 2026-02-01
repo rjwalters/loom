@@ -519,12 +519,55 @@ class BuilderPhase:
         # One side parsed, other didn't — can't reliably compare
         return False
 
+    # Patterns for non-deterministic content that should be normalized
+    # before line-based comparison to avoid false positives.
+    _NORMALIZE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+        # ISO-8601 timestamps: 2026-01-25T10:15:00.123Z or similar
+        (re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[\.\d]*Z?"), "<TIMESTAMP>"),
+        # Error IDs like ERR-ml3akrjz-zq26l (alphanumeric with dashes)
+        (re.compile(r"ERR-[a-z0-9]+-[a-z0-9]+", re.IGNORECASE), "<ERR-ID>"),
+        # Generic UUIDs (before hex to avoid partial matches)
+        (
+            re.compile(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                re.IGNORECASE,
+            ),
+            "<UUID>",
+        ),
+        # Hex hashes (8+ chars, e.g. git SHAs, 0x-prefixed memory addresses)
+        (re.compile(r"(?:0x)?[0-9a-f]{8,}\b", re.IGNORECASE), "<HEX>"),
+        # Stack trace line/column numbers: :123:45 or (line 42)
+        (re.compile(r":\d+:\d+"), ":<L>:<C>"),
+        (re.compile(r"\(line \d+\)"), "(line <N>)"),
+        # Timing values: 1.23s, 123ms, (45s), in 2.45s
+        (re.compile(r"\b\d+(\.\d+)?\s*(ms|s)\b"), "<TIME>"),
+        # Coverage percentages: 85.2%, 100%
+        (re.compile(r"\b\d+(\.\d+)?%"), "<PCT>"),
+    ]
+
+    def _normalize_error_line(self, line: str) -> str:
+        """Normalize non-deterministic content in an error line.
+
+        Replaces timestamps, error IDs, hex hashes, line numbers, timing
+        values, coverage percentages, and UUIDs with stable placeholders
+        so that the same logical error produces the same normalized string
+        across different runs.
+        """
+        result = line
+        for pattern, replacement in self._NORMALIZE_PATTERNS:
+            result = pattern.sub(replacement, result)
+        return result
+
     def _extract_error_lines(self, output: str) -> list[str]:
         """Extract error-indicator lines from test output for comparison.
 
         Returns a list of normalized lines that indicate failures (FAIL, ERROR,
         error messages, etc.). Used to diff baseline vs worktree output to
         detect new regressions.
+
+        Lines are normalized to replace non-deterministic content (timestamps,
+        error IDs, hex hashes, etc.) with stable placeholders so that the same
+        logical error matches across runs.
         """
         error_indicators = ("fail", "error", "✗", "✕", "×", "not ok")
         lines = []
@@ -534,7 +577,7 @@ class BuilderPhase:
                 continue
             lower = stripped.lower()
             if any(indicator in lower for indicator in error_indicators):
-                lines.append(stripped)
+                lines.append(self._normalize_error_line(stripped))
         return lines
 
     def _run_baseline_tests(
@@ -694,6 +737,33 @@ class BuilderPhase:
                         msg = f"pre-existing on main ({summary})"
                     log_warning(
                         f"Tests failed but all failures are pre-existing: {msg}"
+                    )
+                    ctx.report_milestone(
+                        "heartbeat",
+                        action=f"tests have pre-existing failures ({elapsed}s)",
+                    )
+                    return None
+
+                # Exit-code heuristic: when both sides have the same
+                # exit code AND the same number of error lines, the
+                # "new" lines in the diff are likely false positives
+                # from non-deterministic output (timestamps, error IDs,
+                # coverage fluctuations, etc.).  Different error-line
+                # counts suggest genuinely new errors even with the
+                # same exit code.
+                if (
+                    result.returncode == baseline_result.returncode
+                    and len(worktree_errors) == len(baseline_errors)
+                ):
+                    summary = self._parse_test_summary(worktree_output)
+                    msg = f"pre-existing on main (exit code {result.returncode})"
+                    if summary:
+                        msg = f"pre-existing on main ({summary})"
+                    log_warning(
+                        f"Tests failed but line diff is likely non-deterministic "
+                        f"(same exit code {result.returncode}, "
+                        f"same error count {len(worktree_errors)}, "
+                        f"{len(new_errors)} diff lines): {msg}"
                     )
                     ctx.report_milestone(
                         "heartbeat",

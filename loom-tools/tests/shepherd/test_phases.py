@@ -1630,6 +1630,110 @@ class TestBuilderExtractErrorLines:
         assert len(lines) == 0
 
 
+class TestBuilderNormalizeErrorLine:
+    """Test builder phase error line normalization."""
+
+    def test_normalizes_timestamps(self) -> None:
+        """Should replace ISO-8601 timestamps with placeholder."""
+        builder = BuilderPhase()
+        line = "Error at 2026-02-01T05:20:02.687Z: connection failed"
+        result = builder._normalize_error_line(line)
+        assert "<TIMESTAMP>" in result
+        assert "2026-02-01" not in result
+
+    def test_normalizes_error_ids(self) -> None:
+        """Should replace error IDs like ERR-xxx-yyy with placeholder."""
+        builder = BuilderPhase()
+        line = "FAIL ERR-ml3akrjz-zq26l: test_something"
+        result = builder._normalize_error_line(line)
+        assert "<ERR-ID>" in result
+        assert "ml3akrjz" not in result
+
+    def test_normalizes_hex_hashes(self) -> None:
+        """Should replace hex strings (8+ chars) with placeholder."""
+        builder = BuilderPhase()
+        line = "Error in module at 0x7fff5fbff8a0 (commit a7866b6f)"
+        result = builder._normalize_error_line(line)
+        assert "<HEX>" in result
+        assert "7fff5fbff8a0" not in result
+
+    def test_normalizes_line_column_numbers(self) -> None:
+        """Should replace :line:col patterns with placeholder."""
+        builder = BuilderPhase()
+        line = "Error: src/foo.ts:123:45 - unexpected token"
+        result = builder._normalize_error_line(line)
+        assert ":<L>:<C>" in result
+        assert ":123:45" not in result
+
+    def test_normalizes_timing_values(self) -> None:
+        """Should replace timing values with placeholder."""
+        builder = BuilderPhase()
+        line = "FAIL test_slow (took 2.45s, timeout 30s)"
+        result = builder._normalize_error_line(line)
+        assert "<TIME>" in result
+        assert "2.45s" not in result
+
+    def test_normalizes_coverage_percentages(self) -> None:
+        """Should replace percentage values with placeholder."""
+        builder = BuilderPhase()
+        line = "Error: coverage 85.2% below threshold 90%"
+        result = builder._normalize_error_line(line)
+        assert "<PCT>" in result
+        assert "85.2%" not in result
+
+    def test_normalizes_uuids(self) -> None:
+        """Should replace UUIDs with placeholder."""
+        builder = BuilderPhase()
+        line = "Error: session 550e8400-e29b-41d4-a716-446655440000 expired"
+        result = builder._normalize_error_line(line)
+        assert "<UUID>" in result
+        assert "550e8400" not in result
+
+    def test_preserves_error_message_structure(self) -> None:
+        """Should keep the structural parts of error messages intact."""
+        builder = BuilderPhase()
+        line = "FAIL src/bad.test.ts: test_something"
+        result = builder._normalize_error_line(line)
+        assert "FAIL src/bad.test.ts: test_something" == result
+
+    def test_same_error_different_runs_match(self) -> None:
+        """Same logical error with different non-deterministic content should match."""
+        builder = BuilderPhase()
+        run1 = "Error ERR-abc123-def4: biome config at 2026-01-25T10:00:00Z"
+        run2 = "Error ERR-xyz789-ghi0: biome config at 2026-01-26T15:30:00Z"
+        assert builder._normalize_error_line(run1) == builder._normalize_error_line(run2)
+
+    def test_extract_error_lines_normalizes(self) -> None:
+        """_extract_error_lines should return normalized lines."""
+        builder = BuilderPhase()
+        output = (
+            "PASS src/ok.test.ts\n"
+            "FAIL ERR-abc123-def4 at 2026-01-25T10:00:00Z\n"
+            "Done.\n"
+        )
+        lines = builder._extract_error_lines(output)
+        assert len(lines) == 1
+        assert "<ERR-ID>" in lines[0]
+        assert "<TIMESTAMP>" in lines[0]
+
+    def test_normalized_set_diff_eliminates_false_positives(self) -> None:
+        """Set diff of normalized lines should not produce false positives."""
+        builder = BuilderPhase()
+        # Same biome error, different error IDs and timestamps per run
+        baseline = (
+            "error ERR-abc123-def4: biome config invalid at 2026-01-25T10:00:00Z\n"
+            "FAIL: linting (took 1.23s)\n"
+        )
+        worktree = (
+            "error ERR-xyz789-ghi0: biome config invalid at 2026-01-26T15:30:00Z\n"
+            "FAIL: linting (took 2.05s)\n"
+        )
+        baseline_errors = set(builder._extract_error_lines(baseline))
+        worktree_errors = set(builder._extract_error_lines(worktree))
+        new_errors = worktree_errors - baseline_errors
+        assert len(new_errors) == 0
+
+
 class TestBuilderParseFailureCount:
     """Test builder phase failure count parsing."""
 
@@ -1822,6 +1926,82 @@ class TestBuilderFallbackComparison:
             returncode=1,
             stdout="Error: old bug\nError: new regression\n",
             stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+
+
+    def test_fallback_nondeterministic_same_exit_code(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: same exit code + same error count with non-deterministic content -> pre-existing."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Same error with different timestamps/error IDs (the #1935 scenario)
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="error ERR-abc123-def4: biome config invalid at 2026-01-25T10:00:00Z\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="error ERR-xyz789-ghi0: biome config invalid at 2026-01-26T15:30:00Z\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "check:ci:lite"], "pnpm check:ci:lite"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should be treated as pre-existing (not a new regression)
+        assert result is None
+
+    def test_fallback_different_exit_code_still_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: different exit codes should still report new errors."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        baseline_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="Error: minor issue\n", stderr=""
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[], returncode=2, stdout="Error: critical crash\n", stderr=""
         )
         with (
             patch.object(
