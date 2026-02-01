@@ -340,7 +340,7 @@ def run_worker_phase(
     if phase:
         wait_cmd.extend(["--phase", phase])
         # Work-producing roles need longer idle thresholds
-        if phase in ("builder", "doctor"):
+        if phase in ("builder", "doctor", "judge"):
             wait_cmd.extend(["--min-idle-elapsed", "120"])
 
     if worktree:

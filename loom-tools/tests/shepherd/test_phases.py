@@ -23,7 +23,11 @@ from loom_tools.shepherd.phases import (
     PhaseResult,
     PhaseStatus,
 )
-from loom_tools.shepherd.phases.base import _print_heartbeat, _read_heartbeats
+from loom_tools.shepherd.phases.base import (
+    _print_heartbeat,
+    _read_heartbeats,
+    run_worker_phase,
+)
 from loom_tools.shepherd.phases.judge import (
     APPROVAL_PATTERNS,
     NEGATIVE_PREFIXES,
@@ -3828,6 +3832,72 @@ class TestStaleBranchDetection:
                 ShepherdContext._check_stale_branch(mock_context, 42)
 
         assert not any("Stale branch" in r.message for r in caplog.records)
+
+
+class TestRunWorkerPhaseIdleThreshold:
+    """Test run_worker_phase min-idle-elapsed threshold configuration."""
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext for these tests."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        return ctx
+
+    @pytest.mark.parametrize(
+        "phase,expected_threshold",
+        [
+            ("builder", "120"),
+            ("doctor", "120"),
+            ("judge", "120"),
+            ("curator", None),
+            ("approval", None),
+        ],
+    )
+    def test_phase_idle_thresholds(
+        self, mock_context: MagicMock, phase: str, expected_threshold: str | None
+    ) -> None:
+        """Verify which phases get extended idle thresholds.
+
+        - builder, doctor, judge: 120 seconds (work-producing roles)
+        - curator, approval: default (no explicit threshold)
+        """
+        captured_wait_cmd: list[str] = []
+
+        def capture_spawn(cmd: list[str], **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def capture_popen(cmd: list[str], **kwargs):
+            captured_wait_cmd.extend(cmd)
+            proc = MagicMock()
+            proc.poll.return_value = 0  # Process completed
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=capture_spawn),
+            patch("subprocess.Popen", side_effect=capture_popen),
+            patch("time.sleep"),  # Don't actually sleep
+        ):
+            run_worker_phase(
+                mock_context,
+                role=phase,
+                name=f"{phase}-issue-42",
+                timeout=600,
+                phase=phase,
+            )
+
+        if expected_threshold:
+            assert "--min-idle-elapsed" in captured_wait_cmd
+            idx = captured_wait_cmd.index("--min-idle-elapsed")
+            assert captured_wait_cmd[idx + 1] == expected_threshold
+        else:
+            assert "--min-idle-elapsed" not in captured_wait_cmd
 
 
 class TestReadHeartbeats:
