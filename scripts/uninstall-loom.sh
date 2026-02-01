@@ -424,13 +424,19 @@ for loom_dir in "${LOOM_DIRS[@]}"; do
   done < <(find "$TARGET_PATH/$loom_dir" -type f -print0 2>/dev/null | sort -z)
 done
 
-# Also add the root-level loom CLI wrapper if it exists
+# Also add the CLI wrapper if it exists (new location: .loom/bin/loom)
+if [[ -f "$TARGET_PATH/.loom/bin/loom" ]] && [[ -x "$TARGET_PATH/.loom/bin/loom" ]]; then
+  REMOVE_FILES+=(".loom/bin/loom")
+fi
+
+# Backward compatibility: also check old location (repo root)
 if [[ -f "$TARGET_PATH/loom" ]] && [[ -x "$TARGET_PATH/loom" ]]; then
   REMOVE_FILES+=("loom")
 fi
 
 # Track directories to check for emptiness after removal
 REMOVE_DIRS=(
+  ".loom/bin"
   ".loom/roles"
   ".loom/scripts"
   ".loom/scripts/cli"
