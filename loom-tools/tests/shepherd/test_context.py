@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from loom_tools.shepherd.config import ShepherdConfig
+import pytest
+
+from loom_tools.shepherd.config import ExecutionMode, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
+from loom_tools.shepherd.errors import IssueBlockedError
 
 
 def _make_context(tmp_path: Path, issue: int = 42, task_id: str = "abc1234") -> ShepherdContext:
@@ -194,3 +199,152 @@ class TestReportMilestone:
         # Should log a warning about the failure
         assert "Failed to initialize progress file" in caplog.text
         assert "invalid" in caplog.text
+
+
+class TestValidateIssueBlockedLabel:
+    """Tests for loom:blocked label handling in validate_issue()."""
+
+    def test_blocked_label_raises_error_in_default_mode(self, tmp_path: Path) -> None:
+        """Issue with loom:blocked label raises IssueBlockedError in default mode."""
+        config = ShepherdConfig(issue=42, task_id="abc1234", mode=ExecutionMode.DEFAULT)
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        # Mock gh issue view to return issue with blocked label
+        gh_result = MagicMock()
+        gh_result.returncode = 0
+        gh_result.stdout = json.dumps({
+            "url": "https://github.com/test/repo/issues/42",
+            "state": "OPEN",
+            "title": "Test Issue",
+            "labels": [{"name": "loom:blocked"}],
+        })
+
+        with patch("subprocess.run", return_value=gh_result):
+            with pytest.raises(IssueBlockedError):
+                ctx.validate_issue()
+
+    def test_blocked_label_removed_in_merge_mode(self, tmp_path: Path, caplog) -> None:
+        """Issue with loom:blocked label is cleared in merge mode (--merge)."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        # Mock gh issue view to return issue with blocked label
+        gh_result = MagicMock()
+        gh_result.returncode = 0
+        gh_result.stdout = json.dumps({
+            "url": "https://github.com/test/repo/issues/42",
+            "state": "OPEN",
+            "title": "Test Issue",
+            "labels": [{"name": "loom:blocked"}, {"name": "loom:issue"}],
+        })
+
+        remove_label_calls = []
+
+        def mock_run(cmd, **kwargs):
+            if "issue" in cmd and "view" in cmd:
+                return gh_result
+            if "issue" in cmd and "edit" in cmd and "--remove-label" in cmd:
+                # Capture the label being removed
+                remove_idx = cmd.index("--remove-label")
+                remove_label_calls.append(cmd[remove_idx + 1])
+                result = MagicMock()
+                result.returncode = 0
+                return result
+            # Default mock for other commands (like git ls-remote)
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with caplog.at_level(logging.WARNING):
+                meta = ctx.validate_issue()
+
+        # Should succeed, not raise
+        assert meta["title"] == "Test Issue"
+
+        # Should have removed the blocked label
+        assert "loom:blocked" in remove_label_calls
+
+        # Should have logged a warning
+        assert "loom:blocked" in caplog.text
+        assert "merge mode override" in caplog.text
+
+    def test_blocked_label_updates_cache_in_merge_mode(self, tmp_path: Path) -> None:
+        """Removing blocked label in merge mode updates the label cache."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        # Mock gh issue view to return issue with blocked label
+        gh_result = MagicMock()
+        gh_result.returncode = 0
+        gh_result.stdout = json.dumps({
+            "url": "https://github.com/test/repo/issues/42",
+            "state": "OPEN",
+            "title": "Test Issue",
+            "labels": [{"name": "loom:blocked"}, {"name": "loom:issue"}],
+        })
+
+        def mock_run(cmd, **kwargs):
+            if "issue" in cmd and "view" in cmd:
+                return gh_result
+            result = MagicMock()
+            result.returncode = 0 if "edit" in cmd else 1
+            result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            ctx.validate_issue()
+
+        # After validate_issue, the label cache should NOT contain loom:blocked
+        cached_labels = ctx.label_cache.get_issue_labels(42)
+        assert "loom:blocked" not in cached_labels
+        assert "loom:issue" in cached_labels
+
+    def test_no_blocked_label_no_changes(self, tmp_path: Path) -> None:
+        """Issue without loom:blocked label proceeds normally in merge mode."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        # Mock gh issue view to return issue WITHOUT blocked label
+        gh_result = MagicMock()
+        gh_result.returncode = 0
+        gh_result.stdout = json.dumps({
+            "url": "https://github.com/test/repo/issues/42",
+            "state": "OPEN",
+            "title": "Test Issue",
+            "labels": [{"name": "loom:issue"}],
+        })
+
+        edit_calls = []
+
+        def mock_run(cmd, **kwargs):
+            if "issue" in cmd and "view" in cmd:
+                return gh_result
+            if "issue" in cmd and "edit" in cmd:
+                edit_calls.append(cmd)
+            result = MagicMock()
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            meta = ctx.validate_issue()
+
+        # Should succeed
+        assert meta["title"] == "Test Issue"
+
+        # Should NOT have called edit (no label to remove)
+        # Only the git ls-remote call might have been made
+        label_edit_calls = [c for c in edit_calls if "--remove-label" in c]
+        assert len(label_edit_calls) == 0

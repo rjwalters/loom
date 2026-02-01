@@ -17,7 +17,7 @@ from loom_tools.shepherd.errors import (
     IssueClosedError,
     IssueNotFoundError,
 )
-from loom_tools.shepherd.labels import LabelCache
+from loom_tools.shepherd.labels import LabelCache, remove_issue_label
 
 
 @dataclass
@@ -177,7 +177,15 @@ class ShepherdContext:
         if "loom:blocked" in labels:
             if not self.config.is_force_mode:
                 raise IssueBlockedError(issue)
-            # In force mode, log warning but continue
+            # In force mode (--merge), remove loom:blocked and continue
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Issue #%d has loom:blocked label - removing due to merge mode override",
+                issue,
+            )
+            remove_issue_label(issue, "loom:blocked", self.repo_root)
+            labels.discard("loom:blocked")
+            self.label_cache.set_issue_labels(issue, labels)
 
         # Store title
         self.issue_title = meta.get("title", f"Issue #{issue}")
