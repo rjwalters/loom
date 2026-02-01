@@ -463,8 +463,17 @@ def spawn_agent(
         log_error(f"Failed to create tmux session: {session_name}")
         return SpawnResult(status="error", name=name, error="session_create_failed")
 
-    # Set up output capture via pipe-pane
-    pipe_result = _tmux("pipe-pane", "-t", session_name, f"cat >> '{log_file}'")
+    # Set up output capture via pipe-pane with ANSI stripping
+    # The sed command removes:
+    # - Standard ANSI escape sequences: ESC[...m (colors, cursor, etc.)
+    # - Terminal mode queries: ESC[?...h/l (like ?2026h/l)
+    # - OSC sequences: ESC]...BEL (title setting, etc.)
+    strip_ansi_cmd = (
+        f"sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; "
+        f"s/\\x1b\\][^\\x07]*\\x07//g' "
+        f">> '{log_file}'"
+    )
+    pipe_result = _tmux("pipe-pane", "-t", session_name, strip_ansi_cmd)
     if pipe_result.returncode != 0:
         log_warning("Failed to set up output capture (continuing anyway)")
 
