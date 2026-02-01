@@ -203,7 +203,7 @@ class TestWrapperScriptRouting:
         self, defaults_dir: pathlib.Path
     ) -> None:
         """The 'loom' CLI wrapper should route health to Python."""
-        cli_wrapper = defaults_dir / "loom"
+        cli_wrapper = defaults_dir / ".loom" / "bin" / "loom"
         assert cli_wrapper.exists(), "loom CLI wrapper not found"
 
         content = cli_wrapper.read_text()
