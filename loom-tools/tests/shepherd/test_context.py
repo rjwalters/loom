@@ -112,3 +112,85 @@ class TestCleanupStaleProgressForIssue:
         finally:
             # Restore permissions for cleanup
             progress_dir.chmod(0o755)
+
+
+class TestReportMilestone:
+    """Tests for ShepherdContext.report_milestone() behavior."""
+
+    def test_started_event_sets_initialized_flag(self, tmp_path: Path) -> None:
+        """The 'started' event sets _progress_initialized to True on success."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+
+        # Initially not initialized
+        assert not ctx._progress_initialized
+
+        # Report started event
+        result = ctx.report_milestone("started", issue=42, mode="default")
+
+        # Should succeed and set the flag
+        assert result is True
+        assert ctx._progress_initialized is True
+
+    def test_subsequent_events_skip_when_not_initialized(self, tmp_path: Path) -> None:
+        """Non-started events are silently skipped when progress is not initialized."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+
+        # Don't call started, so _progress_initialized is False
+        assert not ctx._progress_initialized
+
+        # Subsequent milestone calls should return False silently (no error)
+        result = ctx.report_milestone("phase_entered", phase="builder")
+        assert result is False
+
+        # Still not initialized
+        assert not ctx._progress_initialized
+
+    def test_subsequent_events_work_when_initialized(self, tmp_path: Path) -> None:
+        """Non-started events work when progress is initialized."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+
+        # Initialize with started event
+        ctx.report_milestone("started", issue=42, mode="default")
+        assert ctx._progress_initialized is True
+
+        # Subsequent events should work
+        result = ctx.report_milestone("phase_entered", phase="builder")
+        assert result is True
+
+    def test_started_failure_prevents_subsequent_calls(self, tmp_path: Path, caplog) -> None:
+        """If 'started' fails, subsequent calls are skipped without error spam."""
+        import logging
+
+        ctx = _make_context(tmp_path, issue=42, task_id="invalid")  # Invalid task_id
+
+        # Started will fail due to invalid task_id format
+        with caplog.at_level(logging.WARNING):
+            result = ctx.report_milestone("started", issue=42, mode="default")
+
+        # Should fail
+        assert result is False
+        assert not ctx._progress_initialized
+
+        # Clear the log to check that subsequent calls don't log errors
+        caplog.clear()
+
+        # Subsequent calls should return False silently
+        with caplog.at_level(logging.WARNING):
+            result = ctx.report_milestone("phase_entered", phase="builder")
+
+        assert result is False
+        # No error logged for the skipped call (we skip silently)
+        assert "No progress file found" not in caplog.text
+
+    def test_started_failure_logs_warning(self, tmp_path: Path, caplog) -> None:
+        """If 'started' fails, a warning is logged."""
+        import logging
+
+        ctx = _make_context(tmp_path, issue=42, task_id="invalid")  # Invalid task_id
+
+        with caplog.at_level(logging.WARNING):
+            ctx.report_milestone("started", issue=42, mode="default")
+
+        # Should log a warning about the failure
+        assert "Failed to initialize progress file" in caplog.text
+        assert "invalid" in caplog.text

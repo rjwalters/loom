@@ -40,6 +40,9 @@ class ShepherdContext:
     # Caches
     label_cache: LabelCache = field(init=False)
 
+    # Progress tracking state
+    _progress_initialized: bool = field(default=False, init=False, repr=False)
+
     def __post_init__(self) -> None:
         self.label_cache = LabelCache(self.repo_root)
         # Set worktree path based on issue number
@@ -252,9 +255,41 @@ class ShepherdContext:
         """
         from loom_tools.milestones import report_milestone as _report
 
+        logger = logging.getLogger(__name__)
+
+        # If progress file was never initialized, skip silently to avoid
+        # repeated "No progress file found" errors on every milestone call.
+        # The initial warning is logged when the "started" event fails.
+        if event != "started" and not self._progress_initialized:
+            return False
+
         try:
-            return _report(
+            result = _report(
                 self.repo_root, self.config.task_id, event, quiet=quiet, **kwargs
             )
-        except Exception:
+
+            # Track whether the progress file was successfully initialized
+            if event == "started":
+                if result:
+                    self._progress_initialized = True
+                else:
+                    # Log a warning that will help diagnose why subsequent
+                    # milestones are not being recorded
+                    logger.warning(
+                        "Failed to initialize progress file for task %s "
+                        "(started milestone returned False). "
+                        "Subsequent milestones will be skipped.",
+                        self.config.task_id,
+                    )
+
+            return result
+        except Exception as exc:
+            # Log the exception for the "started" event since it's critical
+            if event == "started":
+                logger.warning(
+                    "Failed to initialize progress file for task %s: %s. "
+                    "Subsequent milestones will be skipped.",
+                    self.config.task_id,
+                    exc,
+                )
             return False
