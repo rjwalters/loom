@@ -314,6 +314,11 @@ RUNTIME_ARTIFACTS=(
   ".loom/daemon-state.json"
   ".loom/config.json"
   ".loom/stop-daemon"
+  ".loom/manifest.json"
+  ".loom/loom-source-path"
+  ".loom/metrics_state.json"
+  ".loom/stuck-config.json"
+  ".loom/activity.db"
 )
 
 for artifact in "${RUNTIME_ARTIFACTS[@]}"; do
@@ -355,6 +360,7 @@ done
 RUNTIME_DIRS=(
   ".loom/worktrees"
   ".loom/progress"
+  ".loom/logs"
 )
 
 # 5. Mark CLAUDE.md and .gitignore for smart removal
