@@ -66,8 +66,19 @@ class BuilderPhase:
 
         return False, ""
 
-    def run(self, ctx: ShepherdContext) -> PhaseResult:
-        """Run builder phase."""
+    def run(
+        self, ctx: ShepherdContext, *, skip_test_verification: bool = False
+    ) -> PhaseResult:
+        """Run builder phase.
+
+        Args:
+            ctx: Shepherd context
+            skip_test_verification: If True, skip running test verification
+                after the builder completes. Use this when Phase 3c re-runs
+                the builder after Doctor handles pre-existing test failures,
+                since re-running test verification would fail again on the
+                same pre-existing errors.
+        """
         # Handle --from skip without existing PR
         if ctx.config.should_skip_phase(Phase.BUILDER):
             pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
@@ -203,12 +214,15 @@ class BuilderPhase:
                 data={"exit_code": exit_code, "diagnostics": diag},
             )
 
-        # Run test verification in worktree
-        test_result = self._run_test_verification(ctx)
-        if test_result is not None and test_result.status == PhaseStatus.FAILED:
-            # Preserve worktree and push branch so Doctor/Builder can fix tests
-            self._preserve_on_test_failure(ctx, test_result)
-            return test_result
+        # Run test verification in worktree (unless explicitly skipped)
+        if skip_test_verification:
+            log_info("Skipping test verification (pre-existing failures already handled)")
+        else:
+            test_result = self._run_test_verification(ctx)
+            if test_result is not None and test_result.status == PhaseStatus.FAILED:
+                # Preserve worktree and push branch so Doctor/Builder can fix tests
+                self._preserve_on_test_failure(ctx, test_result)
+                return test_result
 
         # Validate phase
         if not self.validate(ctx):

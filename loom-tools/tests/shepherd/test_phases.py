@@ -1301,6 +1301,48 @@ class TestBuilderRunTestFailureIntegration:
         mock_preserve.assert_called_once()
         mock_cleanup.assert_not_called()
 
+    def test_run_skips_test_verification_when_flag_set(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should skip test verification when skip_test_verification=True.
+
+        This is used by Phase 3c after Doctor handles pre-existing test failures,
+        to avoid re-running test verification which would fail again.
+        See issue #1946.
+        """
+        builder = BuilderPhase()
+        mock_context.config.issue = 42
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.return_value = False
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(builder, "_is_rate_limited", return_value=False),
+            patch.object(builder, "_run_quality_validation"),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(builder, "_run_test_verification") as mock_test_verify,
+            patch.object(builder, "validate", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            # Return None first (no existing PR), then 123 (PR created by validate)
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                side_effect=[None, 123],
+            ),
+        ):
+            result = builder.run(mock_context, skip_test_verification=True)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Test verification should NOT have been called
+        mock_test_verify.assert_not_called()
+
 
 class TestBuilderPreserveOnTestFailure:
     """Test builder phase worktree preservation on test failure."""
