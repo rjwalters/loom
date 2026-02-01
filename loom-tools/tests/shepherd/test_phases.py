@@ -1640,15 +1640,6 @@ class TestBuilderTestFailureContext:
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout=test_output, stderr=""
         )
-        diff_completed = subprocess.CompletedProcess(
-            args=[], returncode=0, stdout="src/foo.ts\nsrc/bar.ts\n", stderr=""
-        )
-
-        def subprocess_side_effect(*args, **kwargs):
-            cmd = args[0] if args else kwargs.get("args", [])
-            if isinstance(cmd, list) and "git" in cmd and "diff" in cmd:
-                return diff_completed
-            return completed
 
         with (
             patch.object(
@@ -1659,7 +1650,12 @@ class TestBuilderTestFailureContext:
             patch.object(builder, "_run_baseline_tests", return_value=None),
             patch(
                 "loom_tools.shepherd.phases.builder.subprocess.run",
-                side_effect=subprocess_side_effect,
+                return_value=completed,
+            ),
+            # Mock get_changed_files to return the expected changed files
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["src/foo.ts", "src/bar.ts"],
             ),
         ):
             result = builder._run_test_verification(mock_context)
@@ -1670,6 +1666,53 @@ class TestBuilderTestFailureContext:
         assert "2 failed" in result.data["test_summary"]
         assert "FAIL" in result.data["test_output_tail"]
         assert result.data["changed_files"] == ["src/foo.ts", "src/bar.ts"]
+
+    def test_test_failure_uses_get_changed_files_helper(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Verify _run_test_verification uses get_changed_files helper.
+
+        This test verifies the fix for the bug where committed changes were not
+        detected because the code used 'git diff --name-only origin/main' instead
+        of 'git diff --name-only origin/main...HEAD'. The get_changed_files helper
+        uses the correct three-dot syntax to detect both committed and uncommitted
+        changes.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        test_output = "FAIL tests/test_example.py\n1 failed\n"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=test_output, stderr=""
+        )
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pytest"], "pytest"),
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+            ) as mock_get_changed_files,
+        ):
+            # Simulate committed changes that the old code would have missed
+            mock_get_changed_files.return_value = ["src/module.py", "tests/test_module.py"]
+            result = builder._run_test_verification(mock_context)
+
+        # Verify get_changed_files was called with the worktree path
+        mock_get_changed_files.assert_called_once_with(cwd=worktree_mock)
+
+        # Verify the changed files are included in the result
+        assert result is not None
+        assert result.data["changed_files"] == ["src/module.py", "tests/test_module.py"]
 
     def test_preserve_handles_missing_worktree(self) -> None:
         """_preserve_on_test_failure should handle None worktree gracefully."""
