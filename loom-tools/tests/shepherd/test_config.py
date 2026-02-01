@@ -11,8 +11,11 @@ from loom_tools.common.config import env_int
 from loom_tools.shepherd.config import (
     ExecutionMode,
     Phase,
+    QualityGateLevel,
+    QualityGates,
     ShepherdConfig,
     _generate_task_id,
+    _parse_quality_gate_level,
 )
 
 

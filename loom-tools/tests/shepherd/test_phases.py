@@ -721,10 +721,98 @@ Modify `builder.py` to add validation.
             "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
         ):
             # Should not raise
-            builder._run_quality_validation(mock_context)
+            result = builder._run_quality_validation(mock_context)
 
+        # Should return None (continue)
+        assert result is None
         # Should not have reported any milestone
         mock_context.report_milestone.assert_not_called()
+
+    def test_run_quality_validation_returns_none_for_warnings(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when only warnings exist (default behavior)."""
+        builder = BuilderPhase()
+        # Issue with no AC - default gates make this a WARNING, not BLOCK
+        body = "Just a vague description."
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=body, stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
+            result = builder._run_quality_validation(mock_context)
+
+        # Default gates should NOT block
+        assert result is None
+
+    def test_run_quality_validation_blocks_with_strict_gates(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return FAILED PhaseResult when BLOCK findings exist."""
+        from loom_tools.shepherd.config import QualityGates
+
+        builder = BuilderPhase()
+        # Issue missing acceptance criteria
+        body = """## Summary
+
+Some description without acceptance criteria.
+
+## Test Plan
+
+Test steps:
+1. Run the command
+2. Verify output
+
+Modify `builder.py`.
+"""
+        # Configure strict gates
+        mock_context.config.quality_gates = QualityGates.strict()
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=body, stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
+            result = builder._run_quality_validation(mock_context)
+
+        # Strict gates should block on missing AC
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "acceptance criteria" in result.message.lower()
+        assert result.data.get("quality_blocked") is True
+
+    def test_run_quality_validation_no_block_when_ac_present(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when acceptance criteria exist, even with strict gates."""
+        from loom_tools.shepherd.config import QualityGates
+
+        builder = BuilderPhase()
+        body = """## Acceptance Criteria
+
+- [ ] Feature works
+
+## Test Plan
+
+- [ ] Test it
+
+Modify `builder.py`.
+"""
+        # Configure strict gates
+        mock_context.config.quality_gates = QualityGates.strict()
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=body, stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=completed
+        ):
+            result = builder._run_quality_validation(mock_context)
+
+        # Should not block when AC is present
+        assert result is None
 
 
 class TestBuilderTestVerification:
@@ -1283,7 +1371,7 @@ class TestBuilderRunTestFailureIntegration:
 
         with (
             patch.object(builder, "_is_rate_limited", return_value=False),
-            patch.object(builder, "_run_quality_validation"),
+            patch.object(builder, "_run_quality_validation", return_value=None),
             patch.object(builder, "_create_worktree_marker"),
             patch.object(
                 builder, "_run_test_verification", return_value=test_failure_result
@@ -1325,7 +1413,7 @@ class TestBuilderRunTestFailureIntegration:
 
         with (
             patch.object(builder, "_is_rate_limited", return_value=False),
-            patch.object(builder, "_run_quality_validation"),
+            patch.object(builder, "_run_quality_validation", return_value=None),
             patch.object(builder, "_create_worktree_marker"),
             patch.object(builder, "_run_test_verification") as mock_test_verify,
             patch.object(builder, "validate", return_value=True),

@@ -11,7 +11,7 @@ from pathlib import Path
 from loom_tools.common.git import get_commit_count
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
-from loom_tools.shepherd.config import ExecutionMode, Phase, ShepherdConfig
+from loom_tools.shepherd.config import ExecutionMode, Phase, QualityGates, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import (
     IssueBlockedError,
@@ -128,6 +128,13 @@ EXAMPLES:
         help="Use specific task ID (generated if not provided)",
     )
 
+    parser.add_argument(
+        "--strict-quality",
+        action="store_true",
+        dest="strict_quality",
+        help="Block builder if issue is missing acceptance criteria",
+    )
+
     # Deprecated flags
     parser.add_argument(
         "--wait",
@@ -205,11 +212,17 @@ def _create_config(args: argparse.Namespace) -> ShepherdConfig:
         }
         start_from = phase_map.get(args.start_from)
 
+    # Configure quality gates
+    quality_gates = QualityGates()
+    if args.strict_quality:
+        quality_gates = QualityGates.strict()
+
     config = ShepherdConfig(
         issue=args.issue,
         mode=mode,
         start_from=start_from,
         stop_after=args.stop_after,
+        quality_gates=quality_gates,
     )
 
     if args.task_id:

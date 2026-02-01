@@ -6,7 +6,7 @@ import secrets
 from dataclasses import dataclass, field
 from enum import Enum
 
-from loom_tools.common.config import env_int
+from loom_tools.common.config import env_int, env_str
 
 
 class Phase(Enum):
@@ -35,6 +35,86 @@ class ExecutionMode(Enum):
 
 # Phase order for --from skipping
 PHASE_ORDER = [Phase.CURATOR, Phase.BUILDER, Phase.JUDGE, Phase.MERGE]
+
+
+class QualityGateLevel(Enum):
+    """Severity level for quality gate checks.
+
+    INFO: Log as informational, never blocks
+    WARN: Log as warning, never blocks
+    BLOCK: Log as error, blocks builder phase
+    """
+
+    INFO = "info"
+    WARN = "warn"
+    BLOCK = "block"
+
+
+def _parse_quality_gate_level(value: str, default: QualityGateLevel) -> QualityGateLevel:
+    """Parse a quality gate level from string.
+
+    Args:
+        value: String value (info, warn, block) - case insensitive
+        default: Default value if parsing fails
+
+    Returns:
+        Parsed QualityGateLevel or default if invalid
+    """
+    try:
+        return QualityGateLevel(value.lower())
+    except ValueError:
+        return default
+
+
+@dataclass
+class QualityGates:
+    """Configuration for quality gate severity levels.
+
+    Each quality check can be configured to:
+    - INFO: Log informational message, never blocks
+    - WARN: Log warning, never blocks
+    - BLOCK: Log error and block builder phase
+
+    Configure via environment variables:
+    - LOOM_QUALITY_TEST_PLAN: Test plan section check (default: info)
+    - LOOM_QUALITY_FILE_REFS: File references check (default: info)
+    - LOOM_QUALITY_ACCEPTANCE: Acceptance criteria check (default: warn)
+    - LOOM_QUALITY_VAGUE: Vague criteria check (default: warn)
+    """
+
+    test_plan: QualityGateLevel = field(
+        default_factory=lambda: _parse_quality_gate_level(
+            env_str("LOOM_QUALITY_TEST_PLAN", "info"), QualityGateLevel.INFO
+        )
+    )
+    file_refs: QualityGateLevel = field(
+        default_factory=lambda: _parse_quality_gate_level(
+            env_str("LOOM_QUALITY_FILE_REFS", "info"), QualityGateLevel.INFO
+        )
+    )
+    acceptance_criteria: QualityGateLevel = field(
+        default_factory=lambda: _parse_quality_gate_level(
+            env_str("LOOM_QUALITY_ACCEPTANCE", "warn"), QualityGateLevel.WARN
+        )
+    )
+    vague_criteria: QualityGateLevel = field(
+        default_factory=lambda: _parse_quality_gate_level(
+            env_str("LOOM_QUALITY_VAGUE", "warn"), QualityGateLevel.WARN
+        )
+    )
+
+    @classmethod
+    def strict(cls) -> "QualityGates":
+        """Create strict quality gates (acceptance criteria blocks).
+
+        Used with --strict-quality CLI flag.
+        """
+        return cls(
+            test_plan=QualityGateLevel.WARN,
+            file_refs=QualityGateLevel.INFO,
+            acceptance_criteria=QualityGateLevel.BLOCK,
+            vague_criteria=QualityGateLevel.WARN,
+        )
 
 
 def _generate_task_id() -> str:
@@ -91,6 +171,9 @@ class ShepherdConfig:
     rate_limit_threshold: int = field(
         default_factory=lambda: env_int("LOOM_RATE_LIMIT_THRESHOLD", 99)
     )
+
+    # Quality gates configuration
+    quality_gates: QualityGates = field(default_factory=QualityGates)
 
     # Worktree marker file name
     worktree_marker_file: str = ".loom-in-use"
