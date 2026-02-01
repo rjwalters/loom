@@ -14,6 +14,7 @@ import tempfile
 from typing import Any, TypeVar
 
 from loom_tools.common.paths import LoomPaths
+from loom_tools.models.baseline_health import BaselineHealth
 from loom_tools.models.daemon_state import DaemonState
 from loom_tools.models.health import AlertsFile, HealthMetrics
 from loom_tools.models.progress import ShepherdProgress
@@ -219,3 +220,22 @@ def read_stuck_history(repo_root: pathlib.Path) -> StuckHistory:
     if isinstance(data, list):
         return StuckHistory()
     return StuckHistory.from_dict(data)
+
+
+def read_baseline_health(repo_root: pathlib.Path) -> BaselineHealth:
+    """Load ``.loom/baseline-health.json`` into a :class:`BaselineHealth`.
+
+    Returns a default ``BaselineHealth`` (status="unknown") if the file
+    is missing, empty, or contains invalid JSON.
+    """
+    paths = LoomPaths(repo_root)
+    data = read_json_file(paths.baseline_health_file)
+    if isinstance(data, list):
+        return BaselineHealth()
+    return BaselineHealth.from_dict(data)
+
+
+def write_baseline_health(repo_root: pathlib.Path, health: BaselineHealth) -> None:
+    """Write a :class:`BaselineHealth` to ``.loom/baseline-health.json``."""
+    paths = LoomPaths(repo_root)
+    write_json_file(paths.baseline_health_file, health.to_dict())

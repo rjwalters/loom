@@ -12,6 +12,7 @@ from loom_tools.shepherd.phases.curator import CuratorPhase
 from loom_tools.shepherd.phases.doctor import DoctorPhase
 from loom_tools.shepherd.phases.judge import JudgePhase
 from loom_tools.shepherd.phases.merge import MergePhase
+from loom_tools.shepherd.phases.preflight import PreflightPhase
 
 __all__ = [
     "BasePhase",
@@ -24,4 +25,5 @@ __all__ = [
     "DoctorPhase",
     "JudgePhase",
     "MergePhase",
+    "PreflightPhase",
 ]
