@@ -6,7 +6,7 @@ entry point (``main()``) registered as ``loom-milestone``.
 Events
 ------
 started, phase_entered, phase_completed, worktree_created, first_commit,
-pr_created, heartbeat, completed, blocked, error
+pr_created, heartbeat, completed, blocked, error, judge_retry
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ VALID_EVENTS = frozenset(
         "completed",
         "blocked",
         "error",
+        "judge_retry",
     }
 )
 
@@ -53,6 +54,7 @@ _REQUIRED: dict[str, set[str]] = {
     "completed": set(),
     "blocked": {"reason"},
     "error": {"error"},
+    "judge_retry": {"attempt"},
 }
 
 
@@ -105,6 +107,12 @@ def _build_milestone_data(event: str, **kwargs: Any) -> dict[str, Any]:
     elif event == "error":
         data["error"] = kwargs["error"]
         data["will_retry"] = bool(kwargs.get("will_retry", False))
+    elif event == "judge_retry":
+        data["attempt"] = int(kwargs["attempt"])
+        if "max_retries" in kwargs:
+            data["max_retries"] = int(kwargs["max_retries"])
+        if "reason" in kwargs:
+            data["reason"] = kwargs["reason"]
     return data
 
 
@@ -253,6 +261,8 @@ def _log_event(event: str, data: dict[str, Any]) -> None:
         log_warning(f"Blocked: {data['reason']}")
     elif event == "error":
         log_error(f"Error: {data['error']}")
+    elif event == "judge_retry":
+        log_warning(f"Judge retry: attempt {data['attempt']}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────
@@ -275,6 +285,7 @@ Events:
   completed           --task-id ID [--pr-merged]
   blocked             --task-id ID --reason "reason" [--details "details"]
   error               --task-id ID --error "message" [--will-retry]
+  judge_retry         --task-id ID --attempt NUM [--max-retries NUM] [--reason "reason"]
 
 Examples:
   loom-milestone started --task-id abc1234 --issue 42 --mode force-pr
@@ -283,6 +294,7 @@ Examples:
   loom-milestone heartbeat --task-id abc1234 --action "running tests"
   loom-milestone completed --task-id abc1234 --pr-merged
   loom-milestone error --task-id abc1234 --error "build failed" --will-retry
+  loom-milestone judge_retry --task-id abc1234 --attempt 1 --max-retries 3 --reason "no review submitted"
 """,
     )
 
@@ -320,6 +332,12 @@ Examples:
     parser.add_argument("--error", dest="error_msg", help="Error message (for 'error')")
     parser.add_argument(
         "--will-retry", action="store_true", help="Error is recoverable (for 'error')"
+    )
+    parser.add_argument(
+        "--attempt", type=int, help="Retry attempt number (for 'judge_retry')"
+    )
+    parser.add_argument(
+        "--max-retries", type=int, help="Maximum retries allowed (for 'judge_retry')"
     )
     parser.add_argument(
         "--quiet", "-q", action="store_true", help="Suppress output on success"
@@ -371,6 +389,10 @@ Examples:
         kwargs["error"] = args.error_msg
     if args.will_retry:
         kwargs["will_retry"] = True
+    if args.attempt is not None:
+        kwargs["attempt"] = args.attempt
+    if args.max_retries is not None:
+        kwargs["max_retries"] = args.max_retries
 
     ok = report_milestone(
         repo_root, args.task_id, args.event, quiet=args.quiet, **kwargs
