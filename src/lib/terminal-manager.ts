@@ -6,6 +6,7 @@ import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { invoke } from "@tauri-apps/api/core";
 import { CircuitOpenError, getDaemonCircuitBreaker } from "./circuit-breaker";
+import { getInputLogger } from "./input-logger";
 import { Logger } from "./logger";
 
 const logger = Logger.forComponent("terminal-manager");
@@ -115,6 +116,9 @@ export class TerminalManager {
     // Hook up input handler - send user input directly to daemon
     // Uses circuit breaker to fail fast if daemon is unresponsive
     terminal.onData((data) => {
+      // Log input (fire-and-forget, never blocks)
+      getInputLogger().log(data, terminalId);
+
       const circuitBreaker = getDaemonCircuitBreaker();
 
       // Check circuit before attempting to send input
