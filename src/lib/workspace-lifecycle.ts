@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { loadWorkspaceConfig, saveCurrentConfiguration, setConfigWorkspace } from "./config";
 import type { AgentLauncherDependencies, CoreDependencies } from "./dependencies";
+import { getInputLogger } from "./input-logger";
 import { Logger } from "./logger";
 import { createTerminalsWithRetry, type TerminalConfig } from "./parallel-terminal-creator";
 import type { AppState, Terminal } from "./state";
@@ -502,11 +503,15 @@ export async function handleWorkspacePathInput(
     // Step 9.5: Start stuck agent detection
     await startStuckAgentDetection();
 
-    // Step 10: Set workspace as active
+    // Step 10: Start input logger
+    getInputLogger().start(expandedPath);
+    logger.info("Input logger started", { workspacePath: expandedPath });
+
+    // Step 11: Set workspace as active
     deps.state.workspace.setWorkspace(expandedPath);
     logger.info("Workspace fully loaded", { workspacePath: expandedPath });
 
-    // Step 11: Persist workspace path
+    // Step 12: Persist workspace path
     await persistWorkspacePath(expandedPath);
   } catch (error) {
     logger.error("Error handling workspace", error as Error, { path });

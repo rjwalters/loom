@@ -61,3 +61,37 @@ pub fn append_to_console_log(message: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+#[tauri::command]
+pub fn append_to_input_log(
+    workspace_path: &str,
+    log_date: &str,
+    entry: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let log_path = Path::new(workspace_path)
+        .join(".loom")
+        .join("logs")
+        .join("input")
+        .join(format!("{log_date}.jsonl"));
+
+    // Ensure directory exists
+    if let Some(parent) = log_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create input log directory: {e}"))?;
+        }
+    }
+
+    // Append entry to log file
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open input log: {e}"))?;
+
+    writeln!(file, "{entry}").map_err(|e| format!("Failed to write to input log: {e}"))?;
+
+    Ok(())
+}

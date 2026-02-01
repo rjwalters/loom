@@ -70,3 +70,4 @@ Thumbs.db
 .claude/settings.local.json
 .loom/*.log
 .loom/*.sock
+.loom/logs/

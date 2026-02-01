@@ -221,6 +221,7 @@ fn main() {
             read_text_file,
             write_file,
             append_to_console_log,
+            append_to_input_log,
             // GitHub commands
             check_github_remote,
             check_label_exists,
