@@ -587,13 +587,14 @@ else
 fi
 echo ""
 
-# Install Loom CLI wrapper (./loom)
-if [[ -f "$LOOM_ROOT/defaults/loom" ]]; then
+# Install Loom CLI wrapper (.loom/bin/loom)
+if [[ -f "$LOOM_ROOT/defaults/.loom/bin/loom" ]]; then
   info "Installing Loom CLI wrapper..."
-  cp "$LOOM_ROOT/defaults/loom" "./loom" || \
+  mkdir -p ".loom/bin"
+  cp "$LOOM_ROOT/defaults/.loom/bin/loom" ".loom/bin/loom" || \
     error "Failed to copy Loom CLI"
-  chmod +x "./loom"
-  success "Installed ./loom CLI"
+  chmod +x ".loom/bin/loom"
+  success "Installed .loom/bin/loom CLI"
 fi
 echo ""
 

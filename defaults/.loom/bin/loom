@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Loom CLI - tmux agent pool management
 #
-# Usage: ./loom <command> [options]
+# Usage: ./.loom/bin/loom <command> [options]
 #
 # Commands:
 #   start     Spawn agent pool from config
@@ -15,18 +15,18 @@
 #   help      Show help
 #
 # Examples:
-#   ./loom start                  Start all configured agents
-#   ./loom start --only shepherd  Start only shepherd agents
-#   ./loom status                 Show current state
-#   ./loom attach shepherd-1      Connect to terminal
-#   ./loom stop                   Graceful shutdown
-#   ./loom stop --force           Force kill all sessions
-#   ./loom scale shepherd 3       Scale shepherd pool to 3
-#   ./loom logs terminal-1        Tail agent output
+#   ./.loom/bin/loom start                  Start all configured agents
+#   ./.loom/bin/loom start --only shepherd  Start only shepherd agents
+#   ./.loom/bin/loom status                 Show current state
+#   ./.loom/bin/loom attach shepherd-1      Connect to terminal
+#   ./.loom/bin/loom stop                   Graceful shutdown
+#   ./.loom/bin/loom stop --force           Force kill all sessions
+#   ./.loom/bin/loom scale shepherd 3       Scale shepherd pool to 3
+#   ./.loom/bin/loom logs terminal-1        Tail agent output
 #
 # For more details:
-#   ./loom help
-#   ./loom <command> --help
+#   ./.loom/bin/loom help
+#   ./.loom/bin/loom <command> --help
 
 set -euo pipefail
 
@@ -171,7 +171,7 @@ case "${1:-help}" in
 Loom CLI - tmux agent pool management
 
 USAGE:
-    ./loom <command> [options]
+    ./.loom/bin/loom <command> [options]
 
 COMMANDS:
     start     Spawn agent pool from .loom/config.json
@@ -185,21 +185,21 @@ COMMANDS:
     help      Show this help message
 
 EXAMPLES:
-    ./loom start                  Start all configured agents
-    ./loom start --only shepherd  Start only shepherd agents
-    ./loom status                 Show current state
-    ./loom status --json          Machine-readable status
-    ./loom attach shepherd-1      Connect to agent terminal
-    ./loom send shepherd-1 "/shepherd 123"  Send command to agent
-    ./loom stop                   Graceful shutdown
-    ./loom stop --force           Force kill all sessions
-    ./loom stop shepherd-1        Stop single agent
-    ./loom scale shepherd 3       Scale shepherd pool to 3
-    ./loom logs terminal-1        Tail agent output
-    ./loom logs --all             Tail all agent logs
+    ./.loom/bin/loom start                  Start all configured agents
+    ./.loom/bin/loom start --only shepherd  Start only shepherd agents
+    ./.loom/bin/loom status                 Show current state
+    ./.loom/bin/loom status --json          Machine-readable status
+    ./.loom/bin/loom attach shepherd-1      Connect to agent terminal
+    ./.loom/bin/loom send shepherd-1 "/shepherd 123"  Send command to agent
+    ./.loom/bin/loom stop                   Graceful shutdown
+    ./.loom/bin/loom stop --force           Force kill all sessions
+    ./.loom/bin/loom stop shepherd-1        Stop single agent
+    ./.loom/bin/loom scale shepherd 3       Scale shepherd pool to 3
+    ./.loom/bin/loom logs terminal-1        Tail agent output
+    ./.loom/bin/loom logs --all             Tail all agent logs
 
 For command-specific help:
-    ./loom <command> --help
+    ./.loom/bin/loom <command> --help
 EOF
             exit 0
         fi
@@ -210,7 +210,7 @@ EOF
         ;;
     *)
         echo -e "${RED}Error: Unknown command '$1'${NC}" >&2
-        echo "Run './loom help' for available commands" >&2
+        echo "Run './.loom/bin/loom help' for available commands" >&2
         exit 1
         ;;
 esac
