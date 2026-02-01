@@ -167,6 +167,9 @@ class ShepherdConfig:
     stuck_max_retries: int = field(
         default_factory=lambda: env_int("LOOM_STUCK_MAX_RETRIES", 1)
     )
+    builder_completion_retries: int = field(
+        default_factory=lambda: env_int("LOOM_BUILDER_COMPLETION_RETRIES", 1)
+    )
 
     # Rate limiting
     rate_limit_threshold: int = field(
