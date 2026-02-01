@@ -598,7 +598,7 @@ class JudgePhase:
             ]
             parts.append(f"reviews=[{', '.join(review_states)}]")
         else:
-            parts.append("no loom: labels applied (expected loom:pr or loom:changes-requested)")
+            parts.append("no GitHub reviews on PR (Loom uses comment + label workflow instead)")
 
         # Labels
         loom_labels = [
