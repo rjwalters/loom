@@ -24,6 +24,7 @@ from loom_tools.shepherd.issue_quality import (
 )
 from loom_tools.shepherd.labels import (
     add_issue_label,
+    add_pr_label,
     get_pr_for_issue,
     remove_issue_label,
 )
@@ -254,8 +255,10 @@ class BuilderPhase:
                     f"{diag['summary']}"
                 )
 
-                # Run completion phase
-                completion_exit = self._run_completion_phase(ctx, diag)
+                # Run completion phase (pass attempt for progressive simplification)
+                completion_exit = self._run_completion_phase(
+                    ctx, diag, attempt=completion_attempts,
+                )
 
                 if completion_exit == 3:
                     # Shutdown during completion
@@ -272,7 +275,17 @@ class BuilderPhase:
                 log_warning(f"Completion phase failed with exit code {completion_exit}")
                 # Fall through to failure
 
-            # No incomplete work pattern or retries exhausted
+            # Retries exhausted or no incomplete work pattern —
+            # attempt direct mechanical completion as last resort
+            if self._has_incomplete_work(diag):
+                direct_result = self._direct_completion(ctx, diag)
+                if direct_result:
+                    log_success("Direct completion succeeded, re-validating")
+                    if self.validate(ctx):
+                        break  # Validation passed after direct completion
+                    log_warning("Direct completion ran but validation still fails")
+
+            # All recovery attempts exhausted
             self._cleanup_stale_worktree(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
@@ -1128,6 +1141,37 @@ class BuilderPhase:
             ls_res.returncode == 0 and ls_res.stdout.strip()
         )
 
+        # -- PR detection ----------------------------------------------------
+        pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+        diag["pr_number"] = pr
+        diag["pr_has_review_label"] = False
+        if pr is not None:
+            pr_label_res = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    str(pr),
+                    "--json",
+                    "labels",
+                    "--jq",
+                    "[.labels[].name] | join(\", \")",
+                ],
+                cwd=ctx.repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            pr_labels_str = (
+                pr_label_res.stdout.strip()
+                if pr_label_res.returncode == 0
+                else ""
+            )
+            diag["pr_labels"] = pr_labels_str
+            diag["pr_has_review_label"] = "loom:review-requested" in pr_labels_str
+        else:
+            diag["pr_labels"] = ""
+
         # -- Issue labels ----------------------------------------------------
         label_res = subprocess.run(
             [
@@ -1162,6 +1206,11 @@ class BuilderPhase:
         parts.append(
             f"remote branch {'exists' if diag['remote_branch_exists'] else 'missing'}"
         )
+        if diag["pr_number"] is not None:
+            parts.append(
+                f"PR #{diag['pr_number']} exists "
+                f"(review_label={'yes' if diag['pr_has_review_label'] else 'no'})"
+            )
         parts.append(f"labels=[{diag['issue_labels']}]")
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
@@ -1245,10 +1294,10 @@ class BuilderPhase:
     def _has_incomplete_work(self, diag: dict[str, Any]) -> bool:
         """Check if diagnostics indicate incomplete work that could be completed.
 
-        Returns True if:
-        - Worktree exists
-        - Has uncommitted changes OR commits ahead of main
-        - Remote branch doesn't exist (work not pushed)
+        Returns True if any of these incomplete-work patterns are detected:
+        1. Worktree has uncommitted changes or commits ahead of main
+        2. Remote branch exists but no PR was created
+        3. PR exists but is missing the ``loom:review-requested`` label
 
         This pattern suggests the builder made progress but didn't complete
         the commit/push/PR workflow.
@@ -1256,29 +1305,41 @@ class BuilderPhase:
         if not diag.get("worktree_exists"):
             return False
 
-        has_work = (
+        has_local_work = (
             diag.get("has_uncommitted_changes", False)
             or diag.get("commits_ahead", 0) > 0
         )
 
-        if not has_work:
-            return False
+        if has_local_work:
+            return True
 
-        # If remote branch exists, work was pushed - may just need PR
-        # If no remote, definitely incomplete
-        return True
+        # Remote branch exists but no PR — just needs PR creation
+        if diag.get("remote_branch_exists") and diag.get("pr_number") is None:
+            return True
+
+        # PR exists but missing review label — just needs label
+        if diag.get("pr_number") is not None and not diag.get("pr_has_review_label"):
+            return True
+
+        return False
 
     def _run_completion_phase(
-        self, ctx: ShepherdContext, diag: dict[str, Any]
+        self, ctx: ShepherdContext, diag: dict[str, Any],
+        attempt: int = 1,
     ) -> int:
         """Run a focused completion phase to finish incomplete work.
 
         Spawns a builder session with explicit instructions to complete
         the commit/push/PR workflow based on current worktree state.
 
+        On later attempts, instructions are progressively simplified to
+        focus only on the remaining mechanical steps.
+
         Args:
             ctx: Shepherd context
             diag: Diagnostics from _gather_diagnostics
+            attempt: Current attempt number (1-based), used for progressive
+                simplification of instructions on later retries.
 
         Returns:
             Exit code from the completion worker (0=success)
@@ -1295,15 +1356,39 @@ class BuilderPhase:
             branch = diag.get("branch", f"feature/issue-{ctx.config.issue}")
             instructions.append(f"- Push branch to remote: git push -u origin {branch}")
 
-        instructions.append(
-            f"- Create PR with loom:review-requested label using 'Closes #{ctx.config.issue}' in body"
-        )
-        instructions.append("- Verify PR was created successfully with gh pr view")
+        pr_number = diag.get("pr_number")
+        if pr_number is not None and not diag.get("pr_has_review_label"):
+            # PR exists but missing label — targeted instruction
+            instructions.append(
+                f"- Add review label to existing PR #{pr_number}: "
+                f"gh pr edit {pr_number} --add-label loom:review-requested"
+            )
+        elif pr_number is None:
+            if diag.get("remote_branch_exists") or diag.get("commits_ahead", 0) > 0:
+                instructions.append(
+                    f"- Create PR with loom:review-requested label using "
+                    f"'Closes #{ctx.config.issue}' in body"
+                )
+            else:
+                instructions.append(
+                    f"- Create PR with loom:review-requested label using "
+                    f"'Closes #{ctx.config.issue}' in body"
+                )
+            instructions.append("- Verify PR was created successfully with gh pr view")
 
         instruction_text = "\n".join(instructions)
 
-        log_info(f"Running completion phase for issue #{ctx.config.issue}")
+        log_info(f"Running completion phase for issue #{ctx.config.issue} (attempt {attempt})")
         log_info(f"Instructions:\n{instruction_text}")
+
+        # Progressive simplification: later attempts use more direct language
+        if attempt > 1:
+            urgency = (
+                "URGENT FINAL ATTEMPT: Previous completion attempts failed. "
+                "Execute ONLY the exact commands below, nothing else. "
+            )
+        else:
+            urgency = ""
 
         # Use a special completion prompt as args
         # IMPORTANT: Args must be single-line because they're passed through tmux send-keys.
@@ -1311,7 +1396,8 @@ class BuilderPhase:
         # Join instructions with semicolons instead of newlines.
         instruction_oneline = "; ".join(instructions)
         completion_args = (
-            f"COMPLETION_MODE: Your previous session ended before completing the workflow. "
+            f"COMPLETION_MODE: {urgency}"
+            f"Your previous session ended before completing the workflow. "
             f"You are in worktree .loom/worktrees/issue-{ctx.config.issue} with changes ready. "
             f"Complete these steps: {instruction_oneline}. "
             f"Do NOT implement anything new - just complete the git/PR workflow."
@@ -1328,6 +1414,80 @@ class BuilderPhase:
         )
 
         return exit_code
+
+    def _direct_completion(
+        self, ctx: ShepherdContext, diag: dict[str, Any]
+    ) -> bool:
+        """Attempt direct mechanical completion without spawning an agent.
+
+        Runs git push, gh pr create, or gh pr edit directly via subprocess
+        for purely mechanical operations. This avoids the overhead of
+        spawning a full agent session when only simple shell commands are
+        needed.
+
+        Args:
+            ctx: Shepherd context
+            diag: Diagnostics from _gather_diagnostics
+
+        Returns:
+            True if all required mechanical steps succeeded, False otherwise.
+        """
+        log_info(
+            f"Attempting direct completion for issue #{ctx.config.issue}"
+        )
+
+        # Step 1: Push branch if not yet remote
+        if not diag.get("remote_branch_exists") and diag.get("commits_ahead", 0) > 0:
+            if not self._push_branch(ctx):
+                log_warning("Direct completion: push failed")
+                return False
+            log_info("Direct completion: branch pushed")
+
+        # Re-check for PR (push may have triggered one, or it may already exist)
+        pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+
+        # Step 2: Create PR if needed
+        if pr is None:
+            branch_name = NamingConventions.branch_name(ctx.config.issue)
+            pr_result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "--head",
+                    branch_name,
+                    "--title",
+                    f"Fix #{ctx.config.issue}",
+                    "--body",
+                    f"Closes #{ctx.config.issue}\n\nCreated by shepherd direct completion.",
+                    "--label",
+                    "loom:review-requested",
+                ],
+                cwd=ctx.repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if pr_result.returncode != 0:
+                detail = (pr_result.stderr or pr_result.stdout or "").strip()[:200]
+                log_warning(f"Direct completion: PR creation failed: {detail}")
+                return False
+            log_info("Direct completion: PR created")
+            return True
+
+        # Step 3: PR exists — add label if missing
+        if not diag.get("pr_has_review_label"):
+            if add_pr_label(pr, "loom:review-requested", ctx.repo_root):
+                log_info(
+                    f"Direct completion: added loom:review-requested to PR #{pr}"
+                )
+                return True
+            log_warning("Direct completion: failed to add review label")
+            return False
+
+        # PR exists with label — nothing to do mechanically
+        log_info("Direct completion: PR and label already present")
+        return True
 
     def _cleanup_stale_worktree(self, ctx: ShepherdContext) -> None:
         """Clean up worktree if it has no commits or changes.
