@@ -542,6 +542,12 @@ Loom provides a unified MCP server (`mcp-loom`) for programmatic control. See th
 mcp__loom__get_agent_metrics --command summary --period week
 ```
 
+## GitHub Authentication
+
+Loom uses the `gh` CLI for all GitHub operations. By default it uses the credential from `gh auth login`, which has access to all repositories. To scope access to a single repository, create a fine-grained PAT and set `export GH_TOKEN=github_pat_xxx` before running Loom.
+
+See `.loom/docs/github-authentication.md` for the detailed setup guide, required token permissions per role, and troubleshooting.
+
 ## Resources
 
 - **Main Repository**: https://github.com/rjwalters/loom
@@ -549,6 +555,7 @@ mcp__loom__get_agent_metrics --command summary --period week
 - **Label Definitions**: `.github/labels.yml`
 - **Troubleshooting**: `.loom/docs/troubleshooting.md`
 - **Daemon Reference**: `.loom/docs/daemon-reference.md`
+- **GitHub Authentication**: `.loom/docs/github-authentication.md`
 - **Scripts**: `.loom/scripts/`
 
 ---
