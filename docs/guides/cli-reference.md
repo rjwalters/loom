@@ -45,7 +45,6 @@ The `init` subcommand sets up a Loom workspace by:
 2. **Copying** `.loom/` configuration from defaults
 3. **Installing** repository scaffolding:
    - `CLAUDE.md` - AI context documentation
-   - `AGENTS.md` - Agent workflow guide
    - `.claude/` - Claude Code configuration
    - `.codex/` - Codex configuration (if available)
    - `.github/` - GitHub workflow templates and labels
@@ -153,7 +152,6 @@ The defaults directory must contain:
 defaults/
 ├── config.json           # Default config template
 ├── CLAUDE.md             # AI context template
-├── AGENTS.md             # Agent workflow template
 ├── .loom-README.md       # .loom/ directory documentation
 ├── roles/                # Role definitions
 │   ├── architect.md

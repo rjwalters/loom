@@ -109,7 +109,7 @@ jobs:
         run: |
           git config user.name "Loom Bot"
           git config user.email "loom-bot@your-org.com"
-          git add .loom CLAUDE.md AGENTS.md .claude .gitignore
+          git add .loom CLAUDE.md .claude .gitignore
           git diff --staged --quiet || git commit -m "chore: update Loom configuration"
           git push
 ```
@@ -269,7 +269,6 @@ setup-loom:
     paths:
       - .loom/
       - CLAUDE.md
-      - AGENTS.md
       - .claude/
     expire_in: 1 week
 
@@ -324,7 +323,7 @@ sync-loom-config:
     # Commit if changes detected
     - git config user.name "Loom Sync Bot"
     - git config user.email "loom-bot@your-org.com"
-    - git add .loom CLAUDE.md AGENTS.md .claude .gitignore
+    - git add .loom CLAUDE.md .claude .gitignore
     - git diff --staged --quiet || (git commit -m "chore: sync Loom config" && git push)
 ```
 
@@ -471,7 +470,6 @@ jobs:
           paths:
             - .loom
             - CLAUDE.md
-            - AGENTS.md
 
 workflows:
   main:
@@ -827,7 +825,6 @@ loom-defaults/
 ├── README.md
 ├── config.json
 ├── CLAUDE.md
-├── AGENTS.md
 ├── roles/
 ├── .claude/
 └── .github/

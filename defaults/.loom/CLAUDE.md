@@ -514,7 +514,6 @@ which claude
 - **Main Repository**: https://github.com/rjwalters/loom
 - **Getting Started**: https://github.com/rjwalters/loom#getting-started
 - **Role Definitions**: See `.loom/roles/*.md` in this repository
-- **Workflow Details**: See `.loom/AGENTS.md` in this repository
 
 ### Local Configuration
 

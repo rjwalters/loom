@@ -42,7 +42,7 @@ loom-daemon init [OPTIONS] [PATH]
 Initializes a Loom workspace by:
 1. Validating the target is a git repository
 2. Copying `.loom/` configuration from defaults
-3. Installing repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .github/)
+3. Installing repository scaffolding (CLAUDE.md, .claude/, .github/)
 4. Updating `.gitignore` with Loom ephemeral patterns
 
 **Examples:**
