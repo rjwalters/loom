@@ -469,8 +469,11 @@ if [[ -d "$WORKTREE_PATH" ]]; then
             fi
 
             # Remove the stale worktree (safety checks passed)
-            local_branch=$(git -C "$WORKTREE_PATH" rev-parse --abbrev-ref HEAD 2>/dev/null) || local_branch=""
-            git worktree remove "$WORKTREE_PATH" --force 2>/dev/null || {
+            # Use absolute path and git -C to avoid CWD-inside-worktree issues
+            ABS_WORKTREE="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
+            REPO_DIR="$(pwd -P)"
+            local_branch=$(git -C "$ABS_WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || local_branch=""
+            git -C "$REPO_DIR" worktree remove "$ABS_WORKTREE" --force 2>/dev/null || {
                 print_error "Failed to remove stale worktree"
                 exit 1
             }
