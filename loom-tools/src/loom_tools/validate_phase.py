@@ -17,11 +17,13 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from loom_tools.common.logging import log_warning
+from loom_tools.common.paths import LoomPaths
 
 
 class ValidationStatus(Enum):
@@ -137,6 +139,70 @@ def _report_milestone(
         subprocess.run(cmd, capture_output=True, check=False)
     except OSError:
         pass
+
+
+def _log_recovery_event(
+    issue: int,
+    recovery_type: str,
+    reason: str,
+    repo_root: Path,
+    *,
+    elapsed_seconds: int | None = None,
+    worktree_had_changes: bool = False,
+    commits_recovered: int = 0,
+    pr_number: int | None = None,
+) -> None:
+    """Log a recovery event to .loom/metrics/recovery-events.json.
+
+    Args:
+        issue: Issue number being recovered.
+        recovery_type: Type of recovery performed (commit_and_pr, pr_only, add_label).
+        reason: Reason for recovery (validation_failed, timeout, stuck, etc.).
+        repo_root: Repository root path.
+        elapsed_seconds: Time elapsed since builder started (if known).
+        worktree_had_changes: Whether worktree had uncommitted changes.
+        commits_recovered: Number of commits recovered/pushed.
+        pr_number: PR number if one was created or updated.
+    """
+    paths = LoomPaths(repo_root)
+    metrics_dir = paths.metrics_dir
+    recovery_file = paths.recovery_events_file
+
+    # Ensure metrics directory exists
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build event record
+    event = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "issue": issue,
+        "recovery_type": recovery_type,
+        "reason": reason,
+        "elapsed_seconds": elapsed_seconds,
+        "worktree_had_changes": worktree_had_changes,
+        "commits_recovered": commits_recovered,
+        "pr_number": pr_number,
+    }
+
+    # Append to existing events or create new file
+    events: list[dict[str, Any]] = []
+    if recovery_file.is_file():
+        try:
+            with open(recovery_file) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    events = data
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    events.append(event)
+
+    # Write back (keep last 1000 events to prevent unbounded growth)
+    events = events[-1000:]
+    try:
+        with open(recovery_file, "w") as f:
+            json.dump(events, f, indent=2)
+    except OSError:
+        log_warning(f"Failed to write recovery event to {recovery_file}")
 
 
 def _mark_blocked(
@@ -467,6 +533,13 @@ def validate_builder(
                 "heartbeat", task_id, repo_root,
                 action=f"recovery: added loom:review-requested to PR #{pr_num}",
             )
+            _log_recovery_event(
+                issue=issue,
+                recovery_type="add_label",
+                reason="validation_failed",
+                repo_root=repo_root,
+                pr_number=pr_num,
+            )
             return ValidationResult(
                 "builder", issue, ValidationStatus.RECOVERED,
                 f"Added loom:review-requested to existing PR #{pr_num}", "add_label",
@@ -663,6 +736,28 @@ def validate_builder(
 
     new_pr = r.stdout.strip()
     _report_milestone("heartbeat", task_id, repo_root, action="recovery: created PR from worktree")
+
+    # Extract PR number from URL (e.g., "https://github.com/owner/repo/pull/123")
+    created_pr_num: int | None = None
+    if "/pull/" in new_pr:
+        try:
+            created_pr_num = int(new_pr.split("/pull/")[-1].split("?")[0])
+        except ValueError:
+            pass
+
+    # Determine recovery type based on what we did
+    recovery_type = "commit_and_pr" if status_output else "pr_only"
+
+    _log_recovery_event(
+        issue=issue,
+        recovery_type=recovery_type,
+        reason="validation_failed",
+        repo_root=repo_root,
+        worktree_had_changes=bool(status_output),
+        commits_recovered=1 if status_output else 0,
+        pr_number=created_pr_num,
+    )
+
     return ValidationResult(
         "builder", issue, ValidationStatus.RECOVERED,
         f"Created PR from worktree changes: {new_pr}", "create_pr",

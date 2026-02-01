@@ -29,6 +29,7 @@ class LoomPaths:
     DOCS_DIR = "docs"
     ROLES_DIR = "roles"
     DIAGNOSTICS_DIR = "diagnostics"
+    METRICS_DIR = "metrics"
 
     # State file names
     DAEMON_STATE_FILE = "daemon-state.json"
@@ -38,6 +39,7 @@ class LoomPaths:
     CONFIG_FILE = "config.json"
     STOP_DAEMON_FILE = "stop-daemon"
     STOP_SHEPHERDS_FILE = "stop-shepherds"
+    RECOVERY_EVENTS_FILE = "recovery-events.json"
 
     def __init__(self, repo_root: Path) -> None:
         """Initialize with repository root path.
@@ -88,6 +90,11 @@ class LoomPaths:
         return self.loom_dir / self.DIAGNOSTICS_DIR
 
     @property
+    def metrics_dir(self) -> Path:
+        """Path to .loom/metrics directory."""
+        return self.loom_dir / self.METRICS_DIR
+
+    @property
     def daemon_state_file(self) -> Path:
         """Path to .loom/daemon-state.json."""
         return self.loom_dir / self.DAEMON_STATE_FILE
@@ -121,6 +128,11 @@ class LoomPaths:
     def stop_shepherds_file(self) -> Path:
         """Path to .loom/stop-shepherds (shepherd shutdown signal)."""
         return self.loom_dir / self.STOP_SHEPHERDS_FILE
+
+    @property
+    def recovery_events_file(self) -> Path:
+        """Path to .loom/metrics/recovery-events.json."""
+        return self.metrics_dir / self.RECOVERY_EVENTS_FILE
 
     def worktree_path(self, issue: int) -> Path:
         """Path to worktree for a specific issue.
