@@ -1293,10 +1293,14 @@ class BuilderPhase:
         log_info(f"Instructions:\n{instruction_text}")
 
         # Use a special completion prompt as args
+        # IMPORTANT: Args must be single-line because they're passed through tmux send-keys.
+        # Newlines break shell command parsing (causes "dquote>" prompts).
+        # Join instructions with semicolons instead of newlines.
+        instruction_oneline = "; ".join(instructions)
         completion_args = (
             f"COMPLETION_MODE: Your previous session ended before completing the workflow. "
             f"You are in worktree .loom/worktrees/issue-{ctx.config.issue} with changes ready. "
-            f"Complete these steps:\n{instruction_text}\n"
+            f"Complete these steps: {instruction_oneline}. "
             f"Do NOT implement anything new - just complete the git/PR workflow."
         )
 
