@@ -810,24 +810,30 @@ class BuilderPhase:
                     return None
 
                 # Exit-code heuristic: when both sides have the same
-                # exit code AND the same number of error lines, the
-                # "new" lines in the diff are likely false positives
+                # exit code AND similar error-line counts (within tolerance),
+                # the "new" lines in the diff are likely false positives
                 # from non-deterministic output (timestamps, error IDs,
-                # coverage fluctuations, etc.).  Different error-line
-                # counts suggest genuinely new errors even with the
-                # same exit code.
+                # coverage fluctuations, etc.). Larger differences in
+                # error-line counts suggest genuinely new errors even with
+                # the same exit code.
+                error_diff = abs(len(worktree_errors) - len(baseline_errors))
                 if (
                     result.returncode == baseline_result.returncode
-                    and len(worktree_errors) == len(baseline_errors)
+                    and error_diff <= self._ERROR_LINE_TOLERANCE
                 ):
                     summary = self._parse_test_summary(worktree_output)
                     msg = f"pre-existing on main (exit code {result.returncode})"
                     if summary:
                         msg = f"pre-existing on main ({summary})"
+                    tolerance_note = (
+                        f"same error count {len(worktree_errors)}"
+                        if error_diff == 0
+                        else f"error count diff {error_diff} within tolerance {self._ERROR_LINE_TOLERANCE}"
+                    )
                     log_warning(
                         f"Tests failed but line diff is likely non-deterministic "
                         f"(same exit code {result.returncode}, "
-                        f"same error count {len(worktree_errors)}, "
+                        f"{tolerance_note}, "
                         f"{len(new_errors)} diff lines): {msg}"
                     )
                     ctx.report_milestone(
@@ -1307,6 +1313,20 @@ class BuilderPhase:
             f"(test failure, labeled loom:needs-fix)"
         )
 
+    # Infrastructure files that affect test verification itself.
+    # Changes to these files may cause the same comparison logic failure
+    # in both builder and doctor runs, making doctor recovery ineffective.
+    _TEST_INFRASTRUCTURE_FILES: set[str] = {
+        "builder.py",  # Contains test verification logic
+        "test_phases.py",  # Tests for shepherd phases
+        "cli.py",  # Contains Doctor routing logic
+    }
+
+    # Tolerance for error-line count comparison in exit-code heuristic.
+    # Small differences (±5 lines) with same exit code are likely
+    # non-deterministic fluctuations, not genuine regressions.
+    _ERROR_LINE_TOLERANCE: int = 5
+
     # Maps file extension → set of test ecosystems that extension can affect.
     # Used by _should_skip_doctor_recovery() to determine if builder changes
     # could plausibly cause failures in the failing test ecosystem.
@@ -1365,7 +1385,12 @@ class BuilderPhase:
         the failing tests, the failures are pre-existing and Doctor
         recovery should be skipped.
 
-        Returns True if Doctor should be skipped (no overlap).
+        Also skips Doctor recovery when builder changes include test
+        verification infrastructure files (builder.py, test_phases.py, cli.py)
+        since the same comparison logic would produce identical failures
+        in Doctor's verification run.
+
+        Returns True if Doctor should be skipped (no overlap or infrastructure changes).
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return False  # Can't determine — conservatively try Doctor
@@ -1376,6 +1401,17 @@ class BuilderPhase:
             log_info(
                 "Skipping Doctor recovery: no changed files in worktree "
                 "(test failures are pre-existing)"
+            )
+            return True
+
+        # Check if changed files include test verification infrastructure.
+        # Changes to these files affect the comparison logic itself, meaning
+        # Doctor would encounter the same test verification failures.
+        changed_basenames = {Path(f).name for f in changed}
+        if changed_basenames & self._TEST_INFRASTRUCTURE_FILES:
+            log_info(
+                "Skipping Doctor recovery: changes to test verification "
+                "infrastructure would cause same failure in Doctor"
             )
             return True
 
