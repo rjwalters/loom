@@ -542,8 +542,14 @@ class JudgePhase:
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info when judge validation fails.
 
-        Inspects the judge worker log file and PR review state to provide
-        actionable context about why the judge phase failed.
+        Inspects the judge worker log file, PR review state, and comments
+        to provide actionable context about why the judge phase failed.
+
+        Distinguishes between (issue #1960):
+        - Agent didn't run at all (no log, no activity)
+        - Agent started but didn't complete (loom:reviewing but no outcome)
+        - Agent completed review but label failed (comment exists, no label)
+        - Agent left no signals (timeout without work)
 
         All commands are best-effort; failures are recorded but never raised.
         """
@@ -557,6 +563,14 @@ class JudgePhase:
             try:
                 lines = log_path.read_text().splitlines()
                 diag["log_tail"] = lines[-20:] if len(lines) > 20 else lines
+                # Add timing info (issue #1960)
+                stat = log_path.stat()
+                diag["log_mtime"] = stat.st_mtime
+                diag["log_size_bytes"] = stat.st_size
+                # Calculate approximate session duration from file timestamps
+                ctime = stat.st_ctime  # Creation time (when session started)
+                mtime = stat.st_mtime  # Modification time (last output)
+                diag["session_duration_seconds"] = int(mtime - ctime)
             except OSError:
                 diag["log_tail"] = []
         else:
@@ -588,6 +602,32 @@ class JudgePhase:
             diag["pr_reviews"] = []
             diag["pr_labels"] = []
 
+        # -- Determine failure mode (issue #1960) ------------------------------
+        # Check for comment signals using the existing helper methods.
+        has_reviewing_label = "loom:reviewing" in diag["pr_labels"]
+        has_approval_comment = self._has_approval_comment(ctx)
+        has_rejection_comment = self._has_rejection_comment(ctx)
+        has_outcome_label = any(
+            lbl in diag["pr_labels"]
+            for lbl in ("loom:pr", "loom:changes-requested")
+        )
+
+        # Categorize the failure to help with debugging
+        if not diag["log_exists"]:
+            diag["failure_mode"] = "agent_never_ran"
+        elif not has_reviewing_label and not has_outcome_label:
+            diag["failure_mode"] = "agent_started_no_work"
+        elif has_reviewing_label and not has_outcome_label:
+            if has_approval_comment or has_rejection_comment:
+                diag["failure_mode"] = "comment_exists_label_missing"
+            else:
+                diag["failure_mode"] = "started_reviewing_incomplete"
+        else:
+            diag["failure_mode"] = "unknown"
+
+        diag["has_approval_comment"] = has_approval_comment
+        diag["has_rejection_comment"] = has_rejection_comment
+
         # -- Human-readable summary --------------------------------------------
         parts: list[str] = []
 
@@ -617,6 +657,22 @@ class JudgePhase:
             parts.append("log file empty")
         else:
             parts.append(f"log file not found ({diag['log_file']})")
+
+        # Session duration (if available)
+        if "session_duration_seconds" in diag:
+            duration = diag["session_duration_seconds"]
+            parts.append(f"session duration: {duration}s")
+
+        # Add failure mode explanation
+        failure_mode = diag.get("failure_mode", "unknown")
+        mode_explanations = {
+            "agent_never_ran": "Judge agent did not start (no log file created)",
+            "agent_started_no_work": "Judge started but did not claim the PR (no loom:reviewing label)",
+            "comment_exists_label_missing": "Judge left a comment but failed to apply the label (API failure?)",
+            "started_reviewing_incomplete": "Judge claimed PR (loom:reviewing) but did not complete (timeout?)",
+            "unknown": "Unable to determine failure mode",
+        }
+        diag["failure_explanation"] = mode_explanations.get(failure_mode, "Unknown failure mode")
 
         diag["summary"] = "; ".join(parts)
         return diag
