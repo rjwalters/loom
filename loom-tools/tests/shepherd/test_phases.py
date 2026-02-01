@@ -2416,7 +2416,7 @@ class TestJudgePhase:
 
         judge = JudgePhase()
         fake_diag = {
-            "summary": "no reviews submitted; no loom labels on PR; log file not found",
+            "summary": "no loom: labels applied (expected loom:pr or loom:changes-requested); no loom labels on PR; log file not found",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": False,
             "log_tail": [],
@@ -2435,7 +2435,7 @@ class TestJudgePhase:
 
         assert result.status == PhaseStatus.FAILED
         assert "validation failed" in result.message
-        assert "no reviews submitted" in result.message
+        assert "no loom: labels applied (expected loom:pr or loom:changes-requested)" in result.message
         assert result.data == fake_diag
         assert mock_validate.call_count == 3
         # Should sleep between attempts (2 sleeps for 3 attempts)
@@ -2556,7 +2556,7 @@ class TestJudgeFallbackApproval:
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2578,7 +2578,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2605,7 +2605,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2692,7 +2692,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -2834,7 +2834,7 @@ class TestJudgeDiagnostics:
 
         assert diag["pr_reviews"] == []
         assert diag["pr_labels"] == []
-        assert "no reviews submitted" in diag["summary"]
+        assert "no loom: labels applied (expected loom:pr or loom:changes-requested)" in diag["summary"]
 
     def test_failure_message_includes_diagnostics(
         self, mock_context: MagicMock
@@ -2845,7 +2845,7 @@ class TestJudgeDiagnostics:
 
         judge = JudgePhase()
         fake_diag = {
-            "summary": "no reviews submitted; no loom labels on PR; last output: 'session ended'",
+            "summary": "no loom: labels applied (expected loom:pr or loom:changes-requested); no loom labels on PR; last output: 'session ended'",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": True,
             "log_tail": ["session ended"],
@@ -2865,7 +2865,7 @@ class TestJudgeDiagnostics:
 
         assert result.status == PhaseStatus.FAILED
         assert "judge phase validation failed:" in result.message
-        assert "no reviews submitted" in result.message
+        assert "no loom: labels applied (expected loom:pr or loom:changes-requested)" in result.message
         assert "session ended" in result.message
         assert result.data == fake_diag
 
@@ -3397,7 +3397,7 @@ class TestJudgeFallbackChangesRequested:
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -3419,7 +3419,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -3514,7 +3514,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -3545,7 +3545,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no reviews submitted", "log_tail": []}
+        fake_diag = {"summary": "no loom: labels applied (expected loom:pr or loom:changes-requested)", "log_tail": []}
 
         call_order: list[str] = []
 

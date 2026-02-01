@@ -81,9 +81,9 @@ Loom provides specialized roles for different development tasks. Each role follo
 - **When to use**: Feature development, bug fixes, refactoring
 
 **Judge** (Autonomous 5min, `judge.md`)
-- **Purpose**: Review pull requests
-- **Workflow**: Finds `loom:review-requested` PRs → reviews → approves or requests changes
-- **When to use**: Code quality assurance, automated reviews
+- **Purpose**: Evaluate pull requests
+- **Workflow**: Finds `loom:review-requested` PRs → evaluates → approves or requests changes
+- **When to use**: Code quality assurance, automated evaluations
 
 **Curator** (Autonomous 5min, `curator.md`)
 - **Purpose**: Enhance and organize issues

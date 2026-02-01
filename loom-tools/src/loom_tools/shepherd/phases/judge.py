@@ -598,7 +598,7 @@ class JudgePhase:
             ]
             parts.append(f"reviews=[{', '.join(review_states)}]")
         else:
-            parts.append("no reviews submitted")
+            parts.append("no loom: labels applied (expected loom:pr or loom:changes-requested)")
 
         # Labels
         loom_labels = [

@@ -96,7 +96,7 @@ Launch the Loom desktop application for automated orchestration:
 | Role | File | Purpose | Mode |
 |------|------|---------|------|
 | Builder | `builder.md` | Implement features and fixes | Manual |
-| Judge | `judge.md` | Review pull requests | Autonomous 5min |
+| Judge | `judge.md` | Evaluate pull requests | Autonomous 5min |
 | Champion | `champion.md` | Evaluate proposals, auto-merge PRs | Autonomous 10min |
 | Curator | `curator.md` | Enhance and organize issues | Autonomous 5min |
 | Architect | `architect.md` | Create architectural proposals | Autonomous 15min |
