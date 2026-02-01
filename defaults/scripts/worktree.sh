@@ -180,10 +180,39 @@ check_grace_period() {
     fi
 }
 
+# Function to check if current shell's CWD is inside a worktree
+check_cwd_inside_worktree() {
+    local worktree_path="$1"
+    local current_cwd
+    local abs_worktree_path
+
+    # Get current working directory (resolved, follows symlinks)
+    current_cwd=$(pwd -P 2>/dev/null || pwd)
+
+    # Get absolute path of worktree (resolved)
+    abs_worktree_path=$(cd "$worktree_path" 2>/dev/null && pwd -P || echo "$worktree_path")
+
+    # Check if current CWD is exactly the worktree or inside it
+    if [[ "$current_cwd" == "$abs_worktree_path" || "$current_cwd" == "$abs_worktree_path/"* ]]; then
+        return 0  # CWD is inside worktree
+    else
+        return 1  # CWD is not inside worktree
+    fi
+}
+
 # Function to check if worktree is safe to remove
 is_worktree_safe_to_remove() {
     local worktree_path="$1"
     local reason=""
+
+    # Check 0: Current shell's CWD inside worktree (simplest and most direct check)
+    if check_cwd_inside_worktree "$worktree_path"; then
+        reason="current shell CWD is inside worktree"
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_info "  $reason - preserving"
+        fi
+        return 1
+    fi
 
     # Check 1: In-use marker
     if check_in_use_marker "$worktree_path"; then
