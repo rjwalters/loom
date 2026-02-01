@@ -321,6 +321,102 @@ def remove_label(
     return True
 
 
+def transition_labels(
+    entity_type: EntityType,
+    number: int,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+    repo_root: Path | None = None,
+) -> bool:
+    """Atomically add and remove labels in a single API call.
+
+    This function performs label transitions atomically using a single
+    `gh issue/pr edit` command with both --add-label and --remove-label
+    flags. If the command fails mid-execution, the labels may be in an
+    inconsistent state, but this is much less likely than with separate
+    API calls.
+
+    Args:
+        entity_type: "issue" or "pr"
+        number: Issue or PR number
+        add: Labels to add (optional)
+        remove: Labels to remove (optional)
+        repo_root: Repository root path (optional)
+
+    Returns:
+        True if successful, False otherwise.
+
+    Example:
+        # Atomic: loom:issue -> loom:building
+        transition_labels("issue", 42, add=["loom:building"], remove=["loom:issue"])
+
+        # Atomic: loom:building -> loom:blocked
+        transition_labels("issue", 42, add=["loom:blocked"], remove=["loom:building"])
+    """
+    if not add and not remove:
+        return True  # Nothing to do
+
+    cmd = ["gh", entity_type, "edit", str(number)]
+
+    # Add --remove-label flags first (order doesn't matter to gh, but
+    # conceptually we remove the old state before adding the new)
+    for label in remove or []:
+        cmd.extend(["--remove-label", label])
+
+    # Add --add-label flags
+    for label in add or []:
+        cmd.extend(["--add-label", label])
+
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=False, cwd=repo_root
+    )
+    return result.returncode == 0
+
+
+def transition_issue_labels(
+    issue: int,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+    repo_root: Path | None = None,
+) -> bool:
+    """Atomically add and remove labels on an issue.
+
+    Convenience wrapper around transition_labels() for issues.
+
+    Args:
+        issue: Issue number
+        add: Labels to add (optional)
+        remove: Labels to remove (optional)
+        repo_root: Repository root path (optional)
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    return transition_labels("issue", issue, add=add, remove=remove, repo_root=repo_root)
+
+
+def transition_pr_labels(
+    pr: int,
+    add: list[str] | None = None,
+    remove: list[str] | None = None,
+    repo_root: Path | None = None,
+) -> bool:
+    """Atomically add and remove labels on a PR.
+
+    Convenience wrapper around transition_labels() for PRs.
+
+    Args:
+        pr: PR number
+        add: Labels to add (optional)
+        remove: Labels to remove (optional)
+        repo_root: Repository root path (optional)
+
+    Returns:
+        True if successful, False otherwise.
+    """
+    return transition_labels("pr", pr, add=add, remove=remove, repo_root=repo_root)
+
+
 def get_issue_metadata(issue: int, repo_root: Path | None = None) -> dict | None:
     """Fetch issue metadata (url, state, title, labels) in a single API call.
 

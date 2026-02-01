@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from loom_tools.common.git import get_changed_files, get_commit_count
+from loom_tools.common.git import get_changed_files
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.state import parse_command_output, read_json_file
@@ -19,13 +19,11 @@ from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.issue_quality import (
     Severity,
-    validate_issue_quality,
     validate_issue_quality_with_gates,
 )
 from loom_tools.shepherd.labels import (
-    add_issue_label,
     get_pr_for_issue,
-    remove_issue_label,
+    transition_issue_labels,
 )
 from loom_tools.shepherd.phases.base import (
     PhaseResult,
@@ -102,10 +100,14 @@ class BuilderPhase:
             ctx.pr_number = pr
             # Report milestone
             ctx.report_milestone("pr_created", pr_number=pr)
-            # Ensure issue has loom:building label
+            # Ensure issue has loom:building label (atomic transition)
             if not ctx.has_issue_label("loom:building"):
-                remove_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
-                add_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
+                transition_issue_labels(
+                    ctx.config.issue,
+                    add=["loom:building"],
+                    remove=["loom:issue"],
+                    repo_root=ctx.repo_root,
+                )
                 ctx.label_cache.invalidate_issue(ctx.config.issue)
             # Create marker if worktree exists
             if ctx.worktree_path and ctx.worktree_path.is_dir():
@@ -136,17 +138,25 @@ class BuilderPhase:
         # Report phase entry
         ctx.report_milestone("phase_entered", phase="builder")
 
-        # Claim the issue
-        remove_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
-        add_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
+        # Claim the issue (atomic transition: loom:issue -> loom:building)
+        transition_issue_labels(
+            ctx.config.issue,
+            add=["loom:building"],
+            remove=["loom:issue"],
+            repo_root=ctx.repo_root,
+        )
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
         # Pre-flight issue quality validation (may block with configured gates)
         quality_result = self._run_quality_validation(ctx)
         if quality_result is not None:
-            # Quality validation blocked - revert claim
-            remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
-            add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
+            # Quality validation blocked - revert claim (atomic transition)
+            transition_issue_labels(
+                ctx.config.issue,
+                add=["loom:issue"],
+                remove=["loom:building"],
+                repo_root=ctx.repo_root,
+            )
             ctx.label_cache.invalidate_issue(ctx.config.issue)
             return quality_result
 
@@ -188,9 +198,13 @@ class BuilderPhase:
         )
 
         if exit_code == 3:
-            # Revert claim on shutdown
-            remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
-            add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
+            # Revert claim on shutdown (atomic transition)
+            transition_issue_labels(
+                ctx.config.issue,
+                add=["loom:issue"],
+                remove=["loom:building"],
+                repo_root=ctx.repo_root,
+            )
             ctx.label_cache.invalidate_issue(ctx.config.issue)
             return PhaseResult(
                 status=PhaseStatus.SHUTDOWN,
@@ -1233,7 +1247,7 @@ class BuilderPhase:
                 "comment",
                 str(ctx.config.issue),
                 "--body",
-                f"**Shepherd blocked**: Builder agent was stuck and did not recover after retry. Diagnostics saved to `.loom/diagnostics/`.",
+                "**Shepherd blocked**: Builder agent was stuck and did not recover after retry. Diagnostics saved to `.loom/diagnostics/`.",
             ],
             cwd=ctx.repo_root,
             capture_output=True,
@@ -1407,9 +1421,13 @@ class BuilderPhase:
         # Clean up the worktree
         self._cleanup_stale_worktree(ctx)
 
-        # Revert issue label so it can be picked up again
-        remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
-        add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
+        # Revert issue label so it can be picked up again (atomic transition)
+        transition_issue_labels(
+            ctx.config.issue,
+            add=["loom:issue"],
+            remove=["loom:building"],
+            repo_root=ctx.repo_root,
+        )
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
         log_info(f"Cleaned up worktree and reverted labels for issue #{ctx.config.issue}")
@@ -1457,9 +1475,13 @@ class BuilderPhase:
         # Push whatever commits exist to remote
         self._push_branch(ctx)
 
-        # Transition label: loom:building -> loom:needs-fix
-        remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
-        add_issue_label(ctx.config.issue, "loom:needs-fix", ctx.repo_root)
+        # Transition label: loom:building -> loom:needs-fix (atomic)
+        transition_issue_labels(
+            ctx.config.issue,
+            add=["loom:needs-fix"],
+            remove=["loom:building"],
+            repo_root=ctx.repo_root,
+        )
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
         # Write test failure context file for Doctor phase
