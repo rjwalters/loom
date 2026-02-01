@@ -22,6 +22,7 @@ import {
 } from "./lib/keyboard-navigation";
 import { Logger } from "./lib/logger";
 import { getOutputPoller } from "./lib/output-poller";
+import { initializeResizeHandle } from "./lib/resize-handle";
 import { initializeScreenReaderAnnouncer } from "./lib/screen-reader-announcer";
 // Note: Recovery handlers removed - app now auto-recovers missing sessions
 import { AppState, setAppState, type Terminal, TerminalStatus } from "./lib/state";
@@ -46,12 +47,7 @@ import {
 import { getTerminalManager } from "./lib/terminal-manager";
 import { initTheme, toggleTheme } from "./lib/theme";
 import { showToast } from "./lib/toast";
-import {
-  renderHeader,
-  renderLoadingState,
-  renderMiniTerminals,
-  renderPrimaryTerminal,
-} from "./lib/ui";
+import { renderHeader, renderLoadingState, renderPrimaryTerminal } from "./lib/ui";
 import {
   attachWorkspaceEventListeners,
   setupMainEventListeners,
@@ -219,18 +215,6 @@ function render() {
     hasWorkspace,
     state.workspace.getDisplayedWorkspace()
   );
-
-  // Render mini terminals with health data
-  const terminalHealthMap = new Map(
-    Array.from(systemHealth.terminals.entries()).map(([id, health]) => [
-      id,
-      {
-        lastActivity: health.lastActivity,
-        isStale: health.isStale,
-      },
-    ])
-  );
-  renderMiniTerminals(state.terminals.getTerminals(), hasWorkspace, terminalHealthMap);
 
   // Re-attach workspace event listeners if they were just rendered
   if (!hasWorkspace) {
@@ -677,6 +661,9 @@ const browseWorkspaceWithCallback = () => browseWorkspace(handleWorkspacePathInp
       handleWorkspacePathInput,
       render,
     });
+
+    // Initialize resize handle for terminal/analytics split view
+    initializeResizeHandle();
 
     // Set up all event listeners (consolidated in ui-event-handlers.ts)
     setupMainEventListeners({

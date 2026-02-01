@@ -7,8 +7,8 @@
   </head>
   <body class="bg-gray-200 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
     <div id="app" class="h-screen flex flex-col">
-      <!-- Header -->
-      <header id="header" class="h-16 px-6 flex items-center justify-between border-b border-gray-300 dark:border-gray-700 bg-gray-200 dark:bg-gray-900">
+      <!-- Header (simplified) -->
+      <header id="header" class="h-12 px-4 flex items-center justify-between border-b border-gray-300 dark:border-gray-700 bg-gray-200 dark:bg-gray-900">
         <div class="flex items-center gap-4">
           <div id="workspace-name" class="text-lg font-bold">
             <!-- Dynamically rendered: "Loom" or repo name -->
@@ -26,15 +26,34 @@
         </div>
       </header>
 
-      <!-- Primary Terminal -->
-      <main id="primary-terminal" class="flex-1 p-4 bg-gray-200 dark:bg-gray-900">
-        <!-- Terminal content here -->
-      </main>
+      <!-- Main Content: Terminal + Analytics side-by-side -->
+      <div id="main-content" class="flex-1 flex overflow-hidden">
+        <!-- Terminal View (left panel) -->
+        <div id="terminal-view" class="flex-1 min-w-[300px] p-4 bg-gray-200 dark:bg-gray-900">
+          <!-- Terminal content renders here -->
+        </div>
 
-      <!-- Mini Terminal Row -->
-      <footer id="mini-terminal-row" class="h-40 mb-4 border-t border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800">
-        <!-- Mini terminals here -->
-      </footer>
+        <!-- Resize Handle -->
+        <div id="resize-handle" class="w-1 cursor-col-resize bg-gray-300 dark:bg-gray-600 hover:bg-blue-400 dark:hover:bg-blue-500 transition-colors flex-shrink-0"></div>
+
+        <!-- Analytics View (right panel) -->
+        <div id="analytics-view" class="flex-1 min-w-[300px] overflow-auto p-4 bg-gray-100 dark:bg-gray-800">
+          <!-- Analytics dashboard content (Phase 5) -->
+          <div class="h-full flex items-center justify-center text-gray-400 dark:text-gray-500">
+            <p class="text-lg">Analytics Dashboard (Coming Soon)</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Status Bar -->
+      <div id="status-bar" class="h-8 px-4 flex items-center justify-between border-t border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 text-xs text-gray-600 dark:text-gray-400">
+        <div id="status-left">
+          <!-- Session status -->
+        </div>
+        <div id="status-right">
+          <!-- Quick actions -->
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

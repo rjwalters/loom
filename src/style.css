@@ -33,9 +33,32 @@
   background-color: var(--color-gray-500);
 }
 
-/* Smooth scrolling */
-#mini-terminal-row > div {
-  scroll-behavior: smooth;
+/* Resize handle styles */
+#resize-handle {
+  touch-action: none;
+  user-select: none;
+}
+
+#resize-handle:hover,
+#resize-handle.dragging {
+  background-color: var(--color-blue-400);
+}
+
+.dark #resize-handle:hover,
+.dark #resize-handle.dragging {
+  background-color: var(--color-blue-500);
+}
+
+/* Split layout constraints */
+#terminal-view,
+#analytics-view {
+  min-width: 300px;
+  transition: flex-basis 0.05s ease-out;
+}
+
+#terminal-view.resizing,
+#analytics-view.resizing {
+  transition: none;
 }
 
 /* Instant background color change for terminal header */
