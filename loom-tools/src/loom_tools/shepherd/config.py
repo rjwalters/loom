@@ -140,17 +140,18 @@ class ShepherdConfig:
     stop_after: str | None = None  # "curated", "pr", "approved"
 
     # Timeouts (seconds) - loaded from environment or defaults
+    # Note: Timeouts set high to avoid killing agents mid-work (see issue #2001)
     curator_timeout: int = field(
-        default_factory=lambda: env_int("LOOM_CURATOR_TIMEOUT", 300)
+        default_factory=lambda: env_int("LOOM_CURATOR_TIMEOUT", 3600)
     )
     builder_timeout: int = field(
-        default_factory=lambda: env_int("LOOM_BUILDER_TIMEOUT", 3600)
+        default_factory=lambda: env_int("LOOM_BUILDER_TIMEOUT", 14400)
     )
     judge_timeout: int = field(
-        default_factory=lambda: env_int("LOOM_JUDGE_TIMEOUT", 600)
+        default_factory=lambda: env_int("LOOM_JUDGE_TIMEOUT", 3600)
     )
     doctor_timeout: int = field(
-        default_factory=lambda: env_int("LOOM_DOCTOR_TIMEOUT", 900)
+        default_factory=lambda: env_int("LOOM_DOCTOR_TIMEOUT", 3600)
     )
     poll_interval: int = field(
         default_factory=lambda: env_int("LOOM_POLL_INTERVAL", 5)
