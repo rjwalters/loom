@@ -627,7 +627,20 @@ class BuilderPhase:
                 # Worktree has same or fewer failures — pre-existing
                 return None
 
-            # Worktree has more failures — new regressions
+            # Stage 1.5: Refine with test name comparison
+            # When worktree has more failures, check if they're genuinely new
+            # tests or just flaky count discrepancies
+            baseline_names = self._extract_failing_test_names(baseline_output)
+            worktree_names = self._extract_failing_test_names(worktree_output)
+            if baseline_names and worktree_names:
+                new_failures = worktree_names - baseline_names
+                if not new_failures:
+                    # Same tests failing — count discrepancy is noise
+                    return None
+                # Genuinely new test failures detected
+                return True
+
+            # Name extraction failed for at least one side — trust counts
             return True
 
         # If only one side parsed, we can't do structured comparison
