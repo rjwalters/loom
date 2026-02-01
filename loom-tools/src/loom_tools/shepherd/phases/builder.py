@@ -231,10 +231,48 @@ class BuilderPhase:
                 self._preserve_on_test_failure(ctx, test_result)
                 return test_result
 
-        # Validate phase
-        if not self.validate(ctx):
-            # Cleanup stale worktree
+        # Validate phase with completion retry
+        # If builder made changes but didn't complete commit/push/PR workflow,
+        # spawn a focused completion phase to finish the work.
+        completion_attempts = 0
+        max_completion_attempts = ctx.config.builder_completion_retries
+
+        while True:
+            if self.validate(ctx):
+                break  # Validation passed
+
             diag = self._gather_diagnostics(ctx)
+
+            # Check if this is incomplete work that could be completed
+            if (
+                completion_attempts < max_completion_attempts
+                and self._has_incomplete_work(diag)
+            ):
+                completion_attempts += 1
+                log_warning(
+                    f"Builder left incomplete work (attempt {completion_attempts}/{max_completion_attempts}): "
+                    f"{diag['summary']}"
+                )
+
+                # Run completion phase
+                completion_exit = self._run_completion_phase(ctx, diag)
+
+                if completion_exit == 3:
+                    # Shutdown during completion
+                    return PhaseResult(
+                        status=PhaseStatus.SHUTDOWN,
+                        message="shutdown signal detected during completion phase",
+                        phase_name="builder",
+                    )
+
+                if completion_exit == 0:
+                    log_info("Completion phase finished, re-validating")
+                    continue  # Re-validate
+
+                log_warning(f"Completion phase failed with exit code {completion_exit}")
+                # Fall through to failure
+
+            # No incomplete work pattern or retries exhausted
             self._cleanup_stale_worktree(ctx)
             return PhaseResult(
                 status=PhaseStatus.FAILED,
@@ -242,7 +280,7 @@ class BuilderPhase:
                     f"builder phase validation failed: {diag['summary']}"
                 ),
                 phase_name="builder",
-                data={"diagnostics": diag},
+                data={"diagnostics": diag, "completion_attempts": completion_attempts},
             )
 
         # Get PR number
@@ -1190,6 +1228,89 @@ class BuilderPhase:
         )
 
         ctx.label_cache.invalidate_issue(ctx.config.issue)
+
+    def _has_incomplete_work(self, diag: dict[str, Any]) -> bool:
+        """Check if diagnostics indicate incomplete work that could be completed.
+
+        Returns True if:
+        - Worktree exists
+        - Has uncommitted changes OR commits ahead of main
+        - Remote branch doesn't exist (work not pushed)
+
+        This pattern suggests the builder made progress but didn't complete
+        the commit/push/PR workflow.
+        """
+        if not diag.get("worktree_exists"):
+            return False
+
+        has_work = (
+            diag.get("has_uncommitted_changes", False)
+            or diag.get("commits_ahead", 0) > 0
+        )
+
+        if not has_work:
+            return False
+
+        # If remote branch exists, work was pushed - may just need PR
+        # If no remote, definitely incomplete
+        return True
+
+    def _run_completion_phase(
+        self, ctx: ShepherdContext, diag: dict[str, Any]
+    ) -> int:
+        """Run a focused completion phase to finish incomplete work.
+
+        Spawns a builder session with explicit instructions to complete
+        the commit/push/PR workflow based on current worktree state.
+
+        Args:
+            ctx: Shepherd context
+            diag: Diagnostics from _gather_diagnostics
+
+        Returns:
+            Exit code from the completion worker (0=success)
+        """
+        from loom_tools.shepherd.phases.base import run_worker_phase
+
+        # Build completion instructions based on current state
+        instructions: list[str] = []
+
+        if diag.get("has_uncommitted_changes"):
+            instructions.append("- Stage and commit all changes")
+
+        if not diag.get("remote_branch_exists"):
+            branch = diag.get("branch", f"feature/issue-{ctx.config.issue}")
+            instructions.append(f"- Push branch to remote: git push -u origin {branch}")
+
+        instructions.append(
+            f"- Create PR with loom:review-requested label using 'Closes #{ctx.config.issue}' in body"
+        )
+        instructions.append("- Verify PR was created successfully with gh pr view")
+
+        instruction_text = "\n".join(instructions)
+
+        log_info(f"Running completion phase for issue #{ctx.config.issue}")
+        log_info(f"Instructions:\n{instruction_text}")
+
+        # Use a special completion prompt as args
+        completion_args = (
+            f"COMPLETION_MODE: Your previous session ended before completing the workflow. "
+            f"You are in worktree .loom/worktrees/issue-{ctx.config.issue} with changes ready. "
+            f"Complete these steps:\n{instruction_text}\n"
+            f"Do NOT implement anything new - just complete the git/PR workflow."
+        )
+
+        exit_code = run_worker_phase(
+            ctx,
+            role="builder",
+            name=f"builder-complete-{ctx.config.issue}",
+            timeout=300,  # 5 minutes should be enough to commit/push/PR
+            phase="builder",
+            worktree=ctx.worktree_path,
+            args=completion_args,
+        )
+
+        return exit_code
 
     def _cleanup_stale_worktree(self, ctx: ShepherdContext) -> None:
         """Clean up worktree if it has no commits or changes.
