@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from loom_tools.common.git import get_changed_files, get_commit_count
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.state import parse_command_output, read_json_file
@@ -1198,3 +1199,100 @@ class BuilderPhase:
             f"Preserved worktree for issue #{ctx.config.issue} "
             f"(test failure, labeled loom:needs-fix)"
         )
+
+    # Maps file extension → set of test ecosystems that extension can affect.
+    # Used by _should_skip_doctor_recovery() to determine if builder changes
+    # could plausibly cause failures in the failing test ecosystem.
+    _EXT_TO_ECOSYSTEM: dict[str, set[str]] = {
+        # Rust
+        ".rs": {"cargo"},
+        ".toml": {"cargo", "pnpm"},  # Cargo.toml + possible build scripts
+        # TypeScript/JavaScript
+        ".ts": {"pnpm"},
+        ".tsx": {"pnpm"},
+        ".js": {"pnpm"},
+        ".jsx": {"pnpm"},
+        ".mjs": {"pnpm"},
+        ".cjs": {"pnpm"},
+        ".css": {"pnpm"},
+        ".scss": {"pnpm"},
+        ".svelte": {"pnpm"},
+        ".vue": {"pnpm"},
+        ".json": {"pnpm", "cargo"},  # package.json, tsconfig, etc.
+        # Python
+        ".py": {"pytest"},
+        ".pyi": {"pytest"},
+        # Config files affect all ecosystems
+        ".yml": {"pnpm", "cargo", "pytest"},
+        ".yaml": {"pnpm", "cargo", "pytest"},
+        ".sh": {"pnpm", "cargo", "pytest"},
+        # Lock files
+        ".lock": {"pnpm", "cargo"},
+        # Documentation never affects tests
+        ".md": set(),
+        ".txt": set(),
+        ".rst": set(),
+    }
+
+    def _detect_test_ecosystem(self, test_cmd: list[str]) -> str | None:
+        """Determine the test ecosystem from the test command.
+
+        Returns one of "cargo", "pnpm", "pytest", or None if unknown.
+        """
+        cmd_str = " ".join(test_cmd)
+        if "cargo" in cmd_str:
+            return "cargo"
+        if any(kw in cmd_str for kw in ("pnpm", "npm", "vitest", "jest")):
+            return "pnpm"
+        if any(kw in cmd_str for kw in ("pytest", "python")):
+            return "pytest"
+        return None
+
+    def should_skip_doctor_recovery(
+        self, ctx: ShepherdContext, test_cmd: list[str]
+    ) -> bool:
+        """Check if Doctor recovery should be skipped for test failures.
+
+        Compares the builder's changed files against the failing test
+        ecosystem. If none of the changed files could plausibly affect
+        the failing tests, the failures are pre-existing and Doctor
+        recovery should be skipped.
+
+        Returns True if Doctor should be skipped (no overlap).
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False  # Can't determine — conservatively try Doctor
+
+        # Get files changed by the builder
+        changed = get_changed_files(cwd=ctx.worktree_path)
+        if not changed:
+            log_info(
+                "Skipping Doctor recovery: no changed files in worktree "
+                "(test failures are pre-existing)"
+            )
+            return True
+
+        # Determine which ecosystem the failing tests belong to
+        test_ecosystem = self._detect_test_ecosystem(test_cmd)
+        if test_ecosystem is None:
+            return False  # Unknown ecosystem — conservatively try Doctor
+
+        # Check if any changed file could affect the failing test ecosystem
+        for filepath in changed:
+            ext = Path(filepath).suffix.lower()
+            ecosystems = self._EXT_TO_ECOSYSTEM.get(ext)
+
+            if ecosystems is None:
+                # Unknown extension — conservatively assume it could affect anything
+                return False
+
+            if test_ecosystem in ecosystems:
+                # At least one changed file overlaps with the failing ecosystem
+                return False
+
+        # No overlap found — failures are unrelated to builder's changes
+        log_info(
+            f"Skipping Doctor recovery: {len(changed)} changed file(s) "
+            f"do not affect {test_ecosystem} tests"
+        )
+        return True

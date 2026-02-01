@@ -222,6 +222,68 @@ def has_uncommitted_changes(cwd: pathlib.Path | str | None = None) -> bool:
         return False
 
 
+def get_changed_files(
+    base: str = "origin/main",
+    cwd: pathlib.Path | str | None = None,
+) -> list[str]:
+    """Get list of files changed between HEAD and base ref.
+
+    Parameters
+    ----------
+    base:
+        The base ref to compare against (default ``origin/main``).
+    cwd:
+        Working directory for the git command.
+
+    Returns
+    -------
+    list of str
+        File paths relative to the repository root.
+    """
+    try:
+        result = run_git(
+            ["diff", "--name-only", f"{base}...HEAD"],
+            cwd=cwd,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return [f for f in result.stdout.strip().splitlines() if f]
+    except Exception:
+        pass
+    return []
+
+
+def get_commit_count(
+    base: str = "origin/main",
+    cwd: pathlib.Path | str | None = None,
+) -> int:
+    """Get number of commits from base to HEAD.
+
+    Parameters
+    ----------
+    base:
+        The base ref to count from (default ``origin/main``).
+    cwd:
+        Working directory for the git command.
+
+    Returns
+    -------
+    int
+        Number of commits from base to HEAD.
+    """
+    try:
+        result = run_git(
+            ["rev-list", "--count", f"{base}..HEAD"],
+            cwd=cwd,
+            check=False,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.strip())
+    except Exception:
+        pass
+    return 0
+
+
 def get_commits_ahead_behind(
     base: str = "origin/main",
     cwd: pathlib.Path | str | None = None,

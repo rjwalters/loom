@@ -3736,3 +3736,189 @@ class TestPrintHeartbeat:
         captured = capsys.readouterr()
         assert "\033[2m" in captured.err  # dim
         assert "\033[0m" in captured.err  # reset
+
+
+class TestBuilderDetectTestEcosystem:
+    """Test _detect_test_ecosystem method."""
+
+    def test_cargo_test(self) -> None:
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem(["cargo", "test", "--workspace"]) == "cargo"
+
+    def test_pnpm_check_ci_lite(self) -> None:
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem(["pnpm", "check:ci:lite"]) == "pnpm"
+
+    def test_npm_test(self) -> None:
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem(["npm", "test"]) == "pnpm"
+
+    def test_vitest(self) -> None:
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem(["vitest"]) == "pnpm"
+
+    def test_pytest(self) -> None:
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem(["python", "-m", "pytest"]) == "pytest"
+
+    def test_unknown(self) -> None:
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem(["make", "test"]) is None
+
+
+class TestBuilderShouldSkipDoctorRecovery:
+    """Test should_skip_doctor_recovery method."""
+
+    def test_skip_rust_changes_with_pnpm_failures(self, mock_context: MagicMock) -> None:
+        """Rust-only changes should skip Doctor when pnpm tests fail."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/main.rs", "src/lib.rs"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "check:ci:lite"]
+            )
+        assert result is True
+
+    def test_no_skip_python_changes_with_pytest_failures(self, mock_context: MagicMock) -> None:
+        """Python changes should NOT skip Doctor when pytest fails."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/main.py", "tests/test_foo.py"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["python", "-m", "pytest"]
+            )
+        assert result is False
+
+    def test_no_skip_ts_changes_with_pnpm_failures(self, mock_context: MagicMock) -> None:
+        """TypeScript changes should NOT skip Doctor when pnpm tests fail."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/app.ts", "src/utils.tsx"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "test"]
+            )
+        assert result is False
+
+    def test_skip_python_changes_with_cargo_failures(self, mock_context: MagicMock) -> None:
+        """Python-only changes should skip Doctor when cargo tests fail."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["loom-tools/src/main.py"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["cargo", "test", "--workspace"]
+            )
+        assert result is True
+
+    def test_skip_markdown_changes(self, mock_context: MagicMock) -> None:
+        """Markdown-only changes should skip Doctor for any test ecosystem."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["README.md", "docs/guide.md"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "check:ci:lite"]
+            )
+        assert result is True
+
+    def test_no_skip_toml_changes_with_cargo_failures(self, mock_context: MagicMock) -> None:
+        """TOML changes should NOT skip Doctor when cargo tests fail (.toml affects cargo)."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["Cargo.toml"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["cargo", "test"]
+            )
+        assert result is False
+
+    def test_skip_no_changed_files(self, mock_context: MagicMock) -> None:
+        """No changed files should skip Doctor (failures are pre-existing)."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = []
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "test"]
+            )
+        assert result is True
+
+    def test_no_skip_unknown_extension(self, mock_context: MagicMock) -> None:
+        """Unknown file extensions should conservatively NOT skip Doctor."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["build.zig"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "test"]
+            )
+        assert result is False
+
+    def test_no_skip_unknown_test_ecosystem(self, mock_context: MagicMock) -> None:
+        """Unknown test ecosystem should conservatively NOT skip Doctor."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/main.rs"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["make", "test"]
+            )
+        assert result is False
+
+    def test_no_worktree_path(self, mock_context: MagicMock) -> None:
+        """Missing worktree path should conservatively NOT skip Doctor."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+
+        result = builder.should_skip_doctor_recovery(
+            mock_context, ["pnpm", "test"]
+        )
+        assert result is False
+
+    def test_mixed_changes_one_overlaps(self, mock_context: MagicMock) -> None:
+        """Mixed file types should NOT skip if any file overlaps."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            # .rs doesn't affect pnpm, but .ts does
+            mock_files.return_value = ["src/main.rs", "src/app.ts"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "check:ci:lite"]
+            )
+        assert result is False
+
+    def test_config_files_affect_all(self, mock_context: MagicMock) -> None:
+        """Config files (.yml) should NOT skip Doctor for any ecosystem."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = [".github/workflows/ci.yml"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["cargo", "test"]
+            )
+        assert result is False
