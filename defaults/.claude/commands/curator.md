@@ -332,9 +332,14 @@ $CURRENT
 ### Implementation Guidance
 [Technical approach, options, or recommendations]
 
+### Affected Files
+- \`path/to/file.ts\` - [what changes are needed]
+- \`path/to/other.py\` - [what changes are needed]
+
 ### Test Plan
-- [ ] Test case 1
-- [ ] Test case 2
+- [ ] Manual verification: [describe how to verify the fix/feature works]
+- [ ] Automated tests: [list test files to add/modify, or \"N/A\"]
+- [ ] Edge cases: [any special scenarios to verify]
 "
 
 # 3. Update issue body
@@ -418,10 +423,83 @@ Before marking an issue as `loom:curated`, ensure it has:
 - ✅ Links to related issues/PRs/docs/code
 - ✅ For bugs: reproduction steps and expected behavior
 - ✅ For features: user stories and use cases
-- ✅ Test plan checklist
+- ✅ **Test Plan section** (see Required Sections below)
+- ✅ **Affected Files section** (see Required Sections below)
 - ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
 - ✅ Priority label (`loom:urgent` if critical, otherwise none)
 - ✅ Labeled as `loom:curated` when complete (NOT `loom:issue` - human approval required)
+
+### Required Sections
+
+**CRITICAL**: Curator must ADD these sections if missing. The Builder quality check validates their presence.
+
+#### Test Plan Section
+
+Every curated issue MUST have a `## Test Plan` section with verification steps:
+
+```markdown
+## Test Plan
+
+- [ ] Manual verification: [describe how to verify the fix/feature works]
+- [ ] Automated tests: [list test files to add/modify, or "N/A" if no code tests needed]
+- [ ] Edge cases: [any special scenarios to verify]
+```
+
+**Why this matters**: Builder quality validation looks for `## Test Plan` heading. Without it, Builders receive warnings and may miss important verification steps.
+
+#### Affected Files Section
+
+Every curated issue MUST have an `## Affected Files` section listing files/components to modify:
+
+```markdown
+## Affected Files
+
+- `path/to/file.ts` - [what changes are needed]
+- `path/to/another.py` - [what changes are needed]
+```
+
+**How to find affected files**:
+1. Use `grep` or `rg` to search for relevant code patterns
+2. Check related issues/PRs for file references
+3. Explore the codebase structure to identify components
+4. If truly unknown: "To be determined during implementation" (but try to provide guidance)
+
+**Why this matters**: Builder quality validation looks for file path references. Without them, Builders must do additional exploration and may miss relevant code.
+
+#### How to Add Missing Sections
+
+When enhancing an issue, check for these sections. If missing, ADD them:
+
+```bash
+# 1. Read current issue
+gh issue view 100 --comments
+
+# 2. Research codebase for affected files
+rg "relevant_pattern" --type py --files-with-matches
+rg "function_name" --type ts -l
+
+# 3. Add enhancement with required sections
+gh issue comment 100 --body "$(cat <<'EOF'
+## Implementation Guidance
+
+[Your technical analysis...]
+
+## Affected Files
+
+- `src/module/file.ts` - Add new validation logic
+- `tests/module/file.test.ts` - Add test cases for validation
+
+## Test Plan
+
+- [ ] Manual verification: Run the feature and verify [expected behavior]
+- [ ] Automated tests: Add tests in `tests/module/file.test.ts`
+- [ ] Integration test: Verify end-to-end flow works correctly
+EOF
+)"
+
+# 4. Mark as curated
+gh issue edit 100 --remove-label "loom:curating" --add-label "loom:curated"
+```
 
 ## Working Style
 
@@ -521,6 +599,41 @@ Start with **Option 1** for v0.3.0 (quick win), then add **Option 2** in v0.4.0 
 - #92: Database schema design (required for option 3)
 - Similar feature in Warp terminal: [link]
 ---
+```
+
+### Missing Test Plan & File Refs → Complete Enhancement
+```markdown
+Issue: "Fix terminal output truncation bug"
+
+Original (missing key sections):
+- Has problem description: "Output gets cut off"
+- Has acceptance criteria checkboxes
+- Missing: Test Plan, Affected Files
+
+Added enhancement:
+---
+## Implementation Guidance
+
+The issue is in the output buffer management. When the buffer exceeds
+MAX_LINES, the truncation logic has an off-by-one error.
+
+## Affected Files
+
+- `src/terminal/buffer.ts` - Fix truncation boundary calculation in `trimBuffer()`
+- `src/terminal/buffer.test.ts` - Add test for boundary condition
+- `src/constants.ts` - MAX_LINES constant definition (reference only)
+
+## Test Plan
+
+- [ ] Manual verification: Generate output exceeding MAX_LINES, verify last line is complete
+- [ ] Automated tests: Add test case in `buffer.test.ts` for exact boundary
+- [ ] Edge cases: Test with MAX_LINES-1, MAX_LINES, MAX_LINES+1 line counts
+---
+
+Why this pattern matters:
+- Builder knows exactly which files to modify
+- Test plan provides clear verification steps
+- Builder quality validation passes without warnings
 ```
 
 ## Advanced Curation
