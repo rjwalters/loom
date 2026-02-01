@@ -32,7 +32,6 @@ Running `loom-daemon init` creates these files in your repository:
 
 **Documentation (Commit these)**:
 - `CLAUDE.md` - AI context document for Claude Code (11KB template)
-- `AGENTS.md` - Workflow coordination guide for agents
 
 **Tooling (Commit these)**:
 - `.claude/commands/` - Claude Code slash commands for each role
@@ -346,13 +345,11 @@ After installing Loom (via GUI or CLI), you'll find the following files in your 
 
 ```
 CLAUDE.md             # Technical context for Claude Code agents
-AGENTS.md             # Agent workflow and coordination guide
 ```
 
 **What to do:**
 1. Review `CLAUDE.md` to understand the codebase structure and patterns
-2. Read `AGENTS.md` to learn about agent roles and workflows
-3. Update `CLAUDE.md` with project-specific context as you build
+2. Update `CLAUDE.md` with project-specific context as you build
 
 ### Claude Code Configuration
 
@@ -396,7 +393,6 @@ Loom automatically updates `.gitignore` with ephemeral patterns:
 - ✅ `.loom/config.json` - Share terminal roles across team
 - ✅ `.loom/roles/` - Custom role definitions
 - ✅ `CLAUDE.md` - AI context documentation
-- ✅ `AGENTS.md` - Agent workflow guide
 - ✅ `.claude/` - Slash commands and config
 - ✅ `.github/` - Labels and workflows
 

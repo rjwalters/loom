@@ -92,7 +92,7 @@ Adds Loom configuration and GitHub workflow integration:
 - .claude/commands/ slash commands for roles (/builder, /judge, etc.)
 - .claude/settings.json tool permissions
 - .github/ labels and workflows
-- Documentation (CLAUDE.md, AGENTS.md)
+- Documentation (CLAUDE.md)
 
 Loom Version: ${LOOM_VERSION}
 Loom Commit: ${LOOM_COMMIT}
@@ -146,7 +146,7 @@ Adds Loom configuration and GitHub workflow integration:
 - .loom/ directory with configuration and scripts
 - .claude/ MCP servers and prompts
 - .github/ labels (workflows skipped - requires 'workflow' scope)
-- Documentation (CLAUDE.md, AGENTS.md)
+- Documentation (CLAUDE.md)
 
 Note: GitHub workflow files were skipped due to missing 'workflow' scope.
 To add workflows later, run: gh auth refresh -s workflow
@@ -214,7 +214,7 @@ This PR adds Loom orchestration framework to the repository.
 - ✅ \`.claude/commands/\` - Slash commands for roles (/builder, /judge, /curator, etc.)
 - ✅ \`.claude/settings.json\` - Claude Code tool permissions
 - ✅ \`.github/\` - Labels and workflows
-- ✅ \`CLAUDE.md\`/\`AGENTS.md\` - Documentation with Loom reference
+- ✅ \`CLAUDE.md\` - Documentation with Loom reference
 
 ## GitHub Labels
 

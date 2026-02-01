@@ -891,7 +891,7 @@ Removes Loom configuration, roles, scripts, and tooling:
 - .claude/ slash commands and agent definitions
 - .codex/ configuration
 - .github/ Loom-specific labels and workflows
-- CLAUDE.md and AGENTS.md documentation
+- CLAUDE.md documentation
 - .gitignore Loom patterns
 - Runtime artifacts (state files, logs)"
 

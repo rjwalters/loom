@@ -18,7 +18,6 @@ loom-daemon init
 - `.loom/config.json` - Terminal configurations and role assignments
 - `.loom/roles/` - Default role definitions (builder.md, judge.md, etc.)
 - `CLAUDE.md` - AI context documentation for the repository
-- `AGENTS.md` - Agent workflow and coordination guide
 - `.claude/` - Claude Code slash commands
 - `.github/labels.yml` - GitHub label definitions
 - `.gitignore` updates - Ephemeral pattern additions
@@ -171,7 +170,7 @@ loom-daemon init
 loom-daemon init --force
 
 # Option 3: Manual cleanup
-rm -rf .loom CLAUDE.md AGENTS.md .claude
+rm -rf .loom CLAUDE.md .claude
 loom-daemon init
 ```
 

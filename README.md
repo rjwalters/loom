@@ -108,8 +108,7 @@ your-repo/
 │   └── scripts/         # Helper scripts
 ├── .claude/commands/    # Slash commands
 ├── .github/labels.yml   # Workflow labels
-├── CLAUDE.md            # AI context document
-└── AGENTS.md            # Agent coordination guide
+└── CLAUDE.md            # AI context document
 ```
 
 ## Usage
