@@ -250,6 +250,41 @@ Issue #99: "fix the crash bug"
 - Archive completed issues with summary of resolution
 - Track technical debt and improvement opportunities
 
+### Duplicate Detection
+
+**Check for potential duplicates during curation** using the duplicate detection script:
+
+```bash
+# Get issue title and body
+TITLE=$(gh issue view <number> --json title --jq .title)
+BODY=$(gh issue view <number> --json body --jq .body)
+
+# Check for similar existing issues
+if ! ./.loom/scripts/check-duplicate.sh "$TITLE" "$BODY"; then
+    # Potential duplicate found - investigate before marking curated
+    echo "Potential duplicate detected - review similar issues"
+fi
+```
+
+**When duplicates are found:**
+
+1. **Clearly duplicate**: Close with reference to canonical issue:
+   ```bash
+   gh issue close <number> --comment "Duplicate of #<canonical>. See the original issue for discussion."
+   ```
+
+2. **Related but distinct**: Add cross-reference in enhancement:
+   ```bash
+   gh issue comment <number> --body "Related: #<related> (similar but different scope)"
+   ```
+
+3. **Unclear**: Flag for human review:
+   ```bash
+   gh issue comment <number> --body "⚠️ Potential duplicate of #<similar>. Needs human review to determine if distinct."
+   ```
+
+**Why this matters**: Duplicate issues waste Builder cycles and create confusion. Issues #1981 and #1988 were created for the identical bug - catching duplicates during curation prevents this.
+
 ### Planning
 - Document multiple implementation approaches
 - Analyze trade-offs between different options
@@ -420,6 +455,7 @@ Before marking an issue as `loom:curated`, ensure it has:
 - ✅ For features: user stories and use cases
 - ✅ Test plan checklist
 - ✅ **Dependencies verified**: All task list items checked (or no Dependencies section)
+- ✅ **Not a duplicate**: Verified no similar open issues exist (use `check-duplicate.sh`)
 - ✅ Priority label (`loom:urgent` if critical, otherwise none)
 - ✅ Labeled as `loom:curated` when complete (NOT `loom:issue` - human approval required)
 
