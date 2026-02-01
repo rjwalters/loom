@@ -279,8 +279,7 @@ class TestBuilderPhase:
             patch(
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
         ):
             result = builder.run(mock_context)
 
@@ -310,8 +309,7 @@ class TestBuilderPhase:
             patch(
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
         ):
             result = builder.run(mock_context)
 
@@ -338,8 +336,7 @@ class TestBuilderPhase:
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue",
                 side_effect=[None, None, None],
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
             patch(
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=0,
@@ -375,8 +372,7 @@ class TestBuilderPhase:
             patch(
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
             patch(
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=0,
@@ -413,8 +409,7 @@ class TestBuilderPhase:
             patch(
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
             patch(
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=1,
@@ -443,8 +438,7 @@ class TestBuilderPhase:
             patch(
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
             patch(
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=4,
@@ -1382,8 +1376,7 @@ class TestBuilderRunTestFailureIntegration:
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=0,
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
             patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None),
         ):
             result = builder.run(mock_context)
@@ -1421,8 +1414,7 @@ class TestBuilderRunTestFailureIntegration:
                 "loom_tools.shepherd.phases.builder.run_phase_with_retry",
                 return_value=0,
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
             # Return None first (no existing PR), then 123 (PR created by validate)
             patch(
                 "loom_tools.shepherd.phases.builder.get_pr_for_issue",
@@ -1476,8 +1468,8 @@ class TestBuilderPreserveOnTestFailure:
         comment_calls = [c for c in calls if "comment" in str(c)]
         assert len(comment_calls) >= 1
 
-        # Should have called remove_issue_label and add_issue_label via labels module
-        # (Those are patched separately in the mock_context)
+        # Should have called transition_issue_labels via labels module
+        # (Patched separately in the mock_context)
 
         # Report milestone should be called with blocked reason
         mock_context.report_milestone.assert_called()
@@ -1508,10 +1500,7 @@ class TestBuilderPreserveOnTestFailure:
                 ),
             ),
             patch(
-                "loom_tools.shepherd.phases.builder.remove_issue_label",
-            ),
-            patch(
-                "loom_tools.shepherd.phases.builder.add_issue_label",
+                "loom_tools.shepherd.phases.builder.transition_issue_labels",
             ),
         ):
             builder._preserve_on_test_failure(mock_context, test_result)
@@ -1612,8 +1601,7 @@ class TestBuilderTestFailureContext:
                     args=[], returncode=0, stdout="", stderr=""
                 ),
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
         ):
             builder._preserve_on_test_failure(ctx, test_result)
 
@@ -1737,8 +1725,7 @@ class TestBuilderTestFailureContext:
                     args=[], returncode=0, stdout="", stderr=""
                 ),
             ),
-            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
         ):
             # Should not raise even with worktree_path=None
             builder._preserve_on_test_failure(ctx, test_result)
