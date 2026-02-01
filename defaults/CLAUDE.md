@@ -461,9 +461,19 @@ gh pr create --label "loom:review-requested"
 
 - **Always use the helper script**: `./.loom/scripts/worktree.sh <issue-number>`
 - **Never run git worktree directly**: The helper prevents nested worktrees
+- **Never delete worktrees manually**: Use `loom-clean` for cleanup (see warning below)
 - **One worktree per issue**: Keeps work isolated and organized
 - **Semantic naming**: Worktrees named `.loom/worktrees/issue-{number}`
 - **Clean up when done**: Worktrees are automatically removed when PRs are merged
+
+**WARNING: Never delete worktrees directly with `git worktree remove`**
+
+Running `git worktree remove` while your shell is in or referencing the worktree directory will corrupt your shell state. Even basic commands like `pwd` will fail with "No such file or directory" errors.
+
+If you need to clean up worktrees:
+1. Use `loom-clean` or `loom-clean --force` (handles edge cases safely)
+2. For stuck shepherds, use `./.loom/scripts/recover-orphaned-shepherds.sh`
+3. Let worktrees auto-cleanup when PRs merge
 
 ### Worktree Helper Commands
 
@@ -1019,12 +1029,18 @@ loom-clean --deep --dry-run  # Preview deep clean
 loom-clean --force  # Non-interactive, safe for automation
 ```
 
-**Manual cleanup** (if needed):
+**Manual cleanup** (if needed, but use with caution):
+
+**WARNING**: Running `git worktree remove` while your shell is in the worktree directory will corrupt your shell state. Always ensure you've navigated out of the worktree first, or use `loom-clean` which handles this safely.
+
 ```bash
+# First, ensure you're NOT in the worktree you're removing
+cd /path/to/main/repo
+
 # List worktrees
 git worktree list
 
-# Remove specific stale worktree
+# Remove specific stale worktree (only after navigating out!)
 git worktree remove .loom/worktrees/issue-42 --force
 
 # Prune orphaned worktrees
