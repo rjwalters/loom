@@ -651,6 +651,174 @@ class BuilderPhase:
 
         return names
 
+    def _has_pytest_output(self, output: str) -> bool:
+        """Check if test output contains pytest results.
+
+        Detects whether the combined output from a pipeline command includes
+        pytest execution output. Used to determine if Python tests actually
+        ran when the primary command is a ``&&``-chained pipeline like
+        ``check:ci:lite`` that may short-circuit before reaching pytest.
+        """
+        for line in output.splitlines():
+            stripped = line.strip()
+            # pytest session header: "== test session starts =="
+            if "test session starts" in stripped:
+                return True
+            # pytest summary with = borders: "== 1 failed, 14 passed in 2.45s =="
+            # or "== 15 passed in 0.50s =="
+            # Only match lines that start with "=" to avoid false positives
+            # from vitest/jest ("Tests  5 passed in 1.23s").
+            if stripped.startswith("=") and "passed" in stripped:
+                return True
+        return False
+
+    def _get_supplemental_test_commands(
+        self, ctx: ShepherdContext, primary_output: str
+    ) -> list[tuple[list[str], str]]:
+        """Determine supplemental test commands for ecosystems not covered by primary output.
+
+        When the primary test command is a ``&&``-chained pipeline (like
+        ``check:ci:lite``), earlier failures can short-circuit and prevent
+        later test suites from running. This method checks which ecosystems
+        the builder's changed files affect and returns test commands for any
+        ecosystem whose output is missing from the primary run.
+
+        Currently supports supplemental Python test detection. Can be
+        extended for other ecosystems as needed.
+
+        Returns a list of (command_args, display_name) tuples.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return []
+
+        changed_files = get_changed_files(cwd=ctx.worktree_path)
+        if not changed_files:
+            return []
+
+        # Check if any changed files are Python files
+        has_python_changes = any(
+            f.endswith(".py") or f.endswith(".pyi") for f in changed_files
+        )
+        if not has_python_changes:
+            return []
+
+        # Check if pytest already ran in the primary output
+        if self._has_pytest_output(primary_output):
+            return []
+
+        # Python files changed but pytest didn't run — need supplemental check.
+        # Look for the test:python script in package.json, fall back to pytest.
+        worktree = ctx.worktree_path
+        if (worktree / "package.json").is_file():
+            pkg = read_json_file(worktree / "package.json")
+            if isinstance(pkg, dict):
+                scripts = pkg.get("scripts", {})
+                if "test:python" in scripts:
+                    return [(["pnpm", "test:python"], "pnpm test:python (supplemental)")]
+
+        if (worktree / "pyproject.toml").is_file():
+            return [(["python", "-m", "pytest"], "pytest (supplemental)")]
+
+        return []
+
+    def _run_supplemental_verification(
+        self, ctx: ShepherdContext, primary_output: str
+    ) -> PhaseResult | None:
+        """Run supplemental tests for ecosystems missed by the primary pipeline.
+
+        When the primary test command (e.g., ``check:ci:lite``) short-circuits
+        via ``&&`` chaining, test suites later in the pipeline may not execute.
+        This method detects which ecosystems the builder's changes affect but
+        whose tests didn't run, and executes those test suites separately.
+
+        Uses the same baseline comparison logic as the primary verification
+        to distinguish new regressions from pre-existing failures.
+
+        Returns None if all supplemental tests pass (or none are needed).
+        Returns a PhaseResult with FAILED status if new failures are detected.
+        """
+        supplemental_cmds = self._get_supplemental_test_commands(ctx, primary_output)
+        if not supplemental_cmds:
+            return None
+
+        for test_cmd, display_name in supplemental_cmds:
+            log_info(f"Running supplemental test: {display_name}")
+            ctx.report_milestone("heartbeat", action=f"supplemental: {display_name}")
+
+            # Run baseline for this specific test command (not the full pipeline)
+            baseline_result = self._run_baseline_tests(
+                ctx, test_cmd, display_name, use_provided_cmd=True
+            )
+
+            test_start = time.time()
+            try:
+                result = subprocess.run(
+                    test_cmd,
+                    cwd=ctx.worktree_path,
+                    text=True,
+                    capture_output=True,
+                    timeout=_TEST_VERIFY_TIMEOUT,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed = int(time.time() - test_start)
+                log_error(f"Supplemental test timed out after {elapsed}s ({display_name})")
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=f"supplemental test timed out after {elapsed}s ({display_name})",
+                    phase_name="builder",
+                    data={"test_failure": True},
+                )
+            except OSError as e:
+                log_warning(f"Could not run supplemental test ({display_name}): {e}")
+                continue
+
+            elapsed = int(time.time() - test_start)
+
+            if result.returncode == 0:
+                log_success(f"Supplemental test passed ({display_name}, {elapsed}s)")
+                continue
+
+            # Supplemental test failed — apply baseline comparison
+            if baseline_result is not None and baseline_result.returncode != 0:
+                baseline_output = baseline_result.stdout + "\n" + baseline_result.stderr
+                worktree_output = result.stdout + "\n" + result.stderr
+
+                structured = self._compare_test_results(baseline_output, worktree_output)
+                if structured is None:
+                    summary = self._parse_test_summary(worktree_output)
+                    msg = f"pre-existing on main ({summary})" if summary else "pre-existing on main"
+                    log_warning(
+                        f"Supplemental test failed but pre-existing: {msg}"
+                    )
+                    continue
+
+            # New failure from supplemental test
+            combined = (result.stdout + "\n" + result.stderr).strip()
+            tail_lines = combined.splitlines()[-10:]
+            summary = self._parse_test_summary(combined)
+            changed_files = get_changed_files(cwd=ctx.worktree_path) if ctx.worktree_path else []
+
+            if summary:
+                log_error(f"Supplemental test failed ({summary}, {elapsed}s)")
+            else:
+                log_error(f"Supplemental test failed ({display_name}, exit code {result.returncode}, {elapsed}s)")
+
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=f"supplemental test failed ({display_name}, exit code {result.returncode})",
+                phase_name="builder",
+                data={
+                    "test_failure": True,
+                    "test_output_tail": "\n".join(tail_lines),
+                    "test_summary": summary or "",
+                    "test_command": display_name,
+                    "changed_files": changed_files,
+                },
+            )
+
+        return None
+
     def _compare_test_results(
         self, baseline_output: str, worktree_output: str
     ) -> bool | None:
@@ -788,8 +956,18 @@ class BuilderPhase:
         ctx: ShepherdContext,
         test_cmd: list[str],
         display_name: str,
+        *,
+        use_provided_cmd: bool = False,
     ) -> subprocess.CompletedProcess[str] | None:
         """Run tests against main branch (repo root) to establish a baseline.
+
+        Args:
+            ctx: Shepherd context.
+            test_cmd: Test command (used when *use_provided_cmd* is True).
+            display_name: Human-readable name for logging.
+            use_provided_cmd: When True, run *test_cmd* directly at the repo
+                root instead of auto-detecting the test command.  Used by
+                supplemental verification to run specific ecosystem tests.
 
         Returns the CompletedProcess result from running tests at the repo root,
         or None if the baseline cannot be obtained (timeout, OSError, or no
@@ -798,12 +976,15 @@ class BuilderPhase:
         if not ctx.repo_root or not ctx.repo_root.is_dir():
             return None
 
-        # Detect test command at repo root (may differ from worktree)
-        baseline_test_info = self._detect_test_command(ctx.repo_root)
-        if baseline_test_info is None:
-            return None
+        if use_provided_cmd:
+            baseline_cmd = test_cmd
+        else:
+            # Detect test command at repo root (may differ from worktree)
+            baseline_test_info = self._detect_test_command(ctx.repo_root)
+            if baseline_test_info is None:
+                return None
+            baseline_cmd, _ = baseline_test_info
 
-        baseline_cmd, _ = baseline_test_info
         log_info(f"Running baseline tests on main: {display_name}")
 
         try:
@@ -880,10 +1061,10 @@ class BuilderPhase:
 
         elapsed = int(time.time() - test_start)
 
+        primary_output = result.stdout + "\n" + result.stderr
+
         if result.returncode == 0:
-            summary = self._parse_test_summary(
-                result.stdout + "\n" + result.stderr
-            )
+            summary = self._parse_test_summary(primary_output)
             if summary:
                 log_success(f"Tests passed ({summary}, {elapsed}s)")
             else:
@@ -892,12 +1073,13 @@ class BuilderPhase:
                 "heartbeat",
                 action=f"tests passed ({elapsed}s)",
             )
-            return None
+            # Check supplemental tests for ecosystems missed by the pipeline
+            return self._run_supplemental_verification(ctx, primary_output)
 
         # Tests failed — check if these are pre-existing failures
         if baseline_result is not None and baseline_result.returncode != 0:
             baseline_output = baseline_result.stdout + "\n" + baseline_result.stderr
-            worktree_output = result.stdout + "\n" + result.stderr
+            worktree_output = primary_output
 
             # Primary: structured comparison using parsed failure counts
             structured = self._compare_test_results(baseline_output, worktree_output)
@@ -931,7 +1113,8 @@ class BuilderPhase:
                         "heartbeat",
                         action=f"tests have pre-existing failures ({elapsed}s)",
                     )
-                return None
+                # Check supplemental tests for ecosystems missed by the pipeline
+                return self._run_supplemental_verification(ctx, primary_output)
 
             if structured is True:
                 # Structured comparison detected new failures
@@ -976,7 +1159,8 @@ class BuilderPhase:
                             "heartbeat",
                             action=f"tests have pre-existing failures ({elapsed}s)",
                         )
-                    return None
+                    # Check supplemental tests for ecosystems missed by the pipeline
+                    return self._run_supplemental_verification(ctx, primary_output)
 
                 # Exit-code heuristic: when both sides have the same
                 # exit code AND the same number of error lines, the
@@ -1017,7 +1201,8 @@ class BuilderPhase:
                             "heartbeat",
                             action=f"tests have pre-existing failures ({elapsed}s)",
                         )
-                    return None
+                    # Check supplemental tests for ecosystems missed by the pipeline
+                    return self._run_supplemental_verification(ctx, primary_output)
 
                 log_warning(
                     f"Baseline also fails but worktree introduces "
@@ -1025,10 +1210,8 @@ class BuilderPhase:
                 )
 
         # Tests failed with new errors (or no baseline available)
-        summary = self._parse_test_summary(
-            result.stdout + "\n" + result.stderr
-        )
-        combined = (result.stdout + "\n" + result.stderr).strip()
+        summary = self._parse_test_summary(primary_output)
+        combined = primary_output.strip()
         tail_lines = combined.splitlines()[-10:]
         tail_text = "\n".join(tail_lines)
 
