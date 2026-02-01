@@ -447,3 +447,84 @@ class TestOutputFormat:
         report_milestone(repo, "abc1234", "error", error="fail", will_retry=True)
         data = _read_progress(repo, "abc1234")
         assert data["milestones"][-1]["data"]["will_retry"] is True
+
+
+# ── judge_retry ─────────────────────────────────────────────────
+
+
+class TestJudgeRetryEvent:
+    def test_records_judge_retry(self, repo: pathlib.Path) -> None:
+        """judge_retry event should record attempt and optional fields."""
+        report_milestone(repo, "abc1234", "started", issue=42)
+        ok = report_milestone(
+            repo,
+            "abc1234",
+            "judge_retry",
+            attempt=1,
+            max_retries=3,
+            reason="no review submitted",
+        )
+        assert ok
+
+        data = _read_progress(repo, "abc1234")
+        milestone = data["milestones"][-1]
+        assert milestone["event"] == "judge_retry"
+        assert milestone["data"]["attempt"] == 1
+        assert milestone["data"]["max_retries"] == 3
+        assert milestone["data"]["reason"] == "no review submitted"
+
+    def test_attempt_only(self, repo: pathlib.Path) -> None:
+        """judge_retry with only required attempt field."""
+        report_milestone(repo, "abc1234", "started", issue=42)
+        ok = report_milestone(repo, "abc1234", "judge_retry", attempt=2)
+        assert ok
+
+        data = _read_progress(repo, "abc1234")
+        milestone = data["milestones"][-1]
+        assert milestone["event"] == "judge_retry"
+        assert milestone["data"]["attempt"] == 2
+        assert "max_retries" not in milestone["data"]
+        assert "reason" not in milestone["data"]
+
+    def test_missing_attempt_returns_false(self, repo: pathlib.Path) -> None:
+        """judge_retry without attempt should fail."""
+        report_milestone(repo, "abc1234", "started", issue=42)
+        ok = report_milestone(repo, "abc1234", "judge_retry")
+        assert not ok
+
+    def test_attempt_is_integer(self, repo: pathlib.Path) -> None:
+        """attempt should be an integer."""
+        report_milestone(repo, "abc1234", "started", issue=42)
+        report_milestone(repo, "abc1234", "judge_retry", attempt=1, max_retries=3)
+        data = _read_progress(repo, "abc1234")
+        assert isinstance(data["milestones"][-1]["data"]["attempt"], int)
+        assert isinstance(data["milestones"][-1]["data"]["max_retries"], int)
+
+    def test_judge_retry_via_cli(
+        self, repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """judge_retry should work via CLI."""
+        monkeypatch.chdir(repo)
+        clear_repo_cache()
+        main(["started", "--task-id", "abc1234", "--issue", "42", "--quiet"])
+        rc = main(
+            [
+                "judge_retry",
+                "--task-id",
+                "abc1234",
+                "--attempt",
+                "1",
+                "--max-retries",
+                "3",
+                "--reason",
+                "no review submitted",
+                "--quiet",
+            ]
+        )
+        assert rc == 0
+        data = _read_progress(repo, "abc1234")
+        milestone = data["milestones"][-1]
+        assert milestone["event"] == "judge_retry"
+        assert milestone["data"]["attempt"] == 1
+        assert milestone["data"]["max_retries"] == 3
+        assert milestone["data"]["reason"] == "no review submitted"
