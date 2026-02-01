@@ -36,8 +36,13 @@
 //! db.record_input(&input)?;
 //! ```
 
+mod claims;
+mod cost_analytics;
 mod db;
+mod metrics;
 mod models;
+mod prompts;
+mod quality;
 pub mod resource_usage;
 mod schema;
 pub mod stats;
