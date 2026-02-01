@@ -5,16 +5,19 @@
 mod common;
 
 use common::{
-    cleanup_test_sessions, get_test_tmux_sessions, kill_tmux_session, tmux_session_exists,
-    TestClient, TestDaemon,
+    cleanup_all_loom_sessions, cleanup_test_sessions, get_test_tmux_sessions, kill_tmux_session,
+    tmux_session_exists, TestClient, TestDaemon,
 };
 use serial_test::serial;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-/// Ensure we always begin with a clean slate of tmux sessions for this binary.
+/// Ensure we always begin with a clean slate of tmux sessions.
+/// Cleans ALL loom sessions to prevent the daemon from restoring orphan sessions
+/// from other test binaries or previous runs. This is necessary because the daemon
+/// calls `restore_from_tmux()` on startup which imports any existing loom-* sessions.
 fn setup() {
-    cleanup_test_sessions();
+    cleanup_all_loom_sessions();
 }
 
 /// Create the standard set of 7 workspace terminals and return their IDs
