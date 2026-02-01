@@ -1651,6 +1651,11 @@ class TestBuilderTestFailureContext:
             return completed
 
         with (
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=[],  # No changed files, skip ecosystem-specific tests
+            ),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -2340,7 +2345,11 @@ class TestBuilderFallbackComparison:
     def test_fallback_new_errors_detected(
         self, mock_context: MagicMock
     ) -> None:
-        """Fallback: new error lines in worktree -> FAILED."""
+        """Fallback: new error lines in worktree -> FAILED.
+
+        Uses 7 error lines in worktree vs 1 in baseline (diff=6) to exceed
+        the _ERROR_LINE_TOLERANCE of 5, ensuring new errors are detected.
+        """
         builder = BuilderPhase()
         worktree_mock = MagicMock()
         worktree_mock.is_dir.return_value = True
@@ -2349,10 +2358,12 @@ class TestBuilderFallbackComparison:
         baseline_result = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="Error: old bug\n", stderr=""
         )
+        # 7 error lines total (1 original + 6 new) exceeds tolerance of 5
+        new_errors = "".join(f"Error: new regression {i}\n" for i in range(6))
         worktree_result = subprocess.CompletedProcess(
             args=[],
             returncode=1,
-            stdout="Error: old bug\nError: new regression\n",
+            stdout=f"Error: old bug\n{new_errors}",
             stderr="",
         )
         with (
@@ -4624,3 +4635,313 @@ class TestDoctorPhaseExitCode5:
 
         # Should not call _mark_issue_blocked
         mock_context.label_cache.invalidate_issue.assert_not_called()
+
+
+class TestEcosystemAwareTestVerification:
+    """Test ecosystem-aware test verification methods in BuilderPhase."""
+
+    def test_get_affected_ecosystems_python_files(self) -> None:
+        """Python files should return pytest ecosystem."""
+        builder = BuilderPhase()
+        changed = ["src/module.py", "tests/test_foo.py"]
+        affected = builder._get_affected_ecosystems(changed)
+        assert affected == {"pytest"}
+
+    def test_get_affected_ecosystems_rust_files(self) -> None:
+        """Rust files should return cargo ecosystem."""
+        builder = BuilderPhase()
+        changed = ["src/main.rs", "src/lib.rs"]
+        affected = builder._get_affected_ecosystems(changed)
+        assert affected == {"cargo"}
+
+    def test_get_affected_ecosystems_typescript_files(self) -> None:
+        """TypeScript files should return pnpm ecosystem."""
+        builder = BuilderPhase()
+        changed = ["src/app.ts", "src/components/Button.tsx"]
+        affected = builder._get_affected_ecosystems(changed)
+        assert affected == {"pnpm"}
+
+    def test_get_affected_ecosystems_mixed_files(self) -> None:
+        """Mixed files should return all affected ecosystems."""
+        builder = BuilderPhase()
+        changed = [
+            "src/main.rs",
+            "src/app.ts",
+            "loom-tools/src/module.py",
+        ]
+        affected = builder._get_affected_ecosystems(changed)
+        assert affected == {"cargo", "pnpm", "pytest"}
+
+    def test_get_affected_ecosystems_config_files(self) -> None:
+        """Config files (.yml) should return all ecosystems."""
+        builder = BuilderPhase()
+        changed = [".github/workflows/ci.yml"]
+        affected = builder._get_affected_ecosystems(changed)
+        assert affected == {"pnpm", "cargo", "pytest"}
+
+    def test_get_affected_ecosystems_docs_only(self) -> None:
+        """Documentation files should return empty set."""
+        builder = BuilderPhase()
+        changed = ["README.md", "docs/guide.txt"]
+        affected = builder._get_affected_ecosystems(changed)
+        assert affected == set()
+
+    def test_get_affected_ecosystems_empty_list(self) -> None:
+        """Empty changed files should return empty set."""
+        builder = BuilderPhase()
+        affected = builder._get_affected_ecosystems([])
+        assert affected == set()
+
+    def test_get_ecosystem_test_command_pytest(self, tmp_path: Path) -> None:
+        """Should return pytest command when pyproject.toml exists."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        result = builder._get_ecosystem_test_command(tmp_path, "pytest")
+
+        assert result is not None
+        assert result == (["python", "-m", "pytest"], "pytest")
+
+    def test_get_ecosystem_test_command_pytest_monorepo(self, tmp_path: Path) -> None:
+        """Should return pnpm test:python for monorepo structure."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "loom-tools").mkdir()
+        (tmp_path / "loom-tools" / "pyproject.toml").write_text(
+            "[project]\nname = 'loom-tools'\n"
+        )
+
+        result = builder._get_ecosystem_test_command(tmp_path, "pytest")
+
+        assert result is not None
+        assert result == (["pnpm", "test:python"], "pnpm test:python")
+
+    def test_get_ecosystem_test_command_cargo(self, tmp_path: Path) -> None:
+        """Should return cargo test command when Cargo.toml exists."""
+        builder = BuilderPhase()
+        (tmp_path / "Cargo.toml").write_text('[package]\nname = "test"\n')
+
+        result = builder._get_ecosystem_test_command(tmp_path, "cargo")
+
+        assert result is not None
+        assert result == (
+            ["cargo", "test", "--workspace", "--exclude", "app"],
+            "cargo test",
+        )
+
+    def test_get_ecosystem_test_command_pnpm_test_unit(self, tmp_path: Path) -> None:
+        """Should return pnpm test:unit when script exists."""
+        builder = BuilderPhase()
+        (tmp_path / "package.json").write_text(
+            '{"scripts": {"test:unit": "vitest"}}'
+        )
+
+        result = builder._get_ecosystem_test_command(tmp_path, "pnpm")
+
+        assert result is not None
+        assert result == (["pnpm", "test:unit"], "pnpm test:unit")
+
+    def test_get_ecosystem_test_command_missing_config(self, tmp_path: Path) -> None:
+        """Should return None when no config file exists."""
+        builder = BuilderPhase()
+        result = builder._get_ecosystem_test_command(tmp_path, "pytest")
+        assert result is None
+
+    def test_ecosystem_specific_python_failure_detected(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Ecosystem-specific tests should detect Python failures."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path / "main"
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        # Worktree test fails with new error
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAILED tests/test_foo.py::test_bar\n1 failed, 5 passed in 0.5s\n",
+            stderr="",
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch.object(builder, "_run_baseline_for_ecosystem", return_value=None),
+        ):
+            result = builder._run_ecosystem_specific_tests(mock_context, {"pytest"})
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "pytest" in result.message
+        assert result.data.get("ecosystem") == "pytest"
+
+    def test_ecosystem_specific_preexisting_failures_pass(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Ecosystem-specific tests should allow pre-existing failures."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path / "main"
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        # Both baseline and worktree have same failure
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAILED tests/test_foo.py::test_bar\n1 failed, 5 passed in 0.5s\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAILED tests/test_foo.py::test_bar\n1 failed, 5 passed in 0.6s\n",
+            stderr="",
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch.object(
+                builder, "_run_baseline_for_ecosystem", return_value=baseline_result
+            ),
+        ):
+            result = builder._run_ecosystem_specific_tests(mock_context, {"pytest"})
+
+        # Should be None (passed because failures are pre-existing)
+        assert result is None
+
+    def test_ecosystem_specific_tests_pass(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Ecosystem-specific tests should return None when all pass."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path / "main"
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        passing_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="6 passed in 0.5s\n",
+            stderr="",
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=passing_result,
+            ),
+            patch.object(builder, "_run_baseline_for_ecosystem", return_value=None),
+        ):
+            result = builder._run_ecosystem_specific_tests(mock_context, {"pytest"})
+
+        assert result is None
+
+    def test_run_test_verification_ecosystem_specific_called_first(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Test verification should try ecosystem-specific tests first."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path / "main"
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        ecosystem_failure = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="pytest test verification failed",
+            phase_name="builder",
+            data={"ecosystem": "pytest"},
+        )
+
+        with (
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["src/module.py"],
+            ),
+            patch.object(
+                builder, "_run_ecosystem_specific_tests", return_value=ecosystem_failure
+            ) as mock_eco,
+            patch.object(builder, "_detect_test_command") as mock_detect,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should have called ecosystem-specific tests
+        mock_eco.assert_called_once()
+        # Should NOT fall through to combined test
+        mock_detect.assert_not_called()
+        assert result == ecosystem_failure
+
+    def test_run_test_verification_fallback_when_no_changed_files(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Test verification should fall back to combined when no changed files."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path
+
+        with (
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=[],
+            ),
+            patch.object(
+                builder, "_detect_test_command", return_value=None
+            ) as mock_detect,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should fall through to combined test detection
+        mock_detect.assert_called_once()
+        # Returns None because no test runner detected
+        assert result is None
+
+    def test_run_test_verification_fallback_when_ecosystem_passes(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Test verification should run combined tests after ecosystem passes."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.repo_root = tmp_path
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "package.json").write_text('{"scripts": {"check:ci:lite": "..."}}')
+
+        passing_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="all tests passed\n",
+            stderr="",
+        )
+
+        with (
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["src/module.py"],
+            ),
+            patch.object(
+                builder, "_run_ecosystem_specific_tests", return_value=None
+            ) as mock_eco,
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "check:ci:lite"], "pnpm check:ci:lite"),
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=passing_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should have called ecosystem-specific tests first
+        mock_eco.assert_called_once()
+        # Combined tests also pass
+        assert result is None

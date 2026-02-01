@@ -1,0 +1,13 @@
+{
+  "issue": 2026,
+  "failure_message": "test verification failed (pnpm check:ci:lite, exit code 101)",
+  "test_command": "pnpm check:ci:lite",
+  "test_output_tail": "57 |     let copy_file_with_substitution =\n   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_copy_file_with_substitution`\n   |\n   = note: `-D unused-variables` implied by `-D warnings`\n   = help: to override `-D warnings` add `#[allow(unused_variables)]`\n\n    Checking loom-api v0.1.0 (/Users/rwalters/GitHub/loom/.loom/worktrees/issue-2026/loom-api)\nerror: could not compile `loom-daemon` (bin \"loom-daemon\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish...\nerror: could not compile `loom-daemon` (bin \"loom-daemon\" test) due to 1 previous error",
+  "test_summary": "",
+  "changed_files": [
+    ".gitignore",
+    "docs/guides/ci-cd-setup.md",
+    "docs/guides/common-tasks.md",
+    "docs/guides/getting-started.md"
+  ]
+}

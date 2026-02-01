@@ -735,6 +735,11 @@ class BuilderPhase:
         the worktree. Only fails if the worktree introduces NEW errors not
         present in the baseline.
 
+        For targeted testing, first runs ecosystem-specific tests based on
+        changed files, comparing each ecosystem's baseline vs worktree
+        independently. Falls back to combined test command for comprehensive
+        verification.
+
         Returns None if tests pass or cannot be run (no test runner detected).
         Returns a PhaseResult with FAILED status if tests introduce new failures.
         """
@@ -744,6 +749,19 @@ class BuilderPhase:
         # Ensure dependencies are installed before running tests
         self._ensure_dependencies(ctx.worktree_path)
 
+        # Ecosystem-specific verification for targeted testing
+        # This runs tests per-ecosystem based on changed files, enabling
+        # independent baseline comparison per ecosystem (e.g., Python failures
+        # won't be masked by Rust output in combined check:ci:lite command).
+        changed_files = get_changed_files(cwd=ctx.worktree_path)
+        if changed_files:
+            affected = self._get_affected_ecosystems(changed_files)
+            if affected:
+                ecosystem_result = self._run_ecosystem_specific_tests(ctx, affected)
+                if ecosystem_result is not None:
+                    return ecosystem_result
+
+        # Fall back to combined test command for comprehensive verification
         test_info = self._detect_test_command(ctx.worktree_path)
         if test_info is None:
             log_info("No test runner detected in worktree, skipping test verification")
@@ -1492,3 +1510,215 @@ class BuilderPhase:
             f"do not affect {test_ecosystem} tests"
         )
         return True
+
+    def _get_affected_ecosystems(self, changed_files: list[str]) -> set[str]:
+        """Determine which test ecosystems are affected by the changed files.
+
+        Uses the _EXT_TO_ECOSYSTEM mapping to identify which ecosystems
+        could potentially have failures caused by the changed files.
+
+        Args:
+            changed_files: List of changed file paths (relative or absolute).
+
+        Returns:
+            Set of ecosystem names (e.g., {"pytest", "pnpm"}).
+        """
+        affected: set[str] = set()
+        for filepath in changed_files:
+            ext = Path(filepath).suffix.lower()
+            ecosystems = self._EXT_TO_ECOSYSTEM.get(ext)
+            if ecosystems:
+                affected.update(ecosystems)
+        return affected
+
+    def _get_ecosystem_test_command(
+        self, worktree: Path, ecosystem: str
+    ) -> tuple[list[str], str] | None:
+        """Get test command for a specific ecosystem.
+
+        Args:
+            worktree: Path to the worktree directory.
+            ecosystem: The test ecosystem name ("pytest", "cargo", or "pnpm").
+
+        Returns:
+            Tuple of (command_args, display_name) or None if no test command
+            is available for this ecosystem in this worktree.
+        """
+        if ecosystem == "pytest" and (worktree / "pyproject.toml").is_file():
+            # Check if loom-tools subdir has tests (monorepo structure)
+            if (worktree / "loom-tools" / "pyproject.toml").is_file():
+                return (["pnpm", "test:python"], "pnpm test:python")
+            return (["python", "-m", "pytest"], "pytest")
+
+        if ecosystem == "cargo" and (worktree / "Cargo.toml").is_file():
+            return (["cargo", "test", "--workspace", "--exclude", "app"], "cargo test")
+
+        if ecosystem == "pnpm" and (worktree / "package.json").is_file():
+            pkg = read_json_file(worktree / "package.json")
+            if isinstance(pkg, dict):
+                scripts = pkg.get("scripts", {})
+                if "test:unit" in scripts:
+                    return (["pnpm", "test:unit"], "pnpm test:unit")
+                if "test:unit:coverage" in scripts:
+                    return (["pnpm", "test:unit:coverage"], "pnpm test:unit:coverage")
+
+        return None
+
+    def _run_baseline_for_ecosystem(
+        self,
+        ctx: ShepherdContext,
+        test_cmd: list[str],
+        display_name: str,
+    ) -> subprocess.CompletedProcess[str] | None:
+        """Run baseline tests for a specific ecosystem.
+
+        Args:
+            ctx: Shepherd context with repo_root for baseline.
+            test_cmd: The test command to run.
+            display_name: Human-readable name for logging.
+
+        Returns:
+            CompletedProcess result, or None if baseline cannot be obtained.
+        """
+        if not ctx.repo_root or not ctx.repo_root.is_dir():
+            return None
+
+        log_info(f"Running baseline {display_name} on main")
+        try:
+            return subprocess.run(
+                test_cmd,
+                cwd=ctx.repo_root,
+                text=True,
+                capture_output=True,
+                timeout=_TEST_VERIFY_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            log_warning(f"Baseline {display_name} timed out, skipping comparison")
+            return None
+        except OSError as e:
+            log_warning(f"Could not run baseline {display_name}: {e}")
+            return None
+
+    def _run_ecosystem_specific_tests(
+        self, ctx: ShepherdContext, affected_ecosystems: set[str]
+    ) -> PhaseResult | None:
+        """Run tests for each affected ecosystem independently.
+
+        This method provides ecosystem-aware test verification, running tests
+        for each affected ecosystem separately and comparing each ecosystem's
+        baseline vs worktree independently. This prevents Python test failures
+        from being masked by Rust test output when using combined commands.
+
+        Args:
+            ctx: Shepherd context with worktree_path and repo_root.
+            affected_ecosystems: Set of ecosystems to test (e.g., {"pytest"}).
+
+        Returns:
+            PhaseResult(FAILED) if any ecosystem has new failures.
+            None if all pass or failures are pre-existing.
+        """
+        if not ctx.worktree_path:
+            return None
+
+        for ecosystem in affected_ecosystems:
+            cmd_info = self._get_ecosystem_test_command(ctx.worktree_path, ecosystem)
+            if cmd_info is None:
+                continue
+
+            test_cmd, display_name = cmd_info
+            log_info(f"Running {ecosystem} tests: {display_name}")
+            ctx.report_milestone("heartbeat", action=f"verifying {ecosystem} tests")
+
+            # Run baseline for this ecosystem
+            baseline = self._run_baseline_for_ecosystem(ctx, test_cmd, display_name)
+
+            # Run worktree tests
+            test_start = time.time()
+            try:
+                result = subprocess.run(
+                    test_cmd,
+                    cwd=ctx.worktree_path,
+                    text=True,
+                    capture_output=True,
+                    timeout=_TEST_VERIFY_TIMEOUT,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                elapsed = int(time.time() - test_start)
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=f"{ecosystem} test verification timed out after {elapsed}s ({display_name})",
+                    phase_name="builder",
+                    data={"test_failure": True, "ecosystem": ecosystem},
+                )
+            except OSError:
+                # Skip this ecosystem if command fails to run
+                continue
+
+            elapsed = int(time.time() - test_start)
+
+            if result.returncode == 0:
+                log_success(f"{ecosystem} tests passed ({elapsed}s)")
+                continue
+
+            # Tests failed - check if pre-existing
+            if baseline is not None and baseline.returncode != 0:
+                baseline_output = baseline.stdout + "\n" + baseline.stderr
+                worktree_output = result.stdout + "\n" + result.stderr
+
+                # Use existing structured comparison
+                structured = self._compare_test_results(baseline_output, worktree_output)
+                if structured is None:
+                    # No new failures
+                    log_warning(
+                        f"{ecosystem} test failures are pre-existing on main ({elapsed}s)"
+                    )
+                    continue
+
+                if structured is False:
+                    # Structured parsing failed, use line-based comparison
+                    baseline_errors = set(self._extract_error_lines(baseline_output))
+                    worktree_errors = set(self._extract_error_lines(worktree_output))
+                    new_errors = worktree_errors - baseline_errors
+
+                    if not new_errors:
+                        log_warning(
+                            f"{ecosystem} test failures are pre-existing on main ({elapsed}s)"
+                        )
+                        continue
+
+                    # Same exit code and error count heuristic
+                    if (
+                        result.returncode == baseline.returncode
+                        and len(worktree_errors) == len(baseline_errors)
+                    ):
+                        log_warning(
+                            f"{ecosystem} test failures are likely pre-existing "
+                            f"(same exit code and error count, {elapsed}s)"
+                        )
+                        continue
+
+            # New failures detected
+            summary = self._parse_test_summary(result.stdout + "\n" + result.stderr)
+            combined = (result.stdout + "\n" + result.stderr).strip()
+            tail_lines = combined.splitlines()[-10:]
+            tail_text = "\n".join(tail_lines)
+
+            log_error(f"{ecosystem} tests failed ({elapsed}s)")
+            log_info(f"Test output (last 10 lines):\n{tail_text}")
+
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=f"{ecosystem} test verification failed ({display_name}, exit code {result.returncode})",
+                phase_name="builder",
+                data={
+                    "test_failure": True,
+                    "ecosystem": ecosystem,
+                    "test_command": display_name,
+                    "test_summary": summary or "",
+                    "test_output_tail": tail_text,
+                },
+            )
+
+        return None  # All ecosystems passed or had pre-existing failures
