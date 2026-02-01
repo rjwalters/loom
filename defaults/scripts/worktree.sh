@@ -403,6 +403,26 @@ if check_if_in_worktree; then
     fi
 fi
 
+# Prune orphaned worktree references before any worktree operations
+# This cleans up stale references when worktree directories were deleted externally (e.g., rm -rf)
+# Without this, subsequent worktree operations or `gh pr checkout` can fail
+PRUNE_OUTPUT=$(git worktree prune --dry-run --verbose 2>/dev/null || true)
+if [[ -n "$PRUNE_OUTPUT" ]]; then
+    # There are orphaned references to prune
+    if [[ "$JSON_OUTPUT" != "true" ]]; then
+        print_info "Pruning orphaned worktree references..."
+    fi
+    if git worktree prune 2>/dev/null; then
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_success "Pruned orphaned worktree references"
+        fi
+    else
+        if [[ "$JSON_OUTPUT" != "true" ]]; then
+            print_warning "Failed to prune worktrees (continuing anyway)"
+        fi
+    fi
+fi
+
 # Ensure we're on main branch and pull latest changes
 # This happens whether we came from a worktree (already switched above) or started in main workspace
 CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
