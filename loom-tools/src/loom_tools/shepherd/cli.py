@@ -7,6 +7,7 @@ import sys
 import time
 from pathlib import Path
 
+from loom_tools.common.git import get_commit_count
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.shepherd.config import ExecutionMode, Phase, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
@@ -374,8 +375,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 ctx.label_cache.invalidate_issue(ctx.config.issue)
 
                 # Record commit count before Doctor so we can detect if it changed anything
-                from loom_tools.common.git import get_commit_count
-
                 commits_before = get_commit_count(cwd=ctx.worktree_path)
 
                 # Doctor works in the same worktree to fix tests
