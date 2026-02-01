@@ -810,17 +810,33 @@ class BuilderPhase:
 
             if structured is None:
                 # Structured comparison says no new failures
+                worktree_count = self._parse_failure_count(worktree_output)
                 summary = self._parse_test_summary(worktree_output)
-                msg = f"pre-existing on main (exit code {result.returncode})"
-                if summary:
-                    msg = f"pre-existing on main ({summary})"
-                log_warning(
-                    f"Tests failed but all failures are pre-existing: {msg}"
-                )
-                ctx.report_milestone(
-                    "heartbeat",
-                    action=f"tests have pre-existing failures ({elapsed}s)",
-                )
+
+                if worktree_count == 0:
+                    # Exit code non-zero but no test failures — likely coverage/lint issue
+                    msg = f"exit code {result.returncode} but 0 test failures"
+                    if summary:
+                        msg = f"{summary}, exit code {result.returncode}"
+                    log_warning(
+                        f"Tests passed but process exited non-zero: {msg}"
+                    )
+                    ctx.report_milestone(
+                        "heartbeat",
+                        action=f"tests passed with non-zero exit ({elapsed}s)",
+                    )
+                else:
+                    # Actual failures exist but they're pre-existing
+                    msg = f"pre-existing on main (exit code {result.returncode})"
+                    if summary:
+                        msg = f"pre-existing on main ({summary})"
+                    log_warning(
+                        f"Tests failed but all failures are pre-existing: {msg}"
+                    )
+                    ctx.report_milestone(
+                        "heartbeat",
+                        action=f"tests have pre-existing failures ({elapsed}s)",
+                    )
                 return None
 
             if structured is True:
@@ -841,16 +857,31 @@ class BuilderPhase:
 
                 if not new_errors:
                     summary = self._parse_test_summary(worktree_output)
-                    msg = f"pre-existing on main (exit code {result.returncode})"
-                    if summary:
-                        msg = f"pre-existing on main ({summary})"
-                    log_warning(
-                        f"Tests failed but all failures are pre-existing: {msg}"
-                    )
-                    ctx.report_milestone(
-                        "heartbeat",
-                        action=f"tests have pre-existing failures ({elapsed}s)",
-                    )
+
+                    if len(worktree_errors) == 0:
+                        # No error lines at all — likely coverage/lint issue
+                        msg = f"exit code {result.returncode} but no error lines"
+                        if summary:
+                            msg = f"{summary}, exit code {result.returncode}"
+                        log_warning(
+                            f"Tests passed but process exited non-zero: {msg}"
+                        )
+                        ctx.report_milestone(
+                            "heartbeat",
+                            action=f"tests passed with non-zero exit ({elapsed}s)",
+                        )
+                    else:
+                        # Error lines exist but they're pre-existing
+                        msg = f"pre-existing on main (exit code {result.returncode})"
+                        if summary:
+                            msg = f"pre-existing on main ({summary})"
+                        log_warning(
+                            f"Tests failed but all failures are pre-existing: {msg}"
+                        )
+                        ctx.report_milestone(
+                            "heartbeat",
+                            action=f"tests have pre-existing failures ({elapsed}s)",
+                        )
                     return None
 
                 # Exit-code heuristic: when both sides have the same
@@ -865,19 +896,33 @@ class BuilderPhase:
                     and len(worktree_errors) == len(baseline_errors)
                 ):
                     summary = self._parse_test_summary(worktree_output)
-                    msg = f"pre-existing on main (exit code {result.returncode})"
-                    if summary:
-                        msg = f"pre-existing on main ({summary})"
-                    log_warning(
-                        f"Tests failed but line diff is likely non-deterministic "
-                        f"(same exit code {result.returncode}, "
-                        f"same error count {len(worktree_errors)}, "
-                        f"{len(new_errors)} diff lines): {msg}"
-                    )
-                    ctx.report_milestone(
-                        "heartbeat",
-                        action=f"tests have pre-existing failures ({elapsed}s)",
-                    )
+
+                    if len(worktree_errors) == 0:
+                        # No error lines at all — likely coverage/lint issue
+                        msg = f"exit code {result.returncode} but no error lines"
+                        if summary:
+                            msg = f"{summary}, exit code {result.returncode}"
+                        log_warning(
+                            f"Tests passed but process exited non-zero: {msg}"
+                        )
+                        ctx.report_milestone(
+                            "heartbeat",
+                            action=f"tests passed with non-zero exit ({elapsed}s)",
+                        )
+                    else:
+                        msg = f"pre-existing on main (exit code {result.returncode})"
+                        if summary:
+                            msg = f"pre-existing on main ({summary})"
+                        log_warning(
+                            f"Tests failed but line diff is likely non-deterministic "
+                            f"(same exit code {result.returncode}, "
+                            f"same error count {len(worktree_errors)}, "
+                            f"{len(new_errors)} diff lines): {msg}"
+                        )
+                        ctx.report_milestone(
+                            "heartbeat",
+                            action=f"tests have pre-existing failures ({elapsed}s)",
+                        )
                     return None
 
                 log_warning(
