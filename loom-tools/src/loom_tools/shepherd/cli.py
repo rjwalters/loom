@@ -504,12 +504,18 @@ def orchestrate(ctx: ShepherdContext) -> int:
             # When Doctor was skipped (test_failure_recovery=False),
             # Phase 3c would re-run test verification which would fail
             # again on the same pre-existing errors, so we skip it.
+            #
+            # When Phase 3c does run, we skip test verification because:
+            # 1. If Doctor made no changes, failures are pre-existing
+            # 2. If Doctor made changes, tests were already re-verified above
+            # See issue #1946 for context on this fix.
             if ctx.pr_number is None and test_failure_recovery:
                 _print_phase_header("PHASE 3c: BUILDER (PR creation after test fix)")
                 phase_start = time.time()
 
-                # Re-run builder which will detect existing worktree and create PR
-                result = builder.run(ctx)
+                # Re-run builder to create PR, skipping test verification
+                # since tests were already verified (or failures are pre-existing)
+                result = builder.run(ctx, skip_test_verification=True)
                 elapsed = int(time.time() - phase_start)
 
                 if result.is_shutdown:
