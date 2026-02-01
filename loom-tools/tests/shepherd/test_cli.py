@@ -1643,3 +1643,329 @@ class TestBuilderNoPrPrecondition:
             if c[0][0] == "judge_retry"
         ]
         assert len(retry_calls) == 0
+
+
+class TestDoctorTestFixLoop:
+    """Test builder test failure → Doctor test-fix loop (issue #2046)."""
+
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_test_failure_routes_to_doctor(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+    ) -> None:
+        """Builder test failure should invoke Doctor test-fix, then re-verify tests."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Doctor test-fix
+            100,   # doctor phase_start
+            200,   # doctor elapsed
+            # Test re-verification
+            200,   # test_start
+            210,   # test elapsed
+            # Judge
+            210,   # judge phase_start
+            260,   # judge elapsed
+            # Merge
+            260,   # merge phase_start
+            270,   # merge elapsed
+            270,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Builder reports test failure
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "test_output_tail": "FAILED tests", "test_command": "pnpm test"},
+        )
+        # After Doctor fix, test verification passes
+        builder_inst.run_test_verification_only.return_value = None  # None = tests pass
+
+        # Doctor succeeds
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        # Judge approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        # Merge
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Doctor test-fix was invoked
+        doctor_inst.run_test_fix.assert_called_once()
+        # Test re-verification was run
+        builder_inst.run_test_verification_only.assert_called_once()
+        # Should NOT mark as test failure since Doctor fixed it
+        mock_mark_failure.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_preexisting_skips_to_success(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+    ) -> None:
+        """When Doctor signals pre-existing failures (SKIPPED), builder continues."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Doctor test-fix (pre-existing)
+            100,   # doctor phase_start
+            110,   # doctor elapsed
+            # Judge
+            110,   # judge phase_start
+            160,   # judge elapsed
+            # Merge
+            160,   # merge phase_start
+            170,   # merge elapsed
+            170,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        # Doctor says failures are pre-existing
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED,
+            message="doctor determined test failures are pre-existing",
+            phase_name="doctor",
+            data={"preexisting": True},
+        )
+
+        # Judge approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        # Merge
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Should NOT mark as failure
+        mock_mark_failure.assert_not_called()
+        # Doctor was called
+        doctor_inst.run_test_fix.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_exhaustion_marks_test_failure(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        mock_mark_failure: MagicMock,
+    ) -> None:
+        """When Doctor retries are exhausted, should mark builder test failure."""
+        # test_fix_max_retries defaults to 2
+        time_values = [
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+        ]
+        # Two Doctor attempts, each followed by test re-verification
+        for i in range(2):
+            time_values.extend([
+                100 + i * 100,   # doctor phase_start
+                150 + i * 100,   # doctor elapsed
+                150 + i * 100,   # test_start
+                160 + i * 100,   # test elapsed
+            ])
+
+        mock_time.time = MagicMock(side_effect=time_values)
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+        # Tests keep failing after each Doctor attempt
+        builder_inst.run_test_verification_only.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        # Doctor succeeds each time but tests still fail
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        result = orchestrate(ctx)
+        assert result == 1
+
+        # Doctor was called max times (2)
+        assert doctor_inst.run_test_fix.call_count == 2
+        # Mark as test failure after exhaustion
+        mock_mark_failure.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_non_test_failure_bypasses_doctor(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+    ) -> None:
+        """Non-test builder failures should NOT route to Doctor."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Regular failure (not test_failure)
+        builder_inst.run.return_value = _failed_result("builder", "validation failed")
+
+        result = orchestrate(ctx)
+        assert result == 1
+
+        # Doctor should NOT have been called
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_shutdown_propagates(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+    ) -> None:
+        """Shutdown during Doctor test-fix should propagate gracefully."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            100,   # doctor phase_start
+            110,   # doctor elapsed
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        # Doctor returns shutdown
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = PhaseResult(
+            status=PhaseStatus.SHUTDOWN,
+            message="shutdown signal detected",
+            phase_name="doctor",
+        )
+
+        result = orchestrate(ctx)
+        assert result == 0  # Graceful shutdown returns 0
