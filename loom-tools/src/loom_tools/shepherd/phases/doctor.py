@@ -71,6 +71,15 @@ class DoctorPhase:
                 phase_name="doctor",
             )
 
+        if exit_code == 5:
+            # Doctor explicitly signaled failures are pre-existing
+            return PhaseResult(
+                status=PhaseStatus.SKIPPED,
+                message="doctor determined failures are pre-existing",
+                phase_name="doctor",
+                data={"preexisting": True},
+            )
+
         # Validate phase
         if not self.validate(ctx):
             return PhaseResult(

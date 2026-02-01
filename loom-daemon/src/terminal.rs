@@ -177,7 +177,13 @@ impl TerminalManager {
 
     pub fn list_terminals(&mut self) -> Vec<TerminalInfo> {
         // If registry is empty but tmux sessions exist, restore from tmux
-        if self.terminals.is_empty() {
+        // Skip restore when LOOM_NO_RESTORE=1 is set (used in tests to prevent
+        // cross-test-binary contamination via shared tmux server)
+        let no_restore = std::env::var("LOOM_NO_RESTORE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
+        if self.terminals.is_empty() && !no_restore {
             log::debug!("Registry empty, attempting to restore from tmux");
             if let Err(e) = self.restore_from_tmux() {
                 log::warn!("Failed to restore terminals from tmux: {e}");

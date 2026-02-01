@@ -17,6 +17,7 @@ from loom_tools.shepherd.phases import (
     BasePhase,
     BuilderPhase,
     CuratorPhase,
+    DoctorPhase,
     JudgePhase,
     MergePhase,
     PhaseResult,
@@ -4026,3 +4027,60 @@ class TestBuilderShouldSkipDoctorRecovery:
                 mock_context, ["cargo", "test"]
             )
         assert result is False
+
+
+class TestDoctorPhaseExitCode5:
+    """Test Doctor phase handling of exit code 5 (pre-existing failures)."""
+
+    def test_exit_code_5_returns_skipped_with_preexisting_flag(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 5 should return SKIPPED status with preexisting flag."""
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 5
+            result = doctor.run(mock_context)
+
+        assert result.status == PhaseStatus.SKIPPED
+        assert result.data.get("preexisting") is True
+        assert "pre-existing" in result.message.lower()
+
+    def test_exit_code_0_validates_and_returns_success(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 0 should validate phase and return SUCCESS."""
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "validate") as mock_validate,
+        ):
+            mock_run.return_value = 0
+            mock_validate.return_value = True
+            result = doctor.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+
+    def test_exit_code_5_does_not_mark_blocked(self, mock_context: MagicMock) -> None:
+        """Exit code 5 should NOT mark issue as blocked (unlike exit code 4)."""
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 5
+            result = doctor.run(mock_context)
+
+        # Should not call _mark_issue_blocked
+        mock_context.label_cache.invalidate_issue.assert_not_called()
