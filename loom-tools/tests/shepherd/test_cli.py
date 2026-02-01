@@ -915,6 +915,76 @@ def _failed_result(phase: str = "", message: str = "phase failed") -> PhaseResul
     return PhaseResult(status=PhaseStatus.FAILED, message=message, phase_name=phase)
 
 
+class TestJudgePhaseHeader:
+    """Test judge phase header shows correct attempt count (issue #2008)."""
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_judge_header_shows_correct_retry_count(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Judge phase header should show judge_retries, not doctor_attempts.
+
+        Before fix (bug): PHASE 4: JUDGE (attempt 1) on first run, then
+        PHASE 4: JUDGE (attempt 1) again on retry (used doctor_attempts).
+
+        After fix: PHASE 4: JUDGE (attempt 1) on first run, then
+        PHASE 4: JUDGE (attempt 2) on retry (uses judge_retries).
+        """
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (fails)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Judge attempt 2 (succeeds)
+            10,    # judge phase_start
+            20,    # judge elapsed
+            # Merge
+            20,    # merge phase_start
+            25,    # merge elapsed
+            25,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: first call fails, second approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _failed_result("judge", "validation failed"),
+            _success_result("judge", approved=True),
+        ]
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        captured = capsys.readouterr()
+        # Should see "attempt 1" then "attempt 2" (not "attempt 1" twice)
+        assert "PHASE 4: JUDGE (attempt 1)" in captured.err
+        assert "PHASE 4: JUDGE (attempt 2)" in captured.err
+
+
 class TestJudgeRetry:
     """Test judge retry logic when judge phase fails (issue #1909)."""
 
