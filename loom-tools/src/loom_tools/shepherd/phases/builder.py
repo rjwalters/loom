@@ -340,6 +340,19 @@ class BuilderPhase:
         )
         return result.satisfied
 
+    def run_test_verification_only(self, ctx: ShepherdContext) -> PhaseResult | None:
+        """Run only the test verification step.
+
+        This is used by the orchestrator after Doctor fixes to verify that
+        tests now pass. Unlike the full run() method, this does not spawn
+        the builder worker or modify issue labels.
+
+        Returns:
+            None if tests pass or cannot be run.
+            PhaseResult with FAILED status if tests still fail.
+        """
+        return self._run_test_verification(ctx)
+
     def _fetch_issue_body(self, ctx: ShepherdContext) -> str | None:
         """Fetch the issue body from GitHub.
 

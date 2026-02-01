@@ -4825,3 +4825,106 @@ class TestDoctorPhaseExitCode5:
 
         # Should not call _mark_issue_blocked
         mock_context.label_cache.invalidate_issue.assert_not_called()
+
+
+class TestDoctorTestFixMode:
+    """Test Doctor phase test-fix mode (issue #2046)."""
+
+    def test_run_test_fix_success(self, mock_context: MagicMock) -> None:
+        """run_test_fix should return SUCCESS when doctor exits 0."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 0
+            result = doctor.run_test_fix(mock_context, {
+                "test_command": "pnpm test",
+                "test_output_tail": "3 failed",
+                "changed_files": ["src/foo.ts"],
+            })
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "test fixes" in result.message.lower()
+
+    def test_run_test_fix_preexisting(self, mock_context: MagicMock) -> None:
+        """run_test_fix should return SKIPPED with preexisting flag on exit code 5."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 5
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.SKIPPED
+        assert result.data.get("preexisting") is True
+
+    def test_run_test_fix_shutdown(self, mock_context: MagicMock) -> None:
+        """run_test_fix should return SHUTDOWN on exit code 3."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 3
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.SHUTDOWN
+
+    def test_run_test_fix_stuck(self, mock_context: MagicMock) -> None:
+        """run_test_fix should return STUCK on exit code 4."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 4
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.STUCK
+
+    def test_run_test_fix_failed(self, mock_context: MagicMock) -> None:
+        """run_test_fix should return FAILED on non-zero exit code."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        with patch(
+            "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+        ) as mock_run:
+            mock_run.return_value = 1
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.FAILED
+
+    def test_run_test_fix_passes_args_with_context(self, mock_context: MagicMock) -> None:
+        """run_test_fix should pass --test-fix args with context file path."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_write_test_failure_context") as mock_write,
+        ):
+            mock_run.return_value = 0
+            mock_write.return_value = Path("/fake/worktree/.loom-test-failure-context.json")
+            doctor.run_test_fix(mock_context, {"test_command": "pnpm test"})
+
+        # Verify args contain --test-fix and --context
+        call_kwargs = mock_run.call_args[1]
+        assert "--test-fix 42" in call_kwargs["args"]
+        assert "--context" in call_kwargs["args"]
+
+    def test_run_test_fix_respects_shutdown(self, mock_context: MagicMock) -> None:
+        """run_test_fix should check for shutdown before running."""
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = True
+
+        result = doctor.run_test_fix(mock_context, {})
+        assert result.status == PhaseStatus.SHUTDOWN

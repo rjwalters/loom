@@ -20,7 +20,6 @@ from loom_tools.shepherd.errors import (
     ShepherdError,
     ShutdownSignal,
 )
-from loom_tools.shepherd.labels import get_pr_for_issue
 from loom_tools.shepherd.phases import (
     ApprovalPhase,
     BuilderPhase,
@@ -31,9 +30,7 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
     PreflightPhase,
 )
-# Note: run_phase_with_retry is no longer used after removing test failure
-# auto-recovery (Phase 3b/3c). Kept import commented for reference.
-# from loom_tools.shepherd.phases.base import run_phase_with_retry
+from loom_tools.shepherd.phases.base import PhaseResult
 
 
 def _print_phase_header(title: str) -> None:
@@ -404,9 +401,12 @@ def orchestrate(ctx: ShepherdContext) -> int:
             # Log result inline (no header for passing checks)
             log_info(f"Baseline health: {result.message}")
 
-        # ─── PHASE 3: Builder ─────────────────────────────────────────────
+        # ─── PHASE 3: Builder (with test-fix Doctor loop) ────────────────
         builder = BuilderPhase()
         skip, reason = builder.should_skip(ctx)
+        test_fix_attempts = 0
+        builder_total_elapsed = 0
+        doctor_total_elapsed_test_fix = 0
 
         if skip:
             log_info(f"Skipping builder phase ({reason})")
@@ -416,34 +416,136 @@ def orchestrate(ctx: ShepherdContext) -> int:
             phase_start = time.time()
             result = builder.run(ctx)
             elapsed = int(time.time() - phase_start)
+            builder_total_elapsed = elapsed
 
             if result.is_shutdown:
                 raise ShutdownSignal(result.message)
 
-            if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
-                # Check if this is a test failure with preserved worktree
-                if result.data.get("test_failure"):
-                    # Test failure: mark with explicit label and STOP
-                    # No auto-recovery via Doctor - failures should be visible
-                    log_error(f"Builder test verification failed ({elapsed}s)")
-                    phase_durations["Builder"] = elapsed
+            # Handle test failures with Doctor test-fix loop
+            while (
+                result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK)
+                and result.data.get("test_failure")
+            ):
+                test_fix_attempts += 1
+
+                if test_fix_attempts > ctx.config.test_fix_max_retries:
+                    # Max retries exceeded - fall back to failure label
+                    log_error(
+                        f"Builder test verification failed after "
+                        f"{test_fix_attempts - 1} Doctor fix attempt(s) ({builder_total_elapsed}s)"
+                    )
+                    phase_durations["Builder"] = builder_total_elapsed
+                    if doctor_total_elapsed_test_fix > 0:
+                        phase_durations["Doctor (test-fix)"] = doctor_total_elapsed_test_fix
                     ctx.report_milestone(
-                        "phase_completed", phase="builder", duration_seconds=elapsed, status="test_failure"
+                        "phase_completed",
+                        phase="builder",
+                        duration_seconds=builder_total_elapsed,
+                        status="test_failure",
                     )
                     _mark_builder_test_failure(ctx)
                     return 1
+
+                # Route to Doctor for test fix
+                log_warning(
+                    f"Builder test verification failed ({elapsed}s), "
+                    f"routing to Doctor (attempt {test_fix_attempts}/{ctx.config.test_fix_max_retries})"
+                )
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=f"test failure, routing to Doctor (attempt {test_fix_attempts})",
+                )
+
+                _print_phase_header(f"PHASE 3b: DOCTOR TEST-FIX (attempt {test_fix_attempts})")
+                doctor_start = time.time()
+                doctor = DoctorPhase()
+                doctor_result = doctor.run_test_fix(ctx, result.data)
+                doctor_elapsed = int(time.time() - doctor_start)
+                doctor_total_elapsed_test_fix += doctor_elapsed
+
+                if doctor_result.is_shutdown:
+                    raise ShutdownSignal(doctor_result.message)
+
+                if doctor_result.status == PhaseStatus.SKIPPED:
+                    # Doctor determined failures are pre-existing
+                    log_warning(
+                        f"Doctor determined test failures are pre-existing ({doctor_elapsed}s)"
+                    )
+                    completed_phases.append("Doctor (pre-existing failures)")
+                    # Continue to PR creation - pre-existing failures are acceptable
+                    result = PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message="builder complete (pre-existing test failures)",
+                        phase_name="builder",
+                        data={"preexisting_failures": True},
+                    )
+                    break
+
+                if doctor_result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
+                    # Doctor couldn't fix - re-run test verification to see current state
+                    log_warning(
+                        f"Doctor test-fix failed ({doctor_result.message}), "
+                        f"re-running test verification"
+                    )
+                    completed_phases.append(f"Doctor (attempt {test_fix_attempts}, failed)")
                 else:
+                    # Doctor succeeded - re-run test verification to confirm fix
+                    log_success(f"Doctor applied test fixes ({doctor_elapsed}s)")
+                    completed_phases.append(f"Doctor (attempt {test_fix_attempts}, fixes applied)")
+                    ctx.report_milestone(
+                        "phase_completed",
+                        phase="doctor-test-fix",
+                        duration_seconds=doctor_elapsed,
+                        status="success",
+                    )
+
+                # Re-run test verification
+                _print_phase_header(f"PHASE 3c: TEST VERIFICATION (after Doctor attempt {test_fix_attempts})")
+                test_start = time.time()
+                test_result = builder.run_test_verification_only(ctx)
+                test_elapsed = int(time.time() - test_start)
+                builder_total_elapsed += test_elapsed
+
+                if test_result is None:
+                    # Tests passed
+                    log_success(f"Tests now pass after Doctor fixes ({test_elapsed}s)")
+                    result = PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message="builder complete (tests fixed by Doctor)",
+                        phase_name="builder",
+                        data={"test_fixed_by_doctor": True},
+                    )
+                    break
+                else:
+                    # Tests still failing - update result and loop
+                    log_warning(f"Tests still failing after Doctor fixes ({test_elapsed}s)")
+                    result = test_result
+                    elapsed = test_elapsed
+                    # Continue loop to try Doctor again or exhaust retries
+
+            # Check for non-test failures
+            if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
+                if not result.data.get("test_failure"):
                     log_error(result.message)
                     return 1
+                # Test failure after exhausting retries is handled above
 
+            # Builder succeeded or was skipped
             if result.status == PhaseStatus.SKIPPED:
                 completed_phases.append(f"Builder ({result.message})")
-            else:
-                phase_durations["Builder"] = elapsed
+            elif result.status == PhaseStatus.SUCCESS:
+                phase_durations["Builder"] = builder_total_elapsed
+                if doctor_total_elapsed_test_fix > 0:
+                    phase_durations["Doctor (test-fix)"] = doctor_total_elapsed_test_fix
                 completed_phases.append(f"Builder (PR #{ctx.pr_number})")
-                log_success(f"Builder phase complete - PR #{ctx.pr_number} created ({elapsed}s)")
+                log_success(
+                    f"Builder phase complete - PR #{ctx.pr_number} created ({builder_total_elapsed}s)"
+                )
                 ctx.report_milestone(
-                    "phase_completed", phase="builder", duration_seconds=elapsed, status="success"
+                    "phase_completed",
+                    phase="builder",
+                    duration_seconds=builder_total_elapsed,
+                    status="success",
                 )
 
         # ─── PHASE 4/5: Judge/Doctor Loop ─────────────────────────────────
