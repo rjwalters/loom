@@ -760,7 +760,9 @@ Some description without acceptance criteria.
 
 ## Test Plan
 
-- [ ] Test it
+Test steps:
+1. Run the command
+2. Verify output
 
 Modify `builder.py`.
 """
@@ -1369,7 +1371,7 @@ class TestBuilderRunTestFailureIntegration:
 
         with (
             patch.object(builder, "_is_rate_limited", return_value=False),
-            patch.object(builder, "_run_quality_validation"),
+            patch.object(builder, "_run_quality_validation", return_value=None),
             patch.object(builder, "_create_worktree_marker"),
             patch.object(
                 builder, "_run_test_verification", return_value=test_failure_result
@@ -1411,7 +1413,7 @@ class TestBuilderRunTestFailureIntegration:
 
         with (
             patch.object(builder, "_is_rate_limited", return_value=False),
-            patch.object(builder, "_run_quality_validation"),
+            patch.object(builder, "_run_quality_validation", return_value=None),
             patch.object(builder, "_create_worktree_marker"),
             patch.object(builder, "_run_test_verification") as mock_test_verify,
             patch.object(builder, "validate", return_value=True),

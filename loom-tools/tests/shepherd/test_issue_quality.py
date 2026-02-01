@@ -365,7 +365,9 @@ Some description without acceptance criteria.
 
 ## Test Plan
 
-- [ ] Test it
+Test steps:
+1. Run the command
+2. Verify output
 """
         gates = QualityGates.strict()
         result = validate_issue_quality_with_gates(body, gates)
