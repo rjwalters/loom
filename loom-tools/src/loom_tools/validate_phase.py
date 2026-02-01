@@ -774,7 +774,18 @@ def validate_judge(
             f"PR #{pr_number} has changes requested (loom:changes-requested)",
         )
 
-    msg = f"Judge did not produce loom:pr or loom:changes-requested on PR #{pr_number}"
+    # Issue #1998: Check for intermediate state after Doctor fixes
+    # When Doctor applies fixes, it removes loom:changes-requested and adds
+    # loom:review-requested. If judge worker just ran but hasn't applied its
+    # outcome label yet, we're in an expected intermediate state.
+    if "loom:review-requested" in labels:
+        msg = (
+            f"PR #{pr_number} has loom:review-requested (Doctor applied fixes) "
+            "but judge did not produce outcome label yet"
+        )
+    else:
+        msg = f"Judge did not produce loom:pr or loom:changes-requested on PR #{pr_number}"
+
     if not check_only:
         _mark_phase_failed(
             issue, "judge",

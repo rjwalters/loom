@@ -170,6 +170,11 @@ class JudgePhase:
             # First try approval (judge approved but failed to apply loom:pr label),
             # then try changes-requested (judge rejected but failed to apply
             # loom:changes-requested label).
+            #
+            # Issue #1998: After Doctor applies fixes, the PR may have
+            # loom:review-requested but neither loom:pr nor loom:changes-requested.
+            # This is an expected intermediate state - the judge worker just ran
+            # but may not have applied its outcome label yet.
             if ctx.config.is_force_mode and self._try_fallback_approval(ctx):
                 validated = True
             elif ctx.config.is_force_mode and self._try_fallback_changes_requested(ctx):
@@ -182,6 +187,13 @@ class JudgePhase:
                 )
             else:
                 diag = self._gather_diagnostics(ctx)
+                # Add context about loom:review-requested state (issue #1998)
+                if ctx.has_pr_label("loom:review-requested"):
+                    diag["intermediate_state"] = "doctor_fixed_awaiting_review"
+                    log_info(
+                        f"PR #{ctx.pr_number} has loom:review-requested (Doctor applied fixes) "
+                        "but judge did not produce outcome label"
+                    )
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
                     message=(
@@ -642,7 +654,7 @@ class JudgePhase:
             diag["pr_reviews"] = []
             diag["pr_labels"] = []
 
-        # -- Determine failure mode (issue #1960) ------------------------------
+        # -- Determine failure mode (issue #1960, #1998) -------------------------
         # Check for comment signals using the existing helper methods.
         has_reviewing_label = "loom:reviewing" in diag["pr_labels"]
         has_approval_comment = self._has_approval_comment(ctx)
@@ -651,10 +663,17 @@ class JudgePhase:
             lbl in diag["pr_labels"]
             for lbl in ("loom:pr", "loom:changes-requested")
         )
+        # Issue #1998: Check for Doctor-fixed intermediate state
+        has_review_requested = "loom:review-requested" in diag["pr_labels"]
 
         # Categorize the failure to help with debugging
         if not diag["log_exists"]:
             diag["failure_mode"] = "agent_never_ran"
+        elif has_review_requested and not has_outcome_label:
+            # Issue #1998: Doctor applied fixes, PR has loom:review-requested,
+            # but judge hasn't applied outcome label yet. This takes precedence
+            # over log-based heuristics since the label is a reliable signal.
+            diag["failure_mode"] = "doctor_fixed_awaiting_outcome"
         elif diag["log_exists"] and not diag["has_meaningful_output"]:
             # Issue #1978: Agent spawned but only produced terminal escape sequences
             diag["failure_mode"] = "agent_started_no_meaningful_output"
@@ -714,6 +733,11 @@ class JudgePhase:
             "agent_started_no_work": "Judge started but did not claim the PR (no loom:reviewing label)",
             "comment_exists_label_missing": "Judge left a comment but failed to apply the label (API failure?)",
             "started_reviewing_incomplete": "Judge claimed PR (loom:reviewing) but did not complete (timeout?)",
+            # Issue #1998: Add explanation for Doctor-fixed intermediate state
+            "doctor_fixed_awaiting_outcome": (
+                "PR has loom:review-requested (Doctor applied fixes) but judge "
+                "did not apply outcome label (loom:pr or loom:changes-requested)"
+            ),
             "unknown": "Unable to determine failure mode",
         }
         diag["failure_explanation"] = mode_explanations.get(failure_mode, "Unknown failure mode")

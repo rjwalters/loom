@@ -3295,6 +3295,36 @@ class TestJudgeDiagnostics:
         assert len(diag["log_tail"]) == 3
         assert diag["log_tail"] == ["line 1", "line 2", "line 3"]
 
+    def test_doctor_fixed_awaiting_outcome_failure_mode(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Issue #1998: Detect when Doctor applied fixes but Judge hasn't applied outcome label."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        # Create a log file so agent appears to have run
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text("judge started\njudge finished\n")
+
+        judge = JudgePhase()
+
+        # PR has loom:review-requested (Doctor completed) but no outcome label
+        review_data = json.dumps({
+            "reviews": [],
+            "labels": ["loom:review-requested"],
+        })
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=0, stdout=review_data),
+        ):
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["failure_mode"] == "doctor_fixed_awaiting_outcome"
+        assert "Doctor applied fixes" in diag["failure_explanation"]
+
 
 class TestHasApprovalComment:
     """Test _has_approval_comment with various comment patterns."""
