@@ -14,6 +14,7 @@ import pytest
 from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
     _create_config,
+    _mark_builder_no_pr,
     _mark_judge_exhausted,
     _parse_args,
     main,
@@ -1280,3 +1281,216 @@ class TestMarkJudgeExhausted:
         body_idx = cmd.index("--body") + 1
         assert "Shepherd blocked" in cmd[body_idx]
         assert "1 retry" in cmd[body_idx]
+
+
+class TestMarkBuilderNoPr:
+    """Test _mark_builder_no_pr helper function (issue #1982)."""
+
+    @patch("subprocess.run")
+    def test_transitions_labels(self, mock_run: MagicMock) -> None:
+        """Should run gh command to transition loom:building -> loom:blocked."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = "/fake/repo"
+
+        with patch("loom_tools.common.systematic_failure.record_blocked_reason"), \
+             patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
+            _mark_builder_no_pr(ctx)
+
+        # First subprocess call should be the label transition
+        label_call = mock_run.call_args_list[0]
+        cmd = label_call[0][0]
+        assert "gh" in cmd
+        assert "--remove-label" in cmd
+        assert "loom:building" in cmd
+        assert "--add-label" in cmd
+        assert "loom:blocked" in cmd
+
+    @patch("subprocess.run")
+    def test_records_blocked_reason(self, mock_run: MagicMock) -> None:
+        """Should record builder_no_pr as the blocked reason."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = "/fake/repo"
+
+        with patch("loom_tools.common.systematic_failure.record_blocked_reason") as mock_record, \
+             patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
+            _mark_builder_no_pr(ctx)
+
+        mock_record.assert_called_once_with(
+            "/fake/repo",
+            42,
+            error_class="builder_no_pr",
+            phase="builder",
+            details="Builder phase completed but no PR was created",
+        )
+
+    @patch("subprocess.run")
+    def test_adds_diagnostic_comment(self, mock_run: MagicMock) -> None:
+        """Should add a comment with diagnostic info."""
+        mock_run.return_value = MagicMock(returncode=0)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = "/fake/repo"
+
+        with patch("loom_tools.common.systematic_failure.record_blocked_reason"), \
+             patch("loom_tools.common.systematic_failure.detect_systematic_failure"):
+            _mark_builder_no_pr(ctx)
+
+        # Second subprocess call should be the comment
+        comment_call = mock_run.call_args_list[1]
+        cmd = comment_call[0][0]
+        assert "comment" in cmd
+        body_idx = cmd.index("--body") + 1
+        assert "Shepherd blocked" in cmd[body_idx]
+        assert "no PR was created" in cmd[body_idx]
+
+
+class TestBuilderNoPrPrecondition:
+    """Test that Judge phase is not entered when PR doesn't exist (issue #1982)."""
+
+    @patch("loom_tools.shepherd.cli._mark_builder_no_pr")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_no_pr_skips_judge_and_marks_blocked(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        mock_mark_no_pr: MagicMock,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """When builder completes without PR, Judge should NOT be entered."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        # Simulate builder completing but NOT creating a PR
+        ctx.pr_number = None
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        result = orchestrate(ctx)
+        assert result == 1
+
+        # Verify _mark_builder_no_pr was called
+        mock_mark_no_pr.assert_called_once_with(ctx)
+
+        # Verify the error message
+        captured = capsys.readouterr()
+        assert "no PR was created" in captured.err
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_pr_exists_continues_to_judge(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """When PR exists, Judge phase should proceed normally."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            100,   # judge phase_start
+            150,   # judge elapsed
+            150,   # merge phase_start
+            160,   # merge elapsed
+            160,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        # PR exists
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Judge should have been called
+        judge_inst.run.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli._mark_builder_no_pr")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_no_judge_retry_when_no_pr(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        mock_mark_no_pr: MagicMock,
+    ) -> None:
+        """Judge should NOT be retried when there's no PR (it's a precondition failure)."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = None
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        result = orchestrate(ctx)
+        assert result == 1
+
+        # Judge should NEVER have been called
+        judge_inst = MockJudge.return_value
+        judge_inst.run.assert_not_called()
+
+        # No judge retry milestones
+        retry_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "judge_retry"
+        ]
+        assert len(retry_calls) == 0
