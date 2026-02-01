@@ -613,6 +613,39 @@ def validate_builder(
         _mark_blocked(issue, "builder", "Recovery failed: could not push worktree branch.", repo_root)
         return ValidationResult("builder", issue, ValidationStatus.FAILED, "Could not push branch")
 
+    # Gather commit messages for PR body (best effort - don't fail recovery if this fails)
+    commit_messages = ""
+    r = subprocess.run(
+        ["git", "-C", worktree, "log", "--oneline", "main..HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode == 0:
+        commit_messages = r.stdout.strip()
+
+    # Gather file change statistics for PR body (best effort)
+    diff_stats = ""
+    r = subprocess.run(
+        ["git", "-C", worktree, "diff", "--stat", "main..HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode == 0:
+        diff_stats = r.stdout.strip()
+
+    # Build enhanced PR body
+    body_parts = [
+        f"Closes #{issue}",
+        "",
+        "_PR created by shepherd recovery after builder failed to complete workflow._",
+    ]
+
+    if commit_messages:
+        body_parts.extend(["", "## Commits", "```", commit_messages, "```"])
+
+    if diff_stats:
+        body_parts.extend(["", "## Changes", "```", diff_stats, "```"])
+
+    pr_body = "\n".join(body_parts)
+
     # Create PR
     r = subprocess.run(
         [
@@ -620,7 +653,7 @@ def validate_builder(
             "--head", branch,
             "--label", "loom:review-requested",
             "--title", f"Issue #{issue}: Auto-recovered PR",
-            "--body", f"Closes #{issue}\n\n_PR created by shepherd recovery after builder failed to complete workflow._",
+            "--body", pr_body,
         ],
         capture_output=True, text=True, check=False, cwd=repo_root,
     )

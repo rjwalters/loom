@@ -271,6 +271,192 @@ class TestValidateBuilder:
 
 
 # ---------------------------------------------------------------------------
+# validate_builder: recovery PR body tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuilderRecoveryPRBody:
+    """Tests for enhanced PR body in builder worktree recovery."""
+
+    def _make_worktree(self, tmp_path: Path) -> Path:
+        """Create a fake worktree directory."""
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()  # Minimal git marker
+        return wt
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_recovery_pr_body_includes_commits(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ):
+        """Verify commit messages are included in recovery PR body."""
+        repo = _make_repo(tmp_path)
+        wt = self._make_worktree(tmp_path)
+
+        # Setup mocks
+        mock_gh.return_value = _completed(stdout="OPEN\n")  # issue state
+        mock_find.return_value = None  # no existing PR
+
+        # Track subprocess calls to verify PR body
+        pr_body_captured = []
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            # git -C worktree status --porcelain
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout="M src/file.py\n")
+            # git -C worktree add -A
+            if "add" in cmd and "-A" in cmd:
+                return _completed()
+            # git -C worktree commit
+            if "commit" in cmd:
+                return _completed()
+            # git -C worktree rev-parse --abbrev-ref HEAD
+            if "rev-parse" in cmd and "--abbrev-ref" in cmd and "HEAD" in cmd:
+                return _completed(stdout="feature/issue-42\n")
+            # git -C worktree rev-parse --abbrev-ref @{upstream}
+            if "rev-parse" in cmd and "@{upstream}" in cmd:
+                return _completed(returncode=1)  # no upstream
+            # git -C worktree push
+            if "push" in cmd:
+                return _completed()
+            # git -C worktree log --oneline main..HEAD
+            if "log" in cmd and "--oneline" in cmd and "main..HEAD" in cmd:
+                return _completed(stdout="abc1234 First commit\ndef5678 Second commit\n")
+            # git -C worktree diff --stat main..HEAD
+            if "diff" in cmd and "--stat" in cmd:
+                return _completed(stdout=" src/file.py | 10 ++++++++++\n 1 file changed, 10 insertions(+)\n")
+            # gh pr create
+            if "gh" in cmd and "pr" in cmd and "create" in cmd:
+                # Capture the body argument
+                for i, arg in enumerate(cmd):
+                    if arg == "--body" and i + 1 < len(cmd):
+                        pr_body_captured.append(cmd[i + 1])
+                return _completed(stdout="https://github.com/test/repo/pull/123\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt))
+
+        assert result.status == ValidationStatus.RECOVERED
+        assert len(pr_body_captured) == 1
+        body = pr_body_captured[0]
+        assert "## Commits" in body
+        assert "abc1234 First commit" in body
+        assert "def5678 Second commit" in body
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_recovery_pr_body_includes_file_stats(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ):
+        """Verify file statistics are included in recovery PR body."""
+        repo = _make_repo(tmp_path)
+        wt = self._make_worktree(tmp_path)
+
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        mock_find.return_value = None
+
+        pr_body_captured = []
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout="M src/file.py\n")
+            if "add" in cmd and "-A" in cmd:
+                return _completed()
+            if "commit" in cmd:
+                return _completed()
+            if "rev-parse" in cmd and "--abbrev-ref" in cmd and "HEAD" in cmd:
+                return _completed(stdout="feature/issue-42\n")
+            if "rev-parse" in cmd and "@{upstream}" in cmd:
+                return _completed(returncode=1)
+            if "push" in cmd:
+                return _completed()
+            if "log" in cmd and "--oneline" in cmd and "main..HEAD" in cmd:
+                return _completed(stdout="abc1234 Some commit\n")
+            if "diff" in cmd and "--stat" in cmd:
+                return _completed(stdout=" src/file.py | 10 ++++++++++\n 1 file changed, 10 insertions(+)\n")
+            if "gh" in cmd and "pr" in cmd and "create" in cmd:
+                for i, arg in enumerate(cmd):
+                    if arg == "--body" and i + 1 < len(cmd):
+                        pr_body_captured.append(cmd[i + 1])
+                return _completed(stdout="https://github.com/test/repo/pull/123\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt))
+
+        assert result.status == ValidationStatus.RECOVERED
+        assert len(pr_body_captured) == 1
+        body = pr_body_captured[0]
+        assert "## Changes" in body
+        assert "src/file.py" in body
+        assert "10 insertions" in body
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_recovery_pr_body_fallback_on_git_failures(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
+    ):
+        """Verify graceful fallback if git log/diff commands fail."""
+        repo = _make_repo(tmp_path)
+        wt = self._make_worktree(tmp_path)
+
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        mock_find.return_value = None
+
+        pr_body_captured = []
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout="M src/file.py\n")
+            if "add" in cmd and "-A" in cmd:
+                return _completed()
+            if "commit" in cmd:
+                return _completed()
+            if "rev-parse" in cmd and "--abbrev-ref" in cmd and "HEAD" in cmd:
+                return _completed(stdout="feature/issue-42\n")
+            if "rev-parse" in cmd and "@{upstream}" in cmd:
+                return _completed(returncode=1)
+            if "push" in cmd:
+                return _completed()
+            # Both log and diff fail - should still create PR
+            if "log" in cmd and "--oneline" in cmd and "main..HEAD" in cmd:
+                return _completed(returncode=1, stderr="fatal: bad revision")
+            if "diff" in cmd and "--stat" in cmd:
+                return _completed(returncode=1, stderr="fatal: bad revision")
+            if "gh" in cmd and "pr" in cmd and "create" in cmd:
+                for i, arg in enumerate(cmd):
+                    if arg == "--body" and i + 1 < len(cmd):
+                        pr_body_captured.append(cmd[i + 1])
+                return _completed(stdout="https://github.com/test/repo/pull/123\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt))
+
+        # Recovery should still succeed
+        assert result.status == ValidationStatus.RECOVERED
+        assert len(pr_body_captured) == 1
+        body = pr_body_captured[0]
+        # Should have basic info but not the sections that failed
+        assert "Closes #42" in body
+        assert "_PR created by shepherd recovery" in body
+        # Should NOT have sections since git commands failed
+        assert "## Commits" not in body
+        assert "## Changes" not in body
+
+
+# ---------------------------------------------------------------------------
 # validate_judge
 # ---------------------------------------------------------------------------
 
