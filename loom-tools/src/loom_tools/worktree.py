@@ -226,12 +226,17 @@ def _check_stale_worktree(worktree_path: pathlib.Path, json_output: bool = False
             result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_path, check=False)
             branch = result.stdout.strip() if result.returncode == 0 else ""
 
-            # Remove worktree
-            _run_git(["worktree", "remove", str(worktree_path), "--force"], check=False)
+            # Remove worktree (run from repo root to avoid CWD-inside-worktree issues)
+            repo_root = _get_main_workspace()
+            _run_git(
+                ["worktree", "remove", str(worktree_path), "--force"],
+                cwd=repo_root,
+                check=False,
+            )
 
             # Delete empty branch if possible
             if branch and branch != "main":
-                result = _run_git(["branch", "-d", branch], check=False)
+                result = _run_git(["branch", "-d", branch], cwd=repo_root, check=False)
                 if result.returncode == 0 and not json_output:
                     log_info(f"Removed empty branch: {branch}")
 

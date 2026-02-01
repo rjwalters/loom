@@ -221,10 +221,20 @@ impl TerminalManager {
                         path.display()
                     );
 
+                    // Derive repo root from worktree path (e.g., /repo/.loom/worktrees/issue-42 → /repo)
+                    // Run git from repo root to avoid CWD-inside-worktree issues
+                    let repo_root = path
+                        .ancestors()
+                        .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
+                        .map(|p| p.to_path_buf());
+
                     // First try to remove the worktree via git
-                    let output = Command::new("git")
-                        .args(["worktree", "remove", worktree_path])
-                        .output();
+                    let mut cmd = Command::new("git");
+                    cmd.args(["worktree", "remove", worktree_path]);
+                    if let Some(ref root) = repo_root {
+                        cmd.current_dir(root);
+                    }
+                    let output = cmd.output();
 
                     if let Ok(output) = output {
                         if !output.status.success() {
@@ -233,9 +243,12 @@ impl TerminalManager {
                             log::info!("Attempting force removal...");
 
                             // Try force removal
-                            let _ = Command::new("git")
-                                .args(["worktree", "remove", "--force", worktree_path])
-                                .output();
+                            let mut cmd = Command::new("git");
+                            cmd.args(["worktree", "remove", "--force", worktree_path]);
+                            if let Some(ref root) = repo_root {
+                                cmd.current_dir(root);
+                            }
+                            let _ = cmd.output();
                         }
                     }
 
