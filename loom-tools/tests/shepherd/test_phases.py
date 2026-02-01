@@ -1331,7 +1331,11 @@ class TestBuilderRunTestFailureIntegration:
             ),
             patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
             patch("loom_tools.shepherd.phases.builder.add_issue_label"),
-            patch("loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=123),
+            # Return None first (no existing PR), then 123 (PR created by validate)
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                side_effect=[None, 123],
+            ),
         ):
             result = builder.run(mock_context, skip_test_verification=True)
 
