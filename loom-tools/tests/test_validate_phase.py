@@ -582,6 +582,29 @@ class TestValidateJudge:
         result = validate_judge(42, repo, pr_number=100, check_only=True)
         assert result.status == ValidationStatus.FAILED
 
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_doctor_fixed_intermediate_state_message(self, mock_gh: MagicMock, tmp_path: Path):
+        """Issue #1998: Verify informative message when Doctor fixed but Judge hasn't applied outcome."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="loom:review-requested\n")
+        result = validate_judge(42, repo, pr_number=100, check_only=True)
+        assert result.status == ValidationStatus.FAILED
+        # Should include context about Doctor having applied fixes
+        assert "loom:review-requested" in result.message
+        assert "Doctor applied fixes" in result.message
+
+    @patch("loom_tools.validate_phase._mark_blocked")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_no_labels_at_all_message(self, mock_gh: MagicMock, mock_blocked: MagicMock, tmp_path: Path):
+        """Verify message when no loom labels present (not Doctor-fixed intermediate state)."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="")
+        result = validate_judge(42, repo, pr_number=100)
+        assert result.status == ValidationStatus.FAILED
+        # Should NOT mention Doctor-fixed state
+        assert "Doctor applied fixes" not in result.message
+        assert "did not produce" in result.message
+
     def test_no_pr_number(self, tmp_path: Path):
         repo = _make_repo(tmp_path)
         result = validate_judge(42, repo)
