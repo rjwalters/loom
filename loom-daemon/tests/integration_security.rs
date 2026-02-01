@@ -9,7 +9,7 @@ use serial_test::serial;
 
 /// Cleanup helper to run before/after tests.
 /// Uses broad cleanup because security tests intentionally create terminals
-/// with hardcoded IDs (for injection testing) that don't match TEST_PREFIX.
+/// with hardcoded IDs (for injection testing) that don't match `TEST_PREFIX`.
 fn setup() {
     cleanup_all_loom_sessions();
 }
