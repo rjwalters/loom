@@ -83,7 +83,7 @@ export function renderPrimaryTerminal(
   hasWorkspace: boolean,
   displayedWorkspacePath: string
 ): void {
-  const container = document.getElementById("primary-terminal");
+  const container = document.getElementById("terminal-view");
   if (!container) return;
 
   if (!terminal) {

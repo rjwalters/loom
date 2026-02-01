@@ -4,7 +4,7 @@ import { escapeHtml } from "./helpers";
  * Render loading state during factory reset
  */
 export function renderLoadingState(message: string = "Resetting workspace..."): void {
-  const container = document.getElementById("primary-terminal");
+  const container = document.getElementById("terminal-view");
   if (!container) return;
 
   container.innerHTML = `

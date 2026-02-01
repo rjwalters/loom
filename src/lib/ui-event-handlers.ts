@@ -11,7 +11,6 @@ import type { setupDragAndDrop } from "./drag-drop-manager";
 import type { HealthMonitor } from "./health-monitor";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
-import { announceTerminalSelection } from "./screen-reader-announcer";
 import type { AppState, Terminal } from "./state";
 import {
   closeTerminalWithConfirmation,
@@ -19,7 +18,6 @@ import {
   handleRunNowClick,
   startRename,
 } from "./terminal-actions";
-import { showTerminalActivityModal } from "./terminal-activity-modal";
 import type { TerminalManager } from "./terminal-manager";
 import { showTerminalSettingsModal } from "./terminal-settings-modal";
 import { toggleTheme } from "./theme";
@@ -159,9 +157,8 @@ export function setupMainEventListeners(deps: {
     outputPoller,
     healthMonitor,
     appLevelState,
-    createPlainTerminal,
-    generateNextConfigId,
-    setupDragAndDrop,
+    // Note: createPlainTerminal, generateNextConfigId, and setupDragAndDrop
+    // are unused after Phase 2 (side-by-side layout) removed mini terminal row
   } = deps;
 
   // Theme toggle
@@ -176,11 +173,11 @@ export function setupMainEventListeners(deps: {
     }
   });
 
-  // Primary terminal - double-click to rename, click for settings/clear
-  const primaryTerminal = document.getElementById("primary-terminal");
-  if (primaryTerminal) {
+  // Terminal view - double-click to rename, click for settings/clear
+  const terminalView = document.getElementById("terminal-view");
+  if (terminalView) {
     // Button clicks (settings, clear)
-    primaryTerminal.addEventListener("click", async (e) => {
+    terminalView.addEventListener("click", async (e) => {
       const target = e.target as HTMLElement;
 
       // Settings button
@@ -341,7 +338,7 @@ export function setupMainEventListeners(deps: {
     });
 
     // Double-click to rename
-    primaryTerminal.addEventListener("dblclick", (e) => {
+    terminalView.addEventListener("dblclick", (e) => {
       const target = e.target as HTMLElement;
 
       if (target.classList.contains("terminal-name")) {
@@ -354,7 +351,7 @@ export function setupMainEventListeners(deps: {
     });
 
     // Search input - handle input changes
-    primaryTerminal.addEventListener("input", (e) => {
+    terminalView.addEventListener("input", (e) => {
       const target = e.target as HTMLElement;
       if (target.id === "terminal-search-input") {
         const input = target as HTMLInputElement;
@@ -377,7 +374,7 @@ export function setupMainEventListeners(deps: {
     });
 
     // Search options - handle checkbox changes
-    primaryTerminal.addEventListener("change", (e) => {
+    terminalView.addEventListener("change", (e) => {
       const target = e.target as HTMLElement;
       if (target.id === "terminal-search-case-sensitive" || target.id === "terminal-search-regex") {
         // Re-run search with updated options
@@ -399,7 +396,7 @@ export function setupMainEventListeners(deps: {
     });
 
     // Search input - handle keyboard shortcuts
-    primaryTerminal.addEventListener("keydown", (e) => {
+    terminalView.addEventListener("keydown", (e) => {
       const target = e.target as HTMLElement;
 
       // Search input shortcuts
@@ -430,7 +427,7 @@ export function setupMainEventListeners(deps: {
     });
 
     // Global keyboard shortcut: Cmd+F to open search
-    primaryTerminal.addEventListener("keydown", (e) => {
+    terminalView.addEventListener("keydown", (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "f") {
         e.preventDefault();
         const searchPanel = document.getElementById("terminal-search-panel");
@@ -444,140 +441,6 @@ export function setupMainEventListeners(deps: {
     });
   }
 
-  // Mini terminal row - event delegation for dynamic children
-  const miniRow = document.getElementById("mini-terminal-row");
-  if (miniRow) {
-    miniRow.addEventListener("click", async (e) => {
-      const target = e.target as HTMLElement;
-
-      // Handle Restart Terminal button clicks
-      const restartBtn = target.closest(".restart-terminal-btn");
-      if (restartBtn) {
-        e.stopPropagation();
-        const id = restartBtn.getAttribute("data-terminal-id");
-        if (id) {
-          handleRestartTerminal(id, { state, saveCurrentConfig });
-        }
-        return;
-      }
-
-      // Handle Run Now button clicks (interval mode)
-      const runNowBtn = target.closest(".run-now-btn");
-      if (runNowBtn) {
-        e.stopPropagation();
-        const id = runNowBtn.getAttribute("data-terminal-id");
-        if (id) {
-          handleRunNowClick(id, { state });
-        }
-        return;
-      }
-
-      // Handle Show Activity button clicks
-      const activityBtn = target.closest(".show-activity-btn");
-      if (activityBtn) {
-        e.stopPropagation();
-        const id = activityBtn.getAttribute("data-terminal-id");
-        if (id) {
-          const terminal = state.terminals.getTerminal(id);
-          if (terminal) {
-            showTerminalActivityModal(id, terminal.name);
-          }
-        }
-        return;
-      }
-
-      // Handle close button clicks
-      if (target.classList.contains("close-terminal-btn")) {
-        e.stopPropagation();
-        const id = target.getAttribute("data-terminal-id");
-
-        if (id) {
-          await closeTerminalWithConfirmation(id, {
-            state,
-            outputPoller,
-            terminalManager,
-            appLevelState,
-            saveCurrentConfig,
-          });
-        }
-        return;
-      }
-
-      // Handle add terminal button
-      if (target.id === "add-terminal-btn" || target.closest("#add-terminal-btn")) {
-        // Don't add if no workspace selected
-        if (!state.workspace.hasWorkspace()) {
-          return;
-        }
-
-        // Create plain terminal and open settings modal
-        const newTerminal = await createPlainTerminal({
-          state,
-          workspacePath: state.workspace.getWorkspaceOrThrow(),
-          generateNextConfigId,
-          saveCurrentConfig,
-        });
-
-        // Automatically open settings modal for the newly created terminal
-        if (newTerminal) {
-          showTerminalSettingsModal(newTerminal, state, render);
-        }
-        return;
-      }
-
-      // Handle terminal card clicks (switch primary)
-      const card = target.closest("[data-terminal-id]");
-      if (card) {
-        const id = card.getAttribute("data-terminal-id");
-        if (id) {
-          const terminal = state.terminals.getTerminals().find((t) => t.id === id);
-          state.terminals.setPrimary(id);
-          if (terminal) {
-            announceTerminalSelection(terminal.name);
-          }
-        }
-      }
-    });
-
-    // Handle mousedown to show immediate visual feedback
-    miniRow.addEventListener("mousedown", (e) => {
-      const target = e.target as HTMLElement;
-
-      // Don't handle if clicking close button
-      if (target.classList.contains("close-terminal-btn")) {
-        return;
-      }
-
-      const card = target.closest(".terminal-card");
-      if (card) {
-        // Remove selection from all cards and restore default border
-        document.querySelectorAll(".terminal-card").forEach((c) => {
-          c.classList.remove("border-2", "border-blue-500");
-          c.classList.add("border", "border-gray-200", "dark:border-gray-700");
-        });
-
-        // Add selection to clicked card immediately
-        card.classList.remove("border", "border-gray-200", "dark:border-gray-700");
-        card.classList.add("border-2", "border-blue-500");
-      }
-    });
-
-    // Handle double-click to rename terminals
-    miniRow.addEventListener("dblclick", (e) => {
-      const target = e.target as HTMLElement;
-
-      // Check if double-clicking on the terminal name in mini cards
-      if (target.classList.contains("terminal-name")) {
-        e.stopPropagation();
-        const card = target.closest("[data-terminal-id]");
-        const id = card?.getAttribute("data-terminal-id");
-        if (id) {
-          startRename(id, target, { state, saveCurrentConfig, render });
-        }
-      }
-    });
-
-    // Set up drag-and-drop handlers (extracted to drag-drop-manager.ts)
-    setupDragAndDrop(miniRow, state, saveCurrentConfig);
-  }
+  // Note: Mini terminal row removed in Phase 2 (side-by-side layout)
+  // Terminal management now handled through terminal-view and analytics-view panels
 }
