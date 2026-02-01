@@ -159,7 +159,7 @@ class TestShepherdConfig:
         """Default timeouts should be set from environment or defaults."""
         config = ShepherdConfig(issue=42)
         assert config.curator_timeout == 300
-        assert config.builder_timeout == 1800
+        assert config.builder_timeout == 3600
         assert config.judge_timeout == 600
         assert config.doctor_timeout == 900
         assert config.poll_interval == 5
