@@ -396,7 +396,34 @@ impl TerminalManager {
         Ok(())
     }
 
+    /// Restore terminals from existing tmux sessions.
+    ///
+    /// By default (no filter), imports ALL `loom-*` sessions for backward compatibility.
+    /// When a filter is provided via `restore_from_tmux_with_filter`, only sessions
+    /// matching configured terminal IDs are restored. This prevents importing stale
+    /// sessions from crashed daemons or other daemon instances.
     pub fn restore_from_tmux(&mut self) -> Result<()> {
+        self.restore_from_tmux_with_filter(None)
+    }
+
+    /// Restore terminals from existing tmux sessions, optionally filtering by configured IDs.
+    ///
+    /// # Arguments
+    /// * `configured_ids` - If Some, only restore sessions whose extracted terminal ID
+    ///   matches one of the configured IDs. If None, restore all loom-* sessions.
+    ///
+    /// # Session Ownership (Issue #1952)
+    /// Without filtering, the daemon imports ANY `loom-*` session, which causes:
+    /// - Test interference between different test binaries
+    /// - Stale session accumulation from crashed daemons
+    /// - No ownership verification between daemon instances
+    ///
+    /// With filtering (recommended), only sessions matching the workspace's config.json
+    /// terminal definitions are restored, providing configuration-based ownership.
+    pub fn restore_from_tmux_with_filter(
+        &mut self,
+        configured_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<()> {
         let output = Command::new("tmux")
             .args(["-L", "loom"])
             .args(["list-sessions", "-F", "#{session_name}"])
@@ -414,6 +441,18 @@ impl TerminalManager {
         let sessions = String::from_utf8_lossy(&output.stdout);
         let session_count = sessions.lines().count();
         log::info!("📊 tmux server status: {session_count} total sessions");
+
+        if let Some(ids) = configured_ids {
+            log::info!(
+                "🔒 Configuration-based restore: filtering to {} configured terminal(s)",
+                ids.len()
+            );
+        } else {
+            log::debug!("📦 Legacy restore: importing all loom-* sessions (no filter)");
+        }
+
+        let mut restored_count = 0;
+        let mut skipped_count = 0;
 
         for session in sessions.lines() {
             if let Some(remainder) = session.strip_prefix("loom-") {
@@ -451,6 +490,17 @@ impl TerminalManager {
                 if let Err(e) = Self::validate_terminal_id(&id) {
                     log::warn!("Skipping invalid terminal ID from tmux session {session}: {e}");
                     continue;
+                }
+
+                // If filter is provided, skip sessions not in the configured set
+                if let Some(ids) = configured_ids {
+                    if !ids.contains(&id) {
+                        log::debug!(
+                            "Skipping unconfigured session {session} (terminal ID '{id}' not in config)"
+                        );
+                        skipped_count += 1;
+                        continue;
+                    }
                 }
 
                 // Clear any existing pipe-pane for this session to avoid duplicates
@@ -492,7 +542,15 @@ impl TerminalManager {
                         agent_status: crate::types::AgentStatus::default(),
                         last_interval_run: None,
                     });
+
+                restored_count += 1;
             }
+        }
+
+        if configured_ids.is_some() {
+            log::info!(
+                "📊 Restore complete: {restored_count} restored, {skipped_count} skipped (unconfigured)"
+            );
         }
 
         Ok(())
