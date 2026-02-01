@@ -5,11 +5,19 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::time::timeout;
+
+/// Per-binary unique prefix. Generated once per test binary execution (process),
+/// shared across all tests in that binary. This allows cleanup to be scoped to
+/// only sessions created by the current binary, preventing cross-binary interference
+/// when multiple integration test binaries run in parallel.
+static TEST_PREFIX: LazyLock<String> =
+    LazyLock::new(|| format!("test-{}", uuid::Uuid::new_v4().simple()));
 
 /// Test daemon instance that cleans up on drop
 pub struct TestDaemon {
@@ -185,15 +193,16 @@ impl TestClient {
 
     /// Helper: Create terminal with auto-generated unique ID
     ///
-    /// Use this for non-security tests that need valid, unique terminal IDs.
+    /// Uses the per-binary `TEST_PREFIX` so that cleanup can be scoped to
+    /// only sessions created by the current test binary.
     #[allow(dead_code)]
     pub async fn create_terminal_with_unique_id(
         &mut self,
         name: impl Into<String>,
         working_dir: Option<String>,
     ) -> Result<String> {
-        // Generate a unique config_id for this test terminal
-        let config_id = format!("test-{}", uuid::Uuid::new_v4());
+        // Incorporate the binary-specific prefix so tmux sessions are namespaced
+        let config_id = format!("{}-{}", *TEST_PREFIX, uuid::Uuid::new_v4().simple());
         self.create_terminal_with_config(config_id, name, working_dir, None, None)
             .await
     }
@@ -344,8 +353,34 @@ pub fn get_loom_tmux_sessions() -> Vec<String> {
 }
 
 /// Helper: Clean up all loom-* tmux sessions (for test teardown)
+#[allow(dead_code)]
 pub fn cleanup_all_loom_sessions() {
     for session in get_loom_tmux_sessions() {
+        kill_tmux_session(&session);
+    }
+}
+
+/// Helper: Get loom tmux sessions scoped to the current test binary's prefix.
+///
+/// Only returns sessions whose names start with `loom-{TEST_PREFIX}`, ensuring
+/// that parallel test binaries don't interfere with each other.
+#[allow(dead_code)]
+pub fn get_test_tmux_sessions() -> Vec<String> {
+    let prefix = format!("loom-{}", *TEST_PREFIX);
+    get_loom_tmux_sessions()
+        .into_iter()
+        .filter(|session| session.starts_with(&prefix))
+        .collect()
+}
+
+/// Helper: Clean up only tmux sessions belonging to the current test binary.
+///
+/// Uses `TEST_PREFIX` to scope cleanup so that parallel test binaries don't
+/// destroy each other's sessions. Use `cleanup_all_loom_sessions()` for
+/// a nuclear cleanup (e.g., CI pre-test).
+#[allow(dead_code)]
+pub fn cleanup_test_sessions() {
+    for session in get_test_tmux_sessions() {
         kill_tmux_session(&session);
     }
 }

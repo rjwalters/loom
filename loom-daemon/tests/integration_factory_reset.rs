@@ -5,15 +5,16 @@
 mod common;
 
 use common::{
-    cleanup_all_loom_sessions, get_loom_tmux_sessions, tmux_session_exists, TestClient, TestDaemon,
+    cleanup_test_sessions, get_test_tmux_sessions, kill_tmux_session, tmux_session_exists,
+    TestClient, TestDaemon,
 };
 use serial_test::serial;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
-/// Ensure we always begin with a clean slate of tmux sessions
+/// Ensure we always begin with a clean slate of tmux sessions for this binary.
 fn setup() {
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Create the standard set of 7 workspace terminals and return their IDs
@@ -58,10 +59,10 @@ async fn assert_clean_state(client: &mut TestClient, previously_created_ids: &[S
         len = terminals.len()
     );
 
-    let sessions = get_loom_tmux_sessions();
+    let sessions = get_test_tmux_sessions();
     assert!(
         sessions.is_empty(),
-        "Expected no tmux sessions after cleanup, found: {sessions:?}"
+        "Expected no tmux sessions (for this binary) after cleanup, found: {sessions:?}"
     );
 
     for id in previously_created_ids {
@@ -185,6 +186,7 @@ async fn test_session_health_for_unregistered_terminal() {
         "Daemon should report existing session for unregistered terminal {terminal_id}"
     );
 
-    // Clean up the manual session to avoid leaking tmux state
-    cleanup_all_loom_sessions();
+    // Clean up the manually-created session and any prefix-scoped sessions
+    kill_tmux_session(&session_name);
+    cleanup_test_sessions();
 }

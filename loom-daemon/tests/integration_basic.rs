@@ -5,13 +5,14 @@
 mod common;
 
 use common::{
-    capture_terminal_output, cleanup_all_loom_sessions, tmux_session_exists, TestClient, TestDaemon,
+    capture_terminal_output, cleanup_test_sessions, tmux_session_exists, TestClient, TestDaemon,
 };
 use serial_test::serial;
 
-/// Cleanup helper to run before/after tests
+/// Cleanup helper to run before/after tests.
+/// Only cleans up sessions belonging to the current test binary.
 fn setup() {
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 1.1: Basic Ping/Pong communication
@@ -81,7 +82,7 @@ async fn test_create_terminal() {
     assert!(tmux_session_exists(&session_name), "tmux session {session_name} should exist");
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 2.2: Create terminal with working directory
@@ -134,7 +135,7 @@ async fn test_create_terminal_with_working_dir() {
     );
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 2.3: List terminals
@@ -196,7 +197,7 @@ async fn test_list_terminals() {
     }
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 2.4: Destroy terminal
@@ -237,7 +238,7 @@ async fn test_destroy_terminal() {
     assert_eq!(terminals.len(), 0, "Should have no terminals after destroy");
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 2.5: Destroy non-existent terminal
@@ -259,7 +260,7 @@ async fn test_destroy_nonexistent_terminal() {
     assert!(result.is_err(), "Destroying non-existent terminal should fail");
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 2.6: Send input to terminal
@@ -296,7 +297,7 @@ async fn test_send_input() {
     assert!(output.contains("hello"), "Expected 'hello' in output, got: {output}");
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
 
 /// Test 2.7: Multiple clients can connect
@@ -350,5 +351,5 @@ async fn test_multiple_clients() {
     assert_ne!(id1, id3);
 
     // Cleanup
-    cleanup_all_loom_sessions();
+    cleanup_test_sessions();
 }
