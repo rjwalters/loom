@@ -1369,7 +1369,7 @@ class TestMarkJudgeExhausted:
 
     @patch("subprocess.run")
     def test_transitions_labels(self, mock_run: MagicMock) -> None:
-        """Should run gh command to transition loom:building -> loom:blocked."""
+        """Should run gh command to transition loom:building -> loom:failed:judge."""
         mock_run.return_value = MagicMock(returncode=0)
 
         ctx = MagicMock()
@@ -1387,7 +1387,7 @@ class TestMarkJudgeExhausted:
         assert "--remove-label" in cmd
         assert "loom:building" in cmd
         assert "--add-label" in cmd
-        assert "loom:blocked" in cmd
+        assert "loom:failed:judge" in cmd
 
     @patch("subprocess.run")
     def test_records_blocked_reason(self, mock_run: MagicMock) -> None:
@@ -1428,7 +1428,7 @@ class TestMarkJudgeExhausted:
         cmd = comment_call[0][0]
         assert "comment" in cmd
         body_idx = cmd.index("--body") + 1
-        assert "Shepherd blocked" in cmd[body_idx]
+        assert "Judge phase failed" in cmd[body_idx]
         assert "1 retry" in cmd[body_idx]
 
 
@@ -1437,7 +1437,7 @@ class TestMarkBuilderNoPr:
 
     @patch("subprocess.run")
     def test_transitions_labels(self, mock_run: MagicMock) -> None:
-        """Should run gh command to transition loom:building -> loom:blocked."""
+        """Should run gh command to transition loom:building -> loom:failed:builder."""
         mock_run.return_value = MagicMock(returncode=0)
 
         ctx = MagicMock()
@@ -1455,7 +1455,7 @@ class TestMarkBuilderNoPr:
         assert "--remove-label" in cmd
         assert "loom:building" in cmd
         assert "--add-label" in cmd
-        assert "loom:blocked" in cmd
+        assert "loom:failed:builder" in cmd
 
     @patch("subprocess.run")
     def test_records_blocked_reason(self, mock_run: MagicMock) -> None:
@@ -1496,8 +1496,8 @@ class TestMarkBuilderNoPr:
         cmd = comment_call[0][0]
         assert "comment" in cmd
         body_idx = cmd.index("--body") + 1
-        assert "Shepherd blocked" in cmd[body_idx]
-        assert "no PR was created" in cmd[body_idx]
+        assert "Builder phase failed" in cmd[body_idx]
+        assert "No PR was created" in cmd[body_idx]
 
 
 class TestBuilderNoPrPrecondition:

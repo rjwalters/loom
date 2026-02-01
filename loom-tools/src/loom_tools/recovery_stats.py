@@ -1,5 +1,13 @@
 """Query and display auto-recovery statistics.
 
+.. deprecated::
+    This module is deprecated. Auto-recovery was removed from the shepherd
+    system in favor of explicit failure labels (loom:failed:builder, etc.).
+    Recovery events are no longer generated, so this module only provides
+    historical analysis of pre-existing events.
+
+    The CLI entry point (loom-recovery-stats) has been removed from pyproject.toml.
+
 This module provides a CLI (``loom-recovery-stats``) to analyze recovery events
 logged by the shepherd phase validation. It helps diagnose when builders are
 not completing their workflow normally.
@@ -13,7 +21,7 @@ Usage::
     loom-recovery-stats --json              # JSON output
     loom-recovery-stats --verbose           # Show individual events
 
-Recovery Types:
+Recovery Types (historical):
     - commit_and_pr: Worktree had uncommitted changes, recovery committed and created PR
     - pr_only: Worktree had unpushed commits, recovery pushed and created PR
     - add_label: PR existed but was missing loom:review-requested label

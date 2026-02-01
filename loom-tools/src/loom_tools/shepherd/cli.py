@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from loom_tools.common.git import get_commit_count, get_uncommitted_files
+from loom_tools.common.git import get_uncommitted_files
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.shepherd.config import ExecutionMode, Phase, QualityGates, ShepherdConfig
@@ -20,11 +20,7 @@ from loom_tools.shepherd.errors import (
     ShepherdError,
     ShutdownSignal,
 )
-from loom_tools.shepherd.labels import (
-    add_issue_label,
-    get_pr_for_issue,
-    remove_issue_label,
-)
+from loom_tools.shepherd.labels import get_pr_for_issue
 from loom_tools.shepherd.phases import (
     ApprovalPhase,
     BuilderPhase,
@@ -34,7 +30,9 @@ from loom_tools.shepherd.phases import (
     MergePhase,
     PhaseStatus,
 )
-from loom_tools.shepherd.phases.base import run_phase_with_retry
+# Note: run_phase_with_retry is no longer used after removing test failure
+# auto-recovery (Phase 3b/3c). Kept import commented for reference.
+# from loom_tools.shepherd.phases.base import run_phase_with_retry
 
 
 def _print_phase_header(title: str) -> None:
@@ -385,8 +383,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
         builder = BuilderPhase()
         skip, reason = builder.should_skip(ctx)
 
-        test_failure_recovery = False
-
         if skip:
             log_info(f"Skipping builder phase ({reason})")
             completed_phases.append(f"Builder ({reason})")
@@ -402,199 +398,28 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
                 # Check if this is a test failure with preserved worktree
                 if result.data.get("test_failure"):
-                    log_warning(f"Builder test verification failed ({elapsed}s) — routing to Doctor for fix")
-                    completed_phases.append(f"Builder (test failure, worktree preserved)")
+                    # Test failure: mark with explicit label and STOP
+                    # No auto-recovery via Doctor - failures should be visible
+                    log_error(f"Builder test verification failed ({elapsed}s)")
                     phase_durations["Builder"] = elapsed
                     ctx.report_milestone(
                         "phase_completed", phase="builder", duration_seconds=elapsed, status="test_failure"
                     )
-                    test_failure_recovery = True
+                    _mark_builder_test_failure(ctx)
+                    return 1
                 else:
                     log_error(result.message)
                     return 1
 
-            if not test_failure_recovery:
-                if result.status == PhaseStatus.SKIPPED:
-                    completed_phases.append(f"Builder ({result.message})")
-                else:
-                    phase_durations["Builder"] = elapsed
-                    completed_phases.append(f"Builder (PR #{ctx.pr_number})")
-                    log_success(f"Builder phase complete - PR #{ctx.pr_number} created ({elapsed}s)")
-                    ctx.report_milestone(
-                        "phase_completed", phase="builder", duration_seconds=elapsed, status="success"
-                    )
-
-        # ─── Test Failure Recovery (Doctor fixes failing tests) ────────────
-        if test_failure_recovery:
-            _print_phase_header("PHASE 3b: DOCTOR (test failure recovery)")
-
-            # Pre-check: are the failures related to the builder's changes?
-            builder_phase = BuilderPhase()
-            test_info = builder_phase._detect_test_command(ctx.worktree_path) if ctx.worktree_path else None
-            test_cmd = test_info[0] if test_info else []
-
-            if test_cmd and builder_phase.should_skip_doctor_recovery(ctx, test_cmd):
-                log_warning(
-                    "Skipping Doctor: test failures are unrelated to builder's "
-                    "changes (no changed files affect the failing test ecosystem)"
-                )
-                completed_phases.append("Doctor test fix (skipped — unrelated failures)")
-                ctx.report_milestone(
-                    "phase_completed",
-                    phase="doctor_testfix",
-                    duration_seconds=0,
-                    status="skipped_unrelated",
-                )
-                # Treat as pre-existing failures — restore labels and continue
-                # to PR creation. We skip Phase 3c (full builder re-run)
-                # because it would re-run test verification which would fail
-                # again on the same pre-existing errors.
-                remove_issue_label(ctx.config.issue, "loom:needs-fix", ctx.repo_root)
-                add_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
-                ctx.label_cache.invalidate_issue(ctx.config.issue)
-
-                # Check for existing PR or let the builder create one
-                pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
-                if pr is not None:
-                    ctx.pr_number = pr
-                test_failure_recovery = False
+            if result.status == PhaseStatus.SKIPPED:
+                completed_phases.append(f"Builder ({result.message})")
             else:
-                phase_start = time.time()
-
-                # Restore loom:building label for Doctor phase
-                remove_issue_label(ctx.config.issue, "loom:needs-fix", ctx.repo_root)
-                add_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
-                ctx.label_cache.invalidate_issue(ctx.config.issue)
-
-                # Record commit count before Doctor so we can detect if it changed anything
-                commits_before = get_commit_count(cwd=ctx.worktree_path)
-
-                # Doctor works in the same worktree to fix tests.
-                # Pass context file path so doctor knows what failed.
-                doctor_args = f"--test-fix {ctx.config.issue}"
-                if ctx.worktree_path:
-                    context_file = ctx.worktree_path / ".loom-test-failure-context.json"
-                    if context_file.is_file():
-                        doctor_args += f" --context {context_file}"
-
-                exit_code = run_phase_with_retry(
-                    ctx,
-                    role="doctor",
-                    name=f"doctor-testfix-{ctx.config.issue}",
-                    timeout=ctx.config.doctor_timeout,
-                    max_retries=ctx.config.stuck_max_retries,
-                    phase="doctor",
-                    worktree=ctx.worktree_path,
-                    args=doctor_args,
+                phase_durations["Builder"] = elapsed
+                completed_phases.append(f"Builder (PR #{ctx.pr_number})")
+                log_success(f"Builder phase complete - PR #{ctx.pr_number} created ({elapsed}s)")
+                ctx.report_milestone(
+                    "phase_completed", phase="builder", duration_seconds=elapsed, status="success"
                 )
-                elapsed = int(time.time() - phase_start)
-
-                if exit_code == 3:
-                    raise ShutdownSignal("shutdown signal detected during doctor test fix")
-
-                if exit_code == 5:
-                    # Doctor explicitly signaled failures are pre-existing
-                    log_info("Doctor determined failures are pre-existing (exit code 5)")
-                    completed_phases.append(f"Doctor test fix (pre-existing — explicit signal, {elapsed}s)")
-                    ctx.report_milestone(
-                        "phase_completed",
-                        phase="doctor_testfix",
-                        duration_seconds=elapsed,
-                        status="preexisting_explicit",
-                    )
-                    # Check for existing PR or let the builder create one
-                    pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
-                    if pr is not None:
-                        ctx.pr_number = pr
-                    # Skip re-verification and continue to PR creation
-                    test_failure_recovery = False
-                elif exit_code not in (0, 3, 5):
-                    log_error(f"Doctor test fix failed (exit code {exit_code})")
-                    completed_phases.append("Doctor test fix (failed)")
-                    _mark_test_fix_failed(ctx)
-                    return 1
-
-                # Check if Doctor actually made any commits (fallback for exit code 0)
-                if exit_code == 0:
-                    commits_after = get_commit_count(cwd=ctx.worktree_path)
-                    doctor_made_changes = commits_after > commits_before
-                else:
-                    # For exit code 5, we already handled it above
-                    doctor_made_changes = False
-
-                # Only process exit code 0 (explicit pre-existing handled above)
-                if exit_code == 0:
-                    if not doctor_made_changes:
-                        # Doctor made no commits — failures are pre-existing.
-                        # Skip re-verification to avoid non-deterministic comparison
-                        # producing worse results (see #1935, #1937).
-                        log_warning(
-                            "Doctor made no commits — treating test failures as "
-                            "pre-existing (skipping re-verification)"
-                        )
-                        completed_phases.append(f"Doctor test fix (no changes — pre-existing failures, {elapsed}s)")
-                        ctx.report_milestone(
-                            "phase_completed",
-                            phase="doctor_testfix",
-                            duration_seconds=elapsed,
-                            status="no_changes",
-                        )
-                    else:
-                        # Re-run test verification after Doctor fix
-                        retest_result = builder_phase._run_test_verification(ctx)
-
-                        if retest_result is not None and retest_result.status == PhaseStatus.FAILED:
-                            log_error(f"Tests still failing after Doctor fix: {retest_result.message}")
-                            completed_phases.append("Doctor test fix (tests still failing)")
-                            # Mark blocked since Doctor couldn't fix it
-                            _mark_test_fix_failed(ctx)
-                            return 1
-
-                        completed_phases.append(f"Doctor test fix (tests fixed, {elapsed}s)")
-                        log_success(f"Doctor fixed failing tests ({elapsed}s)")
-                        ctx.report_milestone(
-                            "phase_completed", phase="doctor_testfix", duration_seconds=elapsed, status="success"
-                        )
-
-                    # Validate and find/create PR
-                    if not builder_phase.validate(ctx):
-                        log_warning("Builder validation failed after Doctor test fix — running builder to create PR")
-
-                    # Check for PR
-                    pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
-                    if pr is not None:
-                        ctx.pr_number = pr
-
-            # If no PR exists yet and Doctor actually ran, the builder
-            # didn't get that far. Re-run builder to create the PR.
-            # When Doctor was skipped (test_failure_recovery=False),
-            # Phase 3c would re-run test verification which would fail
-            # again on the same pre-existing errors, so we skip it.
-            #
-            # When Phase 3c does run, we skip test verification because:
-            # 1. If Doctor made no changes, failures are pre-existing
-            # 2. If Doctor made changes, tests were already re-verified above
-            # See issue #1946 for context on this fix.
-            if ctx.pr_number is None and test_failure_recovery:
-                _print_phase_header("PHASE 3c: BUILDER (PR creation after test fix)")
-                phase_start = time.time()
-
-                # Re-run builder to create PR, skipping test verification
-                # since tests were already verified (or failures are pre-existing)
-                result = builder.run(ctx, skip_test_verification=True)
-                elapsed = int(time.time() - phase_start)
-
-                if result.is_shutdown:
-                    raise ShutdownSignal(result.message)
-
-                if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
-                    log_error(result.message)
-                    return 1
-
-                phase_durations["Builder (post-fix)"] = elapsed
-                if ctx.pr_number:
-                    completed_phases.append(f"Builder post-fix (PR #{ctx.pr_number})")
-                    log_success(f"PR #{ctx.pr_number} created after test fix ({elapsed}s)")
 
         # ─── PHASE 4/5: Judge/Doctor Loop ─────────────────────────────────
 
@@ -832,11 +657,16 @@ def orchestrate(ctx: ShepherdContext) -> int:
         return 1
 
 
-def _mark_test_fix_failed(ctx: ShepherdContext) -> None:
-    """Mark issue as blocked after Doctor failed to fix tests."""
+def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
+    """Mark issue with loom:failed:builder-tests after test verification failed.
+
+    This replaces the old auto-recovery behavior. Instead of attempting to
+    fix tests via Doctor, we now mark the failure explicitly and stop.
+    The worktree and branch are preserved for manual intervention.
+    """
     import subprocess
 
-    # Atomic transition: loom:building -> loom:blocked
+    # Atomic transition: loom:building -> loom:failed:builder-tests
     subprocess.run(
         [
             "gh",
@@ -846,7 +676,7 @@ def _mark_test_fix_failed(ctx: ShepherdContext) -> None:
             "--remove-label",
             "loom:building",
             "--add-label",
-            "loom:blocked",
+            "loom:failed:builder-tests",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -862,13 +692,18 @@ def _mark_test_fix_failed(ctx: ShepherdContext) -> None:
     record_blocked_reason(
         ctx.repo_root,
         ctx.config.issue,
-        error_class="test_fix_failed",
-        phase="doctor",
-        details="Doctor could not fix failing tests after builder implementation",
+        error_class="builder_test_failure",
+        phase="builder",
+        details="Builder test verification failed",
     )
     detect_systematic_failure(ctx.repo_root)
 
-    # Add comment
+    # Build diagnostic comment
+    worktree_info = ""
+    if ctx.worktree_path:
+        worktree_info = f"\n\n**Worktree**: `{ctx.worktree_path}`"
+
+    # Add comment with recovery instructions
     subprocess.run(
         [
             "gh",
@@ -876,8 +711,24 @@ def _mark_test_fix_failed(ctx: ShepherdContext) -> None:
             "comment",
             str(ctx.config.issue),
             "--body",
-            "**Shepherd blocked**: Doctor could not fix failing tests. "
-            "Worktree and branch are preserved for manual intervention.",
+            f"**Builder test verification failed**\n\n"
+            f"Tests failed after implementation. Worktree and branch are "
+            f"preserved for manual intervention.{worktree_info}\n\n"
+            f"### Recovery Options\n\n"
+            f"**Option A: Fix tests manually**\n"
+            f"```bash\n"
+            f"cd {ctx.worktree_path or '.loom/worktrees/issue-' + str(ctx.config.issue)}\n"
+            f"# Fix the failing tests\n"
+            f"git add . && git commit -m 'Fix failing tests'\n"
+            f"git push\n"
+            f"gh pr create --label loom:review-requested --body 'Closes #{ctx.config.issue}'\n"
+            f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests\n"
+            f"```\n\n"
+            f"**Option B: Reset and retry**\n"
+            f"```bash\n"
+            f"git worktree remove {ctx.worktree_path or '.loom/worktrees/issue-' + str(ctx.config.issue)} --force\n"
+            f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests --add-label loom:issue\n"
+            f"```",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -886,10 +737,10 @@ def _mark_test_fix_failed(ctx: ShepherdContext) -> None:
 
 
 def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
-    """Mark issue as blocked due to doctor retry exhaustion."""
+    """Mark issue with loom:failed:doctor due to retry exhaustion."""
     import subprocess
 
-    # Atomic transition: loom:building -> loom:blocked
+    # Atomic transition: loom:building -> loom:failed:doctor
     subprocess.run(
         [
             "gh",
@@ -899,7 +750,7 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
             "--remove-label",
             "loom:building",
             "--add-label",
-            "loom:blocked",
+            "loom:failed:doctor",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -929,7 +780,8 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
             "comment",
             str(ctx.config.issue),
             "--body",
-            f"**Shepherd blocked**: Doctor could not resolve Judge feedback after {ctx.config.doctor_max_retries} attempts.",
+            f"**Doctor phase failed**: Could not resolve Judge feedback after "
+            f"{ctx.config.doctor_max_retries} attempts. Manual intervention required.",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -938,10 +790,10 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
 
 
 def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
-    """Mark issue as blocked due to judge retry exhaustion."""
+    """Mark issue with loom:failed:judge due to retry exhaustion."""
     import subprocess
 
-    # Atomic transition: loom:building -> loom:blocked
+    # Atomic transition: loom:building -> loom:failed:judge
     subprocess.run(
         [
             "gh",
@@ -951,7 +803,7 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
             "--remove-label",
             "loom:building",
             "--add-label",
-            "loom:blocked",
+            "loom:failed:judge",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -981,9 +833,8 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
             "comment",
             str(ctx.config.issue),
             "--body",
-            f"**Shepherd blocked**: Judge phase failed after {retries} retry attempt(s). "
-            "No approval or changes-requested outcome was produced. "
-            "This may indicate a judge worker failure — see #1908 for related diagnostics.",
+            f"**Judge phase failed**: No review outcome after {retries} retry attempt(s). "
+            "Neither approval nor changes-requested was produced. Manual intervention required.",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -992,16 +843,15 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
 
 
 def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
-    """Mark issue as blocked because Builder did not create a PR.
+    """Mark issue with loom:failed:builder because no PR was created.
 
     This handles the case where Builder completes without creating a PR,
-    which is a precondition failure for the Judge phase. This is distinct
-    from test failure recovery (handled separately) — this covers unexpected
+    which is a precondition failure for the Judge phase. This covers unexpected
     errors, timeouts, or manual interruptions that leave no PR behind.
     """
     import subprocess
 
-    # Atomic transition: loom:building -> loom:blocked
+    # Atomic transition: loom:building -> loom:failed:builder
     subprocess.run(
         [
             "gh",
@@ -1011,7 +861,7 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
             "--remove-label",
             "loom:building",
             "--add-label",
-            "loom:blocked",
+            "loom:failed:builder",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
@@ -1041,9 +891,8 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
             "comment",
             str(ctx.config.issue),
             "--body",
-            "**Shepherd blocked**: Builder phase completed but no PR was created. "
+            "**Builder phase failed**: No PR was created. "
             "Cannot proceed to Judge phase without a PR to review. "
-            "This may indicate builder failure, timeout, or manual interruption. "
             "Worktree and branch may be preserved for manual investigation.",
         ],
         cwd=ctx.repo_root,
