@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from loom_tools.common.git import get_commit_count
+from loom_tools.common.git import get_commit_count, get_uncommitted_files
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.shepherd.config import ExecutionMode, Phase, QualityGates, ShepherdConfig
@@ -135,6 +135,13 @@ EXAMPLES:
         help="Block builder if issue is missing acceptance criteria",
     )
 
+    parser.add_argument(
+        "--allow-dirty-main",
+        action="store_true",
+        dest="allow_dirty_main",
+        help="Proceed even if main repo has uncommitted changes",
+    )
+
     # Deprecated flags
     parser.add_argument(
         "--wait",
@@ -155,6 +162,52 @@ EXAMPLES:
     )
 
     return parser.parse_args(argv)
+
+
+def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
+    """Check if main repository has uncommitted changes and warn.
+
+    When running from a worktree, test results can differ between:
+    - Running tests from main (includes uncommitted changes)
+    - Running tests from a worktree (clean checkout at HEAD)
+
+    This check warns users about this potential source of confusion.
+
+    Args:
+        repo_root: The resolved repository root path
+        allow_dirty: If True, only warn but don't block
+
+    Returns:
+        True if clean or allowed to proceed, False if dirty and should block
+    """
+    uncommitted = get_uncommitted_files(cwd=repo_root)
+    if not uncommitted:
+        return True
+
+    # Warn about uncommitted changes
+    log_warning(f"Main repository has {len(uncommitted)} uncommitted change(s):")
+    for line in uncommitted[:10]:  # Show first 10 files
+        # Parse porcelain format: "XY filename"
+        status = line[:2].strip()
+        filename = line[3:] if len(line) > 3 else line
+        print(f"  {status} {filename}", file=sys.stderr)
+    if len(uncommitted) > 10:
+        print(f"  ... and {len(uncommitted) - 10} more", file=sys.stderr)
+    print(file=sys.stderr)
+
+    if allow_dirty:
+        log_warning("Proceeding anyway (--allow-dirty-main specified)")
+        print(file=sys.stderr)
+        return True
+
+    log_error(
+        "Main repo has uncommitted changes that could cause test inconsistencies.\n"
+        "  Tests in worktrees run against HEAD, not your uncommitted changes.\n"
+        "  Options:\n"
+        "    1. Commit or stash your changes before running shepherd\n"
+        "    2. Use --allow-dirty-main to proceed anyway"
+    )
+    return False
 
 
 def _auto_navigate_out_of_worktree(repo_root: Path) -> None:
@@ -1009,6 +1062,12 @@ def main(argv: list[str] | None = None) -> int:
     # contains its own shell session's CWD.
     repo_root = find_repo_root()
     _auto_navigate_out_of_worktree(repo_root)
+
+    # Pre-flight check: warn if main repo has uncommitted changes.
+    # This prevents confusion when tests pass in main but fail in worktrees
+    # (or vice versa) due to uncommitted local changes.
+    if not _check_main_repo_clean(repo_root, args.allow_dirty_main):
+        return 1
 
     ctx = ShepherdContext(config=config)
 

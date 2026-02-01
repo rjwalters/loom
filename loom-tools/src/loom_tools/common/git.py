@@ -222,6 +222,33 @@ def has_uncommitted_changes(cwd: pathlib.Path | str | None = None) -> bool:
         return False
 
 
+def get_uncommitted_files(cwd: pathlib.Path | str | None = None) -> list[str]:
+    """Get list of uncommitted files (staged, unstaged, and untracked).
+
+    Parameters
+    ----------
+    cwd:
+        Working directory for the git command.
+
+    Returns
+    -------
+    list of str
+        File paths relative to the repository root, with status prefix.
+        Format: "X filename" where X is the status code:
+        - M: modified
+        - A: added (staged)
+        - D: deleted
+        - ?: untracked
+    """
+    try:
+        result = run_git(["status", "--porcelain"], cwd=cwd, check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            return [line for line in result.stdout.strip().splitlines() if line]
+    except Exception:
+        pass
+    return []
+
+
 def get_changed_files(
     base: str = "origin/main",
     cwd: pathlib.Path | str | None = None,
