@@ -64,7 +64,7 @@ class ShepherdConfig:
         default_factory=lambda: env_int("LOOM_CURATOR_TIMEOUT", 300)
     )
     builder_timeout: int = field(
-        default_factory=lambda: env_int("LOOM_BUILDER_TIMEOUT", 1800)
+        default_factory=lambda: env_int("LOOM_BUILDER_TIMEOUT", 3600)
     )
     judge_timeout: int = field(
         default_factory=lambda: env_int("LOOM_JUDGE_TIMEOUT", 600)
