@@ -35,12 +35,18 @@ loom-clean --deep --dry-run  # Preview deep clean
 loom-clean --force  # Non-interactive, safe for automation
 ```
 
-**Manual cleanup** (if needed):
+**Manual cleanup** (if needed, but use with caution):
+
+**WARNING**: Running `git worktree remove` while your shell is in the worktree directory will corrupt your shell state. Always ensure you've navigated out of the worktree first, or use `loom-clean` which handles this safely.
+
 ```bash
+# First, ensure you're NOT in the worktree you're removing
+cd /path/to/main/repo
+
 # List worktrees
 git worktree list
 
-# Remove specific stale worktree
+# Remove specific stale worktree (only after navigating out!)
 git worktree remove .loom/worktrees/issue-42 --force
 
 # Prune orphaned worktrees

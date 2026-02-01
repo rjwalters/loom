@@ -381,13 +381,18 @@ gh auth login
 
 **Solution:**
 ```bash
-# Remove old worktree
+# IMPORTANT: First navigate OUT of any worktree directory
+cd /path/to/main/repo
+
+# Remove old worktree (only from main repo, not from inside a worktree!)
 git worktree remove .loom/worktrees/issue-42 --force
 git worktree prune
 
 # Try again
 ./.loom/scripts/worktree.sh 42
 ```
+
+**Note**: Running `git worktree remove` while your shell is in the worktree will corrupt your shell state. Always navigate out first!
 
 ### Issue: "Permission denied" when creating issues/PRs
 

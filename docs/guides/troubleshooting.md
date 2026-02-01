@@ -33,6 +33,7 @@ This guide helps you diagnose and fix common issues in Loom.
 3. **Cleanup and retry:**
    ```bash
    # Clean up any partial installation
+   # IMPORTANT: Run from the target-repo root, NOT from inside a worktree
    cd /path/to/target-repo
    git worktree list  # Find orphaned worktrees
    git worktree remove .loom/worktrees/issue-XXX --force
@@ -143,14 +144,19 @@ This guide helps you diagnose and fix common issues in Loom.
 
 **Symptom:** `pnpm worktree <issue>` fails with errors
 
+**WARNING**: Running `git worktree remove` while your shell is in the worktree directory will corrupt your shell state. Always navigate out of the worktree first!
+
 **Common errors and solutions:**
 
 1. **"fatal: 'path' already exists"**
    ```bash
+   # First navigate OUT of the worktree
+   cd /path/to/loom
+
    # Check if worktree exists
    git worktree list
 
-   # Remove if orphaned
+   # Remove if orphaned (only from main repo directory!)
    git worktree remove .loom/worktrees/issue-<number> --force
 
    # Or if that fails
