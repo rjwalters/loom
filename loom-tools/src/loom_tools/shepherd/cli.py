@@ -571,7 +571,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         doctor_total_elapsed = 0
 
         while not pr_approved and doctor_attempts < ctx.config.doctor_max_retries:
-            _print_phase_header(f"PHASE 4: JUDGE (attempt {doctor_attempts + 1})")
+            _print_phase_header(f"PHASE 4: JUDGE (attempt {judge_retries + 1})")
 
             phase_start = time.time()
             result = judge.run(ctx)
