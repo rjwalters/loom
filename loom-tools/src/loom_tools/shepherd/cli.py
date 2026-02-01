@@ -377,8 +377,14 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 # Record commit count before Doctor so we can detect if it changed anything
                 commits_before = get_commit_count(cwd=ctx.worktree_path)
 
-                # Doctor works in the same worktree to fix tests
-                # We pass issue number as args since there's no PR yet
+                # Doctor works in the same worktree to fix tests.
+                # Pass context file path so doctor knows what failed.
+                doctor_args = f"--test-fix {ctx.config.issue}"
+                if ctx.worktree_path:
+                    context_file = ctx.worktree_path / ".loom-test-failure-context.json"
+                    if context_file.is_file():
+                        doctor_args += f" --context {context_file}"
+
                 exit_code = run_phase_with_retry(
                     ctx,
                     role="doctor",
@@ -387,7 +393,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     max_retries=ctx.config.stuck_max_retries,
                     phase="doctor",
                     worktree=ctx.worktree_path,
-                    args=str(ctx.config.issue),
+                    args=doctor_args,
                 )
                 elapsed = int(time.time() - phase_start)
 

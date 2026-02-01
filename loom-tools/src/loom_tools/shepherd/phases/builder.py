@@ -796,11 +796,36 @@ class BuilderPhase:
             action=f"test verification failed ({elapsed}s)",
         )
 
+        # Collect changed files for doctor context
+        changed_files: list[str] = []
+        if ctx.worktree_path:
+            try:
+                diff_result = subprocess.run(
+                    ["git", "diff", "--name-only", "origin/main"],
+                    cwd=ctx.worktree_path,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                if diff_result.returncode == 0:
+                    changed_files = [
+                        f for f in diff_result.stdout.strip().splitlines() if f
+                    ]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
         return PhaseResult(
             status=PhaseStatus.FAILED,
             message=f"test verification failed ({display_name}, exit code {result.returncode})",
             phase_name="builder",
-            data={"test_failure": True},
+            data={
+                "test_failure": True,
+                "test_output_tail": tail_text,
+                "test_summary": summary or "",
+                "test_command": display_name,
+                "changed_files": changed_files,
+            },
         )
 
     def _is_rate_limited(self, ctx: ShepherdContext) -> bool:
@@ -1147,7 +1172,8 @@ class BuilderPhase:
         1. Keeps the worktree intact (with marker for protection)
         2. Pushes existing commits to remote
         3. Labels the issue ``loom:needs-fix`` so Doctor/Builder can continue
-        4. Adds a comment with test failure context
+        4. Writes test failure context to a file for Doctor to read
+        5. Adds a comment with test failure context
         """
         # Push whatever commits exist to remote
         self._push_branch(ctx)
@@ -1157,8 +1183,25 @@ class BuilderPhase:
         add_issue_label(ctx.config.issue, "loom:needs-fix", ctx.repo_root)
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
-        # Add comment with failure context
+        # Write test failure context file for Doctor phase
         failure_msg = test_result.message or "test verification failed"
+        if ctx.worktree_path:
+            context_data = {
+                "issue": ctx.config.issue,
+                "failure_message": failure_msg,
+                "test_command": test_result.data.get("test_command", ""),
+                "test_output_tail": test_result.data.get("test_output_tail", ""),
+                "test_summary": test_result.data.get("test_summary", ""),
+                "changed_files": test_result.data.get("changed_files", []),
+            }
+            context_file = ctx.worktree_path / ".loom-test-failure-context.json"
+            try:
+                context_file.write_text(json.dumps(context_data, indent=2))
+                log_info(f"Wrote test failure context to {context_file}")
+            except OSError as e:
+                log_warning(f"Could not write test failure context: {e}")
+
+        # Add comment with failure context
         branch_name = NamingConventions.branch_name(ctx.config.issue)
         worktree_rel = (
             f".loom/worktrees/issue-{ctx.config.issue}"

@@ -1445,6 +1445,127 @@ class TestBuilderPreserveOnTestFailure:
         assert result.data.get("test_failure") is True
 
 
+class TestBuilderTestFailureContext:
+    """Test that test failure context is written and passed to doctor."""
+
+    def test_preserve_writes_context_file(self, tmp_path: Path) -> None:
+        """_preserve_on_test_failure should write .loom-test-failure-context.json."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        ctx.repo_root = Path("/fake/repo")
+        ctx.worktree_path = tmp_path
+        ctx.label_cache = MagicMock()
+
+        test_result = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed (pnpm test, exit code 1)",
+            phase_name="builder",
+            data={
+                "test_failure": True,
+                "test_output_tail": "FAIL src/foo.test.ts\nExpected true, got false",
+                "test_summary": "2 failed, 3 passed",
+                "test_command": "pnpm test",
+                "changed_files": ["src/foo.ts", "src/bar.ts"],
+            },
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr=""
+                ),
+            ),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+        ):
+            builder._preserve_on_test_failure(ctx, test_result)
+
+        context_file = tmp_path / ".loom-test-failure-context.json"
+        assert context_file.exists()
+        data = json.loads(context_file.read_text())
+        assert data["issue"] == 42
+        assert data["test_command"] == "pnpm test"
+        assert data["test_summary"] == "2 failed, 3 passed"
+        assert "FAIL src/foo.test.ts" in data["test_output_tail"]
+        assert data["changed_files"] == ["src/foo.ts", "src/bar.ts"]
+        assert "test verification failed" in data["failure_message"]
+
+    def test_test_failure_result_includes_context_data(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Test failure PhaseResult should include test output and changed files."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        test_output = "FAIL src/foo.test.ts\nTests  2 failed, 3 passed\n"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=test_output, stderr=""
+        )
+        diff_completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="src/foo.ts\nsrc/bar.ts\n", stderr=""
+        )
+
+        def subprocess_side_effect(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            if isinstance(cmd, list) and "git" in cmd and "diff" in cmd:
+                return diff_completed
+            return completed
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess_side_effect,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.data["test_failure"] is True
+        assert result.data["test_command"] == "pnpm test"
+        assert "2 failed" in result.data["test_summary"]
+        assert "FAIL" in result.data["test_output_tail"]
+        assert result.data["changed_files"] == ["src/foo.ts", "src/bar.ts"]
+
+    def test_preserve_handles_missing_worktree(self) -> None:
+        """_preserve_on_test_failure should handle None worktree gracefully."""
+        builder = BuilderPhase()
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42)
+        ctx.repo_root = Path("/fake/repo")
+        ctx.worktree_path = None
+        ctx.label_cache = MagicMock()
+
+        test_result = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout="", stderr=""
+                ),
+            ),
+            patch("loom_tools.shepherd.phases.builder.remove_issue_label"),
+            patch("loom_tools.shepherd.phases.builder.add_issue_label"),
+        ):
+            # Should not raise even with worktree_path=None
+            builder._preserve_on_test_failure(ctx, test_result)
+
+
 class TestBuilderPushBranch:
     """Test builder phase branch pushing."""
 

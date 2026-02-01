@@ -23,7 +23,36 @@ Check for an argument passed via the slash command:
 
 **Arguments**: `$ARGUMENTS`
 
-If a number is provided (e.g., `/doctor 123`):
+### Test Fix Mode (from Shepherd)
+
+If arguments contain `--test-fix <issue>` (e.g., `--test-fix 123` or `--test-fix 123 --context /path/to/context.json`):
+1. This is a **test failure recovery** invoked by the Shepherd
+2. You are working in the issue worktree (already checked out)
+3. Your ONLY job is to fix the failing tests described in the context
+4. **Read the context file first** if `--context <path>` is provided:
+   ```bash
+   cat <path>
+   ```
+   The context file (`.loom-test-failure-context.json`) contains:
+   - `test_command`: The test command that was run
+   - `test_output_tail`: Last 10 lines of test output showing what failed
+   - `test_summary`: Parsed test summary (e.g., "3 failed, 12 passed")
+   - `changed_files`: Files the builder modified (your scope)
+   - `failure_message`: Human-readable failure description
+
+5. **CRITICAL RULES for test fix mode:**
+   - Fix ONLY the specific test failures described in the context
+   - Do NOT make changes to files outside the `changed_files` list unless a test failure directly requires it
+   - Do NOT make opportunistic improvements, refactoring, or unrelated fixes
+   - If test failures are in code you didn't change, check if your changes broke them
+   - If failures are pre-existing and unrelated to the builder's changes, document this and exit
+   - Run the test command from the context to verify your fix works
+
+6. After fixing, commit and proceed normally
+
+### Standard PR Fix Mode
+
+If a number is provided without `--test-fix` (e.g., `/doctor 123`):
 1. Treat that number as the target **PR** to fix
 2. **Skip** the "Finding Work" section entirely
 3. Claim the PR: `gh pr edit <number> --add-label "loom:treating"`
