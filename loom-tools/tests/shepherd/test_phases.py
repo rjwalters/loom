@@ -2451,6 +2451,157 @@ class TestBuilderFallbackComparison:
         assert result.status == PhaseStatus.FAILED
 
 
+class TestBuilderZeroFailuresNonZeroExit:
+    """Test that 0 failures with non-zero exit doesn't say 'Tests failed'.
+
+    Issue #2009: When tests pass (0 failures) but the process exits non-zero
+    (e.g., coverage threshold not met), the message should NOT say "Tests
+    failed" since no tests actually failed.
+    """
+
+    def test_structured_path_zero_failures_nonzero_exit(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Non-zero exit with 0 failures should say 'Tests passed but...'."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Both baseline and worktree exit non-zero but show 0 failures
+        # (e.g., coverage threshold failure)
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Tests  10 passed\nCoverage threshold not met\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Tests  10 passed\nCoverage threshold not met\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch("loom_tools.shepherd.phases.builder.log_warning") as mock_warn,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should return None (not a failure)
+        assert result is None
+        # Message should NOT say "Tests failed"
+        mock_warn.assert_called_once()
+        call_args = mock_warn.call_args[0][0]
+        assert "Tests passed but process exited non-zero" in call_args
+        assert "Tests failed" not in call_args
+
+    def test_structured_path_actual_preexisting_failures(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Non-zero exit with actual failures should still say 'Tests failed'."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Both baseline and worktree have the same failure count (non-zero)
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Tests  2 failed, 8 passed\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Tests  2 failed, 8 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch("loom_tools.shepherd.phases.builder.log_warning") as mock_warn,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should return None (pre-existing)
+        assert result is None
+        # Message SHOULD say "Tests failed but all failures are pre-existing"
+        mock_warn.assert_called_once()
+        call_args = mock_warn.call_args[0][0]
+        assert "Tests failed but all failures are pre-existing" in call_args
+
+    def test_fallback_path_zero_errors_nonzero_exit(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback path: no error lines with non-zero exit should not say 'Tests failed'."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Output with no parseable summary and no error lines (triggers fallback)
+        # Both exit non-zero but no actual errors in output
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Build completed successfully\nCoverage: 75%\nThreshold: 80%\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Build completed successfully\nCoverage: 75%\nThreshold: 80%\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch("loom_tools.shepherd.phases.builder.log_warning") as mock_warn,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should return None (not a failure)
+        assert result is None
+        # Message should NOT say "Tests failed"
+        mock_warn.assert_called_once()
+        call_args = mock_warn.call_args[0][0]
+        assert "Tests passed but process exited non-zero" in call_args
+        assert "Tests failed" not in call_args
+
+
 class TestBuilderEnsureDependencies:
     """Test builder phase dependency installation."""
 
