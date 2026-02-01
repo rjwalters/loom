@@ -930,7 +930,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         worktree_mock.is_dir.return_value = True
         mock_context.worktree_path = worktree_mock
 
-        # Both baseline and worktree have the same failure
+        # Both baseline and worktree have the same failure count
         baseline_result = subprocess.CompletedProcess(
             args=[],
             returncode=1,
@@ -961,6 +961,84 @@ test result: ok. 17 passed; 0 failed; 0 ignored
 
         assert result is None
 
+    def test_run_test_verification_preexisting_pytest_different_traces(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Same pytest failure in both runs with different stack traces.
+
+        This is the core false-positive scenario from #1920: a single
+        pre-existing test failure produces different traceback line numbers
+        or formatting between baseline and worktree runs, but the failure
+        count and test name are identical.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Baseline: one pytest failure with specific traceback
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "============================= test session starts ==============================\n"
+                "collected 15 items\n\n"
+                "tests/test_foo.py::test_bar FAILED\n"
+                "tests/test_foo.py::test_baz PASSED\n\n"
+                "=================================== FAILURES ===================================\n"
+                "_________________________________ test_bar _____________________________________\n\n"
+                "    def test_bar():\n"
+                ">       assert compute(42) == 100\n"
+                "E       AssertionError: assert 99 == 100\n"
+                "E        +  where 99 = compute(42)\n\n"
+                "tests/test_foo.py:15: AssertionError\n"
+                "=========================== short test summary info ============================\n"
+                "FAILED tests/test_foo.py::test_bar - AssertionError: assert 99 == 100\n"
+                "========================= 1 failed, 14 passed in 2.45s ========================\n"
+            ),
+            stderr="",
+        )
+        # Worktree: same failure, different line number in traceback
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "============================= test session starts ==============================\n"
+                "collected 15 items\n\n"
+                "tests/test_foo.py::test_bar FAILED\n"
+                "tests/test_foo.py::test_baz PASSED\n\n"
+                "=================================== FAILURES ===================================\n"
+                "_________________________________ test_bar _____________________________________\n\n"
+                "    def test_bar():\n"
+                ">       assert compute(42) == 100\n"
+                "E       AssertionError: assert 98 == 100\n"
+                "E        +  where 98 = compute(42)\n\n"
+                "tests/test_foo.py:17: AssertionError\n"
+                "=========================== short test summary info ============================\n"
+                "FAILED tests/test_foo.py::test_bar - AssertionError: assert 98 == 100\n"
+                "========================= 1 failed, 14 passed in 2.51s ========================\n"
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["python", "-m", "pytest"], "pytest"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should be None (pre-existing), NOT a false-positive FAILED
+        assert result is None
+
     def test_run_test_verification_new_failures_on_top_of_baseline(
         self, mock_context: MagicMock
     ) -> None:
@@ -977,7 +1055,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
             stdout="FAIL src/foo.test.ts\nTests  1 failed, 4 passed\n",
             stderr="",
         )
-        # Worktree has the old failure plus a new one
+        # Worktree has more failures (higher count)
         worktree_result = subprocess.CompletedProcess(
             args=[],
             returncode=1,
@@ -1002,6 +1080,48 @@ test result: ok. 17 passed; 0 failed; 0 ignored
 
         assert result is not None
         assert result.status == PhaseStatus.FAILED
+
+    def test_run_test_verification_fewer_failures_is_improvement(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None when worktree has fewer failures than baseline."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Baseline has 2 failures
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Tests  2 failed, 3 passed\n",
+            stderr="",
+        )
+        # Worktree has 1 failure (improvement)
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Tests  1 failed, 4 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Fewer failures = improvement, should pass
+        assert result is None
 
     def test_run_test_verification_baseline_passes_worktree_fails(
         self, mock_context: MagicMock
@@ -1508,6 +1628,219 @@ class TestBuilderExtractErrorLines:
         output = "PASS src/ok.test.ts\nAll tests passed.\nDone.\n"
         lines = builder._extract_error_lines(output)
         assert len(lines) == 0
+
+
+class TestBuilderParseFailureCount:
+    """Test builder phase failure count parsing."""
+
+    def test_pytest_summary(self) -> None:
+        """Should parse pytest failure count from summary line."""
+        builder = BuilderPhase()
+        output = "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        assert builder._parse_failure_count(output) == 1
+
+    def test_pytest_multiple_failures(self) -> None:
+        """Should parse pytest with multiple failures."""
+        builder = BuilderPhase()
+        output = "========================= 3 failed, 12 passed in 5.01s ========================\n"
+        assert builder._parse_failure_count(output) == 3
+
+    def test_cargo_test_summary(self) -> None:
+        """Should parse cargo test failure count."""
+        builder = BuilderPhase()
+        output = "test result: FAILED. 8 passed; 2 failed; 0 ignored; 0 measured\n"
+        assert builder._parse_failure_count(output) == 2
+
+    def test_vitest_summary(self) -> None:
+        """Should parse vitest/jest failure count."""
+        builder = BuilderPhase()
+        output = "Tests  2 failed, 3 passed\n"
+        assert builder._parse_failure_count(output) == 2
+
+    def test_no_recognizable_output(self) -> None:
+        """Should return None for unrecognized output."""
+        builder = BuilderPhase()
+        output = "Build complete.\nAll good.\n"
+        assert builder._parse_failure_count(output) is None
+
+    def test_empty_output(self) -> None:
+        """Should return None for empty output."""
+        builder = BuilderPhase()
+        assert builder._parse_failure_count("") is None
+
+
+class TestBuilderExtractFailingTestNames:
+    """Test builder phase failing test name extraction."""
+
+    def test_pytest_failed_names(self) -> None:
+        """Should extract pytest FAILED test names from short summary."""
+        builder = BuilderPhase()
+        output = (
+            "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+            "FAILED tests/test_baz.py::test_qux - ValueError\n"
+        )
+        names = builder._extract_failing_test_names(output)
+        assert names == {
+            "tests/test_foo.py::test_bar",
+            "tests/test_baz.py::test_qux",
+        }
+
+    def test_cargo_test_names(self) -> None:
+        """Should extract cargo test failing test names."""
+        builder = BuilderPhase()
+        output = (
+            "test utils::tests::test_parse ... ok\n"
+            "test utils::tests::test_validate ... FAILED\n"
+            "test core::tests::test_run ... ok\n"
+        )
+        names = builder._extract_failing_test_names(output)
+        assert names == {"utils::tests::test_validate"}
+
+    def test_vitest_fail_names(self) -> None:
+        """Should extract vitest FAIL file names."""
+        builder = BuilderPhase()
+        output = (
+            "FAIL src/foo.test.ts\n"
+            "FAIL src/bar.test.ts\n"
+            " PASS src/ok.test.ts\n"
+        )
+        names = builder._extract_failing_test_names(output)
+        assert names == {"src/foo.test.ts", "src/bar.test.ts"}
+
+    def test_empty_output(self) -> None:
+        """Should return empty set for no failures."""
+        builder = BuilderPhase()
+        assert builder._extract_failing_test_names("") == set()
+        assert builder._extract_failing_test_names("All tests passed.\n") == set()
+
+
+class TestBuilderCompareTestResults:
+    """Test builder phase structured test comparison."""
+
+    def test_same_failure_count_returns_none(self) -> None:
+        """Same failure count -> no new failures (pre-existing)."""
+        builder = BuilderPhase()
+        baseline = "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        worktree = "========================= 1 failed, 14 passed in 2.51s ========================\n"
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_worktree_more_failures_returns_true(self) -> None:
+        """Higher failure count in worktree -> new failures detected."""
+        builder = BuilderPhase()
+        baseline = "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        worktree = "========================= 2 failed, 13 passed in 2.51s ========================\n"
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_worktree_fewer_failures_returns_none(self) -> None:
+        """Fewer failures in worktree -> improvement, no new failures."""
+        builder = BuilderPhase()
+        baseline = "========================= 2 failed, 13 passed in 2.45s ========================\n"
+        worktree = "========================= 1 failed, 14 passed in 2.51s ========================\n"
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_neither_parseable_returns_false(self) -> None:
+        """Neither output parseable -> signal fallback."""
+        builder = BuilderPhase()
+        baseline = "Something went wrong\n"
+        worktree = "Unknown error\n"
+        assert builder._compare_test_results(baseline, worktree) is False
+
+    def test_one_side_parseable_returns_false(self) -> None:
+        """Only one side parseable -> can't compare, signal fallback."""
+        builder = BuilderPhase()
+        baseline = "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        worktree = "Something went wrong\n"
+        assert builder._compare_test_results(baseline, worktree) is False
+
+    def test_cargo_test_same_count(self) -> None:
+        """Cargo test with same failure count -> pre-existing."""
+        builder = BuilderPhase()
+        baseline = "test result: FAILED. 8 passed; 1 failed; 0 ignored\n"
+        worktree = "test result: FAILED. 8 passed; 1 failed; 0 ignored\n"
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_vitest_same_count(self) -> None:
+        """Vitest with same failure count -> pre-existing."""
+        builder = BuilderPhase()
+        baseline = "Tests  2 failed, 3 passed\n"
+        worktree = "Tests  2 failed, 3 passed\n"
+        assert builder._compare_test_results(baseline, worktree) is None
+
+
+class TestBuilderFallbackComparison:
+    """Test that fallback to line-based comparison works when parsing fails."""
+
+    def test_fallback_preexisting_identical_output(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: identical error output in both -> pre-existing."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Output with no parseable summary (triggers fallback)
+        unparseable_output = "Error: something broke\nSegfault at line 42\n"
+        baseline_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=unparseable_output, stderr=""
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=unparseable_output, stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is None
+
+    def test_fallback_new_errors_detected(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: new error lines in worktree -> FAILED."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        baseline_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="Error: old bug\n", stderr=""
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Error: old bug\nError: new regression\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
 
 
 class TestBuilderEnsureDependencies:
