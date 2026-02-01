@@ -437,8 +437,8 @@ pub fn initialize_workspace(
     }
 
     // Verify copied files match their sources
-    verify_copied_files(&roles_src, &roles_dst, ".loom/roles", &mut report);
-    verify_copied_files(&scripts_src, &scripts_dst, ".loom/scripts", &mut report);
+    verify_copied_files(&roles_src, &roles_dst, ".loom/roles", &mut report, None);
+    verify_copied_files(&scripts_src, &scripts_dst, ".loom/scripts", &mut report, None);
 
     // Copy .loom-specific README
     let loom_readme_src = defaults.join(".loom-README.md");
@@ -460,21 +460,29 @@ pub fn initialize_workspace(
     // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
     setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
 
-    // Verify scaffolding directories match their sources
-    // Note: Files with template substitution (CLAUDE.md, workflows) will show
-    // as mismatches in byte comparison - this is expected. The shell-based
-    // verify-install.sh checksums the rendered output for accurate verification.
+    // Verify scaffolding directories match their sources.
+    // Template context is provided so that files with template variables
+    // (e.g., .github/workflows/label-external-issues.yml) are substituted
+    // before comparison, avoiding false-positive content mismatches.
+    let repo_info = extract_repo_info(workspace);
+    let template_ctx = TemplateContext {
+        repo_owner: repo_info.as_ref().map(|(o, _)| o.clone()),
+        repo_name: repo_info.map(|(_, n)| n),
+        loom_metadata: LoomMetadata::from_env(),
+    };
+    let ctx = Some(&template_ctx);
+
     let claude_src = defaults.join(".claude");
     let claude_dst = workspace.join(".claude");
-    verify_copied_files(&claude_src, &claude_dst, ".claude", &mut report);
+    verify_copied_files(&claude_src, &claude_dst, ".claude", &mut report, ctx);
 
     let codex_src = defaults.join(".codex");
     let codex_dst = workspace.join(".codex");
-    verify_copied_files(&codex_src, &codex_dst, ".codex", &mut report);
+    verify_copied_files(&codex_src, &codex_dst, ".codex", &mut report, ctx);
 
     let github_src = defaults.join(".github");
     let github_dst = workspace.join(".github");
-    verify_copied_files(&github_src, &github_dst, ".github", &mut report);
+    verify_copied_files(&github_src, &github_dst, ".github", &mut report, ctx);
 
     // Generate installation manifest using verify-install.sh
     // This creates .loom/manifest.json with SHA-256 checksums of all
@@ -837,12 +845,34 @@ fn force_merge_dir_with_report(
     Ok(())
 }
 
+/// Context for template variable substitution during verification.
+///
+/// When source files contain template variables (e.g., `{{REPO_OWNER}}`), the installed
+/// files will have these substituted with actual values. Verification must apply the same
+/// substitution to source content before comparing, otherwise every template-substituted
+/// file reports a false-positive content mismatch.
+struct TemplateContext {
+    repo_owner: Option<String>,
+    repo_name: Option<String>,
+    loom_metadata: LoomMetadata,
+}
+
 /// Verify that copied files match their source after installation
 ///
 /// Compares each file in the source directory with the corresponding file in the
 /// destination directory. Files that don't match are added to the report's
 /// `verification_failures` list.
-fn verify_copied_files(src: &Path, dst: &Path, prefix: &str, report: &mut InitReport) {
+///
+/// If `template_ctx` is provided, source files containing template variables (`{{`)
+/// are substituted before comparison so that template-expanded installed files
+/// don't produce false-positive mismatches.
+fn verify_copied_files(
+    src: &Path,
+    dst: &Path,
+    prefix: &str,
+    report: &mut InitReport,
+    template_ctx: Option<&TemplateContext>,
+) {
     if !src.exists() || !dst.exists() {
         return;
     }
@@ -862,7 +892,7 @@ fn verify_copied_files(src: &Path, dst: &Path, prefix: &str, report: &mut InitRe
         let rel_path = format!("{}/{}", prefix, file_name.to_string_lossy());
 
         if file_type.is_dir() {
-            verify_copied_files(&src_path, &dst_path, &rel_path, report);
+            verify_copied_files(&src_path, &dst_path, &rel_path, report, template_ctx);
         } else if dst_path.exists() {
             // Compare file contents
             let src_contents = fs::read(&src_path);
@@ -870,10 +900,32 @@ fn verify_copied_files(src: &Path, dst: &Path, prefix: &str, report: &mut InitRe
 
             match (src_contents, dst_contents) {
                 (Ok(src_data), Ok(dst_data)) => {
-                    if src_data != dst_data {
+                    // If template context is provided and source contains template
+                    // variables, apply substitution before comparing
+                    let effective_src = if let Some(ctx) = template_ctx {
+                        if let Ok(text) = std::str::from_utf8(&src_data) {
+                            if text.contains("{{") {
+                                substitute_template_variables(
+                                    text,
+                                    ctx.repo_owner.as_deref(),
+                                    ctx.repo_name.as_deref(),
+                                    &ctx.loom_metadata,
+                                )
+                                .into_bytes()
+                            } else {
+                                src_data
+                            }
+                        } else {
+                            src_data
+                        }
+                    } else {
+                        src_data
+                    };
+
+                    if effective_src != dst_data {
                         report.verification_failures.push(format!(
                             "{rel_path} (content mismatch: source {} bytes, installed {} bytes)",
-                            src_data.len(),
+                            effective_src.len(),
                             dst_data.len()
                         ));
                     }
@@ -1781,7 +1833,7 @@ mod tests {
         fs::write(src.join("missing.sh"), "should exist").unwrap();
 
         let mut report = InitReport::default();
-        verify_copied_files(&src, &dst, "scripts", &mut report);
+        verify_copied_files(&src, &dst, "scripts", &mut report, None);
 
         // Should have 2 failures: mismatch + missing
         assert_eq!(report.verification_failures.len(), 2);
@@ -1812,9 +1864,90 @@ mod tests {
         fs::write(dst.join("b.sh"), "content b").unwrap();
 
         let mut report = InitReport::default();
-        verify_copied_files(&src, &dst, "scripts", &mut report);
+        verify_copied_files(&src, &dst, "scripts", &mut report, None);
 
         assert!(report.verification_failures.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_verify_copied_files_with_template_substitution() {
+        // Files with template variables should pass verification when the installed
+        // file has the templates substituted with actual values (issue #1918)
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        // Source has template variables, destination has substituted values
+        fs::write(
+            src.join("workflow.yml"),
+            "url: https://github.com/{{REPO_OWNER}}/{{REPO_NAME}}/discussions",
+        )
+        .unwrap();
+        fs::write(dst.join("workflow.yml"), "url: https://github.com/myowner/myrepo/discussions")
+            .unwrap();
+
+        // Non-template file should still match normally
+        fs::write(src.join("plain.txt"), "no templates here").unwrap();
+        fs::write(dst.join("plain.txt"), "no templates here").unwrap();
+
+        let ctx = TemplateContext {
+            repo_owner: Some("myowner".to_string()),
+            repo_name: Some("myrepo".to_string()),
+            loom_metadata: LoomMetadata::default(),
+        };
+
+        let mut report = InitReport::default();
+        verify_copied_files(&src, &dst, ".github", &mut report, Some(&ctx));
+
+        assert!(
+            report.verification_failures.is_empty(),
+            "Template-substituted files should not produce verification failures, got: {:?}",
+            report.verification_failures
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_verify_copied_files_template_still_detects_real_mismatch() {
+        // Even with template context, genuine content mismatches should be detected
+        let temp_dir = TempDir::new().unwrap();
+        let src = temp_dir.path().join("src");
+        let dst = temp_dir.path().join("dst");
+
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+
+        // Source has template, but destination has wrong substitution
+        fs::write(
+            src.join("workflow.yml"),
+            "url: https://github.com/{{REPO_OWNER}}/{{REPO_NAME}}/discussions",
+        )
+        .unwrap();
+        fs::write(
+            dst.join("workflow.yml"),
+            "url: https://github.com/wrong-owner/wrong-repo/discussions plus extra",
+        )
+        .unwrap();
+
+        let ctx = TemplateContext {
+            repo_owner: Some("myowner".to_string()),
+            repo_name: Some("myrepo".to_string()),
+            loom_metadata: LoomMetadata::default(),
+        };
+
+        let mut report = InitReport::default();
+        verify_copied_files(&src, &dst, ".github", &mut report, Some(&ctx));
+
+        assert_eq!(
+            report.verification_failures.len(),
+            1,
+            "Genuine mismatch should still be detected even with template context"
+        );
+        assert!(report.verification_failures[0].contains("workflow.yml"));
     }
 
     #[test]
