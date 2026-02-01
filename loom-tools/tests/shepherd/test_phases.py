@@ -5416,3 +5416,460 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         # Should not include commit or push instructions
         assert "commit" not in call_kwargs["args"].lower()
         assert "push" not in call_kwargs["args"].lower()
+
+
+class TestBuilderHasPytestOutput:
+    """Test _has_pytest_output detection."""
+
+    def test_detects_pytest_session_header(self) -> None:
+        builder = BuilderPhase()
+        output = (
+            "============================= test session starts ==============================\n"
+            "collected 15 items\n"
+        )
+        assert builder._has_pytest_output(output) is True
+
+    def test_detects_pytest_summary_with_borders(self) -> None:
+        builder = BuilderPhase()
+        output = "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        assert builder._has_pytest_output(output) is True
+
+    def test_detects_pytest_all_pass_summary(self) -> None:
+        builder = BuilderPhase()
+        output = "========================= 15 passed in 0.50s ========================\n"
+        assert builder._has_pytest_output(output) is True
+
+    def test_no_pytest_cargo_only(self) -> None:
+        builder = BuilderPhase()
+        output = (
+            "running 14 tests\n"
+            "test result: ok. 14 passed; 0 failed; 0 ignored\n"
+        )
+        assert builder._has_pytest_output(output) is False
+
+    def test_no_pytest_vitest_only(self) -> None:
+        builder = BuilderPhase()
+        output = "Tests  5 passed in 1.23s\n"
+        assert builder._has_pytest_output(output) is False
+
+    def test_empty_output(self) -> None:
+        builder = BuilderPhase()
+        assert builder._has_pytest_output("") is False
+
+    def test_mixed_cargo_and_pytest(self) -> None:
+        builder = BuilderPhase()
+        output = (
+            "test result: ok. 14 passed; 0 failed\n"
+            "============================= test session starts ==============================\n"
+            "15 passed in 0.50s\n"
+        )
+        assert builder._has_pytest_output(output) is True
+
+
+class TestBuilderGetSupplementalTestCommands:
+    """Test _get_supplemental_test_commands."""
+
+    def test_no_python_changes_returns_empty(self, mock_context: MagicMock) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=["src/main.rs", "src/lib.rs"],
+        ):
+            result = builder._get_supplemental_test_commands(
+                mock_context, "test result: ok. 14 passed; 0 failed\n"
+            )
+        assert result == []
+
+    def test_python_changes_with_pytest_in_output_returns_empty(
+        self, mock_context: MagicMock
+    ) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        pytest_output = (
+            "test result: ok. 14 passed; 0 failed\n"
+            "============================= test session starts ==============================\n"
+            "15 passed in 0.50s\n"
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=["loom-tools/src/loom_tools/builder.py"],
+        ):
+            result = builder._get_supplemental_test_commands(mock_context, pytest_output)
+        assert result == []
+
+    def test_python_changes_without_pytest_uses_pnpm_test_python(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        # Create package.json with test:python script
+        pkg = {"scripts": {"check:ci:lite": "...", "test:python": "cd loom-tools && uv run pytest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        cargo_only_output = "test result: ok. 14 passed; 0 failed\n"
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=["loom-tools/src/loom_tools/builder.py"],
+        ):
+            result = builder._get_supplemental_test_commands(mock_context, cargo_only_output)
+
+        assert len(result) == 1
+        assert result[0] == (["pnpm", "test:python"], "pnpm test:python (supplemental)")
+
+    def test_python_changes_without_test_python_script_uses_pytest(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        # package.json without test:python, but pyproject.toml exists
+        pkg = {"scripts": {"check:ci:lite": "..."}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        cargo_only_output = "test result: ok. 14 passed; 0 failed\n"
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=["loom-tools/src/loom_tools/builder.py"],
+        ):
+            result = builder._get_supplemental_test_commands(mock_context, cargo_only_output)
+
+        assert len(result) == 1
+        assert result[0] == (["python", "-m", "pytest"], "pytest (supplemental)")
+
+    def test_pyi_files_count_as_python(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        pkg = {"scripts": {"test:python": "pytest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=["loom-tools/src/types.pyi"],
+        ):
+            result = builder._get_supplemental_test_commands(mock_context, "")
+        assert len(result) == 1
+
+    def test_no_changed_files_returns_empty(self, mock_context: MagicMock) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=[],
+        ):
+            result = builder._get_supplemental_test_commands(mock_context, "")
+        assert result == []
+
+    def test_no_worktree_returns_empty(self, mock_context: MagicMock) -> None:
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+        result = builder._get_supplemental_test_commands(mock_context, "")
+        assert result == []
+
+
+class TestBuilderSupplementalVerification:
+    """Test _run_supplemental_verification end-to-end scenarios."""
+
+    def test_no_supplemental_needed_returns_none(
+        self, mock_context: MagicMock
+    ) -> None:
+        """No supplemental tests needed -> returns None."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch.object(builder, "_get_supplemental_test_commands", return_value=[]):
+            result = builder._run_supplemental_verification(mock_context, "")
+        assert result is None
+
+    def test_supplemental_passes_returns_none(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Supplemental test passes -> returns None."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        passing_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="15 passed in 0.50s\n", stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_get_supplemental_test_commands",
+                return_value=[(["pnpm", "test:python"], "pnpm test:python (supplemental)")],
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=passing_result,
+            ),
+        ):
+            result = builder._run_supplemental_verification(mock_context, "")
+        assert result is None
+
+    def test_supplemental_catches_new_python_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Supplemental test finds new Python failure -> returns FAILED.
+
+        This is the core scenario from issue #1980: the primary pipeline
+        (check:ci:lite) short-circuited before reaching pytest, but the
+        builder introduced a new Python test failure.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Baseline passes (no pre-existing failures)
+        baseline_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="15 passed in 0.50s\n", stderr=""
+        )
+        # Worktree fails (new regression)
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAILED tests/test_foo.py::test_bar - AssertionError\n"
+                "1 failed, 14 passed in 2.45s\n"
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_get_supplemental_test_commands",
+                return_value=[(["pnpm", "test:python"], "pnpm test:python (supplemental)")],
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=baseline_result),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["loom-tools/src/loom_tools/builder.py"],
+            ),
+        ):
+            result = builder._run_supplemental_verification(mock_context, "")
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "supplemental" in result.message
+        assert result.data["test_failure"] is True
+
+    def test_supplemental_preexisting_failure_returns_none(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Supplemental test fails but failure is pre-existing on main -> returns None."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Both baseline and worktree fail with same count
+        failing_output = (
+            "FAILED tests/test_foo.py::test_bar\n"
+            "1 failed, 14 passed in 2.45s\n"
+        )
+        baseline_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=failing_output, stderr=""
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=failing_output, stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_get_supplemental_test_commands",
+                return_value=[(["pnpm", "test:python"], "pnpm test:python (supplemental)")],
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=baseline_result),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_supplemental_verification(mock_context, "")
+        assert result is None
+
+    def test_supplemental_timeout_returns_failed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Supplemental test timeout -> returns FAILED."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with (
+            patch.object(
+                builder,
+                "_get_supplemental_test_commands",
+                return_value=[(["pnpm", "test:python"], "pnpm test:python (supplemental)")],
+            ),
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pnpm test:python", timeout=300),
+            ),
+        ):
+            result = builder._run_supplemental_verification(mock_context, "")
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "timed out" in result.message
+
+    def test_primary_pass_triggers_supplemental_for_python_changes(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Full integration: primary passes but pipeline missed pytest, supplemental catches failure.
+
+        Simulates the exact scenario from issue #1980: check:ci:lite passes
+        (cargo OK), but Python files changed and pytest didn't run. The
+        supplemental verification runs pytest and catches the new failure.
+        """
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        # Create package.json with test scripts
+        pkg = {"scripts": {"check:ci:lite": "...", "test:python": "cd loom-tools && uv run pytest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        # Primary pipeline passed (cargo only, no pytest)
+        primary_pass = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="test result: ok. 14 passed; 0 failed; 0 ignored\n",
+            stderr="",
+        )
+
+        # Supplemental baseline passes
+        supp_baseline = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="15 passed in 0.50s\n", stderr=""
+        )
+        # Supplemental worktree fails (new regression)
+        supp_worktree_fail = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAILED tests/test_bar.py::test_baz\n1 failed, 14 passed in 2.45s\n",
+            stderr="",
+        )
+
+        call_count = 0
+
+        def mock_subprocess_run(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return primary_pass  # Primary pipeline
+            return supp_worktree_fail  # Supplemental test in worktree
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "check:ci:lite"], "pnpm check:ci:lite"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests",
+                side_effect=[None, supp_baseline],  # First call: primary baseline, second: supplemental
+            ),
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_subprocess_run,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["loom-tools/src/loom_tools/builder.py"],
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "supplemental" in result.message
+
+    def test_primary_preexisting_triggers_supplemental(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Full integration: primary has pre-existing failures, supplemental catches new Python failure.
+
+        The primary pipeline (check:ci:lite) fails with pre-existing
+        failures (lint, etc.). The supplemental verification still runs
+        pytest and catches a new Python regression.
+        """
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        pkg = {"scripts": {"check:ci:lite": "...", "test:python": "cd loom-tools && uv run pytest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        # Both primary runs fail identically (pre-existing lint failure)
+        primary_output = "error: biome config invalid\ntest result: ok. 14 passed; 0 failed\n"
+        primary_baseline = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=primary_output, stderr=""
+        )
+        primary_worktree = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=primary_output, stderr=""
+        )
+
+        # Supplemental baseline passes, worktree fails
+        supp_baseline = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="15 passed in 0.50s\n", stderr=""
+        )
+        supp_worktree_fail = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAILED tests/test_bar.py::test_baz\n1 failed, 14 passed\n",
+            stderr="",
+        )
+
+        call_count = 0
+
+        def mock_subprocess_run(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return primary_worktree
+            return supp_worktree_fail
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "check:ci:lite"], "pnpm check:ci:lite"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests",
+                side_effect=[primary_baseline, supp_baseline],
+            ),
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_subprocess_run,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["loom-tools/src/loom_tools/builder.py"],
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+        assert "supplemental" in result.message
