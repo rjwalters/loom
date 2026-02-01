@@ -357,12 +357,6 @@ Both are valuable. Your job is to prevent accumulation of technical debt, not to
 
 Your goal is to be a helpful voice for simplicity, not a blocker or a source of noise. Quality over quantity.
 
-## Worktree Cleanup
-
-As the Hermit role, you also manage periodic cleanup of orphaned git worktrees. Run worktree cleanup **weekly** during autonomous scanning.
-
-*For the full cleanup script, criteria, and workflow, see `hermit-patterns.md`.*
-
 ## Terminal Probe Protocol
 
 Loom uses an intelligent probe system to detect what's running in each terminal.
