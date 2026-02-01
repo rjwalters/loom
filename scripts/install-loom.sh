@@ -820,7 +820,7 @@ header "What's Included:"
 echo "  ✅ .loom/ directory with configuration and scripts"
 echo "  ✅ .claude/ directory with slash commands"
 echo "  ✅ .github/ directory with labels and workflows"
-echo "  ✅ CLAUDE.md and AGENTS.md documentation"
+echo "  ✅ CLAUDE.md documentation"
 echo ""
 
 header "Next Steps:"

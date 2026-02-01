@@ -180,11 +180,6 @@ pub fn validate_loom_source_repo(workspace_path: &Path) -> ValidationReport {
         report.issues.push("Missing CLAUDE.md".to_string());
     }
 
-    report.has_agents_md = workspace_path.join("AGENTS.md").exists();
-    if !report.has_agents_md {
-        report.issues.push("Missing AGENTS.md".to_string());
-    }
-
     // Check labels.yml
     report.has_labels_yml = workspace_path.join(".github").join("labels.yml").exists();
     if !report.has_labels_yml {

@@ -57,10 +57,10 @@ pub fn copy_loom_config(defaults_path: &Path, loom_path: &Path) -> Result<(), St
     Ok(())
 }
 
-/// Helper function to setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+/// Helper function to setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
 ///
 /// Copies workspace-root files from defaults/.loom/ (templates for target repos).
-/// Note: defaults/CLAUDE.md and defaults/AGENTS.md are for the Loom repo itself (dogfooding).
+/// Note: defaults/CLAUDE.md is for the Loom repo itself (dogfooding).
 pub fn setup_repository_scaffolding(
     workspace_path: &Path,
     defaults_path: &Path,
@@ -73,17 +73,6 @@ pub fn setup_repository_scaffolding(
         if claude_md_src.exists() {
             fs::copy(&claude_md_src, &claude_md_dst)
                 .map_err(|e| format!("Failed to copy CLAUDE.md: {e}"))?;
-        }
-    }
-
-    // Copy target-repo-specific AGENTS.md from defaults/.loom/
-    // (NOT defaults/AGENTS.md which is for Loom repo itself)
-    let agents_md_dst = workspace_path.join("AGENTS.md");
-    if !agents_md_dst.exists() {
-        let agents_md_src = defaults_path.join(".loom").join("AGENTS.md");
-        if agents_md_src.exists() {
-            fs::copy(&agents_md_src, &agents_md_dst)
-                .map_err(|e| format!("Failed to copy AGENTS.md: {e}"))?;
         }
     }
 
@@ -349,7 +338,7 @@ pub fn initialize_loom_workspace(path: &str, defaults_path: &str) -> Result<(), 
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
-    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
     setup_repository_scaffolding(workspace_path, &defaults)?;
 
     Ok(())
@@ -484,7 +473,7 @@ pub fn reset_workspace_to_defaults(
             .map_err(|e| format!("Failed to create .gitignore: {e}"))?;
     }
 
-    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
     setup_repository_scaffolding(workspace, &defaults)?;
 
     Ok(())

@@ -262,7 +262,7 @@ if [[ -d "$DEFAULTS_PATH" ]]; then
       README.md)
         continue
         ;;
-      # .loom/ files -> .loom/ (CLAUDE.md, AGENTS.md in .loom/)
+      # .loom/ files -> .loom/ (CLAUDE.md in .loom/)
       .loom/*)
         target_file="$rel_path"
         ;;
@@ -270,7 +270,7 @@ if [[ -d "$DEFAULTS_PATH" ]]; then
       .DS_Store)
         continue
         ;;
-      # All other files map directly (CLAUDE.md, AGENTS.md, .claude/*, .codex/*, .github/*)
+      # All other files map directly (CLAUDE.md, .claude/*, .codex/*, .github/*)
       *)
         target_file="$rel_path"
         ;;
