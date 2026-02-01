@@ -53,6 +53,9 @@ impl TestDaemon {
         let mut process = Command::new(&daemon_bin)
             .env("LOOM_SOCKET_PATH", &socket_path)
             .env("RUST_LOG", "debug")
+            // Disable restore_from_tmux() to prevent cross-test-binary contamination
+            // via the shared tmux server. Each test manages its own terminals.
+            .env("LOOM_NO_RESTORE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
