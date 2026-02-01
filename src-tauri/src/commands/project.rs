@@ -25,7 +25,7 @@ fn init_loom_directory(project_path: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
     }
 
-    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
     super::workspace::setup_repository_scaffolding(project_path, &defaults_dir)?;
 
     Ok(())

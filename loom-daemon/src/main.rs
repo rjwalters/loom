@@ -350,7 +350,9 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                 println!("\nActions that would be performed:");
                 println!("  1. Validate {workspace_str} is a git repository");
                 println!("  2. Copy .loom/ configuration from {defaults}");
-                println!("  3. Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/, .github/)");
+                println!(
+                    "  3. Setup repository scaffolding (CLAUDE.md, .claude/, .codex/, .github/)"
+                );
                 println!("  4. Update .gitignore with Loom ephemeral patterns");
                 return Ok(());
             }
@@ -386,12 +388,6 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                                 println!("  ✓ CLAUDE.md       - Present");
                             } else {
                                 println!("  ✗ CLAUDE.md       - Missing");
-                            }
-
-                            if validation.has_agents_md {
-                                println!("  ✓ AGENTS.md       - Present");
-                            } else {
-                                println!("  ✗ AGENTS.md       - Missing");
                             }
 
                             if validation.has_labels_yml {
@@ -432,7 +428,6 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     println!("  📄 .loom/config.json - Terminal configuration");
                     println!("  📁 .loom/roles/    - Agent role definitions");
                     println!("  📄 CLAUDE.md       - AI context documentation");
-                    println!("  📄 AGENTS.md       - Agent workflow guide");
                     println!("  📁 .claude/        - Claude Code configuration");
                     println!("  📁 .codex/         - Codex configuration");
                     println!("  📁 .github/        - GitHub workflow templates");

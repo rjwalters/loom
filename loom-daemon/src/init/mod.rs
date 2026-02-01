@@ -9,7 +9,7 @@
 //! 1. Validates the target is a git repository
 //! 2. Detects self-installation (Loom source repo) and runs validation-only mode
 //! 3. Copies `.loom/` configuration from `defaults/` (merge mode preserves custom files)
-//! 4. Sets up repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+//! 4. Sets up repository scaffolding (CLAUDE.md, .claude/, .codex/)
 //! 5. Updates .gitignore with Loom ephemeral patterns
 //! 6. Reports which files were preserved vs added
 //!
@@ -74,8 +74,6 @@ pub struct ValidationReport {
     pub commands_found: Vec<String>,
     /// Whether CLAUDE.md exists
     pub has_claude_md: bool,
-    /// Whether AGENTS.md exists
-    pub has_agents_md: bool,
     /// Whether .github/labels.yml exists
     pub has_labels_yml: bool,
     /// Issues found during validation
@@ -217,7 +215,7 @@ pub fn initialize_workspace(
     // Update .gitignore with Loom ephemeral patterns
     update_gitignore(workspace)?;
 
-    // Setup repository scaffolding (CLAUDE.md, AGENTS.md, .claude/, .codex/)
+    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
     setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
 
     // Verify scaffolding directories match their sources.
@@ -330,7 +328,6 @@ mod tests {
 
         // Create docs
         fs::write(workspace.join("CLAUDE.md"), "").unwrap();
-        fs::write(workspace.join("AGENTS.md"), "").unwrap();
 
         // Create labels.yml
         fs::create_dir_all(workspace.join(".github")).unwrap();
@@ -355,7 +352,6 @@ mod tests {
         assert!(validation.scripts_found.contains(&"worktree".to_string()));
         assert!(validation.commands_found.contains(&"builder".to_string()));
         assert!(validation.has_claude_md);
-        assert!(validation.has_agents_md);
         assert!(validation.has_labels_yml);
     }
 

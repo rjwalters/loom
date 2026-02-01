@@ -1,6 +1,6 @@
 //! Repository scaffolding setup
 //!
-//! Sets up CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ directories.
+//! Sets up CLAUDE.md, .claude/, .codex/, and .github/ directories.
 
 use std::fs;
 use std::path::Path;
@@ -21,11 +21,11 @@ pub fn wrap_loom_content(content: &str) -> String {
 
 /// Setup repository scaffolding files
 ///
-/// Copies CLAUDE.md, AGENTS.md, .claude/, .codex/, and .github/ to the workspace.
+/// Copies CLAUDE.md, .claude/, .codex/, and .github/ to the workspace.
 /// - Fresh install: Copies all files from defaults
 /// - Reinstall without force (merge mode): Adds new files, preserves ALL existing files
 /// - Reinstall with force (force-merge mode): Updates default files, preserves custom files
-/// - Template variables: Substitutes variables in CLAUDE.md, AGENTS.md, and workflow files
+/// - Template variables: Substitutes variables in CLAUDE.md and workflow files
 ///   - `{{REPO_OWNER}}`, `{{REPO_NAME}}`: Repository info from git remote
 ///   - `{{LOOM_VERSION}}`, `{{LOOM_COMMIT}}`, `{{INSTALL_DATE}}`: Loom installation metadata
 ///
@@ -192,13 +192,6 @@ pub fn setup_repository_scaffolding(
             }
         }
     }
-
-    copy_file_with_substitution(
-        &defaults_path.join(".loom").join("AGENTS.md"),
-        &workspace_path.join("AGENTS.md"),
-        "AGENTS.md",
-        report,
-    )?;
 
     // Copy .claude/ directory - always update default commands, preserve custom commands
     // - Fresh install: copy all from defaults
