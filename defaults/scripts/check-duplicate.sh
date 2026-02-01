@@ -44,6 +44,10 @@ print_warning() {
     echo -e "${YELLOW}WARNING: $1${NC}" >&2
 }
 
+print_success() {
+    echo -e "${GREEN}$1${NC}" >&2
+}
+
 print_help() {
     cat << 'EOF'
 check-duplicate.sh - Check for potential duplicate issues
@@ -106,9 +110,11 @@ calculate_similarity() {
     local keywords1="$1"
     local keywords2="$2"
 
-    # Convert to arrays
-    local -a arr1=($keywords1)
-    local -a arr2=($keywords2)
+    # Convert to arrays using read -ra for safe word splitting
+    local -a arr1
+    local -a arr2
+    read -ra arr1 <<< "$keywords1"
+    read -ra arr2 <<< "$keywords2"
 
     # Handle empty arrays
     if [[ ${#arr1[@]} -eq 0 ]] || [[ ${#arr2[@]} -eq 0 ]]; then
@@ -152,10 +158,6 @@ search_similar_issues() {
         print_warning "No significant keywords extracted from title/body"
         return 0
     fi
-
-    # Get a few key terms for GitHub search (API limits)
-    local search_terms
-    search_terms=$(echo "$new_keywords" | head -5 | tr '\n' ' ')
 
     # Search open issues
     local issues
@@ -307,7 +309,11 @@ main() {
             echo '{"error": "Failed to check duplicates"}'
         fi
     else
-        echo "$result"
+        if [[ $exit_code -eq 0 ]]; then
+            print_success "No duplicates found"
+        else
+            echo "$result"
+        fi
     fi
 
     exit $exit_code
