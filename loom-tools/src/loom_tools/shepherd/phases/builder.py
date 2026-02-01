@@ -950,23 +950,11 @@ class BuilderPhase:
         )
 
         # Collect changed files for doctor context
+        # Use get_changed_files helper which uses origin/main...HEAD to detect
+        # both committed and uncommitted changes
         changed_files: list[str] = []
         if ctx.worktree_path:
-            try:
-                diff_result = subprocess.run(
-                    ["git", "diff", "--name-only", "origin/main"],
-                    cwd=ctx.worktree_path,
-                    text=True,
-                    capture_output=True,
-                    timeout=30,
-                    check=False,
-                )
-                if diff_result.returncode == 0:
-                    changed_files = [
-                        f for f in diff_result.stdout.strip().splitlines() if f
-                    ]
-            except (subprocess.TimeoutExpired, OSError):
-                pass
+            changed_files = get_changed_files(cwd=ctx.worktree_path)
 
         return PhaseResult(
             status=PhaseStatus.FAILED,

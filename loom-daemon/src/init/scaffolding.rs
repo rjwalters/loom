@@ -53,38 +53,6 @@ pub fn setup_repository_scaffolding(
     // Get Loom installation metadata from environment variables
     let loom_metadata = LoomMetadata::from_env();
 
-    // Helper to copy file with template variable substitution
-    let copy_file_with_substitution =
-        |src: &Path, dst: &Path, name: &str, report: &mut InitReport| -> Result<(), String> {
-            if src.exists() {
-                let existed = dst.exists();
-                if force && existed {
-                    fs::remove_file(dst)
-                        .map_err(|e| format!("Failed to remove existing {name}: {e}"))?;
-                }
-                if force || !existed {
-                    let content = fs::read_to_string(src)
-                        .map_err(|e| format!("Failed to read {name}: {e}"))?;
-                    let substituted = substitute_template_variables(
-                        &content,
-                        repo_owner.as_deref(),
-                        repo_name.as_deref(),
-                        &loom_metadata,
-                    );
-                    fs::write(dst, substituted)
-                        .map_err(|e| format!("Failed to write {name}: {e}"))?;
-                    if existed {
-                        report.updated.push(name.to_string());
-                    } else {
-                        report.added.push(name.to_string());
-                    }
-                } else {
-                    report.preserved.push(name.to_string());
-                }
-            }
-            Ok(())
-        };
-
     // Helper to copy directory with force logic and reporting
     // - Fresh install (dst doesn't exist): copy all
     // - Reinstall without force: merge (add new, preserve existing)
