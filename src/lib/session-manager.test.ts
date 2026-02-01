@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CircuitOpenError } from "./circuit-breaker";
+import { CircuitOpenError, CircuitState } from "./circuit-breaker";
 import { getSessionManager, resetSessionManager, SessionManager } from "./session-manager";
 
 // Mock Tauri invoke
@@ -103,7 +103,9 @@ describe("SessionManager", () => {
 
     it("throws error when circuit breaker is open", async () => {
       mockCircuitBreaker.canAttempt.mockReturnValue(false);
-      mockCircuitBreaker.execute.mockRejectedValue(new CircuitOpenError("daemon-ipc", "open"));
+      mockCircuitBreaker.execute.mockRejectedValue(
+        new CircuitOpenError("daemon-ipc", CircuitState.OPEN)
+      );
 
       await expect(sessionManager.launchSession("/test/workspace")).rejects.toThrow(
         "Daemon is unresponsive"
