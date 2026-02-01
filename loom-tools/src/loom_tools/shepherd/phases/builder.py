@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -417,6 +418,107 @@ class BuilderPhase:
 
         return None
 
+    def _parse_failure_count(self, output: str) -> int | None:
+        """Extract the number of test failures from command output.
+
+        Parses structured summary lines from pytest, cargo test, and
+        vitest/jest to extract the failure count. Returns None if no
+        recognizable pattern is found.
+        """
+        lines = output.strip().splitlines()
+
+        for line in reversed(lines):
+            stripped = line.strip()
+            cleaned = stripped.strip("= ").strip()
+
+            # pytest: "1 failed, 12 passed in 0.03s" or "1 failed"
+            m = re.search(r"(\d+)\s+failed", cleaned)
+            if m and ("passed" in cleaned or "failed" in cleaned):
+                return int(m.group(1))
+
+            # cargo test: "test result: FAILED. 0 passed; 1 failed; 0 ignored"
+            if stripped.startswith("test result:"):
+                m = re.search(r"(\d+)\s+failed", stripped)
+                if m:
+                    return int(m.group(1))
+
+            # vitest/jest: "Tests  2 failed, 3 passed"
+            if "test" in stripped.lower() and "failed" in stripped.lower():
+                m = re.search(r"(\d+)\s+failed", stripped)
+                if m:
+                    return int(m.group(1))
+
+        return None
+
+    def _extract_failing_test_names(self, output: str) -> set[str]:
+        """Extract individual failing test names from test output.
+
+        Parses output from common test runners to extract the names of
+        failing tests. Used as a secondary comparison when failure counts
+        are equal to detect whether different tests are failing.
+
+        Supported formats:
+        - pytest: "FAILED tests/test_foo.py::test_bar - AssertionError"
+        - cargo test: "test some::path ... FAILED"
+        - vitest/jest: "FAIL src/foo.test.ts" at line start
+        """
+        names: set[str] = set()
+
+        for raw_line in output.splitlines():
+            stripped = raw_line.strip()
+
+            # pytest short summary: "FAILED tests/test_foo.py::test_bar - ..."
+            m = re.match(r"FAILED\s+(\S+)", stripped)
+            if m:
+                names.add(m.group(1))
+                continue
+
+            # cargo test: "test some::module::test_name ... FAILED"
+            m = re.match(r"test\s+(\S+)\s+\.\.\.\s+FAILED", stripped)
+            if m:
+                names.add(m.group(1))
+                continue
+
+            # vitest/jest: "FAIL src/foo.test.ts" (at start of line)
+            # but not summary lines like "Tests  2 failed"
+            if stripped.startswith("FAIL ") and "/" in stripped:
+                name = stripped[5:].strip()
+                if name:
+                    names.add(name)
+                continue
+
+        return names
+
+    def _compare_test_results(
+        self, baseline_output: str, worktree_output: str
+    ) -> bool | None:
+        """Compare baseline and worktree test results using structured parsing.
+
+        Returns:
+            None  — structured comparison succeeded, no new failures detected
+            True  — structured comparison succeeded, new failures detected
+            False — structured parsing failed, caller should use fallback
+        """
+        baseline_count = self._parse_failure_count(baseline_output)
+        worktree_count = self._parse_failure_count(worktree_output)
+
+        # If we can parse both counts, use count-based comparison
+        if baseline_count is not None and worktree_count is not None:
+            if worktree_count <= baseline_count:
+                # Worktree has same or fewer failures — pre-existing
+                return None
+
+            # Worktree has more failures — new regressions
+            return True
+
+        # If only one side parsed, we can't do structured comparison
+        if baseline_count is None and worktree_count is None:
+            # Neither parsed — signal fallback
+            return False
+
+        # One side parsed, other didn't — can't reliably compare
+        return False
+
     def _extract_error_lines(self, output: str) -> list[str]:
         """Extract error-indicator lines from test output for comparison.
 
@@ -548,25 +650,15 @@ class BuilderPhase:
 
         # Tests failed — check if these are pre-existing failures
         if baseline_result is not None and baseline_result.returncode != 0:
-            # Baseline also fails. Compare error output to determine if
-            # the worktree introduced new failures.
-            baseline_errors = set(
-                self._extract_error_lines(
-                    baseline_result.stdout + "\n" + baseline_result.stderr
-                )
-            )
-            worktree_errors = set(
-                self._extract_error_lines(
-                    result.stdout + "\n" + result.stderr
-                )
-            )
-            new_errors = worktree_errors - baseline_errors
+            baseline_output = baseline_result.stdout + "\n" + baseline_result.stderr
+            worktree_output = result.stdout + "\n" + result.stderr
 
-            if not new_errors:
-                # All failures are pre-existing on main
-                summary = self._parse_test_summary(
-                    result.stdout + "\n" + result.stderr
-                )
+            # Primary: structured comparison using parsed failure counts
+            structured = self._compare_test_results(baseline_output, worktree_output)
+
+            if structured is None:
+                # Structured comparison says no new failures
+                summary = self._parse_test_summary(worktree_output)
                 msg = f"pre-existing on main (exit code {result.returncode})"
                 if summary:
                     msg = f"pre-existing on main ({summary})"
@@ -579,11 +671,40 @@ class BuilderPhase:
                 )
                 return None
 
-            # New errors introduced by the worktree
-            log_warning(
-                f"Baseline also fails but worktree introduces "
-                f"{len(new_errors)} new error(s)"
-            )
+            if structured is True:
+                # Structured comparison detected new failures
+                log_warning(
+                    "Baseline also fails but worktree introduces "
+                    "new test failures (higher failure count)"
+                )
+            else:
+                # Structured parsing failed — fall back to line-based comparison
+                baseline_errors = set(
+                    self._extract_error_lines(baseline_output)
+                )
+                worktree_errors = set(
+                    self._extract_error_lines(worktree_output)
+                )
+                new_errors = worktree_errors - baseline_errors
+
+                if not new_errors:
+                    summary = self._parse_test_summary(worktree_output)
+                    msg = f"pre-existing on main (exit code {result.returncode})"
+                    if summary:
+                        msg = f"pre-existing on main ({summary})"
+                    log_warning(
+                        f"Tests failed but all failures are pre-existing: {msg}"
+                    )
+                    ctx.report_milestone(
+                        "heartbeat",
+                        action=f"tests have pre-existing failures ({elapsed}s)",
+                    )
+                    return None
+
+                log_warning(
+                    f"Baseline also fails but worktree introduces "
+                    f"{len(new_errors)} new error(s)"
+                )
 
         # Tests failed with new errors (or no baseline available)
         summary = self._parse_test_summary(
