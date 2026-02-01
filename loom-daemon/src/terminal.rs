@@ -5,6 +5,16 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Build the pipe-pane command string that strips ANSI escape sequences from output.
+///
+/// The sed command removes:
+/// - Standard ANSI escape sequences: ESC[...letter (colors, cursor, modes)
+/// - Terminal mode queries: ESC[?...h/l (like ?2026h/l)
+/// - OSC sequences: ESC]...BEL (title setting, etc.)
+fn pipe_pane_cmd(output_file: &str) -> String {
+    format!("sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\\x1b\\][^\\x07]*\\x07//g' >> {output_file}")
+}
+
 pub struct TerminalManager {
     terminals: HashMap<TerminalId, TerminalInfo>,
 }
@@ -127,9 +137,9 @@ impl TerminalManager {
             return Err(anyhow!("Failed to create tmux session '{tmux_session}'"));
         }
 
-        // Set up pipe-pane to capture all output to a file
+        // Set up pipe-pane to capture output with ANSI stripping
         let output_file = format!("/tmp/loom-{id}.out");
-        let pipe_cmd = format!("cat >> {output_file}");
+        let pipe_cmd = pipe_pane_cmd(&output_file);
 
         log::info!("Setting up pipe-pane for session {tmux_session} to {output_file}");
         let result = Command::new("tmux")
@@ -510,9 +520,9 @@ impl TerminalManager {
                     .args(["pipe-pane", "-t", session])
                     .spawn();
 
-                // Set up fresh pipe-pane to capture output
+                // Set up fresh pipe-pane to capture output with ANSI stripping
                 let output_file = format!("/tmp/loom-{id}.out");
-                let pipe_cmd = format!("cat >> {output_file}");
+                let pipe_cmd = pipe_pane_cmd(&output_file);
 
                 log::info!("Setting up pipe-pane for session {session} to {output_file}");
                 let result = Command::new("tmux")
