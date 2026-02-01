@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 import subprocess
 import time
+from pathlib import Path
+from typing import Any
 
 from loom_tools.common.logging import log_info, log_warning
+from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import parse_command_output
 from loom_tools.shepherd.config import Phase
 from loom_tools.shepherd.context import ShepherdContext
@@ -170,10 +173,14 @@ class JudgePhase:
                     data={"changes_requested": True},
                 )
             else:
+                diag = self._gather_diagnostics(ctx)
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
-                    message="judge phase validation failed",
+                    message=(
+                        f"judge phase validation failed: {diag['summary']}"
+                    ),
                     phase_name="judge",
+                    data=diag,
                 )
 
         # Check result — cache was already invalidated above, but
@@ -526,6 +533,93 @@ class JudgePhase:
             return False
 
         return True
+
+    def _get_log_path(self, ctx: ShepherdContext) -> Path:
+        """Return the expected judge worker log file path."""
+        paths = LoomPaths(ctx.repo_root)
+        return paths.worker_log_file("judge", ctx.config.issue)
+
+    def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
+        """Collect diagnostic info when judge validation fails.
+
+        Inspects the judge worker log file and PR review state to provide
+        actionable context about why the judge phase failed.
+
+        All commands are best-effort; failures are recorded but never raised.
+        """
+        diag: dict[str, Any] = {}
+
+        # -- Log file ----------------------------------------------------------
+        log_path = self._get_log_path(ctx)
+        diag["log_file"] = str(log_path)
+        diag["log_exists"] = log_path.is_file()
+        if log_path.is_file():
+            try:
+                lines = log_path.read_text().splitlines()
+                diag["log_tail"] = lines[-20:] if len(lines) > 20 else lines
+            except OSError:
+                diag["log_tail"] = []
+        else:
+            diag["log_tail"] = []
+
+        # -- PR review state ---------------------------------------------------
+        assert ctx.pr_number is not None
+        review_result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "reviews,labels",
+                "--jq",
+                '{reviews: [.reviews[-3:][] | {state: .state, author: .author.login}], labels: [.labels[].name]}',
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        review_data = parse_command_output(review_result)
+        if isinstance(review_data, dict):
+            diag["pr_reviews"] = review_data.get("reviews", [])
+            diag["pr_labels"] = review_data.get("labels", [])
+        else:
+            diag["pr_reviews"] = []
+            diag["pr_labels"] = []
+
+        # -- Human-readable summary --------------------------------------------
+        parts: list[str] = []
+
+        # Review state
+        if diag["pr_reviews"]:
+            review_states = [
+                f"{r.get('state', 'unknown')}" for r in diag["pr_reviews"]
+            ]
+            parts.append(f"reviews=[{', '.join(review_states)}]")
+        else:
+            parts.append("no reviews submitted")
+
+        # Labels
+        loom_labels = [
+            lbl for lbl in diag["pr_labels"] if lbl.startswith("loom:")
+        ]
+        if loom_labels:
+            parts.append(f"labels=[{', '.join(loom_labels)}]")
+        else:
+            parts.append("no loom labels on PR")
+
+        # Log tail
+        if diag["log_tail"]:
+            last_line = diag["log_tail"][-1].strip()
+            parts.append(f"last output: {last_line!r}")
+        elif diag["log_exists"]:
+            parts.append("log file empty")
+        else:
+            parts.append(f"log file not found ({diag['log_file']})")
+
+        diag["summary"] = "; ".join(parts)
+        return diag
 
     def _mark_issue_blocked(
         self, ctx: ShepherdContext, error_class: str, details: str

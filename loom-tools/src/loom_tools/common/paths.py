@@ -155,6 +155,18 @@ class LoomPaths:
         """
         return self.logs_dir / f"loom-builder-issue-{issue}.log"
 
+    def worker_log_file(self, role: str, issue: int) -> Path:
+        """Path to worker log file for a specific role and issue.
+
+        Args:
+            role: The worker role (e.g., "judge", "builder").
+            issue: The issue number.
+
+        Returns:
+            Path to .loom/logs/loom-{role}-issue-{N}.log
+        """
+        return self.logs_dir / f"loom-{role}-issue-{issue}.log"
+
 
 class NamingConventions:
     """Naming conventions for branches, worktrees, and other identifiers.
