@@ -422,15 +422,18 @@ class TestValidateBuilder:
         assert "closed" in result.message.lower()
 
     @patch("loom_tools.validate_phase._find_pr_for_issue")
-    @patch("loom_tools.validate_phase._mark_blocked")
+    @patch("loom_tools.validate_phase._mark_phase_failed")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_no_pr_no_worktree(self, mock_gh: MagicMock, mock_blocked: MagicMock, mock_find: MagicMock, tmp_path: Path):
+    def test_no_pr_no_worktree(self, mock_gh: MagicMock, mock_phase_failed: MagicMock, mock_find: MagicMock, tmp_path: Path):
         repo = _make_repo(tmp_path)
         mock_gh.return_value = _completed(stdout="OPEN\n")
         mock_find.return_value = None
         result = validate_builder(42, repo, worktree=None)
         assert result.status == ValidationStatus.FAILED
-        mock_blocked.assert_called_once()
+        mock_phase_failed.assert_called_once()
+        # Verify failure_label is passed
+        call_kwargs = mock_phase_failed.call_args[1]
+        assert call_kwargs.get("failure_label") == "loom:failed:builder"
 
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
@@ -446,12 +449,16 @@ class TestValidateBuilder:
 
 
 # ---------------------------------------------------------------------------
-# validate_builder: recovery PR body tests
+# validate_builder: no auto-recovery tests
 # ---------------------------------------------------------------------------
 
 
-class TestBuilderRecoveryPRBody:
-    """Tests for enhanced PR body in builder worktree recovery."""
+class TestBuilderNoAutoRecovery:
+    """Tests verifying auto-recovery was removed from builder validation.
+
+    Note: Auto-recovery (commit, push, create PR) was removed in favor of
+    explicit failure labels. These tests verify the new behavior.
+    """
 
     def _make_worktree(self, tmp_path: Path) -> Path:
         """Create a fake worktree directory."""
@@ -463,172 +470,75 @@ class TestBuilderRecoveryPRBody:
     @patch("loom_tools.validate_phase.subprocess.run")
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_recovery_pr_body_includes_commits(
+    def test_worktree_with_changes_fails_instead_of_recovering(
         self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
     ):
-        """Verify commit messages are included in recovery PR body."""
+        """Verify that uncommitted changes result in failure, not recovery."""
         repo = _make_repo(tmp_path)
         wt = self._make_worktree(tmp_path)
 
-        # Setup mocks
         mock_gh.return_value = _completed(stdout="OPEN\n")  # issue state
         mock_find.return_value = None  # no existing PR
-
-        # Track subprocess calls to verify PR body
-        pr_body_captured = []
 
         def side_effect_fn(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
             # git -C worktree status --porcelain
             if "status" in cmd and "--porcelain" in cmd:
-                return _completed(stdout="M src/file.py\n")
-            # git -C worktree add -A
-            if "add" in cmd and "-A" in cmd:
+                return _completed(stdout="M src/file.py\n")  # Has changes
+            # git -C worktree log --oneline @{upstream}..HEAD
+            if "log" in cmd and "@{upstream}" in cmd:
+                return _completed(stdout="abc123 Some commit\n")  # Has unpushed commits
+            # gh issue edit (for _mark_phase_failed)
+            if "gh" in cmd and "issue" in cmd and "edit" in cmd:
                 return _completed()
-            # git -C worktree commit
-            if "commit" in cmd:
+            # gh issue comment (for _mark_phase_failed)
+            if "gh" in cmd and "issue" in cmd and "comment" in cmd:
                 return _completed()
-            # git -C worktree rev-parse --abbrev-ref HEAD
-            if "rev-parse" in cmd and "--abbrev-ref" in cmd and "HEAD" in cmd:
-                return _completed(stdout="feature/issue-42\n")
-            # git -C worktree rev-parse --abbrev-ref @{upstream}
-            if "rev-parse" in cmd and "@{upstream}" in cmd:
-                return _completed(returncode=1)  # no upstream
-            # git -C worktree push
-            if "push" in cmd:
-                return _completed()
-            # git -C worktree log --oneline main..HEAD
-            if "log" in cmd and "--oneline" in cmd and "main..HEAD" in cmd:
-                return _completed(stdout="abc1234 First commit\ndef5678 Second commit\n")
-            # git -C worktree diff --stat main..HEAD
-            if "diff" in cmd and "--stat" in cmd:
-                return _completed(stdout=" src/file.py | 10 ++++++++++\n 1 file changed, 10 insertions(+)\n")
-            # gh pr create
-            if "gh" in cmd and "pr" in cmd and "create" in cmd:
-                # Capture the body argument
-                for i, arg in enumerate(cmd):
-                    if arg == "--body" and i + 1 < len(cmd):
-                        pr_body_captured.append(cmd[i + 1])
-                return _completed(stdout="https://github.com/test/repo/pull/123\n")
             return _completed()
 
         mock_run.side_effect = side_effect_fn
 
         result = validate_builder(42, repo, worktree=str(wt))
 
-        assert result.status == ValidationStatus.RECOVERED
-        assert len(pr_body_captured) == 1
-        body = pr_body_captured[0]
-        assert "## Commits" in body
-        assert "abc1234 First commit" in body
-        assert "def5678 Second commit" in body
+        # Should FAIL, not RECOVER - no auto-recovery anymore
+        assert result.status == ValidationStatus.FAILED
+        assert "no auto-recovery" in result.message.lower()
 
     @patch("loom_tools.validate_phase.subprocess.run")
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_recovery_pr_body_includes_file_stats(
+    def test_failure_applies_correct_label(
         self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
     ):
-        """Verify file statistics are included in recovery PR body."""
+        """Verify failure applies loom:failed:builder label."""
         repo = _make_repo(tmp_path)
         wt = self._make_worktree(tmp_path)
 
         mock_gh.return_value = _completed(stdout="OPEN\n")
         mock_find.return_value = None
 
-        pr_body_captured = []
+        label_calls = []
 
         def side_effect_fn(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
             if "status" in cmd and "--porcelain" in cmd:
                 return _completed(stdout="M src/file.py\n")
-            if "add" in cmd and "-A" in cmd:
+            if "log" in cmd and "@{upstream}" in cmd:
+                return _completed(stdout="abc123 Commit\n")
+            if "gh" in cmd and "issue" in cmd and "edit" in cmd:
+                label_calls.append(cmd)
                 return _completed()
-            if "commit" in cmd:
+            if "gh" in cmd and "issue" in cmd and "comment" in cmd:
                 return _completed()
-            if "rev-parse" in cmd and "--abbrev-ref" in cmd and "HEAD" in cmd:
-                return _completed(stdout="feature/issue-42\n")
-            if "rev-parse" in cmd and "@{upstream}" in cmd:
-                return _completed(returncode=1)
-            if "push" in cmd:
-                return _completed()
-            if "log" in cmd and "--oneline" in cmd and "main..HEAD" in cmd:
-                return _completed(stdout="abc1234 Some commit\n")
-            if "diff" in cmd and "--stat" in cmd:
-                return _completed(stdout=" src/file.py | 10 ++++++++++\n 1 file changed, 10 insertions(+)\n")
-            if "gh" in cmd and "pr" in cmd and "create" in cmd:
-                for i, arg in enumerate(cmd):
-                    if arg == "--body" and i + 1 < len(cmd):
-                        pr_body_captured.append(cmd[i + 1])
-                return _completed(stdout="https://github.com/test/repo/pull/123\n")
             return _completed()
 
         mock_run.side_effect = side_effect_fn
 
         result = validate_builder(42, repo, worktree=str(wt))
 
-        assert result.status == ValidationStatus.RECOVERED
-        assert len(pr_body_captured) == 1
-        body = pr_body_captured[0]
-        assert "## Changes" in body
-        assert "src/file.py" in body
-        assert "10 insertions" in body
-
-    @patch("loom_tools.validate_phase.subprocess.run")
-    @patch("loom_tools.validate_phase._find_pr_for_issue")
-    @patch("loom_tools.validate_phase._run_gh")
-    def test_recovery_pr_body_fallback_on_git_failures(
-        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
-    ):
-        """Verify graceful fallback if git log/diff commands fail."""
-        repo = _make_repo(tmp_path)
-        wt = self._make_worktree(tmp_path)
-
-        mock_gh.return_value = _completed(stdout="OPEN\n")
-        mock_find.return_value = None
-
-        pr_body_captured = []
-
-        def side_effect_fn(*args, **kwargs):
-            cmd = args[0] if args else kwargs.get("args", [])
-            if "status" in cmd and "--porcelain" in cmd:
-                return _completed(stdout="M src/file.py\n")
-            if "add" in cmd and "-A" in cmd:
-                return _completed()
-            if "commit" in cmd:
-                return _completed()
-            if "rev-parse" in cmd and "--abbrev-ref" in cmd and "HEAD" in cmd:
-                return _completed(stdout="feature/issue-42\n")
-            if "rev-parse" in cmd and "@{upstream}" in cmd:
-                return _completed(returncode=1)
-            if "push" in cmd:
-                return _completed()
-            # Both log and diff fail - should still create PR
-            if "log" in cmd and "--oneline" in cmd and "main..HEAD" in cmd:
-                return _completed(returncode=1, stderr="fatal: bad revision")
-            if "diff" in cmd and "--stat" in cmd:
-                return _completed(returncode=1, stderr="fatal: bad revision")
-            if "gh" in cmd and "pr" in cmd and "create" in cmd:
-                for i, arg in enumerate(cmd):
-                    if arg == "--body" and i + 1 < len(cmd):
-                        pr_body_captured.append(cmd[i + 1])
-                return _completed(stdout="https://github.com/test/repo/pull/123\n")
-            return _completed()
-
-        mock_run.side_effect = side_effect_fn
-
-        result = validate_builder(42, repo, worktree=str(wt))
-
-        # Recovery should still succeed
-        assert result.status == ValidationStatus.RECOVERED
-        assert len(pr_body_captured) == 1
-        body = pr_body_captured[0]
-        # Should have basic info but not the sections that failed
-        assert "Closes #42" in body
-        assert "_PR created by shepherd recovery" in body
-        # Should NOT have sections since git commands failed
-        assert "## Commits" not in body
-        assert "## Changes" not in body
+        assert result.status == ValidationStatus.FAILED
+        assert len(label_calls) == 1
+        assert "loom:failed:builder" in label_calls[0]
 
 
 # ---------------------------------------------------------------------------
@@ -653,14 +563,17 @@ class TestValidateJudge:
         assert result.status == ValidationStatus.SATISFIED
         assert "changes requested" in result.message.lower()
 
-    @patch("loom_tools.validate_phase._mark_blocked")
+    @patch("loom_tools.validate_phase._mark_phase_failed")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_neither_label(self, mock_gh: MagicMock, mock_blocked: MagicMock, tmp_path: Path):
+    def test_neither_label(self, mock_gh: MagicMock, mock_phase_failed: MagicMock, tmp_path: Path):
         repo = _make_repo(tmp_path)
         mock_gh.return_value = _completed(stdout="loom:review-requested\n")
         result = validate_judge(42, repo, pr_number=100)
         assert result.status == ValidationStatus.FAILED
-        mock_blocked.assert_called_once()
+        mock_phase_failed.assert_called_once()
+        # Verify failure_label is passed
+        call_kwargs = mock_phase_failed.call_args[1]
+        assert call_kwargs.get("failure_label") == "loom:failed:judge"
 
     @patch("loom_tools.validate_phase._run_gh")
     def test_neither_label_check_only(self, mock_gh: MagicMock, tmp_path: Path):
@@ -696,14 +609,17 @@ class TestValidateDoctor:
         result = validate_doctor(42, repo, pr_number=100)
         assert result.status == ValidationStatus.SATISFIED
 
-    @patch("loom_tools.validate_phase._mark_blocked")
+    @patch("loom_tools.validate_phase._mark_phase_failed")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_missing_label(self, mock_gh: MagicMock, mock_blocked: MagicMock, tmp_path: Path):
+    def test_missing_label(self, mock_gh: MagicMock, mock_phase_failed: MagicMock, tmp_path: Path):
         repo = _make_repo(tmp_path)
         mock_gh.return_value = _completed(stdout="loom:pr\n")
         result = validate_doctor(42, repo, pr_number=100)
         assert result.status == ValidationStatus.FAILED
-        mock_blocked.assert_called_once()
+        mock_phase_failed.assert_called_once()
+        # Verify failure_label is passed
+        call_kwargs = mock_phase_failed.call_args[1]
+        assert call_kwargs.get("failure_label") == "loom:failed:doctor"
 
     @patch("loom_tools.validate_phase._run_gh")
     def test_missing_label_check_only(self, mock_gh: MagicMock, tmp_path: Path):

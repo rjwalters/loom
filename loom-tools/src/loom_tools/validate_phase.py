@@ -1,12 +1,17 @@
-"""Validate shepherd phase contracts and attempt recovery.
+"""Validate shepherd phase contracts.
 
 Ports the logic from ``defaults/scripts/validate-phase.sh`` to a Python module
 with both a programmatic API and a CLI (``loom-validate-phase``).
 
 Phase contract validators check that the expected artifacts exist after a
 shepherd phase completes (e.g. the builder created a PR with the correct
-label).  When a contract is not satisfied the validator may attempt recovery
-(adding a missing label, committing and pushing worktree changes, etc.).
+label). When a contract is not satisfied, the validator marks the issue with
+an appropriate failure label (e.g., ``loom:failed:builder``) and provides
+diagnostic information for manual intervention.
+
+Note: Auto-recovery was removed in favor of explicit failure visibility.
+Failures now result in clear labels and diagnostic comments instead of
+attempting to commit/push/create PRs automatically.
 """
 
 from __future__ import annotations
@@ -206,19 +211,34 @@ def _log_recovery_event(
         log_warning(f"Failed to write recovery event to {recovery_file}")
 
 
-def _mark_blocked(
+def _mark_phase_failed(
     issue: int,
     phase: str,
     reason: str,
     repo_root: Path,
     diagnostics: str = "",
+    *,
+    failure_label: str | None = None,
 ) -> None:
-    """Atomic ``loom:building`` -> ``loom:blocked`` transition + issue comment."""
+    """Mark issue with phase-specific failure label and add comment.
+
+    Args:
+        issue: Issue number
+        phase: Phase name (e.g., "builder", "judge")
+        reason: Human-readable failure reason
+        repo_root: Repository root path
+        diagnostics: Optional diagnostic markdown to append
+        failure_label: Specific failure label to apply (e.g., "loom:failed:builder")
+                      If None, uses "loom:blocked" as fallback
+    """
+    # Determine label to apply
+    target_label = failure_label or "loom:blocked"
+
     subprocess.run(
         [
             "gh", "issue", "edit", str(issue),
             "--remove-label", "loom:building",
-            "--add-label", "loom:blocked",
+            "--add-label", target_label,
         ],
         capture_output=True,
         check=False,
@@ -241,6 +261,10 @@ def _mark_blocked(
         check=False,
         cwd=repo_root,
     )
+
+
+# Keep old name for backwards compatibility
+_mark_blocked = _mark_phase_failed
 
 
 # ---------------------------------------------------------------------------
@@ -611,27 +635,29 @@ def validate_builder(
             f"No PR found for issue #{issue} (check-only mode, no recovery attempted)",
         )
 
-    # Attempt worktree recovery
+    # No PR found and no worktree - fail with clear message
     if not worktree:
         msg = (
             f"No PR found (searched by branch 'feature/issue-{issue}' and keywords) "
             "and no worktree path provided"
         )
-        _mark_blocked(
+        _mark_phase_failed(
             issue, "builder",
             f"Builder did not create a PR. Searched for: branch 'feature/issue-{issue}' "
-            f"and 'Closes/Fixes/Resolves #{issue}' in PR body. No worktree available for recovery.",
+            f"and 'Closes/Fixes/Resolves #{issue}' in PR body. No worktree available.",
             repo_root,
+            failure_label="loom:failed:builder",
         )
         return ValidationResult("builder", issue, ValidationStatus.FAILED, msg)
 
     wt = Path(worktree)
     if not wt.is_dir():
         diag = _gather_builder_diagnostics(issue, worktree, repo_root)
-        _mark_blocked(
+        _mark_phase_failed(
             issue, "builder",
             "Builder did not create a PR and worktree path does not exist.",
             repo_root, diag.to_markdown(),
+            failure_label="loom:failed:builder",
         )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED,
@@ -644,10 +670,11 @@ def validate_builder(
         capture_output=True, text=True, check=False,
     )
     if r.returncode != 0:
-        _mark_blocked(
+        _mark_phase_failed(
             issue, "builder",
             "Builder did not create a PR and worktree is not a valid git directory.",
             repo_root,
+            failure_label="loom:failed:builder",
         )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED, "Could not check worktree status",
@@ -663,14 +690,15 @@ def validate_builder(
         )
         if not (r.stdout.strip() if r.returncode == 0 else ""):
             diag = _gather_builder_diagnostics(issue, worktree, repo_root)
-            _mark_blocked(
+            _mark_phase_failed(
                 issue, "builder",
                 "Builder did not create a PR. Worktree had no uncommitted or unpushed changes.",
                 repo_root, diag.to_markdown(),
+                failure_label="loom:failed:builder",
             )
             return ValidationResult(
                 "builder", issue, ValidationStatus.FAILED,
-                "No PR found and no changes in worktree to recover.",
+                "No PR found and no changes in worktree.",
             )
 
     # Guard: only marker files?
@@ -682,144 +710,32 @@ def validate_builder(
         ]
         if not substantive:
             diag = _gather_builder_diagnostics(issue, worktree, repo_root)
-            _mark_blocked(
+            _mark_phase_failed(
                 issue, "builder",
                 "Builder did not produce substantive changes. "
                 "Only marker/infrastructure files were found in the worktree.",
                 repo_root, diag.to_markdown(),
+                failure_label="loom:failed:builder",
             )
             return ValidationResult(
                 "builder", issue, ValidationStatus.FAILED,
                 "No substantive changes to recover (only marker files found).",
             )
 
-    # Recovery: commit, push, create PR
-    _report_milestone("heartbeat", task_id, repo_root, action="recovery: attempting builder worktree recovery")
-
-    # Commit uncommitted changes
-    if status_output:
-        r = subprocess.run(
-            ["git", "-C", worktree, "add", "-A"],
-            capture_output=True, text=True, check=False,
-        )
-        if r.returncode != 0:
-            _mark_blocked(issue, "builder", "Recovery failed: could not stage worktree changes.", repo_root)
-            return ValidationResult("builder", issue, ValidationStatus.FAILED, "Could not stage changes")
-
-        r = subprocess.run(
-            ["git", "-C", worktree, "commit", "-m",
-             f"Auto-commit: builder did not complete workflow for #{issue}"],
-            capture_output=True, text=True, check=False,
-        )
-        if r.returncode != 0:
-            _mark_blocked(issue, "builder", "Recovery failed: could not commit worktree changes.", repo_root)
-            return ValidationResult("builder", issue, ValidationStatus.FAILED, "Could not commit changes")
-
-    # Get branch name
-    r = subprocess.run(
-        ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "HEAD"],
-        capture_output=True, text=True, check=False,
+    # No auto-recovery: fail with diagnostics
+    # Builder failed to create a PR. Mark the issue with failure label and
+    # provide diagnostics for manual intervention.
+    diag = _gather_builder_diagnostics(issue, worktree, repo_root)
+    _mark_phase_failed(
+        issue, "builder",
+        "Builder did not create a PR. Worktree has uncommitted or unpushed changes "
+        "that require manual review.",
+        repo_root, diag.to_markdown(),
+        failure_label="loom:failed:builder",
     )
-    if r.returncode != 0:
-        _mark_blocked(issue, "builder", "Recovery failed: could not determine worktree branch.", repo_root)
-        return ValidationResult("builder", issue, ValidationStatus.FAILED, "Could not determine branch name")
-    branch = r.stdout.strip()
-
-    # Push
-    r = subprocess.run(
-        ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "@{upstream}"],
-        capture_output=True, text=True, check=False,
-    )
-    if r.returncode != 0:
-        # No upstream — push with -u
-        r = subprocess.run(
-            ["git", "-C", worktree, "push", "-u", "origin", branch],
-            capture_output=True, text=True, check=False,
-        )
-    else:
-        r = subprocess.run(
-            ["git", "-C", worktree, "push"],
-            capture_output=True, text=True, check=False,
-        )
-    if r.returncode != 0:
-        _mark_blocked(issue, "builder", "Recovery failed: could not push worktree branch.", repo_root)
-        return ValidationResult("builder", issue, ValidationStatus.FAILED, "Could not push branch")
-
-    # Gather commit messages for PR body (best effort - don't fail recovery if this fails)
-    commit_messages = ""
-    r = subprocess.run(
-        ["git", "-C", worktree, "log", "--oneline", "main..HEAD"],
-        capture_output=True, text=True, check=False,
-    )
-    if r.returncode == 0:
-        commit_messages = r.stdout.strip()
-
-    # Gather file change statistics for PR body (best effort)
-    diff_stats = ""
-    r = subprocess.run(
-        ["git", "-C", worktree, "diff", "--stat", "main..HEAD"],
-        capture_output=True, text=True, check=False,
-    )
-    if r.returncode == 0:
-        diff_stats = r.stdout.strip()
-
-    # Build enhanced PR body
-    body_parts = [
-        f"Closes #{issue}",
-        "",
-        "_PR created by shepherd recovery after builder failed to complete workflow._",
-    ]
-
-    if commit_messages:
-        body_parts.extend(["", "## Commits", "```", commit_messages, "```"])
-
-    if diff_stats:
-        body_parts.extend(["", "## Changes", "```", diff_stats, "```"])
-
-    pr_body = "\n".join(body_parts)
-
-    # Create PR
-    r = subprocess.run(
-        [
-            "gh", "pr", "create",
-            "--head", branch,
-            "--label", "loom:review-requested",
-            "--title", f"Issue #{issue}: Auto-recovered PR",
-            "--body", pr_body,
-        ],
-        capture_output=True, text=True, check=False, cwd=repo_root,
-    )
-    if r.returncode != 0:
-        _mark_blocked(issue, "builder", "Recovery failed: could not create PR from worktree.", repo_root)
-        return ValidationResult("builder", issue, ValidationStatus.FAILED, "Could not create PR")
-
-    new_pr = r.stdout.strip()
-    _report_milestone("heartbeat", task_id, repo_root, action="recovery: created PR from worktree")
-
-    # Extract PR number from URL (e.g., "https://github.com/owner/repo/pull/123")
-    created_pr_num: int | None = None
-    if "/pull/" in new_pr:
-        try:
-            created_pr_num = int(new_pr.split("/pull/")[-1].split("?")[0])
-        except ValueError:
-            pass
-
-    # Determine recovery type based on what we did
-    recovery_type = "commit_and_pr" if status_output else "pr_only"
-
-    _log_recovery_event(
-        issue=issue,
-        recovery_type=recovery_type,
-        reason="validation_failed",
-        repo_root=repo_root,
-        worktree_had_changes=bool(status_output),
-        commits_recovered=1 if status_output else 0,
-        pr_number=created_pr_num,
-    )
-
     return ValidationResult(
-        "builder", issue, ValidationStatus.RECOVERED,
-        f"Created PR from worktree changes: {new_pr}", "create_pr",
+        "builder", issue, ValidationStatus.FAILED,
+        "No PR found. Builder failed without creating PR (no auto-recovery).",
     )
 
 
@@ -860,7 +776,12 @@ def validate_judge(
 
     msg = f"Judge did not produce loom:pr or loom:changes-requested on PR #{pr_number}"
     if not check_only:
-        _mark_blocked(issue, "judge", f"Judge phase did not produce a review decision on PR #{pr_number}.", repo_root)
+        _mark_phase_failed(
+            issue, "judge",
+            f"Judge phase did not produce a review decision on PR #{pr_number}.",
+            repo_root,
+            failure_label="loom:failed:judge",
+        )
 
     return ValidationResult("judge", issue, ValidationStatus.FAILED, msg)
 
@@ -896,7 +817,12 @@ def validate_doctor(
 
     msg = f"Doctor did not re-request review on PR #{pr_number}"
     if not check_only:
-        _mark_blocked(issue, "doctor", f"Doctor phase did not apply loom:review-requested to PR #{pr_number}.", repo_root)
+        _mark_phase_failed(
+            issue, "doctor",
+            f"Doctor phase did not apply loom:review-requested to PR #{pr_number}.",
+            repo_root,
+            failure_label="loom:failed:doctor",
+        )
 
     return ValidationResult("doctor", issue, ValidationStatus.FAILED, msg)
 
