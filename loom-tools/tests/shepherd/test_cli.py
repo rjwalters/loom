@@ -13,6 +13,7 @@ import pytest
 
 from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
+    _check_main_repo_clean,
     _create_config,
     _mark_builder_no_pr,
     _mark_judge_exhausted,
@@ -71,6 +72,16 @@ class TestParseArgs:
         """Should parse --task-id."""
         args = _parse_args(["42", "--task-id", "abc1234"])
         assert args.task_id == "abc1234"
+
+    def test_parses_allow_dirty_main(self) -> None:
+        """Should parse --allow-dirty-main flag."""
+        args = _parse_args(["42", "--allow-dirty-main"])
+        assert args.allow_dirty_main is True
+
+    def test_allow_dirty_main_default_false(self) -> None:
+        """--allow-dirty-main should default to False."""
+        args = _parse_args(["42"])
+        assert args.allow_dirty_main is False
 
 
 class TestCreateConfig:
@@ -306,6 +317,74 @@ class TestMain:
 
         # Navigate must be called before context is created
         assert call_order == ["navigate", "context"]
+
+    def test_dirty_main_blocks_without_flag(self) -> None:
+        """main should exit with 1 when repo is dirty and no --allow-dirty-main."""
+        with patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]):
+            result = main(["42"])
+            assert result == 1
+
+    def test_dirty_main_proceeds_with_flag(self) -> None:
+        """main should proceed when repo is dirty but --allow-dirty-main is set."""
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=0), \
+             patch("loom_tools.shepherd.cli.ShepherdContext"), \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]):
+            result = main(["42", "--allow-dirty-main"])
+            assert result == 0
+
+    def test_clean_repo_proceeds(self) -> None:
+        """main should proceed when repo is clean."""
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=0), \
+             patch("loom_tools.shepherd.cli.ShepherdContext"), \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=[]):
+            result = main(["42"])
+            assert result == 0
+
+
+class TestCheckMainRepoClean:
+    """Tests for _check_main_repo_clean pre-flight check (issue #1996)."""
+
+    def test_returns_true_when_clean(self) -> None:
+        """Should return True when no uncommitted files."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=[]):
+            result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=False)
+            assert result is True
+
+    def test_returns_false_when_dirty_and_not_allowed(self) -> None:
+        """Should return False when files are dirty and not allowed."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]):
+            result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=False)
+            assert result is False
+
+    def test_returns_true_when_dirty_but_allowed(self) -> None:
+        """Should return True when files are dirty but allowed."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]):
+            result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
+            assert result is True
+
+    def test_logs_warning_with_file_list(self) -> None:
+        """Should log warning with list of changed files."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py", "?? new.txt"]), \
+             patch("loom_tools.shepherd.cli.log_warning") as mock_warn:
+            _check_main_repo_clean(Path("/fake/repo"), allow_dirty=False)
+            mock_warn.assert_called()
+            # First call should mention the count
+            assert "2 uncommitted" in mock_warn.call_args_list[0][0][0]
+
+    def test_truncates_long_file_list(self) -> None:
+        """Should truncate file list at 10 files."""
+        files = [f"M file{i}.py" for i in range(15)]
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=files), \
+             patch("loom_tools.shepherd.cli.log_warning"):
+            # Just check it doesn't crash with many files
+            result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
+            assert result is True
 
 
 def _make_ctx(
