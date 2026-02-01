@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
+from unittest import mock
+
+from loom_tools.shepherd.config import QualityGateLevel, QualityGates
 from loom_tools.shepherd.issue_quality import (
+    QualityFinding,
     Severity,
     ValidationResult,
     validate_issue_quality,
+    validate_issue_quality_with_gates,
 )
 
 
@@ -299,8 +305,6 @@ class TestValidationResult:
 
     def test_filters_infos(self) -> None:
         """infos property should only return INFO severity."""
-        from loom_tools.shepherd.issue_quality import QualityFinding
-
         result = ValidationResult(
             findings=[
                 QualityFinding(severity=Severity.INFO, message="i1"),
@@ -309,3 +313,192 @@ class TestValidationResult:
         )
         assert len(result.infos) == 2
         assert len(result.warnings) == 0
+
+    def test_filters_blocks(self) -> None:
+        """blocks property should only return BLOCK severity."""
+        result = ValidationResult(
+            findings=[
+                QualityFinding(severity=Severity.BLOCK, message="b1"),
+                QualityFinding(severity=Severity.WARNING, message="w1"),
+                QualityFinding(severity=Severity.BLOCK, message="b2"),
+            ]
+        )
+        assert len(result.blocks) == 2
+        assert len(result.warnings) == 1
+
+    def test_has_blocking_findings_true(self) -> None:
+        """has_blocking_findings returns True when BLOCK findings exist."""
+        result = ValidationResult(
+            findings=[
+                QualityFinding(severity=Severity.BLOCK, message="b1"),
+                QualityFinding(severity=Severity.WARNING, message="w1"),
+            ]
+        )
+        assert result.has_blocking_findings is True
+
+    def test_has_blocking_findings_false(self) -> None:
+        """has_blocking_findings returns False when no BLOCK findings."""
+        result = ValidationResult(
+            findings=[
+                QualityFinding(severity=Severity.WARNING, message="w1"),
+                QualityFinding(severity=Severity.INFO, message="i1"),
+            ]
+        )
+        assert result.has_blocking_findings is False
+
+
+class TestValidateIssueQualityWithGates:
+    """Test validate_issue_quality_with_gates function with configurable gates."""
+
+    def test_default_gates_no_blocks(self) -> None:
+        """Default quality gates should not produce BLOCK findings."""
+        body = "Just a vague description without any sections."
+        gates = QualityGates()  # Default: info/warn levels only
+        result = validate_issue_quality_with_gates(body, gates)
+        assert len(result.blocks) == 0
+
+    def test_strict_gates_missing_ac_blocks(self) -> None:
+        """Strict gates should produce BLOCK finding for missing acceptance criteria."""
+        body = """## Summary
+
+Some description without acceptance criteria.
+
+## Test Plan
+
+- [ ] Test it
+"""
+        gates = QualityGates.strict()
+        result = validate_issue_quality_with_gates(body, gates)
+        assert len(result.blocks) == 1
+        assert "acceptance criteria" in result.blocks[0].message.lower()
+
+    def test_strict_gates_with_ac_no_block(self) -> None:
+        """Strict gates should not block when acceptance criteria exist."""
+        body = """## Summary
+
+Some description.
+
+## Acceptance Criteria
+
+- [ ] Feature works correctly
+
+## Test Plan
+
+- [ ] Unit test
+"""
+        gates = QualityGates.strict()
+        result = validate_issue_quality_with_gates(body, gates)
+        assert len(result.blocks) == 0
+
+    def test_custom_gates_test_plan_blocks(self) -> None:
+        """Custom gates can make test plan check block."""
+        body = """## Acceptance Criteria
+
+- [ ] Feature works
+
+Modify `builder.py` to implement.
+"""
+        gates = QualityGates(test_plan=QualityGateLevel.BLOCK)
+        result = validate_issue_quality_with_gates(body, gates)
+        assert result.has_blocking_findings is True
+        assert any("test plan" in f.message.lower() for f in result.blocks)
+
+    def test_custom_gates_file_refs_blocks(self) -> None:
+        """Custom gates can make file references check block."""
+        body = """## Acceptance Criteria
+
+- [ ] Feature works
+
+## Test Plan
+
+- [ ] Test it
+"""
+        gates = QualityGates(file_refs=QualityGateLevel.BLOCK)
+        result = validate_issue_quality_with_gates(body, gates)
+        assert result.has_blocking_findings is True
+        assert any("file" in f.message.lower() for f in result.blocks)
+
+    def test_custom_gates_vague_criteria_blocks(self) -> None:
+        """Custom gates can make vague criteria check block."""
+        body = """## Acceptance Criteria
+
+- [ ] Make it better
+
+## Test Plan
+
+- [ ] Test it
+
+Modify `builder.py`.
+"""
+        gates = QualityGates(vague_criteria=QualityGateLevel.BLOCK)
+        result = validate_issue_quality_with_gates(body, gates)
+        assert result.has_blocking_findings is True
+        assert any("vague" in f.message.lower() for f in result.blocks)
+
+    def test_all_info_gates_no_warnings(self) -> None:
+        """When all gates are INFO, findings should be INFO level."""
+        body = "Vague description."
+        gates = QualityGates(
+            test_plan=QualityGateLevel.INFO,
+            file_refs=QualityGateLevel.INFO,
+            acceptance_criteria=QualityGateLevel.INFO,
+            vague_criteria=QualityGateLevel.INFO,
+        )
+        result = validate_issue_quality_with_gates(body, gates)
+        assert len(result.blocks) == 0
+        assert len(result.warnings) == 0
+        assert len(result.infos) > 0
+
+
+class TestQualityGatesEnvironment:
+    """Test quality gates environment variable configuration."""
+
+    def test_env_var_test_plan_block(self) -> None:
+        """LOOM_QUALITY_TEST_PLAN=block should set test_plan to BLOCK."""
+        with mock.patch.dict(os.environ, {"LOOM_QUALITY_TEST_PLAN": "block"}):
+            gates = QualityGates()
+            assert gates.test_plan == QualityGateLevel.BLOCK
+
+    def test_env_var_acceptance_block(self) -> None:
+        """LOOM_QUALITY_ACCEPTANCE=block should set acceptance_criteria to BLOCK."""
+        with mock.patch.dict(os.environ, {"LOOM_QUALITY_ACCEPTANCE": "block"}):
+            gates = QualityGates()
+            assert gates.acceptance_criteria == QualityGateLevel.BLOCK
+
+    def test_env_var_file_refs_warn(self) -> None:
+        """LOOM_QUALITY_FILE_REFS=warn should set file_refs to WARN."""
+        with mock.patch.dict(os.environ, {"LOOM_QUALITY_FILE_REFS": "warn"}):
+            gates = QualityGates()
+            assert gates.file_refs == QualityGateLevel.WARN
+
+    def test_env_var_vague_info(self) -> None:
+        """LOOM_QUALITY_VAGUE=info should set vague_criteria to INFO."""
+        with mock.patch.dict(os.environ, {"LOOM_QUALITY_VAGUE": "info"}):
+            gates = QualityGates()
+            assert gates.vague_criteria == QualityGateLevel.INFO
+
+    def test_env_var_case_insensitive(self) -> None:
+        """Environment variable values should be case-insensitive."""
+        with mock.patch.dict(os.environ, {"LOOM_QUALITY_TEST_PLAN": "BLOCK"}):
+            gates = QualityGates()
+            assert gates.test_plan == QualityGateLevel.BLOCK
+
+    def test_env_var_invalid_uses_default(self) -> None:
+        """Invalid environment variable value should use default."""
+        with mock.patch.dict(os.environ, {"LOOM_QUALITY_TEST_PLAN": "invalid"}):
+            gates = QualityGates()
+            assert gates.test_plan == QualityGateLevel.INFO  # Default
+
+
+class TestSeverityEnum:
+    """Test Severity enum."""
+
+    def test_block_severity_exists(self) -> None:
+        """BLOCK severity level should exist."""
+        assert Severity.BLOCK.value == "block"
+
+    def test_severity_values(self) -> None:
+        """All severity values should be correct."""
+        assert Severity.BLOCK.value == "block"
+        assert Severity.WARNING.value == "warning"
+        assert Severity.INFO.value == "info"

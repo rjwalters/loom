@@ -20,6 +20,7 @@ from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.issue_quality import (
     Severity,
     validate_issue_quality,
+    validate_issue_quality_with_gates,
 )
 from loom_tools.shepherd.labels import (
     add_issue_label,
@@ -140,8 +141,14 @@ class BuilderPhase:
         add_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
-        # Pre-flight issue quality validation (informational only)
-        self._run_quality_validation(ctx)
+        # Pre-flight issue quality validation (may block with configured gates)
+        quality_result = self._run_quality_validation(ctx)
+        if quality_result is not None:
+            # Quality validation blocked - revert claim
+            remove_issue_label(ctx.config.issue, "loom:building", ctx.repo_root)
+            add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
+            ctx.label_cache.invalidate_issue(ctx.config.issue)
+            return quality_result
 
         # Create worktree
         if ctx.worktree_path and not ctx.worktree_path.is_dir():
@@ -309,31 +316,54 @@ class BuilderPhase:
             pass
         return None
 
-    def _run_quality_validation(self, ctx: ShepherdContext) -> None:
+    def _run_quality_validation(self, ctx: ShepherdContext) -> PhaseResult | None:
         """Run pre-flight quality validation on the issue body.
 
-        Logs warnings for quality issues but never blocks the builder.
+        Logs findings at configured severity levels. Returns PhaseResult.FAILED
+        if any BLOCK-level findings exist, otherwise returns None to continue.
+
+        Returns:
+            None if validation passes (or cannot run), PhaseResult if blocked.
         """
         body = self._fetch_issue_body(ctx)
         if body is None:
-            return
+            return None
 
-        result = validate_issue_quality(body)
+        # Use quality gates from config for configurable severity
+        result = validate_issue_quality_with_gates(body, ctx.config.quality_gates)
 
         if not result.findings:
             log_info(f"Issue #{ctx.config.issue} passed pre-flight quality checks")
-            return
+            return None
 
+        # Log findings at appropriate levels
         for finding in result.findings:
-            if finding.severity == Severity.WARNING:
+            if finding.severity == Severity.BLOCK:
+                log_error(f"Issue #{ctx.config.issue} quality: {finding.message}")
+            elif finding.severity == Severity.WARNING:
                 log_warning(f"Issue #{ctx.config.issue} quality: {finding.message}")
             else:
                 log_info(f"Issue #{ctx.config.issue} quality: {finding.message}")
 
         ctx.report_milestone(
             "heartbeat",
-            action=f"issue quality: {len(result.warnings)} warning(s), {len(result.infos)} info(s)",
+            action=f"issue quality: {len(result.blocks)} block(s), {len(result.warnings)} warning(s), {len(result.infos)} info(s)",
         )
+
+        # Block if any BLOCK-level findings exist
+        if result.has_blocking_findings:
+            block_messages = [f.message for f in result.blocks]
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=f"issue quality check failed: {'; '.join(block_messages)}",
+                phase_name="builder",
+                data={
+                    "quality_blocked": True,
+                    "block_findings": block_messages,
+                },
+            )
+
+        return None
 
     def _ensure_dependencies(self, worktree: Path) -> bool:
         """Ensure project dependencies are installed in the worktree.
