@@ -487,13 +487,35 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         f"Doctor determined test failures are pre-existing ({doctor_elapsed}s)"
                     )
                     completed_phases.append("Doctor (pre-existing failures)")
+
+                    # Run validation and completion to ensure PR exists
+                    # Even with pre-existing failures, we need to verify the
+                    # builder actually committed and created a PR
+                    _print_phase_header("PHASE 3d: COMPLETION VALIDATION (pre-existing failures)")
+                    completion_start = time.time()
+                    completion_result = builder.validate_and_complete(ctx)
+                    completion_elapsed = int(time.time() - completion_start)
+                    builder_total_elapsed += completion_elapsed
+
+                    if completion_result.is_shutdown:
+                        raise ShutdownSignal(completion_result.message)
+
+                    if completion_result.status == PhaseStatus.FAILED:
+                        log_error(completion_result.message)
+                        _mark_builder_no_pr(ctx)
+                        return 1
+
                     # Continue to PR creation - pre-existing failures are acceptable
                     result = PhaseResult(
                         status=PhaseStatus.SUCCESS,
                         message="builder complete (pre-existing test failures)",
                         phase_name="builder",
-                        data={"preexisting_failures": True},
+                        data={
+                            "preexisting_failures": True,
+                            "pr_number": completion_result.data.get("pr_number"),
+                        },
                     )
+                    log_success(f"Completion validation passed ({completion_elapsed}s)")
                     break
 
                 if doctor_result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
@@ -522,14 +544,37 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 builder_total_elapsed += test_elapsed
 
                 if test_result is None:
-                    # Tests passed
+                    # Tests passed - now validate PR exists and complete if needed
                     log_success(f"Tests now pass after Doctor fixes ({test_elapsed}s)")
+
+                    # Run validation and completion to ensure PR exists
+                    # This handles the case where builder created code but
+                    # didn't commit/push/create PR before doctor fixed tests
+                    _print_phase_header("PHASE 3d: COMPLETION VALIDATION (after Doctor fixes)")
+                    completion_start = time.time()
+                    completion_result = builder.validate_and_complete(ctx)
+                    completion_elapsed = int(time.time() - completion_start)
+                    builder_total_elapsed += completion_elapsed
+
+                    if completion_result.is_shutdown:
+                        raise ShutdownSignal(completion_result.message)
+
+                    if completion_result.status == PhaseStatus.FAILED:
+                        log_error(completion_result.message)
+                        _mark_builder_no_pr(ctx)
+                        return 1
+
+                    # Use the completion result which has the PR number
                     result = PhaseResult(
                         status=PhaseStatus.SUCCESS,
                         message="builder complete (tests fixed by Doctor)",
                         phase_name="builder",
-                        data={"test_fixed_by_doctor": True},
+                        data={
+                            "test_fixed_by_doctor": True,
+                            "pr_number": completion_result.data.get("pr_number"),
+                        },
                     )
+                    log_success(f"Completion validation passed ({completion_elapsed}s)")
                     break
                 else:
                     # Tests still failing - update result and loop
