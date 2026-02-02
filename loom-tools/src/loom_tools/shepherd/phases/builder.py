@@ -369,6 +369,114 @@ class BuilderPhase:
         """
         return self._run_test_verification(ctx)
 
+    def validate_and_complete(self, ctx: ShepherdContext) -> PhaseResult:
+        """Validate builder phase and run completion if needed.
+
+        This method is used after the doctor test-fix loop succeeds to ensure
+        that a PR actually exists. If the builder made changes but didn't
+        complete the commit/push/PR workflow, this will spawn a focused
+        completion phase to finish the work.
+
+        This is the same validation and completion logic that runs at the end
+        of the normal builder.run() method, extracted for reuse.
+
+        Returns:
+            PhaseResult with SUCCESS status if PR exists or was created.
+            PhaseResult with FAILED status if completion could not be achieved.
+        """
+        # Run validation with completion retry
+        completion_attempts = 0
+        max_completion_attempts = ctx.config.builder_completion_retries
+
+        while True:
+            if self.validate(ctx):
+                break  # Validation passed
+
+            # Re-diagnose on each iteration to detect partial progress
+            diag = self._gather_diagnostics(ctx)
+
+            # Check if this is incomplete work that could be completed
+            if not self._has_incomplete_work(diag):
+                # No incomplete work pattern — nothing to retry
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"builder phase validation failed after doctor fixes: "
+                        f"{diag['summary']}"
+                    ),
+                    phase_name="builder",
+                    data={"diagnostics": diag, "completion_attempts": completion_attempts},
+                )
+
+            if completion_attempts >= max_completion_attempts:
+                # Retries exhausted — try direct fallback for mechanical ops
+                if self._direct_completion(ctx, diag):
+                    log_success("Direct completion succeeded after doctor fixes")
+                    continue  # Re-validate
+
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"builder phase validation failed after doctor fixes: "
+                        f"{diag['summary']}"
+                    ),
+                    phase_name="builder",
+                    data={"diagnostics": diag, "completion_attempts": completion_attempts},
+                )
+
+            completion_attempts += 1
+            log_warning(
+                f"Builder left incomplete work after doctor fixes "
+                f"(attempt {completion_attempts}/{max_completion_attempts}): "
+                f"{diag['summary']}"
+            )
+
+            # Run completion phase with attempt number for progressive simplification
+            completion_exit = self._run_completion_phase(
+                ctx, diag, attempt=completion_attempts
+            )
+
+            if completion_exit == 3:
+                # Shutdown during completion
+                return PhaseResult(
+                    status=PhaseStatus.SHUTDOWN,
+                    message="shutdown signal detected during completion phase",
+                    phase_name="builder",
+                )
+
+            if completion_exit == 0:
+                log_info("Completion phase finished, re-validating")
+                continue  # Re-validate
+
+            log_warning(f"Completion phase failed with exit code {completion_exit}")
+            # Loop back to re-diagnose and potentially retry
+
+        # Get PR number
+        pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+        if pr is None:
+            diag = self._gather_diagnostics(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    f"could not find PR for issue #{ctx.config.issue} after doctor fixes: "
+                    f"{diag['summary']}"
+                ),
+                phase_name="builder",
+                data={"diagnostics": diag},
+            )
+
+        ctx.pr_number = pr
+
+        # Report PR created
+        ctx.report_milestone("pr_created", pr_number=pr)
+
+        return PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message=f"builder phase complete after doctor fixes - PR #{pr} created",
+            phase_name="builder",
+            data={"pr_number": pr},
+        )
+
     def _fetch_issue_body(self, ctx: ShepherdContext) -> str | None:
         """Fetch the issue body from GitHub.
 
