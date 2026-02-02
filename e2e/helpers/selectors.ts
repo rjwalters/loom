@@ -13,14 +13,16 @@ export const selectors = {
   workspaceName: "#workspace-name",
   workspaceChangeBtn: "#change-workspace-btn",
 
-  // Terminal management - uses IDs and classes from ui/terminal-grid.ts
-  terminalContainer: "#mini-terminal-row",
-  terminalCard: ".terminal-card",
-  addTerminalBtn: "#add-terminal-btn",
-  terminalSettingsBtn: ".terminal-settings-btn",
-  terminalDeleteBtn: ".terminal-delete-btn",
-  terminalOutput: "#terminal-output",
-  terminalInput: "#terminal-input",
+  // Terminal management - uses IDs and classes from ui/terminal-primary.ts (single-session model)
+  terminalContainer: "#terminal-wrapper",
+  terminalView: "#terminal-view",
+  terminalHeader: "#terminal-header",
+  xtermContainers: "#persistent-xterm-containers",
+  terminalSettingsBtn: "#terminal-settings-btn",
+  terminalCloseBtn: "#terminal-close-btn",
+  terminalSearchBtn: "#terminal-search-btn",
+  terminalExportBtn: "#terminal-export-btn",
+  terminalClearBtn: "#terminal-clear-btn",
 
   // Terminal settings modal
   settingsModal: "#terminal-settings-modal",
@@ -41,9 +43,9 @@ export const selectors = {
   confirmResetBtn: "#confirm-reset-btn",
   cancelResetBtn: "#cancel-reset-btn",
 
-  // Primary terminal view
-  primaryTerminalContainer: "#primary-terminal",
-  primaryTerminalXterm: "#primary-terminal .xterm",
+  // Primary terminal view (same as terminal container in single-session model)
+  primaryTerminalContainer: "#terminal-wrapper",
+  primaryTerminalXterm: "#persistent-xterm-containers .xterm",
 
   // Dialogs and modals
   dialog: '[role="dialog"]',
@@ -59,7 +61,6 @@ export const selectors = {
  */
 export const textMatchers = {
   selectWorkspace: /Select.*Workspace|Choose.*Workspace|Open.*Workspace/i,
-  addTerminal: "+",
   save: "Save",
   cancel: "Cancel",
   delete: "Delete",
@@ -68,4 +69,5 @@ export const textMatchers = {
   stopEngine: "Stop",
   factoryReset: "Factory Reset",
   noWorkspace: /No workspace selected|Select a workspace/i,
+  openRepository: /Open a git repository to begin/i,
 } as const;
