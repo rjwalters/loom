@@ -476,3 +476,164 @@ class TestInstalledScriptsMatchDefaults:
         assert not mismatches, (
             f"Scripts differ from defaults (may need reinstall): {mismatches}"
         )
+
+
+class TestSourcePriorityOverInstalled:
+    """Verify loom-tools.sh library prefers source over installed CLI.
+
+    Related issue: #2085 - loom-tools source not being picked up after modifications
+
+    The run_loom_tool() function in loom-tools.sh should prefer source Python
+    modules (via PYTHONPATH) over system-installed CLI commands to ensure
+    source code changes are immediately reflected during development.
+    """
+
+    @pytest.fixture
+    def defaults_dir(self) -> pathlib.Path:
+        return _find_defaults_dir()
+
+    @pytest.fixture
+    def repo_root(self) -> pathlib.Path:
+        return _find_repo_root()
+
+    def test_loom_tools_library_exists(self, defaults_dir: pathlib.Path) -> None:
+        """loom-tools.sh library should exist."""
+        lib = defaults_dir / "scripts" / "lib" / "loom-tools.sh"
+        assert lib.exists(), "loom-tools.sh library not found"
+
+    def test_source_priority_in_documentation(
+        self, defaults_dir: pathlib.Path
+    ) -> None:
+        """loom-tools.sh documentation should indicate source-first priority."""
+        lib = defaults_dir / "scripts" / "lib" / "loom-tools.sh"
+        content = lib.read_text()
+
+        # Find run_loom_tool function documentation specifically
+        func_start = content.find("run_loom_tool()")
+        assert func_start != -1, "run_loom_tool() function not found"
+
+        # Extract just the comment block before the function
+        func_section = content[:func_start].split("\n")
+        # Find the last "# Priority:" before the function
+        priority_section_start = None
+        for i, line in enumerate(func_section):
+            if "# Priority:" in line:
+                priority_section_start = i
+
+        assert priority_section_start is not None, (
+            "No Priority: documentation before run_loom_tool()"
+        )
+
+        # Extract priority lines (numbered items after "# Priority:")
+        priority_lines = []
+        for line in func_section[priority_section_start + 1:]:
+            stripped = line.strip()
+            if stripped.startswith("#") and any(
+                stripped.startswith(f"#   {n}.") for n in range(1, 10)
+            ):
+                priority_lines.append(line)
+            elif not stripped.startswith("#"):
+                break
+
+        assert len(priority_lines) >= 3, (
+            f"Incomplete priority documentation: {priority_lines}"
+        )
+
+        # First priority item should mention Python module or PYTHONPATH
+        first_priority = priority_lines[0].lower()
+        assert "python" in first_priority or "pythonpath" in first_priority, (
+            f"First priority should be Python/PYTHONPATH-based, got: {priority_lines[0]}"
+        )
+
+        # System CLI should NOT be first
+        assert "system" not in first_priority and "installed" not in first_priority, (
+            "System-installed CLI should not be first priority"
+        )
+
+    def test_source_check_before_system_cli(
+        self, defaults_dir: pathlib.Path
+    ) -> None:
+        """run_loom_tool() should check for source before system CLI."""
+        lib = defaults_dir / "scripts" / "lib" / "loom-tools.sh"
+        content = lib.read_text()
+
+        # Find the function body
+        func_start = content.find("run_loom_tool()")
+        assert func_start != -1, "run_loom_tool() function not found"
+
+        # Extract function body (until next top-level function or EOF)
+        func_body_start = content.find("{", func_start)
+        func_body_end = content.find("\n}", func_body_start)
+        func_body = content[func_body_start:func_body_end]
+
+        # Check order: find_loom_tools check should come before "command -v"
+        pythonpath_check = func_body.find("PYTHONPATH")
+        find_tools_check = func_body.find("find_loom_tools")
+        command_check = func_body.find('command -v "$full_cli"')
+
+        assert find_tools_check != -1, "find_loom_tools() call not found"
+        assert pythonpath_check != -1, "PYTHONPATH exec not found"
+        assert command_check != -1, "command -v fallback not found"
+
+        # Source-based execution should come before system CLI check
+        assert find_tools_check < command_check, (
+            "find_loom_tools() should be checked before system CLI"
+        )
+        assert pythonpath_check < command_check, (
+            "PYTHONPATH exec should come before system CLI fallback"
+        )
+
+    def test_fallback_to_installed_cli_exists(
+        self, defaults_dir: pathlib.Path
+    ) -> None:
+        """run_loom_tool() should still fall back to installed CLI if no source."""
+        lib = defaults_dir / "scripts" / "lib" / "loom-tools.sh"
+        content = lib.read_text()
+
+        # The fallback should use "command -v" to check for installed CLI
+        assert 'command -v "$full_cli"' in content, (
+            "Fallback to system CLI not found"
+        )
+
+        # And it should exec the CLI if found
+        assert 'exec "$full_cli"' in content, (
+            "exec for system CLI not found"
+        )
+
+    def test_pythonpath_sets_correct_source(
+        self, defaults_dir: pathlib.Path
+    ) -> None:
+        """PYTHONPATH should be set to loom-tools source directory."""
+        lib = defaults_dir / "scripts" / "lib" / "loom-tools.sh"
+        content = lib.read_text()
+
+        # Should use LOOM_TOOLS_SRC in PYTHONPATH
+        assert "LOOM_TOOLS_SRC" in content, (
+            "LOOM_TOOLS_SRC variable not used"
+        )
+        assert 'PYTHONPATH="${LOOM_TOOLS_SRC}' in content, (
+            "PYTHONPATH not set from LOOM_TOOLS_SRC"
+        )
+
+    def test_venv_checked_after_source(
+        self, defaults_dir: pathlib.Path
+    ) -> None:
+        """venv CLI should be checked after direct source but before system CLI."""
+        lib = defaults_dir / "scripts" / "lib" / "loom-tools.sh"
+        content = lib.read_text()
+
+        func_start = content.find("run_loom_tool()")
+        func_body = content[func_start:]
+
+        pythonpath_exec = func_body.find("PYTHONPATH=")
+        venv_check = func_body.find('.venv/bin/"$full_cli"')
+        command_check = func_body.find('command -v "$full_cli"')
+
+        # Order should be: PYTHONPATH source > venv > system CLI
+        if venv_check != -1:  # venv check is optional
+            assert pythonpath_exec < venv_check, (
+                "PYTHONPATH source should be checked before venv"
+            )
+            assert venv_check < command_check, (
+                "venv should be checked before system CLI"
+            )
