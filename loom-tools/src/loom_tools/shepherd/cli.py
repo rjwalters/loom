@@ -1085,14 +1085,190 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
     )
 
 
+def _gather_no_pr_diagnostics(ctx: ShepherdContext) -> dict[str, str | int | list[str]]:
+    """Gather diagnostic information when no PR was created.
+
+    Collects worktree state information to help diagnose why the builder
+    failed to create a PR.
+
+    Returns:
+        Dictionary with diagnostic information:
+        - worktree_exists: bool
+        - worktree_path: str (if exists)
+        - uncommitted_files: list of file paths with status
+        - uncommitted_count: int
+        - commits_ahead_of_main: int
+        - remote_branch_exists: bool
+        - current_branch: str or None
+        - suggested_recovery: str
+    """
+    from loom_tools.common.git import (
+        get_commit_count,
+        get_current_branch,
+        get_uncommitted_files,
+        run_git,
+    )
+
+    diagnostics: dict[str, str | int | list[str] | bool] = {}
+    worktree_path = ctx.worktree_path
+    issue = ctx.config.issue
+    branch_name = f"feature/issue-{issue}"
+
+    # Check if worktree exists
+    diagnostics["worktree_exists"] = worktree_path is not None and worktree_path.is_dir()
+    if worktree_path:
+        diagnostics["worktree_path"] = str(worktree_path)
+
+    # If worktree exists, gather git state from it
+    cwd = worktree_path if diagnostics["worktree_exists"] else ctx.repo_root
+
+    # Get uncommitted files
+    uncommitted = get_uncommitted_files(cwd=cwd)
+    diagnostics["uncommitted_files"] = uncommitted
+    diagnostics["uncommitted_count"] = len(uncommitted)
+
+    # Get commits ahead of main
+    diagnostics["commits_ahead_of_main"] = get_commit_count(base="origin/main", cwd=cwd)
+
+    # Get current branch
+    diagnostics["current_branch"] = get_current_branch(cwd=cwd)
+
+    # Check if remote branch exists
+    try:
+        result = run_git(
+            ["ls-remote", "--heads", "origin", branch_name],
+            cwd=ctx.repo_root,
+            check=False,
+        )
+        diagnostics["remote_branch_exists"] = (
+            result.returncode == 0 and bool(result.stdout.strip())
+        )
+    except Exception:
+        diagnostics["remote_branch_exists"] = False
+
+    # Determine suggested recovery
+    uncommitted_count = diagnostics["uncommitted_count"]
+    commits_ahead = diagnostics["commits_ahead_of_main"]
+    remote_exists = diagnostics["remote_branch_exists"]
+
+    if uncommitted_count > 0 and commits_ahead == 0:
+        diagnostics["suggested_recovery"] = "commit changes, push, create PR manually"
+    elif uncommitted_count > 0 and commits_ahead > 0:
+        diagnostics["suggested_recovery"] = "commit remaining changes, push, create PR manually"
+    elif commits_ahead > 0 and not remote_exists:
+        diagnostics["suggested_recovery"] = "push branch, create PR manually"
+    elif commits_ahead > 0 and remote_exists:
+        diagnostics["suggested_recovery"] = "create PR manually (branch already pushed)"
+    elif not diagnostics["worktree_exists"]:
+        diagnostics["suggested_recovery"] = "re-run shepherd or create worktree manually"
+    else:
+        diagnostics["suggested_recovery"] = "investigate worktree state, no commits found"
+
+    return diagnostics
+
+
+def _format_diagnostics_for_log(diagnostics: dict[str, str | int | list[str] | bool]) -> str:
+    """Format diagnostic information for log output."""
+    lines = ["Diagnostics:"]
+    lines.append(f"  Worktree exists: {'yes' if diagnostics.get('worktree_exists') else 'no'}"
+                 + (f" ({diagnostics.get('worktree_path')})" if diagnostics.get('worktree_exists') else ""))
+
+    uncommitted = diagnostics.get("uncommitted_files", [])
+    if uncommitted:
+        # Group files by directory prefix for readability
+        lines.append(f"  Uncommitted changes: {len(uncommitted)} file(s)")
+        # Show first few files
+        for f in uncommitted[:5]:
+            lines.append(f"    {f}")
+        if len(uncommitted) > 5:
+            lines.append(f"    ... and {len(uncommitted) - 5} more")
+    else:
+        lines.append("  Uncommitted changes: none")
+
+    lines.append(f"  Commits ahead of main: {diagnostics.get('commits_ahead_of_main', 0)}")
+    lines.append(f"  Remote branch exists: {'yes' if diagnostics.get('remote_branch_exists') else 'no'}")
+    lines.append(f"  Current branch: {diagnostics.get('current_branch') or 'unknown'}")
+    lines.append(f"  Suggested recovery: {diagnostics.get('suggested_recovery', 'unknown')}")
+    return "\n".join(lines)
+
+
+def _format_diagnostics_for_comment(
+    diagnostics: dict[str, str | int | list[str] | bool],
+    issue: int,
+) -> str:
+    """Format diagnostic information for GitHub issue comment."""
+    lines = ["**Builder phase failed**: No PR was created.",
+             "",
+             "Cannot proceed to Judge phase without a PR to review.",
+             "",
+             "### Diagnostics",
+             ""]
+
+    worktree_exists = diagnostics.get("worktree_exists", False)
+    worktree_path = diagnostics.get("worktree_path", f".loom/worktrees/issue-{issue}")
+    lines.append(f"| Property | Value |")
+    lines.append(f"|----------|-------|")
+    lines.append(f"| Worktree exists | {'yes' if worktree_exists else 'no'} |")
+    if worktree_exists:
+        lines.append(f"| Worktree path | `{worktree_path}` |")
+    lines.append(f"| Uncommitted changes | {diagnostics.get('uncommitted_count', 0)} file(s) |")
+    lines.append(f"| Commits ahead of main | {diagnostics.get('commits_ahead_of_main', 0)} |")
+    lines.append(f"| Remote branch exists | {'yes' if diagnostics.get('remote_branch_exists') else 'no'} |")
+    lines.append(f"| Current branch | `{diagnostics.get('current_branch') or 'unknown'}` |")
+
+    uncommitted = diagnostics.get("uncommitted_files", [])
+    if uncommitted:
+        lines.append("")
+        lines.append("**Uncommitted files:**")
+        for f in uncommitted[:10]:
+            lines.append(f"- `{f}`")
+        if len(uncommitted) > 10:
+            lines.append(f"- ... and {len(uncommitted) - 10} more")
+
+    lines.append("")
+    lines.append("### Suggested Recovery")
+    lines.append("")
+    suggested = diagnostics.get("suggested_recovery", "investigate worktree state")
+    lines.append(f"**{suggested}**")
+    lines.append("")
+
+    # Provide concrete recovery commands based on the state
+    if worktree_exists:
+        commits_ahead = diagnostics.get("commits_ahead_of_main", 0)
+        uncommitted_count = diagnostics.get("uncommitted_count", 0)
+        remote_exists = diagnostics.get("remote_branch_exists", False)
+
+        lines.append("```bash")
+        lines.append(f"cd {worktree_path}")
+        if uncommitted_count > 0:
+            lines.append("git add .")
+            lines.append('git commit -m "Complete implementation"')
+        if not remote_exists or commits_ahead > 0 or uncommitted_count > 0:
+            lines.append(f"git push -u origin feature/issue-{issue}")
+        lines.append(f'gh pr create --label "loom:review-requested" --body "Closes #{issue}"')
+        lines.append(f"gh issue edit {issue} --remove-label loom:failed:builder")
+        lines.append("```")
+
+    return "\n".join(lines)
+
+
 def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
     """Mark issue with loom:failed:builder because no PR was created.
 
     This handles the case where Builder completes without creating a PR,
     which is a precondition failure for the Judge phase. This covers unexpected
     errors, timeouts, or manual interruptions that leave no PR behind.
+
+    Gathers and logs diagnostic information to help operators understand
+    what state the worktree is in and how to recover.
     """
     import subprocess
+
+    # Gather diagnostic information before any state changes
+    diagnostics = _gather_no_pr_diagnostics(ctx)
+
+    # Log diagnostics to stderr for visibility
+    log_info(_format_diagnostics_for_log(diagnostics))
 
     # Atomic transition: loom:building -> loom:failed:builder
     subprocess.run(
@@ -1126,7 +1302,8 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
     )
     detect_systematic_failure(ctx.repo_root)
 
-    # Add comment
+    # Add diagnostic comment to the issue
+    comment_body = _format_diagnostics_for_comment(diagnostics, ctx.config.issue)
     subprocess.run(
         [
             "gh",
@@ -1134,9 +1311,7 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
             "comment",
             str(ctx.config.issue),
             "--body",
-            "**Builder phase failed**: No PR was created. "
-            "Cannot proceed to Judge phase without a PR to review. "
-            "Worktree and branch may be preserved for manual investigation.",
+            comment_body,
         ],
         cwd=ctx.repo_root,
         capture_output=True,
