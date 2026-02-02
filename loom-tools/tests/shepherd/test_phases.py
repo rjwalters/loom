@@ -5744,6 +5744,83 @@ class TestBuilderHasIncompleteWork:
         assert builder._has_incomplete_work(diag) is False
 
 
+class TestBuilderIsNoChangesNeeded:
+    """Test _is_no_changes_needed for detecting 'no changes needed' condition."""
+
+    def test_no_worktree_returns_false(self) -> None:
+        """Without worktree, cannot determine no changes needed."""
+        builder = BuilderPhase()
+        diag = {"worktree_exists": False}
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_worktree_with_no_work_returns_true(self) -> None:
+        """Worktree exists but no work done = no changes needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_uncommitted_changes_returns_false(self) -> None:
+        """Uncommitted changes mean work in progress, not no changes needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_commits_ahead_returns_false(self) -> None:
+        """Commits ahead mean work was done, not no changes needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "remote_branch_exists": False,
+            "pr_number": None,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_remote_branch_exists_returns_false(self) -> None:
+        """Remote branch existing means work was pushed, not no changes needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_pr_exists_returns_false(self) -> None:
+        """PR existing means work was done, not no changes needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": 100,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_handles_missing_keys_gracefully(self) -> None:
+        """Should handle missing keys by treating them as falsy."""
+        builder = BuilderPhase()
+        # Only worktree_exists is provided, all others should default
+        diag = {"worktree_exists": True}
+        assert builder._is_no_changes_needed(diag) is True
+
+
 class TestBuilderDirectCompletion:
     """Test _direct_completion for mechanical fallback operations."""
 

@@ -65,6 +65,7 @@ EXIT CODES:
     3  SHUTDOWN           - Shutdown signal received
     4  NEEDS_INTERVENTION - Stuck/blocked, needs human intervention
     5  SKIPPED            - Issue already complete (no action needed)
+    6  NO_CHANGES_NEEDED  - Problem already resolved, issue closed
 
 NOTE:
     Force mode does NOT skip the Judge phase. Code review always runs because
@@ -311,6 +312,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         - SHUTDOWN (3): Shutdown signal received
         - NEEDS_INTERVENTION (4): Stuck/blocked, needs human intervention
         - SKIPPED (5): Issue already complete
+        - NO_CHANGES_NEEDED (6): Problem already resolved, issue closed
     """
     start_time = time.time()
     completed_phases: list[str] = []
@@ -592,6 +594,14 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
             # Builder succeeded or was skipped
             if result.status == PhaseStatus.SKIPPED:
+                # Check if this is "no changes needed" (different from regular skip)
+                if result.data.get("no_changes_needed"):
+                    # Close the issue and exit successfully
+                    _handle_no_changes_needed(ctx, result)
+                    log_success(
+                        f"Issue #{ctx.config.issue} closed - no changes needed"
+                    )
+                    return ShepherdExitCode.NO_CHANGES_NEEDED
                 completed_phases.append(f"Builder ({result.message})")
             elif result.status == PhaseStatus.SUCCESS:
                 phase_durations["Builder"] = builder_total_elapsed
@@ -1317,6 +1327,76 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
         capture_output=True,
         check=False,
     )
+
+
+def _handle_no_changes_needed(ctx: ShepherdContext, result: "PhaseResult") -> None:
+    """Handle the case where Builder determined no changes are needed.
+
+    This closes the issue gracefully with an explanatory comment, indicating
+    that the reported problem doesn't exist or is already resolved on main.
+    No failure labels are applied since this is a valid completion state.
+    """
+    import subprocess
+
+    reason = result.data.get("reason", "already_resolved")
+    reason_text = {
+        "already_resolved": "The reported problem appears to be already resolved on main.",
+        "no_changes_required": "Analysis indicates no code changes are required.",
+    }.get(reason, "No changes were determined to be necessary.")
+
+    # Build comment body
+    comment_body = f"""**Shepherd complete: No changes needed**
+
+{reason_text}
+
+The Builder phase analyzed this issue and determined that:
+- No code changes are required
+- The issue can be safely closed
+
+If this is incorrect, please reopen the issue with additional context about the problem.
+"""
+
+    # Close the issue with the comment
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "close",
+            str(ctx.config.issue),
+            "--comment",
+            comment_body,
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    # Remove loom:building label if present (issue is now closed anyway)
+    subprocess.run(
+        [
+            "gh",
+            "issue",
+            "edit",
+            str(ctx.config.issue),
+            "--remove-label",
+            "loom:building",
+        ],
+        cwd=ctx.repo_root,
+        capture_output=True,
+        check=False,
+    )
+
+    # Clean up worktree if it exists
+    if ctx.worktree_path and ctx.worktree_path.is_dir():
+        from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
+
+        if is_worktree_safe_to_remove(ctx.worktree_path):
+            subprocess.run(
+                ["git", "worktree", "remove", str(ctx.worktree_path), "--force"],
+                cwd=ctx.repo_root,
+                capture_output=True,
+                check=False,
+            )
 
 
 def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:

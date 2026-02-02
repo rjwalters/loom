@@ -43,6 +43,10 @@ class TestShepherdExitCode:
         """SKIPPED should be 5."""
         assert ShepherdExitCode.SKIPPED == 5
 
+    def test_no_changes_needed_is_six(self) -> None:
+        """NO_CHANGES_NEEDED should be 6."""
+        assert ShepherdExitCode.NO_CHANGES_NEEDED == 6
+
     def test_can_use_as_int(self) -> None:
         """Exit codes should be usable as integers."""
         assert int(ShepherdExitCode.SUCCESS) == 0
@@ -93,6 +97,11 @@ class TestDescribeExitCode:
         """Should describe SKIPPED exit code."""
         desc = describe_exit_code(5)
         assert "skip" in desc.lower() or "complete" in desc.lower()
+
+    def test_describes_no_changes_needed(self) -> None:
+        """Should describe NO_CHANGES_NEEDED exit code."""
+        desc = describe_exit_code(6)
+        assert "no changes" in desc.lower() or "resolved" in desc.lower()
 
     def test_unknown_code_returns_message(self) -> None:
         """Should return message for unknown exit codes."""
