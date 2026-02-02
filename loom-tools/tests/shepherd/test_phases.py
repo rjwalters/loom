@@ -4894,13 +4894,18 @@ class TestDoctorPhaseExitCode5:
         self, mock_context: MagicMock
     ) -> None:
         """Exit code 0 should validate phase and return SUCCESS."""
-        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+        from loom_tools.shepherd.phases.doctor import (
+            CIResult,
+            CIStatus,
+            DoctorDiagnostics,
+        )
 
         doctor = DoctorPhase()
         mock_context.pr_number = 123
         mock_context.check_shutdown.return_value = False
 
         diagnostics = DoctorDiagnostics(commits_made=1)
+        ci_result = CIResult(status=CIStatus.PASSED, message="CI passed")
 
         with (
             patch(
@@ -4909,6 +4914,7 @@ class TestDoctorPhaseExitCode5:
             patch.object(doctor, "validate") as mock_validate,
             patch.object(doctor, "_get_commit_count", return_value=0),
             patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci", return_value=ci_result),
         ):
             mock_run.return_value = 0
             mock_validate.return_value = True
@@ -6524,6 +6530,8 @@ class TestDoctorFailureModes:
     ) -> None:
         """Doctor with exit 0 but validation failure should be validation_failed."""
         from loom_tools.shepherd.phases.doctor import (
+            CIResult,
+            CIStatus,
             DoctorDiagnostics,
             DoctorFailureMode,
         )
@@ -6534,6 +6542,7 @@ class TestDoctorFailureModes:
 
         # Create diagnostics that will be mutated
         diagnostics = DoctorDiagnostics(commits_made=1, pr_labels=["loom:changes-requested"])
+        ci_result = CIResult(status=CIStatus.PASSED, message="CI passed")
 
         with (
             patch(
@@ -6541,6 +6550,7 @@ class TestDoctorFailureModes:
             ) as mock_run,
             patch.object(doctor, "_get_commit_count", return_value=0),
             patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci", return_value=ci_result),
             patch.object(doctor, "validate", return_value=False),
             patch.object(doctor, "_attempt_label_recovery", return_value=False),
         ):
@@ -6554,7 +6564,7 @@ class TestDoctorFailureModes:
         self, mock_context: MagicMock
     ) -> None:
         """When validation fails but doctor made progress, should attempt recovery."""
-        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus, DoctorDiagnostics
 
         doctor = DoctorPhase()
         mock_context.pr_number = 123
@@ -6563,6 +6573,7 @@ class TestDoctorFailureModes:
         diagnostics = DoctorDiagnostics(
             commits_made=1, pr_labels=["loom:changes-requested"]
         )
+        ci_result = CIResult(status=CIStatus.PASSED, message="CI passed")
 
         with (
             patch(
@@ -6570,6 +6581,7 @@ class TestDoctorFailureModes:
             ) as mock_run,
             patch.object(doctor, "_get_commit_count", return_value=0),
             patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci", return_value=ci_result),
             patch.object(doctor, "validate", return_value=False),
             patch.object(doctor, "_attempt_label_recovery") as mock_recovery,
         ):
@@ -6829,3 +6841,467 @@ class TestDoctorTestFixWithDiagnostics:
 
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("commits_made") == 2
+
+
+class TestDoctorCIWaiting:
+    """Test Doctor phase CI waiting functionality (issue #2082)."""
+
+    def test_get_ci_status_returns_passed_when_all_checks_succeed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_get_ci_status should return PASSED when all checks succeed."""
+        from loom_tools.shepherd.phases.doctor import CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+            ]
+        })
+
+        with patch("subprocess.run", return_value=mock_result):
+            ci_result = doctor._get_ci_status(mock_context)
+
+        assert ci_result.status == CIStatus.PASSED
+        assert ci_result.checks_passed == 2
+        assert ci_result.checks_failed == 0
+        assert ci_result.checks_pending == 0
+
+    def test_get_ci_status_returns_failed_when_check_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_get_ci_status should return FAILED when any check fails."""
+        from loom_tools.shepherd.phases.doctor import CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+                {"conclusion": "FAILURE", "status": "COMPLETED"},
+            ]
+        })
+
+        with patch("subprocess.run", return_value=mock_result):
+            ci_result = doctor._get_ci_status(mock_context)
+
+        assert ci_result.status == CIStatus.FAILED
+        assert ci_result.checks_passed == 1
+        assert ci_result.checks_failed == 1
+
+    def test_get_ci_status_returns_pending_when_checks_running(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_get_ci_status should return PENDING when checks are in progress."""
+        from loom_tools.shepherd.phases.doctor import CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS", "status": "COMPLETED"},
+                {"conclusion": "", "status": "IN_PROGRESS"},
+            ]
+        })
+
+        with patch("subprocess.run", return_value=mock_result):
+            ci_result = doctor._get_ci_status(mock_context)
+
+        assert ci_result.status == CIStatus.PENDING
+        assert ci_result.checks_passed == 1
+        assert ci_result.checks_pending == 1
+
+    def test_get_ci_status_returns_passed_when_no_checks_configured(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_get_ci_status should return PASSED when no checks are configured."""
+        from loom_tools.shepherd.phases.doctor import CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = json.dumps({"statusCheckRollup": []})
+
+        with patch("subprocess.run", return_value=mock_result):
+            ci_result = doctor._get_ci_status(mock_context)
+
+        assert ci_result.status == CIStatus.PASSED
+        assert "No CI checks configured" in ci_result.message
+
+    def test_get_ci_status_returns_unknown_on_api_error(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_get_ci_status should return UNKNOWN when gh command fails."""
+        from loom_tools.shepherd.phases.doctor import CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "API error"
+
+        with patch("subprocess.run", return_value=mock_result):
+            ci_result = doctor._get_ci_status(mock_context)
+
+        assert ci_result.status == CIStatus.UNKNOWN
+        assert "Failed to get PR status" in ci_result.message
+
+    def test_get_ci_status_returns_unknown_when_no_pr_number(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_get_ci_status should return UNKNOWN when no PR number."""
+        from loom_tools.shepherd.phases.doctor import CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = None
+
+        ci_result = doctor._get_ci_status(mock_context)
+
+        assert ci_result.status == CIStatus.UNKNOWN
+        assert "No PR number" in ci_result.message
+
+    def test_wait_for_ci_returns_immediately_when_passed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_wait_for_ci should return immediately when CI passes."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        passed_result = CIResult(
+            status=CIStatus.PASSED,
+            message="CI passed",
+            checks_total=2,
+            checks_passed=2,
+        )
+
+        with patch.object(doctor, "_get_ci_status", return_value=passed_result):
+            ci_result = doctor._wait_for_ci(mock_context, timeout_seconds=60)
+
+        assert ci_result.status == CIStatus.PASSED
+
+    def test_wait_for_ci_returns_immediately_when_failed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_wait_for_ci should return immediately when CI fails."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        failed_result = CIResult(
+            status=CIStatus.FAILED,
+            message="CI failed",
+            checks_total=2,
+            checks_passed=1,
+            checks_failed=1,
+        )
+
+        with patch.object(doctor, "_get_ci_status", return_value=failed_result):
+            ci_result = doctor._wait_for_ci(mock_context, timeout_seconds=60)
+
+        assert ci_result.status == CIStatus.FAILED
+
+    def test_wait_for_ci_polls_until_complete(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_wait_for_ci should poll until CI completes."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        # First two calls return pending, third returns passed
+        pending_result = CIResult(
+            status=CIStatus.PENDING,
+            message="CI pending",
+            checks_total=2,
+            checks_passed=1,
+            checks_pending=1,
+        )
+        passed_result = CIResult(
+            status=CIStatus.PASSED,
+            message="CI passed",
+            checks_total=2,
+            checks_passed=2,
+        )
+
+        call_count = [0]
+
+        def mock_get_ci_status(ctx: Any) -> CIResult:
+            call_count[0] += 1
+            if call_count[0] < 3:
+                return pending_result
+            return passed_result
+
+        with (
+            patch.object(doctor, "_get_ci_status", side_effect=mock_get_ci_status),
+            patch("loom_tools.shepherd.phases.doctor.time.sleep"),
+        ):
+            ci_result = doctor._wait_for_ci(mock_context, timeout_seconds=300)
+
+        assert ci_result.status == CIStatus.PASSED
+        assert call_count[0] == 3
+
+    def test_wait_for_ci_returns_pending_on_timeout(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_wait_for_ci should return PENDING status on timeout."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        pending_result = CIResult(
+            status=CIStatus.PENDING,
+            message="CI pending",
+            checks_total=2,
+            checks_passed=1,
+            checks_pending=1,
+        )
+
+        with (
+            patch.object(doctor, "_get_ci_status", return_value=pending_result),
+            patch("loom_tools.shepherd.phases.doctor.time.sleep"),
+            patch("loom_tools.shepherd.phases.doctor.time.time", side_effect=[0, 0, 400]),
+        ):
+            ci_result = doctor._wait_for_ci(mock_context, timeout_seconds=300)
+
+        assert ci_result.status == CIStatus.PENDING
+        assert "timeout" in ci_result.message.lower()
+
+    def test_wait_for_ci_handles_shutdown_signal(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_wait_for_ci should return UNKNOWN on shutdown signal."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.side_effect = [False, True]
+
+        pending_result = CIResult(
+            status=CIStatus.PENDING,
+            message="CI pending",
+        )
+
+        with (
+            patch.object(doctor, "_get_ci_status", return_value=pending_result),
+            patch("loom_tools.shepherd.phases.doctor.time.sleep"),
+        ):
+            ci_result = doctor._wait_for_ci(mock_context, timeout_seconds=300)
+
+        assert ci_result.status == CIStatus.UNKNOWN
+        assert "Shutdown" in ci_result.message
+
+    def test_run_waits_for_ci_when_doctor_makes_commits(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should wait for CI when doctor makes commits."""
+        from loom_tools.shepherd.phases.doctor import (
+            CIResult,
+            CIStatus,
+            DoctorDiagnostics,
+            DoctorPhase,
+        )
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(
+            commits_made=1,
+            pr_labels=["loom:review-requested"],
+        )
+
+        ci_result = CIResult(
+            status=CIStatus.PASSED,
+            message="CI passed",
+            checks_total=2,
+            checks_passed=2,
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci", return_value=ci_result) as mock_wait,
+            patch.object(doctor, "validate", return_value=True),
+        ):
+            mock_run.return_value = 0
+            result = doctor.run(mock_context)
+
+        # CI wait should have been called
+        mock_wait.assert_called_once_with(mock_context)
+        assert result.status == PhaseStatus.SUCCESS
+
+    def test_run_returns_failed_when_ci_fails_after_commits(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should return FAILED when CI fails after doctor commits."""
+        from loom_tools.shepherd.phases.doctor import (
+            CIResult,
+            CIStatus,
+            DoctorDiagnostics,
+            DoctorPhase,
+        )
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(commits_made=1)
+
+        ci_result = CIResult(
+            status=CIStatus.FAILED,
+            message="CI failed: 1/2 checks failed",
+            checks_total=2,
+            checks_passed=1,
+            checks_failed=1,
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci", return_value=ci_result),
+        ):
+            mock_run.return_value = 0
+            result = doctor.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "CI failed" in result.message
+        assert result.data.get("ci_status", {}).get("status") == "failed"
+
+    def test_run_continues_to_validation_when_ci_times_out(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should continue to validation when CI times out (pending)."""
+        from loom_tools.shepherd.phases.doctor import (
+            CIResult,
+            CIStatus,
+            DoctorDiagnostics,
+            DoctorPhase,
+        )
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(
+            commits_made=1,
+            pr_labels=["loom:review-requested"],
+        )
+
+        ci_result = CIResult(
+            status=CIStatus.PENDING,
+            message="CI timeout: 1 checks still running",
+            checks_total=2,
+            checks_passed=1,
+            checks_pending=1,
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci", return_value=ci_result),
+            patch.object(doctor, "validate", return_value=True) as mock_validate,
+        ):
+            mock_run.return_value = 0
+            result = doctor.run(mock_context)
+
+        # Should still proceed to validation
+        mock_validate.assert_called_once()
+        assert result.status == PhaseStatus.SUCCESS
+
+    def test_run_does_not_wait_for_ci_when_no_commits(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run() should not wait for CI when doctor makes no commits."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics, DoctorPhase
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(
+            commits_made=0,
+            pr_labels=["loom:review-requested"],
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "_wait_for_ci") as mock_wait,
+            patch.object(doctor, "validate", return_value=True),
+        ):
+            mock_run.return_value = 0
+            doctor.run(mock_context)
+
+        # CI wait should NOT have been called since no commits made
+        mock_wait.assert_not_called()
+
+    def test_ci_result_is_complete_property(self) -> None:
+        """CIResult.is_complete should return True for terminal states."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus
+
+        passed = CIResult(status=CIStatus.PASSED, message="")
+        failed = CIResult(status=CIStatus.FAILED, message="")
+        pending = CIResult(status=CIStatus.PENDING, message="")
+        unknown = CIResult(status=CIStatus.UNKNOWN, message="")
+
+        assert passed.is_complete is True
+        assert failed.is_complete is True
+        assert pending.is_complete is False
+        assert unknown.is_complete is True
+
+    def test_ci_result_to_dict(self) -> None:
+        """CIResult.to_dict should include all fields."""
+        from loom_tools.shepherd.phases.doctor import CIResult, CIStatus
+
+        ci_result = CIResult(
+            status=CIStatus.PASSED,
+            message="CI passed",
+            checks_total=3,
+            checks_passed=2,
+            checks_failed=0,
+            checks_pending=1,
+        )
+
+        result = ci_result.to_dict()
+
+        assert result["status"] == "passed"
+        assert result["message"] == "CI passed"
+        assert result["checks_total"] == 3
+        assert result["checks_passed"] == 2
+        assert result["checks_failed"] == 0
+        assert result["checks_pending"] == 1
