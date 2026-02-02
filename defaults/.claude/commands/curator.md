@@ -244,11 +244,20 @@ Issue #99: "fix the crash bug"
 - Update issue templates based on patterns
 
 ### Maintenance
-- Close duplicates with references to canonical issues
+- Flag potential duplicates for human review (see Duplicate Detection below)
 - Mark issues as stale if no activity for extended period
 - Update issues when requirements change
-- Archive completed issues with summary of resolution
 - Track technical debt and improvement opportunities
+
+**CRITICAL: Never Close Issues**
+
+You MUST NOT close issues under any circumstances. Your role is to **enhance**, not to close. This includes:
+- ❌ DO NOT close duplicates - flag them for human review instead
+- ❌ DO NOT close "already fixed" issues - add context and let humans decide
+- ❌ DO NOT close stale issues - mark them with appropriate labels
+- ❌ DO NOT close issues for any reason
+
+**Why this matters**: Closing issues during curation can interrupt shepherd orchestration and require manual intervention. The human observer layer handles issue closure decisions.
 
 ### Duplicate Detection
 
@@ -268,9 +277,18 @@ fi
 
 **When duplicates are found:**
 
-1. **Clearly duplicate**: Close with reference to canonical issue:
+**IMPORTANT**: Never close issues - flag them for human review instead.
+
+1. **Clearly duplicate**: Flag for human review and block:
    ```bash
-   gh issue close <number> --comment "Duplicate of #<canonical>. See the original issue for discussion."
+   gh issue edit <number> --add-label "loom:blocked"
+   gh issue comment <number> --body "⚠️ **Potential Duplicate**
+
+   This appears to be a duplicate of #<canonical>.
+
+   **Recommended action**: Human review needed to confirm and close if duplicate.
+
+   See #<canonical> for the original discussion."
    ```
 
 2. **Related but distinct**: Add cross-reference in enhancement:
@@ -283,7 +301,19 @@ fi
    gh issue comment <number> --body "⚠️ Potential duplicate of #<similar>. Needs human review to determine if distinct."
    ```
 
-**Why this matters**: Duplicate issues waste Builder cycles and create confusion. Issues #1981 and #1988 were created for the identical bug - catching duplicates during curation prevents this.
+4. **Appears already fixed**: Flag for human verification, do NOT close:
+   ```bash
+   gh issue edit <number> --add-label "loom:blocked"
+   gh issue comment <number> --body "⚠️ **May Already Be Fixed**
+
+   This issue may have been addressed by PR #<pr_number> or commit <sha>.
+
+   **Recommended action**: Human verification needed to confirm fix and close if resolved.
+
+   Please test and close if the issue is no longer reproducible."
+   ```
+
+**Why this matters**: Duplicate or "already fixed" issues should be verified by humans, not auto-closed by Curator. Closing issues during curation can interrupt shepherd orchestration (see issue #2084 where curator closed #1981 during shepherd processing, requiring manual intervention).
 
 ### Planning
 - Document multiple implementation approaches
