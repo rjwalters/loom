@@ -1341,6 +1341,251 @@ tests/test_bar.py ....                                                  [100%]
         assert "12 passed" in result
 
 
+class TestBuilderScopedTestVerification:
+    """Test scoped test verification based on changed files."""
+
+    def test_classify_changed_files_python(self) -> None:
+        """Should classify Python files correctly."""
+        builder = BuilderPhase()
+        files = [
+            "loom-tools/src/loom_tools/shepherd/phases/builder.py",
+            "loom-tools/tests/shepherd/test_phases.py",
+        ]
+        languages = builder._classify_changed_files(files)
+        assert languages == {"python"}
+
+    def test_classify_changed_files_rust(self) -> None:
+        """Should classify Rust files correctly."""
+        builder = BuilderPhase()
+        files = [
+            "src-tauri/src/main.rs",
+            "loom-daemon/src/init.rs",
+        ]
+        languages = builder._classify_changed_files(files)
+        assert languages == {"rust"}
+
+    def test_classify_changed_files_typescript(self) -> None:
+        """Should classify TypeScript files correctly."""
+        builder = BuilderPhase()
+        files = [
+            "src/main.ts",
+            "src/lib/terminal-manager.ts",
+        ]
+        languages = builder._classify_changed_files(files)
+        assert languages == {"typescript"}
+
+    def test_classify_changed_files_mixed(self) -> None:
+        """Should classify mixed files correctly."""
+        builder = BuilderPhase()
+        files = [
+            "loom-tools/src/loom_tools/shepherd/phases/builder.py",
+            "src/main.ts",
+            "src-tauri/src/main.rs",
+        ]
+        languages = builder._classify_changed_files(files)
+        assert languages == {"python", "typescript", "rust"}
+
+    def test_classify_changed_files_config(self) -> None:
+        """Should classify config files correctly."""
+        builder = BuilderPhase()
+        files = [
+            "package.json",
+            "Cargo.toml",
+        ]
+        languages = builder._classify_changed_files(files)
+        assert languages == {"config"}
+
+    def test_classify_changed_files_path_takes_precedence(self) -> None:
+        """Path patterns should take precedence over extension."""
+        builder = BuilderPhase()
+        # Even though .json normally maps to config, loom-tools/ maps to python
+        files = ["loom-tools/pyproject.toml"]
+        languages = builder._classify_changed_files(files)
+        # The path pattern loom-tools/ -> python should match
+        assert "python" in languages
+
+    def test_classify_changed_files_other(self) -> None:
+        """Should classify unknown files as other."""
+        builder = BuilderPhase()
+        files = ["README.md", "LICENSE"]
+        languages = builder._classify_changed_files(files)
+        assert languages == {"other"}
+
+    def test_get_scoped_test_commands_python_only(self, tmp_path: Path) -> None:
+        """Should return only Python tests for Python changes."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"python"})
+
+        assert len(commands) == 1
+        assert commands[0][1] == "pytest"
+
+    def test_get_scoped_test_commands_rust_only(self, tmp_path: Path) -> None:
+        """Should return Rust clippy and tests for Rust changes."""
+        builder = BuilderPhase()
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"rust"})
+
+        assert len(commands) == 2
+        cmd_names = [name for _, name in commands]
+        assert "cargo clippy" in cmd_names
+        assert "cargo test" in cmd_names
+
+    def test_get_scoped_test_commands_typescript_only(self, tmp_path: Path) -> None:
+        """Should return TypeScript tests for TypeScript changes."""
+        builder = BuilderPhase()
+        pkg = {
+            "scripts": {
+                "lint": "biome check",
+                "typecheck": "tsc --noEmit",
+                "test:unit": "vitest",
+            }
+        }
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"typescript"})
+
+        cmd_names = [name for _, name in commands]
+        assert "pnpm lint" in cmd_names
+        assert "pnpm typecheck" in cmd_names
+        assert "pnpm test:unit" in cmd_names
+
+    def test_get_scoped_test_commands_config_runs_all(self, tmp_path: Path) -> None:
+        """Config changes should run full test suite."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"check:ci:lite": "pnpm lint && pnpm test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"config"})
+
+        # Should fall back to full test detection
+        assert len(commands) == 1
+        assert commands[0][1] == "pnpm check:ci:lite"
+
+    def test_get_scoped_test_commands_other_runs_all(self, tmp_path: Path) -> None:
+        """Unknown file types should run full test suite."""
+        builder = BuilderPhase()
+        pkg = {"scripts": {"check:ci:lite": "pnpm lint && pnpm test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"other"})
+
+        # Should fall back to full test detection
+        assert len(commands) == 1
+        assert commands[0][1] == "pnpm check:ci:lite"
+
+    def test_get_scoped_test_commands_no_matching_runners(
+        self, tmp_path: Path
+    ) -> None:
+        """Should return empty list when no matching test runners exist."""
+        builder = BuilderPhase()
+        # No pyproject.toml, so Python tests won't be detected
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"python"})
+
+        assert commands == []
+
+    def test_scoped_verification_skips_unrelated_tests(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Scoped verification should skip unrelated test suites."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.report_milestone = MagicMock()
+
+        # Set up a polyglot project
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "Cargo.toml").write_text("[package]\nname = 'test'\n")
+        pkg = {"scripts": {"test:unit": "vitest"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        # Simulate only Python files changed
+        with (
+            patch.object(
+                builder, "_ensure_dependencies"
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["loom-tools/src/foo.py"],
+            ),
+            patch.object(
+                builder, "_run_single_test_with_baseline", return_value=None
+            ) as mock_run,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should only run Python tests (pytest), not Rust or TypeScript
+        assert result is None
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert call_args[0][2] == "pytest"  # display_name
+
+    def test_scoped_verification_falls_back_on_config_changes(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Config changes should fall back to full test suite."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.report_milestone = MagicMock()
+
+        pkg = {"scripts": {"check:ci:lite": "pnpm lint && pnpm test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        # Simulate config file changed
+        with (
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=["package.json"],
+            ),
+            patch.object(
+                builder, "_run_single_test_with_baseline", return_value=None
+            ) as mock_run,
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should run full test suite
+        assert result is None
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert call_args[0][2] == "pnpm check:ci:lite"
+
+    def test_scoped_verification_falls_back_when_no_changed_files(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should fall back to full suite when no changed files detected."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.report_milestone = MagicMock()
+
+        pkg = {"scripts": {"check:ci:lite": "pnpm lint && pnpm test"}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+
+        # Simulate no changed files (git diff fails or returns empty)
+        with (
+            patch.object(builder, "_ensure_dependencies"),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_changed_files",
+                return_value=[],
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=None
+            ),
+            patch(
+                "subprocess.run",
+                return_value=MagicMock(
+                    returncode=0, stdout="All tests passed", stderr=""
+                ),
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should pass (full test suite ran and passed)
+        assert result is None
+
+
 class TestBuilderRunTestFailureIntegration:
     """Test that builder run() preserves worktree on test failure."""
 
@@ -1636,17 +1881,35 @@ class TestBuilderTestFailureContext:
                 "_detect_test_command",
                 return_value=(["pnpm", "test"], "pnpm test"),
             ),
-            patch.object(builder, "_run_baseline_tests", return_value=None),
-            patch(
-                "loom_tools.shepherd.phases.builder.subprocess.run",
-                return_value=completed,
+            # Mock scoped test commands to use the fallback path (full test suite)
+            patch.object(
+                builder,
+                "_get_scoped_test_commands",
+                return_value=[(["pnpm", "test"], "pnpm test")],
             ),
+            patch.object(
+                builder,
+                "_run_single_test_with_baseline",
+            ) as mock_single_test,
             # Mock get_changed_files to return the expected changed files
             patch(
                 "loom_tools.shepherd.phases.builder.get_changed_files",
                 return_value=["src/foo.ts", "src/bar.ts"],
             ),
         ):
+            # Make _run_single_test_with_baseline return a failure result
+            mock_single_test.return_value = PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="test verification failed (pnpm test, exit code 1)",
+                phase_name="builder",
+                data={
+                    "test_failure": True,
+                    "test_output_tail": test_output,
+                    "test_summary": "Tests  2 failed, 3 passed",
+                    "test_command": "pnpm test",
+                    "changed_files": ["src/foo.ts", "src/bar.ts"],
+                },
+            )
             result = builder._run_test_verification(mock_context)
 
         assert result is not None
@@ -1666,6 +1929,10 @@ class TestBuilderTestFailureContext:
         of 'git diff --name-only origin/main...HEAD'. The get_changed_files helper
         uses the correct three-dot syntax to detect both committed and uncommitted
         changes.
+
+        With scoped test verification, get_changed_files is called at the start
+        of _run_test_verification to determine which test suites to run, and
+        again when collecting context data for a failure result.
         """
         builder = BuilderPhase()
         worktree_mock = MagicMock()
@@ -1673,9 +1940,6 @@ class TestBuilderTestFailureContext:
         mock_context.worktree_path = worktree_mock
 
         test_output = "FAIL tests/test_example.py\n1 failed\n"
-        completed = subprocess.CompletedProcess(
-            args=[], returncode=1, stdout=test_output, stderr=""
-        )
 
         with (
             patch.object(
@@ -1683,21 +1947,41 @@ class TestBuilderTestFailureContext:
                 "_detect_test_command",
                 return_value=(["pytest"], "pytest"),
             ),
-            patch.object(builder, "_run_baseline_tests", return_value=None),
-            patch(
-                "loom_tools.shepherd.phases.builder.subprocess.run",
-                return_value=completed,
+            # Mock scoped test commands to return pytest
+            patch.object(
+                builder,
+                "_get_scoped_test_commands",
+                return_value=[(["pytest"], "pytest")],
             ),
+            patch.object(
+                builder,
+                "_run_single_test_with_baseline",
+            ) as mock_single_test,
             patch(
                 "loom_tools.shepherd.phases.builder.get_changed_files",
             ) as mock_get_changed_files,
         ):
             # Simulate committed changes that the old code would have missed
             mock_get_changed_files.return_value = ["src/module.py", "tests/test_module.py"]
+
+            # Make _run_single_test_with_baseline return a failure result
+            mock_single_test.return_value = PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="test verification failed (pytest, exit code 1)",
+                phase_name="builder",
+                data={
+                    "test_failure": True,
+                    "test_output_tail": test_output,
+                    "test_summary": "1 failed",
+                    "test_command": "pytest",
+                    "changed_files": ["src/module.py", "tests/test_module.py"],
+                },
+            )
             result = builder._run_test_verification(mock_context)
 
         # Verify get_changed_files was called with the worktree path
-        mock_get_changed_files.assert_called_once_with(cwd=worktree_mock)
+        # (called once at the start to determine scoped tests)
+        mock_get_changed_files.assert_called_with(cwd=worktree_mock)
 
         # Verify the changed files are included in the result
         assert result is not None
