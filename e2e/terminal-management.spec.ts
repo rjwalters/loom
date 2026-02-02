@@ -14,16 +14,16 @@ test.describe("Terminal Management", () => {
   });
 
   test("should display terminal container", async ({ page }) => {
-    // The mini terminal row should be visible (contains terminal cards)
+    // The terminal wrapper should be visible (single-session model)
     // Use a longer timeout for CI environments which may be slower
-    const terminalRow = page.locator(selectors.terminalContainer);
-    await expect(terminalRow).toBeVisible({ timeout: 15000 });
+    const terminalWrapper = page.locator(selectors.terminalContainer);
+    await expect(terminalWrapper).toBeVisible({ timeout: 15000 });
   });
 
-  test("should have add terminal button", async ({ page }) => {
-    // The add terminal button should be present
-    const addButton = page.locator(selectors.addTerminalBtn);
-    await expect(addButton).toBeVisible({ timeout: 15000 });
+  test("should have terminal settings button", async ({ page }) => {
+    // The terminal settings button should be present in single-session UI
+    const settingsButton = page.locator(selectors.terminalSettingsBtn);
+    await expect(settingsButton).toBeVisible({ timeout: 15000 });
   });
 
   test("should handle keyboard navigation", async ({ page }) => {

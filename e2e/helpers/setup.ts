@@ -145,23 +145,31 @@ export async function clearPersistedState(page: Page): Promise<void> {
 }
 
 /**
- * Get terminal count from the UI.
+ * Check if the terminal is visible in single-session UI.
  */
-export async function getTerminalCount(page: Page): Promise<number> {
-  return await page.locator(selectors.terminalCard).count();
+export async function isTerminalVisible(page: Page): Promise<boolean> {
+  const wrapper = page.locator(selectors.terminalContainer);
+  return await wrapper.isVisible();
 }
 
 /**
- * Create a new terminal via the UI.
+ * Open terminal settings modal via the settings button.
  */
-export async function createTerminal(
-  page: Page,
-  options?: { role?: string; workerType?: string }
-): Promise<void> {
-  await page.click(selectors.addTerminalBtn);
+export async function openTerminalSettings(page: Page): Promise<void> {
+  await page.click(selectors.terminalSettingsBtn);
 
   // Wait for settings modal
   await page.waitForSelector(selectors.settingsModal, { timeout: 5000 });
+}
+
+/**
+ * Configure terminal settings.
+ */
+export async function configureTerminal(
+  page: Page,
+  options?: { role?: string; workerType?: string }
+): Promise<void> {
+  await openTerminalSettings(page);
 
   if (options?.role) {
     await page.selectOption(selectors.roleSelect, options.role);
@@ -178,15 +186,11 @@ export async function createTerminal(
 }
 
 /**
- * Delete a terminal by index.
+ * Close the terminal via the close button.
  */
-export async function deleteTerminal(page: Page, index = 0): Promise<void> {
-  const terminal = page.locator(selectors.terminalCard).nth(index);
+export async function closeTerminal(page: Page): Promise<void> {
+  await page.click(selectors.terminalCloseBtn);
 
-  // Hover to reveal delete button
-  await terminal.hover();
-  await terminal.locator(selectors.terminalDeleteBtn).click();
-
-  // Confirm deletion
+  // Wait for confirmation dialog and confirm
   await page.click(selectors.confirmResetBtn);
 }
