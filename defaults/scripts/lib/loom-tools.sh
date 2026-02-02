@@ -64,10 +64,13 @@ find_loom_tools() {
 #   $@ - Arguments to pass to the command
 #
 # Priority:
-#   1. System-installed CLI (loom-<name>)
+#   1. Python module with PYTHONPATH (if loom-tools source exists)
 #   2. venv CLI in loom-tools directory
-#   3. Python module with PYTHONPATH set
+#   3. System-installed CLI (loom-<name>)
 #   4. Error with helpful message
+#
+# This order ensures source code is always authoritative during development.
+# When running in a target repo (not the Loom source), falls back to installed CLI.
 run_loom_tool() {
     local cli_name="$1"
     local module_name="$2"
@@ -75,25 +78,25 @@ run_loom_tool() {
 
     local full_cli="loom-${cli_name}"
 
-    # Try system-installed CLI first
-    if command -v "$full_cli" >/dev/null 2>&1; then
-        exec "$full_cli" "$@"
-    fi
-
-    # Try to find loom-tools directory
+    # Try to find loom-tools directory (source takes precedence)
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[1]}")" && pwd)"
 
     if find_loom_tools "$script_dir"; then
+        # Try Python module with PYTHONPATH first (always current source)
+        if [[ -d "$LOOM_TOOLS_SRC/loom_tools" ]]; then
+            PYTHONPATH="${LOOM_TOOLS_SRC}:${PYTHONPATH:-}" exec python3 -m "loom_tools.${module_name}" "$@"
+        fi
+
         # Try venv CLI
         if [[ -x "$LOOM_TOOLS_DIR/.venv/bin/$full_cli" ]]; then
             exec "$LOOM_TOOLS_DIR/.venv/bin/$full_cli" "$@"
         fi
+    fi
 
-        # Try Python module with PYTHONPATH
-        if [[ -d "$LOOM_TOOLS_SRC/loom_tools" ]]; then
-            PYTHONPATH="${LOOM_TOOLS_SRC}:${PYTHONPATH:-}" exec python3 -m "loom_tools.${module_name}" "$@"
-        fi
+    # Fall back to system-installed CLI (for target repos without source)
+    if command -v "$full_cli" >/dev/null 2>&1; then
+        exec "$full_cli" "$@"
     fi
 
     # Not found - provide helpful error message
