@@ -20,6 +20,7 @@ from loom_tools.shepherd.errors import (
     ShepherdError,
     ShutdownSignal,
 )
+from loom_tools.shepherd.exit_codes import ShepherdExitCode
 from loom_tools.shepherd.phases import (
     ApprovalPhase,
     BuilderPhase,
@@ -56,6 +57,14 @@ PHASES:
     4. Judge      - Review PR, approve or request changes (always runs, even in force mode)
     5. Doctor     - Address requested changes (if any)
     6. Merge      - Auto-merge (--force/--merge) or exit at loom:pr (default)
+
+EXIT CODES:
+    0  SUCCESS            - Full success (merged/approved)
+    1  BUILDER_FAILED     - No PR created (builder failed)
+    2  PR_TESTS_FAILED    - PR created but tests failed
+    3  SHUTDOWN           - Shutdown signal received
+    4  NEEDS_INTERVENTION - Stuck/blocked, needs human intervention
+    5  SKIPPED            - Issue already complete (no action needed)
 
 NOTE:
     Force mode does NOT skip the Judge phase. Code review always runs because
@@ -295,7 +304,13 @@ def orchestrate(ctx: ShepherdContext) -> int:
     """Run the shepherd orchestration loop.
 
     Returns:
-        Exit code (0 for success, non-zero for error)
+        Exit code from ShepherdExitCode enum:
+        - SUCCESS (0): Full success (merged/approved)
+        - BUILDER_FAILED (1): No PR created
+        - PR_TESTS_FAILED (2): PR created but tests failed
+        - SHUTDOWN (3): Shutdown signal received
+        - NEEDS_INTERVENTION (4): Stuck/blocked, needs human intervention
+        - SKIPPED (5): Issue already complete
     """
     start_time = time.time()
     completed_phases: list[str] = []
@@ -307,7 +322,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
             ctx.validate_issue()
         except IssueClosedError as e:
             log_info(f"Issue #{ctx.config.issue} is already {e.state} - no orchestration needed")
-            return 0
+            return ShepherdExitCode.SKIPPED
 
         log_info(f"Issue: #{ctx.config.issue}")
         log_info(f"Mode: {ctx.config.mode.value}")
@@ -339,7 +354,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
             if result.status == PhaseStatus.FAILED:
                 log_error(result.message)
-                return 1
+                return ShepherdExitCode.BUILDER_FAILED
 
             if result.status == PhaseStatus.SKIPPED:
                 completed_phases.append(f"Curator ({result.message})")
@@ -353,7 +368,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         if ctx.config.stop_after == "curated":
             _print_phase_header("STOPPING: Reached --to curated")
-            return 0
+            return ShepherdExitCode.SUCCESS
 
         # ─── PHASE 2: Approval Gate ───────────────────────────────────────
         _print_phase_header("PHASE 2: APPROVAL GATE")
@@ -375,7 +390,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         if ctx.config.stop_after == "approved":
             _print_phase_header("STOPPING: Reached --to approved")
-            return 0
+            return ShepherdExitCode.SUCCESS
 
         # ─── PRE-FLIGHT: Baseline Health Check ───────────────────────────
         # This is a lightweight cache lookup (no subprocess, no timing needed).
@@ -396,7 +411,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     details=result.message,
                 )
                 _mark_baseline_blocked(ctx, result)
-                return 1
+                return ShepherdExitCode.NEEDS_INTERVENTION
 
             # Log result inline (no header for passing checks)
             log_info(f"Baseline health: {result.message}")
@@ -444,7 +459,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         status="test_failure",
                     )
                     _mark_builder_test_failure(ctx)
-                    return 1
+                    return ShepherdExitCode.PR_TESTS_FAILED
 
                 # Route to Doctor for test fix
                 log_warning(
@@ -572,7 +587,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
                 if not result.data.get("test_failure"):
                     log_error(result.message)
-                    return 1
+                    return ShepherdExitCode.BUILDER_FAILED
                 # Test failure after exhausting retries is handled above
 
             # Builder succeeded or was skipped
@@ -602,7 +617,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         if ctx.pr_number is None:
             log_error("Cannot enter Judge phase: no PR was created during Builder phase")
             _mark_builder_no_pr(ctx)
-            return 1
+            return ShepherdExitCode.BUILDER_FAILED
 
         doctor_attempts = 0
         judge_retries = 0
@@ -656,7 +671,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     f"retry attempt(s): {result.message}"
                 )
                 _mark_judge_exhausted(ctx, judge_retries)
-                return 1
+                return ShepherdExitCode.NEEDS_INTERVENTION
 
             # Judge succeeded — reset retry counter for this loop iteration
             judge_retries = 0
@@ -686,7 +701,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 if doctor_attempts >= ctx.config.doctor_max_retries:
                     log_error(f"Doctor max retries ({ctx.config.doctor_max_retries}) exceeded")
                     _mark_doctor_exhausted(ctx)
-                    return 1
+                    return ShepherdExitCode.NEEDS_INTERVENTION
 
                 # ─── Doctor Phase ─────────────────────────────────────
                 _print_phase_header(f"PHASE 5: DOCTOR (attempt {doctor_attempts})")
@@ -702,7 +717,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
                 if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
                     log_error(result.message)
-                    return 1
+                    return ShepherdExitCode.NEEDS_INTERVENTION
 
                 completed_phases.append("Doctor (fixes applied)")
                 log_success(f"Doctor applied fixes ({elapsed}s)")
@@ -734,7 +749,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     f"retry attempt(s): {result.message}"
                 )
                 _mark_judge_exhausted(ctx, judge_retries)
-                return 1
+                return ShepherdExitCode.NEEDS_INTERVENTION
 
         # Print skipped header if Doctor never ran (Judge approved first try)
         if doctor_attempts == 0 and not skip:
@@ -748,7 +763,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         if ctx.config.stop_after == "pr":
             _print_phase_header("STOPPING: Reached --to pr")
-            return 0
+            return ShepherdExitCode.SUCCESS
 
         # ─── PHASE 6: Merge Gate ──────────────────────────────────────────
         _print_phase_header("PHASE 6: MERGE GATE")
@@ -762,7 +777,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         if result.status == PhaseStatus.FAILED:
             log_error(result.message)
-            return 1
+            return ShepherdExitCode.NEEDS_INTERVENTION
 
         phase_durations["Merge"] = elapsed
         if result.data.get("merged"):
@@ -803,7 +818,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         print(file=sys.stderr)
         log_success("Orchestration complete!")
 
-        return 0
+        return ShepherdExitCode.SUCCESS
 
     except ShutdownSignal as e:
         log_warning(f"Shutdown signal detected: {e}")
@@ -813,20 +828,20 @@ def orchestrate(ctx: ShepherdContext) -> int:
             details=str(e),
         )
         log_info("Cleaning up and exiting gracefully...")
-        return 0
+        return ShepherdExitCode.SHUTDOWN
 
     except IssueNotFoundError as e:
         log_error(str(e))
-        return 1
+        return ShepherdExitCode.BUILDER_FAILED
 
     except IssueBlockedError as e:
         log_error(str(e))
         log_info("Use --force to override blocked status")
-        return 1
+        return ShepherdExitCode.NEEDS_INTERVENTION
 
     except ShepherdError as e:
         log_error(str(e))
-        return 1
+        return ShepherdExitCode.NEEDS_INTERVENTION
 
 
 def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
@@ -1167,7 +1182,7 @@ def main(argv: list[str] | None = None) -> int:
     # This prevents confusion when tests pass in main but fail in worktrees
     # (or vice versa) due to uncommitted local changes.
     if not _check_main_repo_clean(repo_root, args.allow_dirty_main):
-        return 1
+        return ShepherdExitCode.NEEDS_INTERVENTION
 
     ctx = ShepherdContext(config=config)
 

@@ -8,6 +8,7 @@ from loom_tools.shepherd.errors import (
     ShepherdError,
     ShutdownSignal,
 )
+from loom_tools.shepherd.exit_codes import ShepherdExitCode, describe_exit_code
 from loom_tools.shepherd.labels import LabelCache
 
 __all__ = [
@@ -20,4 +21,6 @@ __all__ = [
     "ShutdownSignal",
     "PhaseValidationError",
     "AgentStuckError",
+    "ShepherdExitCode",
+    "describe_exit_code",
 ]
