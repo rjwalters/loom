@@ -2885,6 +2885,262 @@ class TestBuilderFallbackComparison:
         assert result.status == PhaseStatus.FAILED
 
 
+class TestBuilderFallbackNameComparison:
+    """Test name-based comparison in line-based fallback path.
+
+    Issue #2066: The line-based fallback should use test name comparison
+    to detect when different tests are failing, even with the same error count.
+    """
+
+    def test_fallback_different_tests_same_count_detected_as_new(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: baseline fails Test A, worktree fails Test B (same count) -> new failure.
+
+        When error line counts are equal but different tests are failing,
+        the name-based comparison should detect this as a genuine regression.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Both have 1 error line (same count), but different test names
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAILED tests/test_a.py::test_alpha - Error\n"
+                "Error: test_alpha failed\n"
+            ),
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAILED tests/test_b.py::test_beta - Error\n"
+                "Error: test_beta failed\n"
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should detect as new failure because different tests are failing
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+
+    def test_fallback_same_test_same_count_preexisting(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: baseline fails Test A, worktree fails Test A (same name) -> pre-existing.
+
+        When error line counts are equal and the same test is failing,
+        this should correctly be identified as pre-existing.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Both have 1 error line and the same test name
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAILED tests/test_a.py::test_alpha - Error\n"
+                "Error: test_alpha failed at 2026-01-25T10:00:00Z\n"
+            ),
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAILED tests/test_a.py::test_alpha - Error\n"
+                "Error: test_alpha failed at 2026-01-26T15:30:00Z\n"
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should be treated as pre-existing (same test failing)
+        assert result is None
+
+    def test_fallback_unparseable_names_falls_back_to_line_heuristic(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: unparseable test output -> falls back to line count heuristic.
+
+        When test names cannot be extracted from the output, the fallback
+        should use the existing line count heuristic (same count = pre-existing).
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        # Output with no parseable test names, just error lines
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Error: something broke\n",
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="Error: different thing broke\n",
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should fall back to line heuristic: same exit code + same error count = pre-existing
+        assert result is None
+
+    def test_fallback_cargo_different_tests_same_count(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: cargo test with different failing tests -> new failure.
+
+        Verifies that cargo test format works with the name-based comparison.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "test utils::tests::test_parse ... FAILED\n"
+                "error: test failed\n"
+            ),
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "test core::tests::test_run ... FAILED\n"
+                "error: test failed\n"
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["cargo", "test"], "cargo test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should detect as new failure because different tests are failing
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+
+    def test_fallback_vitest_different_tests_same_count(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback: vitest with different failing tests -> new failure.
+
+        Verifies that vitest format works with the name-based comparison.
+        """
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        baseline_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAIL src/foo.test.ts\n"
+                "Error: assertion failed\n"
+            ),
+            stderr="",
+        )
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout=(
+                "FAIL src/bar.test.ts\n"
+                "Error: assertion failed\n"
+            ),
+            stderr="",
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch.object(
+                builder, "_run_baseline_tests", return_value=baseline_result
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+        ):
+            result = builder._run_test_verification(mock_context)
+
+        # Should detect as new failure because different tests are failing
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+
+
 class TestBuilderZeroFailuresNonZeroExit:
     """Test that 0 failures with non-zero exit doesn't say 'Tests failed'.
 

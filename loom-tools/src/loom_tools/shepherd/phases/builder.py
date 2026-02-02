@@ -1635,21 +1635,61 @@ class BuilderPhase:
                             action=f"tests passed with non-zero exit ({elapsed}s)",
                         )
                     else:
-                        msg = f"pre-existing on main (exit code {result.returncode})"
-                        if summary:
-                            msg = f"pre-existing on main ({summary})"
-                        log_warning(
-                            f"Tests failed but line diff is likely non-deterministic "
-                            f"(same exit code {result.returncode}, "
-                            f"same error count {len(worktree_errors)}, "
-                            f"{len(new_errors)} diff lines): {msg}"
+                        # Before concluding pre-existing, try name-based comparison
+                        # to detect different tests failing with same error count
+                        baseline_names = self._extract_failing_test_names(
+                            baseline_output
                         )
-                        ctx.report_milestone(
-                            "heartbeat",
-                            action=f"tests have pre-existing failures ({elapsed}s)",
+                        worktree_names = self._extract_failing_test_names(
+                            worktree_output
                         )
-                    # Check supplemental tests for ecosystems missed by the pipeline
-                    return self._run_supplemental_verification(ctx, primary_output)
+                        if baseline_names and worktree_names:
+                            new_test_names = worktree_names - baseline_names
+                            if new_test_names:
+                                # Different tests are failing — genuine regression
+                                log_warning(
+                                    f"Baseline also fails but worktree has different "
+                                    f"failing tests: {new_test_names}"
+                                )
+                                # Fall through to failure path below
+                            else:
+                                # Same tests failing — pre-existing
+                                msg = f"pre-existing on main (exit code {result.returncode})"
+                                if summary:
+                                    msg = f"pre-existing on main ({summary})"
+                                log_warning(
+                                    f"Tests failed but line diff is likely non-deterministic "
+                                    f"(same exit code {result.returncode}, "
+                                    f"same error count {len(worktree_errors)}, "
+                                    f"{len(new_errors)} diff lines): {msg}"
+                                )
+                                ctx.report_milestone(
+                                    "heartbeat",
+                                    action=f"tests have pre-existing failures ({elapsed}s)",
+                                )
+                                # Check supplemental tests for ecosystems missed by the pipeline
+                                return self._run_supplemental_verification(
+                                    ctx, primary_output
+                                )
+                        else:
+                            # Name extraction failed — fall back to line heuristic
+                            msg = f"pre-existing on main (exit code {result.returncode})"
+                            if summary:
+                                msg = f"pre-existing on main ({summary})"
+                            log_warning(
+                                f"Tests failed but line diff is likely non-deterministic "
+                                f"(same exit code {result.returncode}, "
+                                f"same error count {len(worktree_errors)}, "
+                                f"{len(new_errors)} diff lines): {msg}"
+                            )
+                            ctx.report_milestone(
+                                "heartbeat",
+                                action=f"tests have pre-existing failures ({elapsed}s)",
+                            )
+                            # Check supplemental tests for ecosystems missed by the pipeline
+                            return self._run_supplemental_verification(
+                                ctx, primary_output
+                            )
 
                 log_warning(
                     f"Baseline also fails but worktree introduces "
