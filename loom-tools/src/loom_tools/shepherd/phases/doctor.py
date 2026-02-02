@@ -3,17 +3,61 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from loom_tools.common.logging import log_info, log_warning
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import (
     PhaseResult,
     PhaseStatus,
     run_phase_with_retry,
 )
+
+# Default timeout for waiting for CI to complete (5 minutes)
+DEFAULT_CI_TIMEOUT_SECONDS = 300
+# Poll interval when waiting for CI
+CI_POLL_INTERVAL_SECONDS = 15
+
+
+class CIStatus(Enum):
+    """Status of CI checks on a PR."""
+
+    PASSED = "passed"  # All checks passed
+    FAILED = "failed"  # At least one check failed
+    PENDING = "pending"  # Checks are still running
+    UNKNOWN = "unknown"  # Could not determine status (e.g., API error)
+
+
+@dataclass
+class CIResult:
+    """Result of checking CI status."""
+
+    status: CIStatus
+    message: str
+    checks_total: int = 0
+    checks_passed: int = 0
+    checks_failed: int = 0
+    checks_pending: int = 0
+
+    @property
+    def is_complete(self) -> bool:
+        """True if CI is no longer running (passed, failed, or unknown)."""
+        return self.status in (CIStatus.PASSED, CIStatus.FAILED, CIStatus.UNKNOWN)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for logging/debugging."""
+        return {
+            "status": self.status.value,
+            "message": self.message,
+            "checks_total": self.checks_total,
+            "checks_passed": self.checks_passed,
+            "checks_failed": self.checks_failed,
+            "checks_pending": self.checks_pending,
+        }
 
 
 class DoctorFailureMode(Enum):
@@ -145,6 +189,43 @@ class DoctorPhase:
                 phase_name="doctor",
                 data=diagnostics.to_dict(),
             )
+
+        # If doctor made commits, wait for CI to complete before proceeding
+        # This prevents validation from failing due to CI still running
+        if diagnostics.made_progress:
+            ci_result = self._wait_for_ci(ctx)
+            diagnostics_dict = diagnostics.to_dict()
+            diagnostics_dict["ci_status"] = ci_result.to_dict()
+
+            if ci_result.status == CIStatus.FAILED:
+                # CI failed after doctor's changes - this is a real failure
+                log_warning(f"[doctor] CI failed after doctor commits: {ci_result.message}")
+                diagnostics.failure_mode = DoctorFailureMode.INSUFFICIENT_CHANGES
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=f"CI failed after doctor fixes: {ci_result.message}",
+                    phase_name="doctor",
+                    data=diagnostics_dict,
+                )
+
+            if ci_result.status == CIStatus.PENDING:
+                # CI timed out - report as warning but continue to validation
+                # The Judge phase will also check CI status
+                log_warning(
+                    f"[doctor] CI still pending after timeout, proceeding with validation"
+                )
+                ctx.report_milestone(
+                    "heartbeat",
+                    action="CI still pending after timeout, proceeding with validation",
+                )
+
+            # Check for shutdown during CI wait
+            if ci_result.status == CIStatus.UNKNOWN and "Shutdown" in ci_result.message:
+                return PhaseResult(
+                    status=PhaseStatus.SHUTDOWN,
+                    message="shutdown signal received while waiting for CI",
+                    phase_name="doctor",
+                )
 
         # Validate phase - doctor must re-request review
         if not self.validate(ctx):
@@ -371,6 +452,199 @@ class DoctorPhase:
                 return True
 
         return False
+
+    def _get_ci_status(self, ctx: ShepherdContext) -> CIResult:
+        """Get the current CI status for the PR.
+
+        Uses ``gh pr view`` to inspect the status check rollup and determine
+        if checks have passed, failed, or are still pending.
+
+        Args:
+            ctx: Shepherd context with pr_number set
+
+        Returns:
+            CIResult with current status and check counts
+        """
+        if ctx.pr_number is None:
+            return CIResult(
+                status=CIStatus.UNKNOWN,
+                message="No PR number available",
+            )
+
+        result = subprocess.run(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(ctx.pr_number),
+                "--json",
+                "statusCheckRollup",
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            return CIResult(
+                status=CIStatus.UNKNOWN,
+                message=f"Failed to get PR status: {result.stderr.strip()}",
+            )
+
+        try:
+            import json
+
+            data = json.loads(result.stdout)
+        except (json.JSONDecodeError, ValueError) as e:
+            return CIResult(
+                status=CIStatus.UNKNOWN,
+                message=f"Failed to parse PR status: {e}",
+            )
+
+        checks = data.get("statusCheckRollup", [])
+        if not checks:
+            # No checks configured - treat as passed
+            return CIResult(
+                status=CIStatus.PASSED,
+                message="No CI checks configured",
+                checks_total=0,
+            )
+
+        # Count check states
+        passed = 0
+        failed = 0
+        pending = 0
+
+        for check in checks:
+            conclusion = check.get("conclusion", "")
+            status = check.get("status", "")
+
+            if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+                passed += 1
+            elif conclusion in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"):
+                failed += 1
+            elif status in ("IN_PROGRESS", "QUEUED", "PENDING", "WAITING"):
+                pending += 1
+            elif conclusion == "":
+                # Empty conclusion with no status usually means pending
+                pending += 1
+            else:
+                # Unknown state - treat as failed to be safe
+                failed += 1
+
+        total = passed + failed + pending
+
+        if failed > 0:
+            return CIResult(
+                status=CIStatus.FAILED,
+                message=f"CI failed: {failed}/{total} checks failed",
+                checks_total=total,
+                checks_passed=passed,
+                checks_failed=failed,
+                checks_pending=pending,
+            )
+
+        if pending > 0:
+            return CIResult(
+                status=CIStatus.PENDING,
+                message=f"CI pending: {pending}/{total} checks still running",
+                checks_total=total,
+                checks_passed=passed,
+                checks_failed=failed,
+                checks_pending=pending,
+            )
+
+        return CIResult(
+            status=CIStatus.PASSED,
+            message=f"CI passed: {passed}/{total} checks succeeded",
+            checks_total=total,
+            checks_passed=passed,
+            checks_failed=failed,
+            checks_pending=pending,
+        )
+
+    def _wait_for_ci(
+        self,
+        ctx: ShepherdContext,
+        timeout_seconds: int = DEFAULT_CI_TIMEOUT_SECONDS,
+    ) -> CIResult:
+        """Wait for CI checks to complete on the PR.
+
+        Polls the PR status at regular intervals until CI completes or times out.
+        Reports progress via heartbeat milestones so the operator can see status.
+
+        Args:
+            ctx: Shepherd context with pr_number set
+            timeout_seconds: Maximum time to wait for CI (default 5 minutes)
+
+        Returns:
+            CIResult with final status:
+            - PASSED: All checks passed
+            - FAILED: At least one check failed
+            - PENDING: Timeout reached while checks still running
+            - UNKNOWN: Error fetching status
+        """
+        start_time = time.time()
+        last_status_message = ""
+
+        log_info(f"[doctor] Waiting for CI checks on PR #{ctx.pr_number}")
+        ctx.report_milestone(
+            "heartbeat",
+            action=f"waiting for CI checks on PR #{ctx.pr_number}",
+        )
+
+        while True:
+            ci_result = self._get_ci_status(ctx)
+
+            # Log status changes
+            if ci_result.message != last_status_message:
+                log_info(f"[doctor] CI status: {ci_result.message}")
+                last_status_message = ci_result.message
+
+            # If CI is complete (passed, failed, or error), return immediately
+            if ci_result.is_complete:
+                log_info(f"[doctor] CI complete: {ci_result.status.value}")
+                return ci_result
+
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout_seconds:
+                log_warning(
+                    f"[doctor] CI timeout after {int(elapsed)}s - "
+                    f"{ci_result.checks_pending} checks still pending"
+                )
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=f"CI timeout: {ci_result.checks_pending} checks still pending",
+                )
+                # Return pending status to indicate timeout, not failure
+                return CIResult(
+                    status=CIStatus.PENDING,
+                    message=f"CI timeout after {int(elapsed)}s: {ci_result.checks_pending} checks still running",
+                    checks_total=ci_result.checks_total,
+                    checks_passed=ci_result.checks_passed,
+                    checks_failed=ci_result.checks_failed,
+                    checks_pending=ci_result.checks_pending,
+                )
+
+            # Check for shutdown signal
+            if ctx.check_shutdown():
+                log_info("[doctor] Shutdown signal detected while waiting for CI")
+                return CIResult(
+                    status=CIStatus.UNKNOWN,
+                    message="Shutdown signal received",
+                )
+
+            # Report periodic progress
+            if int(elapsed) % 60 == 0 and elapsed > 0:
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=f"waiting for CI: {ci_result.checks_pending} checks pending ({int(elapsed)}s elapsed)",
+                )
+
+            # Wait before next poll
+            time.sleep(CI_POLL_INTERVAL_SECONDS)
 
     def run_test_fix(
         self, ctx: ShepherdContext, test_failure_data: dict[str, Any]
