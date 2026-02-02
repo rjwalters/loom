@@ -48,6 +48,10 @@ function makeMockData(overrides?: Partial<AnalyticsData>): AnalyticsData {
       total_cost_usd: 12.5,
       avg_cycle_time_hours: 2.5,
       cycle_time_trend: "improving" as const,
+      total_prompts: 80,
+      prev_issues_closed: 15,
+      prev_prs_merged: 12,
+      prev_avg_cycle_time_hours: 3.0,
     },
     inputStats: {
       totalEntries: 50,

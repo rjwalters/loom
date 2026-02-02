@@ -54,7 +54,10 @@ export async function renderStatusBar(
 /**
  * Start periodic status bar updates
  */
-function startStatusRefresh(workspacePath: string): void {
+function startStatusRefresh(
+  workspacePath: string,
+  _sessionState: "idle" | "working" | "error" | "stopped"
+): void {
   if (statusRefreshTimer) return;
 
   statusRefreshTimer = setInterval(async () => {

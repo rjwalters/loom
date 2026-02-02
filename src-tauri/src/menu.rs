@@ -3,43 +3,17 @@ use tauri::{
     Emitter, Manager,
 };
 
-#[allow(clippy::too_many_lines)]
 pub fn build_menu<R: tauri::Runtime>(
     handle: &impl tauri::Manager<R>,
 ) -> Result<tauri::menu::Menu<R>, tauri::Error> {
-    // Build File menu
-    let new_terminal = MenuItemBuilder::new("New Terminal")
-        .id("new_terminal")
-        .accelerator("CmdOrCtrl+T")
-        .build(handle)?;
-    let close_terminal = MenuItemBuilder::new("Close Terminal")
-        .id("close_terminal")
-        .accelerator("CmdOrCtrl+Shift+W")
-        .build(handle)?;
+    // Build File menu (simplified - single session model)
     let close_workspace = MenuItemBuilder::new("Close Workspace")
         .id("close_workspace")
         .accelerator("CmdOrCtrl+W")
         .build(handle)?;
-    let start_workspace = MenuItemBuilder::new("Start...")
-        .id("start_workspace")
-        .accelerator("CmdOrCtrl+Shift+R")
-        .build(handle)?;
-    let force_start_workspace = MenuItemBuilder::new("Force Start")
-        .id("force_start_workspace")
-        .accelerator("CmdOrCtrl+Shift+Alt+R")
-        .build(handle)?;
-    let factory_reset_workspace = MenuItemBuilder::new("Factory Reset...")
-        .id("factory_reset_workspace")
-        .build(handle)?;
 
     let file_menu = SubmenuBuilder::new(handle, "File")
-        .item(&new_terminal)
-        .item(&close_terminal)
-        .separator()
         .item(&close_workspace)
-        .item(&start_workspace)
-        .item(&force_start_workspace)
-        .item(&factory_reset_workspace)
         .separator()
         .quit()
         .build()?;
@@ -165,7 +139,6 @@ pub fn build_menu<R: tauri::Runtime>(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-#[allow(clippy::too_many_lines)]
 pub fn handle_menu_event<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     event: tauri::menu::MenuEvent,
@@ -173,34 +146,9 @@ pub fn handle_menu_event<R: tauri::Runtime>(
     let menu_id = event.id().as_ref();
 
     match menu_id {
-        "new_terminal" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("new-terminal", ());
-            }
-        }
-        "close_terminal" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("close-terminal", ());
-            }
-        }
         "close_workspace" => {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.emit("close-workspace", ());
-            }
-        }
-        "start_workspace" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("start-workspace", ());
-            }
-        }
-        "force_start_workspace" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("force-start-workspace", ());
-            }
-        }
-        "factory_reset_workspace" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.emit("factory-reset-workspace", ());
             }
         }
         "toggle_theme" => {
