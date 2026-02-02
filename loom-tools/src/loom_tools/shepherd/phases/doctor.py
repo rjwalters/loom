@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,48 @@ from loom_tools.shepherd.phases.base import (
     PhaseStatus,
     run_phase_with_retry,
 )
+
+
+class DoctorFailureMode(Enum):
+    """Classification of doctor phase failure modes.
+
+    These modes help the daemon make smarter retry/escalate decisions:
+    - NO_PROGRESS: Doctor made no commits, retry is unlikely to help
+    - INSUFFICIENT_CHANGES: Doctor committed but problem persists, may retry
+    - VALIDATION_FAILED: Doctor worked but label state is inconsistent
+    """
+
+    NO_PROGRESS = "no_progress"  # Doctor made no commits
+    INSUFFICIENT_CHANGES = "insufficient_changes"  # Doctor committed but didn't fix
+    VALIDATION_FAILED = "validation_failed"  # Label transition incomplete
+
+
+@dataclass
+class DoctorDiagnostics:
+    """Diagnostic information from doctor phase execution.
+
+    This provides visibility into what the doctor actually accomplished,
+    enabling better retry decisions.
+    """
+
+    commits_made: int = 0
+    has_uncommitted_changes: bool = False
+    pr_labels: list[str] | None = None
+    failure_mode: DoctorFailureMode | None = None
+
+    @property
+    def made_progress(self) -> bool:
+        """True if doctor made any commits."""
+        return self.commits_made > 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for PhaseResult.data."""
+        return {
+            "commits_made": self.commits_made,
+            "has_uncommitted_changes": self.has_uncommitted_changes,
+            "pr_labels": self.pr_labels,
+            "failure_mode": self.failure_mode.value if self.failure_mode else None,
+        }
 
 
 class DoctorPhase:
@@ -43,6 +87,9 @@ class DoctorPhase:
 
         # Report phase entry
         ctx.report_milestone("phase_entered", phase="doctor")
+
+        # Capture commit count before doctor runs (for progress detection)
+        commits_before = self._get_commit_count(ctx)
 
         # Run doctor worker with retry
         exit_code = run_phase_with_retry(
@@ -82,18 +129,44 @@ class DoctorPhase:
                 data={"preexisting": True},
             )
 
-        # Validate phase
-        if not self.validate(ctx):
+        # Diagnose what doctor accomplished (regardless of exit code)
+        diagnostics = self._diagnose_doctor_outcome(ctx, commits_before)
+
+        # Handle non-zero exit codes with diagnostic info
+        if exit_code != 0:
+            diagnostics.failure_mode = (
+                DoctorFailureMode.NO_PROGRESS
+                if not diagnostics.made_progress
+                else DoctorFailureMode.INSUFFICIENT_CHANGES
+            )
             return PhaseResult(
                 status=PhaseStatus.FAILED,
-                message="doctor phase validation failed",
+                message=f"doctor failed with exit code {exit_code} ({diagnostics.failure_mode.value})",
                 phase_name="doctor",
+                data=diagnostics.to_dict(),
+            )
+
+        # Validate phase - doctor must re-request review
+        if not self.validate(ctx):
+            # Doctor ran successfully but didn't complete label transition
+            diagnostics.failure_mode = DoctorFailureMode.VALIDATION_FAILED
+
+            # If doctor made commits but validation failed, attempt label recovery
+            if diagnostics.made_progress:
+                self._attempt_label_recovery(ctx, diagnostics)
+
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=f"doctor phase validation failed ({diagnostics.failure_mode.value})",
+                phase_name="doctor",
+                data=diagnostics.to_dict(),
             )
 
         return PhaseResult(
             status=PhaseStatus.SUCCESS,
             message="doctor applied fixes",
             phase_name="doctor",
+            data=diagnostics.to_dict(),
         )
 
     def validate(self, ctx: ShepherdContext) -> bool:
@@ -169,6 +242,136 @@ class DoctorPhase:
 
         ctx.label_cache.invalidate_issue(ctx.config.issue)
 
+    def _get_commit_count(self, ctx: ShepherdContext) -> int:
+        """Get the current commit count in the worktree ahead of main.
+
+        Returns 0 if worktree doesn't exist or git command fails.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return 0
+
+        result = subprocess.run(
+            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            cwd=ctx.worktree_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            try:
+                return int(result.stdout.strip())
+            except ValueError:
+                return 0
+        return 0
+
+    def _diagnose_doctor_outcome(
+        self, ctx: ShepherdContext, commits_before: int
+    ) -> DoctorDiagnostics:
+        """Diagnose what the doctor accomplished after running.
+
+        Checks:
+        - How many commits were made
+        - Whether there are uncommitted changes
+        - Current PR labels
+
+        Args:
+            ctx: Shepherd context
+            commits_before: Number of commits ahead of main before doctor ran
+
+        Returns:
+            DoctorDiagnostics with gathered information
+        """
+        diagnostics = DoctorDiagnostics()
+
+        # Check commits made
+        commits_after = self._get_commit_count(ctx)
+        diagnostics.commits_made = max(0, commits_after - commits_before)
+
+        # Check for uncommitted changes in worktree
+        if ctx.worktree_path and ctx.worktree_path.is_dir():
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=ctx.worktree_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                diagnostics.has_uncommitted_changes = True
+
+        # Get current PR labels
+        if ctx.pr_number is not None:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    str(ctx.pr_number),
+                    "--json",
+                    "labels",
+                    "--jq",
+                    ".labels[].name",
+                ],
+                cwd=ctx.repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                diagnostics.pr_labels = result.stdout.strip().splitlines()
+
+        return diagnostics
+
+    def _attempt_label_recovery(
+        self, ctx: ShepherdContext, diagnostics: DoctorDiagnostics
+    ) -> bool:
+        """Attempt to recover label state when doctor made progress but validation failed.
+
+        When doctor commits changes but fails to transition labels, we try to
+        reset to a known state (loom:review-requested) so the Judge can re-evaluate.
+
+        Args:
+            ctx: Shepherd context
+            diagnostics: Doctor diagnostics with PR label state
+
+        Returns:
+            True if recovery was successful
+        """
+        if ctx.pr_number is None:
+            return False
+
+        # Check current label state
+        labels = diagnostics.pr_labels or []
+
+        # If PR still has loom:changes-requested but doctor made progress,
+        # transition to loom:review-requested for Judge re-evaluation
+        if "loom:changes-requested" in labels and "loom:review-requested" not in labels:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "pr",
+                    "edit",
+                    str(ctx.pr_number),
+                    "--remove-label",
+                    "loom:changes-requested",
+                    "--add-label",
+                    "loom:review-requested",
+                ],
+                cwd=ctx.repo_root,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=f"label recovery: transitioned PR #{ctx.pr_number} to loom:review-requested",
+                )
+                ctx.label_cache.invalidate_pr(ctx.pr_number)
+                return True
+
+        return False
+
     def run_test_fix(
         self, ctx: ShepherdContext, test_failure_data: dict[str, Any]
     ) -> PhaseResult:
@@ -189,7 +392,7 @@ class DoctorPhase:
             PhaseResult with:
                 - SUCCESS: Doctor made commits to fix tests
                 - SKIPPED: Doctor determined failures are pre-existing (exit code 5)
-                - FAILED: Doctor could not fix the tests
+                - FAILED: Doctor could not fix the tests (with failure mode info)
         """
         # Check for shutdown
         if ctx.check_shutdown():
@@ -201,6 +404,9 @@ class DoctorPhase:
 
         # Report phase entry
         ctx.report_milestone("phase_entered", phase="doctor-test-fix")
+
+        # Capture commit count before doctor runs (for progress detection)
+        commits_before = self._get_commit_count(ctx)
 
         # Build args for Doctor in test-fix mode
         # Format: --test-fix <issue> --context <path>
@@ -230,11 +436,13 @@ class DoctorPhase:
             )
 
         if exit_code == 4:
-            # Doctor stuck
+            # Doctor stuck - diagnose what was accomplished
+            diagnostics = self._diagnose_doctor_outcome(ctx, commits_before)
             return PhaseResult(
                 status=PhaseStatus.STUCK,
                 message="doctor stuck during test-fix after retry",
                 phase_name="doctor",
+                data=diagnostics.to_dict(),
             )
 
         if exit_code == 5:
@@ -246,17 +454,27 @@ class DoctorPhase:
                 data={"preexisting": True},
             )
 
+        # Diagnose what doctor accomplished
+        diagnostics = self._diagnose_doctor_outcome(ctx, commits_before)
+
         if exit_code != 0:
+            diagnostics.failure_mode = (
+                DoctorFailureMode.NO_PROGRESS
+                if not diagnostics.made_progress
+                else DoctorFailureMode.INSUFFICIENT_CHANGES
+            )
             return PhaseResult(
                 status=PhaseStatus.FAILED,
-                message=f"doctor test-fix failed with exit code {exit_code}",
+                message=f"doctor test-fix failed with exit code {exit_code} ({diagnostics.failure_mode.value})",
                 phase_name="doctor",
+                data=diagnostics.to_dict(),
             )
 
         return PhaseResult(
             status=PhaseStatus.SUCCESS,
             message="doctor applied test fixes",
             phase_name="doctor",
+            data=diagnostics.to_dict(),
         )
 
     def _write_test_failure_context(

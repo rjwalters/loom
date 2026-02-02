@@ -4796,15 +4796,21 @@ class TestDoctorPhaseExitCode5:
         self, mock_context: MagicMock
     ) -> None:
         """Exit code 0 should validate phase and return SUCCESS."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
         doctor = DoctorPhase()
         mock_context.pr_number = 123
         mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(commits_made=1)
 
         with (
             patch(
                 "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
             ) as mock_run,
             patch.object(doctor, "validate") as mock_validate,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
         ):
             mock_run.return_value = 0
             mock_validate.return_value = True
@@ -6346,3 +6352,382 @@ class TestBuilderValidateAndComplete:
         assert result.status == PhaseStatus.FAILED
         assert "could not find PR" in result.message
         assert "after doctor fixes" in result.message
+
+
+class TestDoctorFailureModes:
+    """Test Doctor phase failure mode classification (issue #2068)."""
+
+    def test_no_progress_mode_when_no_commits_made(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Doctor with exit code != 0 and no commits should be classified as no_progress."""
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(
+                doctor,
+                "_diagnose_doctor_outcome",
+                return_value=MagicMock(
+                    made_progress=False,
+                    commits_made=0,
+                    to_dict=lambda: {
+                        "commits_made": 0,
+                        "failure_mode": "no_progress",
+                    },
+                ),
+            ),
+        ):
+            mock_run.return_value = 1  # Non-zero exit code
+            result = doctor.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("failure_mode") == "no_progress"
+        assert result.data.get("commits_made") == 0
+
+    def test_insufficient_changes_mode_when_commits_made_but_failed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Doctor with commits but non-zero exit should be insufficient_changes."""
+        from loom_tools.shepherd.phases.doctor import (
+            DoctorDiagnostics,
+            DoctorFailureMode,
+        )
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        # Create a real diagnostics object for this test
+        diagnostics = DoctorDiagnostics(commits_made=2)
+        diagnostics.failure_mode = DoctorFailureMode.INSUFFICIENT_CHANGES
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+        ):
+            mock_run.return_value = 1  # Non-zero exit code
+            result = doctor.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("failure_mode") == "insufficient_changes"
+        assert result.data.get("commits_made") == 2
+
+    def test_validation_failed_mode_when_exit_0_but_validation_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Doctor with exit 0 but validation failure should be validation_failed."""
+        from loom_tools.shepherd.phases.doctor import (
+            DoctorDiagnostics,
+            DoctorFailureMode,
+        )
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        # Create diagnostics that will be mutated
+        diagnostics = DoctorDiagnostics(commits_made=1, pr_labels=["loom:changes-requested"])
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "validate", return_value=False),
+            patch.object(doctor, "_attempt_label_recovery", return_value=False),
+        ):
+            mock_run.return_value = 0  # Success exit code
+            result = doctor.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("failure_mode") == "validation_failed"
+
+    def test_label_recovery_attempted_on_validation_failure_with_progress(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When validation fails but doctor made progress, should attempt recovery."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(
+            commits_made=1, pr_labels=["loom:changes-requested"]
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "validate", return_value=False),
+            patch.object(doctor, "_attempt_label_recovery") as mock_recovery,
+        ):
+            mock_run.return_value = 0
+            mock_recovery.return_value = False  # Recovery attempted but failed
+            doctor.run(mock_context)
+
+        # Should have attempted recovery since commits were made
+        mock_recovery.assert_called_once()
+
+    def test_no_label_recovery_when_no_progress(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When validation fails and no progress, should not attempt recovery."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(
+            commits_made=0, pr_labels=["loom:changes-requested"]
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+            patch.object(doctor, "validate", return_value=False),
+            patch.object(doctor, "_attempt_label_recovery") as mock_recovery,
+        ):
+            mock_run.return_value = 0
+            doctor.run(mock_context)
+
+        # Should NOT have attempted recovery since no commits were made
+        mock_recovery.assert_not_called()
+
+
+class TestDoctorDiagnostics:
+    """Test DoctorDiagnostics data class."""
+
+    def test_made_progress_true_when_commits_made(self) -> None:
+        """made_progress should be True when commits_made > 0."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        diag = DoctorDiagnostics(commits_made=1)
+        assert diag.made_progress is True
+
+    def test_made_progress_false_when_no_commits(self) -> None:
+        """made_progress should be False when commits_made == 0."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        diag = DoctorDiagnostics(commits_made=0)
+        assert diag.made_progress is False
+
+    def test_to_dict_includes_all_fields(self) -> None:
+        """to_dict should include all diagnostic fields."""
+        from loom_tools.shepherd.phases.doctor import (
+            DoctorDiagnostics,
+            DoctorFailureMode,
+        )
+
+        diag = DoctorDiagnostics(
+            commits_made=2,
+            has_uncommitted_changes=True,
+            pr_labels=["loom:pr", "loom:review-requested"],
+            failure_mode=DoctorFailureMode.INSUFFICIENT_CHANGES,
+        )
+
+        result = diag.to_dict()
+
+        assert result["commits_made"] == 2
+        assert result["has_uncommitted_changes"] is True
+        assert result["pr_labels"] == ["loom:pr", "loom:review-requested"]
+        assert result["failure_mode"] == "insufficient_changes"
+
+    def test_to_dict_handles_none_failure_mode(self) -> None:
+        """to_dict should handle None failure_mode gracefully."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        diag = DoctorDiagnostics()  # Default failure_mode is None
+        result = diag.to_dict()
+
+        assert result["failure_mode"] is None
+
+
+class TestDoctorGetCommitCount:
+    """Test _get_commit_count helper method."""
+
+    def test_returns_0_when_no_worktree(self, mock_context: MagicMock) -> None:
+        """Should return 0 when worktree path is None."""
+        doctor = DoctorPhase()
+        mock_context.worktree_path = None
+
+        assert doctor._get_commit_count(mock_context) == 0
+
+    def test_returns_0_when_worktree_missing(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return 0 when worktree directory doesn't exist."""
+        doctor = DoctorPhase()
+        mock_context.worktree_path = tmp_path / "nonexistent"
+
+        assert doctor._get_commit_count(mock_context) == 0
+
+    def test_returns_commit_count_from_git(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should parse commit count from git rev-list."""
+        doctor = DoctorPhase()
+        mock_context.worktree_path = tmp_path
+        tmp_path.mkdir(exist_ok=True)
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="5\n")
+            result = doctor._get_commit_count(mock_context)
+
+        assert result == 5
+
+
+class TestDoctorLabelRecovery:
+    """Test _attempt_label_recovery method."""
+
+    def test_transitions_changes_requested_to_review_requested(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should transition loom:changes-requested to loom:review-requested."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        diagnostics = DoctorDiagnostics(pr_labels=["loom:changes-requested"])
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            result = doctor._attempt_label_recovery(mock_context, diagnostics)
+
+        assert result is True
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args[0][0]
+        assert "--remove-label" in call_args
+        assert "loom:changes-requested" in call_args
+        assert "--add-label" in call_args
+        assert "loom:review-requested" in call_args
+
+    def test_no_recovery_when_already_review_requested(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should not transition if already has loom:review-requested."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = 123
+
+        diagnostics = DoctorDiagnostics(
+            pr_labels=["loom:changes-requested", "loom:review-requested"]
+        )
+
+        with patch("subprocess.run") as mock_run:
+            result = doctor._attempt_label_recovery(mock_context, diagnostics)
+
+        assert result is False
+        mock_run.assert_not_called()
+
+    def test_returns_false_when_no_pr_number(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return False when no PR number available."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.pr_number = None
+
+        diagnostics = DoctorDiagnostics(pr_labels=["loom:changes-requested"])
+
+        result = doctor._attempt_label_recovery(mock_context, diagnostics)
+        assert result is False
+
+
+class TestDoctorTestFixWithDiagnostics:
+    """Test run_test_fix includes diagnostics in failure results."""
+
+    def test_stuck_result_includes_diagnostics(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run_test_fix STUCK result should include diagnostics."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(commits_made=1)
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+        ):
+            mock_run.return_value = 4  # Stuck
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.STUCK
+        assert result.data.get("commits_made") == 1
+
+    def test_failed_result_includes_failure_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run_test_fix FAILED result should include failure_mode."""
+        from loom_tools.shepherd.phases.doctor import (
+            DoctorDiagnostics,
+            DoctorFailureMode,
+        )
+
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(commits_made=0)
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+        ):
+            mock_run.return_value = 1  # Failed
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("failure_mode") == "no_progress"
+
+    def test_success_result_includes_diagnostics(
+        self, mock_context: MagicMock
+    ) -> None:
+        """run_test_fix SUCCESS result should include diagnostics."""
+        from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
+
+        doctor = DoctorPhase()
+        mock_context.check_shutdown.return_value = False
+
+        diagnostics = DoctorDiagnostics(commits_made=2)
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.doctor.run_phase_with_retry"
+            ) as mock_run,
+            patch.object(doctor, "_get_commit_count", return_value=0),
+            patch.object(doctor, "_diagnose_doctor_outcome", return_value=diagnostics),
+        ):
+            mock_run.return_value = 0  # Success
+            result = doctor.run_test_fix(mock_context, {})
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("commits_made") == 2

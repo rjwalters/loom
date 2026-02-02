@@ -716,7 +716,26 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     raise ShutdownSignal(result.message)
 
                 if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
-                    log_error(result.message)
+                    # Use failure mode to provide better diagnostics
+                    failure_mode = result.data.get("failure_mode")
+                    commits_made = result.data.get("commits_made", 0)
+
+                    if failure_mode == "no_progress":
+                        log_error(
+                            f"Doctor made no progress ({result.message}). "
+                            "Retry unlikely to help."
+                        )
+                        _mark_doctor_exhausted(ctx, failure_mode="no_progress")
+                    elif failure_mode == "validation_failed" and commits_made > 0:
+                        log_error(
+                            f"Doctor made {commits_made} commit(s) but validation failed. "
+                            "Label state may need manual recovery."
+                        )
+                        _mark_doctor_exhausted(ctx, failure_mode="validation_failed")
+                    else:
+                        log_error(result.message)
+                        _mark_doctor_exhausted(ctx)
+
                     return ShepherdExitCode.NEEDS_INTERVENTION
 
                 completed_phases.append("Doctor (fixes applied)")
@@ -923,8 +942,16 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
     )
 
 
-def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
-    """Mark issue with loom:failed:doctor due to retry exhaustion."""
+def _mark_doctor_exhausted(
+    ctx: ShepherdContext, *, failure_mode: str | None = None
+) -> None:
+    """Mark issue with loom:failed:doctor due to retry exhaustion.
+
+    Args:
+        ctx: Shepherd context
+        failure_mode: Optional failure classification (no_progress, insufficient_changes,
+                      validation_failed) for better diagnostics
+    """
     import subprocess
 
     # Atomic transition: loom:building -> loom:failed:doctor
@@ -950,16 +977,46 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
         record_blocked_reason,
     )
 
+    # Build error class and details based on failure mode
+    error_class = f"doctor_{failure_mode}" if failure_mode else "doctor_exhausted"
+    if failure_mode == "no_progress":
+        details = "Doctor made no commits - no progress toward resolution"
+    elif failure_mode == "validation_failed":
+        details = "Doctor committed but label transition failed - label state inconsistent"
+    elif failure_mode == "insufficient_changes":
+        details = "Doctor committed but changes did not resolve the issue"
+    else:
+        details = f"max retries ({ctx.config.doctor_max_retries}) exceeded"
+
     record_blocked_reason(
         ctx.repo_root,
         ctx.config.issue,
-        error_class="doctor_exhausted",
+        error_class=error_class,
         phase="doctor",
-        details=f"max retries ({ctx.config.doctor_max_retries}) exceeded",
+        details=details,
     )
     detect_systematic_failure(ctx.repo_root)
 
-    # Add comment
+    # Build appropriate comment based on failure mode
+    if failure_mode == "no_progress":
+        comment_body = (
+            "**Doctor phase failed**: Doctor made no commits toward resolution. "
+            "This suggests the issue may be too complex for automated fixing or "
+            "the feedback was unclear. Manual intervention required."
+        )
+    elif failure_mode == "validation_failed":
+        comment_body = (
+            "**Doctor phase failed**: Doctor committed changes but did not complete "
+            "the label transition (missing `loom:review-requested`). PR label state "
+            "may need manual recovery. Check PR labels and apply `loom:review-requested` "
+            "if commits address the feedback."
+        )
+    else:
+        comment_body = (
+            f"**Doctor phase failed**: Could not resolve Judge feedback after "
+            f"{ctx.config.doctor_max_retries} attempts. Manual intervention required."
+        )
+
     subprocess.run(
         [
             "gh",
@@ -967,8 +1024,7 @@ def _mark_doctor_exhausted(ctx: ShepherdContext) -> None:
             "comment",
             str(ctx.config.issue),
             "--body",
-            f"**Doctor phase failed**: Could not resolve Judge feedback after "
-            f"{ctx.config.doctor_max_retries} attempts. Manual intervention required.",
+            comment_body,
         ],
         cwd=ctx.repo_root,
         capture_output=True,
