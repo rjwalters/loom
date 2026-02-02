@@ -292,6 +292,25 @@ class BuilderPhase:
 
             # Check if this is incomplete work that could be completed
             if not self._has_incomplete_work(diag):
+                # Check if this is the "no changes needed" pattern
+                if self._is_no_changes_needed(diag):
+                    log_info(
+                        f"Builder analyzed issue #{ctx.config.issue} and determined "
+                        "no changes are needed"
+                    )
+                    self._cleanup_stale_worktree(ctx)
+                    return PhaseResult(
+                        status=PhaseStatus.SKIPPED,
+                        message="no changes needed - problem already resolved on main",
+                        phase_name="builder",
+                        data={
+                            "no_changes_needed": True,
+                            "reason": "already_resolved",
+                            "close_issue": True,
+                            "diagnostics": diag,
+                        },
+                    )
+
                 # No incomplete work pattern — nothing to retry
                 self._cleanup_stale_worktree(ctx)
                 return PhaseResult(
@@ -434,6 +453,24 @@ class BuilderPhase:
 
             # Check if this is incomplete work that could be completed
             if not self._has_incomplete_work(diag):
+                # Check if this is the "no changes needed" pattern
+                if self._is_no_changes_needed(diag):
+                    log_info(
+                        f"Builder analyzed issue #{ctx.config.issue} after doctor fixes "
+                        "and determined no changes are needed"
+                    )
+                    return PhaseResult(
+                        status=PhaseStatus.SKIPPED,
+                        message="no changes needed - problem already resolved on main",
+                        phase_name="builder",
+                        data={
+                            "no_changes_needed": True,
+                            "reason": "already_resolved",
+                            "close_issue": True,
+                            "diagnostics": diag,
+                        },
+                    )
+
                 # No incomplete work pattern — nothing to retry
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
@@ -2003,6 +2040,34 @@ class BuilderPhase:
             return True
 
         return False
+
+    def _is_no_changes_needed(self, diag: dict[str, Any]) -> bool:
+        """Check if diagnostics indicate "no changes needed" condition.
+
+        Returns True when all of these conditions hold:
+        - Worktree exists (builder analyzed the issue)
+        - No commits ahead of main (builder made no changes)
+        - No uncommitted changes (no work in progress)
+        - No remote branch exists (nothing pushed)
+        - No PR exists (nothing created)
+
+        This pattern indicates the builder analyzed the issue and determined
+        that no changes are required - the reported problem either doesn't
+        exist or is already resolved on main.
+        """
+        if not diag.get("worktree_exists"):
+            return False
+
+        # All indicators of work must be absent
+        has_any_work = (
+            diag.get("has_uncommitted_changes", False)
+            or diag.get("commits_ahead", 0) > 0
+            or diag.get("remote_branch_exists", False)
+            or diag.get("pr_number") is not None
+        )
+
+        # No work detected = no changes needed
+        return not has_any_work
 
     def _diagnose_remaining_steps(self, diag: dict[str, Any], issue: int) -> list[str]:
         """Determine exactly which steps remain to complete the workflow.
