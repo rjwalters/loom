@@ -175,15 +175,26 @@ class JudgePhase:
             # loom:review-requested but neither loom:pr nor loom:changes-requested.
             # This is an expected intermediate state - the judge worker just ran
             # but may not have applied its outcome label yet.
+            #
+            # Issue #2083: When fallback succeeds, return immediately without
+            # re-querying GitHub labels. The `gh pr edit` return code is
+            # authoritative - if it succeeded, the label was applied. Querying
+            # GitHub API immediately after can race with label propagation.
             if ctx.config.is_force_mode and self._try_fallback_approval(ctx):
-                validated = True
+                # Fallback already applied loom:pr — trust it and return success
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=f"[force-mode] Fallback approval applied to PR #{ctx.pr_number}",
+                    phase_name="judge",
+                    data={"approved": True, "fallback_used": True},
+                )
             elif ctx.config.is_force_mode and self._try_fallback_changes_requested(ctx):
                 # Fallback detected changes-requested — route to doctor loop
                 return PhaseResult(
                     status=PhaseStatus.SUCCESS,
                     message=f"[force-mode] Fallback detected changes requested on PR #{ctx.pr_number}",
                     phase_name="judge",
-                    data={"changes_requested": True},
+                    data={"changes_requested": True, "fallback_used": True},
                 )
             else:
                 diag = self._gather_diagnostics(ctx)
@@ -203,9 +214,9 @@ class JudgePhase:
                     data=diag,
                 )
 
-        # Check result — cache was already invalidated above, but
-        # invalidate once more to ensure the label checks below
-        # reflect the latest state.
+        # Standard validation passed — check the result labels.
+        # Cache was already invalidated above, but invalidate once more
+        # to ensure the label checks below reflect the latest state.
         ctx.label_cache.invalidate_pr(ctx.pr_number)
 
         if ctx.has_pr_label("loom:pr"):
