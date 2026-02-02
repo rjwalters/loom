@@ -192,6 +192,17 @@ class BuilderPhase:
             ctx.label_cache.invalidate_issue(ctx.config.issue)
             return quality_result
 
+        # Check for and recover from stale worktree (issue #1995)
+        # A stale worktree is one left behind by a previous builder that crashed
+        # or timed out before making any commits.
+        if ctx.worktree_path and ctx.worktree_path.is_dir():
+            if self._is_stale_worktree(ctx.worktree_path):
+                log_warning(
+                    f"Stale worktree detected at {ctx.worktree_path} "
+                    "(no commits, no uncommitted changes) - cleaning up"
+                )
+                self._reset_stale_worktree(ctx)
+
         # Create worktree
         if ctx.worktree_path and not ctx.worktree_path.is_dir():
             try:
@@ -2314,6 +2325,127 @@ class BuilderPhase:
         )
 
         return exit_code
+
+    def _is_stale_worktree(self, worktree_path: Path) -> bool:
+        """Check if an existing worktree is stale (abandoned without commits).
+
+        A stale worktree is one where a previous builder:
+        1. Created the worktree
+        2. Failed/crashed/timed out before making any commits
+        3. Left the worktree in place
+
+        Returns True if the worktree exists, has no commits ahead of main,
+        and has no uncommitted changes. This indicates the worktree can be
+        safely reset or removed for a fresh start.
+        """
+        if not worktree_path.is_dir():
+            return False
+
+        # Check for uncommitted changes
+        status_result = subprocess.run(
+            ["git", "-C", str(worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode != 0:
+            return False  # Can't determine status, don't treat as stale
+        if status_result.stdout.strip():
+            return False  # Has uncommitted changes, not stale
+
+        # Check for commits ahead of main
+        # Use origin/main instead of @{upstream} because the branch may not
+        # have an upstream tracking branch set yet
+        log_result = subprocess.run(
+            ["git", "-C", str(worktree_path), "log", "--oneline", "origin/main..HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if log_result.returncode != 0:
+            return False  # Can't determine commit status
+        if log_result.stdout.strip():
+            return False  # Has commits ahead of main, not stale
+
+        # Worktree exists with no commits and no changes - it's stale
+        return True
+
+    def _reset_stale_worktree(self, ctx: ShepherdContext) -> None:
+        """Reset a stale worktree to match origin/main.
+
+        This method is called when we detect a stale worktree from a previous
+        builder that crashed before making any commits. Instead of removing
+        and recreating the worktree, we reset it to origin/main and let the
+        builder continue fresh.
+
+        This approach:
+        1. Preserves the worktree directory structure
+        2. Ensures the branch is in sync with main
+        3. Is faster than remove + recreate
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return
+
+        # Fetch latest from origin to ensure we have current main
+        subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "fetch", "origin", "main"],
+            capture_output=True,
+            check=False,
+        )
+
+        # Hard reset to origin/main
+        result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "reset", "--hard", "origin/main"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.returncode == 0:
+            log_info(f"Reset stale worktree {ctx.worktree_path} to origin/main")
+        else:
+            # If reset fails, fall back to removing the worktree entirely
+            log_warning(
+                f"Failed to reset stale worktree, removing it: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+            self._remove_stale_worktree(ctx)
+
+    def _remove_stale_worktree(self, ctx: ShepherdContext) -> None:
+        """Remove a stale worktree and its branch.
+
+        Called as a fallback when resetting fails. Removes the worktree
+        and deletes the local branch so worktree.sh can recreate it.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return
+
+        # Get branch name before removal
+        branch_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+
+        # Remove worktree
+        subprocess.run(
+            ["git", "worktree", "remove", str(ctx.worktree_path), "--force"],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+
+        # Delete branch
+        if branch and branch != "main":
+            subprocess.run(
+                ["git", "-C", str(ctx.repo_root), "branch", "-D", branch],
+                capture_output=True,
+                check=False,
+            )
+
+        log_info(f"Removed stale worktree {ctx.worktree_path} and branch {branch}")
 
     def _cleanup_stale_worktree(self, ctx: ShepherdContext) -> None:
         """Clean up worktree if it has no commits or changes.

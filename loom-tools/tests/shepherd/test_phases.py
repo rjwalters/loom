@@ -6077,6 +6077,176 @@ class TestBuilderIsNoChangesNeeded:
         assert builder._is_no_changes_needed(diag) is True
 
 
+class TestBuilderStaleWorktreeRecovery:
+    """Test stale worktree detection and recovery (issue #1995)."""
+
+    def test_is_stale_worktree_nonexistent_dir(self, tmp_path: Path) -> None:
+        """Non-existent directory is not considered stale."""
+        builder = BuilderPhase()
+        nonexistent = tmp_path / "nonexistent"
+        assert builder._is_stale_worktree(nonexistent) is False
+
+    def test_is_stale_worktree_with_uncommitted_changes(self, tmp_path: Path) -> None:
+        """Worktree with uncommitted changes is not stale."""
+        builder = BuilderPhase()
+        # Create a mock worktree directory
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            # git status shows uncommitted changes
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="M  src/file.py\n"
+            )
+            assert builder._is_stale_worktree(worktree) is False
+
+    def test_is_stale_worktree_with_commits(self, tmp_path: Path) -> None:
+        """Worktree with commits ahead of main is not stale."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            def run_side_effect(cmd, **kwargs):
+                result = MagicMock()
+                if "status" in cmd:
+                    result.returncode = 0
+                    result.stdout = ""
+                elif "log" in cmd:
+                    result.returncode = 0
+                    result.stdout = "abc1234 Add feature\n"  # Has commits
+                return result
+
+            mock_run.side_effect = run_side_effect
+            assert builder._is_stale_worktree(worktree) is False
+
+    def test_is_stale_worktree_detects_stale(self, tmp_path: Path) -> None:
+        """Worktree with no commits and no changes is stale."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            def run_side_effect(cmd, **kwargs):
+                result = MagicMock()
+                if "status" in cmd:
+                    result.returncode = 0
+                    result.stdout = ""  # No uncommitted changes
+                elif "log" in cmd:
+                    result.returncode = 0
+                    result.stdout = ""  # No commits ahead
+                return result
+
+            mock_run.side_effect = run_side_effect
+            assert builder._is_stale_worktree(worktree) is True
+
+    def test_is_stale_worktree_handles_git_errors(self, tmp_path: Path) -> None:
+        """Git command errors should not be treated as stale."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            # git status fails
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
+            assert builder._is_stale_worktree(worktree) is False
+
+    def test_reset_stale_worktree_success(self, tmp_path: Path) -> None:
+        """Successful reset logs info message."""
+        builder = BuilderPhase()
+
+        # Create real mock context with real Path
+        ctx = MagicMock()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        ctx.worktree_path = worktree
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+            patch.object(builder, "_remove_stale_worktree") as mock_remove,
+        ):
+            # Fetch succeeds
+            # Reset succeeds
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            builder._reset_stale_worktree(ctx)
+
+            # Should not call remove since reset succeeded
+            mock_remove.assert_not_called()
+            # Should have run fetch and reset
+            assert mock_run.call_count == 2
+
+    def test_reset_stale_worktree_falls_back_to_remove(
+        self, tmp_path: Path
+    ) -> None:
+        """Failed reset falls back to removing worktree."""
+        builder = BuilderPhase()
+
+        # Create real mock context with real Path
+        ctx = MagicMock()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        ctx.worktree_path = worktree
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+            patch.object(builder, "_remove_stale_worktree") as mock_remove,
+        ):
+            def run_side_effect(cmd, **kwargs):
+                result = MagicMock()
+                if "fetch" in cmd:
+                    result.returncode = 0
+                elif "reset" in cmd:
+                    result.returncode = 1  # Reset fails
+                    result.stderr = "fatal: could not reset"
+                    result.stdout = ""
+                return result
+
+            mock_run.side_effect = run_side_effect
+
+            builder._reset_stale_worktree(ctx)
+
+            # Should call remove as fallback
+            mock_remove.assert_called_once_with(ctx)
+
+    def test_remove_stale_worktree_cleans_up(self, tmp_path: Path) -> None:
+        """Remove stale worktree removes both worktree and branch."""
+        builder = BuilderPhase()
+
+        # Create real mock context with real Path
+        ctx = MagicMock()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        ctx.worktree_path = worktree
+        ctx.repo_root = tmp_path
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # First call gets branch name, second removes worktree, third deletes branch
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="feature/issue-42\n"),  # rev-parse
+                MagicMock(returncode=0),  # worktree remove
+                MagicMock(returncode=0),  # branch delete
+            ]
+
+            builder._remove_stale_worktree(ctx)
+
+            assert mock_run.call_count == 3
+            # Check worktree remove was called
+            worktree_call = mock_run.call_args_list[1]
+            assert "worktree" in worktree_call[0][0]
+            assert "remove" in worktree_call[0][0]
+            # Check branch delete was called
+            branch_call = mock_run.call_args_list[2]
+            assert "branch" in branch_call[0][0]
+            assert "-D" in branch_call[0][0]
+
+
 class TestBuilderDirectCompletion:
     """Test _direct_completion for mechanical fallback operations."""
 
