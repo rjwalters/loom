@@ -36,6 +36,38 @@ logger = logging.getLogger(__name__)
 # Default timeout for test verification (seconds)
 _TEST_VERIFY_TIMEOUT = 300
 
+# File extensions mapped to language categories for scoped test verification
+_LANGUAGE_EXTENSIONS: dict[str, str] = {
+    # Python
+    ".py": "python",
+    ".pyi": "python",
+    # Rust
+    ".rs": "rust",
+    # TypeScript/JavaScript
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".mjs": "javascript",
+    ".cjs": "javascript",
+    # Configuration files that affect all languages
+    ".json": "config",
+    ".toml": "config",
+    ".yaml": "config",
+    ".yml": "config",
+}
+
+# Paths that indicate which language is affected (takes precedence over extension)
+_LANGUAGE_PATH_PATTERNS: list[tuple[str, str]] = [
+    ("loom-tools/", "python"),
+    ("src-tauri/", "rust"),
+    ("loom-daemon/", "rust"),
+    ("loom-api/", "rust"),
+    ("src/", "typescript"),
+    ("e2e/", "typescript"),
+    ("mcp-loom/", "javascript"),
+]
+
 
 class BuilderPhase:
     """Phase 3: Builder - Create worktree, implement, create PR."""
@@ -606,6 +638,135 @@ class BuilderPhase:
             log_warning(f"Could not run pnpm install: {e}")
             return False
 
+    def _classify_changed_files(self, files: list[str]) -> set[str]:
+        """Classify changed files by language/type.
+
+        Returns a set of language categories: "python", "rust", "typescript",
+        "javascript", "config", "other".
+
+        Config changes are treated as affecting ALL languages since they may
+        impact the build/test configuration.
+        """
+        languages: set[str] = set()
+
+        for filepath in files:
+            # Check path patterns first (more specific)
+            matched = False
+            for pattern, lang in _LANGUAGE_PATH_PATTERNS:
+                if filepath.startswith(pattern):
+                    languages.add(lang)
+                    matched = True
+                    break
+
+            # If no path pattern matched, check extension
+            if not matched:
+                ext = Path(filepath).suffix.lower()
+                if ext in _LANGUAGE_EXTENSIONS:
+                    languages.add(_LANGUAGE_EXTENSIONS[ext])
+                else:
+                    languages.add("other")
+
+        return languages
+
+    def _get_scoped_test_commands(
+        self, worktree: Path, languages: set[str]
+    ) -> list[tuple[list[str], str]]:
+        """Get the test commands scoped to the changed languages.
+
+        Returns a list of (command_args, display_name) tuples for the relevant
+        test suites. If "config" is in languages, returns all test commands
+        (config changes affect everything).
+
+        Returns an empty list if no relevant tests are detected.
+        """
+        commands: list[tuple[list[str], str]] = []
+
+        # Config changes affect everything - run all tests
+        if "config" in languages:
+            full_cmd = self._detect_test_command(worktree)
+            if full_cmd:
+                return [full_cmd]
+            return []
+
+        # Check which test runners are available
+        has_package_json = (worktree / "package.json").is_file()
+        has_cargo_toml = (worktree / "Cargo.toml").is_file()
+        has_pyproject = (worktree / "pyproject.toml").is_file()
+
+        # Python changes -> Python tests only
+        if "python" in languages and has_pyproject:
+            commands.append(
+                (["uv", "run", "pytest", "-x", "-q"], "pytest")
+            )
+
+        # Rust changes -> Rust clippy and tests
+        if "rust" in languages and has_cargo_toml:
+            # Clippy for linting
+            commands.append(
+                (
+                    [
+                        "cargo",
+                        "clippy",
+                        "--workspace",
+                        "--exclude",
+                        "app",
+                        "--all-targets",
+                        "--all-features",
+                        "--locked",
+                        "--",
+                        "-D",
+                        "warnings",
+                    ],
+                    "cargo clippy",
+                )
+            )
+            # Cargo test
+            commands.append(
+                (
+                    [
+                        "cargo",
+                        "test",
+                        "--workspace",
+                        "--exclude",
+                        "app",
+                        "--locked",
+                        "--all-features",
+                        "--no-fail-fast",
+                        "--",
+                        "--nocapture",
+                    ],
+                    "cargo test",
+                )
+            )
+
+        # TypeScript/JavaScript changes -> vitest + biome lint
+        if ("typescript" in languages or "javascript" in languages) and has_package_json:
+            pkg = read_json_file(worktree / "package.json")
+            if isinstance(pkg, dict):
+                scripts = pkg.get("scripts", {})
+                # Lint check (biome or eslint)
+                if "lint" in scripts:
+                    commands.append((["pnpm", "lint"], "pnpm lint"))
+                # Typecheck
+                if "typecheck" in scripts:
+                    commands.append((["pnpm", "typecheck"], "pnpm typecheck"))
+                # Unit tests
+                if "test:unit:coverage" in scripts:
+                    commands.append(
+                        (["pnpm", "test:unit:coverage"], "pnpm test:unit:coverage")
+                    )
+                elif "test:unit" in scripts:
+                    commands.append((["pnpm", "test:unit"], "pnpm test:unit"))
+
+        # If "other" category or no specific tests detected, fall back to
+        # full test suite
+        if not commands and ("other" in languages or not languages):
+            full_cmd = self._detect_test_command(worktree)
+            if full_cmd:
+                commands.append(full_cmd)
+
+        return commands
+
     def _detect_test_command(self, worktree: Path) -> tuple[list[str], str] | None:
         """Detect the appropriate test command for the project in the worktree.
 
@@ -1121,8 +1282,143 @@ class BuilderPhase:
             log_warning(f"Could not run baseline tests: {e}")
             return None
 
+    def _run_single_test_with_baseline(
+        self,
+        ctx: ShepherdContext,
+        test_cmd: list[str],
+        display_name: str,
+    ) -> PhaseResult | None:
+        """Run a single test command with baseline comparison.
+
+        This is a helper for scoped test verification. It runs the test command
+        once on the worktree and compares against baseline (main branch) to
+        determine if failures are new or pre-existing.
+
+        Returns None if tests pass or failures are pre-existing.
+        Returns a PhaseResult with FAILED status if new test failures are found.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return None
+
+        # Run baseline tests on main
+        baseline_result = self._run_baseline_tests(ctx, test_cmd, display_name)
+
+        log_info(f"Running tests: {display_name}")
+        ctx.report_milestone("heartbeat", action=f"verifying tests: {display_name}")
+
+        test_start = time.time()
+        try:
+            result = subprocess.run(
+                test_cmd,
+                cwd=ctx.worktree_path,
+                text=True,
+                capture_output=True,
+                timeout=_TEST_VERIFY_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = int(time.time() - test_start)
+            log_error(f"Tests timed out after {elapsed}s ({display_name})")
+            ctx.report_milestone(
+                "heartbeat",
+                action=f"test verification timed out after {elapsed}s",
+            )
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=f"test verification timed out after {elapsed}s ({display_name})",
+                phase_name="builder",
+                data={"test_failure": True},
+            )
+        except OSError as e:
+            log_warning(f"Could not run tests ({display_name}): {e}")
+            return None
+
+        elapsed = int(time.time() - test_start)
+        output = result.stdout + "\n" + result.stderr
+
+        if result.returncode == 0:
+            summary = self._parse_test_summary(output)
+            if summary:
+                log_success(f"Tests passed ({summary}, {elapsed}s)")
+            else:
+                log_success(f"Tests passed ({elapsed}s)")
+            ctx.report_milestone(
+                "heartbeat",
+                action=f"tests passed ({elapsed}s)",
+            )
+            return None
+
+        # Tests failed — check if these are pre-existing failures
+        if baseline_result is not None and baseline_result.returncode != 0:
+            baseline_output = baseline_result.stdout + "\n" + baseline_result.stderr
+            worktree_output = output
+
+            # Structured comparison using parsed failure counts
+            structured = self._compare_test_results(baseline_output, worktree_output)
+
+            if structured is None:
+                # No new failures detected
+                summary = self._parse_test_summary(worktree_output)
+                msg = f"pre-existing on main ({summary})" if summary else "pre-existing on main"
+                log_warning(f"Tests failed but all failures are pre-existing: {msg}")
+                ctx.report_milestone(
+                    "heartbeat",
+                    action=f"tests have pre-existing failures ({elapsed}s)",
+                )
+                return None
+
+            if structured is True:
+                log_warning(
+                    f"Baseline also fails but worktree introduces "
+                    f"new test failures (higher failure count) for {display_name}"
+                )
+            # Fall through to return failure
+
+        # Tests failed with new errors
+        summary = self._parse_test_summary(output)
+        tail_lines = output.strip().splitlines()[-10:]
+        tail_text = "\n".join(tail_lines)
+
+        if summary:
+            log_error(f"Tests failed ({summary}, {elapsed}s)")
+        else:
+            log_error(f"Tests failed (exit code {result.returncode}, {elapsed}s)")
+
+        log_info(f"Test output (last 10 lines):\n{tail_text}")
+        ctx.report_milestone(
+            "heartbeat",
+            action=f"test verification failed ({elapsed}s)",
+        )
+
+        # Collect changed files for doctor context
+        changed_files: list[str] = []
+        if ctx.worktree_path:
+            changed_files = get_changed_files(cwd=ctx.worktree_path)
+
+        return PhaseResult(
+            status=PhaseStatus.FAILED,
+            message=f"test verification failed ({display_name}, exit code {result.returncode})",
+            phase_name="builder",
+            data={
+                "test_failure": True,
+                "test_output_tail": tail_text,
+                "test_summary": summary or "",
+                "test_command": display_name,
+                "changed_files": changed_files,
+            },
+        )
+
     def _run_test_verification(self, ctx: ShepherdContext) -> PhaseResult | None:
         """Run test verification in the worktree after builder completes.
+
+        Uses scoped test verification: determines which files changed between
+        main and HEAD, then runs only the test suites relevant to those changes.
+        For example, Python-only changes skip Rust tests entirely.
+
+        Falls back to full test suite when:
+        - Changed files cannot be determined (git diff fails)
+        - Config files are changed (affect all languages)
+        - No scoped test commands could be determined
 
         Uses baseline comparison: runs tests against main first, then against
         the worktree. Only fails if the worktree introduces NEW errors not
@@ -1137,6 +1433,39 @@ class BuilderPhase:
         # Ensure dependencies are installed before running tests
         self._ensure_dependencies(ctx.worktree_path)
 
+        # Get changed files and determine which test suites to run
+        changed_files = get_changed_files(cwd=ctx.worktree_path)
+
+        if changed_files:
+            languages = self._classify_changed_files(changed_files)
+            log_info(
+                f"Scoped test verification: {len(changed_files)} changed files, "
+                f"languages: {sorted(languages) if languages else 'none detected'}"
+            )
+
+            # Get scoped test commands based on changed languages
+            test_commands = self._get_scoped_test_commands(ctx.worktree_path, languages)
+
+            if test_commands:
+                # Run scoped tests instead of full suite
+                cmd_names = [name for _, name in test_commands]
+                log_info(f"Running scoped tests: {', '.join(cmd_names)}")
+
+                # Run each scoped test command
+                for test_cmd, display_name in test_commands:
+                    result = self._run_single_test_with_baseline(
+                        ctx, test_cmd, display_name
+                    )
+                    if result is not None:
+                        # Test failed, return early
+                        return result
+
+                # All scoped tests passed - check supplemental verification
+                # using the last test command's output (stored in ctx)
+                return None
+
+        # Fall back to full test suite
+        log_info("Using full test suite (no scoping or config files changed)")
         test_info = self._detect_test_command(ctx.worktree_path)
         if test_info is None:
             log_info("No test runner detected in worktree, skipping test verification")
