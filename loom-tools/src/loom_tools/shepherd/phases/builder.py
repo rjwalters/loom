@@ -293,6 +293,11 @@ class BuilderPhase:
                 f"{diag['summary']}"
             )
 
+            # Brief delay before retry to allow transient GitHub API issues to resolve
+            if completion_attempts > 1:
+                log_info("Waiting 5 seconds before retry to allow transient issues to resolve")
+                time.sleep(5)
+
             # Run completion phase with attempt number for progressive simplification
             completion_exit = self._run_completion_phase(
                 ctx, diag, attempt=completion_attempts
@@ -430,6 +435,11 @@ class BuilderPhase:
                 f"(attempt {completion_attempts}/{max_completion_attempts}): "
                 f"{diag['summary']}"
             )
+
+            # Brief delay before retry to allow transient GitHub API issues to resolve
+            if completion_attempts > 1:
+                log_info("Waiting 5 seconds before retry to allow transient issues to resolve")
+                time.sleep(5)
 
             # Run completion phase with attempt number for progressive simplification
             completion_exit = self._run_completion_phase(
@@ -1434,20 +1444,25 @@ class BuilderPhase:
             )
             diag["commits_ahead"] = len(commits)
 
-            # Uncommitted changes
+            # Uncommitted changes (with file count for diagnostic prompts)
             status_res = subprocess.run(
                 ["git", "-C", str(wt), "status", "--porcelain"],
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            diag["has_uncommitted_changes"] = bool(
-                status_res.returncode == 0 and status_res.stdout.strip()
+            uncommitted_files = (
+                status_res.stdout.strip().splitlines()
+                if status_res.returncode == 0 and status_res.stdout.strip()
+                else []
             )
+            diag["has_uncommitted_changes"] = bool(uncommitted_files)
+            diag["uncommitted_file_count"] = len(uncommitted_files)
         else:
             diag["branch"] = None
             diag["commits_ahead"] = 0
             diag["has_uncommitted_changes"] = False
+            diag["uncommitted_file_count"] = 0
 
         # -- Remote branch ---------------------------------------------------
         branch_name = NamingConventions.branch_name(ctx.config.issue)
@@ -1520,10 +1535,15 @@ class BuilderPhase:
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []
         if diag["worktree_exists"]:
+            uncommitted_note = (
+                f"{diag['uncommitted_file_count']} files"
+                if diag["has_uncommitted_changes"]
+                else "none"
+            )
             parts.append(
                 f"worktree exists (branch={diag['branch']}, "
                 f"commits_ahead={diag['commits_ahead']}, "
-                f"uncommitted={diag['has_uncommitted_changes']})"
+                f"uncommitted={uncommitted_note})"
             )
         else:
             parts.append("worktree does not exist")
@@ -1809,9 +1829,42 @@ class BuilderPhase:
         # Newlines break shell command parsing (causes "dquote>" prompts).
         # Join instructions with semicolons instead of newlines.
         instruction_oneline = "; ".join(instructions)
+
+        # Build diagnostic context for retry attempts
+        # On attempt >= 2, include specific state details to help the agent understand
+        # the exact situation (file counts, branch state, etc.)
+        diag_context = ""
+        if attempt >= 2:
+            diag_parts = []
+            if diag.get("uncommitted_file_count", 0) > 0:
+                diag_parts.append(
+                    f"there are {diag['uncommitted_file_count']} uncommitted files"
+                )
+            if diag.get("commits_ahead", 0) > 0:
+                diag_parts.append(
+                    f"the branch has {diag['commits_ahead']} commits ahead of main"
+                )
+            elif diag.get("remote_branch_exists"):
+                diag_parts.append(
+                    "the remote branch exists but has no commits ahead of main"
+                )
+            else:
+                diag_parts.append("the remote branch does not exist yet")
+            if diag.get("pr_number"):
+                if diag.get("pr_has_review_label"):
+                    diag_parts.append(
+                        f"PR #{diag['pr_number']} exists with loom:review-requested"
+                    )
+                else:
+                    diag_parts.append(
+                        f"PR #{diag['pr_number']} exists but is missing loom:review-requested label"
+                    )
+            if diag_parts:
+                diag_context = f" Current state: {', '.join(diag_parts)}."
+
         completion_args = (
             f"COMPLETION_MODE: Your previous session ended before completing the workflow. "
-            f"You are in worktree .loom/worktrees/issue-{ctx.config.issue} with changes ready. "
+            f"You are in worktree .loom/worktrees/issue-{ctx.config.issue} with changes ready.{diag_context} "
             f"Complete these steps: {instruction_oneline}. "
             f"Do NOT implement anything new - just complete the git/PR workflow."
         )

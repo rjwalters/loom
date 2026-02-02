@@ -5417,6 +5417,263 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         assert "commit" not in call_kwargs["args"].lower()
         assert "push" not in call_kwargs["args"].lower()
 
+    def test_attempt_2_includes_diagnostic_context(self, mock_context: MagicMock) -> None:
+        """Second attempt should include specific diagnostic details in prompt."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": True,
+            "uncommitted_file_count": 7,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=2)
+
+        call_kwargs = mock_run.call_args[1]
+        # Should include file count
+        assert "7 uncommitted files" in call_kwargs["args"]
+        # Should include branch state
+        assert "remote branch exists but has no commits ahead of main" in call_kwargs["args"]
+
+    def test_attempt_1_does_not_include_diagnostic_context(self, mock_context: MagicMock) -> None:
+        """First attempt should not include diagnostic context."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": True,
+            "uncommitted_file_count": 7,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=1)
+
+        call_kwargs = mock_run.call_args[1]
+        # Should NOT include file count on first attempt
+        assert "uncommitted files" not in call_kwargs["args"]
+
+    def test_diagnostic_context_with_commits_ahead(self, mock_context: MagicMock) -> None:
+        """Diagnostic context should describe commits ahead when present."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": False,
+            "uncommitted_file_count": 0,
+            "commits_ahead": 3,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=2)
+
+        call_kwargs = mock_run.call_args[1]
+        assert "3 commits ahead of main" in call_kwargs["args"]
+
+    def test_diagnostic_context_with_pr_missing_label(self, mock_context: MagicMock) -> None:
+        """Diagnostic context should note PR missing label."""
+        builder = BuilderPhase()
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.worktree_path = Path("/fake/worktree")
+
+        diag = {
+            "has_uncommitted_changes": False,
+            "uncommitted_file_count": 0,
+            "commits_ahead": 1,
+            "remote_branch_exists": True,
+            "pr_number": 150,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+        ) as mock_run:
+            builder._run_completion_phase(mock_context, diag, attempt=2)
+
+        call_kwargs = mock_run.call_args[1]
+        assert "PR #150 exists but is missing loom:review-requested label" in call_kwargs["args"]
+
+
+class TestBuilderDiagnosticsUncommittedFileCount:
+    """Test uncommitted file count in diagnostics."""
+
+    def test_uncommitted_file_count_captured(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should capture count of uncommitted files."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("log line\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                # Simulate 7 uncommitted files
+                result.stdout = "M file1.py\nM file2.py\nA file3.py\n?? file4.py\nM file5.py\nM file6.py\nD file7.py\n"
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["uncommitted_file_count"] == 7
+        assert diag["has_uncommitted_changes"] is True
+
+    def test_summary_includes_file_count(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Summary should include file count when uncommitted."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("log line\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = "M file1.py\nM file2.py\nA file3.py\n"
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        # Summary should say "3 files" not just "True"
+        assert "uncommitted=3 files" in diag["summary"]
+
+    def test_no_uncommitted_shows_none_in_summary(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Summary should show 'none' when no uncommitted files."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-builder-issue-42.log"
+        log_file.write_text("log line\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["uncommitted_file_count"] == 0
+        assert "uncommitted=none" in diag["summary"]
+
+    def test_no_worktree_has_zero_file_count(self, mock_context: MagicMock) -> None:
+        """Missing worktree should have zero file count."""
+        mock_context.worktree_path = None
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = Path("/fake/repo")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["uncommitted_file_count"] == 0
+
 
 class TestBuilderHasPytestOutput:
     """Test _has_pytest_output detection."""
