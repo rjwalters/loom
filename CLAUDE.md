@@ -341,6 +341,7 @@ Shepherds report progress milestones to `.loom/progress/` for daemon visibility.
 |-------|------|------|
 | `started` | Shepherd begins orchestration | `issue`, `mode` |
 | `phase_entered` | Enters new orchestration phase | `phase` (curator, builder, judge, etc.) |
+| `phase_completed` | Phase finishes processing | `phase`, `duration_seconds`, `status` |
 | `worktree_created` | Worktree created for issue | `path` |
 | `first_commit` | First commit made in worktree | `sha` |
 | `pr_created` | Pull request created | `pr_number` |
@@ -348,6 +349,7 @@ Shepherds report progress milestones to `.loom/progress/` for daemon visibility.
 | `completed` | Orchestration finished | `pr_merged` |
 | `blocked` | Work is blocked | `reason`, `details` |
 | `error` | Encountered an error | `error`, `will_retry` |
+| `judge_retry` | Judge phase retry attempted | `attempt`, `max_retries`, `reason` |
 
 **Reporting Milestones**:
 
@@ -360,6 +362,9 @@ Shepherds use the `report-milestone.sh` script:
 # Report phase transition
 ./.loom/scripts/report-milestone.sh phase_entered --task-id abc123 --phase builder
 
+# Report phase completion
+./.loom/scripts/report-milestone.sh phase_completed --task-id abc123 --phase builder --duration-seconds 120 --status success
+
 # Report heartbeat during long operation
 ./.loom/scripts/report-milestone.sh heartbeat --task-id abc123 --action "running tests"
 
@@ -371,6 +376,9 @@ Shepherds use the `report-milestone.sh` script:
 
 # Report error (with retry)
 ./.loom/scripts/report-milestone.sh error --task-id abc123 --error "build failed" --will-retry
+
+# Report judge retry
+./.loom/scripts/report-milestone.sh judge_retry --task-id abc123 --attempt 1 --max-retries 3 --reason "no review submitted"
 ```
 
 **Daemon Snapshot Integration**:
