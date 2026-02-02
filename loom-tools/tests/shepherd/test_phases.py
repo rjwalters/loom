@@ -4995,6 +4995,258 @@ class TestBuilderDetectTestEcosystem:
         assert builder._detect_test_ecosystem(["make", "test"]) is None
 
 
+class TestBuilderDetectTestEcosystemFromOutput:
+    """Test _detect_test_ecosystem_from_output method.
+
+    This method parses actual test output to determine which test runner
+    failed, enabling accurate ecosystem attribution for umbrella commands
+    like 'pnpm check:ci:lite' that run multiple test ecosystems.
+    """
+
+    def test_cargo_test_result_failed(self) -> None:
+        """Detects cargo test failure from 'test result: FAILED' line."""
+        builder = BuilderPhase()
+        output = """
+running 14 tests
+test foo::bar ... ok
+test foo::baz ... FAILED
+test result: FAILED. 13 passed; 1 failed; 0 ignored
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "cargo"
+
+    def test_cargo_target_failed(self) -> None:
+        """Detects cargo failure from 'error: N target(s) failed:' line."""
+        builder = BuilderPhase()
+        output = """
+error: could not compile `foo`
+error: 1 target failed:
+    `foo v0.1.0 (path/to/foo)`
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "cargo"
+
+    def test_cargo_test_individual_failed(self) -> None:
+        """Detects cargo test failure from individual 'test ... FAILED' line."""
+        builder = BuilderPhase()
+        output = """
+running 5 tests
+test integration::auth::test_login ... ok
+test integration::auth::test_logout ... FAILED
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "cargo"
+
+    def test_pytest_failed_line(self) -> None:
+        """Detects pytest failure from 'FAILED tests/...' line."""
+        builder = BuilderPhase()
+        output = """
+================================ FAILURES ================================
+FAILED tests/test_foo.py::test_bar - AssertionError: Expected 1, got 2
+========================= short test summary info ==========================
+FAILED tests/test_foo.py::test_bar - AssertionError
+== 1 failed, 14 passed in 2.45s ==
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "pytest"
+
+    def test_pytest_summary_failed(self) -> None:
+        """Detects pytest failure from summary line with '= N failed ... ='."""
+        builder = BuilderPhase()
+        output = """
+=================== test session starts ====================
+collected 15 items
+tests/test_foo.py F..............
+========================= short test summary info ==========================
+== 1 failed, 14 passed in 2.45s ==
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "pytest"
+
+    def test_vitest_fail_line(self) -> None:
+        """Detects vitest failure from 'FAIL src/...' line."""
+        builder = BuilderPhase()
+        output = """
+ FAIL  src/components/Button.test.ts > Button > renders correctly
+AssertionError: expected 'Hello' to be 'World'
+Tests  1 failed, 5 passed
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "pnpm"
+
+    def test_vitest_summary_failed(self) -> None:
+        """Detects vitest failure from 'Tests  N failed' summary line."""
+        builder = BuilderPhase()
+        output = """
+ ✓ src/utils.test.ts (2 tests)
+ × src/components/Button.test.ts (1 test)
+
+ Tests  1 failed, 2 passed (3 total)
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "pnpm"
+
+    def test_no_recognizable_pattern(self) -> None:
+        """Returns None when no recognizable failure pattern found."""
+        builder = BuilderPhase()
+        output = """
+Running tests...
+All tests passed!
+Done.
+"""
+        assert builder._detect_test_ecosystem_from_output(output) is None
+
+    def test_empty_output(self) -> None:
+        """Returns None for empty output."""
+        builder = BuilderPhase()
+        assert builder._detect_test_ecosystem_from_output("") is None
+        assert builder._detect_test_ecosystem_from_output("   ") is None
+
+    def test_umbrella_command_cargo_failure(self) -> None:
+        """Correctly identifies cargo failures in umbrella command output.
+
+        This is the key scenario from issue #1947: pnpm check:ci:lite runs
+        both TypeScript and Rust tests, but when Rust fails, we should
+        detect 'cargo' not 'pnpm'.
+        """
+        builder = BuilderPhase()
+        # Simulated output from pnpm check:ci:lite where vitest passes
+        # but cargo test fails
+        output = """
+> loom@1.0.0 check:ci:lite
+> vitest run && cargo test --workspace
+
+✓ src/utils.test.ts (2 tests)
+✓ src/components/Button.test.ts (3 tests)
+
+ Tests  5 passed (5 total)
+ Start 0.00s
+ Duration 1.23s
+
+running 100 tests
+test foo::bar ... ok
+test foo::baz ... FAILED
+
+failures:
+
+---- foo::baz stdout ----
+thread 'foo::baz' panicked at 'assertion failed'
+
+failures:
+    foo::baz
+
+test result: FAILED. 99 passed; 1 failed; 0 ignored
+error: test failed, to rerun pass `--lib`
+"""
+        assert builder._detect_test_ecosystem_from_output(output) == "cargo"
+
+    def test_umbrella_command_vitest_failure(self) -> None:
+        """Correctly identifies vitest failures in umbrella command output.
+
+        When vitest fails first (before cargo runs), we should detect 'pnpm'.
+        """
+        builder = BuilderPhase()
+        output = """
+> loom@1.0.0 check:ci:lite
+> vitest run && cargo test --workspace
+
+ FAIL  src/components/Button.test.ts > Button > renders correctly
+AssertionError: expected 'Hello' to be 'World'
+
+ Tests  1 failed, 4 passed (5 total)
+ Start 0.00s
+ Duration 1.23s
+"""
+        # cargo never ran because vitest failed first (&&-chained)
+        assert builder._detect_test_ecosystem_from_output(output) == "pnpm"
+
+
+class TestBuilderShouldSkipDoctorRecoveryWithOutput:
+    """Test should_skip_doctor_recovery with test_output parameter.
+
+    These tests verify that output-based ecosystem detection takes precedence
+    over command-based detection for umbrella commands.
+    """
+
+    def test_output_based_detection_overrides_command(self, mock_context: MagicMock) -> None:
+        """Output-based detection should override command-based detection.
+
+        When 'pnpm check:ci:lite' fails in cargo (Rust), the ecosystem should
+        be detected as 'cargo' from output, not 'pnpm' from command.
+        """
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        # Builder only changed Python files
+        cargo_failure_output = """
+test result: FAILED. 99 passed; 1 failed; 0 ignored
+error: test failed
+"""
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["scripts/helper.py"]
+            # Command is "pnpm check:ci:lite" but output shows cargo failure
+            result = builder.should_skip_doctor_recovery(
+                mock_context,
+                ["pnpm", "check:ci:lite"],
+                test_output=cargo_failure_output,
+            )
+        # Python files don't affect cargo tests -> should skip
+        assert result is True
+
+    def test_output_based_detection_rust_changes_cargo_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Rust changes should NOT skip Doctor when cargo actually fails."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        cargo_failure_output = """
+test result: FAILED. 99 passed; 1 failed; 0 ignored
+"""
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/main.rs"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context,
+                ["pnpm", "check:ci:lite"],
+                test_output=cargo_failure_output,
+            )
+        # Rust files DO affect cargo tests -> should NOT skip
+        assert result is False
+
+    def test_fallback_to_command_when_output_has_no_pattern(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Falls back to command-based detection when output is unrecognizable."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        # Output with no recognizable failure pattern
+        ambiguous_output = """
+Error: something went wrong
+Process exited with code 1
+"""
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/main.rs"]
+            result = builder.should_skip_doctor_recovery(
+                mock_context,
+                ["pnpm", "check:ci:lite"],
+                test_output=ambiguous_output,
+            )
+        # Falls back to "pnpm" from command, .rs doesn't affect pnpm -> skip
+        assert result is True
+
+    def test_none_output_uses_command_detection(self, mock_context: MagicMock) -> None:
+        """When test_output is None, uses command-based detection."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+
+        with patch("loom_tools.shepherd.phases.builder.get_changed_files") as mock_files:
+            mock_files.return_value = ["src/main.rs"]
+            # No test_output provided
+            result = builder.should_skip_doctor_recovery(
+                mock_context, ["pnpm", "check:ci:lite"]
+            )
+        # Command says "pnpm", .rs doesn't affect pnpm -> skip
+        assert result is True
+
+
 class TestBuilderShouldSkipDoctorRecovery:
     """Test should_skip_doctor_recovery method."""
 

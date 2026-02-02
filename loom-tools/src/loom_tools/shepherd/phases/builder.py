@@ -2449,6 +2449,11 @@ class BuilderPhase:
         """Determine the test ecosystem from the test command.
 
         Returns one of "cargo", "pnpm", "pytest", or None if unknown.
+
+        Note: For umbrella commands like ``pnpm check:ci:lite`` that run
+        multiple test ecosystems, this returns "pnpm" based on the command
+        name. Use :meth:`_detect_test_ecosystem_from_output` with actual
+        test output for more accurate ecosystem attribution.
         """
         cmd_str = " ".join(test_cmd)
         if "cargo" in cmd_str:
@@ -2459,8 +2464,72 @@ class BuilderPhase:
             return "pytest"
         return None
 
+    def _detect_test_ecosystem_from_output(self, output: str) -> str | None:
+        """Determine which test ecosystem failed by parsing test output.
+
+        For umbrella test commands like ``pnpm check:ci:lite`` that run
+        multiple test ecosystems (TypeScript, Rust, Python), this parses
+        the actual output to identify which test runner produced failures.
+
+        This provides more accurate ecosystem attribution than command-based
+        detection, enabling correct pre-check filtering for Doctor recovery.
+
+        Args:
+            output: Test command output (stdout + stderr combined).
+
+        Returns:
+            One of "cargo", "pnpm", "pytest", or None if unknown.
+            Returns the ecosystem of the **first failure found** when
+            scanning from the end of output (most recent failure).
+        """
+        # Scan lines from end to find the most recent failure pattern
+        lines = output.strip().splitlines()
+
+        for line in reversed(lines):
+            stripped = line.strip()
+            cleaned = stripped.strip("= ").strip()
+
+            # cargo test failure: "test result: FAILED. N passed; N failed"
+            if stripped.startswith("test result:") and "FAILED" in stripped:
+                return "cargo"
+
+            # cargo multi-target failure: "error: N target(s) failed:"
+            if re.match(r"error:\s+\d+\s+targets?\s+failed", stripped):
+                return "cargo"
+
+            # cargo test individual failure: "test some::path ... FAILED"
+            if re.match(r"test\s+\S+\s+\.\.\.\s+FAILED", stripped):
+                return "cargo"
+
+            # pytest failure: "FAILED tests/test_foo.py::test_bar"
+            if stripped.startswith("FAILED ") and "::" in stripped:
+                return "pytest"
+
+            # pytest summary failure: "N failed" with "passed" in same line
+            # (inside = borders like "== 1 failed, 14 passed in 2.45s ==")
+            if (
+                stripped.startswith("=")
+                and "failed" in cleaned.lower()
+                and "passed" in cleaned.lower()
+            ):
+                # Distinguish pytest from vitest by looking for "in Xs" pattern
+                # pytest: "1 failed, 14 passed in 2.45s"
+                # vitest: "Tests  1 failed, 14 passed"
+                if re.search(r"in\s+[\d.]+s", cleaned):
+                    return "pytest"
+
+            # vitest/jest failure: "FAIL src/foo.test.ts" (at line start)
+            if stripped.startswith("FAIL ") and "/" in stripped:
+                return "pnpm"
+
+            # vitest/jest summary: "Tests  N failed" (note double space)
+            if re.match(r"Tests\s+\d+\s+failed", stripped, re.IGNORECASE):
+                return "pnpm"
+
+        return None
+
     def should_skip_doctor_recovery(
-        self, ctx: ShepherdContext, test_cmd: list[str]
+        self, ctx: ShepherdContext, test_cmd: list[str], test_output: str | None = None
     ) -> bool:
         """Check if Doctor recovery should be skipped for test failures.
 
@@ -2469,7 +2538,21 @@ class BuilderPhase:
         the failing tests, the failures are pre-existing and Doctor
         recovery should be skipped.
 
-        Returns True if Doctor should be skipped (no overlap).
+        For umbrella test commands like ``pnpm check:ci:lite`` that run
+        multiple test ecosystems, providing ``test_output`` enables
+        accurate ecosystem attribution by parsing which test runner
+        actually failed, rather than inferring from the command name.
+
+        Args:
+            ctx: Shepherd context with worktree path.
+            test_cmd: The test command that was run.
+            test_output: Optional test output for output-based ecosystem
+                detection. When provided and contains recognizable failure
+                patterns, this takes precedence over command-based detection.
+
+        Returns:
+            True if Doctor should be skipped (no overlap between changed
+            files and failing test ecosystem).
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return False  # Can't determine — conservatively try Doctor
@@ -2483,8 +2566,18 @@ class BuilderPhase:
             )
             return True
 
-        # Determine which ecosystem the failing tests belong to
-        test_ecosystem = self._detect_test_ecosystem(test_cmd)
+        # Determine which ecosystem the failing tests belong to.
+        # Prefer output-based detection (more accurate for umbrella commands),
+        # fall back to command-based detection.
+        test_ecosystem = None
+        if test_output:
+            test_ecosystem = self._detect_test_ecosystem_from_output(test_output)
+            if test_ecosystem:
+                log_info(f"Detected test ecosystem from output: {test_ecosystem}")
+
+        if test_ecosystem is None:
+            test_ecosystem = self._detect_test_ecosystem(test_cmd)
+
         if test_ecosystem is None:
             return False  # Unknown ecosystem — conservatively try Doctor
 
