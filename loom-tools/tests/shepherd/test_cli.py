@@ -15,6 +15,9 @@ from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
     _check_main_repo_clean,
     _create_config,
+    _format_diagnostics_for_comment,
+    _format_diagnostics_for_log,
+    _gather_no_pr_diagnostics,
     _mark_builder_no_pr,
     _mark_judge_exhausted,
     _parse_args,
@@ -1436,10 +1439,22 @@ class TestMarkJudgeExhausted:
 class TestMarkBuilderNoPr:
     """Test _mark_builder_no_pr helper function (issue #1982)."""
 
+    @patch("loom_tools.shepherd.cli._gather_no_pr_diagnostics")
     @patch("subprocess.run")
-    def test_transitions_labels(self, mock_run: MagicMock) -> None:
+    def test_transitions_labels(
+        self, mock_run: MagicMock, mock_gather: MagicMock
+    ) -> None:
         """Should run gh command to transition loom:building -> loom:failed:builder."""
         mock_run.return_value = MagicMock(returncode=0)
+        mock_gather.return_value = {
+            "worktree_exists": False,
+            "uncommitted_files": [],
+            "uncommitted_count": 0,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "main",
+            "suggested_recovery": "re-run shepherd",
+        }
 
         ctx = MagicMock()
         ctx.config.issue = 42
@@ -1458,10 +1473,22 @@ class TestMarkBuilderNoPr:
         assert "--add-label" in cmd
         assert "loom:failed:builder" in cmd
 
+    @patch("loom_tools.shepherd.cli._gather_no_pr_diagnostics")
     @patch("subprocess.run")
-    def test_records_blocked_reason(self, mock_run: MagicMock) -> None:
+    def test_records_blocked_reason(
+        self, mock_run: MagicMock, mock_gather: MagicMock
+    ) -> None:
         """Should record builder_no_pr as the blocked reason."""
         mock_run.return_value = MagicMock(returncode=0)
+        mock_gather.return_value = {
+            "worktree_exists": False,
+            "uncommitted_files": [],
+            "uncommitted_count": 0,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "main",
+            "suggested_recovery": "re-run shepherd",
+        }
 
         ctx = MagicMock()
         ctx.config.issue = 42
@@ -1479,10 +1506,23 @@ class TestMarkBuilderNoPr:
             details="Builder phase completed but no PR was created",
         )
 
+    @patch("loom_tools.shepherd.cli._gather_no_pr_diagnostics")
     @patch("subprocess.run")
-    def test_adds_diagnostic_comment(self, mock_run: MagicMock) -> None:
+    def test_adds_diagnostic_comment(
+        self, mock_run: MagicMock, mock_gather: MagicMock
+    ) -> None:
         """Should add a comment with diagnostic info."""
         mock_run.return_value = MagicMock(returncode=0)
+        mock_gather.return_value = {
+            "worktree_exists": True,
+            "worktree_path": "/fake/repo/.loom/worktrees/issue-42",
+            "uncommitted_files": ["M src/file.py"],
+            "uncommitted_count": 1,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "commit changes, push, create PR manually",
+        }
 
         ctx = MagicMock()
         ctx.config.issue = 42
@@ -1499,6 +1539,303 @@ class TestMarkBuilderNoPr:
         body_idx = cmd.index("--body") + 1
         assert "Builder phase failed" in cmd[body_idx]
         assert "No PR was created" in cmd[body_idx]
+        # Verify diagnostic info is in the comment
+        assert "Diagnostics" in cmd[body_idx]
+        assert "Worktree exists | yes" in cmd[body_idx]
+        assert "Suggested Recovery" in cmd[body_idx]
+
+
+class TestGatherNoPrDiagnostics:
+    """Test _gather_no_pr_diagnostics helper function (issue #2065)."""
+
+    @patch("loom_tools.common.git.run_git")
+    @patch("loom_tools.common.git.get_current_branch")
+    @patch("loom_tools.common.git.get_commit_count")
+    @patch("loom_tools.common.git.get_uncommitted_files")
+    def test_gathers_worktree_state_when_exists(
+        self,
+        mock_uncommitted: MagicMock,
+        mock_commits: MagicMock,
+        mock_branch: MagicMock,
+        mock_run_git: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should gather git state from worktree when it exists."""
+        # Create a mock worktree directory
+        worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+        worktree_path.mkdir(parents=True)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.worktree_path = worktree_path
+
+        # Mock git operations
+        mock_uncommitted.return_value = ["M src/file1.py", "?? src/file2.py"]
+        mock_commits.return_value = 3
+        mock_branch.return_value = "feature/issue-42"
+        mock_run_git.return_value = MagicMock(returncode=0, stdout="abc123\trefs/heads/feature/issue-42\n")
+
+        diagnostics = _gather_no_pr_diagnostics(ctx)
+
+        assert diagnostics["worktree_exists"] is True
+        assert diagnostics["worktree_path"] == str(worktree_path)
+        assert diagnostics["uncommitted_count"] == 2
+        assert diagnostics["commits_ahead_of_main"] == 3
+        assert diagnostics["current_branch"] == "feature/issue-42"
+        assert diagnostics["remote_branch_exists"] is True
+
+    @patch("loom_tools.common.git.run_git")
+    @patch("loom_tools.common.git.get_current_branch")
+    @patch("loom_tools.common.git.get_commit_count")
+    @patch("loom_tools.common.git.get_uncommitted_files")
+    def test_handles_no_worktree(
+        self,
+        mock_uncommitted: MagicMock,
+        mock_commits: MagicMock,
+        mock_branch: MagicMock,
+        mock_run_git: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should handle case when worktree doesn't exist."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"  # Doesn't exist
+
+        mock_uncommitted.return_value = []
+        mock_commits.return_value = 0
+        mock_branch.return_value = "main"
+        mock_run_git.return_value = MagicMock(returncode=1, stdout="")
+
+        diagnostics = _gather_no_pr_diagnostics(ctx)
+
+        assert diagnostics["worktree_exists"] is False
+        assert diagnostics["suggested_recovery"] == "re-run shepherd or create worktree manually"
+
+    @patch("loom_tools.common.git.run_git")
+    @patch("loom_tools.common.git.get_current_branch")
+    @patch("loom_tools.common.git.get_commit_count")
+    @patch("loom_tools.common.git.get_uncommitted_files")
+    def test_suggests_commit_when_uncommitted_no_commits(
+        self,
+        mock_uncommitted: MagicMock,
+        mock_commits: MagicMock,
+        mock_branch: MagicMock,
+        mock_run_git: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should suggest commit when there are uncommitted changes but no commits."""
+        worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+        worktree_path.mkdir(parents=True)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.worktree_path = worktree_path
+
+        mock_uncommitted.return_value = ["M src/file1.py"]
+        mock_commits.return_value = 0  # No commits ahead
+        mock_branch.return_value = "feature/issue-42"
+        mock_run_git.return_value = MagicMock(returncode=1, stdout="")
+
+        diagnostics = _gather_no_pr_diagnostics(ctx)
+
+        assert diagnostics["suggested_recovery"] == "commit changes, push, create PR manually"
+
+    @patch("loom_tools.common.git.run_git")
+    @patch("loom_tools.common.git.get_current_branch")
+    @patch("loom_tools.common.git.get_commit_count")
+    @patch("loom_tools.common.git.get_uncommitted_files")
+    def test_suggests_push_when_commits_no_remote(
+        self,
+        mock_uncommitted: MagicMock,
+        mock_commits: MagicMock,
+        mock_branch: MagicMock,
+        mock_run_git: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should suggest push when commits exist but remote branch doesn't."""
+        worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+        worktree_path.mkdir(parents=True)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.worktree_path = worktree_path
+
+        mock_uncommitted.return_value = []  # No uncommitted
+        mock_commits.return_value = 2  # Commits ahead
+        mock_branch.return_value = "feature/issue-42"
+        mock_run_git.return_value = MagicMock(returncode=1, stdout="")  # No remote
+
+        diagnostics = _gather_no_pr_diagnostics(ctx)
+
+        assert diagnostics["suggested_recovery"] == "push branch, create PR manually"
+
+    @patch("loom_tools.common.git.run_git")
+    @patch("loom_tools.common.git.get_current_branch")
+    @patch("loom_tools.common.git.get_commit_count")
+    @patch("loom_tools.common.git.get_uncommitted_files")
+    def test_suggests_create_pr_when_branch_pushed(
+        self,
+        mock_uncommitted: MagicMock,
+        mock_commits: MagicMock,
+        mock_branch: MagicMock,
+        mock_run_git: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Should suggest create PR when branch already pushed."""
+        worktree_path = tmp_path / ".loom" / "worktrees" / "issue-42"
+        worktree_path.mkdir(parents=True)
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = tmp_path
+        ctx.worktree_path = worktree_path
+
+        mock_uncommitted.return_value = []
+        mock_commits.return_value = 2
+        mock_branch.return_value = "feature/issue-42"
+        mock_run_git.return_value = MagicMock(returncode=0, stdout="abc123\trefs/heads/feature/issue-42\n")
+
+        diagnostics = _gather_no_pr_diagnostics(ctx)
+
+        assert diagnostics["suggested_recovery"] == "create PR manually (branch already pushed)"
+
+
+class TestFormatDiagnosticsForLog:
+    """Test _format_diagnostics_for_log helper function (issue #2065)."""
+
+    def test_formats_full_diagnostics(self) -> None:
+        """Should format all diagnostic fields for log output."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path/to/.loom/worktrees/issue-42",
+            "uncommitted_files": ["M src/file1.py", "?? src/file2.py"],
+            "uncommitted_count": 2,
+            "commits_ahead_of_main": 3,
+            "remote_branch_exists": True,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "create PR manually",
+        }
+
+        output = _format_diagnostics_for_log(diagnostics)
+
+        assert "Diagnostics:" in output
+        assert "Worktree exists: yes" in output
+        assert "/path/to/.loom/worktrees/issue-42" in output
+        assert "Uncommitted changes: 2 file(s)" in output
+        assert "M src/file1.py" in output
+        assert "Commits ahead of main: 3" in output
+        assert "Remote branch exists: yes" in output
+        assert "Current branch: feature/issue-42" in output
+        assert "Suggested recovery: create PR manually" in output
+
+    def test_formats_no_uncommitted(self) -> None:
+        """Should show 'none' when no uncommitted files."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path",
+            "uncommitted_files": [],
+            "uncommitted_count": 0,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "main",
+            "suggested_recovery": "investigate",
+        }
+
+        output = _format_diagnostics_for_log(diagnostics)
+
+        assert "Uncommitted changes: none" in output
+
+    def test_truncates_long_file_list(self) -> None:
+        """Should show first 5 files and count of remaining."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path",
+            "uncommitted_files": [f"M file{i}.py" for i in range(10)],
+            "uncommitted_count": 10,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "main",
+            "suggested_recovery": "commit changes",
+        }
+
+        output = _format_diagnostics_for_log(diagnostics)
+
+        assert "M file0.py" in output
+        assert "M file4.py" in output
+        assert "... and 5 more" in output
+
+
+class TestFormatDiagnosticsForComment:
+    """Test _format_diagnostics_for_comment helper function (issue #2065)."""
+
+    def test_formats_markdown_table(self) -> None:
+        """Should format diagnostics as markdown table."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path/to/.loom/worktrees/issue-42",
+            "uncommitted_files": ["M src/file1.py"],
+            "uncommitted_count": 1,
+            "commits_ahead_of_main": 2,
+            "remote_branch_exists": False,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "push branch, create PR manually",
+        }
+
+        output = _format_diagnostics_for_comment(diagnostics, 42)
+
+        assert "**Builder phase failed**" in output
+        assert "### Diagnostics" in output
+        assert "| Property | Value |" in output
+        assert "| Worktree exists | yes |" in output
+        assert "| Uncommitted changes | 1 file(s) |" in output
+        assert "| Commits ahead of main | 2 |" in output
+        assert "### Suggested Recovery" in output
+
+    def test_includes_recovery_commands(self) -> None:
+        """Should include concrete recovery bash commands."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path/to/.loom/worktrees/issue-42",
+            "uncommitted_files": ["M src/file1.py"],
+            "uncommitted_count": 1,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "commit changes, push, create PR manually",
+        }
+
+        output = _format_diagnostics_for_comment(diagnostics, 42)
+
+        assert "```bash" in output
+        assert "git add ." in output
+        assert "git commit" in output
+        assert "git push -u origin feature/issue-42" in output
+        assert "gh pr create" in output
+        assert "Closes #42" in output
+
+    def test_lists_uncommitted_files(self) -> None:
+        """Should list uncommitted files in comment."""
+        diagnostics = {
+            "worktree_exists": True,
+            "worktree_path": "/path",
+            "uncommitted_files": ["M src/a.py", "?? src/b.py", "D src/c.py"],
+            "uncommitted_count": 3,
+            "commits_ahead_of_main": 0,
+            "remote_branch_exists": False,
+            "current_branch": "feature/issue-42",
+            "suggested_recovery": "commit changes",
+        }
+
+        output = _format_diagnostics_for_comment(diagnostics, 42)
+
+        assert "**Uncommitted files:**" in output
+        assert "- `M src/a.py`" in output
+        assert "- `?? src/b.py`" in output
+        assert "- `D src/c.py`" in output
 
 
 class TestBuilderNoPrPrecondition:
