@@ -5873,3 +5873,219 @@ class TestBuilderSupplementalVerification:
         assert result is not None
         assert result.status == PhaseStatus.FAILED
         assert "supplemental" in result.message
+
+
+class TestBuilderValidateAndComplete:
+    """Tests for BuilderPhase.validate_and_complete() method.
+
+    This method is used after the doctor test-fix loop succeeds to ensure
+    that a PR actually exists. It runs the same validation and completion
+    logic as the end of builder.run().
+    """
+
+    def test_validate_and_complete_success_when_pr_exists(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should return SUCCESS when PR exists."""
+        builder = BuilderPhase()
+
+        with (
+            patch.object(builder, "validate", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=123,
+            ),
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #123" in result.message
+        assert result.data.get("pr_number") == 123
+        assert mock_context.pr_number == 123
+
+    def test_validate_and_complete_runs_completion_when_incomplete(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should run completion phase when work is incomplete."""
+        builder = BuilderPhase()
+        mock_context.config.builder_completion_retries = 2
+
+        # First validation fails, second succeeds (after completion)
+        validate_calls = [False, True]
+
+        incomplete_diag = {
+            "summary": "has uncommitted changes",
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "validate", side_effect=validate_calls),
+            patch.object(builder, "_gather_diagnostics", return_value=incomplete_diag),
+            patch.object(builder, "_has_incomplete_work", return_value=True),
+            patch.object(builder, "_run_completion_phase", return_value=0),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=456,
+            ),
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #456" in result.message
+        assert result.data.get("pr_number") == 456
+
+    def test_validate_and_complete_fails_when_no_incomplete_work(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should fail when validation fails and no incomplete work."""
+        builder = BuilderPhase()
+
+        no_work_diag = {
+            "summary": "worktree does not exist",
+            "worktree_exists": False,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_gather_diagnostics", return_value=no_work_diag),
+            patch.object(builder, "_has_incomplete_work", return_value=False),
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "builder phase validation failed after doctor fixes" in result.message
+        assert result.data.get("diagnostics") == no_work_diag
+
+    def test_validate_and_complete_exhausts_retries(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should fail after exhausting completion retries."""
+        builder = BuilderPhase()
+        mock_context.config.builder_completion_retries = 2
+
+        incomplete_diag = {
+            "summary": "has uncommitted changes but completion keeps failing",
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_gather_diagnostics", return_value=incomplete_diag),
+            patch.object(builder, "_has_incomplete_work", return_value=True),
+            patch.object(builder, "_run_completion_phase", return_value=1),  # Always fail
+            patch.object(builder, "_direct_completion", return_value=False),
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "validation failed after doctor fixes" in result.message
+        assert result.data.get("completion_attempts") == 2
+
+    def test_validate_and_complete_handles_shutdown(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should return SHUTDOWN when completion phase shuts down."""
+        builder = BuilderPhase()
+        mock_context.config.builder_completion_retries = 2
+
+        incomplete_diag = {
+            "summary": "has uncommitted changes",
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "validate", return_value=False),
+            patch.object(builder, "_gather_diagnostics", return_value=incomplete_diag),
+            patch.object(builder, "_has_incomplete_work", return_value=True),
+            patch.object(builder, "_run_completion_phase", return_value=3),  # Shutdown
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.SHUTDOWN
+        assert "shutdown" in result.message.lower()
+
+    def test_validate_and_complete_tries_direct_completion_as_fallback(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should try direct completion when retries exhausted."""
+        builder = BuilderPhase()
+        mock_context.config.builder_completion_retries = 1
+
+        # First two validate calls fail, third succeeds (after direct completion)
+        validate_calls = [False, False, True]
+
+        incomplete_diag = {
+            "summary": "has commits but needs push",
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "validate", side_effect=validate_calls),
+            patch.object(builder, "_gather_diagnostics", return_value=incomplete_diag),
+            patch.object(builder, "_has_incomplete_work", return_value=True),
+            patch.object(builder, "_run_completion_phase", return_value=1),  # Fail
+            patch.object(builder, "_direct_completion", return_value=True),  # Succeed
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=789,
+            ),
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #789" in result.message
+
+    def test_validate_and_complete_fails_when_pr_not_found_after_validation(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate_and_complete should fail if PR not found even after validation passes."""
+        builder = BuilderPhase()
+
+        fake_diag = {
+            "summary": "worktree exists but no PR",
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "validate", return_value=True),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,  # PR still not found
+            ),
+        ):
+            result = builder.validate_and_complete(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "could not find PR" in result.message
+        assert "after doctor fixes" in result.message
