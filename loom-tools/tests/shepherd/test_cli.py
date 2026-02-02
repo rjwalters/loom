@@ -22,6 +22,7 @@ from loom_tools.shepherd.cli import (
     orchestrate,
 )
 from loom_tools.shepherd.config import ExecutionMode, Phase, ShepherdConfig
+from loom_tools.shepherd.exit_codes import ShepherdExitCode
 from loom_tools.shepherd.phases import PhaseResult, PhaseStatus
 
 
@@ -319,12 +320,12 @@ class TestMain:
         assert call_order == ["navigate", "context"]
 
     def test_dirty_main_blocks_without_flag(self) -> None:
-        """main should exit with 1 when repo is dirty and no --allow-dirty-main."""
+        """main should exit with NEEDS_INTERVENTION when repo is dirty and no --allow-dirty-main."""
         with patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
              patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
              patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["M file.py"]):
             result = main(["42"])
-            assert result == 1
+            assert result == ShepherdExitCode.NEEDS_INTERVENTION
 
     def test_dirty_main_proceeds_with_flag(self) -> None:
         """main should proceed when repo is dirty but --allow-dirty-main is set."""
@@ -1172,7 +1173,7 @@ class TestJudgeRetry:
         judge_inst.run.return_value = _failed_result("judge", "validation failed")
 
         result = orchestrate(ctx)
-        assert result == 1
+        assert result == ShepherdExitCode.NEEDS_INTERVENTION
 
         # Verify _mark_judge_exhausted was called with retry count (1):
         # first fail triggers retry (judge_retries=1), second fail exhausts retries
@@ -1680,13 +1681,16 @@ class TestDoctorTestFixLoop:
             # Test re-verification
             200,   # test_start
             210,   # test elapsed
+            # Completion validation (after Doctor fixes)
+            210,   # completion_start
+            220,   # completion elapsed
             # Judge
-            210,   # judge phase_start
-            260,   # judge elapsed
+            220,   # judge phase_start
+            270,   # judge elapsed
             # Merge
-            260,   # merge phase_start
-            270,   # merge elapsed
-            270,   # duration calc
+            270,   # merge phase_start
+            280,   # merge elapsed
+            280,   # duration calc
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -1708,6 +1712,8 @@ class TestDoctorTestFixLoop:
         )
         # After Doctor fix, test verification passes
         builder_inst.run_test_verification_only.return_value = None  # None = tests pass
+        # Validation and completion passes (PR created)
+        builder_inst.validate_and_complete.return_value = _success_result("builder", committed=True, pr_created=True)
 
         # Doctor succeeds
         doctor_inst = MockDoctor.return_value
@@ -1722,7 +1728,7 @@ class TestDoctorTestFixLoop:
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
-        assert result == 0
+        assert result == ShepherdExitCode.SUCCESS
 
         # Doctor test-fix was invoked
         doctor_inst.run_test_fix.assert_called_once()
@@ -1760,13 +1766,16 @@ class TestDoctorTestFixLoop:
             # Doctor test-fix (pre-existing)
             100,   # doctor phase_start
             110,   # doctor elapsed
+            # Completion validation (pre-existing failures)
+            110,   # completion_start
+            160,   # completion elapsed
             # Judge
-            110,   # judge phase_start
-            160,   # judge elapsed
+            160,   # judge phase_start
+            210,   # judge elapsed
             # Merge
-            160,   # merge phase_start
-            170,   # merge elapsed
-            170,   # duration calc
+            210,   # merge phase_start
+            220,   # merge elapsed
+            220,   # duration calc
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -1784,6 +1793,8 @@ class TestDoctorTestFixLoop:
             phase_name="builder",
             data={"test_failure": True},
         )
+        # Validation and completion passes (PR created)
+        builder_inst.validate_and_complete.return_value = _success_result("builder", committed=True, pr_created=True)
 
         # Doctor says failures are pre-existing
         doctor_inst = MockDoctor.return_value
@@ -1803,7 +1814,7 @@ class TestDoctorTestFixLoop:
         MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
 
         result = orchestrate(ctx)
-        assert result == 0
+        assert result == ShepherdExitCode.SUCCESS
 
         # Should NOT mark as failure
         mock_mark_failure.assert_not_called()
@@ -1873,7 +1884,7 @@ class TestDoctorTestFixLoop:
         doctor_inst.run_test_fix.return_value = _success_result("doctor")
 
         result = orchestrate(ctx)
-        assert result == 1
+        assert result == ShepherdExitCode.PR_TESTS_FAILED
 
         # Doctor was called max times (2)
         assert doctor_inst.run_test_fix.call_count == 2
@@ -1968,4 +1979,4 @@ class TestDoctorTestFixLoop:
         )
 
         result = orchestrate(ctx)
-        assert result == 0  # Graceful shutdown returns 0
+        assert result == ShepherdExitCode.SHUTDOWN
