@@ -350,6 +350,8 @@ Shepherds report progress milestones to `.loom/progress/` for daemon visibility.
 | `blocked` | Work is blocked | `reason`, `details` |
 | `error` | Encountered an error | `error`, `will_retry` |
 | `judge_retry` | Judge phase retry attempted | `attempt`, `max_retries`, `reason` |
+| `checkpoint_saved` | Builder checkpoint written | `stage`, `recovery_path`, `details` |
+| `checkpoint_loaded` | Resuming from checkpoint | `stage`, `recovery_path`, `skip_stages` |
 
 **Reporting Milestones**:
 
