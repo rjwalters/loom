@@ -268,6 +268,26 @@ class BuilderPhase:
         if exit_code not in (0, 3, 4):
             # Unexpected non-zero exit from builder subprocess
             diag = self._gather_diagnostics(ctx)
+
+            # If there are uncommitted changes, preserve them as a WIP commit
+            if diag.get("has_uncommitted_changes"):
+                reason = f"builder exited with code {exit_code}"
+                if self._commit_interrupted_work(ctx, reason):
+                    # Work was preserved - return failure but work is recoverable
+                    return PhaseResult(
+                        status=PhaseStatus.FAILED,
+                        message=(
+                            f"builder subprocess exited with code {exit_code}, "
+                            f"uncommitted work preserved as WIP commit"
+                        ),
+                        phase_name="builder",
+                        data={
+                            "exit_code": exit_code,
+                            "diagnostics": diag,
+                            "work_preserved": True,
+                        },
+                    )
+
             return PhaseResult(
                 status=PhaseStatus.FAILED,
                 message=(
@@ -2563,6 +2583,147 @@ class BuilderPhase:
             f"{(result.stderr or result.stdout or '').strip()[:200]}"
         )
         return False
+
+    def _has_uncommitted_changes(self, ctx: ShepherdContext) -> bool:
+        """Check if the worktree has uncommitted changes (staged or unstaged)."""
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return bool(result.returncode == 0 and result.stdout.strip())
+
+    def _commit_interrupted_work(self, ctx: ShepherdContext, reason: str) -> bool:
+        """Commit and push uncommitted work when builder is interrupted.
+
+        When the builder exits abnormally with uncommitted changes, this method:
+        1. Stages all changes (git add -A)
+        2. Creates a WIP commit with descriptive message
+        3. Pushes the commit to remote
+        4. Labels the issue as loom:needs-fix for Doctor to pick up
+        5. Adds a comment explaining the situation
+
+        Args:
+            ctx: Shepherd context
+            reason: Brief description of why the builder was interrupted
+
+        Returns:
+            True if work was successfully committed and pushed, False otherwise.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        if not self._has_uncommitted_changes(ctx):
+            return False
+
+        log_info(f"Builder interrupted with uncommitted changes, preserving work")
+
+        # Stage all changes
+        stage_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "add", "-A"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if stage_result.returncode != 0:
+            log_warning(
+                f"Failed to stage changes: "
+                f"{(stage_result.stderr or stage_result.stdout or '').strip()[:200]}"
+            )
+            return False
+
+        # Create WIP commit
+        commit_msg = (
+            f"WIP: Builder interrupted for issue #{ctx.config.issue}\n\n"
+            f"Reason: {reason}\n\n"
+            f"This commit contains uncommitted work from a builder session that\n"
+            f"was interrupted before completion. The Doctor or a subsequent\n"
+            f"Builder can continue from this point."
+        )
+        commit_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "commit", "-m", commit_msg],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_result.returncode != 0:
+            log_warning(
+                f"Failed to create WIP commit: "
+                f"{(commit_result.stderr or commit_result.stdout or '').strip()[:200]}"
+            )
+            return False
+
+        log_info("Created WIP commit for interrupted work")
+
+        # Push to remote
+        if not self._push_branch(ctx):
+            log_warning("Could not push WIP commit to remote")
+            # Continue anyway - local commit still preserves work
+
+        # Transition label: loom:building -> loom:needs-fix
+        transition_issue_labels(
+            ctx.config.issue,
+            add=["loom:needs-fix"],
+            remove=["loom:building"],
+            repo_root=ctx.repo_root,
+        )
+        ctx.label_cache.invalidate_issue(ctx.config.issue)
+
+        # Write context file for Doctor phase
+        branch_name = NamingConventions.branch_name(ctx.config.issue)
+        context_data = {
+            "issue": ctx.config.issue,
+            "failure_message": f"Builder interrupted: {reason}",
+            "interrupted": True,
+            "wip_commit": True,
+        }
+        context_file = ctx.worktree_path / ".loom-interrupted-context.json"
+        try:
+            context_file.write_text(json.dumps(context_data, indent=2))
+            log_info(f"Wrote interrupted context to {context_file}")
+        except OSError as e:
+            log_warning(f"Could not write interrupted context: {e}")
+
+        # Add comment with context
+        worktree_rel = f".loom/worktrees/issue-{ctx.config.issue}"
+        comment = (
+            f"**Shepherd**: Builder was interrupted with uncommitted work. "
+            f"Changes have been committed as a WIP commit and pushed.\n\n"
+            f"- **Reason**: {reason}\n"
+            f"- **Branch**: `{branch_name}`\n"
+            f"- **Worktree**: `{worktree_rel}`\n\n"
+            f"The Doctor or a subsequent Builder can pick this up and "
+            f"continue from the WIP commit."
+        )
+        subprocess.run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                str(ctx.config.issue),
+                "--body",
+                comment,
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+
+        ctx.report_milestone(
+            "blocked",
+            reason="builder_interrupted",
+            details=reason,
+        )
+
+        log_info(
+            f"Preserved interrupted work for issue #{ctx.config.issue} "
+            f"(WIP commit, labeled loom:needs-fix)"
+        )
+        return True
 
     def _preserve_on_test_failure(
         self, ctx: ShepherdContext, test_result: PhaseResult
