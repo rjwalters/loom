@@ -230,6 +230,76 @@ class TestApprovalPhase:
 
         assert result.status == PhaseStatus.SHUTDOWN
 
+    def test_returns_success_when_daemon_claimed(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return success when issue has loom:building (daemon pre-approval)."""
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.side_effect = lambda label: label == "loom:building"
+
+        approval = ApprovalPhase()
+        result = approval.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "pre-approved" in result.message
+        assert result.data["summary"] == "daemon-claimed"
+        assert result.data["method"] == "building-label"
+
+    def test_both_labels_present_uses_loom_issue(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When both loom:issue and loom:building are present, loom:issue takes priority."""
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.return_value = True  # both labels present
+
+        approval = ApprovalPhase()
+        result = approval.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "already approved" in result.message
+
+    def test_validate_accepts_building_label(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate() should accept loom:building as valid approval."""
+        mock_context.has_issue_label.side_effect = lambda label: label == "loom:building"
+
+        approval = ApprovalPhase()
+        assert approval.validate(mock_context) is True
+
+    def test_validate_accepts_issue_label(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate() should still accept loom:issue."""
+        mock_context.has_issue_label.side_effect = lambda label: label == "loom:issue"
+
+        approval = ApprovalPhase()
+        assert approval.validate(mock_context) is True
+
+    def test_validate_rejects_neither_label(
+        self, mock_context: MagicMock
+    ) -> None:
+        """validate() should reject when neither label is present."""
+        mock_context.has_issue_label.return_value = False
+
+        approval = ApprovalPhase()
+        assert approval.validate(mock_context) is False
+
+    def test_daemon_claimed_does_not_trigger_in_default_mode_without_labels(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Without either label in default mode, should enter polling loop (not auto-approve)."""
+        mock_context.check_shutdown.side_effect = [False, True]
+        mock_context.has_issue_label.return_value = False
+        mock_context.config = ShepherdConfig(issue=42)
+
+        approval = ApprovalPhase()
+        with patch("loom_tools.shepherd.phases.approval.time.sleep"):
+            result = approval.run(mock_context)
+
+        assert result.status == PhaseStatus.SHUTDOWN
+        assert "shutdown signal detected during approval wait" in result.message
+
 
 class TestBuilderPhase:
     """Test BuilderPhase."""
