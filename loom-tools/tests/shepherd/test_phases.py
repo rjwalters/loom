@@ -289,16 +289,69 @@ class TestApprovalPhase:
         self, mock_context: MagicMock
     ) -> None:
         """Without either label in default mode, should enter polling loop (not auto-approve)."""
-        mock_context.check_shutdown.side_effect = [False, True]
+        mock_context.check_shutdown.side_effect = [False, False, True]
         mock_context.has_issue_label.return_value = False
         mock_context.config = ShepherdConfig(issue=42)
 
         approval = ApprovalPhase()
-        with patch("loom_tools.shepherd.phases.approval.time.sleep"):
+        with patch("loom_tools.shepherd.phases.approval.time") as mock_time:
+            mock_time.time.side_effect = [0, 5, 10]  # within timeout
+            mock_time.sleep = MagicMock()
             result = approval.run(mock_context)
 
         assert result.status == PhaseStatus.SHUTDOWN
         assert "shutdown signal detected during approval wait" in result.message
+
+    def test_times_out_after_approval_timeout(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return FAILED when approval timeout is exceeded."""
+        mock_context.config = ShepherdConfig(issue=42, approval_timeout=10)
+        mock_context.check_shutdown.return_value = False
+        mock_context.has_issue_label.return_value = False
+
+        approval = ApprovalPhase()
+
+        # Simulate time passing beyond the timeout
+        with patch("loom_tools.shepherd.phases.approval.time") as mock_time:
+            mock_time.time.side_effect = [0, 11]  # start=0, elapsed=11 > 10
+            mock_time.sleep = MagicMock()
+
+            result = approval.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "timed out" in result.message
+        assert "11s" in result.message
+
+    def test_reports_heartbeat_during_wait(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should report heartbeat milestone while waiting for approval."""
+        mock_context.config = ShepherdConfig(issue=42, approval_timeout=1800)
+        # has_issue_label calls: loom:issue(30), loom:building(40),
+        # loop iter1 loom:issue(73) -> False (triggers heartbeat),
+        # loop iter2 loom:issue(73) -> True (exits)
+        mock_context.check_shutdown.side_effect = [False, False]
+        mock_context.has_issue_label.side_effect = [False, False, False, True]
+
+        approval = ApprovalPhase()
+
+        with patch("loom_tools.shepherd.phases.approval.time") as mock_time:
+            mock_time.time.side_effect = [0, 5, 10]  # within timeout
+            mock_time.sleep = MagicMock()
+
+            result = approval.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        # Verify heartbeat was reported during the wait iterations
+        mock_context.report_milestone.assert_called()
+        heartbeat_calls = [
+            c
+            for c in mock_context.report_milestone.call_args_list
+            if c[0][0] == "heartbeat"
+        ]
+        assert len(heartbeat_calls) >= 1
+        assert heartbeat_calls[0].kwargs["action"] == "waiting for approval"
 
 
 class TestBuilderPhase:
