@@ -911,6 +911,53 @@ class TestBuilderTestVerification:
         result = builder._detect_test_command(tmp_path)
         assert result is None
 
+    def test_find_python_test_root_at_root(self, tmp_path: Path) -> None:
+        """Should find pyproject.toml at worktree root."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        result = builder._find_python_test_root(tmp_path)
+        assert result == tmp_path
+
+    def test_find_python_test_root_nested(self, tmp_path: Path) -> None:
+        """Should find pyproject.toml in loom-tools subdirectory."""
+        builder = BuilderPhase()
+        (tmp_path / "loom-tools").mkdir()
+        (tmp_path / "loom-tools" / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        result = builder._find_python_test_root(tmp_path)
+        assert result == tmp_path / "loom-tools"
+
+    def test_find_python_test_root_not_found(self, tmp_path: Path) -> None:
+        """Should return None when no pyproject.toml exists."""
+        builder = BuilderPhase()
+
+        result = builder._find_python_test_root(tmp_path)
+        assert result is None
+
+    def test_find_python_test_root_prefers_root(self, tmp_path: Path) -> None:
+        """Should prefer root pyproject.toml over nested."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'root'\n")
+        (tmp_path / "loom-tools").mkdir()
+        (tmp_path / "loom-tools" / "pyproject.toml").write_text("[project]\nname = 'nested'\n")
+
+        result = builder._find_python_test_root(tmp_path)
+        assert result == tmp_path
+
+    def test_detect_test_command_nested_pytest(self, tmp_path: Path) -> None:
+        """Should detect pytest with nested pyproject.toml."""
+        builder = BuilderPhase()
+        (tmp_path / "loom-tools").mkdir()
+        (tmp_path / "loom-tools" / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        result = builder._detect_test_command(tmp_path)
+        assert result is not None
+        cmd, name = result
+        assert name == "pytest"
+        assert "--rootdir" in cmd
+        assert str(tmp_path / "loom-tools") in cmd
+
     def test_parse_test_summary_vitest(self) -> None:
         """Should extract vitest test summary."""
         builder = BuilderPhase()
@@ -1486,6 +1533,20 @@ class TestBuilderScopedTestVerification:
         commands = builder._get_scoped_test_commands(tmp_path, {"python"})
 
         assert commands == []
+
+    def test_get_scoped_test_commands_nested_python(self, tmp_path: Path) -> None:
+        """Should use --directory flag for nested pyproject.toml."""
+        builder = BuilderPhase()
+        (tmp_path / "loom-tools").mkdir()
+        (tmp_path / "loom-tools" / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        commands = builder._get_scoped_test_commands(tmp_path, {"python"})
+
+        assert len(commands) == 1
+        cmd, name = commands[0]
+        assert name == "pytest"
+        assert "--directory" in cmd
+        assert str(tmp_path / "loom-tools") in cmd
 
     def test_scoped_verification_skips_unrelated_tests(
         self, mock_context: MagicMock, tmp_path: Path
@@ -7210,6 +7271,32 @@ class TestBuilderGetSupplementalTestCommands:
 
         assert len(result) == 1
         assert result[0] == (["python", "-m", "pytest"], "pytest (supplemental)")
+
+    def test_python_changes_with_nested_pyproject_uses_rootdir(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should use --rootdir flag for nested pyproject.toml."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        # package.json without test:python, nested pyproject.toml
+        pkg = {"scripts": {"check:ci:lite": "..."}}
+        (tmp_path / "package.json").write_text(json.dumps(pkg))
+        (tmp_path / "loom-tools").mkdir()
+        (tmp_path / "loom-tools" / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        cargo_only_output = "test result: ok. 14 passed; 0 failed\n"
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_changed_files",
+            return_value=["loom-tools/src/loom_tools/builder.py"],
+        ):
+            result = builder._get_supplemental_test_commands(mock_context, cargo_only_output)
+
+        assert len(result) == 1
+        cmd, name = result[0]
+        assert name == "pytest (supplemental)"
+        assert "--rootdir" in cmd
+        assert str(tmp_path / "loom-tools") in cmd
 
     def test_pyi_files_count_as_python(
         self, mock_context: MagicMock, tmp_path: Path
