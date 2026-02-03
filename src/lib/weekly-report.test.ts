@@ -39,10 +39,6 @@ vi.mock("./agent-metrics", () => ({
   getTrendIcon: vi.fn((t) => (t === "improving" ? "^" : t === "declining" ? "v" : "-")),
 }));
 
-vi.mock("./correlation-analysis", () => ({
-  runCorrelationAnalysis: vi.fn(),
-}));
-
 vi.mock("./logger", () => ({
   Logger: {
     forComponent: () => ({

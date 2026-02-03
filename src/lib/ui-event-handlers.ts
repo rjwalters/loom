@@ -7,7 +7,6 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { AppLevelState } from "./app-state";
-import type { setupDragAndDrop } from "./drag-drop-manager";
 import type { HealthMonitor } from "./health-monitor";
 import { Logger } from "./logger";
 import type { OutputPoller } from "./output-poller";
@@ -147,7 +146,6 @@ export function setupMainEventListeners(deps: {
     saveCurrentConfig: () => Promise<void>;
   }) => Promise<Terminal | undefined>;
   generateNextConfigId: (terminals: Terminal[]) => string;
-  setupDragAndDrop: typeof setupDragAndDrop;
 }): void {
   const {
     state,
@@ -157,7 +155,7 @@ export function setupMainEventListeners(deps: {
     outputPoller,
     healthMonitor,
     appLevelState,
-    // Note: createPlainTerminal, generateNextConfigId, and setupDragAndDrop
+    // Note: createPlainTerminal and generateNextConfigId
     // are unused after Phase 2 (side-by-side layout) removed mini terminal row
   } = deps;
 
