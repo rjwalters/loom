@@ -1,0 +1,190 @@
+"""Spawn shepherds for ready issues."""
+
+from __future__ import annotations
+
+import subprocess
+from typing import TYPE_CHECKING, Any
+
+from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
+from loom_tools.common.github import gh_run
+from loom_tools.common.logging import log_error, log_info, log_success, log_warning
+from loom_tools.common.time_utils import now_utc
+from loom_tools.models.daemon_state import ShepherdEntry
+
+if TYPE_CHECKING:
+    from loom_tools.daemon_v2.context import DaemonContext
+
+
+def spawn_shepherds(ctx: DaemonContext) -> int:
+    """Spawn shepherds for ready issues.
+
+    Returns the number of shepherds successfully spawned.
+    """
+    if ctx.snapshot is None or ctx.state is None:
+        return 0
+
+    available_slots = ctx.get_available_shepherd_slots()
+    ready_issues = ctx.get_ready_issues()
+
+    if available_slots <= 0:
+        log_info("No available shepherd slots")
+        return 0
+
+    if not ready_issues:
+        log_info("No ready issues to assign")
+        return 0
+
+    # Limit to available slots
+    issues_to_spawn = ready_issues[:available_slots]
+    spawned = 0
+
+    for issue in issues_to_spawn:
+        issue_num = issue.get("number")
+        if issue_num is None:
+            continue
+
+        # Find an idle shepherd slot
+        shepherd_name = _find_idle_shepherd(ctx)
+        if shepherd_name is None:
+            log_warning("No idle shepherd slot available")
+            break
+
+        success = _spawn_single_shepherd(ctx, shepherd_name, issue_num)
+        if success:
+            spawned += 1
+
+    return spawned
+
+
+def _find_idle_shepherd(ctx: DaemonContext) -> str | None:
+    """Find an idle shepherd slot in daemon state.
+
+    Creates new shepherd entries if needed up to max_shepherds.
+    """
+    if ctx.state is None:
+        return None
+
+    # Check existing shepherds for idle slots
+    for name, entry in ctx.state.shepherds.items():
+        if entry.status == "idle":
+            return name
+
+    # Check if we can create a new shepherd
+    current_count = len(ctx.state.shepherds)
+    if current_count < ctx.config.max_shepherds:
+        new_name = f"shepherd-{current_count + 1}"
+        ctx.state.shepherds[new_name] = ShepherdEntry(status="idle")
+        return new_name
+
+    return None
+
+
+def _spawn_single_shepherd(
+    ctx: DaemonContext,
+    shepherd_name: str,
+    issue_num: int,
+) -> bool:
+    """Spawn a single shepherd for an issue.
+
+    Returns True if successful.
+    """
+    if ctx.state is None:
+        return False
+
+    timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Claim the issue
+    if not _claim_issue(issue_num):
+        log_error(f"Failed to claim issue #{issue_num}")
+        return False
+
+    log_info(f"Claimed issue #{issue_num} for {shepherd_name}")
+
+    # Build spawn arguments
+    args = str(issue_num)
+    if ctx.config.force_mode:
+        args += " --force"
+
+    # Check for existing session and handle it
+    if session_exists(shepherd_name):
+        log_info(f"Killing existing session for {shepherd_name}")
+        kill_stuck_session(shepherd_name)
+
+    # Spawn the shepherd
+    result = spawn_agent(
+        role="shepherd",
+        name=shepherd_name,
+        args=args,
+        worktree="",  # Shepherd creates its own worktree
+        repo_root=ctx.repo_root,
+    )
+
+    if result.status == "error":
+        log_error(f"Failed to spawn {shepherd_name}: {result.error}")
+        # Unclaim the issue
+        _unclaim_issue(issue_num)
+        return False
+
+    # Update daemon state
+    entry = ctx.state.shepherds.get(shepherd_name)
+    if entry is None:
+        entry = ShepherdEntry()
+        ctx.state.shepherds[shepherd_name] = entry
+
+    entry.status = "working"
+    entry.issue = issue_num
+    entry.task_id = _extract_task_id(result.session)
+    entry.output_file = result.log
+    entry.started = timestamp
+    entry.last_phase = "started"
+    entry.execution_mode = "tmux"
+    entry.idle_since = None
+    entry.idle_reason = None
+
+    log_success(f"Spawned {shepherd_name} for issue #{issue_num}")
+    return True
+
+
+def _claim_issue(issue_num: int) -> bool:
+    """Claim an issue by swapping labels.
+
+    Returns True if successful.
+    """
+    try:
+        gh_run([
+            "issue", "edit", str(issue_num),
+            "--remove-label", "loom:issue",
+            "--add-label", "loom:building",
+        ])
+        return True
+    except Exception as e:
+        log_error(f"Failed to claim issue #{issue_num}: {e}")
+        return False
+
+
+def _unclaim_issue(issue_num: int) -> None:
+    """Unclaim an issue (revert label swap on failure)."""
+    try:
+        gh_run([
+            "issue", "edit", str(issue_num),
+            "--remove-label", "loom:building",
+            "--add-label", "loom:issue",
+        ])
+    except Exception:
+        pass
+
+
+def _extract_task_id(session_name: str) -> str | None:
+    """Extract task ID from spawn result.
+
+    The task ID is a 7-character hex string generated by the Claude CLI.
+    Since we don't have direct access to it from spawn_agent, we generate
+    a placeholder that will be updated when the progress file is created.
+    """
+    import hashlib
+    import time
+
+    # Generate a 7-char hex ID based on session name and time
+    # This will be replaced by the actual task ID from progress files
+    data = f"{session_name}-{time.time()}".encode()
+    return hashlib.sha256(data).hexdigest()[:7]
