@@ -741,6 +741,21 @@ class BuilderPhase:
 
         return languages
 
+    def _find_python_test_root(self, worktree: Path) -> Path | None:
+        """Find the directory containing pyproject.toml for Python tests.
+
+        Checks the worktree root first, then known Python package directories.
+        Returns None if no pyproject.toml is found.
+        """
+        # Check root first
+        if (worktree / "pyproject.toml").is_file():
+            return worktree
+        # Check known Python package directories
+        for subdir in ["loom-tools"]:
+            if (worktree / subdir / "pyproject.toml").is_file():
+                return worktree / subdir
+        return None
+
     def _get_scoped_test_commands(
         self, worktree: Path, languages: set[str]
     ) -> list[tuple[list[str], str]]:
@@ -764,13 +779,19 @@ class BuilderPhase:
         # Check which test runners are available
         has_package_json = (worktree / "package.json").is_file()
         has_cargo_toml = (worktree / "Cargo.toml").is_file()
-        has_pyproject = (worktree / "pyproject.toml").is_file()
+        python_root = self._find_python_test_root(worktree)
 
         # Python changes -> Python tests only
-        if "python" in languages and has_pyproject:
-            commands.append(
-                (["uv", "run", "pytest", "-x", "-q"], "pytest")
-            )
+        if "python" in languages and python_root:
+            if python_root == worktree:
+                commands.append((["uv", "run", "pytest", "-x", "-q"], "pytest"))
+            else:
+                commands.append(
+                    (
+                        ["uv", "run", "--directory", str(python_root), "pytest", "-x", "-q"],
+                        "pytest",
+                    )
+                )
 
         # Rust changes -> Rust clippy and tests
         if "rust" in languages and has_cargo_toml:
@@ -863,8 +884,15 @@ class BuilderPhase:
         if (worktree / "Cargo.toml").is_file():
             return (["cargo", "test", "--workspace"], "cargo test --workspace")
 
-        if (worktree / "pyproject.toml").is_file():
-            return (["python", "-m", "pytest"], "pytest")
+        python_root = self._find_python_test_root(worktree)
+        if python_root:
+            if python_root == worktree:
+                return (["python", "-m", "pytest"], "pytest")
+            else:
+                return (
+                    ["python", "-m", "pytest", "--rootdir", str(python_root)],
+                    "pytest",
+                )
 
         return None
 
@@ -1068,8 +1096,17 @@ class BuilderPhase:
                 if "test:python" in scripts:
                     return [(["pnpm", "test:python"], "pnpm test:python (supplemental)")]
 
-        if (worktree / "pyproject.toml").is_file():
-            return [(["python", "-m", "pytest"], "pytest (supplemental)")]
+        python_root = self._find_python_test_root(worktree)
+        if python_root:
+            if python_root == worktree:
+                return [(["python", "-m", "pytest"], "pytest (supplemental)")]
+            else:
+                return [
+                    (
+                        ["python", "-m", "pytest", "--rootdir", str(python_root)],
+                        "pytest (supplemental)",
+                    )
+                ]
 
         return []
 
