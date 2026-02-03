@@ -10,6 +10,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+from loom_tools.checkpoints import (
+    Checkpoint,
+    get_recovery_recommendation,
+    read_checkpoint,
+)
 from loom_tools.common.git import get_changed_files
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
@@ -1969,6 +1974,22 @@ class BuilderPhase:
             label_res.stdout.strip() if label_res.returncode == 0 else "unknown"
         )
 
+        # -- Builder checkpoint ----------------------------------------------
+        checkpoint = None
+        if wt and wt.is_dir():
+            checkpoint = read_checkpoint(wt)
+        if checkpoint is not None:
+            recommendation = get_recovery_recommendation(checkpoint)
+            diag["checkpoint"] = checkpoint.to_dict()
+            diag["checkpoint_stage"] = checkpoint.stage
+            diag["checkpoint_recovery_path"] = recommendation["recovery_path"]
+            diag["checkpoint_skip_stages"] = recommendation["skip_stages"]
+        else:
+            diag["checkpoint"] = None
+            diag["checkpoint_stage"] = None
+            diag["checkpoint_recovery_path"] = "retry_from_scratch"
+            diag["checkpoint_skip_stages"] = []
+
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []
         if diag["worktree_exists"]:
@@ -1997,6 +2018,8 @@ class BuilderPhase:
         else:
             parts.append("no PR")
         parts.append(f"labels=[{diag['issue_labels']}]")
+        if diag.get("checkpoint_stage"):
+            parts.append(f"checkpoint={diag['checkpoint_stage']}")
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
 
@@ -2084,6 +2107,7 @@ class BuilderPhase:
         - Has commits ahead of main (needs: push, PR)
         - Remote branch exists but no PR (needs: PR creation)
         - PR exists but missing loom:review-requested label (needs: label)
+        - Checkpoint indicates recoverable stage (tested, committed, pushed)
 
         This pattern suggests the builder made progress but didn't complete
         the commit/push/PR workflow.
@@ -2108,6 +2132,14 @@ class BuilderPhase:
             diag.get("pr_number") is not None
             and not diag.get("pr_has_review_label", False)
         ):
+            return True
+
+        # Check checkpoint for recoverable stages
+        # If checkpoint shows progress past 'implementing', there may be work to salvage
+        checkpoint_stage = diag.get("checkpoint_stage")
+        if checkpoint_stage in ("tested", "committed", "pushed"):
+            # Checkpoint indicates work was done that may be recoverable
+            # even if git state doesn't show it (edge case: changes were stashed, etc.)
             return True
 
         return False
@@ -2296,9 +2328,19 @@ class BuilderPhase:
         instruction_oneline = "; ".join(instructions)
 
         # Build diagnostic context for retry attempts
-        # On attempt >= 2, include specific state details to help the agent understand
-        # the exact situation (file counts, branch state, etc.)
+        # Include checkpoint info and state details to help the agent understand
+        # the exact situation
         diag_context = ""
+
+        # Always include checkpoint info if available (more reliable than git state inference)
+        checkpoint_stage = diag.get("checkpoint_stage")
+        if checkpoint_stage:
+            checkpoint_info = f"Builder checkpoint indicates progress through '{checkpoint_stage}' stage."
+            checkpoint_details = diag.get("checkpoint", {}).get("details", {})
+            if checkpoint_details.get("test_result"):
+                checkpoint_info += f" Tests: {checkpoint_details['test_result']}."
+            diag_context = f" {checkpoint_info}"
+
         if attempt >= 2:
             diag_parts = []
             if diag.get("uncommitted_file_count", 0) > 0:

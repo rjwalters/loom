@@ -6,7 +6,8 @@ entry point (``main()``) registered as ``loom-milestone``.
 Events
 ------
 started, phase_entered, phase_completed, worktree_created, first_commit,
-pr_created, heartbeat, completed, blocked, error, judge_retry
+pr_created, heartbeat, completed, blocked, error, judge_retry,
+checkpoint_saved, checkpoint_loaded
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ VALID_EVENTS = frozenset(
         "blocked",
         "error",
         "judge_retry",
+        "checkpoint_saved",
+        "checkpoint_loaded",
     }
 )
 
@@ -55,6 +58,8 @@ _REQUIRED: dict[str, set[str]] = {
     "blocked": {"reason"},
     "error": {"error"},
     "judge_retry": {"attempt"},
+    "checkpoint_saved": {"stage"},
+    "checkpoint_loaded": {"stage"},
 }
 
 
@@ -113,6 +118,18 @@ def _build_milestone_data(event: str, **kwargs: Any) -> dict[str, Any]:
             data["max_retries"] = int(kwargs["max_retries"])
         if "reason" in kwargs:
             data["reason"] = kwargs["reason"]
+    elif event == "checkpoint_saved":
+        data["stage"] = kwargs["stage"]
+        if "recovery_path" in kwargs:
+            data["recovery_path"] = kwargs["recovery_path"]
+        if "details" in kwargs:
+            data["details"] = kwargs["details"]
+    elif event == "checkpoint_loaded":
+        data["stage"] = kwargs["stage"]
+        if "recovery_path" in kwargs:
+            data["recovery_path"] = kwargs["recovery_path"]
+        if "skip_stages" in kwargs:
+            data["skip_stages"] = kwargs["skip_stages"]
     return data
 
 
@@ -263,6 +280,10 @@ def _log_event(event: str, data: dict[str, Any]) -> None:
         log_error(f"Error: {data['error']}")
     elif event == "judge_retry":
         log_warning(f"Judge retry: attempt {data['attempt']}")
+    elif event == "checkpoint_saved":
+        log_info(f"Checkpoint saved: stage={data['stage']}")
+    elif event == "checkpoint_loaded":
+        log_info(f"Checkpoint loaded: stage={data['stage']}, recovery={data.get('recovery_path', 'unknown')}")
 
 
 # ── CLI ─────────────────────────────────────────────────────────
@@ -286,6 +307,8 @@ Events:
   blocked             --task-id ID --reason "reason" [--details "details"]
   error               --task-id ID --error "message" [--will-retry]
   judge_retry         --task-id ID --attempt NUM [--max-retries NUM] [--reason "reason"]
+  checkpoint_saved    --task-id ID --stage STAGE [--recovery-path PATH]
+  checkpoint_loaded   --task-id ID --stage STAGE [--recovery-path PATH] [--skip-stages STAGES]
 
 Examples:
   loom-milestone started --task-id abc1234 --issue 42 --mode force-pr
@@ -295,6 +318,8 @@ Examples:
   loom-milestone completed --task-id abc1234 --pr-merged
   loom-milestone error --task-id abc1234 --error "build failed" --will-retry
   loom-milestone judge_retry --task-id abc1234 --attempt 1 --max-retries 3 --reason "no review submitted"
+  loom-milestone checkpoint_saved --task-id abc1234 --stage tested --recovery-path route_to_commit
+  loom-milestone checkpoint_loaded --task-id abc1234 --stage committed --skip-stages "planning,implementing,tested"
 """,
     )
 
@@ -338,6 +363,15 @@ Examples:
     )
     parser.add_argument(
         "--max-retries", type=int, help="Maximum retries allowed (for 'judge_retry')"
+    )
+    parser.add_argument(
+        "--stage", help="Checkpoint stage (for 'checkpoint_saved', 'checkpoint_loaded')"
+    )
+    parser.add_argument(
+        "--recovery-path", help="Recovery path recommendation (for checkpoint events)"
+    )
+    parser.add_argument(
+        "--skip-stages", help="Comma-separated stages to skip (for 'checkpoint_loaded')"
     )
     parser.add_argument(
         "--quiet", "-q", action="store_true", help="Suppress output on success"
@@ -393,6 +427,12 @@ Examples:
         kwargs["attempt"] = args.attempt
     if args.max_retries is not None:
         kwargs["max_retries"] = args.max_retries
+    if hasattr(args, "stage") and args.stage is not None:
+        kwargs["stage"] = args.stage
+    if hasattr(args, "recovery_path") and args.recovery_path is not None:
+        kwargs["recovery_path"] = args.recovery_path
+    if hasattr(args, "skip_stages") and args.skip_stages is not None:
+        kwargs["skip_stages"] = args.skip_stages.split(",")
 
     ok = report_milestone(
         repo_root, args.task_id, args.event, quiet=args.quiet, **kwargs
