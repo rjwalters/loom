@@ -39,6 +39,8 @@ Thumbs.db
 .loom/.daemon.log
 .loom/daemon.sock
 .loom/daemon-state.json
+.loom/daemon-loop.pid
+.loom/daemon-metrics.json
 .loom/loom-source-path
 .loom/[0-9][0-9]-daemon-state.json
 .loom/stuck-history.json
