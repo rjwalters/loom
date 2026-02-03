@@ -328,10 +328,11 @@ class TestApprovalPhase:
     ) -> None:
         """Should report heartbeat milestone while waiting for approval."""
         mock_context.config = ShepherdConfig(issue=42, approval_timeout=1800)
-        # First check_shutdown returns False, approval not granted,
-        # then second iteration: shutdown True to exit loop
-        mock_context.check_shutdown.side_effect = [False, False, False]
-        mock_context.has_issue_label.side_effect = [False, False, True]
+        # has_issue_label calls: loom:issue(30), loom:building(40),
+        # loop iter1 loom:issue(73) -> False (triggers heartbeat),
+        # loop iter2 loom:issue(73) -> True (exits)
+        mock_context.check_shutdown.side_effect = [False, False]
+        mock_context.has_issue_label.side_effect = [False, False, False, True]
 
         approval = ApprovalPhase()
 
