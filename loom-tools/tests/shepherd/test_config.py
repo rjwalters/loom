@@ -149,11 +149,13 @@ class TestShepherdConfig:
         config = ShepherdConfig(
             issue=42,
             curator_timeout=100,
+            approval_timeout=150,
             builder_timeout=200,
             judge_timeout=300,
             doctor_timeout=400,
         )
         assert config.get_phase_timeout(Phase.CURATOR) == 100
+        assert config.get_phase_timeout(Phase.APPROVAL) == 150
         assert config.get_phase_timeout(Phase.BUILDER) == 200
         assert config.get_phase_timeout(Phase.JUDGE) == 300
         assert config.get_phase_timeout(Phase.DOCTOR) == 400
@@ -163,6 +165,7 @@ class TestShepherdConfig:
         config = ShepherdConfig(issue=42)
         # Note: Timeouts set high to avoid killing agents mid-work (see issue #2001)
         assert config.curator_timeout == 3600
+        assert config.approval_timeout == 1800
         assert config.builder_timeout == 14400
         assert config.judge_timeout == 3600
         assert config.doctor_timeout == 3600

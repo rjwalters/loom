@@ -57,7 +57,17 @@ class ApprovalPhase:
             )
 
         # Wait for human approval
+        start_time = time.time()
         while True:
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed > ctx.config.approval_timeout:
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=f"approval timed out after {int(elapsed)}s",
+                    phase_name="approval",
+                )
+
             # Refresh cache and check
             ctx.label_cache.invalidate_issue(ctx.config.issue)
             if ctx.has_issue_label("loom:issue"):
@@ -75,6 +85,9 @@ class ApprovalPhase:
                     message="shutdown signal detected during approval wait",
                     phase_name="approval",
                 )
+
+            # Report heartbeat so daemon knows we're waiting, not stuck
+            ctx.report_milestone("heartbeat", action="waiting for approval")
 
             time.sleep(ctx.config.poll_interval)
 

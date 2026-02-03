@@ -150,6 +150,9 @@ class ShepherdConfig:
     judge_timeout: int = field(
         default_factory=lambda: env_int("LOOM_JUDGE_TIMEOUT", 3600)
     )
+    approval_timeout: int = field(
+        default_factory=lambda: env_int("LOOM_APPROVAL_TIMEOUT", 1800)
+    )
     doctor_timeout: int = field(
         default_factory=lambda: env_int("LOOM_DOCTOR_TIMEOUT", 3600)
     )
@@ -210,6 +213,7 @@ class ShepherdConfig:
         """Get timeout for a specific phase."""
         timeouts = {
             Phase.CURATOR: self.curator_timeout,
+            Phase.APPROVAL: self.approval_timeout,
             Phase.BUILDER: self.builder_timeout,
             Phase.JUDGE: self.judge_timeout,
             Phase.DOCTOR: self.doctor_timeout,
