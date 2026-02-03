@@ -82,6 +82,29 @@ export async function mockTauriAPI(page: Page): Promise<void> {
             return "/mock/workspace/path";
           case "check_daemon_connection":
             return { connected: false };
+          case "check_system_dependencies":
+            // Return all dependencies available
+            return {
+              tmux_available: true,
+              git_available: true,
+              claude_code_available: true,
+              gh_available: true,
+              gh_copilot_available: true,
+              gemini_cli_available: false,
+              deepseek_cli_available: false,
+              grok_cli_available: false,
+              amp_cli_available: false,
+            };
+          case "get_cli_workspace":
+            return null; // No CLI workspace argument
+          case "get_stored_workspace":
+            return null; // No stored workspace
+          case "clear_stored_workspace":
+            return null;
+          case "store_workspace":
+            return null;
+          case "validate_workspace_path":
+            return true; // All paths are valid in tests
           default:
             return null;
         }
