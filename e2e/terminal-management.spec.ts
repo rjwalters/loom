@@ -1,6 +1,11 @@
 import { expect, test } from "@playwright/test";
-import { selectors } from "./helpers/selectors";
-import { clearPersistedState, mockTauriAPI, waitForAppReady } from "./helpers/setup";
+import { selectors, textMatchers } from "./helpers/selectors";
+import {
+  clearPersistedState,
+  mockTauriAPI,
+  selectMockWorkspace,
+  waitForAppReady,
+} from "./helpers/setup";
 
 test.describe("Terminal Management", () => {
   test.beforeEach(async ({ page }) => {
@@ -13,17 +18,19 @@ test.describe("Terminal Management", () => {
     await clearPersistedState(page);
   });
 
-  test("should display terminal container", async ({ page }) => {
-    // The terminal wrapper should be visible (single-session model)
-    // Use a longer timeout for CI environments which may be slower
-    const terminalWrapper = page.locator(selectors.terminalContainer);
-    await expect(terminalWrapper).toBeVisible({ timeout: 15000 });
+  test("should show workspace selector when no workspace selected", async ({ page }) => {
+    // Without a workspace, the app should show the workspace selector
+    const workspacePrompt = page.getByText(textMatchers.openRepository);
+    await expect(workspacePrompt).toBeVisible({ timeout: 15000 });
   });
 
-  test("should have terminal settings button", async ({ page }) => {
-    // The terminal settings button should be present in single-session UI
-    const settingsButton = page.locator(selectors.terminalSettingsBtn);
-    await expect(settingsButton).toBeVisible({ timeout: 15000 });
+  test("should show no terminals message after workspace selection", async ({ page }) => {
+    // Select a mock workspace first
+    await selectMockWorkspace(page);
+
+    // With workspace but no terminals, should show the "No terminals" message
+    const noTerminalsMessage = page.getByText("No terminals. Click + to add a terminal.");
+    await expect(noTerminalsMessage).toBeVisible({ timeout: 15000 });
   });
 
   test("should handle keyboard navigation", async ({ page }) => {
