@@ -2016,6 +2016,266 @@ class TestBuilderTestFailureContext:
             builder._preserve_on_test_failure(ctx, test_result)
 
 
+class TestBuilderCommitInterruptedWork:
+    """Test BuilderPhase._commit_interrupted_work for preserving work on interruption."""
+
+    def test_commit_interrupted_work_success(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should stage, commit, and push interrupted work."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+        mock_context.repo_root = tmp_path
+        mock_context.label_cache = MagicMock()
+
+        # Track subprocess calls
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(tuple(str(c) for c in cmd))
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  file.py\n"  # Has changes
+            return result
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=fake_run,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.transition_issue_labels"
+            ) as mock_transition,
+        ):
+            result = builder._commit_interrupted_work(
+                mock_context, "builder exited with code 1"
+            )
+
+        assert result is True
+
+        # Verify git operations
+        cmd_strs = [" ".join(c) for c in calls]
+        assert any("git add -A" in c for c in cmd_strs), "Should stage all changes"
+        assert any("git commit -m" in c for c in cmd_strs), "Should create commit"
+        assert any("git push -u origin" in c for c in cmd_strs), "Should push branch"
+
+        # Verify label transitions
+        mock_transition.assert_called_once_with(
+            42,
+            add=["loom:needs-fix"],
+            remove=["loom:building"],
+            repo_root=tmp_path,
+        )
+
+    def test_commit_interrupted_work_no_changes(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when no uncommitted changes."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = ""  # No changes
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_interrupted_work(mock_context, "test reason")
+
+        assert result is False
+
+    def test_commit_interrupted_work_no_worktree(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return False when worktree doesn't exist."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+
+        result = builder._commit_interrupted_work(mock_context, "test reason")
+        assert result is False
+
+    def test_commit_interrupted_work_writes_context_file(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should write .loom-interrupted-context.json file."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+        mock_context.repo_root = tmp_path
+        mock_context.label_cache = MagicMock()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  file.py\n"
+            return result
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=fake_run,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+        ):
+            builder._commit_interrupted_work(mock_context, "test reason")
+
+        context_file = worktree / ".loom-interrupted-context.json"
+        assert context_file.is_file()
+        context = json.loads(context_file.read_text())
+        assert context["issue"] == 42
+        assert "interrupted" in context["failure_message"].lower()
+        assert context["wip_commit"] is True
+
+    def test_commit_interrupted_work_stage_fails(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when git add fails."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "status --porcelain" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=0, stdout="M  file.py\n", stderr=""
+                )
+            if "git add" in cmd_str:
+                return subprocess.CompletedProcess(
+                    args=cmd, returncode=1, stdout="", stderr="error"
+                )
+            return subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            result = builder._commit_interrupted_work(mock_context, "test reason")
+
+        assert result is False
+
+
+class TestBuilderHasUncommittedChanges:
+    """Test BuilderPhase._has_uncommitted_changes helper."""
+
+    def test_has_changes(self, tmp_path: Path, mock_context: MagicMock) -> None:
+        """Should return True when worktree has uncommitted changes."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="M  file.py\n", stderr=""
+            ),
+        ):
+            result = builder._has_uncommitted_changes(mock_context)
+
+        assert result is True
+
+    def test_no_changes(self, tmp_path: Path, mock_context: MagicMock) -> None:
+        """Should return False when worktree is clean."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        ):
+            result = builder._has_uncommitted_changes(mock_context)
+
+        assert result is False
+
+    def test_no_worktree(self, mock_context: MagicMock) -> None:
+        """Should return False when worktree doesn't exist."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+
+        result = builder._has_uncommitted_changes(mock_context)
+        assert result is False
+
+
+class TestBuilderInterruptedWorkIntegration:
+    """Integration tests for builder interrupted work recovery in run()."""
+
+    def test_run_preserves_uncommitted_work_on_abnormal_exit(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Builder run() should preserve uncommitted work when exit code != 0."""
+        mock_context.check_shutdown.return_value = False
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        # Diagnostics show uncommitted changes
+        fake_diag = {
+            "summary": "test",
+            "has_uncommitted_changes": True,
+            "worktree_exists": True,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=1,  # Abnormal exit
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                builder, "_commit_interrupted_work", return_value=True
+            ) as mock_commit,
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        # Should have attempted to commit interrupted work
+        mock_commit.assert_called_once()
+        assert "code 1" in mock_commit.call_args[0][1]  # Reason includes exit code
+
+        assert result.status == PhaseStatus.FAILED
+        assert "uncommitted work preserved" in result.message
+        assert result.data.get("work_preserved") is True
+
+
 class TestBuilderPushBranch:
     """Test builder phase branch pushing."""
 
