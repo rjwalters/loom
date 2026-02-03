@@ -31,7 +31,6 @@ import {
   type TrendDirection,
   type VelocitySummary,
 } from "./agent-metrics";
-import { type CorrelationSummary, runCorrelationAnalysis } from "./correlation-analysis";
 import { Logger } from "./logger";
 
 const logger = Logger.forComponent("weekly-report");
@@ -189,24 +188,18 @@ export async function generateWeeklyReport(workspacePath: string): Promise<Weekl
 
   try {
     // Fetch all data in parallel
-    const [weekMetrics, prevWeekMetrics, velocity, roleMetrics, correlationSummary] =
-      await Promise.all([
-        getAgentMetrics(workspacePath, "week"),
-        getPreviousWeekMetrics(workspacePath),
-        getVelocitySummary(workspacePath),
-        getMetricsByRole(workspacePath, "week"),
-        runCorrelationAnalysis(workspacePath),
-      ]);
+    const [weekMetrics, prevWeekMetrics, velocity, roleMetrics] = await Promise.all([
+      getAgentMetrics(workspacePath, "week"),
+      getPreviousWeekMetrics(workspacePath),
+      getVelocitySummary(workspacePath),
+      getMetricsByRole(workspacePath, "week"),
+    ]);
 
     // Build summary
     const summary = buildWeekSummary(weekMetrics, prevWeekMetrics, velocity);
 
     // Identify patterns
-    const { successPatterns, improvementAreas } = identifyPatterns(
-      correlationSummary,
-      roleMetrics,
-      summary
-    );
+    const { successPatterns, improvementAreas } = identifyPatterns(roleMetrics, summary);
 
     // Detect anomalies
     const anomalies = await detectAnomalies(workspacePath, summary, roleMetrics);
@@ -220,7 +213,7 @@ export async function generateWeeklyReport(workspacePath: string): Promise<Weekl
     );
 
     // Generate "Did you know?" insights
-    const didYouKnow = generateDidYouKnow(summary, roleMetrics, correlationSummary);
+    const didYouKnow = generateDidYouKnow(summary, roleMetrics);
 
     const report: WeeklyReport = {
       id: generateReportId(),
@@ -322,27 +315,11 @@ function determineTrend(current: number, previous: number, lowerIsBetter = false
  * Identify success patterns and improvement areas
  */
 function identifyPatterns(
-  correlationSummary: CorrelationSummary,
   roleMetrics: RoleMetrics[],
   summary: WeekSummary
 ): { successPatterns: IdentifiedPattern[]; improvementAreas: IdentifiedPattern[] } {
   const successPatterns: IdentifiedPattern[] = [];
   const improvementAreas: IdentifiedPattern[] = [];
-
-  // Convert correlation insights to patterns
-  for (const insight of correlationSummary.top_insights) {
-    const pattern: IdentifiedPattern = {
-      type: "success",
-      factor: insight.factor,
-      description: insight.insight,
-      impact: insight.recommendation,
-      strength: insight.correlation_strength,
-    };
-
-    if (insight.correlation_strength === "strong" || insight.correlation_strength === "moderate") {
-      successPatterns.push(pattern);
-    }
-  }
 
   // Identify role-specific patterns
   for (const role of roleMetrics) {
@@ -572,11 +549,7 @@ function generateRecommendations(
 /**
  * Generate "Did you know?" insights
  */
-function generateDidYouKnow(
-  summary: WeekSummary,
-  roleMetrics: RoleMetrics[],
-  correlationSummary: CorrelationSummary
-): DidYouKnow[] {
+function generateDidYouKnow(summary: WeekSummary, roleMetrics: RoleMetrics[]): DidYouKnow[] {
   const insights: DidYouKnow[] = [];
 
   // Cost per feature
@@ -604,18 +577,6 @@ function generateDidYouKnow(
       icon: "zap",
       fact: `The ${topRole.role} role was most active with ${formatNumber(topRole.prompt_count)} prompts`,
       context: `That's ${percentOfTotal}% of all activity this week`,
-    });
-  }
-
-  // Best day insight from correlations
-  const dayInsight = correlationSummary.top_insights.find((i) =>
-    i.factor.toLowerCase().includes("day")
-  );
-  if (dayInsight) {
-    insights.push({
-      icon: "calendar",
-      fact: dayInsight.insight,
-      context: dayInsight.recommendation,
     });
   }
 

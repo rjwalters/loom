@@ -195,11 +195,6 @@ if (!eventListenersRegistered) {
     showHealthDashboardModal();
   });
 
-  listen("show-prompt-library", async () => {
-    const { showPromptLibraryModal } = await import("./lib/prompt-library-modal");
-    showPromptLibraryModal();
-  });
-
   listen("show-daemon-status", async () => {
     try {
       interface DaemonStatus {
@@ -225,11 +220,6 @@ if (!eventListenersRegistered) {
   listen("show-budget-management", async () => {
     const { showBudgetManagementModal } = await import("./lib/budget-management");
     showBudgetManagementModal();
-  });
-
-  listen("show-comparative-analysis", async () => {
-    const { showComparativeAnalysisModal } = await import("./lib/comparative-analysis-modal");
-    showComparativeAnalysisModal();
   });
 
   listen("show-activity-playback", async () => {
