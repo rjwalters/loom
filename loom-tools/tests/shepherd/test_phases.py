@@ -2060,10 +2060,11 @@ class TestBuilderCommitInterruptedWork:
         assert result is True
 
         # Verify git operations
+        # Commands include "-C <path>" so match subcommands
         cmd_strs = [" ".join(c) for c in calls]
-        assert any("git add -A" in c for c in cmd_strs), "Should stage all changes"
-        assert any("git commit -m" in c for c in cmd_strs), "Should create commit"
-        assert any("git push -u origin" in c for c in cmd_strs), "Should push branch"
+        assert any("add -A" in c for c in cmd_strs), "Should stage all changes"
+        assert any("commit -m" in c for c in cmd_strs), "Should create commit"
+        assert any("push" in c and "origin" in c for c in cmd_strs), "Should push branch"
 
         # Verify label transitions
         mock_transition.assert_called_once_with(
@@ -2163,7 +2164,8 @@ class TestBuilderCommitInterruptedWork:
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=0, stdout="M  file.py\n", stderr=""
                 )
-            if "git add" in cmd_str:
+            # Match "git -C <path> add -A" format
+            if "add" in cmd_str and "-A" in cmd_str:
                 return subprocess.CompletedProcess(
                     args=cmd, returncode=1, stdout="", stderr="error"
                 )
