@@ -34,6 +34,7 @@ loom-health-monitor = "loom_tools.health_monitor:main"
 loom-baseline-health = "loom_tools.baseline_health_cli:main"
 loom-snapshot = "loom_tools.snapshot:main"
 loom-checkpoint = "loom_tools.checkpoints:main"
+loom-daemon = "loom_tools.daemon_v2.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
