@@ -83,10 +83,10 @@ fi
 
 if [[ -n "$LOOM_TOOLS" ]] && [[ -x "$LOOM_TOOLS/.venv/bin/loom-daemon" ]]; then
     # Use venv from loom-tools directory
-    exec "$LOOM_TOOLS/.venv/bin/loom-daemon" "${args[@]}"
+    exec "$LOOM_TOOLS/.venv/bin/loom-daemon" ${args[@]+"${args[@]}"}
 elif command -v loom-daemon &>/dev/null; then
     # System-installed
-    exec loom-daemon "${args[@]}"
+    exec loom-daemon ${args[@]+"${args[@]}"}
 else
     echo "[ERROR] Python daemon not available." >&2
     echo "" >&2

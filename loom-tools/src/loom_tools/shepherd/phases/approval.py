@@ -35,6 +35,16 @@ class ApprovalPhase:
                 data={"summary": "already approved"},
             )
 
+        # Check if pre-approved by daemon (daemon claims issue by swapping
+        # loom:issue -> loom:building before spawning shepherd)
+        if ctx.has_issue_label("loom:building"):
+            return PhaseResult(
+                status=PhaseStatus.SUCCESS,
+                message="issue pre-approved (claimed by daemon, has loom:building label)",
+                phase_name="approval",
+                data={"summary": "daemon-claimed", "method": "building-label"},
+            )
+
         # In force mode, auto-approve
         if ctx.config.is_force_mode:
             add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
@@ -71,7 +81,7 @@ class ApprovalPhase:
     def validate(self, ctx: ShepherdContext) -> bool:
         """Validate approval phase contract.
 
-        Issue must have loom:issue label.
+        Issue must have loom:issue or loom:building label.
         """
         ctx.label_cache.invalidate_issue(ctx.config.issue)
-        return ctx.has_issue_label("loom:issue")
+        return ctx.has_issue_label("loom:issue") or ctx.has_issue_label("loom:building")
