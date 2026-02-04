@@ -150,7 +150,7 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 4. **Understand context**: Read PR description and linked issues
 5. **Check out code**: `gh pr checkout <number>` to get the branch locally
 6. **Rebase check**: Verify PR is up-to-date with main (see Rebase Check section below)
-7. **Run quality checks**: Tests, lints, type checks, build
+7. **Run quality checks**: Tests, lints, type checks, build (use Scoped Test Execution — see section below)
 7b. **Execute test plan**: Parse PR description for "## Test Plan" section.
     If found, classify each step as automatable or observation-only.
     Execute automatable steps and document results in evaluation comment.
@@ -1024,6 +1024,212 @@ Include a "Test Execution" section in your evaluation comment:
 | Test plan step fails | Report the failure; use judgment on whether to block approval |
 
 **Important:** Test plan execution supplements the evaluation — it is not a blocking requirement. The Judge should use judgment about whether test plan failures warrant requesting changes or are acceptable with a note.
+
+## Scoped Test Execution
+
+When running quality checks (step 7), use **scoped test execution** to run only the tests relevant to changed files. This reduces evaluation time while maintaining confidence that changed code is correct.
+
+### Step 1: Detect Changed Files
+
+```bash
+# Get list of files changed in the PR relative to main
+CHANGED_FILES=$(git diff --name-only origin/main...HEAD)
+echo "$CHANGED_FILES"
+```
+
+### Step 2: Check for Config File Changes
+
+If the PR touches configuration files that affect the entire project, **skip scoping and run the full test suite**:
+
+```bash
+# Config files that should trigger full suite
+CONFIG_PATTERNS="pyproject.toml|setup.cfg|setup.py|package.json|pnpm-lock.yaml|yarn.lock|Cargo.toml|Cargo.lock|tsconfig.json|jest.config|vitest.config|.eslintrc|Makefile|CMakeLists"
+
+if echo "$CHANGED_FILES" | grep -qE "($CONFIG_PATTERNS)"; then
+    echo "Config files changed — running full test suite"
+    # Run full suite (skip to Fallback section below)
+fi
+```
+
+### Step 3: Classify Changed Files by Language
+
+Classify the changed files to determine which scoped test strategies to apply:
+
+| Extension/Path | Language | Scoped Strategy |
+|----------------|----------|-----------------|
+| `.py`, `.pyi` | Python | `pytest --testmon` or full pytest |
+| `.ts`, `.tsx` | TypeScript | `jest --changedSince` or `vitest --changed` |
+| `.js`, `.jsx`, `.mjs`, `.cjs` | JavaScript | `jest --changedSince` or `vitest --changed` |
+| `.rs` | Rust | `cargo test -p <crate>` |
+| Other | Unknown | Full test suite |
+
+### Step 4: Run Scoped Tests by Language
+
+#### Python Repositories
+
+**Preferred: Use `pytest-testmon` when available**
+
+```bash
+# Check if pytest-testmon is available
+if python -m pytest --co --testmon 2>/dev/null; then
+    # Check if .testmondata exists and is reasonably current
+    if [ -f .testmondata ]; then
+        TESTMON_AGE=$(( $(date +%s) - $(stat -f %m .testmondata 2>/dev/null || stat -c %Y .testmondata 2>/dev/null) ))
+        if [ "$TESTMON_AGE" -lt 86400 ]; then
+            echo "Using pytest-testmon for scoped test execution"
+            python -m pytest --testmon -x -q
+            SCOPED_STRATEGY="pytest-testmon"
+        else
+            echo "Testmon data is stale (>24h) — falling back to full pytest"
+            python -m pytest -x -q
+            SCOPED_STRATEGY="full-pytest (stale testmon data)"
+        fi
+    else
+        echo "No .testmondata found — running full pytest (consider installing pytest-testmon)"
+        python -m pytest -x -q
+        SCOPED_STRATEGY="full-pytest (no testmon data)"
+    fi
+else
+    echo "pytest-testmon not available — running full pytest"
+    python -m pytest -x -q
+    SCOPED_STRATEGY="full-pytest (testmon not installed)"
+fi
+```
+
+**Recommendation if testmon is unavailable:**
+Note in evaluation comment: "Consider installing `pytest-testmon` (`pip install pytest-testmon`) for faster scoped test execution in future reviews."
+
+#### JavaScript/TypeScript Repositories
+
+**Detect and use the project's test runner:**
+
+```bash
+# Check for Jest
+if npx jest --version 2>/dev/null; then
+    echo "Using Jest with --changedSince for scoped tests"
+    npx jest --changedSince=origin/main
+    SCOPED_STRATEGY="jest --changedSince"
+
+# Check for Vitest
+elif npx vitest --version 2>/dev/null; then
+    echo "Using Vitest with --changed for scoped tests"
+    npx vitest run --changed origin/main
+    SCOPED_STRATEGY="vitest --changed"
+
+# Fallback: run whatever test script is configured
+else
+    echo "No Jest or Vitest detected — running configured test script"
+    npm test 2>/dev/null || pnpm test 2>/dev/null || yarn test 2>/dev/null
+    SCOPED_STRATEGY="full-test-script (no scoping tool detected)"
+fi
+```
+
+#### Rust Repositories
+
+**Scope to changed crates in workspace projects:**
+
+```bash
+# Check if this is a Cargo workspace
+if grep -q '^\[workspace\]' Cargo.toml 2>/dev/null; then
+    # Find which crates have changed files
+    CHANGED_CRATES=$(echo "$CHANGED_FILES" | grep '\.rs$' | \
+        sed 's|/.*||' | sort -u | \
+        while read dir; do
+            if [ -f "$dir/Cargo.toml" ]; then
+                grep '^name' "$dir/Cargo.toml" | head -1 | sed 's/name *= *"\(.*\)"/\1/'
+            fi
+        done)
+
+    if [ -n "$CHANGED_CRATES" ]; then
+        echo "Scoping Rust tests to changed crates: $CHANGED_CRATES"
+        for crate in $CHANGED_CRATES; do
+            cargo test -p "$crate"
+        done
+        SCOPED_STRATEGY="cargo test -p ($(echo $CHANGED_CRATES | tr '\n' ', '))"
+    else
+        echo "Changed Rust files not in identifiable crates — running full cargo test"
+        cargo test --workspace
+        SCOPED_STRATEGY="full-cargo-test"
+    fi
+else
+    # Single-crate project, just run tests
+    cargo test
+    SCOPED_STRATEGY="cargo-test (single crate)"
+fi
+```
+
+### Step 5: Fallback to Full Suite
+
+Run the full test suite when:
+- Config files are changed (detected in step 2)
+- Changed files span unknown languages
+- Scoped tools are not available
+- First run in a repository with no scoping data
+
+```bash
+# Generic fallback — use whatever the project's standard check command is
+pnpm check:ci 2>/dev/null || \
+    npm test 2>/dev/null || \
+    python -m pytest 2>/dev/null || \
+    cargo test 2>/dev/null || \
+    make test 2>/dev/null
+SCOPED_STRATEGY="full-suite (fallback)"
+```
+
+### Step 6: Document Strategy in Evaluation Comment
+
+**Always log which scoping strategy was used.** Include a "Test Scoping" section in your evaluation comment:
+
+```markdown
+## Test Scoping
+
+**Strategy**: `pytest-testmon`
+**Changed files**: 3 Python files in `src/utils/`
+**Scoped result**: 12 tests selected, all passed
+**Note**: Full suite has 847 tests; scoped execution covered tests affected by changes.
+```
+
+Or when falling back:
+
+```markdown
+## Test Scoping
+
+**Strategy**: `full-suite` (config files changed)
+**Reason**: PR modifies `pyproject.toml` — full test suite required
+**Result**: 847 tests, all passed
+```
+
+Or when recommending a missing tool:
+
+```markdown
+## Test Scoping
+
+**Strategy**: `full-pytest` (testmon not installed)
+**Result**: 847 tests, all passed
+**Recommendation**: Consider installing `pytest-testmon` for faster scoped test execution in future reviews.
+```
+
+### Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| PR touches only docs/markdown | Skip test execution entirely (no code changes) |
+| PR touches files in multiple languages | Run scoped tests for each language independently |
+| Scoped tests pass but you suspect missed coverage | Note in evaluation; do not block approval |
+| `pytest-testmon` DB is from wrong branch | Fall back to full pytest (check DB age) |
+| No test framework detected | Note absence in evaluation; check if project has tests at all |
+| PR touches shared utilities | Scoped tools may miss downstream tests — note this risk in evaluation |
+
+### Why Scoped Test Execution Matters
+
+| Metric | Full Suite | Scoped |
+|--------|-----------|--------|
+| Typical duration | 2-10 minutes | 10-60 seconds |
+| Tests executed | All | Only affected |
+| Confidence | Maximum | High (with caveats) |
+| Use case | Config changes, first run | Focused code changes |
+
+**Key principle**: Scoped execution is an optimization, not a replacement for CI. The full test suite still runs in CI (step 8 verifies CI status). Scoped execution gives the Judge faster local feedback during evaluation.
 
 ## Feedback Style
 
