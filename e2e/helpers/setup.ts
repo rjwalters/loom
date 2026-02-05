@@ -48,14 +48,32 @@ export async function mockTauriAPI(page: Page): Promise<void> {
           if (path.endsWith("config.json")) {
             return JSON.stringify({
               version: "2",
-              nextAgentNumber: 1,
-              terminals: [],
+              nextAgentNumber: 2,
+              terminals: [
+                {
+                  id: "terminal-1",
+                  name: "Test Terminal",
+                  role: "builder",
+                  roleConfig: {
+                    workerType: "claude",
+                    roleFile: "builder.md",
+                    targetInterval: 0,
+                    intervalPrompt: "",
+                  },
+                },
+              ],
             });
           }
           if (path.endsWith("state.json")) {
             return JSON.stringify({
-              workspace: "/mock/workspace/path",
-              engineRunning: false,
+              nextAgentNumber: 2,
+              terminals: [
+                {
+                  id: "terminal-1",
+                  status: "idle",
+                  isPrimary: true,
+                },
+              ],
             });
           }
           return "";
@@ -75,7 +93,15 @@ export async function mockTauriAPI(page: Page): Promise<void> {
         // Return appropriate mock responses based on command
         switch (cmd) {
           case "get_terminals":
-            return [];
+            return [
+              {
+                id: "terminal-1",
+                name: "Test Terminal",
+                status: "idle",
+                isPrimary: true,
+                role: "builder",
+              },
+            ];
           case "get_terminal_output":
             return "";
           case "get_workspace_path":
@@ -103,8 +129,50 @@ export async function mockTauriAPI(page: Page): Promise<void> {
             return null;
           case "store_workspace":
             return null;
+          case "set_stored_workspace":
+            return null;
           case "validate_workspace_path":
             return true; // All paths are valid in tests
+          case "check_loom_initialized":
+            return true; // Workspace is already initialized
+          case "ensure_workspace_scaffolding":
+            return null;
+          case "read_config":
+            return JSON.stringify({
+              version: "2",
+              terminals: [
+                {
+                  id: "terminal-1",
+                  name: "Test Terminal",
+                  role: "builder",
+                  roleConfig: {
+                    workerType: "claude",
+                    roleFile: "builder.md",
+                    targetInterval: 0,
+                    intervalPrompt: "",
+                  },
+                },
+              ],
+            });
+          case "read_state":
+            return JSON.stringify({
+              nextAgentNumber: 2,
+              terminals: [
+                {
+                  id: "terminal-1",
+                  status: "idle",
+                  isPrimary: true,
+                },
+              ],
+            });
+          case "create_terminal":
+            return "terminal-1"; // Return session ID
+          case "save_config":
+            return null;
+          case "save_state":
+            return null;
+          case "get_daemon_status":
+            return { running: false, socket_path: "", error: null };
           default:
             return null;
         }

@@ -24,13 +24,22 @@ test.describe("Terminal Management", () => {
     await expect(workspacePrompt).toBeVisible({ timeout: 15000 });
   });
 
-  test("should show no terminals message after workspace selection", async ({ page }) => {
-    // Select a mock workspace first
+  test("should display terminal container", async ({ page }) => {
+    // Select a mock workspace to trigger terminal loading
     await selectMockWorkspace(page);
 
-    // With workspace but no terminals, should show the "No terminals" message
-    const noTerminalsMessage = page.getByText("No terminals. Click + to add a terminal.");
-    await expect(noTerminalsMessage).toBeVisible({ timeout: 15000 });
+    // The terminal wrapper should be visible (single-session model)
+    const terminalWrapper = page.locator(selectors.terminalContainer);
+    await expect(terminalWrapper).toBeVisible({ timeout: 15000 });
+  });
+
+  test("should have terminal settings button", async ({ page }) => {
+    // Select a mock workspace to trigger terminal loading
+    await selectMockWorkspace(page);
+
+    // The terminal settings button should be present in single-session UI
+    const settingsButton = page.locator(selectors.terminalSettingsBtn);
+    await expect(settingsButton).toBeVisible({ timeout: 15000 });
   });
 
   test("should handle keyboard navigation", async ({ page }) => {
