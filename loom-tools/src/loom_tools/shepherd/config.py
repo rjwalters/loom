@@ -28,7 +28,7 @@ class ExecutionMode(Enum):
     - NORMAL: Legacy mode, same as DEFAULT (--wait was deprecated)
     """
 
-    DEFAULT = "force-pr"
+    DEFAULT = "default"
     FORCE_MERGE = "force-merge"
     NORMAL = "normal"  # Deprecated, treated same as DEFAULT
 
@@ -192,6 +192,14 @@ class ShepherdConfig:
     def is_force_mode(self) -> bool:
         """True if running in force mode (auto-approve, auto-merge)."""
         return self.mode == ExecutionMode.FORCE_MERGE
+
+    @property
+    def should_auto_approve(self) -> bool:
+        """True if shepherd should auto-promote past the approval gate.
+
+        Both DEFAULT and FORCE_MERGE auto-approve. Only NORMAL (legacy/deprecated) blocks.
+        """
+        return self.mode in (ExecutionMode.DEFAULT, ExecutionMode.FORCE_MERGE)
 
     def should_skip_phase(self, phase: Phase) -> bool:
         """Check if a phase should be skipped based on --from argument.

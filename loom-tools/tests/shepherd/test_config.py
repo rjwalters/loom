@@ -74,7 +74,7 @@ class TestExecutionMode:
 
     def test_mode_values(self) -> None:
         """Modes should have expected string values."""
-        assert ExecutionMode.DEFAULT.value == "force-pr"
+        assert ExecutionMode.DEFAULT.value == "default"
         assert ExecutionMode.FORCE_MERGE.value == "force-merge"
         assert ExecutionMode.NORMAL.value == "normal"
 
@@ -101,6 +101,21 @@ class TestShepherdConfig:
         """is_force_mode should be True for FORCE_MERGE."""
         config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
         assert config.is_force_mode is True
+
+    def test_should_auto_approve_true_for_default(self) -> None:
+        """should_auto_approve should be True for DEFAULT mode."""
+        config = ShepherdConfig(issue=42)
+        assert config.should_auto_approve is True
+
+    def test_should_auto_approve_true_for_force_merge(self) -> None:
+        """should_auto_approve should be True for FORCE_MERGE mode."""
+        config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        assert config.should_auto_approve is True
+
+    def test_should_auto_approve_false_for_normal(self) -> None:
+        """should_auto_approve should be False for NORMAL (deprecated) mode."""
+        config = ShepherdConfig(issue=42, mode=ExecutionMode.NORMAL)
+        assert config.should_auto_approve is False
 
     def test_auto_generated_task_id(self) -> None:
         """Task ID should be auto-generated."""
