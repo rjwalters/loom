@@ -285,13 +285,13 @@ class TestApprovalPhase:
         approval = ApprovalPhase()
         assert approval.validate(mock_context) is False
 
-    def test_daemon_claimed_does_not_trigger_in_default_mode_without_labels(
+    def test_enters_polling_loop_in_normal_mode_without_labels(
         self, mock_context: MagicMock
     ) -> None:
-        """Without either label in default mode, should enter polling loop (not auto-approve)."""
+        """Without either label in NORMAL mode, should enter polling loop (not auto-approve)."""
         mock_context.check_shutdown.side_effect = [False, False, True]
         mock_context.has_issue_label.return_value = False
-        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.NORMAL)
 
         approval = ApprovalPhase()
         with patch("loom_tools.shepherd.phases.approval.time") as mock_time:
@@ -306,7 +306,7 @@ class TestApprovalPhase:
         self, mock_context: MagicMock
     ) -> None:
         """Should return FAILED when approval timeout is exceeded."""
-        mock_context.config = ShepherdConfig(issue=42, approval_timeout=10)
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.NORMAL, approval_timeout=10)
         mock_context.check_shutdown.return_value = False
         mock_context.has_issue_label.return_value = False
 
@@ -327,7 +327,7 @@ class TestApprovalPhase:
         self, mock_context: MagicMock
     ) -> None:
         """Should report heartbeat milestone while waiting for approval."""
-        mock_context.config = ShepherdConfig(issue=42, approval_timeout=1800)
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.NORMAL, approval_timeout=1800)
         # has_issue_label calls: loom:issue(30), loom:building(40),
         # loop iter1 loom:issue(73) -> False (triggers heartbeat),
         # loop iter2 loom:issue(73) -> True (exits)
