@@ -25,6 +25,7 @@ class ShepherdExitCode(IntEnum):
     | 4         | Stuck/blocked, needs help     | Alert human                       |
     | 5         | Skipped (already complete)    | No action                         |
     | 6         | No changes needed             | Close issue, mark complete        |
+    | 7         | Transient API error           | Requeue issue, retry after backoff|
 
     Using IntEnum allows these to be used directly as exit codes:
         return ShepherdExitCode.SUCCESS
@@ -57,6 +58,11 @@ class ShepherdExitCode(IntEnum):
     # The reported problem doesn't exist or is already resolved on main
     NO_CHANGES_NEEDED = 6
 
+    # Transient API error (500, rate limit, network issue, etc.)
+    # Safe to retry - the issue itself is not the problem
+    # Daemon should requeue with backoff (max 3 retries per issue)
+    TRANSIENT_ERROR = 7
+
 
 # Convenience mapping for code interpretation
 EXIT_CODE_DESCRIPTIONS = {
@@ -67,6 +73,7 @@ EXIT_CODE_DESCRIPTIONS = {
     ShepherdExitCode.NEEDS_INTERVENTION: "Stuck/blocked - needs human intervention",
     ShepherdExitCode.SKIPPED: "Skipped - issue already complete",
     ShepherdExitCode.NO_CHANGES_NEEDED: "No changes needed - problem already resolved",
+    ShepherdExitCode.TRANSIENT_ERROR: "Transient API error - safe to retry after backoff",
 }
 
 

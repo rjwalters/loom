@@ -6,8 +6,8 @@ entry point (``main()``) registered as ``loom-milestone``.
 Events
 ------
 started, phase_entered, phase_completed, worktree_created, first_commit,
-pr_created, heartbeat, completed, blocked, error, judge_retry,
-checkpoint_saved, checkpoint_loaded
+pr_created, heartbeat, completed, blocked, error, transient_error,
+judge_retry, checkpoint_saved, checkpoint_loaded
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ VALID_EVENTS = frozenset(
         "completed",
         "blocked",
         "error",
+        "transient_error",
         "judge_retry",
         "checkpoint_saved",
         "checkpoint_loaded",
@@ -57,6 +58,7 @@ _REQUIRED: dict[str, set[str]] = {
     "completed": set(),
     "blocked": {"reason"},
     "error": {"error"},
+    "transient_error": {"error"},
     "judge_retry": {"attempt"},
     "checkpoint_saved": {"stage"},
     "checkpoint_loaded": {"stage"},
@@ -112,6 +114,9 @@ def _build_milestone_data(event: str, **kwargs: Any) -> dict[str, Any]:
     elif event == "error":
         data["error"] = kwargs["error"]
         data["will_retry"] = bool(kwargs.get("will_retry", False))
+    elif event == "transient_error":
+        data["error"] = kwargs["error"]
+        data["pattern"] = kwargs.get("pattern", "")
     elif event == "judge_retry":
         data["attempt"] = int(kwargs["attempt"])
         if "max_retries" in kwargs:
@@ -150,6 +155,8 @@ def _apply_state_updates(
         progress.status = "blocked"
     elif event == "error":
         progress.status = "retrying" if data.get("will_retry") else "errored"
+    elif event == "transient_error":
+        progress.status = "errored"
 
 
 # ── Programmatic API ────────────────────────────────────────────
@@ -278,6 +285,8 @@ def _log_event(event: str, data: dict[str, Any]) -> None:
         log_warning(f"Blocked: {data['reason']}")
     elif event == "error":
         log_error(f"Error: {data['error']}")
+    elif event == "transient_error":
+        log_warning(f"Transient error: {data['error']}")
     elif event == "judge_retry":
         log_warning(f"Judge retry: attempt {data['attempt']}")
     elif event == "checkpoint_saved":
@@ -306,6 +315,7 @@ Events:
   completed           --task-id ID [--pr-merged]
   blocked             --task-id ID --reason "reason" [--details "details"]
   error               --task-id ID --error "message" [--will-retry]
+  transient_error     --task-id ID --error "message" [--pattern "pattern"]
   judge_retry         --task-id ID --attempt NUM [--max-retries NUM] [--reason "reason"]
   checkpoint_saved    --task-id ID --stage STAGE [--recovery-path PATH]
   checkpoint_loaded   --task-id ID --stage STAGE [--recovery-path PATH] [--skip-stages STAGES]
@@ -317,6 +327,7 @@ Examples:
   loom-milestone heartbeat --task-id abc1234 --action "running tests"
   loom-milestone completed --task-id abc1234 --pr-merged
   loom-milestone error --task-id abc1234 --error "build failed" --will-retry
+  loom-milestone transient_error --task-id abc1234 --error "500 Internal Server Error" --pattern "500"
   loom-milestone judge_retry --task-id abc1234 --attempt 1 --max-retries 3 --reason "no review submitted"
   loom-milestone checkpoint_saved --task-id abc1234 --stage tested --recovery-path route_to_commit
   loom-milestone checkpoint_loaded --task-id abc1234 --stage committed --skip-stages "planning,implementing,tested"
@@ -357,6 +368,9 @@ Examples:
     parser.add_argument("--error", dest="error_msg", help="Error message (for 'error')")
     parser.add_argument(
         "--will-retry", action="store_true", help="Error is recoverable (for 'error')"
+    )
+    parser.add_argument(
+        "--pattern", help="Error pattern that triggered the event (for 'transient_error')"
     )
     parser.add_argument(
         "--attempt", type=int, help="Retry attempt number (for 'judge_retry')"
@@ -423,6 +437,8 @@ Examples:
         kwargs["error"] = args.error_msg
     if args.will_retry:
         kwargs["will_retry"] = True
+    if hasattr(args, "pattern") and args.pattern is not None:
+        kwargs["pattern"] = args.pattern
     if args.attempt is not None:
         kwargs["attempt"] = args.attempt
     if args.max_retries is not None:

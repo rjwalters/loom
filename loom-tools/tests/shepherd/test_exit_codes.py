@@ -47,6 +47,10 @@ class TestShepherdExitCode:
         """NO_CHANGES_NEEDED should be 6."""
         assert ShepherdExitCode.NO_CHANGES_NEEDED == 6
 
+    def test_transient_error_is_seven(self) -> None:
+        """TRANSIENT_ERROR should be 7."""
+        assert ShepherdExitCode.TRANSIENT_ERROR == 7
+
     def test_can_use_as_int(self) -> None:
         """Exit codes should be usable as integers."""
         assert int(ShepherdExitCode.SUCCESS) == 0
@@ -102,6 +106,11 @@ class TestDescribeExitCode:
         """Should describe NO_CHANGES_NEEDED exit code."""
         desc = describe_exit_code(6)
         assert "no changes" in desc.lower() or "resolved" in desc.lower()
+
+    def test_describes_transient_error(self) -> None:
+        """Should describe TRANSIENT_ERROR exit code."""
+        desc = describe_exit_code(7)
+        assert "transient" in desc.lower() or "retry" in desc.lower()
 
     def test_unknown_code_returns_message(self) -> None:
         """Should return message for unknown exit codes."""

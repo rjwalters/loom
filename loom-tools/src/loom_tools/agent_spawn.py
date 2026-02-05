@@ -44,6 +44,26 @@ SESSION_PREFIX = "loom-"
 DEFAULT_STUCK_THRESHOLD = 300  # 5 minutes
 DEFAULT_VERIFY_TIMEOUT = 10  # seconds
 
+# Patterns in log output that indicate transient API errors
+# (agent is waiting for "try again" input, not actually stuck on a logic problem)
+API_ERROR_PATTERNS = (
+    "500 Internal Server Error",
+    "Rate limit exceeded",
+    "rate_limit",
+    "overloaded",
+    "temporarily unavailable",
+    "503 Service",
+    "502 Bad Gateway",
+    "Connection refused",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "ECONNRESET",
+    "NetworkError",
+    "network error",
+    "socket hang up",
+    "No messages returned",
+)
+
 
 @dataclass
 class SpawnResult:
@@ -347,6 +367,28 @@ def check_stop_signals(name: str, repo_root: pathlib.Path) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def check_log_for_api_errors(log_file: pathlib.Path, tail_lines: int = 50) -> str | None:
+    """Check the tail of a log file for API error patterns.
+
+    Returns the matched pattern if found, None otherwise.
+    """
+    if not log_file.is_file():
+        return None
+
+    try:
+        content = log_file.read_text()
+        # Only check the last portion to avoid matching old errors
+        lines = content.splitlines()
+        tail = "\n".join(lines[-tail_lines:])
+        for pattern in API_ERROR_PATTERNS:
+            if pattern.lower() in tail.lower():
+                return pattern
+    except (OSError, UnicodeDecodeError):
+        pass
+
+    return None
+
+
 def session_is_stuck(name: str, repo_root: pathlib.Path, threshold: int) -> bool:
     """Check if an existing session is stuck (idle with no claude activity).
 
@@ -391,6 +433,14 @@ def session_is_stuck(name: str, repo_root: pathlib.Path, threshold: int) -> bool
                                 return False  # Not stuck
                         except OSError:
                             continue
+
+                # Check 4: Look for API error patterns in log
+                api_error = check_log_for_api_errors(log_file)
+                if api_error:
+                    log_warning(
+                        f"API error pattern detected in log: {api_error} "
+                        f"- session likely waiting for 'try again' input"
+                    )
 
                 return True  # Stuck
         except OSError:
