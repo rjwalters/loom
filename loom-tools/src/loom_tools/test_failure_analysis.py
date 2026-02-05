@@ -25,11 +25,10 @@ import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from loom_tools.common.logging import log_error, log_info, log_warning
-from loom_tools.common.paths import LoomPaths
+from loom_tools.common.logging import log_error, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_progress_files
-from loom_tools.models.progress import Milestone, ShepherdProgress
+from loom_tools.models.progress import ShepherdProgress
 
 # ANSI color codes
 _RED = "\033[0;31m"
