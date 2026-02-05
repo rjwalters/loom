@@ -5,13 +5,41 @@ from __future__ import annotations
 import pathlib
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.time_utils import now_utc
+from loom_tools.models.daemon_state import TransientRetryEntry
 
 if TYPE_CHECKING:
     from loom_tools.daemon_v2.context import DaemonContext
+
+# Transient error patterns that indicate API/infrastructure issues (not code bugs)
+TRANSIENT_ERROR_PATTERNS = (
+    "500 Internal Server Error",
+    "Rate limit exceeded",
+    "rate_limit",
+    "overloaded",
+    "temporarily unavailable",
+    "503 Service",
+    "502 Bad Gateway",
+    "Connection refused",
+    "ECONNREFUSED",
+    "ETIMEDOUT",
+    "ECONNRESET",
+    "NetworkError",
+    "network error",
+    "socket hang up",
+    "No messages returned",
+)
+
+# Maximum retries for transient errors per issue
+MAX_TRANSIENT_RETRIES = 3
+
+# Backoff duration in seconds before retrying a transiently-failed issue
+TRANSIENT_BACKOFF_SECONDS = 300  # 5 minutes
 
 
 @dataclass
@@ -24,6 +52,24 @@ class CompletionEntry:
     task_id: str | None = None
     success: bool = True
     pr_merged: bool = False
+    is_transient_error: bool = False
+
+
+def _check_transient_error(milestones: list[dict[str, Any]]) -> bool:
+    """Check if progress milestones indicate a transient API error.
+
+    Looks at error events in the milestones for patterns that match
+    known transient API/infrastructure failures.
+    """
+    for milestone in reversed(milestones):
+        if milestone.get("event") == "error":
+            error_msg = milestone.get("data", {}).get("error", "")
+            for pattern in TRANSIENT_ERROR_PATTERNS:
+                if pattern.lower() in error_msg.lower():
+                    return True
+        if milestone.get("event") == "transient_error":
+            return True
+    return False
 
 
 def check_completions(ctx: DaemonContext) -> list[CompletionEntry]:
@@ -66,6 +112,7 @@ def check_completions(ctx: DaemonContext) -> list[CompletionEntry]:
         if progress.get("status") == "errored":
             task_id = progress.get("task_id")
             issue = progress.get("issue")
+            milestones = progress.get("milestones", [])
 
             shepherd_name = None
             for name, entry in ctx.state.shepherds.items():
@@ -74,12 +121,14 @@ def check_completions(ctx: DaemonContext) -> list[CompletionEntry]:
                     break
 
             if shepherd_name:
+                is_transient = _check_transient_error(milestones)
                 completed.append(CompletionEntry(
                     type="shepherd",
                     name=shepherd_name,
                     issue=issue,
                     task_id=task_id,
                     success=False,
+                    is_transient_error=is_transient,
                 ))
 
     return completed
@@ -136,12 +185,99 @@ def _handle_shepherd_completion(
             if completion.pr_merged:
                 ctx.state.total_prs_merged += 1
 
+        # Clear transient retry tracking on success
+        if completion.issue is not None:
+            issue_key = str(completion.issue)
+            ctx.state.transient_retries.pop(issue_key, None)
+
         # Trigger cleanup
         _trigger_shepherd_cleanup(ctx.repo_root, completion.issue)
+    elif completion.is_transient_error and completion.issue is not None:
+        _handle_transient_error_retry(ctx, completion, timestamp)
     else:
         log_warning(
             f"Shepherd {completion.name} failed on issue #{completion.issue}"
         )
+
+
+def _handle_transient_error_retry(
+    ctx: DaemonContext,
+    completion: CompletionEntry,
+    timestamp: str,
+) -> None:
+    """Handle a shepherd failure caused by a transient API error.
+
+    Re-queues the issue for retry if under the retry limit, with backoff.
+    """
+    if ctx.state is None or completion.issue is None:
+        return
+
+    issue_key = str(completion.issue)
+    retry_entry = ctx.state.transient_retries.get(
+        issue_key, TransientRetryEntry()
+    )
+
+    if retry_entry.retry_count >= MAX_TRANSIENT_RETRIES:
+        log_warning(
+            f"Issue #{completion.issue} exhausted transient retries "
+            f"({retry_entry.retry_count}/{MAX_TRANSIENT_RETRIES}) - "
+            f"not requeuing"
+        )
+        return
+
+    # Increment retry count and set backoff
+    retry_entry.retry_count += 1
+    retry_entry.last_retry_at = timestamp
+    backoff_until = (
+        now_utc() + timedelta(seconds=TRANSIENT_BACKOFF_SECONDS)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    retry_entry.backoff_until = backoff_until
+    ctx.state.transient_retries[issue_key] = retry_entry
+
+    log_warning(
+        f"Shepherd {completion.name} failed on issue #{completion.issue} "
+        f"due to transient API error (retry {retry_entry.retry_count}/"
+        f"{MAX_TRANSIENT_RETRIES}). Requeuing with {TRANSIENT_BACKOFF_SECONDS}s backoff."
+    )
+
+    # Re-queue the issue: swap loom:building back to loom:issue
+    _requeue_issue(completion.issue, retry_entry.retry_count, timestamp)
+
+
+def _requeue_issue(
+    issue: int,
+    retry_count: int,
+    timestamp: str,
+) -> None:
+    """Re-queue an issue by swapping labels and adding a comment."""
+    try:
+        result = gh_run(
+            [
+                "issue", "edit", str(issue),
+                "--remove-label", "loom:building",
+                "--add-label", "loom:issue",
+            ],
+            check=False,
+        )
+        if result.returncode == 0:
+            log_info(f"Requeued issue #{issue} (loom:building -> loom:issue)")
+
+            comment = (
+                f"**Transient Error Recovery**\n\n"
+                f"This issue was automatically requeued after a transient API error.\n\n"
+                f"**Retry**: {retry_count}/{MAX_TRANSIENT_RETRIES}\n"
+                f"**Backoff**: {TRANSIENT_BACKOFF_SECONDS}s before next attempt\n\n"
+                f"---\n"
+                f"*Recovered by daemon transient error handler at {timestamp}*"
+            )
+            gh_run(
+                ["issue", "comment", str(issue), "--body", comment],
+                check=False,
+            )
+        else:
+            log_warning(f"Failed to requeue issue #{issue}")
+    except Exception:
+        log_warning(f"Failed to requeue issue #{issue}")
 
 
 def _handle_support_role_completion(

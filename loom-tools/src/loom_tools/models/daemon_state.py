@@ -257,6 +257,36 @@ class BlockedIssueRetry:
 
 
 @dataclass
+class TransientRetryEntry:
+    """Retry metadata for a single issue that failed due to transient API errors."""
+
+    retry_count: int = 0
+    last_retry_at: str | None = None
+    max_retries: int = 3
+    backoff_until: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TransientRetryEntry:
+        return cls(
+            retry_count=data.get("retry_count", 0),
+            last_retry_at=data.get("last_retry_at"),
+            max_retries=data.get("max_retries", 3),
+            backoff_until=data.get("backoff_until"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "retry_count": self.retry_count,
+            "max_retries": self.max_retries,
+        }
+        if self.last_retry_at is not None:
+            d["last_retry_at"] = self.last_retry_at
+        if self.backoff_until is not None:
+            d["backoff_until"] = self.backoff_until
+        return d
+
+
+@dataclass
 class DaemonState:
     started_at: str | None = None
     last_poll: str | None = None
@@ -276,6 +306,7 @@ class DaemonState:
     systematic_failure: SystematicFailure = field(default_factory=SystematicFailure)
     blocked_issue_retries: dict[str, BlockedIssueRetry] = field(default_factory=dict)
     recent_failures: list[RecentFailure] = field(default_factory=list)
+    transient_retries: dict[str, TransientRetryEntry] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DaemonState:
@@ -304,6 +335,12 @@ class DaemonState:
             RecentFailure.from_dict(f) for f in data.get("recent_failures", [])
         ]
 
+        transient_retries_raw = data.get("transient_retries", {})
+        transient_retries = {
+            k: TransientRetryEntry.from_dict(v)
+            for k, v in transient_retries_raw.items()
+        }
+
         return cls(
             started_at=data.get("started_at"),
             last_poll=data.get("last_poll"),
@@ -323,6 +360,7 @@ class DaemonState:
             systematic_failure=systematic_failure,
             blocked_issue_retries=blocked_issue_retries,
             recent_failures=recent_failures,
+            transient_retries=transient_retries,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -342,6 +380,9 @@ class DaemonState:
                 k: v.to_dict() for k, v in self.blocked_issue_retries.items()
             },
             "recent_failures": [f.to_dict() for f in self.recent_failures],
+            "transient_retries": {
+                k: v.to_dict() for k, v in self.transient_retries.items()
+            },
         }
         for k in (
             "started_at", "last_poll", "daemon_session_id",
