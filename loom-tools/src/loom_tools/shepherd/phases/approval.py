@@ -45,15 +45,15 @@ class ApprovalPhase:
                 data={"summary": "daemon-claimed", "method": "building-label"},
             )
 
-        # In force mode, auto-approve
-        if ctx.config.is_force_mode:
+        # In default or force mode, auto-approve past the approval gate
+        if ctx.config.should_auto_approve:
             add_issue_label(ctx.config.issue, "loom:issue", ctx.repo_root)
             ctx.label_cache.invalidate_issue(ctx.config.issue)
             return PhaseResult(
                 status=PhaseStatus.SUCCESS,
-                message="issue auto-approved (force mode)",
+                message="issue auto-approved",
                 phase_name="approval",
-                data={"summary": "force mode"},
+                data={"summary": "auto-approved"},
             )
 
         # Wait for human approval

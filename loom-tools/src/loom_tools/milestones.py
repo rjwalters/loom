@@ -321,7 +321,7 @@ Events:
   checkpoint_loaded   --task-id ID --stage STAGE [--recovery-path PATH] [--skip-stages STAGES]
 
 Examples:
-  loom-milestone started --task-id abc1234 --issue 42 --mode force-pr
+  loom-milestone started --task-id abc1234 --issue 42 --mode default
   loom-milestone phase_entered --task-id abc1234 --phase builder
   loom-milestone phase_completed --task-id abc1234 --phase builder --duration-seconds 120 --status success
   loom-milestone heartbeat --task-id abc1234 --action "running tests"

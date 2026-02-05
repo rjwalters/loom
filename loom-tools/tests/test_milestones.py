@@ -78,11 +78,11 @@ class TestStartedEvent:
         assert data["milestones"][0]["data"]["issue"] == 42
 
     def test_with_mode(self, repo: pathlib.Path) -> None:
-        ok = report_milestone(repo, "abc1234", "started", issue=42, mode="force-pr")
+        ok = report_milestone(repo, "abc1234", "started", issue=42, mode="default")
         assert ok
         data = _read_progress(repo, "abc1234")
-        assert data["mode"] == "force-pr"
-        assert data["milestones"][0]["data"]["mode"] == "force-pr"
+        assert data["mode"] == "default"
+        assert data["milestones"][0]["data"]["mode"] == "default"
 
     def test_creates_progress_dir(self, repo: pathlib.Path) -> None:
         progress_dir = repo / ".loom" / "progress"
