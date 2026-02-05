@@ -295,6 +295,15 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
 
     echo ""
     success "Uninstall complete - proceeding with fresh installation"
+
+    # Clean up staged deletions from uninstall
+    # The uninstall ran in --local mode, staging file deletions directly in the
+    # main working directory. The fresh install will happen in a worktree, so
+    # main must stay clean to avoid leftover staged changes after completion.
+    info "Cleaning staged changes from uninstall..."
+    git -C "$TARGET_PATH" restore --staged . 2>/dev/null || true
+    git -C "$TARGET_PATH" checkout -- . 2>/dev/null || true
+
     echo ""
   else
     info "No existing Loom installation detected - proceeding with fresh install"
