@@ -22,7 +22,7 @@ _ANSI_ESCAPE_PATTERN = re.compile(
     \x1b  # ESC character
     (?:
         \[  # CSI sequences: ESC [
-        [0-9;]*  # parameters
+        [?0-9;]*  # parameters (including ? for private modes)
         [A-Za-z]  # final character
         |
         \]  # OSC sequences: ESC ]

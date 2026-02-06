@@ -444,8 +444,8 @@ class TestAnsiStripping:
         assert strip_ansi(colored_with_title) == expected
 
     @patch("loom_tools.agent_spawn._tmux")
-    def test_spawn_agent_uses_sed_filter(self, mock_tmux: MagicMock) -> None:
-        """Test that spawn_agent sets up pipe-pane with sed ANSI stripping."""
+    def test_spawn_agent_uses_python_log_filter(self, mock_tmux: MagicMock) -> None:
+        """Test that spawn_agent sets up pipe-pane with Python log filter."""
         from loom_tools.agent_spawn import spawn_agent
 
         mock_tmux.return_value = subprocess.CompletedProcess(
@@ -481,10 +481,13 @@ class TestAnsiStripping:
 
             assert len(pipe_pane_calls) >= 1, "pipe-pane should be called"
 
-            # Check the pipe-pane command includes sed with ANSI stripping
+            # Check the pipe-pane command uses Python log filter with sed fallback
             pipe_pane_call = pipe_pane_calls[0]
             pipe_cmd = pipe_pane_call[0][3] if len(pipe_pane_call[0]) > 3 else ""
 
-            assert "sed" in pipe_cmd, f"pipe-pane should use sed, got: {pipe_cmd}"
-            assert "\\x1b" in pipe_cmd, f"sed command should strip ANSI sequences: {pipe_cmd}"
-            assert ">>" in pipe_cmd, f"sed command should append to log file: {pipe_cmd}"
+            assert "python3 -m loom_tools.log_filter" in pipe_cmd, \
+                f"pipe-pane should use Python log filter, got: {pipe_cmd}"
+            assert "sed" in pipe_cmd, \
+                f"pipe-pane should include sed fallback, got: {pipe_cmd}"
+            assert ">>" in pipe_cmd, \
+                f"command should append to log file: {pipe_cmd}"
