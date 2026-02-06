@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.state import read_daemon_state, write_json_file
 from loom_tools.common.time_utils import now_utc
+from loom_tools.models.daemon_state import SystematicFailure
 from loom_tools.daemon_v2.actions.completions import check_completions, handle_completion
 from loom_tools.daemon_v2.actions.proposals import promote_proposals
 from loom_tools.agent_spawn import kill_stuck_session, session_exists
@@ -349,6 +350,15 @@ def _escalate_level_3(ctx: DaemonContext) -> None:
                 pass
         if cleared > 0:
             log_info(f"STALL-L3: Cleared {cleared} stale progress file(s)")
+
+    # Reset systematic failure state — pool restart is a clean slate
+    if ctx.state.systematic_failure.active:
+        log_info(
+            f"STALL-L3: Cleared systematic failure state "
+            f"(pattern={ctx.state.systematic_failure.pattern})"
+        )
+        ctx.state.systematic_failure = SystematicFailure()
+        ctx.state.recent_failures = []
 
     log_success(f"STALL-L3: Pool restart complete - killed {killed} session(s)")
 
