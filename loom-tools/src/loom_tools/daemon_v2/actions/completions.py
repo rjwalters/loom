@@ -9,6 +9,11 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from loom_tools.common.github import gh_run
+from loom_tools.common.issue_failures import (
+    MAX_FAILURES_BEFORE_BLOCK,
+    record_failure,
+    record_success,
+)
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import TransientRetryEntry
@@ -190,6 +195,9 @@ def _handle_shepherd_completion(
             issue_key = str(completion.issue)
             ctx.state.transient_retries.pop(issue_key, None)
 
+            # Clear persistent failure log on success
+            record_success(ctx.repo_root, completion.issue)
+
         # Trigger cleanup
         _trigger_shepherd_cleanup(ctx.repo_root, completion.issue)
     elif completion.is_transient_error and completion.issue is not None:
@@ -198,6 +206,10 @@ def _handle_shepherd_completion(
         log_warning(
             f"Shepherd {completion.name} failed on issue #{completion.issue}"
         )
+
+        # Record non-transient failure in persistent log
+        if completion.issue is not None:
+            _record_persistent_failure(ctx, completion)
 
 
 def _handle_transient_error_retry(
@@ -278,6 +290,73 @@ def _requeue_issue(
             log_warning(f"Failed to requeue issue #{issue}")
     except Exception:
         log_warning(f"Failed to requeue issue #{issue}")
+
+
+def _record_persistent_failure(
+    ctx: DaemonContext,
+    completion: CompletionEntry,
+) -> None:
+    """Record a non-transient shepherd failure to the persistent failure log.
+
+    If the issue has reached MAX_FAILURES_BEFORE_BLOCK, automatically labels
+    it as loom:blocked with a comment explaining the failure pattern.
+    """
+    if completion.issue is None:
+        return
+
+    # Determine error class and phase from shepherd entry
+    shepherd_entry = ctx.state.shepherds.get(completion.name) if ctx.state else None
+    phase = shepherd_entry.last_phase if shepherd_entry else "unknown"
+    error_class = "shepherd_failure"
+
+    entry = record_failure(
+        ctx.repo_root,
+        completion.issue,
+        error_class=error_class,
+        phase=phase or "",
+        details=f"Shepherd {completion.name} failed during {phase or 'unknown'} phase",
+    )
+
+    if entry.should_auto_block:
+        log_warning(
+            f"Issue #{completion.issue} has failed {entry.total_failures} times "
+            f"(>= {MAX_FAILURES_BEFORE_BLOCK}) - auto-labeling as loom:blocked"
+        )
+        _auto_block_issue(completion.issue, entry)
+
+
+def _auto_block_issue(issue: int, entry: "IssueFailureEntry") -> None:
+    """Auto-label an issue as loom:blocked after too many failures."""
+    from loom_tools.common.issue_failures import IssueFailureEntry  # noqa: F811
+
+    try:
+        gh_run(
+            [
+                "issue", "edit", str(issue),
+                "--remove-label", "loom:issue",
+                "--add-label", "loom:blocked",
+            ],
+            check=False,
+        )
+
+        comment = (
+            f"**Persistent Failure - Auto-Blocked**\n\n"
+            f"This issue has failed **{entry.total_failures}** times across daemon sessions "
+            f"and has been automatically blocked.\n\n"
+            f"**Last error class**: `{entry.error_class}`\n"
+            f"**Last phase**: `{entry.phase}`\n"
+            f"**First failure**: {entry.first_failure_at or 'unknown'}\n"
+            f"**Last failure**: {entry.last_failure_at or 'unknown'}\n\n"
+            f"A maintainer should investigate before re-labeling as `loom:issue`.\n\n"
+            f"---\n"
+            f"*Auto-blocked by daemon persistent failure tracking*"
+        )
+        gh_run(
+            ["issue", "comment", str(issue), "--body", comment],
+            check=False,
+        )
+    except Exception:
+        log_warning(f"Failed to auto-block issue #{issue}")
 
 
 def _handle_support_role_completion(

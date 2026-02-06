@@ -53,7 +53,10 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     # 1. Capture fresh snapshot
     log_info("Capturing system state...")
     try:
-        ctx.snapshot = build_snapshot(repo_root=ctx.repo_root)
+        ctx.snapshot = build_snapshot(
+            repo_root=ctx.repo_root,
+            _current_iteration=ctx.iteration,
+        )
     except Exception as e:
         log_error(f"Failed to capture snapshot: {e}")
         return IterationResult(

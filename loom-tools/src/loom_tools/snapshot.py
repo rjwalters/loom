@@ -29,7 +29,8 @@ from typing import Any, Sequence
 import shutil
 
 from loom_tools.common.github import gh_parallel_queries, gh_get_default_branch_ci_status
-from loom_tools.common.logging import log_warning
+from loom_tools.common.issue_failures import load_failure_log, IssueFailureLog
+from loom_tools.common.logging import log_info, log_warning
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import (
@@ -340,6 +341,63 @@ def sort_issues_by_strategy(
 def _created_at_key(item: dict[str, Any]) -> str:
     """Extract createdAt for sorting (empty string as fallback)."""
     return item.get("createdAt", "")
+
+
+def filter_issues_by_failure_backoff(
+    issues: list[dict[str, Any]],
+    failure_log: IssueFailureLog,
+    current_iteration: int,
+) -> list[dict[str, Any]]:
+    """Filter out issues that are in failure backoff.
+
+    Issues with persistent failure history are skipped if the daemon hasn't
+    completed enough iterations since the failure was recorded. Issues that
+    have hit MAX_FAILURES_BEFORE_BLOCK are also filtered out (they should
+    already be labeled loom:blocked, but this provides defense in depth).
+
+    Args:
+        issues: Sorted list of ready issues.
+        failure_log: Persistent failure log.
+        current_iteration: Current daemon iteration number.
+
+    Returns:
+        Filtered list of issues not in backoff.
+    """
+    if not failure_log.entries:
+        return issues
+
+    filtered: list[dict[str, Any]] = []
+    for issue in issues:
+        issue_num = issue.get("number")
+        if issue_num is None:
+            filtered.append(issue)
+            continue
+
+        entry = failure_log.entries.get(str(issue_num))
+        if entry is None:
+            filtered.append(issue)
+            continue
+
+        # Auto-block threshold reached — skip entirely
+        if entry.should_auto_block:
+            log_warning(
+                f"Skipping issue #{issue_num}: {entry.total_failures} failures "
+                f"(>= threshold), should be auto-blocked"
+            )
+            continue
+
+        # Check backoff: skip if not enough iterations have passed
+        backoff = entry.backoff_iterations()
+        if backoff > 0 and current_iteration % (backoff + 1) != 0:
+            log_info(
+                f"Skipping issue #{issue_num}: in backoff "
+                f"(failures={entry.total_failures}, backoff_iters={backoff})"
+            )
+            continue
+
+        filtered.append(issue)
+
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1220,7 @@ def build_snapshot(
     _pipeline_data: dict[str, Any] | None = None,
     _tmux_pool: TmuxPool | None = None,
     _preflight: dict[str, Any] | None = None,
+    _current_iteration: int = 0,
 ) -> dict[str, Any]:
     """Build the full snapshot dict.
 
@@ -1181,8 +1240,12 @@ def build_snapshot(
         repo_root, ci_health_check_enabled=cfg.ci_health_check_enabled
     )
 
-    # 2. Sort ready issues
+    # 2. Sort ready issues and filter by failure backoff
     ready_issues = sort_issues_by_strategy(pipeline["ready_issues"], cfg.issue_strategy)
+    failure_log = load_failure_log(repo_root)
+    ready_issues = filter_issues_by_failure_backoff(
+        ready_issues, failure_log, _current_iteration
+    )
     building_issues = pipeline["building_issues"]
     blocked_issues = pipeline["blocked_issues"]
     architect_proposals = pipeline["architect_proposals"]

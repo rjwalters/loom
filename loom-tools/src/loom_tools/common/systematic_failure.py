@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from loom_tools.common.config import env_int
+from loom_tools.common.issue_failures import record_failure as _record_persistent_failure
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.models.daemon_state import SystematicFailure
@@ -95,6 +96,18 @@ def record_blocked_reason(
     data["recent_failures"] = failures[-_MAX_RECENT_FAILURES:]
 
     write_json_file(state_file, data)
+
+    # Also write to persistent cross-session failure log
+    try:
+        _record_persistent_failure(
+            repo_root,
+            issue,
+            error_class=error_class,
+            phase=phase,
+            details=details,
+        )
+    except Exception:
+        logger.warning("Failed to write to persistent failure log for issue #%d", issue)
 
 
 def detect_systematic_failure(

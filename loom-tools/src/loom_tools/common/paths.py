@@ -41,6 +41,7 @@ class LoomPaths:
     STOP_SHEPHERDS_FILE = "stop-shepherds"
     RECOVERY_EVENTS_FILE = "recovery-events.json"
     BASELINE_HEALTH_FILE = "baseline-health.json"
+    ISSUE_FAILURES_FILE = "issue-failures.json"
 
     def __init__(self, repo_root: Path) -> None:
         """Initialize with repository root path.
@@ -134,6 +135,11 @@ class LoomPaths:
     def baseline_health_file(self) -> Path:
         """Path to .loom/baseline-health.json."""
         return self.loom_dir / self.BASELINE_HEALTH_FILE
+
+    @property
+    def issue_failures_file(self) -> Path:
+        """Path to .loom/issue-failures.json."""
+        return self.loom_dir / self.ISSUE_FAILURES_FILE
 
     @property
     def recovery_events_file(self) -> Path:
