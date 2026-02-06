@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from loom_tools.agent_spawn import kill_stuck_session, session_exists
 from loom_tools.common.config import env_bool, env_int
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
@@ -631,6 +632,74 @@ def handle_daemon_startup(
     log_success("Daemon startup cleanup complete")
 
 
+def _terminate_active_sessions(
+    state_path: pathlib.Path,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Terminate all active tmux sessions tracked in daemon state.
+
+    Kills shepherds first (they hold issue locks and may be mid-commit),
+    then support roles.  Uses graceful shutdown (Ctrl-C) before force-kill
+    via the existing ``kill_stuck_session()`` helper.
+    """
+    if not state_path.exists():
+        return
+
+    data = read_json_file(state_path)
+    if not isinstance(data, dict):
+        return
+
+    terminated = 0
+
+    # Kill shepherds first — they hold issue locks
+    shepherds = data.get("shepherds", {})
+    if isinstance(shepherds, dict):
+        for name, entry in shepherds.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") not in ("working", "errored"):
+                continue
+            if dry_run:
+                log_info(f"[DRY-RUN] Would terminate shepherd session: {name}")
+            elif session_exists(name):
+                log_info(f"Terminating shepherd session: {name}")
+                kill_stuck_session(name)
+                terminated += 1
+
+    # Then kill support roles
+    support_roles = data.get("support_roles", {})
+    if isinstance(support_roles, dict):
+        for role_name, entry in support_roles.items():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("status") not in ("running", "working"):
+                continue
+            # Support role entries may store their tmux session name;
+            # fall back to the role name itself.
+            tmux_session = entry.get("tmux_session", role_name)
+            # kill_stuck_session prepends SESSION_PREFIX, so strip it
+            # if the stored value already includes it.
+            session_name = (
+                tmux_session.removeprefix("loom-") if tmux_session else role_name
+            )
+            if dry_run:
+                log_info(
+                    f"[DRY-RUN] Would terminate support role session: {role_name}"
+                )
+            elif session_exists(session_name):
+                log_info(f"Terminating support role session: {role_name}")
+                kill_stuck_session(session_name)
+                terminated += 1
+
+    if dry_run:
+        log_info("[DRY-RUN] Would terminate all active tmux sessions")
+    elif terminated > 0:
+        log_success(f"Terminated {terminated} active tmux session(s)")
+    else:
+        log_info("No active tmux sessions to terminate")
+
+
 def handle_daemon_shutdown(
     repo_root: pathlib.Path,
     config: CleanupConfig,
@@ -647,7 +716,10 @@ def handle_daemon_shutdown(
         log_info("Archiving task outputs...")
         _run_archive_logs(repo_root, dry_run=dry_run)
 
-    # 2. Finalize daemon-state.json
+    # 2. Terminate all active tmux sessions
+    _terminate_active_sessions(state_path, dry_run=dry_run)
+
+    # 3. Finalize daemon-state.json
     if state_path.exists():
         log_info("Finalizing daemon-state.json...")
         stopped_at = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -688,7 +760,7 @@ def handle_daemon_shutdown(
                     f"daemon-state.json finalized (running=false, stopped_at={stopped_at})"
                 )
 
-    # 3. Run session reflection if available
+    # 4. Run session reflection if available
     for script_dir in [repo_root / "scripts", repo_root / ".loom" / "scripts"]:
         reflection = script_dir / "session-reflection.sh"
         if reflection.exists() and os.access(reflection, os.X_OK):
