@@ -956,16 +956,31 @@ class TestHealth:
         assert all(w["level"] == "info" for w in warnings)
 
     def test_ci_failing(self) -> None:
-        """CI failing generates a warning."""
+        """CI failing generates an info-level warning (degraded, not stalled)."""
         status, warnings = compute_health(
             ready_count=1, building_count=0, blocked_count=0,
             total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
             usage_healthy=True, session_percent=50.0,
             ci_status={"status": "failing", "failed_runs": ["CI"], "message": "CI failing on main"},
         )
+        assert status == "degraded"
+        ci_warn = [w for w in warnings if w["code"] == "ci_failing"]
+        assert len(ci_warn) == 1
+        assert ci_warn[0]["level"] == "info"
+        assert "CI failing" in ci_warn[0]["message"]
+
+    def test_ci_failing_with_warning_level_issue(self) -> None:
+        """ci_failing (info) + orphaned_issues (warning) → stalled."""
+        status, warnings = compute_health(
+            ready_count=1, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=2,
+            usage_healthy=True, session_percent=50.0,
+            ci_status={"status": "failing", "failed_runs": ["CI"], "message": "CI failing on main"},
+        )
         assert status == "stalled"
-        assert any(w["code"] == "ci_failing" for w in warnings)
-        assert any("CI failing" in w["message"] for w in warnings)
+        codes = {w["code"] for w in warnings}
+        assert "ci_failing" in codes
+        assert "orphaned_issues" in codes
 
     def test_ci_passing_no_warning(self) -> None:
         """CI passing does not generate a warning."""
