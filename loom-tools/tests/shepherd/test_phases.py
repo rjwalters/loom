@@ -24,8 +24,14 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import (
+    INSTANT_EXIT_BACKOFF_SECONDS,
+    INSTANT_EXIT_MAX_RETRIES,
+    INSTANT_EXIT_MIN_OUTPUT_CHARS,
+    INSTANT_EXIT_THRESHOLD_SECONDS,
+    _is_instant_exit,
     _print_heartbeat,
     _read_heartbeats,
+    run_phase_with_retry,
     run_worker_phase,
 )
 from loom_tools.shepherd.phases.judge import (
@@ -8816,3 +8822,360 @@ class TestDoctorCIWaiting:
         assert result["checks_passed"] == 2
         assert result["checks_failed"] == 0
         assert result["checks_pending"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Instant-exit detection tests (issue #2135)
+# ---------------------------------------------------------------------------
+
+
+class TestIsInstantExit:
+    """Test _is_instant_exit helper function."""
+
+    def test_no_log_file_returns_false(self, tmp_path: Path) -> None:
+        """Missing log file should not be flagged as instant exit."""
+        assert _is_instant_exit(tmp_path / "nonexistent.log") is False
+
+    def test_short_session_no_output_returns_true(self, tmp_path: Path) -> None:
+        """Log with <5s duration and minimal content is an instant exit."""
+        log = tmp_path / "session.log"
+        # Write only ANSI escape sequences (no meaningful content)
+        log.write_text("\x1b[?2026l\x1b[0m\n")
+        # File ctime and mtime will be nearly identical (0s apart)
+        assert _is_instant_exit(log) is True
+
+    def test_short_session_with_output_returns_false(self, tmp_path: Path) -> None:
+        """Log with <5s duration but meaningful content is NOT an instant exit."""
+        log = tmp_path / "session.log"
+        # Write enough meaningful content to exceed threshold
+        log.write_text("x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1))
+        assert _is_instant_exit(log) is False
+
+    def test_long_session_no_output_returns_false(self, tmp_path: Path) -> None:
+        """Log with >=5s duration but empty content is NOT an instant exit.
+
+        This tests that the duration check happens first (short-circuit).
+        """
+        import os
+
+        log = tmp_path / "session.log"
+        log.write_text("\x1b[?2026l")
+        # Fake a 10-second session by backdating the ctime via atime/mtime
+        stat = log.stat()
+        os.utime(log, (stat.st_atime, stat.st_mtime + 10))
+        assert _is_instant_exit(log) is False
+
+    def test_empty_log_returns_true(self, tmp_path: Path) -> None:
+        """Completely empty log with 0s duration is an instant exit."""
+        log = tmp_path / "session.log"
+        log.write_text("")
+        assert _is_instant_exit(log) is True
+
+
+class TestRunWorkerPhaseInstantExit:
+    """Test that run_worker_phase detects instant exits and returns code 6."""
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        return ctx
+
+    def test_instant_exit_returns_code_6(self, mock_context: MagicMock) -> None:
+        """When agent completes in <5s with no output, return exit code 6."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=True
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 6
+
+    def test_normal_completion_returns_code_0(self, mock_context: MagicMock) -> None:
+        """When agent completes normally, return exit code 0."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+
+    def test_non_zero_exit_skips_instant_exit_check(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit codes other than 0 should not trigger instant-exit detection."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 4  # Stuck
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit"
+            ) as mock_check,
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 4
+        mock_check.assert_not_called()
+
+
+class TestRunPhaseWithRetryInstantExit:
+    """Test that run_phase_with_retry retries on instant-exit (code 6)."""
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(
+            issue=42, task_id="test-123", stuck_max_retries=2
+        )
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        return ctx
+
+    def test_retries_on_instant_exit_then_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry on code 6 and return 0 when the retry succeeds."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # First call: instant exit; second call: success
+            return 6 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        # First backoff is 2 seconds
+        mock_sleep.assert_called_once_with(INSTANT_EXIT_BACKOFF_SECONDS[0])
+
+    def test_exhausts_retries_returns_code_6(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return 6 after exhausting all instant-exit retries."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=6,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 6
+
+    def test_retry_count_matches_constant(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry exactly INSTANT_EXIT_MAX_RETRIES times."""
+        call_count = 0
+
+        def count_calls(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=count_calls,
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # 1 initial call + INSTANT_EXIT_MAX_RETRIES retries
+        assert call_count == 1 + INSTANT_EXIT_MAX_RETRIES
+
+    def test_backoff_timing(self, mock_context: MagicMock) -> None:
+        """Should use exponential backoff from INSTANT_EXIT_BACKOFF_SECONDS."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=6,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # Verify backoff values for each retry
+        sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
+        assert sleep_values == INSTANT_EXIT_BACKOFF_SECONDS
+
+    def test_reports_error_and_heartbeat_milestones(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should report error milestone with will_retry and heartbeat milestone."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # Check that milestones were reported
+        milestone_calls = mock_context.report_milestone.call_args_list
+        # Should have: error milestone, then heartbeat milestone
+        assert len(milestone_calls) == 2
+        # First call: error with will_retry
+        assert milestone_calls[0].args[0] == "error"
+        assert milestone_calls[0].kwargs["will_retry"] is True
+        # Second call: heartbeat with retry info
+        assert milestone_calls[1].args[0] == "heartbeat"
+        assert "instant-exit" in milestone_calls[1].kwargs["action"]
+
+    def test_stuck_and_instant_exit_have_separate_counters(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Stuck retries (code 4) and instant-exit retries (code 6) are independent."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 6  # Instant exit
+            elif call_count == 2:
+                return 4  # Stuck
+            else:
+                return 0  # Success
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3

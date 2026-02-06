@@ -11,6 +11,8 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from loom_tools.common.logging import log_warning, strip_ansi
+from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_json_file
 
 if TYPE_CHECKING:
@@ -18,6 +20,20 @@ if TYPE_CHECKING:
 
 # How often (in seconds) to poll the progress file during agent-wait-bg.sh
 _HEARTBEAT_POLL_INTERVAL = 5
+
+# Minimum session duration (seconds) to consider a session as having run
+# successfully. Sessions shorter than this with no meaningful output are
+# treated as transient spawn failures (e.g., Claude API error on startup).
+# See issue #2135.
+INSTANT_EXIT_THRESHOLD_SECONDS = 5
+
+# Minimum characters of non-ANSI content required for "meaningful output".
+# Matches the threshold used in judge.py for consistency.
+INSTANT_EXIT_MIN_OUTPUT_CHARS = 100
+
+# Maximum retries for instant-exit detection, with exponential backoff.
+INSTANT_EXIT_MAX_RETRIES = 3
+INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
 
 
 class PhaseStatus(Enum):
@@ -258,6 +274,39 @@ def _print_heartbeat(action: str) -> None:
     print(f"\033[2m[{ts}] \u27f3 {action}\033[0m", file=sys.stderr)
 
 
+def _is_instant_exit(log_path: Path) -> bool:
+    """Check if a session log indicates an instant-exit (transient spawn failure).
+
+    A session is considered an instant exit when:
+    - The log file exists but is very short-lived (< INSTANT_EXIT_THRESHOLD_SECONDS)
+    - AND has no meaningful output (< INSTANT_EXIT_MIN_OUTPUT_CHARS non-ANSI chars)
+
+    This detects cases where the Claude CLI spawns but immediately exits due to
+    transient API errors, without producing any substantive work.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the session appears to be an instant exit.
+    """
+    if not log_path.is_file():
+        # No log file at all — could be spawn failure, not instant exit.
+        return False
+
+    try:
+        stat = log_path.stat()
+        duration = int(stat.st_mtime - stat.st_ctime)
+        if duration >= INSTANT_EXIT_THRESHOLD_SECONDS:
+            return False
+
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        return len(stripped.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+    except OSError:
+        return False
+
+
 def run_worker_phase(
     ctx: ShepherdContext,
     *,
@@ -286,11 +335,12 @@ def run_worker_phase(
         args: Optional arguments for the worker
 
     Returns:
-        Exit code from agent-wait-bg.sh:
+        Exit code from agent-wait-bg.sh (or synthetic):
         - 0: Success
         - 3: Shutdown signal
         - 4: Agent stuck after retry
         - 5: Failures are pre-existing (Doctor only)
+        - 6: Instant exit detected (session < 5s with no meaningful output)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir
@@ -396,6 +446,20 @@ def run_worker_phase(
         check=False,
     )
 
+    # Detect instant-exit: session completed (exit 0) but ran for < 5s with
+    # no meaningful output.  Return synthetic exit code 6 so the retry layer
+    # can handle it with backoff.  See issue #2135.
+    if wait_exit == 0:
+        paths = LoomPaths(ctx.repo_root)
+        log_path = paths.worker_log_file(role, ctx.config.issue)
+        if _is_instant_exit(log_path):
+            log_warning(
+                f"Instant-exit detected for {role} session '{name}': "
+                f"session completed in <{INSTANT_EXIT_THRESHOLD_SECONDS}s "
+                f"with no meaningful output (log: {log_path})"
+            )
+            return 6
+
     return wait_exit
 
 
@@ -411,14 +475,18 @@ def run_phase_with_retry(
     pr_number: int | None = None,
     args: str | None = None,
 ) -> int:
-    """Run a phase with automatic retry on stuck detection.
+    """Run a phase with automatic retry on stuck or instant-exit detection.
 
     On exit code 4 (stuck), retries up to max_retries times.
+    On exit code 6 (instant exit), retries up to INSTANT_EXIT_MAX_RETRIES
+    times with exponential backoff.
 
     Returns:
-        Exit code: 0=success, 3=shutdown, 4=stuck after retries, other=error
+        Exit code: 0=success, 3=shutdown, 4=stuck after retries,
+                   6=instant-exit after retries, other=error
     """
     stuck_retries = 0
+    instant_exit_retries = 0
 
     while True:
         exit_code = run_worker_phase(
@@ -432,8 +500,41 @@ def run_phase_with_retry(
             args=args,
         )
 
+        # --- Instant-exit handling (exit code 6) ---
+        if exit_code == 6:
+            instant_exit_retries += 1
+            if instant_exit_retries > INSTANT_EXIT_MAX_RETRIES:
+                log_warning(
+                    f"Instant-exit persisted for {role} after "
+                    f"{INSTANT_EXIT_MAX_RETRIES} retries"
+                )
+                return 6  # Caller should treat as failure
+
+            # Exponential backoff before retry
+            backoff_idx = min(
+                instant_exit_retries - 1, len(INSTANT_EXIT_BACKOFF_SECONDS) - 1
+            )
+            backoff = INSTANT_EXIT_BACKOFF_SECONDS[backoff_idx]
+
+            ctx.report_milestone(
+                "error",
+                error=f"instant-exit detected for {role}",
+                will_retry=True,
+            )
+            ctx.report_milestone(
+                "heartbeat",
+                action=(
+                    f"retrying instant-exit {role} "
+                    f"(attempt {instant_exit_retries}/{INSTANT_EXIT_MAX_RETRIES}, "
+                    f"backoff {backoff}s)"
+                ),
+            )
+
+            time.sleep(backoff)
+            continue
+
+        # --- Stuck handling (exit code 4) ---
         if exit_code != 4:
-            # Not stuck - return as-is
             return exit_code
 
         stuck_retries += 1
