@@ -239,6 +239,7 @@ class TestRunIterationIntegration:
             mock.patch("loom_tools.daemon_v2.iteration.read_daemon_state", return_value=state),
             mock.patch("loom_tools.daemon_v2.iteration.write_json_file"),
             mock.patch("loom_tools.daemon_v2.actions.completions._trigger_shepherd_cleanup"),
+            mock.patch("loom_tools.daemon_v2.iteration.force_reclaim_stale_shepherds", return_value=0),
         ):
             result = run_iteration(ctx)
 

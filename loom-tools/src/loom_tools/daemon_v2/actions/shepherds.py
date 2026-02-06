@@ -8,11 +8,16 @@ from typing import TYPE_CHECKING, Any
 from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
 from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
-from loom_tools.common.time_utils import now_utc
+from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
 from loom_tools.models.daemon_state import ShepherdEntry
 
 if TYPE_CHECKING:
     from loom_tools.daemon_v2.context import DaemonContext
+
+# Default grace period for newly spawned shepherds (seconds).
+# A shepherd that has been working longer than this without creating a
+# progress file is considered stuck.
+NO_PROGRESS_GRACE_PERIOD = 300  # 5 minutes
 
 
 def spawn_shepherds(ctx: DaemonContext) -> int:
@@ -231,6 +236,10 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
             log_warning(f"STALL-L2: {name} has stale heartbeat (task_id={entry.task_id})")
             is_stale = True
 
+        # Check 3: no progress file after grace period
+        if not is_stale and entry.started and entry.task_id:
+            is_stale = _check_no_progress_file(ctx, name, entry)
+
         if not is_stale:
             continue
 
@@ -263,6 +272,53 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         reclaimed += 1
 
     return reclaimed
+
+
+def _check_no_progress_file(
+    ctx: DaemonContext,
+    name: str,
+    entry: ShepherdEntry,
+) -> bool:
+    """Check if a working shepherd has no progress file past the grace period.
+
+    Returns True if the shepherd should be considered stale.
+    """
+    if entry.started is None or entry.task_id is None:
+        return False
+
+    now = now_utc()
+    try:
+        started_dt = parse_iso_timestamp(entry.started)
+        spawn_age = int((now - started_dt).total_seconds())
+    except (ValueError, OSError):
+        return False
+
+    if spawn_age < NO_PROGRESS_GRACE_PERIOD:
+        return False
+
+    # Check if a progress file exists for this shepherd's task_id
+    progress_file = ctx.repo_root / ".loom" / "progress" / f"shepherd-{entry.task_id}.json"
+    if not progress_file.exists():
+        # Also check snapshot progress data — the task_id in daemon-state is
+        # generated at spawn time and may not match the actual progress file
+        # name. Fall back to checking if *any* progress entry tracks this issue.
+        shepherd_progress = (
+            ctx.snapshot.get("shepherds", {}).get("progress", [])
+            if ctx.snapshot
+            else []
+        )
+        has_progress = any(
+            prog.get("issue") == entry.issue
+            for prog in shepherd_progress
+        )
+        if not has_progress:
+            log_warning(
+                f"WARN:no_progress_file {name} has no progress file "
+                f"after {spawn_age}s (task_id={entry.task_id}, issue=#{entry.issue})"
+            )
+            return True
+
+    return False
 
 
 def _extract_task_id(session_name: str) -> str | None:
