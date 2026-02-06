@@ -394,14 +394,14 @@ class TestHeartbeatStaleness:
     def test_grace_period_configurable_via_env(self) -> None:
         """Grace period configurable via LOOM_HEARTBEAT_GRACE_PERIOD env var."""
         from unittest import mock as _mock
-        with _mock.patch.dict("os.environ", {"LOOM_HEARTBEAT_GRACE_PERIOD": "600"}):
+        with _mock.patch.dict("os.environ", {"LOOM_HEARTBEAT_GRACE_PERIOD": "900"}):
             cfg = SnapshotConfig.from_env()
-        assert cfg.heartbeat_grace_period == 600
+        assert cfg.heartbeat_grace_period == 900
 
     def test_grace_period_default(self) -> None:
-        """Default grace period is 300 seconds."""
+        """Default grace period is 600 seconds."""
         cfg = SnapshotConfig()
-        assert cfg.heartbeat_grace_period == 300
+        assert cfg.heartbeat_grace_period == 600
 
     def test_grace_period_missing_started_at(self, tmp_path: pathlib.Path) -> None:
         """Missing started_at falls back to existing behavior (no grace period applied)."""

@@ -75,7 +75,7 @@ class SnapshotConfig:
     # CI health check configuration
     ci_health_check_enabled: bool = True  # Enable CI status monitoring
     # Heartbeat grace period for newly spawned shepherds
-    heartbeat_grace_period: int = 300  # 5 minutes
+    heartbeat_grace_period: int = 600  # 10 minutes
     # Spinning issue detection: auto-escalate after N review cycles
     spinning_review_threshold: int = 3
 

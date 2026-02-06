@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 # Default grace period for newly spawned shepherds (seconds).
 # A shepherd that has been working longer than this without creating a
 # progress file is considered stuck.
-NO_PROGRESS_GRACE_PERIOD = 300  # 5 minutes
+NO_PROGRESS_GRACE_PERIOD = 600  # 10 minutes
 
 
 def spawn_shepherds(ctx: DaemonContext) -> int:
