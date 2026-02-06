@@ -10,6 +10,7 @@ import sys
 import time
 from typing import Any
 
+from loom_tools.common.issue_failures import load_failure_log, merge_into_daemon_state
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.common.time_utils import now_utc
@@ -288,6 +289,8 @@ def _init_state_file(ctx: DaemonContext) -> None:
                 data["iteration"] = 0
                 data["daemon_session_id"] = ctx.session_id
                 data["execution_mode"] = "direct"
+                # Merge persistent failure history into existing state
+                _merge_persistent_failures(ctx, data)
                 write_json_file(ctx.state_file, data)
                 return
         except Exception:
@@ -316,7 +319,32 @@ def _init_state_file(ctx: DaemonContext) -> None:
         "recent_failures": [],
     }
     ctx.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Merge persistent failure history into fresh state
+    _merge_persistent_failures(ctx, data)
+
     write_json_file(ctx.state_file, data)
+
+
+def _merge_persistent_failures(ctx: DaemonContext, data: dict) -> None:
+    """Merge persistent failure log into daemon state on startup.
+
+    Loads .loom/issue-failures.json and merges failure counts into
+    blocked_issue_retries so cross-session failure history is preserved.
+    """
+    try:
+        failure_log = load_failure_log(ctx.repo_root)
+        if failure_log.entries:
+            retries = data.get("blocked_issue_retries", {})
+            data["blocked_issue_retries"] = merge_into_daemon_state(
+                ctx.repo_root, retries
+            )
+            log_info(
+                f"Merged {len(failure_log.entries)} persistent failure entries "
+                f"into daemon state"
+            )
+    except Exception as e:
+        log_warning(f"Failed to merge persistent failure log: {e}")
 
 
 def _init_metrics_file(ctx: DaemonContext) -> None:
