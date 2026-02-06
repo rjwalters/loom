@@ -513,13 +513,13 @@ def spawn_agent(
         log_error(f"Failed to create tmux session: {session_name}")
         return SpawnResult(status="error", name=name, error="session_create_failed")
 
-    # Set up output capture via pipe-pane with ANSI stripping
-    # The sed command removes:
-    # - Standard ANSI escape sequences: ESC[...m (colors, cursor, etc.)
-    # - Terminal mode queries: ESC[?...h/l (like ?2026h/l)
-    # - OSC sequences: ESC]...BEL (title setting, etc.)
+    # Set up output capture via pipe-pane with Python log filter
+    # The Python filter handles ANSI stripping, CR processing,
+    # blank line suppression, and duplicate line collapsing.
+    # Falls back to basic sed stripping if Python filter is unavailable.
     strip_ansi_cmd = (
-        f"sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; "
+        f"python3 -m loom_tools.log_filter >> '{log_file}' 2>/dev/null "
+        f"|| sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; "
         f"s/\\x1b\\][^\\x07]*\\x07//g' "
         f">> '{log_file}'"
     )
