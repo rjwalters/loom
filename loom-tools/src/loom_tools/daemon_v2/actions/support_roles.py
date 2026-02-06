@@ -30,6 +30,7 @@ def spawn_support_role(
     role: str,
     *,
     demand: bool = False,
+    target_pr: int | None = None,
 ) -> bool:
     """Spawn a support role.
 
@@ -37,6 +38,7 @@ def spawn_support_role(
         ctx: Daemon context
         role: Role name (guide, champion, doctor, etc.)
         demand: True if this is a demand-based spawn (vs interval)
+        target_pr: Optional PR number to target (e.g., ``/doctor 123``)
 
     Returns True if spawned successfully.
     """
@@ -55,6 +57,8 @@ def spawn_support_role(
 
     timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
     spawn_reason = "demand" if demand else "interval"
+    if target_pr:
+        spawn_reason = f"targeted(PR #{target_pr})"
     log_info(f"Spawning support role {role} ({spawn_reason})")
 
     # Kill existing session if it exists (may be stuck)
@@ -64,7 +68,9 @@ def spawn_support_role(
 
     # Build args
     args = ""
-    if ctx.config.force_mode and role in ("champion",):
+    if target_pr:
+        args = str(target_pr)
+    elif ctx.config.force_mode and role in ("champion",):
         args = "--force"
 
     # Spawn the role
@@ -93,6 +99,14 @@ def spawn_support_role(
     return True
 
 
+def _get_first_targeted_pr(ctx: DaemonContext, key: str) -> int | None:
+    """Get the first targeted PR number from the snapshot's computed section."""
+    if ctx.snapshot is None:
+        return None
+    prs = ctx.snapshot.get("computed", {}).get(key, [])
+    return prs[0] if prs else None
+
+
 def spawn_roles_from_actions(ctx: DaemonContext) -> int:
     """Spawn support roles based on recommended actions from snapshot.
 
@@ -102,15 +116,25 @@ def spawn_roles_from_actions(ctx: DaemonContext) -> int:
     spawned = 0
 
     # Demand-based triggers (higher priority)
+    # Targeted dispatch takes precedence: if orphaned PRs exist, the
+    # snapshot generates ``spawn_*_targeted`` instead of ``spawn_*_demand``.
     if "spawn_champion_demand" in actions:
         if spawn_support_role(ctx, "champion", demand=True):
             spawned += 1
 
-    if "spawn_doctor_demand" in actions:
+    if "spawn_doctor_targeted" in actions:
+        pr = _get_first_targeted_pr(ctx, "doctor_targeted_prs")
+        if spawn_support_role(ctx, "doctor", demand=True, target_pr=pr):
+            spawned += 1
+    elif "spawn_doctor_demand" in actions:
         if spawn_support_role(ctx, "doctor", demand=True):
             spawned += 1
 
-    if "spawn_judge_demand" in actions:
+    if "spawn_judge_targeted" in actions:
+        pr = _get_first_targeted_pr(ctx, "judge_targeted_prs")
+        if spawn_support_role(ctx, "judge", demand=True, target_pr=pr):
+            spawned += 1
+    elif "spawn_judge_demand" in actions:
         if spawn_support_role(ctx, "judge", demand=True):
             spawned += 1
 
@@ -123,7 +147,7 @@ def spawn_roles_from_actions(ctx: DaemonContext) -> int:
         if spawn_support_role(ctx, "champion"):
             spawned += 1
 
-    if "trigger_doctor" in actions and "spawn_doctor_demand" not in actions:
+    if "trigger_doctor" in actions and "spawn_doctor_demand" not in actions and "spawn_doctor_targeted" not in actions:
         if spawn_support_role(ctx, "doctor"):
             spawned += 1
 
@@ -131,7 +155,7 @@ def spawn_roles_from_actions(ctx: DaemonContext) -> int:
         if spawn_support_role(ctx, "auditor"):
             spawned += 1
 
-    if "trigger_judge" in actions and "spawn_judge_demand" not in actions:
+    if "trigger_judge" in actions and "spawn_judge_demand" not in actions and "spawn_judge_targeted" not in actions:
         if spawn_support_role(ctx, "judge"):
             spawned += 1
 

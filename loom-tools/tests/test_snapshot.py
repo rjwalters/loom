@@ -20,6 +20,7 @@ from loom_tools.models.daemon_state import (
 SystematicFailure = SystematicFailureModel
 from loom_tools.snapshot import (
     EnhancedProgress,
+    OrphanedPR,
     PipelineHealth,
     SnapshotConfig,
     SupportRoleState,
@@ -32,6 +33,7 @@ from loom_tools.snapshot import (
     compute_shepherd_progress,
     compute_support_role_state,
     compute_systematic_failure_state,
+    detect_orphaned_prs,
     detect_orphaned_shepherds,
     detect_tmux_pool,
     main,
