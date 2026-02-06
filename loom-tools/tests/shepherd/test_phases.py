@@ -4015,6 +4015,68 @@ class TestJudgePhase:
         assert mock_validate.call_count == 1
         mock_sleep.assert_not_called()
 
+    def test_exit_code_6_instant_exit_marks_blocked(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 (instant-exit after retries) should mark issue blocked and return FAILED.
+
+        When run_phase_with_retry returns exit code 6, the judge should:
+        - Mark the issue as blocked with error_class 'judge_instant_exit'
+        - Return PhaseStatus.FAILED with instant_exit data
+        - NOT proceed to validation (no label checks needed)
+        See issue #2139.
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+
+        judge = JudgePhase()
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6
+            ),
+            patch.object(judge, "_mark_issue_blocked") as mock_blocked,
+            patch.object(judge, "validate") as mock_validate,
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "instant-exit" in result.message
+        assert result.data == {"instant_exit": True}
+        mock_blocked.assert_called_once_with(
+            mock_context, "judge_instant_exit", "agent instant-exit after retry"
+        )
+        # Validation should NOT be called — exit code 6 short-circuits
+        mock_validate.assert_not_called()
+
+    def test_exit_code_6_in_force_mode_skips_fallback(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 6 in force mode should still mark blocked, not attempt fallback.
+
+        Instant-exit means no comments exist, so fallback detection would be
+        pointless. The handler should return immediately.
+        See issue #2139.
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+
+        judge = JudgePhase()
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=6
+            ),
+            patch.object(judge, "_mark_issue_blocked") as mock_blocked,
+            patch.object(judge, "_try_fallback_approval") as mock_fallback,
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data == {"instant_exit": True}
+        mock_blocked.assert_called_once()
+        # Fallback should NOT be attempted for instant-exit
+        mock_fallback.assert_not_called()
+
 
 class TestJudgeFallbackApproval:
     """Test force-mode fallback approval detection in JudgePhase."""

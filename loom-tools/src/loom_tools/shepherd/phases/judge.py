@@ -148,6 +148,18 @@ class JudgePhase:
                 phase_name="judge",
             )
 
+        if exit_code == 6:
+            # Instant-exit: CLI sessions exited in <5s with no output after retries
+            self._mark_issue_blocked(
+                ctx, "judge_instant_exit", "agent instant-exit after retry"
+            )
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="judge instant-exit after retry (CLI sessions exited in <5s with no output)",
+                phase_name="judge",
+                data={"instant_exit": True},
+            )
+
         # Invalidate caches BEFORE validation so the first attempt
         # fetches fresh data instead of stale cached labels.
         ctx.label_cache.invalidate_pr(ctx.pr_number)
