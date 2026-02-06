@@ -6702,23 +6702,38 @@ class TestBuilderStaleWorktreeRecovery:
 class TestBuilderDirectCompletion:
     """Test _direct_completion for mechanical fallback operations."""
 
-    def test_push_only(self, mock_context: MagicMock) -> None:
-        """Should push branch directly when that's the only step."""
+    def test_push_and_create_pr(self, mock_context: MagicMock) -> None:
+        """Should push and create PR directly when both steps remain."""
         builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
         diag = {
             "has_uncommitted_changes": False,
             "commits_ahead": 2,
             "remote_branch_exists": False,
             "pr_number": None,
             "pr_has_review_label": False,
+            "branch": "feature/issue-42",
         }
 
-        with patch.object(builder, "_push_branch", return_value=True):
-            # push_branch is mechanical but create_pr is not
+        with (
+            patch.object(builder, "_push_branch", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
             result = builder._direct_completion(mock_context, diag)
 
-        # Should return False because "create_pr" is not mechanical
-        assert result is False
+        assert result is True
+        # Verify gh pr create was called
+        call_args = mock_run.call_args[0][0]
+        assert call_args[:3] == ["gh", "pr", "create"]
+        assert "--head" in call_args
+        assert "feature/issue-42" in call_args
+        assert "--label" in call_args
+        assert "loom:review-requested" in call_args
+        assert "--body" in call_args
+        assert "Closes #42" in call_args
 
     def test_add_label_only(self, mock_context: MagicMock) -> None:
         """Should add label directly when that's the only step."""
@@ -6785,6 +6800,125 @@ class TestBuilderDirectCompletion:
             "remote_branch_exists": True,
             "pr_number": 100,
             "pr_has_review_label": True,
+        }
+        result = builder._direct_completion(mock_context, diag)
+        assert result is False
+
+    def test_create_pr_only(self, mock_context: MagicMock) -> None:
+        """Should create PR directly when remote exists but no PR."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        call_args = mock_run.call_args[0][0]
+        assert call_args[:3] == ["gh", "pr", "create"]
+        assert "--head" in call_args
+        assert "feature/issue-42" in call_args
+        assert "--title" in call_args
+        assert "Issue #42" in call_args
+        assert "--label" in call_args
+        assert "loom:review-requested" in call_args
+        assert "--body" in call_args
+        assert "Closes #42" in call_args
+
+    def test_create_pr_failure_returns_false(self, mock_context: MagicMock) -> None:
+        """Should return False when gh pr create fails."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stderr="GraphQL: error"
+            )
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is False
+
+    def test_create_pr_uses_branch_from_diagnostics(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should use the branch name from diagnostics, not a hardcoded one."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=99)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "custom/my-branch",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            builder._direct_completion(mock_context, diag)
+
+        call_args = mock_run.call_args[0][0]
+        assert "custom/my-branch" in call_args
+
+    def test_create_pr_fallback_branch_name(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should fall back to NamingConventions when branch is missing from diag."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.config = ShepherdConfig(issue=55)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            # No "branch" key — should fallback
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            builder._direct_completion(mock_context, diag)
+
+        call_args = mock_run.call_args[0][0]
+        assert "feature/issue-55" in call_args
+
+    def test_stage_and_commit_with_create_pr_returns_false(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Multi-step with non-mechanical stage_and_commit should fall through."""
+        builder = BuilderPhase()
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
         }
         result = builder._direct_completion(mock_context, diag)
         assert result is False

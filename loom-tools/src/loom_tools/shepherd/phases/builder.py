@@ -358,12 +358,14 @@ class BuilderPhase:
                     data={"diagnostics": diag, "completion_attempts": completion_attempts},
                 )
 
-            if completion_attempts >= max_completion_attempts:
-                # Retries exhausted — try direct fallback for mechanical ops
-                if self._direct_completion(ctx, diag):
-                    log_success("Direct completion succeeded")
-                    continue  # Re-validate
+            # Try direct completion first — avoids spawning an LLM agent
+            # when only mechanical steps (push, create_pr, add label) remain.
+            if self._direct_completion(ctx, diag):
+                log_success("Direct completion succeeded")
+                continue  # Re-validate
 
+            if completion_attempts >= max_completion_attempts:
+                # Retries exhausted and direct completion couldn't handle it
                 self._cleanup_stale_worktree(ctx)
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
@@ -2239,13 +2241,14 @@ class BuilderPhase:
     ) -> bool:
         """Attempt to complete mechanical operations directly in Python.
 
-        Handles simple operations (push branch, add label) without spawning
-        a full agent. Returns True if all remaining steps were completed.
+        Handles simple operations (push branch, create PR, add label) without
+        spawning a full agent. Returns True if all remaining steps were
+        completed.
         """
         steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
 
         # Only handle purely mechanical steps directly
-        mechanical_steps = {"push_branch", "add_review_label"}
+        mechanical_steps = {"push_branch", "add_review_label", "create_pr"}
         if not steps or not set(steps).issubset(mechanical_steps):
             return False
 
@@ -2260,6 +2263,40 @@ class BuilderPhase:
                     log_warning("Direct completion: push failed")
                     return False
                 log_success("Direct completion: branch pushed")
+
+            elif step == "create_pr":
+                branch = diag.get(
+                    "branch",
+                    NamingConventions.branch_name(ctx.config.issue),
+                )
+                result = subprocess.run(
+                    [
+                        "gh",
+                        "pr",
+                        "create",
+                        "--head",
+                        branch,
+                        "--title",
+                        f"Issue #{ctx.config.issue}",
+                        "--label",
+                        "loom:review-requested",
+                        "--body",
+                        f"Closes #{ctx.config.issue}",
+                    ],
+                    cwd=ctx.repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    log_warning(
+                        f"Direct completion: gh pr create failed: "
+                        f"{result.stderr.strip()[:200]}"
+                    )
+                    return False
+                log_success(
+                    f"Direct completion: PR created for issue #{ctx.config.issue}"
+                )
 
             elif step == "add_review_label":
                 pr_num = diag.get("pr_number")
