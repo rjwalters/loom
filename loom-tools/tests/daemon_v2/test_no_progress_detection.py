@@ -168,7 +168,7 @@ class TestCheckNoProgressFile:
 
     def test_grace_period_constant(self) -> None:
         """Verify the grace period constant matches the expected value."""
-        assert NO_PROGRESS_GRACE_PERIOD == 300
+        assert NO_PROGRESS_GRACE_PERIOD == 600
 
 
 class TestForceReclaimNoProgress:

@@ -75,7 +75,7 @@ class SnapshotConfig:
     # CI health check configuration
     ci_health_check_enabled: bool = True  # Enable CI status monitoring
     # Heartbeat grace period for newly spawned shepherds
-    heartbeat_grace_period: int = 300  # 5 minutes
+    heartbeat_grace_period: int = 600  # 10 minutes
     # Spinning issue detection: auto-escalate after N review cycles
     spinning_review_threshold: int = 3
 
@@ -111,7 +111,7 @@ class SnapshotConfig:
             systematic_failure_cooldown=_int("LOOM_SYSTEMATIC_FAILURE_COOLDOWN", 1800),
             systematic_failure_max_probes=_int("LOOM_SYSTEMATIC_FAILURE_MAX_PROBES", 3),
             ci_health_check_enabled=os.environ.get("LOOM_CI_HEALTH_CHECK", "true").lower() not in ("false", "0", "no"),
-            heartbeat_grace_period=_int("LOOM_HEARTBEAT_GRACE_PERIOD", 300),
+            heartbeat_grace_period=_int("LOOM_HEARTBEAT_GRACE_PERIOD", 600),
             spinning_review_threshold=_int("LOOM_SPINNING_REVIEW_THRESHOLD", 3),
         )
 
