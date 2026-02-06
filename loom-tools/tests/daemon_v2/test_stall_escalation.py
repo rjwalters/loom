@@ -353,6 +353,15 @@ class TestEscalateLevel3:
         _escalate_level_3(ctx)  # Should not raise
 
     @patch("loom_tools.daemon_v2.iteration.kill_stuck_session")
+    @patch("loom_tools.daemon_v2.iteration.session_exists", return_value=False)
+    def test_resets_stall_counter(self, mock_exists, mock_kill):
+        """Level 3 should reset consecutive_stalled to 0 after execution."""
+        ctx = _make_ctx(stalled=10)
+        ctx.state = DaemonState()
+        _escalate_level_3(ctx)
+        assert ctx.consecutive_stalled == 0
+
+    @patch("loom_tools.daemon_v2.iteration.kill_stuck_session")
     @patch("loom_tools.daemon_v2.iteration.session_exists", return_value=True)
     def test_reverts_issue_labels(self, mock_exists, mock_kill):
         """Level 3 should revert issue labels for reclaimed shepherds."""

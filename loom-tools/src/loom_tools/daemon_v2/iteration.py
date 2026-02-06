@@ -351,3 +351,5 @@ def _escalate_level_3(ctx: DaemonContext) -> None:
             log_info(f"STALL-L3: Cleared {cleared} stale progress file(s)")
 
     log_success(f"STALL-L3: Pool restart complete - killed {killed} session(s)")
+
+    ctx.consecutive_stalled = 0
