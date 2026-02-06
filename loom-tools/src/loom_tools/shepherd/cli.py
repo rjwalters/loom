@@ -170,6 +170,22 @@ EXAMPLES:
     return parser.parse_args(argv)
 
 
+def _is_loom_runtime(porcelain_line: str) -> bool:
+    """Check if a git status porcelain line refers to a .loom/ runtime file.
+
+    Args:
+        porcelain_line: A line from ``git status --porcelain``, e.g. ``"?? .loom/daemon-state.json"``
+
+    Returns:
+        True if the file path starts with ``.loom/``
+    """
+    # Format: "XY filename" or "XY filename -> renamed"
+    path = porcelain_line[3:] if len(porcelain_line) > 3 else ""
+    if " -> " in path:
+        path = path.split(" -> ")[-1]  # Use destination for renames
+    return path.startswith(".loom/")
+
+
 def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
     """Check if main repository has uncommitted changes and warn.
 
@@ -178,6 +194,8 @@ def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
     - Running tests from a worktree (clean checkout at HEAD)
 
     This check warns users about this potential source of confusion.
+    Files under ``.loom/`` are filtered out since they are runtime artifacts,
+    not source code.
 
     Args:
         repo_root: The resolved repository root path
@@ -187,6 +205,8 @@ def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
         True if clean or allowed to proceed, False if dirty and should block
     """
     uncommitted = get_uncommitted_files(cwd=repo_root)
+    # Filter out .loom/ runtime files - these are never source code
+    uncommitted = [f for f in uncommitted if not _is_loom_runtime(f)]
     if not uncommitted:
         return True
 
