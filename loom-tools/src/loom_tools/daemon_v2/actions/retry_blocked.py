@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 
 from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_info, log_warning
-from loom_tools.common.state import read_json_file, write_json_file
 from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import BlockedIssueRetry
 
