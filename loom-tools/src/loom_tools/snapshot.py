@@ -1201,7 +1201,7 @@ def build_snapshot(
         orphaned_prs=orphaned_prs,
     )
 
-    # 15. Promotable proposals
+    # 16. Promotable proposals
     promotable_proposals = (
         [i["number"] for i in architect_proposals]
         + [i["number"] for i in hermit_proposals]
