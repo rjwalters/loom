@@ -83,7 +83,13 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
             0, ctx.config.max_shepherds - active_shepherds
         )
 
-    # 4. Get recommended actions
+    # 4. Proactive stale shepherd reclaim (every iteration)
+    #    Detects shepherds with dead tmux sessions, stale heartbeats, or
+    #    missing progress files. Runs before action planning so reclaimed
+    #    slots are available for new spawns.
+    _reclaim_stale_shepherds(ctx)
+
+    # 5. Get recommended actions
     actions = ctx.get_recommended_actions()
     if ctx.config.debug_mode:
         log_info(f"Recommended actions: {actions}")
@@ -92,7 +98,7 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     result = IterationResult(status="success", summary="")
     result.completions_handled = len(completions)
 
-    # 5. Execute actions based on recommendations
+    # 6. Execute actions based on recommendations
 
     # Promote proposals (force mode only)
     if "promote_proposals" in actions and ctx.config.force_mode:
@@ -113,16 +119,45 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
         except Exception as e:
             log_warning(f"Orphan recovery failed: {e}")
 
-    # 6. Stall escalation
+    # 7. Stall escalation
     _update_stall_counter(ctx, result)
 
-    # 7. Save state
+    # 8. Save state
     _save_daemon_state(ctx)
 
-    # 8. Build summary
+    # 9. Build summary
     result.summary = _build_summary(ctx, result)
 
     return result
+
+
+def _reclaim_stale_shepherds(ctx: DaemonContext) -> None:
+    """Proactively reclaim stale shepherds every iteration.
+
+    Runs force_reclaim_stale_shepherds when any shepherd is in "working"
+    status. This catches shepherds with dead sessions, stale heartbeats,
+    or missing progress files without waiting for stall escalation.
+    """
+    if ctx.state is None or ctx.snapshot is None:
+        return
+
+    has_working = any(
+        e.status == "working" for e in ctx.state.shepherds.values()
+    )
+    if not has_working:
+        return
+
+    reclaimed = force_reclaim_stale_shepherds(ctx)
+    if reclaimed > 0:
+        log_success(f"Proactive reclaim: freed {reclaimed} stale shepherd(s)")
+        # Recompute active shepherd count after reclaim
+        active_shepherds = sum(
+            1 for e in ctx.state.shepherds.values() if e.status == "working"
+        )
+        ctx.snapshot["computed"]["active_shepherds"] = active_shepherds
+        ctx.snapshot["computed"]["available_shepherd_slots"] = max(
+            0, ctx.config.max_shepherds - active_shepherds
+        )
 
 
 def _save_daemon_state(ctx: DaemonContext) -> None:
