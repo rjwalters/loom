@@ -4,8 +4,10 @@ Validates that loom-shepherd.sh correctly detects unmerged files (merge
 conflicts) and exits with a clear error message before attempting to run
 the Python shepherd implementation.
 
+Also tests the Python-level dirty-repo check that filters .loom/ runtime files.
+
 Script path: defaults/scripts/loom-shepherd.sh
-Related issue: #1747
+Related issues: #1747, #2129
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ from __future__ import annotations
 import pathlib
 import re
 import subprocess
+from unittest.mock import patch
 
 
 SCRIPT_REL_PATH = "defaults/scripts/loom-shepherd.sh"
@@ -257,3 +260,96 @@ class TestCleanRepository:
         (repo / "untracked.py").write_text("content\n")
         result = _run_preflight_snippet(repo)
         assert result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
+# Python-level dirty-repo check tests (issue #2129)
+# ---------------------------------------------------------------------------
+
+from loom_tools.shepherd.cli import _check_main_repo_clean, _is_loom_runtime
+
+
+class TestIsLoomRuntime:
+    """Unit tests for _is_loom_runtime helper."""
+
+    def test_untracked_loom_file(self) -> None:
+        assert _is_loom_runtime("?? .loom/daemon-state.json") is True
+
+    def test_modified_loom_file(self) -> None:
+        assert _is_loom_runtime(" M .loom/config.json") is True
+
+    def test_added_loom_file(self) -> None:
+        assert _is_loom_runtime("A  .loom/progress/shepherd-abc.json") is True
+
+    def test_regular_source_file(self) -> None:
+        assert _is_loom_runtime(" M src/main.py") is False
+
+    def test_untracked_source_file(self) -> None:
+        assert _is_loom_runtime("?? new_file.py") is False
+
+    def test_rename_into_loom(self) -> None:
+        assert _is_loom_runtime("R  old.json -> .loom/new.json") is True
+
+    def test_rename_out_of_loom(self) -> None:
+        assert _is_loom_runtime("R  .loom/old.json -> new.json") is False
+
+    def test_loom_prefix_not_in_dir(self) -> None:
+        """Files named .loom-something (not in .loom/) should NOT be filtered."""
+        assert _is_loom_runtime("?? .loom-config") is False
+
+    def test_short_line(self) -> None:
+        """Handles pathologically short lines without crashing."""
+        assert _is_loom_runtime("??") is False
+
+    def test_node_modules_not_filtered(self) -> None:
+        assert _is_loom_runtime("?? node_modules") is False
+
+
+class TestCheckMainRepoCleanLoomFiltering:
+    """Tests that _check_main_repo_clean filters .loom/ runtime files."""
+
+    def _mock_uncommitted(self, files: list[str]):
+        """Return a patch that makes get_uncommitted_files return *files*."""
+        return patch(
+            "loom_tools.shepherd.cli.get_uncommitted_files",
+            return_value=files,
+        )
+
+    def test_only_loom_files_is_clean(self) -> None:
+        """Only .loom/ files -> repo treated as clean."""
+        with self._mock_uncommitted(
+            ["?? .loom/daemon-state.json", "?? .loom/progress/foo.json"]
+        ):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is True
+
+    def test_only_source_files_is_dirty(self) -> None:
+        """Only source files -> repo treated as dirty."""
+        with self._mock_uncommitted([" M src/main.py"]):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is False
+
+    def test_mix_filters_loom_shows_source(self) -> None:
+        """Mix of .loom/ and source files -> dirty, only source files reported."""
+        with self._mock_uncommitted(
+            ["?? .loom/daemon-state.json", " M src/main.py", "?? .loom/config.json"]
+        ):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is False
+
+    def test_empty_list_is_clean(self) -> None:
+        """No uncommitted files -> clean."""
+        with self._mock_uncommitted([]):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is True
+
+    def test_allow_dirty_with_source_files(self) -> None:
+        """With allow_dirty=True, source files still return True."""
+        with self._mock_uncommitted([" M src/main.py"]):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=True) is True
+
+    def test_allow_dirty_with_loom_files(self) -> None:
+        """With allow_dirty=True and only .loom/ files -> clean (filtered before allow_dirty)."""
+        with self._mock_uncommitted(["?? .loom/daemon-state.json"]):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=True) is True
+
+    def test_dot_loom_prefix_file_not_filtered(self) -> None:
+        """A file named .loom-config (not in .loom/) should NOT be filtered."""
+        with self._mock_uncommitted(["?? .loom-config"]):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is False
