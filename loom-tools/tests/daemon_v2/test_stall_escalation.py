@@ -18,7 +18,7 @@ from loom_tools.daemon_v2.iteration import (
     _iteration_made_progress,
     _update_stall_counter,
 )
-from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
+from loom_tools.models.daemon_state import DaemonState, RecentFailure, ShepherdEntry, SystematicFailure
 
 
 def _make_ctx(
@@ -360,6 +360,41 @@ class TestEscalateLevel3:
         ctx.state = DaemonState()
         _escalate_level_3(ctx)
         assert ctx.consecutive_stalled == 0
+
+    @patch("loom_tools.daemon_v2.iteration.kill_stuck_session")
+    @patch("loom_tools.daemon_v2.iteration.session_exists", return_value=False)
+    def test_clears_systematic_failure(self, mock_exists, mock_kill):
+        """Level 3 should clear systematic_failure and recent_failures."""
+        ctx = _make_ctx(stalled=10)
+        ctx.state = DaemonState()
+        ctx.state.systematic_failure = SystematicFailure(
+            active=True,
+            pattern="judge_no_review",
+            count=3,
+            detected_at="2026-01-25T10:00:00Z",
+        )
+        ctx.state.recent_failures = [
+            RecentFailure(issue=42, error_class="judge_no_review", phase="judge"),
+            RecentFailure(issue=43, error_class="judge_no_review", phase="judge"),
+            RecentFailure(issue=44, error_class="judge_no_review", phase="judge"),
+        ]
+
+        _escalate_level_3(ctx)
+
+        assert ctx.state.systematic_failure.active is False
+        assert ctx.state.systematic_failure.pattern == ""
+        assert ctx.state.systematic_failure.count == 0
+        assert ctx.state.recent_failures == []
+
+    @patch("loom_tools.daemon_v2.iteration.kill_stuck_session")
+    @patch("loom_tools.daemon_v2.iteration.session_exists", return_value=False)
+    def test_no_crash_without_systematic_failure(self, mock_exists, mock_kill):
+        """Level 3 should not crash when systematic failure is already inactive."""
+        ctx = _make_ctx(stalled=10)
+        ctx.state = DaemonState()
+        # systematic_failure defaults to inactive — should not crash
+        _escalate_level_3(ctx)
+        assert ctx.state.systematic_failure.active is False
 
     @patch("loom_tools.daemon_v2.iteration.kill_stuck_session")
     @patch("loom_tools.daemon_v2.iteration.session_exists", return_value=True)
