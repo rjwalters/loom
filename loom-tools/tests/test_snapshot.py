@@ -403,6 +403,11 @@ class TestHeartbeatStaleness:
         cfg = SnapshotConfig()
         assert cfg.heartbeat_grace_period == 600
 
+    def test_grace_period_default_from_env(self) -> None:
+        """Default grace period via from_env() is 600 seconds."""
+        cfg = SnapshotConfig.from_env()
+        assert cfg.heartbeat_grace_period == 600
+
     def test_grace_period_missing_started_at(self, tmp_path: pathlib.Path) -> None:
         """Missing started_at falls back to existing behavior (no grace period applied)."""
         progress_dir = tmp_path / ".loom" / "progress"
