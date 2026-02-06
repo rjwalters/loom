@@ -14,6 +14,7 @@ import pytest
 from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
     _check_main_repo_clean,
+    _is_loom_runtime,
     _create_config,
     _format_diagnostics_for_comment,
     _format_diagnostics_for_log,
@@ -351,6 +352,37 @@ class TestMain:
             assert result == 0
 
 
+class TestIsLoomRuntime:
+    """Tests for _is_loom_runtime filter (issue #2158)."""
+
+    def test_loom_directory_files(self) -> None:
+        """Should match files under .loom/ directory."""
+        assert _is_loom_runtime("?? .loom/daemon-state.json") is True
+        assert _is_loom_runtime("M  .loom/state.json") is True
+        assert _is_loom_runtime("?? .loom/logs/agent.log") is True
+
+    def test_loom_dash_root_files(self) -> None:
+        """Should match .loom-* root-level files like .loom-checkpoint."""
+        assert _is_loom_runtime("?? .loom-checkpoint") is True
+        assert _is_loom_runtime("M  .loom-in-use") is True
+
+    def test_non_loom_files(self) -> None:
+        """Should NOT match regular source files."""
+        assert _is_loom_runtime("M  src/main.py") is False
+        assert _is_loom_runtime("?? README.md") is False
+        assert _is_loom_runtime("M  .github/workflows/ci.yml") is False
+
+    def test_rename_uses_destination(self) -> None:
+        """Should use destination path for renames."""
+        assert _is_loom_runtime("R  old.txt -> .loom/new.txt") is True
+        assert _is_loom_runtime("R  .loom/old.txt -> src/new.txt") is False
+
+    def test_empty_and_short_lines(self) -> None:
+        """Should handle edge cases gracefully."""
+        assert _is_loom_runtime("") is False
+        assert _is_loom_runtime("M ") is False
+
+
 class TestCheckMainRepoClean:
     """Tests for _check_main_repo_clean pre-flight check (issue #1996)."""
 
@@ -389,6 +421,20 @@ class TestCheckMainRepoClean:
             # Just check it doesn't crash with many files
             result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=True)
             assert result is True
+
+    def test_filters_loom_checkpoint_file(self) -> None:
+        """Should treat .loom-checkpoint as clean (issue #2158)."""
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=["?? .loom-checkpoint"]):
+            result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=False)
+            assert result is True
+
+    def test_filters_loom_runtime_but_keeps_source_changes(self) -> None:
+        """Should filter .loom/ files but still detect real source changes."""
+        files = ["?? .loom/daemon-state.json", "?? .loom-checkpoint", "M  src/main.py"]
+        with patch("loom_tools.shepherd.cli.get_uncommitted_files", return_value=files), \
+             patch("loom_tools.shepherd.cli.log_warning"):
+            result = _check_main_repo_clean(Path("/fake/repo"), allow_dirty=False)
+            assert result is False
 
 
 def _make_ctx(

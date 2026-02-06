@@ -171,19 +171,22 @@ EXAMPLES:
 
 
 def _is_loom_runtime(porcelain_line: str) -> bool:
-    """Check if a git status porcelain line refers to a .loom/ runtime file.
+    """Check if a git status porcelain line refers to a loom runtime file.
+
+    Matches both ``.loom/`` directory files and ``.loom-*`` root-level files
+    (e.g. ``.loom-checkpoint``).
 
     Args:
         porcelain_line: A line from ``git status --porcelain``, e.g. ``"?? .loom/daemon-state.json"``
 
     Returns:
-        True if the file path starts with ``.loom/``
+        True if the file path starts with ``.loom/`` or ``.loom-``
     """
     # Format: "XY filename" or "XY filename -> renamed"
     path = porcelain_line[3:] if len(porcelain_line) > 3 else ""
     if " -> " in path:
         path = path.split(" -> ")[-1]  # Use destination for renames
-    return path.startswith(".loom/")
+    return path.startswith(".loom/") or path.startswith(".loom-")
 
 
 def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:

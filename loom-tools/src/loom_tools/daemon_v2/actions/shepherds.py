@@ -104,6 +104,7 @@ def _spawn_single_shepherd(
     args = str(issue_num)
     if ctx.config.force_mode:
         args += " --force"
+    args += " --allow-dirty-main"
 
     # Check for existing session and handle it
     if session_exists(shepherd_name):

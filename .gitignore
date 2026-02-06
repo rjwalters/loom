@@ -35,6 +35,7 @@ Thumbs.db
 
 # Loom runtime state (don't commit these)
 .loom-in-use
+.loom-checkpoint
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
