@@ -345,9 +345,21 @@ def run_worker_phase(
     """
     scripts_dir = ctx.scripts_dir
 
+    # Guard against missing scripts directory.  This can happen when the
+    # working tree is on a branch that predates the Loom installation (the
+    # branch was created before .loom/scripts/ was added to the repo).
+    # See issue #2147.
+    spawn_script = scripts_dir / "agent-spawn.sh"
+    if not spawn_script.is_file():
+        log_warning(
+            f"Script not found: {spawn_script} — "
+            "the branch may predate Loom installation"
+        )
+        return 1
+
     # Build spawn command
     spawn_cmd = [
-        str(scripts_dir / "agent-spawn.sh"),
+        str(spawn_script),
         "--role",
         role,
         "--name",
@@ -376,8 +388,16 @@ def run_worker_phase(
         return 1
 
     # Build wait command
+    wait_script = scripts_dir / "agent-wait-bg.sh"
+    if not wait_script.is_file():
+        log_warning(
+            f"Script not found: {wait_script} — "
+            "the branch may predate Loom installation"
+        )
+        return 1
+
     wait_cmd = [
-        str(scripts_dir / "agent-wait-bg.sh"),
+        str(wait_script),
         name,
         "--timeout",
         str(timeout),
@@ -437,14 +457,16 @@ def run_worker_phase(
     wait_exit = wait_proc.returncode
 
     # Clean up the worker session
-    destroy_cmd = [str(scripts_dir / "agent-destroy.sh"), name, "--force"]
-    subprocess.run(
-        destroy_cmd,
-        cwd=ctx.repo_root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    destroy_script = scripts_dir / "agent-destroy.sh"
+    if destroy_script.is_file():
+        destroy_cmd = [str(destroy_script), name, "--force"]
+        subprocess.run(
+            destroy_cmd,
+            cwd=ctx.repo_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
 
     # Detect instant-exit: session completed (exit 0) but ran for < 5s with
     # no meaningful output.  Return synthetic exit code 6 so the retry layer

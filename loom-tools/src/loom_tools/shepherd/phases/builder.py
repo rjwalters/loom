@@ -218,6 +218,12 @@ class BuilderPhase:
                     capture=True,
                 )
                 ctx.report_milestone("worktree_created", path=str(ctx.worktree_path))
+            except FileNotFoundError as exc:
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=str(exc),
+                    phase_name="builder",
+                )
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or "").strip()
                 msg = "failed to create worktree"

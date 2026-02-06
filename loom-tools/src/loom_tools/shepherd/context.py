@@ -113,8 +113,17 @@ class ShepherdContext:
 
         Returns:
             CompletedProcess result
+
+        Raises:
+            FileNotFoundError: If the script does not exist (e.g. the
+                working tree is on a branch that predates Loom installation).
         """
         script_path = self.scripts_dir / script_name
+        if not script_path.is_file():
+            raise FileNotFoundError(
+                f"Script not found: {script_path} — "
+                "the branch may predate Loom installation"
+            )
         cmd = [str(script_path), *args]
         return subprocess.run(
             cmd,

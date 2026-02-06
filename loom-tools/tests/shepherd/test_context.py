@@ -348,3 +348,29 @@ class TestValidateIssueBlockedLabel:
         # Only the git ls-remote call might have been made
         label_edit_calls = [c for c in edit_calls if "--remove-label" in c]
         assert len(label_edit_calls) == 0
+
+
+class TestRunScriptMissingScript:
+    """Tests for run_script() when scripts are missing (issue #2147)."""
+
+    def test_missing_script_raises_file_not_found(self, tmp_path: Path) -> None:
+        """run_script() raises FileNotFoundError for missing scripts."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+        # scripts_dir exists but the script file does not
+        (tmp_path / ".loom" / "scripts").mkdir(parents=True, exist_ok=True)
+
+        with pytest.raises(FileNotFoundError, match="predate Loom installation"):
+            ctx.run_script("nonexistent.sh", [])
+
+    def test_existing_script_runs_normally(self, tmp_path: Path) -> None:
+        """run_script() works normally when the script file exists."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script = scripts_dir / "test-script.sh"
+        script.write_text("#!/bin/sh\necho ok\n")
+        script.chmod(0o755)
+
+        result = ctx.run_script("test-script.sh", [], check=False)
+        assert result.returncode == 0
+        assert "ok" in result.stdout
