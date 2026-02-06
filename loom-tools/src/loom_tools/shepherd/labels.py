@@ -10,6 +10,29 @@ from typing import Literal
 # Entity type for generic label operations
 EntityType = Literal["issue", "pr"]
 
+# Label exclusion groups: only one label from each group should be present
+# on an entity at a time. Used by transition_labels(enforce_exclusion=True)
+# and by the daemon health check to detect contradictory states.
+LABEL_EXCLUSION_GROUPS: list[frozenset[str]] = [
+    frozenset({"loom:pr", "loom:changes-requested", "loom:review-requested"}),
+    frozenset({"loom:issue", "loom:building", "loom:blocked"}),
+]
+
+
+def get_exclusion_conflicts(labels: set[str]) -> list[dict[str, object]]:
+    """Check a set of labels for exclusion group violations.
+
+    Returns a list of dicts with 'group' (the frozenset) and
+    'conflicting' (the set of labels that conflict) for each violation.
+    Returns an empty list if no conflicts.
+    """
+    conflicts: list[dict[str, object]] = []
+    for group in LABEL_EXCLUSION_GROUPS:
+        matching = labels & group
+        if len(matching) > 1:
+            conflicts.append({"group": group, "conflicting": matching})
+    return conflicts
+
 
 class LabelCache:
     """Cache for issue/PR labels with invalidation.
@@ -327,6 +350,8 @@ def transition_labels(
     add: list[str] | None = None,
     remove: list[str] | None = None,
     repo_root: Path | None = None,
+    *,
+    enforce_exclusion: bool = False,
 ) -> bool:
     """Atomically add and remove labels in a single API call.
 
@@ -342,6 +367,10 @@ def transition_labels(
         add: Labels to add (optional)
         remove: Labels to remove (optional)
         repo_root: Repository root path (optional)
+        enforce_exclusion: When True, automatically remove all other labels
+            in the same exclusion group as each label being added. This
+            prevents contradictory label states. Default False for backward
+            compatibility.
 
     Returns:
         True if successful, False otherwise.
@@ -352,15 +381,29 @@ def transition_labels(
 
         # Atomic: loom:building -> loom:blocked
         transition_labels("issue", 42, add=["loom:blocked"], remove=["loom:building"])
+
+        # Auto-remove conflicting labels from exclusion groups
+        transition_labels("pr", 100, add=["loom:pr"], enforce_exclusion=True)
+        # Also removes loom:changes-requested and loom:review-requested
     """
     if not add and not remove:
         return True  # Nothing to do
+
+    # Build the effective remove set
+    effective_remove = set(remove or [])
+
+    if enforce_exclusion and add:
+        for label in add:
+            for group in LABEL_EXCLUSION_GROUPS:
+                if label in group:
+                    # Remove all other labels in the group
+                    effective_remove |= group - {label}
 
     cmd = ["gh", entity_type, "edit", str(number)]
 
     # Add --remove-label flags first (order doesn't matter to gh, but
     # conceptually we remove the old state before adding the new)
-    for label in remove or []:
+    for label in sorted(effective_remove):
         cmd.extend(["--remove-label", label])
 
     # Add --add-label flags

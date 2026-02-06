@@ -47,6 +47,7 @@ from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_daemon_state, read_json_file
 from loom_tools.common.time_utils import elapsed_seconds, format_duration, now_utc
 from loom_tools.models.daemon_state import DaemonState
+from loom_tools.shepherd.labels import LABEL_EXCLUSION_GROUPS
 
 
 # Default thresholds
@@ -116,6 +117,7 @@ class PipelineState:
     review_requested: list[dict[str, Any]] = field(default_factory=list)
     ready_to_merge: list[dict[str, Any]] = field(default_factory=list)
     blocked: list[dict[str, Any]] = field(default_factory=list)
+    changes_requested: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def ready_count(self) -> int:
@@ -154,6 +156,7 @@ class HealthReport:
     pipeline: PipelineState = field(default_factory=PipelineState)
     orphaned_building: list[int] = field(default_factory=list)
     stale_building: list[StaleIssue] = field(default_factory=list)
+    contradictory_labels: list[dict[str, Any]] = field(default_factory=list)
     support_roles: list[SupportRoleStatus] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     criticals: list[str] = field(default_factory=list)
@@ -251,6 +254,7 @@ def get_pipeline_state() -> PipelineState:
         (["pr", "list", "--label", "loom:review-requested", "--state", "open", "--json", "number,title"],),
         (["pr", "list", "--label", "loom:pr", "--state", "open", "--json", "number,title"],),
         (["issue", "list", "--label", "loom:blocked", "--state", "open", "--json", "number,title"],),
+        (["pr", "list", "--label", "loom:changes-requested", "--state", "open", "--json", "number,title"],),
     ]
 
     results = gh_parallel_queries(queries)
@@ -261,6 +265,7 @@ def get_pipeline_state() -> PipelineState:
         review_requested=results[2],
         ready_to_merge=results[3],
         blocked=results[4],
+        changes_requested=results[5],
     )
 
 
