@@ -293,9 +293,10 @@ class TestIsLoomRuntime:
     def test_rename_out_of_loom(self) -> None:
         assert _is_loom_runtime("R  .loom/old.json -> new.json") is False
 
-    def test_loom_prefix_not_in_dir(self) -> None:
-        """Files named .loom-something (not in .loom/) should NOT be filtered."""
-        assert _is_loom_runtime("?? .loom-config") is False
+    def test_loom_dash_root_files_are_filtered(self) -> None:
+        """Root-level .loom-* files are runtime artifacts and should be filtered."""
+        assert _is_loom_runtime("?? .loom-checkpoint") is True
+        assert _is_loom_runtime("?? .loom-in-use") is True
 
     def test_short_line(self) -> None:
         """Handles pathologically short lines without crashing."""
@@ -349,7 +350,7 @@ class TestCheckMainRepoCleanLoomFiltering:
         with self._mock_uncommitted(["?? .loom/daemon-state.json"]):
             assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=True) is True
 
-    def test_dot_loom_prefix_file_not_filtered(self) -> None:
-        """A file named .loom-config (not in .loom/) should NOT be filtered."""
-        with self._mock_uncommitted(["?? .loom-config"]):
-            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is False
+    def test_dot_loom_dash_files_are_filtered(self) -> None:
+        """Root-level .loom-* files are runtime artifacts and should be filtered."""
+        with self._mock_uncommitted(["?? .loom-checkpoint"]):
+            assert _check_main_repo_clean(pathlib.Path("/fake"), allow_dirty=False) is True
