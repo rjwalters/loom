@@ -67,6 +67,16 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     for completion in completions:
         handle_completion(ctx, completion)
 
+    # Recompute active shepherd count after completions modify ctx.state
+    if completions and ctx.state is not None and ctx.snapshot is not None:
+        active_shepherds = sum(
+            1 for e in ctx.state.shepherds.values() if e.status == "working"
+        )
+        ctx.snapshot["computed"]["active_shepherds"] = active_shepherds
+        ctx.snapshot["computed"]["available_shepherd_slots"] = max(
+            0, ctx.config.max_shepherds - active_shepherds
+        )
+
     # 4. Get recommended actions
     actions = ctx.get_recommended_actions()
     if ctx.config.debug_mode:
