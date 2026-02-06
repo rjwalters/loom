@@ -21,6 +21,9 @@ DEFAULT_CHAMPION_INTERVAL = 600  # seconds
 DEFAULT_DOCTOR_INTERVAL = 300  # seconds
 DEFAULT_AUDITOR_INTERVAL = 600  # seconds
 DEFAULT_JUDGE_INTERVAL = 300  # seconds
+DEFAULT_STALL_DIAGNOSTIC_THRESHOLD = 3  # consecutive stalled iterations
+DEFAULT_STALL_RECOVERY_THRESHOLD = 5
+DEFAULT_STALL_RESTART_THRESHOLD = 10
 
 
 @dataclass
@@ -55,6 +58,11 @@ class DaemonConfig:
     auditor_interval: int = DEFAULT_AUDITOR_INTERVAL
     judge_interval: int = DEFAULT_JUDGE_INTERVAL
 
+    # Stall escalation thresholds
+    stall_diagnostic_threshold: int = DEFAULT_STALL_DIAGNOSTIC_THRESHOLD
+    stall_recovery_threshold: int = DEFAULT_STALL_RECOVERY_THRESHOLD
+    stall_restart_threshold: int = DEFAULT_STALL_RESTART_THRESHOLD
+
     @classmethod
     def from_env(
         cls,
@@ -84,6 +92,15 @@ class DaemonConfig:
             doctor_interval=env_int("LOOM_DOCTOR_INTERVAL", DEFAULT_DOCTOR_INTERVAL),
             auditor_interval=env_int("LOOM_AUDITOR_INTERVAL", DEFAULT_AUDITOR_INTERVAL),
             judge_interval=env_int("LOOM_JUDGE_INTERVAL", DEFAULT_JUDGE_INTERVAL),
+            stall_diagnostic_threshold=env_int(
+                "LOOM_STALL_DIAGNOSTIC_THRESHOLD", DEFAULT_STALL_DIAGNOSTIC_THRESHOLD
+            ),
+            stall_recovery_threshold=env_int(
+                "LOOM_STALL_RECOVERY_THRESHOLD", DEFAULT_STALL_RECOVERY_THRESHOLD
+            ),
+            stall_restart_threshold=env_int(
+                "LOOM_STALL_RESTART_THRESHOLD", DEFAULT_STALL_RESTART_THRESHOLD
+            ),
         )
 
     def mode_display(self) -> str:
