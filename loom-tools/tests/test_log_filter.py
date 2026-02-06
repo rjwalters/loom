@@ -1,0 +1,239 @@
+"""Tests for loom_tools.log_filter."""
+
+from __future__ import annotations
+
+import io
+from unittest.mock import MagicMock, patch
+
+from loom_tools.log_filter import clean_line, main
+
+
+# ---------------------------------------------------------------------------
+# TestCleanLine — unit tests for clean_line()
+# ---------------------------------------------------------------------------
+
+
+class TestCleanLine:
+    """Unit tests for the clean_line() pure function."""
+
+    # -- ANSI stripping (delegates to strip_ansi) --
+
+    def test_ansi_color_codes_stripped(self) -> None:
+        assert clean_line("\x1b[31mError\x1b[0m") == "Error"
+
+    def test_ansi_bold_and_color_stripped(self) -> None:
+        assert clean_line("\x1b[1;32mOK\x1b[0m") == "OK"
+
+    def test_ansi_24bit_color_stripped(self) -> None:
+        assert clean_line("\x1b[38;2;226;141;109mtext\x1b[39m") == "text"
+
+    # -- Carriage return processing --
+
+    def test_carriage_return_keeps_last_segment(self) -> None:
+        """Spinner animation: only the final segment after \\r is kept."""
+        assert clean_line("frame1\rframe2\rframe3") == "frame3"
+
+    def test_carriage_return_single(self) -> None:
+        assert clean_line("old\rnew") == "new"
+
+    def test_carriage_return_with_ansi(self) -> None:
+        """CR processing happens before ANSI stripping."""
+        assert clean_line("old\r\x1b[32mnew\x1b[0m") == "new"
+
+    # -- Backspace removal --
+
+    def test_backspace_erases_preceding_char(self) -> None:
+        assert clean_line("ab\x08c") == "ac"
+
+    def test_multiple_backspaces(self) -> None:
+        assert clean_line("abc\x08\x08d") == "ad"
+
+    def test_leading_backspace_ignored(self) -> None:
+        assert clean_line("\x08hello") == "hello"
+
+    def test_backspace_erases_all(self) -> None:
+        """More backspaces than characters empties the string."""
+        result = clean_line("a\x08\x08")
+        # After erasing 'a' the leading backspace is stripped
+        assert result is None or result.strip() == ""
+
+    # -- Control character removal --
+
+    def test_null_byte_removed(self) -> None:
+        assert clean_line("hel\x00lo") == "hello"
+
+    def test_bell_removed(self) -> None:
+        assert clean_line("alert\x07!") == "alert!"
+
+    def test_vertical_tab_removed(self) -> None:
+        assert clean_line("a\x0bb") == "ab"
+
+    def test_form_feed_removed(self) -> None:
+        assert clean_line("a\x0cb") == "ab"
+
+    def test_tab_preserved(self) -> None:
+        assert clean_line("\tindented") == "\tindented"
+
+    # -- Unicode control/format character removal --
+
+    def test_zero_width_space_removed(self) -> None:
+        """U+200B (zero-width space) is category Cf and should be removed."""
+        assert clean_line("he\u200bllo") == "hello"
+
+    def test_zero_width_joiner_removed(self) -> None:
+        """U+200D (zero-width joiner) is category Cf."""
+        assert clean_line("a\u200db") == "ab"
+
+    def test_left_to_right_mark_removed(self) -> None:
+        """U+200E (left-to-right mark) is category Cf."""
+        assert clean_line("text\u200e!") == "text!"
+
+    def test_soft_hyphen_removed(self) -> None:
+        """U+00AD (soft hyphen) is category Cf."""
+        assert clean_line("hy\u00adphen") == "hyphen"
+
+    def test_normal_unicode_preserved(self) -> None:
+        """Regular Unicode text is not affected."""
+        assert clean_line("cafe\u0301") == "cafe\u0301"  # combining accent
+
+    # -- Blank line suppression --
+
+    def test_empty_string_returns_none(self) -> None:
+        assert clean_line("") is None
+
+    def test_whitespace_only_returns_none(self) -> None:
+        assert clean_line("   ") is None
+
+    def test_tabs_only_returns_none(self) -> None:
+        assert clean_line("\t\t") is None
+
+    def test_control_chars_only_returns_none(self) -> None:
+        """Line with only control characters becomes blank -> None."""
+        assert clean_line("\x00\x01\x02") is None
+
+    # -- Combined cleaning --
+
+    def test_ansi_and_carriage_return(self) -> None:
+        assert clean_line("\x1b[31mold\x1b[0m\r\x1b[32mnew\x1b[0m") == "new"
+
+    def test_ansi_and_backspace(self) -> None:
+        assert clean_line("\x1b[31mab\x08c\x1b[0m") == "ac"
+
+    def test_all_artifacts_combined(self) -> None:
+        """Input with CR, ANSI, backspace, and control chars."""
+        raw = "junk\r\x1b[31mhe\x00l\x08lo\x1b[0m"
+        # CR keeps "\x1b[31mhe\x00l\x08lo\x1b[0m"
+        # ANSI strip -> "he\x00l\x08lo"
+        # Backspace: l\x08 -> erase l, giving "he\x00lo"
+        # Control char \x00 removed -> "helo"
+        assert clean_line(raw) == "helo"
+
+    # -- Edge cases --
+
+    def test_very_long_line(self) -> None:
+        line = "x" * 10000
+        assert clean_line(line) == line
+
+    def test_only_newline_chars_suppressed(self) -> None:
+        """A line of only \\n and \\t is whitespace -> None."""
+        assert clean_line("\n\t\n") is None
+
+    def test_mixed_cr_and_backspace(self) -> None:
+        """CR processed first, then backspace erases preceding char."""
+        raw = "abc\rxy\x08z"
+        # CR -> "xy\x08z", backspace erases 'y' -> "xz"
+        assert clean_line(raw) == "xz"
+
+    def test_plain_text_unchanged(self) -> None:
+        assert clean_line("Hello, world!") == "Hello, world!"
+
+
+# ---------------------------------------------------------------------------
+# TestMain — integration tests for main()
+# ---------------------------------------------------------------------------
+
+
+class TestMain:
+    """Integration tests for the stdin→stdout main() pipeline."""
+
+    @staticmethod
+    def _run_main(input_text: str) -> str:
+        """Helper: run main() with given stdin, capture stdout."""
+        stdin = io.StringIO(input_text)
+        stdout = io.StringIO()
+        with patch("sys.stdin", stdin), patch("sys.stdout", stdout):
+            main()
+        return stdout.getvalue()
+
+    def test_basic_passthrough(self) -> None:
+        output = self._run_main("hello\nworld\n")
+        assert output == "hello\nworld\n"
+
+    def test_blank_lines_suppressed(self) -> None:
+        output = self._run_main("hello\n\n\nworld\n")
+        assert output == "hello\nworld\n"
+
+    def test_duplicate_collapsing_two(self) -> None:
+        """Two identical lines: first printed, second summarised."""
+        output = self._run_main("same\nsame\n")
+        assert output == "same\n  [repeated 1 more time]\n"
+
+    def test_duplicate_collapsing_many(self) -> None:
+        """Five identical lines: first + 'repeated 4 more times'."""
+        output = self._run_main("dup\ndup\ndup\ndup\ndup\n")
+        assert output == "dup\n  [repeated 4 more times]\n"
+
+    def test_duplicate_then_different(self) -> None:
+        """Duplicate summary flushed when a new line appears."""
+        output = self._run_main("a\na\na\nb\n")
+        assert output == "a\n  [repeated 2 more times]\nb\n"
+
+    def test_trailing_duplicate_flushed_at_eof(self) -> None:
+        """Duplicate count is emitted in the finally block on EOF."""
+        output = self._run_main("x\nx\nx\n")
+        assert output == "x\n  [repeated 2 more times]\n"
+
+    def test_empty_stdin_no_output(self) -> None:
+        output = self._run_main("")
+        assert output == ""
+
+    def test_broken_pipe_graceful(self) -> None:
+        """BrokenPipeError on stdout.write is caught silently."""
+        stdin = io.StringIO("hello\n")
+        mock_stdout = MagicMock()
+        mock_stdout.write.side_effect = BrokenPipeError
+        with patch("sys.stdin", stdin), patch("sys.stdout", mock_stdout):
+            main()  # Should not raise
+
+    def test_mixed_clean_suppressed_duplicate(self) -> None:
+        """End-to-end: real lines, blank lines, and duplicates."""
+        input_text = "alpha\n\nbeta\nbeta\nbeta\n\ngamma\n"
+        output = self._run_main(input_text)
+        assert output == "alpha\nbeta\n  [repeated 2 more times]\ngamma\n"
+
+    def test_ansi_stripped_before_dedup(self) -> None:
+        """Lines differing only by ANSI codes are treated as duplicates."""
+        input_text = "\x1b[31mhello\x1b[0m\n\x1b[32mhello\x1b[0m\n"
+        output = self._run_main(input_text)
+        assert output == "hello\n  [repeated 1 more time]\n"
+
+    def test_singular_repeated_message(self) -> None:
+        """'repeated 1 more time' uses singular form."""
+        output = self._run_main("z\nz\n")
+        assert "  [repeated 1 more time]\n" in output
+
+    def test_plural_repeated_message(self) -> None:
+        """'repeated N more times' uses plural for N > 1."""
+        output = self._run_main("z\nz\nz\n")
+        assert "  [repeated 2 more times]\n" in output
+
+    def test_whitespace_only_lines_suppressed_in_stream(self) -> None:
+        output = self._run_main("hello\n   \n\t\nworld\n")
+        assert output == "hello\nworld\n"
+
+    def test_cr_spinner_frames_deduplicated(self) -> None:
+        """Simulated spinner: CR-separated frames collapse to unique outputs."""
+        # Each line has spinner frames separated by CR
+        input_text = "frame1\rframe2\rframe3\nframe1\rframe2\rframe3\n"
+        output = self._run_main(input_text)
+        assert output == "frame3\n  [repeated 1 more time]\n"
