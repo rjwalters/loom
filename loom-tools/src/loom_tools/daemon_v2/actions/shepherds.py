@@ -174,6 +174,96 @@ def _unclaim_issue(issue_num: int) -> None:
         pass
 
 
+def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
+    """Force reclaim shepherds with stale heartbeats.
+
+    Checks each 'working' shepherd for:
+    1. Dead tmux sessions (no session or no claude process)
+    2. Stale heartbeats from progress files
+
+    For each stale shepherd found:
+    - Kills the tmux session if it exists
+    - Resets the shepherd entry to idle
+    - Reverts the issue label from loom:building to loom:issue
+
+    Returns the number of shepherds reclaimed.
+    """
+    if ctx.state is None or ctx.snapshot is None:
+        return 0
+
+    reclaimed = 0
+    timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Get stale heartbeat info from snapshot
+    shepherd_progress = (
+        ctx.snapshot.get("shepherds", {}).get("progress", [])
+    )
+    stale_task_ids: set[str] = set()
+    for prog in shepherd_progress:
+        if prog.get("heartbeat_stale", False):
+            tid = prog.get("task_id", "")
+            if tid:
+                stale_task_ids.add(tid)
+
+    for name, entry in list(ctx.state.shepherds.items()):
+        if entry.status != "working":
+            continue
+
+        is_stale = False
+
+        # Check 1: tmux session dead
+        if not session_exists(name):
+            log_warning(f"STALL-L2: {name} has no tmux session")
+            is_stale = True
+        else:
+            # Check if claude is actually running
+            session_name = f"loom-{name}"
+            from loom_tools.agent_spawn import _get_pane_pid, _is_claude_running
+
+            shell_pid = _get_pane_pid(session_name)
+            if not shell_pid or not _is_claude_running(shell_pid):
+                log_warning(f"STALL-L2: {name} tmux session has no active claude process")
+                is_stale = True
+
+        # Check 2: stale heartbeat from progress files
+        if not is_stale and entry.task_id and entry.task_id in stale_task_ids:
+            log_warning(f"STALL-L2: {name} has stale heartbeat (task_id={entry.task_id})")
+            is_stale = True
+
+        if not is_stale:
+            continue
+
+        # Kill tmux session if it exists
+        if session_exists(name):
+            log_info(f"STALL-L2: Killing tmux session for {name}")
+            kill_stuck_session(name)
+
+        # Reset shepherd entry to idle
+        issue = entry.issue
+        entry.status = "idle"
+        entry.issue = None
+        entry.task_id = None
+        entry.output_file = None
+        entry.idle_since = timestamp
+        entry.idle_reason = "stall_recovery"
+        entry.last_issue = issue
+        entry.last_completed = timestamp
+
+        log_info(f"STALL-L2: Reset {name} to idle")
+
+        # Revert issue label
+        if issue is not None:
+            try:
+                _unclaim_issue(issue)
+                log_info(f"STALL-L2: Reverted issue #{issue} labels to loom:issue")
+            except Exception as e:
+                log_warning(f"STALL-L2: Failed to revert labels for issue #{issue}: {e}")
+
+        reclaimed += 1
+
+    return reclaimed
+
+
 def _extract_task_id(session_name: str) -> str | None:
     """Extract task ID from spawn result.
 

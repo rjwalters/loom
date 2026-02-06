@@ -27,6 +27,7 @@ class DaemonContext:
     # Loop state
     iteration: int = 0
     running: bool = True
+    consecutive_stalled: int = 0
 
     # Per-iteration data (refreshed each iteration)
     snapshot: dict[str, Any] | None = None
