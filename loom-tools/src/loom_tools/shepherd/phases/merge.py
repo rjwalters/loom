@@ -47,6 +47,12 @@ class MergePhase:
                     phase_name="merge",
                     data={"merged": True},
                 )
+            except FileNotFoundError as exc:
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=str(exc),
+                    phase_name="merge",
+                )
             except subprocess.CalledProcessError:
                 self._mark_issue_blocked(
                     ctx, "merge_failed", f"failed to merge PR #{ctx.pr_number}"

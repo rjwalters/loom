@@ -5427,17 +5427,118 @@ class TestStaleBranchDetection:
         assert not any("Stale branch" in r.message for r in caplog.records)
 
 
+class TestRunWorkerPhaseMissingScripts:
+    """Test run_worker_phase handles missing scripts gracefully (issue #2147)."""
+
+    def test_missing_spawn_script_returns_1(self, tmp_path: Path) -> None:
+        """When agent-spawn.sh is missing, return exit code 1 without crashing."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        # Create scripts_dir but do NOT create any script files
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        exit_code = run_worker_phase(
+            ctx,
+            role="judge",
+            name="judge-issue-42",
+            timeout=600,
+            phase="judge",
+        )
+
+        assert exit_code == 1
+
+    def test_missing_wait_script_returns_1(self, tmp_path: Path) -> None:
+        """When agent-wait-bg.sh is missing, return exit code 1."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        # Create spawn script but NOT wait script
+        (scripts_dir / "agent-spawn.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        with patch("subprocess.run", side_effect=mock_spawn):
+            exit_code = run_worker_phase(
+                ctx,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 1
+
+    def test_missing_destroy_script_skips_cleanup(self, tmp_path: Path) -> None:
+        """When agent-destroy.sh is missing, cleanup is skipped without crash."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        # Create spawn and wait scripts but NOT destroy
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=False,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                ctx,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        # Should complete successfully even without destroy script
+        assert exit_code == 0
+
+
 class TestRunWorkerPhaseIdleThreshold:
     """Test run_worker_phase min-idle-elapsed threshold configuration."""
 
     @pytest.fixture
-    def mock_context(self) -> MagicMock:
+    def mock_context(self, tmp_path: Path) -> MagicMock:
         """Create a mock ShepherdContext for these tests."""
         ctx = MagicMock(spec=ShepherdContext)
         ctx.config = ShepherdConfig(issue=42, task_id="test-123")
-        ctx.repo_root = Path("/fake/repo")
-        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
-        ctx.progress_dir = Path("/tmp/progress")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script in ("agent-spawn.sh", "agent-wait-bg.sh", "agent-destroy.sh"):
+            (scripts_dir / script).touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
         return ctx
 
     @pytest.mark.parametrize(
@@ -9072,13 +9173,17 @@ class TestRunWorkerPhaseInstantExit:
     """Test that run_worker_phase detects instant exits and returns code 6."""
 
     @pytest.fixture
-    def mock_context(self) -> MagicMock:
+    def mock_context(self, tmp_path: Path) -> MagicMock:
         """Create a mock ShepherdContext."""
         ctx = MagicMock(spec=ShepherdContext)
         ctx.config = ShepherdConfig(issue=42, task_id="test-123")
-        ctx.repo_root = Path("/fake/repo")
-        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
-        ctx.progress_dir = Path("/tmp/progress")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script in ("agent-spawn.sh", "agent-wait-bg.sh", "agent-destroy.sh"):
+            (scripts_dir / script).touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
         return ctx
 
     def test_instant_exit_returns_code_6(self, mock_context: MagicMock) -> None:
