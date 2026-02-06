@@ -209,11 +209,11 @@ def _update_stall_counter(ctx: DaemonContext, result: IterationResult) -> None:
         ctx.consecutive_stalled = 0
         return
 
-    if health == "healthy":
+    if health in ("healthy", "degraded"):
         ctx.consecutive_stalled = 0
         return
 
-    # Stalled: unhealthy and no progress
+    # Stalled: warning-level issues present and no progress
     ctx.consecutive_stalled += 1
     log_warning(
         f"Consecutive stalled iterations: {ctx.consecutive_stalled} "

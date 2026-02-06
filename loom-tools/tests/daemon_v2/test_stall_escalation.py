@@ -160,10 +160,24 @@ class TestUpdateStallCounter:
         ctx = _make_ctx(stalled=0, health="degraded")
         result = _make_result()
         _update_stall_counter(ctx, result)
-        # degraded is neither "healthy" nor stalled with warnings
-        # it has info-level warnings only, so health != "healthy"
-        # counter should increment since degraded != healthy and no progress
-        assert ctx.consecutive_stalled == 1
+        # degraded means only info-level warnings (e.g. ci_failing) —
+        # these are environmental/informational and should not drive escalation
+        assert ctx.consecutive_stalled == 0
+
+    def test_degraded_health_resets_counter(self):
+        """Degraded health should reset an existing stall counter."""
+        ctx = _make_ctx(stalled=5, health="degraded")
+        result = _make_result()
+        _update_stall_counter(ctx, result)
+        assert ctx.consecutive_stalled == 0
+
+    def test_ci_failing_only_does_not_escalate_over_many_iterations(self):
+        """ci_failing alone (degraded) should never trigger escalation."""
+        ctx = _make_ctx(stalled=0, health="degraded")
+        result = _make_result()
+        for _ in range(15):
+            _update_stall_counter(ctx, result)
+        assert ctx.consecutive_stalled == 0
 
     def test_no_snapshot_does_not_crash(self):
         ctx = _make_ctx()

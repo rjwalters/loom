@@ -976,7 +976,7 @@ def compute_health(
         failed_runs = ci_status.get("failed_runs", [])
         warnings.append({
             "code": "ci_failing",
-            "level": "warning",
+            "level": "info",
             "message": ci_status.get("message", f"CI failing on main: {len(failed_runs)} workflow(s) failed"),
         })
 
