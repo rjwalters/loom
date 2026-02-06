@@ -23,6 +23,7 @@ from loom_tools.snapshot import (
     OrphanedPR,
     PipelineHealth,
     SnapshotConfig,
+    SpinningPR,
     SupportRoleState,
     SystematicFailureState,
     TmuxPool,
@@ -35,6 +36,7 @@ from loom_tools.snapshot import (
     compute_systematic_failure_state,
     detect_orphaned_prs,
     detect_orphaned_shepherds,
+    detect_spinning_prs,
     detect_tmux_pool,
     main,
     run_preflight_checks,
@@ -1514,3 +1516,171 @@ class TestBuildSnapshotPreflight:
             _preflight=injected,
         )
         assert snapshot["preflight"] == injected
+
+
+# ---------------------------------------------------------------------------
+# Spinning PR detection
+# ---------------------------------------------------------------------------
+
+
+class TestDetectSpinningPRs:
+    """Tests for detect_spinning_prs."""
+
+    def test_empty_changes_requested(self) -> None:
+        assert detect_spinning_prs([], threshold=3) == []
+
+    @mock.patch("loom_tools.snapshot._count_review_rounds", return_value=5)
+    @mock.patch("loom_tools.snapshot._extract_linked_issue", return_value=42)
+    def test_detects_spinning_pr(self, _mock_issue: mock.MagicMock, _mock_count: mock.MagicMock) -> None:
+        changes = [{"number": 100, "title": "Fix stuff", "labels": [{"name": "loom:changes-requested"}]}]
+        result = detect_spinning_prs(changes, threshold=3)
+        assert len(result) == 1
+        assert result[0].pr_number == 100
+        assert result[0].review_cycles == 5
+        assert result[0].linked_issue == 42
+
+    @mock.patch("loom_tools.snapshot._count_review_rounds", return_value=2)
+    def test_below_threshold_not_spinning(self, _mock_count: mock.MagicMock) -> None:
+        changes = [{"number": 100, "title": "Fix stuff", "labels": []}]
+        result = detect_spinning_prs(changes, threshold=3)
+        assert result == []
+
+    @mock.patch("loom_tools.snapshot._count_review_rounds", side_effect=[5, 1, 4])
+    @mock.patch("loom_tools.snapshot._extract_linked_issue", return_value=None)
+    def test_mixed_prs(self, _mock_issue: mock.MagicMock, _mock_count: mock.MagicMock) -> None:
+        changes = [
+            {"number": 100, "title": "PR A", "labels": []},
+            {"number": 101, "title": "PR B", "labels": []},
+            {"number": 102, "title": "PR C", "labels": []},
+        ]
+        result = detect_spinning_prs(changes, threshold=3)
+        assert len(result) == 2
+        assert result[0].pr_number == 100
+        assert result[1].pr_number == 102
+
+    @mock.patch("loom_tools.snapshot._count_review_rounds", return_value=3)
+    @mock.patch("loom_tools.snapshot._extract_linked_issue", return_value=None)
+    def test_threshold_exact_match(self, _mock_issue: mock.MagicMock, _mock_count: mock.MagicMock) -> None:
+        changes = [{"number": 100, "title": "PR", "labels": []}]
+        result = detect_spinning_prs(changes, threshold=3)
+        assert len(result) == 1
+
+
+class TestSpinningPRToDict:
+    def test_basic(self) -> None:
+        s = SpinningPR(pr_number=42, review_cycles=5)
+        d = s.to_dict()
+        assert d == {"pr_number": 42, "review_cycles": 5}
+
+    def test_with_linked_issue(self) -> None:
+        s = SpinningPR(pr_number=42, review_cycles=5, linked_issue=10)
+        d = s.to_dict()
+        assert d == {"pr_number": 42, "review_cycles": 5, "linked_issue": 10}
+
+
+class TestComputeHealthSpinning:
+    """Tests for spinning_prs integration in compute_health."""
+
+    def test_no_spinning_prs(self) -> None:
+        status, warnings = compute_health(
+            ready_count=1,
+            building_count=0,
+            blocked_count=0,
+            total_proposals=0,
+            stale_heartbeat_count=0,
+            orphaned_count=0,
+            usage_healthy=True,
+            session_percent=50.0,
+            spinning_prs=[],
+        )
+        assert status == "healthy"
+        assert not any(w["code"] == "spinning_prs" for w in warnings)
+
+    def test_spinning_prs_warning(self) -> None:
+        spinning = [SpinningPR(pr_number=100, review_cycles=5, linked_issue=42)]
+        status, warnings = compute_health(
+            ready_count=1,
+            building_count=0,
+            blocked_count=0,
+            total_proposals=0,
+            stale_heartbeat_count=0,
+            orphaned_count=0,
+            usage_healthy=True,
+            session_percent=50.0,
+            spinning_prs=spinning,
+        )
+        assert status == "stalled"
+        spin_warns = [w for w in warnings if w["code"] == "spinning_prs"]
+        assert len(spin_warns) == 1
+        assert "#100" in spin_warns[0]["message"]
+
+    def test_multiple_spinning_prs(self) -> None:
+        spinning = [
+            SpinningPR(pr_number=100, review_cycles=5),
+            SpinningPR(pr_number=200, review_cycles=3),
+        ]
+        status, warnings = compute_health(
+            ready_count=1,
+            building_count=0,
+            blocked_count=0,
+            total_proposals=0,
+            stale_heartbeat_count=0,
+            orphaned_count=0,
+            usage_healthy=True,
+            session_percent=50.0,
+            spinning_prs=spinning,
+        )
+        spin_warns = [w for w in warnings if w["code"] == "spinning_prs"]
+        assert len(spin_warns) == 1
+        assert "2 PR(s)" in spin_warns[0]["message"]
+
+
+class TestRecommendedActionsSpinning:
+    """Tests for spinning_prs integration in compute_recommended_actions."""
+
+    def _base_kwargs(self) -> dict:
+        return {
+            "ready_count": 0,
+            "building_count": 0,
+            "blocked_count": 0,
+            "total_proposals": 0,
+            "architect_count": 0,
+            "hermit_count": 0,
+            "review_count": 0,
+            "changes_count": 0,
+            "merge_count": 0,
+            "available_shepherd_slots": 3,
+            "needs_work_generation": False,
+            "architect_cooldown_ok": False,
+            "hermit_cooldown_ok": False,
+            "support_roles": {r: SupportRoleState() for r in ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")},
+            "orphaned_count": 0,
+            "invalid_task_id_count": 0,
+        }
+
+    def test_no_spinning_prs(self) -> None:
+        actions, _ = compute_recommended_actions(**self._base_kwargs(), spinning_prs=[])
+        assert "escalate_spinning_issues" not in actions
+
+    def test_spinning_prs_triggers_action(self) -> None:
+        spinning = [SpinningPR(pr_number=100, review_cycles=5, linked_issue=42)]
+        actions, _ = compute_recommended_actions(**self._base_kwargs(), spinning_prs=spinning)
+        assert "escalate_spinning_issues" in actions
+
+
+class TestSnapshotConfigSpinning:
+    """Tests for spinning_review_threshold config."""
+
+    def test_default_threshold(self) -> None:
+        cfg = SnapshotConfig()
+        assert cfg.spinning_review_threshold == 3
+
+    def test_from_env(self) -> None:
+        with mock.patch.dict("os.environ", {"LOOM_SPINNING_REVIEW_THRESHOLD": "5"}):
+            cfg = SnapshotConfig.from_env()
+        assert cfg.spinning_review_threshold == 5
+
+    def test_to_dict_includes_threshold(self) -> None:
+        cfg = SnapshotConfig()
+        d = cfg.to_dict()
+        assert d["spinning_review_threshold"] == 3

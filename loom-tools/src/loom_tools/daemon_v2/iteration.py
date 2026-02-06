@@ -12,6 +12,7 @@ from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import SystematicFailure
 from loom_tools.daemon_v2.actions.completions import check_completions, handle_completion
 from loom_tools.daemon_v2.actions.proposals import promote_proposals
+from loom_tools.daemon_v2.actions.spinning import escalate_spinning_issues
 from loom_tools.agent_spawn import kill_stuck_session, session_exists
 from loom_tools.daemon_v2.actions.shepherds import (
     _unclaim_issue,
@@ -121,6 +122,12 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
             run_orphan_recovery(ctx.repo_root, recover=True, verbose=ctx.config.debug_mode)
         except Exception as e:
             log_warning(f"Orphan recovery failed: {e}")
+
+    # Escalate spinning issues (PRs stuck in review cycles)
+    if "escalate_spinning_issues" in actions:
+        spinning_data = ctx.snapshot.get("prs", {}).get("spinning", [])
+        if spinning_data:
+            escalate_spinning_issues(spinning_data)
 
     # 7. Stall escalation
     _update_stall_counter(ctx, result)

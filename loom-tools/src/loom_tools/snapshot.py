@@ -76,6 +76,8 @@ class SnapshotConfig:
     ci_health_check_enabled: bool = True  # Enable CI status monitoring
     # Heartbeat grace period for newly spawned shepherds
     heartbeat_grace_period: int = 300  # 5 minutes
+    # Spinning issue detection: auto-escalate after N review cycles
+    spinning_review_threshold: int = 3
 
     @classmethod
     def from_env(cls) -> SnapshotConfig:
@@ -110,6 +112,7 @@ class SnapshotConfig:
             systematic_failure_max_probes=_int("LOOM_SYSTEMATIC_FAILURE_MAX_PROBES", 3),
             ci_health_check_enabled=os.environ.get("LOOM_CI_HEALTH_CHECK", "true").lower() not in ("false", "0", "no"),
             heartbeat_grace_period=_int("LOOM_HEARTBEAT_GRACE_PERIOD", 300),
+            spinning_review_threshold=_int("LOOM_SPINNING_REVIEW_THRESHOLD", 3),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -123,6 +126,7 @@ class SnapshotConfig:
             "systematic_failure_threshold": self.systematic_failure_threshold,
             "systematic_failure_cooldown": self.systematic_failure_cooldown,
             "systematic_failure_max_probes": self.systematic_failure_max_probes,
+            "spinning_review_threshold": self.spinning_review_threshold,
         }
 
 
@@ -654,6 +658,111 @@ def detect_orphaned_prs(
 
 
 # ---------------------------------------------------------------------------
+# Spinning PR detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SpinningPR:
+    """A PR that has cycled through too many review rounds."""
+
+    pr_number: int
+    review_cycles: int
+    linked_issue: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "pr_number": self.pr_number,
+            "review_cycles": self.review_cycles,
+        }
+        if self.linked_issue is not None:
+            d["linked_issue"] = self.linked_issue
+        return d
+
+
+def detect_spinning_prs(
+    changes_requested: list[dict[str, Any]],
+    threshold: int = 3,
+) -> list[SpinningPR]:
+    """Detect PRs stuck in review cycles (changes-requested repeatedly).
+
+    Queries the review count for each changes-requested PR. A PR is
+    "spinning" when it has accumulated >= *threshold* reviews requesting
+    changes, indicating a build→review→fix→review loop that isn't
+    converging.
+
+    Only examines PRs already labeled ``loom:changes-requested`` since those
+    are the ones actively stuck in the cycle.
+    """
+    if not changes_requested:
+        return []
+
+    # Build a list of PR numbers to query
+    pr_numbers = [pr.get("number") for pr in changes_requested if pr.get("number")]
+    if not pr_numbers:
+        return []
+
+    spinning: list[SpinningPR] = []
+
+    for pr_num in pr_numbers:
+        review_count = _count_review_rounds(pr_num)
+        if review_count >= threshold:
+            linked_issue = _extract_linked_issue(pr_num)
+            spinning.append(SpinningPR(
+                pr_number=pr_num,
+                review_cycles=review_count,
+                linked_issue=linked_issue,
+            ))
+
+    return spinning
+
+
+def _count_review_rounds(pr_number: int) -> int:
+    """Count the number of review rounds (CHANGES_REQUESTED) on a PR.
+
+    Uses ``gh api`` to fetch reviews and counts distinct
+    CHANGES_REQUESTED submissions.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
+                "--jq", '[.[] | select(.state == "CHANGES_REQUESTED")] | length',
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return 0
+
+
+def _extract_linked_issue(pr_number: int) -> int | None:
+    """Extract linked issue number from a PR's body (looks for 'Closes #N').
+
+    Returns the issue number or None.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "view", str(pr_number),
+                "--json", "body",
+                "--jq", ".body",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and result.stdout:
+            body = result.stdout
+            match = re.search(r"(?:Closes|Fixes|Resolves)\s+#(\d+)", body, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Pipeline health computation
 # ---------------------------------------------------------------------------
 
@@ -850,6 +959,7 @@ def compute_recommended_actions(
     systematic_failure_state: SystematicFailureState | None = None,
     pipeline_health: PipelineHealth | None = None,
     orphaned_prs: list[OrphanedPR] | None = None,
+    spinning_prs: list[SpinningPR] | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """Compute recommended actions and demand flags.
 
@@ -965,6 +1075,11 @@ def compute_recommended_actions(
     if pipeline_health and pipeline_health.status == "stalled" and pipeline_health.retryable_count > 0:
         actions.append("retry_blocked_issues")
 
+    # Escalate spinning PRs (review cycle loop detected)
+    _spinning = spinning_prs or []
+    if _spinning:
+        actions.append("escalate_spinning_issues")
+
     # Wait fallback
     if not actions or (len(actions) == 1 and actions[0] == "check_stuck"):
         actions.append("wait")
@@ -1057,6 +1172,7 @@ def compute_health(
     session_percent: float,
     ci_status: dict[str, Any] | None = None,
     contradictory_labels: list[dict[str, Any]] | None = None,
+    spinning_prs: list[SpinningPR] | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     """Compute health status and warnings.
 
@@ -1122,6 +1238,16 @@ def compute_health(
             "code": "session_budget_low",
             "level": "warning",
             "message": f"Session usage at {session_percent}% — nearing budget limit",
+        })
+
+    # spinning_prs — PRs stuck in review cycles
+    _spinning = spinning_prs or []
+    if _spinning:
+        pr_nums = ", ".join(f"#{s.pr_number}" for s in _spinning)
+        warnings.append({
+            "code": "spinning_prs",
+            "level": "warning",
+            "message": f"{len(_spinning)} PR(s) stuck in review cycles: {pr_nums}",
         })
 
     # ci_failing - CI is broken on the default branch
@@ -1335,6 +1461,9 @@ def build_snapshot(
     sf = daemon_state.systematic_failure
     sf_state = compute_systematic_failure_state(daemon_state, cfg, _now=now)
 
+    # 14b. Spinning PR detection
+    spinning_prs = detect_spinning_prs(changes_requested, threshold=cfg.spinning_review_threshold)
+
     # 15. Recommended actions
     actions, demand = compute_recommended_actions(
         ready_count=ready_count,
@@ -1357,6 +1486,7 @@ def build_snapshot(
         systematic_failure_state=sf_state,
         pipeline_health=p_health,
         orphaned_prs=orphaned_prs,
+        spinning_prs=spinning_prs,
     )
 
     # 16. Promotable proposals
@@ -1385,6 +1515,7 @@ def build_snapshot(
         session_percent=session_percent,
         ci_status=ci_status,
         contradictory_labels=contradictory,
+        spinning_prs=spinning_prs,
     )
 
     # 18. Build support_roles output (schema matches shell)
@@ -1426,6 +1557,8 @@ def build_snapshot(
             "ready_to_merge": ready_to_merge,
             "orphaned": [o.to_dict() for o in orphaned_prs],
             "orphaned_count": len(orphaned_prs),
+            "spinning": [s.to_dict() for s in spinning_prs],
+            "spinning_count": len(spinning_prs),
         },
         "shepherds": {
             "progress": [ep.to_dict() for ep in shepherd_progress],
