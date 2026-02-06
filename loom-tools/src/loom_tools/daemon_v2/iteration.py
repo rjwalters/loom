@@ -20,7 +20,10 @@ from loom_tools.daemon_v2.actions.shepherds import (
     force_reclaim_stale_shepherds,
     spawn_shepherds,
 )
-from loom_tools.daemon_v2.actions.support_roles import spawn_roles_from_actions
+from loom_tools.daemon_v2.actions.support_roles import (
+    reclaim_completed_support_roles,
+    spawn_roles_from_actions,
+)
 from loom_tools.orphan_recovery import run_orphan_recovery
 from loom_tools.snapshot import build_snapshot
 
@@ -93,6 +96,14 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
     #    missing progress files. Runs before action planning so reclaimed
     #    slots are available for new spawns.
     _reclaim_stale_shepherds(ctx)
+
+    # 4b. Detect completed support roles (tmux session exited)
+    #     Support roles have no progress files — we detect completion by
+    #     checking whether their tmux session is still alive.
+    support_completions = _reclaim_completed_support_roles(ctx)
+    for sc in support_completions:
+        handle_completion(ctx, sc)
+    completions.extend(support_completions)
 
     # 5. Get recommended actions
     actions = ctx.get_recommended_actions()
@@ -177,6 +188,32 @@ def _reclaim_stale_shepherds(ctx: DaemonContext) -> None:
         ctx.snapshot["computed"]["available_shepherd_slots"] = max(
             0, ctx.config.max_shepherds - active_shepherds
         )
+
+
+def _reclaim_completed_support_roles(
+    ctx: DaemonContext,
+) -> list:
+    """Detect support roles whose tmux sessions have exited.
+
+    Returns a list of :class:`CompletionEntry` for completed roles so they
+    can be fed through :func:`handle_completion`.
+    """
+    if ctx.state is None:
+        return []
+
+    has_running = any(
+        e.status == "running" for e in ctx.state.support_roles.values()
+    )
+    if not has_running:
+        return []
+
+    completed = reclaim_completed_support_roles(ctx)
+    if completed:
+        log_success(
+            f"Detected {len(completed)} completed support role(s): "
+            + ", ".join(c.name for c in completed)
+        )
+    return completed
 
 
 def _save_daemon_state(ctx: DaemonContext) -> None:

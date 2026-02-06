@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
 from loom_tools.common.logging import log_info, log_success, log_warning
 from loom_tools.common.time_utils import now_utc
+from loom_tools.daemon_v2.actions.completions import CompletionEntry
 from loom_tools.models.daemon_state import SupportRoleEntry
 
 if TYPE_CHECKING:
@@ -169,3 +170,40 @@ def spawn_roles_from_actions(ctx: DaemonContext) -> int:
             spawned += 1
 
     return spawned
+
+
+def reclaim_completed_support_roles(ctx: DaemonContext) -> list[CompletionEntry]:
+    """Detect support roles whose tmux sessions have exited and mark them idle.
+
+    Iterates over all support roles with status ``"running"`` and checks
+    whether their tmux session is still alive.  When a session is gone the
+    role is considered complete and a :class:`CompletionEntry` is returned
+    so the caller can feed it through :func:`handle_completion`.
+
+    Returns a list of ``CompletionEntry`` objects for completed roles.
+    """
+    if ctx.state is None:
+        return []
+
+    completed: list[CompletionEntry] = []
+
+    for role_name, entry in ctx.state.support_roles.items():
+        if entry.status != "running":
+            continue
+
+        # Check if the tmux session is still alive
+        if session_exists(role_name):
+            continue
+
+        log_info(
+            f"Support role {role_name} tmux session exited — marking as completed"
+        )
+
+        completed.append(
+            CompletionEntry(
+                type="support_role",
+                name=role_name,
+            )
+        )
+
+    return completed
