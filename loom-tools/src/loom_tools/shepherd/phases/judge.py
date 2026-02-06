@@ -69,7 +69,7 @@ NEGATIVE_PREFIXES: list[re.Pattern[str]] = [
 
 
 class JudgePhase:
-    """Phase 4: Judge - Review PR, approve or request changes."""
+    """Phase 4: Judge - Evaluate PR, approve or request changes."""
 
     def should_skip(self, ctx: ShepherdContext) -> tuple[bool, str]:
         """Check if judge phase should be skipped.
@@ -212,7 +212,7 @@ class JudgePhase:
                 diag = self._gather_diagnostics(ctx)
                 # Add context about loom:review-requested state (issue #1998)
                 if ctx.has_pr_label("loom:review-requested"):
-                    diag["intermediate_state"] = "doctor_fixed_awaiting_review"
+                    diag["intermediate_state"] = "doctor_fixed_awaiting_judging"
                     log_info(
                         f"PR #{ctx.pr_number} has loom:review-requested (Doctor applied fixes) "
                         "but judge did not produce outcome label"
@@ -335,13 +335,17 @@ class JudgePhase:
         """Attempt fallback changes-requested detection in force mode.
 
         When the standard label-based validation fails in force mode, check
-        for rejection signals in PR comments or a CHANGES_REQUESTED review
-        state. If either condition is met, apply the loom:changes-requested
-        label and return True so the caller can route to the doctor loop.
+        for rejection signals in PR comments. If found, apply the
+        loom:changes-requested label and return True so the caller can route
+        to the doctor loop.
 
         This handles the scenario where the judge worker requested changes
-        but failed to apply the label due to a GitHub API error or timing
-        issue.
+        (left a rejection comment) but failed to apply the label due to a
+        GitHub API error or timing issue.
+
+        Note: The judge agent uses a comment + label workflow ("judging")
+        rather than GitHub's native review API, so only comment-based
+        detection is used here.
 
         Returns:
             True if fallback changes-requested was detected and label applied.
@@ -354,21 +358,16 @@ class JudgePhase:
         )
 
         has_rejection = self._has_rejection_comment(ctx)
-        has_cr_review = self._has_changes_requested_review(ctx)
 
-        if not has_rejection and not has_cr_review:
+        if not has_rejection:
             log_info(
-                "[force-mode] No rejection comment or CHANGES_REQUESTED review "
-                "found — fallback denied"
+                "[force-mode] No rejection comment found — fallback denied"
             )
             return False
 
-        signal = (
-            "rejection comment" if has_rejection else "CHANGES_REQUESTED review state"
-        )
         log_warning(
             f"[force-mode] Fallback changes-requested: PR #{ctx.pr_number} has "
-            f"{signal} — applying loom:changes-requested label"
+            "rejection comment — applying loom:changes-requested label"
         )
 
         result = subprocess.run(
@@ -489,38 +488,6 @@ class JudgePhase:
 
         return False
 
-    def _has_changes_requested_review(self, ctx: ShepherdContext) -> bool:
-        """Check if PR has a CHANGES_REQUESTED review state.
-
-        Uses ``gh pr view --json reviews`` to inspect review states.
-
-        Returns:
-            True if any review has a CHANGES_REQUESTED state.
-        """
-        assert ctx.pr_number is not None
-
-        result = subprocess.run(
-            [
-                "gh",
-                "pr",
-                "view",
-                str(ctx.pr_number),
-                "--json",
-                "reviews",
-            ],
-            cwd=ctx.repo_root,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        data = parse_command_output(result)
-        if not isinstance(data, dict):
-            return False
-
-        reviews = data.get("reviews", [])
-        return any(r.get("state") == "CHANGES_REQUESTED" for r in reviews)
-
     def _pr_checks_passing(self, ctx: ShepherdContext) -> bool:
         """Check if PR status checks are passing and PR is mergeable.
 
@@ -614,13 +581,13 @@ class JudgePhase:
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info when judge validation fails.
 
-        Inspects the judge worker log file, PR review state, and comments
+        Inspects the judge worker log file, PR judging state, and comments
         to provide actionable context about why the judge phase failed.
 
         Distinguishes between (issue #1960):
         - Agent didn't run at all (no log, no activity)
         - Agent started but didn't complete (loom:reviewing but no outcome)
-        - Agent completed review but label failed (comment exists, no label)
+        - Agent completed judging but label failed (comment exists, no label)
         - Agent left no signals (timeout without work)
 
         All commands are best-effort; failures are recorded but never raised.
@@ -651,7 +618,7 @@ class JudgePhase:
         else:
             diag["log_tail"] = []
 
-        # -- PR review state ---------------------------------------------------
+        # -- PR state (labels and any native GitHub reviews) --------------------
         assert ctx.pr_number is not None
         review_result = subprocess.run(
             [
@@ -716,14 +683,16 @@ class JudgePhase:
         # -- Human-readable summary --------------------------------------------
         parts: list[str] = []
 
-        # Review state
-        if diag["pr_reviews"]:
-            review_states = [
-                f"{r.get('state', 'unknown')}" for r in diag["pr_reviews"]
-            ]
-            parts.append(f"reviews=[{', '.join(review_states)}]")
+        # Judging state (comment + label signals)
+        comment_signals: list[str] = []
+        if has_approval_comment:
+            comment_signals.append("approval")
+        if has_rejection_comment:
+            comment_signals.append("rejection")
+        if comment_signals:
+            parts.append(f"judge comments=[{', '.join(comment_signals)}]")
         else:
-            parts.append("no GitHub reviews on PR (Loom uses comment + label workflow instead)")
+            parts.append("no judge comments detected")
 
         # Labels
         loom_labels = [
@@ -754,8 +723,8 @@ class JudgePhase:
             "agent_never_ran": "Judge agent did not start (no log file created)",
             "agent_started_no_meaningful_output": "Judge agent spawned but produced only terminal escape sequences (likely timeout or prompt failure)",
             "agent_started_no_work": "Judge started but did not claim the PR (no loom:reviewing label)",
-            "comment_exists_label_missing": "Judge left a comment but failed to apply the label (API failure?)",
-            "started_reviewing_incomplete": "Judge claimed PR (loom:reviewing) but did not complete (timeout?)",
+            "comment_exists_label_missing": "Judge left a comment but failed to apply the outcome label (API failure?)",
+            "started_reviewing_incomplete": "Judge claimed PR (loom:reviewing) but did not complete judging (timeout?)",
             # Issue #1998: Add explanation for Doctor-fixed intermediate state
             "doctor_fixed_awaiting_outcome": (
                 "PR has loom:review-requested (Doctor applied fixes) but judge "

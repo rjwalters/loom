@@ -190,7 +190,7 @@ class TestShepherdConfig:
         """Default retry limits should be set."""
         config = ShepherdConfig(issue=42)
         assert config.doctor_max_retries == 3
-        assert config.judge_max_retries == 1
+        assert config.judge_max_retries == 3
         assert config.stuck_max_retries == 1
 
     def test_judge_max_retries_env_override(self) -> None:

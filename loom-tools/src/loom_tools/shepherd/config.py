@@ -165,7 +165,7 @@ class ShepherdConfig:
         default_factory=lambda: env_int("LOOM_DOCTOR_MAX_RETRIES", 3)
     )
     judge_max_retries: int = field(
-        default_factory=lambda: env_int("LOOM_JUDGE_MAX_RETRIES", 1)
+        default_factory=lambda: env_int("LOOM_JUDGE_MAX_RETRIES", 3)
     )
     stuck_max_retries: int = field(
         default_factory=lambda: env_int("LOOM_STUCK_MAX_RETRIES", 1)
