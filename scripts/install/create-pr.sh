@@ -206,7 +206,6 @@ if [[ -z "${PR_BODY:-}" ]]; then
 This PR adds Loom orchestration framework to the repository.
 
 **Loom Version**: ${LOOM_VERSION}
-**Loom Commit**: ${LOOM_COMMIT}
 
 ## What's Included
 
@@ -236,7 +235,7 @@ fi
 
 # Use custom PR title if provided, otherwise default install title
 if [[ -z "${PR_TITLE:-}" ]]; then
-  PR_TITLE="Install Loom ${LOOM_VERSION} (${LOOM_COMMIT})"
+  PR_TITLE="Install Loom ${LOOM_VERSION}"
 fi
 
 # Create pull request and capture the URL
