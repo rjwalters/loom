@@ -532,6 +532,57 @@ def detect_orphaned_shepherds(
 
 
 # ---------------------------------------------------------------------------
+# Orphaned PR detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OrphanedPR:
+    """A PR that needs attention but has no active shepherd tracking it."""
+
+    pr_number: int
+    needed_role: str  # "judge" or "doctor"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"pr_number": self.pr_number, "needed_role": self.needed_role}
+
+
+def detect_orphaned_prs(
+    daemon_state: DaemonState,
+    review_requested: list[dict[str, Any]],
+    changes_requested: list[dict[str, Any]],
+) -> list[OrphanedPR]:
+    """Detect PRs needing attention that no active shepherd is tracking.
+
+    A PR is orphaned when it has ``loom:review-requested`` (needs judge) or
+    ``loom:changes-requested`` (needs doctor) but no working shepherd has it
+    as its ``pr_number``.
+
+    Returns orphaned PRs sorted by PR number ascending (FIFO).
+    """
+    # Collect PR numbers tracked by active shepherds
+    tracked_prs: set[int] = set()
+    for entry in daemon_state.shepherds.values():
+        if entry.status == "working" and entry.pr_number is not None:
+            tracked_prs.add(entry.pr_number)
+
+    orphaned: list[OrphanedPR] = []
+
+    for pr in review_requested:
+        pr_num = pr.get("number")
+        if pr_num is not None and pr_num not in tracked_prs:
+            orphaned.append(OrphanedPR(pr_number=pr_num, needed_role="judge"))
+
+    for pr in changes_requested:
+        pr_num = pr.get("number")
+        if pr_num is not None and pr_num not in tracked_prs:
+            orphaned.append(OrphanedPR(pr_number=pr_num, needed_role="doctor"))
+
+    # Sort by PR number ascending (FIFO — oldest PR first)
+    orphaned.sort(key=lambda o: o.pr_number)
+    return orphaned
+
+
+# ---------------------------------------------------------------------------
 # Pipeline health computation
 # ---------------------------------------------------------------------------
 
@@ -727,14 +778,16 @@ def compute_recommended_actions(
     systematic_failure_active: bool = False,
     systematic_failure_state: SystematicFailureState | None = None,
     pipeline_health: PipelineHealth | None = None,
-) -> tuple[list[str], dict[str, bool]]:
+    orphaned_prs: list[OrphanedPR] | None = None,
+) -> tuple[list[str], dict[str, Any]]:
     """Compute recommended actions and demand flags.
 
     Returns ``(actions, demand_flags)`` where demand_flags has keys
-    ``champion_demand``, ``doctor_demand``, ``judge_demand``.
+    ``champion_demand``, ``doctor_demand``, ``judge_demand``,
+    and optionally ``doctor_targeted_prs`` and ``judge_targeted_prs``.
     """
     actions: list[str] = []
-    demand = {"champion_demand": False, "doctor_demand": False, "judge_demand": False}
+    demand: dict[str, Any] = {"champion_demand": False, "doctor_demand": False, "judge_demand": False}
 
     # Action: promote proposals (for force mode)
     if total_proposals > 0:
@@ -778,6 +831,13 @@ def compute_recommended_actions(
         actions.append("check_stuck")
 
     # Demand-based spawning
+    # Targeted dispatch takes precedence over generic demand: if orphaned PRs
+    # exist, dispatch the first one (FIFO) with the PR number so the agent
+    # can target it directly.
+    _orphaned = orphaned_prs or []
+    doctor_targeted = [o for o in _orphaned if o.needed_role == "doctor"]
+    judge_targeted = [o for o in _orphaned if o.needed_role == "judge"]
+
     champion_status = support_roles.get("champion", SupportRoleState()).status
     if merge_count > 0 and champion_status != "running":
         actions.append("spawn_champion_demand")
@@ -785,12 +845,20 @@ def compute_recommended_actions(
 
     doctor_status = support_roles.get("doctor", SupportRoleState()).status
     if changes_count > 0 and doctor_status != "running":
-        actions.append("spawn_doctor_demand")
+        if doctor_targeted:
+            actions.append("spawn_doctor_targeted")
+            demand["doctor_targeted_prs"] = [o.pr_number for o in doctor_targeted]
+        else:
+            actions.append("spawn_doctor_demand")
         demand["doctor_demand"] = True
 
     judge_status = support_roles.get("judge", SupportRoleState()).status
     if review_count > 0 and judge_status != "running":
-        actions.append("spawn_judge_demand")
+        if judge_targeted:
+            actions.append("spawn_judge_targeted")
+            demand["judge_targeted_prs"] = [o.pr_number for o in judge_targeted]
+        else:
+            actions.append("spawn_judge_demand")
         demand["judge_demand"] = True
 
     # Interval-based triggers (skip if demand trigger handles it)
@@ -1090,7 +1158,10 @@ def build_snapshot(
     orphaned = detect_orphaned_shepherds(daemon_state, building_issues, shepherd_progress)
     orphaned_count = len(orphaned)
 
-    # 12. Pipeline health (retry/backoff classification)
+    # 12. Orphaned PRs (PRs needing attention without an active shepherd)
+    orphaned_prs = detect_orphaned_prs(daemon_state, review_requested, changes_requested)
+
+    # 13. Pipeline health (retry/backoff classification)
     p_health = compute_pipeline_health(
         ready_count=ready_count,
         building_count=building_count,
@@ -1102,11 +1173,11 @@ def build_snapshot(
         now=now,
     )
 
-    # 13. Systematic failure detection and state computation
+    # 14. Systematic failure detection and state computation
     sf = daemon_state.systematic_failure
     sf_state = compute_systematic_failure_state(daemon_state, cfg, _now=now)
 
-    # 14. Recommended actions
+    # 15. Recommended actions
     actions, demand = compute_recommended_actions(
         ready_count=ready_count,
         building_count=building_count,
@@ -1127,9 +1198,10 @@ def build_snapshot(
         systematic_failure_active=sf.active,
         systematic_failure_state=sf_state,
         pipeline_health=p_health,
+        orphaned_prs=orphaned_prs,
     )
 
-    # 15. Promotable proposals
+    # 16. Promotable proposals
     promotable_proposals = (
         [i["number"] for i in architect_proposals]
         + [i["number"] for i in hermit_proposals]
@@ -1190,6 +1262,8 @@ def build_snapshot(
             "review_requested": review_requested,
             "changes_requested": changes_requested,
             "ready_to_merge": ready_to_merge,
+            "orphaned": [o.to_dict() for o in orphaned_prs],
+            "orphaned_count": len(orphaned_prs),
         },
         "shepherds": {
             "progress": [ep.to_dict() for ep in shepherd_progress],
@@ -1244,6 +1318,8 @@ def build_snapshot(
             "champion_demand": demand["champion_demand"],
             "doctor_demand": demand["doctor_demand"],
             "judge_demand": demand["judge_demand"],
+            "doctor_targeted_prs": demand.get("doctor_targeted_prs", []),
+            "judge_targeted_prs": demand.get("judge_targeted_prs", []),
             "execution_mode": tmux_pool.execution_mode,
             "tmux_available": tmux_pool.available,
             "tmux_shepherd_count": tmux_pool.shepherd_count,
