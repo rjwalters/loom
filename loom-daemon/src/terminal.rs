@@ -11,8 +11,11 @@ use std::process::Command;
 /// - Standard ANSI escape sequences: ESC[...letter (colors, cursor, modes)
 /// - Terminal mode queries: ESC[?...h/l (like ?2026h/l)
 /// - OSC sequences: ESC]...BEL (title setting, etc.)
+/// - Carriage returns (\r) from TUI line rewriting
+/// - Backspaces (\x08) from cursor corrections
+/// - Bare escape sequences (ESC not followed by [ or ]) from raw cursor movement
 fn pipe_pane_cmd(output_file: &str) -> String {
-    format!("sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\\x1b\\][^\\x07]*\\x07//g' >> {output_file}")
+    format!("sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; s/\\x1b\\][^\\x07]*\\x07//g; s/\\r//g; s/\\x08//g; s/\\x1b[^][]//g' >> {output_file}")
 }
 
 pub struct TerminalManager {
