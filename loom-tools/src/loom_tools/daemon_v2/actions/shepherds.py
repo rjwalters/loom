@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
 from loom_tools.common.github import gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
-from loom_tools.common.paths import LoomPaths
 from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
 from loom_tools.models.daemon_state import ShepherdEntry
 
