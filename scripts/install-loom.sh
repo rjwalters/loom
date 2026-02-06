@@ -426,6 +426,64 @@ if [[ ! -d "$LOOM_ROOT/scripts/install" ]]; then
 fi
 
 # ============================================================================
+# PRE-FLIGHT: Idempotency Checks
+# ============================================================================
+# Skip idempotency checks if --force or --clean flags are set
+if [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
+  header "Pre-flight: Idempotency Checks"
+  echo ""
+
+  # Check 1: Is Loom already installed with the same version?
+  if [[ -f "$TARGET_PATH/CLAUDE.md" ]]; then
+    INSTALLED_VERSION=$(grep 'Loom Version' "$TARGET_PATH/CLAUDE.md" 2>/dev/null | head -1 | sed 's/.*Loom Version.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
+    if [[ "$INSTALLED_VERSION" == "$LOOM_VERSION" ]]; then
+      info "Loom v${LOOM_VERSION} is already installed in this repository."
+      info "Use --force to reinstall or --clean for a fresh install."
+      echo ""
+
+      # Disable error trap and exit successfully
+      trap - EXIT SIGINT SIGTERM
+      exit 0
+    elif [[ -n "$INSTALLED_VERSION" ]]; then
+      info "Existing Loom installation detected: v${INSTALLED_VERSION}"
+      info "Upgrading to: v${LOOM_VERSION}"
+    fi
+  fi
+
+  # Check 2: Is there already an open installation PR?
+  REPO_NWOPATH=$(git -C "$TARGET_PATH" config --get remote.origin.url 2>/dev/null | sed -E 's#^.*(github\.com[/:])##; s/\.git$//' || true)
+  if [[ -n "$REPO_NWOPATH" ]] && [[ "$REPO_NWOPATH" =~ ^[^/]+/[^/]+$ ]]; then
+    EXISTING_INSTALL_PR=$(gh pr list -R "$REPO_NWOPATH" --state open --search "Install Loom" --json url,headRefName --jq '
+      [.[] | select(.headRefName | startswith("feature/loom-installation"))][0].url' 2>/dev/null || true)
+
+    if [[ -n "$EXISTING_INSTALL_PR" ]]; then
+      warning "An open Loom installation PR already exists:"
+      info "  ${EXISTING_INSTALL_PR}"
+      echo ""
+
+      if [[ "$NON_INTERACTIVE" == "true" ]]; then
+        info "Non-interactive mode: Skipping duplicate installation."
+        info "Use --force to create a new PR regardless."
+        echo ""
+        trap - EXIT SIGINT SIGTERM
+        exit 0
+      else
+        read -r -p "Create a new installation PR anyway? [y/N] " -n 1 CREATE_ANYWAY
+        echo ""
+        if [[ ! $CREATE_ANYWAY =~ ^[Yy]$ ]]; then
+          info "Aborting. Merge or close the existing PR first, or use --force."
+          trap - EXIT SIGINT SIGTERM
+          exit 0
+        fi
+      fi
+    fi
+  fi
+
+  success "Idempotency checks passed"
+  echo ""
+fi
+
+# ============================================================================
 # STEP 1: Validate Target Repository
 # ============================================================================
 CURRENT_STEP="Validate Target"
@@ -546,6 +604,18 @@ fi
 info "Recording Loom source path..."
 echo "$LOOM_ROOT" > .loom/loom-source-path
 success "Loom source path recorded"
+
+# Store installation metadata (commit hash moved here from CLAUDE.md for idempotency)
+info "Recording installation metadata..."
+cat > .loom/install-metadata.json <<METADATA
+{
+  "loom_version": "${LOOM_VERSION}",
+  "loom_commit": "${LOOM_COMMIT}",
+  "install_date": "$(date +%Y-%m-%d)",
+  "loom_source": "${LOOM_ROOT}"
+}
+METADATA
+success "Installation metadata recorded"
 echo ""
 
 # Verify expected files were created
