@@ -73,6 +73,8 @@ class SnapshotConfig:
     systematic_failure_max_probes: int = 3  # Max probes before giving up
     # CI health check configuration
     ci_health_check_enabled: bool = True  # Enable CI status monitoring
+    # Heartbeat grace period for newly spawned shepherds
+    heartbeat_grace_period: int = 300  # 5 minutes
 
     @classmethod
     def from_env(cls) -> SnapshotConfig:
@@ -106,6 +108,7 @@ class SnapshotConfig:
             systematic_failure_cooldown=_int("LOOM_SYSTEMATIC_FAILURE_COOLDOWN", 1800),
             systematic_failure_max_probes=_int("LOOM_SYSTEMATIC_FAILURE_MAX_PROBES", 3),
             ci_health_check_enabled=os.environ.get("LOOM_CI_HEALTH_CHECK", "true").lower() not in ("false", "0", "no"),
+            heartbeat_grace_period=_int("LOOM_HEARTBEAT_GRACE_PERIOD", 300),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -378,6 +381,15 @@ def compute_shepherd_progress(
                 age = _elapsed(sp.last_heartbeat, now)
                 if age > cfg.heartbeat_stale_threshold:
                     stale = True
+            except (ValueError, OSError):
+                pass
+
+        # Grace period: don't flag recently spawned shepherds as stale
+        if stale and sp.started_at:
+            try:
+                spawn_age = _elapsed(sp.started_at, now)
+                if spawn_age < cfg.heartbeat_grace_period:
+                    stale = False
             except (ValueError, OSError):
                 pass
 
@@ -1494,6 +1506,7 @@ ENVIRONMENT VARIABLES:
     LOOM_JUDGE_INTERVAL      Judge re-trigger interval in seconds (default: 300)
     LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
     LOOM_HEARTBEAT_STALE_THRESHOLD  Heartbeat staleness threshold (default: 120)
+    LOOM_HEARTBEAT_GRACE_PERIOD     Grace period for new shepherds (default: 300)
     LOOM_TMUX_SOCKET         Tmux socket name (default: loom)
     LOOM_MAX_RETRY_COUNT     Max retries for blocked issues (default: 3)
     LOOM_RETRY_COOLDOWN      Initial retry cooldown in seconds (default: 1800)

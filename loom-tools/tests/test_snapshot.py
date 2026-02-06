@@ -68,6 +68,7 @@ def _cfg(**overrides: object) -> SnapshotConfig:
         "judge_interval": 300,
         "issue_strategy": "fifo",
         "heartbeat_stale_threshold": 120,
+        "heartbeat_grace_period": 300,
         "tmux_socket": "loom",
         "systematic_failure_cooldown": 1800,
         "systematic_failure_max_probes": 3,
@@ -319,6 +320,118 @@ class TestHeartbeatStaleness:
         (tmp_path / ".loom").mkdir(parents=True)
         result = compute_shepherd_progress(tmp_path, _cfg(), _now=NOW)
         assert result == []
+
+    def test_grace_period_new_shepherd_no_heartbeat(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd spawned 60s ago with no heartbeat -> NOT stale (within grace period)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "2026-01-30T17:59:00Z",  # 60s ago
+            # no last_heartbeat
+        }))
+        cfg = _cfg(heartbeat_stale_threshold=120, heartbeat_grace_period=300)
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is False
+        assert result[0].heartbeat_age_seconds == -1
+
+    def test_grace_period_new_shepherd_stale_heartbeat(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd spawned 60s ago with stale heartbeat -> NOT stale (grace period overrides)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "2026-01-30T17:59:00Z",  # 60s ago
+            "last_heartbeat": "2026-01-30T17:55:00Z",  # 300s ago — stale
+        }))
+        cfg = _cfg(heartbeat_stale_threshold=120, heartbeat_grace_period=300)
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is False
+        assert result[0].heartbeat_age_seconds == 300
+
+    def test_grace_period_old_shepherd_stale_heartbeat(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd spawned 10 minutes ago with 3-minute-old heartbeat -> stale (past grace period)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "2026-01-30T17:50:00Z",  # 10 min ago
+            "last_heartbeat": "2026-01-30T17:57:00Z",  # 180s ago — stale
+        }))
+        cfg = _cfg(heartbeat_stale_threshold=120, heartbeat_grace_period=300)
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is True
+        assert result[0].heartbeat_age_seconds == 180
+
+    def test_grace_period_old_shepherd_fresh_heartbeat(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd spawned 10 minutes ago with fresh heartbeat -> NOT stale (normal operation)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "2026-01-30T17:50:00Z",  # 10 min ago
+            "last_heartbeat": "2026-01-30T17:59:30Z",  # 30s ago — fresh
+        }))
+        cfg = _cfg(heartbeat_stale_threshold=120, heartbeat_grace_period=300)
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is False
+        assert result[0].heartbeat_age_seconds == 30
+
+    def test_grace_period_configurable_via_env(self) -> None:
+        """Grace period configurable via LOOM_HEARTBEAT_GRACE_PERIOD env var."""
+        from unittest import mock as _mock
+        with _mock.patch.dict("os.environ", {"LOOM_HEARTBEAT_GRACE_PERIOD": "600"}):
+            cfg = SnapshotConfig.from_env()
+        assert cfg.heartbeat_grace_period == 600
+
+    def test_grace_period_default(self) -> None:
+        """Default grace period is 300 seconds."""
+        cfg = SnapshotConfig()
+        assert cfg.heartbeat_grace_period == 300
+
+    def test_grace_period_missing_started_at(self, tmp_path: pathlib.Path) -> None:
+        """Missing started_at falls back to existing behavior (no grace period applied)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "last_heartbeat": "2026-01-30T17:55:00Z",  # 300s ago — stale
+            # no started_at
+        }))
+        cfg = _cfg(heartbeat_stale_threshold=120, heartbeat_grace_period=300)
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is True
+
+    def test_grace_period_malformed_started_at(self, tmp_path: pathlib.Path) -> None:
+        """Malformed started_at falls back to existing behavior (stale detection applies)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "not-a-timestamp",
+            "last_heartbeat": "2026-01-30T17:55:00Z",  # 300s ago — stale
+        }))
+        cfg = _cfg(heartbeat_stale_threshold=120, heartbeat_grace_period=300)
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is True
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1383,7 @@ class TestEnvironmentVariables:
             "LOOM_SYSTEMATIC_FAILURE_THRESHOLD": "4",
             "LOOM_SYSTEMATIC_FAILURE_COOLDOWN": "3600",
             "LOOM_SYSTEMATIC_FAILURE_MAX_PROBES": "5",
+            "LOOM_HEARTBEAT_GRACE_PERIOD": "600",
         }
         with mock.patch.dict("os.environ", env, clear=False):
             cfg = SnapshotConfig.from_env()
@@ -1294,6 +1408,7 @@ class TestEnvironmentVariables:
         assert cfg.systematic_failure_threshold == 4
         assert cfg.systematic_failure_cooldown == 3600
         assert cfg.systematic_failure_max_probes == 5
+        assert cfg.heartbeat_grace_period == 600
 
 
 # ---------------------------------------------------------------------------
