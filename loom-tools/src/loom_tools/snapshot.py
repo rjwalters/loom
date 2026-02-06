@@ -39,6 +39,7 @@ from loom_tools.common.state import (
 )
 from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
 from loom_tools.models.daemon_state import DaemonState, SupportRoleEntry
+from loom_tools.shepherd.labels import LABEL_EXCLUSION_GROUPS
 
 # ---------------------------------------------------------------------------
 # Configuration (18 env vars, same defaults as shell version)
@@ -902,6 +903,75 @@ def compute_recommended_actions(
 
 
 # ---------------------------------------------------------------------------
+# Contradictory label detection
+# ---------------------------------------------------------------------------
+
+def detect_contradictory_labels(
+    pipeline_data: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Detect entities with contradictory labels from exclusion groups.
+
+    Uses the pipeline data (which queries PRs/issues by label in parallel)
+    to find entities appearing in multiple mutually-exclusive result sets.
+
+    Returns a list of dicts with:
+        entity_type: "pr" or "issue"
+        number: entity number
+        conflicting_labels: list of conflicting label names
+    """
+    conflicts: list[dict[str, Any]] = []
+
+    # PR exclusion group: loom:pr, loom:changes-requested, loom:review-requested
+    # These map to pipeline keys: ready_to_merge, changes_requested, review_requested
+    pr_label_map: dict[str, str] = {
+        "review_requested": "loom:review-requested",
+        "changes_requested": "loom:changes-requested",
+        "ready_to_merge": "loom:pr",
+    }
+
+    # Build a dict of PR number -> set of labels found
+    pr_labels: dict[int, set[str]] = {}
+    for key, label in pr_label_map.items():
+        for item in pipeline_data.get(key, []):
+            num = item.get("number")
+            if num is not None:
+                pr_labels.setdefault(num, set()).add(label)
+
+    for num, labels in pr_labels.items():
+        if len(labels) > 1:
+            conflicts.append({
+                "entity_type": "pr",
+                "number": num,
+                "conflicting_labels": sorted(labels),
+            })
+
+    # Issue exclusion group: loom:issue, loom:building, loom:blocked
+    # These map to pipeline keys: ready_issues, building_issues, blocked_issues
+    issue_label_map: dict[str, str] = {
+        "ready_issues": "loom:issue",
+        "building_issues": "loom:building",
+        "blocked_issues": "loom:blocked",
+    }
+
+    issue_labels: dict[int, set[str]] = {}
+    for key, label in issue_label_map.items():
+        for item in pipeline_data.get(key, []):
+            num = item.get("number")
+            if num is not None:
+                issue_labels.setdefault(num, set()).add(label)
+
+    for num, labels in issue_labels.items():
+        if len(labels) > 1:
+            conflicts.append({
+                "entity_type": "issue",
+                "number": num,
+                "conflicting_labels": sorted(labels),
+            })
+
+    return conflicts
+
+
+# ---------------------------------------------------------------------------
 # Health warnings and status
 # ---------------------------------------------------------------------------
 
@@ -916,12 +986,25 @@ def compute_health(
     usage_healthy: bool,
     session_percent: float,
     ci_status: dict[str, Any] | None = None,
+    contradictory_labels: list[dict[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, str]]]:
     """Compute health status and warnings.
 
     Returns ``(health_status, health_warnings)``.
     """
     warnings: list[dict[str, str]] = []
+
+    # contradictory_labels — entities with mutually exclusive labels
+    if contradictory_labels:
+        for conflict in contradictory_labels:
+            entity_type = conflict.get("entity_type", "entity")
+            number = conflict.get("number", "?")
+            labels = ", ".join(conflict.get("conflicting_labels", []))
+            warnings.append({
+                "code": "contradictory_labels",
+                "level": "warning",
+                "message": f"{entity_type} #{number} has contradictory labels: {labels}",
+            })
 
     # pipeline_stalled
     if ready_count == 0 and building_count == 0 and blocked_count > 0:
@@ -1212,6 +1295,9 @@ def build_snapshot(
     session_percent = _extract_session_percent(usage)
     usage_healthy = session_percent < 97 if isinstance(session_percent, (int, float)) else True
 
+    # 16b. Contradictory label detection
+    contradictory = detect_contradictory_labels(pipeline)
+
     # 17. Health status
     health_status, health_warnings = compute_health(
         ready_count=ready_count,
@@ -1223,6 +1309,7 @@ def build_snapshot(
         usage_healthy=usage_healthy,
         session_percent=session_percent,
         ci_status=ci_status,
+        contradictory_labels=contradictory,
     )
 
     # 18. Build support_roles output (schema matches shell)
@@ -1274,6 +1361,8 @@ def build_snapshot(
         "validation": {
             "invalid_task_ids": invalid_task_ids,
             "invalid_task_id_count": invalid_task_id_count,
+            "contradictory_labels": contradictory,
+            "contradictory_label_count": len(contradictory),
         },
         "support_roles": support_roles_out,
         "pipeline_health": {
