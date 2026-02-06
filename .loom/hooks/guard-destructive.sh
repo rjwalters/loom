@@ -11,45 +11,88 @@
 #
 # Output format (Claude Code hooks spec):
 #   { "hookSpecificOutput": { "permissionDecision": "deny|ask", "permissionDecisionReason": "..." } }
+#
+# Error handling: This script MUST never exit with a non-zero code or produce
+# invalid output. Any internal error is caught by the trap, logged for
+# diagnostics, and results in an "allow" decision to prevent infinite retry
+# loops in Claude Code.
 
-set -euo pipefail
+# Determine log directory relative to this script's location
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
+HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
 
-INPUT=$(cat)
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
-CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
+# Log a diagnostic error message (best-effort, never fails the script)
+log_hook_error() {
+    local msg="$1"
+    # Ensure log directory exists
+    mkdir -p "$(dirname "$HOOK_ERROR_LOG")" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [guard-destructive] $msg" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+}
+
+# Top-level error trap: on ANY unexpected error, output valid JSON "allow"
+# and log the failure for debugging. This prevents Claude Code from showing
+# "PreToolUse:Bash hook error" which causes infinite retry loops.
+trap 'log_hook_error "Unexpected error on line ${LINENO}: ${BASH_COMMAND:-unknown} (exit=$?)"; exit 0' ERR
+
+# Read stdin safely — if cat or jq fails, the ERR trap fires and we allow
+INPUT=$(cat 2>/dev/null) || INPUT=""
+
+# Verify jq is available before attempting to parse
+if ! command -v jq &>/dev/null; then
+    log_hook_error "jq not found in PATH — allowing command (cannot parse input)"
+    exit 0
+fi
+
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null) || COMMAND=""
+CWD=$(echo "$INPUT" | jq -r '.cwd // empty' 2>/dev/null) || CWD=""
 
 # If no command to check, allow
 if [[ -z "$COMMAND" ]]; then
     exit 0
 fi
 
-# Resolve repo root from cwd
+# Resolve repo root from cwd (handles worktree paths safely)
 REPO_ROOT=""
-if [[ -n "$CWD" ]]; then
+if [[ -n "$CWD" ]] && [[ -d "$CWD" ]]; then
     REPO_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)
+elif [[ -n "$CWD" ]]; then
+    # CWD doesn't exist (e.g., deleted worktree) — log but continue without repo root
+    log_hook_error "cwd does not exist: $CWD — skipping repo root resolution"
 fi
 
 # Helper: output a deny decision and exit
 deny() {
     local reason="$1"
-    jq -n --arg reason "$reason" '{
+    if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             permissionDecision: "deny",
             permissionDecisionReason: $reason
         }
-    }'
+    }' 2>/dev/null; then
+        exit 0
+    fi
+    # jq failed — emit raw JSON as fallback
+    local escaped_reason
+    escaped_reason=$(echo "$reason" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\n/\\n/g')
+    echo "{\"hookSpecificOutput\":{\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"${escaped_reason}\"}}"
     exit 0
 }
 
 # Helper: output an ask decision and exit
 ask() {
     local reason="$1"
-    jq -n --arg reason "$reason" '{
+    if jq -n --arg reason "$reason" '{
         hookSpecificOutput: {
             permissionDecision: "ask",
             permissionDecisionReason: $reason
         }
-    }'
+    }' 2>/dev/null; then
+        exit 0
+    fi
+    # jq failed — emit raw JSON as fallback
+    local escaped_reason
+    escaped_reason=$(echo "$reason" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\n/\\n/g')
+    echo "{\"hookSpecificOutput\":{\"permissionDecision\":\"ask\",\"permissionDecisionReason\":\"${escaped_reason}\"}}"
     exit 0
 }
 
