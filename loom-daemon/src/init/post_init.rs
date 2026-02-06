@@ -50,12 +50,39 @@ pub fn generate_manifest(workspace_path: &Path) {
 pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     let gitignore_path = workspace_path.join(".gitignore");
 
-    // Ephemeral files that should be ignored
+    // Ephemeral/runtime files that should be ignored.
+    // Keep in sync with the Loom source repo's .gitignore (lines 36–75).
     let ephemeral_patterns = [
-        ".loom/state.json",
+        ".loom-in-use",
+        ".loom/.daemon.pid",
+        ".loom/.daemon.log",
+        ".loom/daemon.sock",
+        ".loom/daemon-state.json",
+        ".loom/daemon-loop.pid",
+        ".loom/daemon-metrics.json",
+        ".loom/loom-source-path",
+        ".loom/[0-9][0-9]-daemon-state.json",
+        ".loom/stuck-history.json",
+        ".loom/alerts.json",
+        ".loom/health-metrics.json",
+        ".loom/interventions/",
         ".loom/worktrees/",
+        ".loom/state.json",
+        ".loom/mcp-command.json",
+        ".loom/activity.db",
+        ".loom/claims/",
+        ".loom/signals/",
+        ".loom/status/",
+        ".loom/progress/",
+        ".loom/diagnostics/",
+        ".loom/guide-docs-state.json",
+        ".loom/metrics_state.json",
+        ".loom/manifest.json",
+        ".loom/stuck-config.json",
+        ".loom/metrics/",
         ".loom/*.log",
         ".loom/*.sock",
+        ".loom/logs/",
     ];
 
     if gitignore_path.exists() {
@@ -84,7 +111,7 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
         }
     } else {
         // Create .gitignore with ephemeral patterns
-        let mut loom_entries = String::from("# Loom - AI Development Orchestration\n");
+        let mut loom_entries = String::from("# Loom runtime state (don't commit these)\n");
         for pattern in &ephemeral_patterns {
             loom_entries.push_str(pattern);
             loom_entries.push('\n');
@@ -94,4 +121,121 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn creates_gitignore_with_all_patterns_when_none_exists() {
+        let tmp = TempDir::new().unwrap();
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+
+        // Spot-check key runtime patterns
+        assert!(contents.contains(".loom-in-use"));
+        assert!(contents.contains(".loom/daemon-state.json"));
+        assert!(contents.contains(".loom/worktrees/"));
+        assert!(contents.contains(".loom/progress/"));
+        assert!(contents.contains(".loom/*.log"));
+        assert!(contents.contains(".loom/logs/"));
+        assert!(contents.contains(".loom/daemon-metrics.json"));
+        assert!(contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
+        assert!(contents.contains(".loom/activity.db"));
+        assert!(contents.contains("# Loom runtime state"));
+    }
+
+    #[test]
+    fn appends_missing_patterns_to_existing_gitignore() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // Pre-existing gitignore with only old patterns
+        fs::write(&gitignore, "node_modules/\n.loom/state.json\n.loom/worktrees/\n").unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // Original content preserved
+        assert!(contents.contains("node_modules/"));
+        // Pre-existing patterns not duplicated
+        assert_eq!(contents.matches(".loom/state.json").count(), 1);
+        assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
+        // New patterns added
+        assert!(contents.contains(".loom-in-use"));
+        assert!(contents.contains(".loom/daemon-state.json"));
+        assert!(contents.contains(".loom/progress/"));
+        assert!(contents.contains(".loom/activity.db"));
+    }
+
+    #[test]
+    fn does_not_duplicate_patterns_on_repeated_runs() {
+        let tmp = TempDir::new().unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+
+        assert_eq!(contents.matches(".loom/daemon-state.json").count(), 1);
+        assert_eq!(contents.matches(".loom-in-use").count(), 1);
+        assert_eq!(contents.matches(".loom/worktrees/").count(), 1);
+    }
+
+    #[test]
+    fn covers_all_source_repo_gitignore_patterns() {
+        // Verify that every Loom runtime pattern from the source .gitignore
+        // is present in the ephemeral_patterns list by running update_gitignore
+        // and checking the output.
+        let tmp = TempDir::new().unwrap();
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+
+        let expected = [
+            ".loom-in-use",
+            ".loom/.daemon.pid",
+            ".loom/.daemon.log",
+            ".loom/daemon.sock",
+            ".loom/daemon-state.json",
+            ".loom/daemon-loop.pid",
+            ".loom/daemon-metrics.json",
+            ".loom/loom-source-path",
+            ".loom/[0-9][0-9]-daemon-state.json",
+            ".loom/stuck-history.json",
+            ".loom/alerts.json",
+            ".loom/health-metrics.json",
+            ".loom/interventions/",
+            ".loom/worktrees/",
+            ".loom/state.json",
+            ".loom/mcp-command.json",
+            ".loom/activity.db",
+            ".loom/claims/",
+            ".loom/signals/",
+            ".loom/status/",
+            ".loom/progress/",
+            ".loom/diagnostics/",
+            ".loom/guide-docs-state.json",
+            ".loom/metrics_state.json",
+            ".loom/manifest.json",
+            ".loom/stuck-config.json",
+            ".loom/metrics/",
+            ".loom/*.log",
+            ".loom/*.sock",
+            ".loom/logs/",
+        ];
+
+        for pattern in &expected {
+            assert!(
+                contents.contains(pattern),
+                "Missing pattern in generated .gitignore: {pattern}"
+            );
+        }
+    }
 }

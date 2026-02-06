@@ -204,10 +204,8 @@ Thumbs.db
 *.log
 logs/
 
-# Loom (will be added by installation)
-# .loom/state.json
-# .loom/worktrees/
-# .loom/*.log
+# Loom runtime state (added by loom-daemon init)
+# These patterns are also managed by loom-daemon's update_gitignore().
 GITIGNORE
     success "Created .gitignore"
   fi
