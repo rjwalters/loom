@@ -5,12 +5,14 @@ Each module handles a specific category of daemon actions:
 - shepherds: Spawn shepherds for ready issues
 - support_roles: Spawn support roles (interval and demand-based)
 - proposals: Auto-promote proposals in force mode
+- retry_blocked: Retry blocked issues after cooldown
 """
 
 from loom_tools.daemon_v2.actions.completions import check_completions, handle_completion
 from loom_tools.daemon_v2.actions.shepherds import spawn_shepherds
 from loom_tools.daemon_v2.actions.support_roles import spawn_support_role
 from loom_tools.daemon_v2.actions.proposals import promote_proposals
+from loom_tools.daemon_v2.actions.retry_blocked import retry_blocked_issues
 
 __all__ = [
     "check_completions",
@@ -18,4 +20,5 @@ __all__ = [
     "spawn_shepherds",
     "spawn_support_role",
     "promote_proposals",
+    "retry_blocked_issues",
 ]
