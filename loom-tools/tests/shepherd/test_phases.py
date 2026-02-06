@@ -3933,7 +3933,7 @@ class TestJudgePhase:
 
         judge = JudgePhase()
         fake_diag = {
-            "summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead); no loom labels on PR; log file not found",
+            "summary": "no judge comments detected; no loom labels on PR; log file not found",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": False,
             "log_tail": [],
@@ -3952,7 +3952,7 @@ class TestJudgePhase:
 
         assert result.status == PhaseStatus.FAILED
         assert "validation failed" in result.message
-        assert "no GitHub reviews on PR (Loom uses comment + label workflow instead)" in result.message
+        assert "no judge comments detected" in result.message
         assert result.data == fake_diag
         assert mock_validate.call_count == 3
         # Should sleep between attempts (2 sleeps for 3 attempts)
@@ -4135,7 +4135,7 @@ class TestJudgeFallbackApproval:
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -4157,7 +4157,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -4170,7 +4170,7 @@ class TestJudgeFallbackApproval:
             patch.object(judge, "_pr_checks_passing", return_value=True),
             # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
@@ -4184,7 +4184,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -4197,7 +4197,7 @@ class TestJudgeFallbackApproval:
             patch.object(judge, "_pr_checks_passing", return_value=False),
             # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
@@ -4271,7 +4271,7 @@ class TestJudgeFallbackApproval:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -4432,10 +4432,10 @@ class TestJudgeDiagnostics:
         assert diag["log_tail"] == []
         assert "log file empty" in diag["summary"]
 
-    def test_includes_pr_review_state(
+    def test_includes_pr_state_in_diagnostics(
         self, mock_context: MagicMock, tmp_path: Path
     ) -> None:
-        """Diagnostics should include PR review state from GitHub."""
+        """Diagnostics should include PR state data (labels and reviews stored for debugging)."""
         ctx = self._make_context(mock_context)
         ctx.repo_root = tmp_path
 
@@ -4452,9 +4452,11 @@ class TestJudgeDiagnostics:
         ):
             diag = judge._gather_diagnostics(ctx)
 
+        # PR reviews and labels are stored in diagnostics for debugging
         assert diag["pr_reviews"] == [{"state": "COMMENTED", "author": "bot"}]
         assert "loom:review-requested" in diag["pr_labels"]
-        assert "reviews=[COMMENTED]" in diag["summary"]
+        # Summary shows judge comment signals (not GitHub native reviews)
+        assert "no judge comments detected" in diag["summary"]
         assert "labels=[loom:review-requested]" in diag["summary"]
 
     def test_handles_gh_command_failure(
@@ -4474,7 +4476,7 @@ class TestJudgeDiagnostics:
 
         assert diag["pr_reviews"] == []
         assert diag["pr_labels"] == []
-        assert "no GitHub reviews on PR (Loom uses comment + label workflow instead)" in diag["summary"]
+        assert "no judge comments detected" in diag["summary"]
 
     def test_failure_message_includes_diagnostics(
         self, mock_context: MagicMock
@@ -4485,7 +4487,7 @@ class TestJudgeDiagnostics:
 
         judge = JudgePhase()
         fake_diag = {
-            "summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead); no loom labels on PR; last output: 'session ended'",
+            "summary": "no judge comments detected; no loom labels on PR; last output: 'session ended'",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": True,
             "log_tail": ["session ended"],
@@ -4505,7 +4507,7 @@ class TestJudgeDiagnostics:
 
         assert result.status == PhaseStatus.FAILED
         assert "judge phase validation failed:" in result.message
-        assert "no GitHub reviews on PR (Loom uses comment + label workflow instead)" in result.message
+        assert "no judge comments detected" in result.message
         assert "session ended" in result.message
         assert result.data == fake_diag
 
@@ -5003,11 +5005,6 @@ class TestJudgeFallbackChangesRequested:
             ),
             # _try_fallback_changes_requested -> _has_rejection_comment
             MagicMock(returncode=0, stdout="Changes requested\n"),
-            # _try_fallback_changes_requested -> _has_changes_requested_review
-            MagicMock(
-                returncode=0,
-                stdout=json.dumps({"reviews": []}),
-            ),
             # _try_fallback_changes_requested -> gh pr edit --add-label
             MagicMock(returncode=0),
         ]
@@ -5028,10 +5025,10 @@ class TestJudgeFallbackChangesRequested:
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("changes_requested") is True
 
-    def test_fallback_activates_via_review_state(
+    def test_fallback_activates_via_rejection_comment_alone(
         self, mock_context: MagicMock
     ) -> None:
-        """Fallback should succeed via CHANGES_REQUESTED review state."""
+        """Fallback should succeed via rejection comment alone (no native review needed)."""
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
@@ -5045,9 +5042,8 @@ class TestJudgeFallbackChangesRequested:
             # Approval fallback fails (no approval comment)
             patch.object(judge, "_has_approval_comment", return_value=False),
             patch.object(judge, "_pr_checks_passing", return_value=True),
-            # Rejection fallback: no rejection comment but CHANGES_REQUESTED review
-            patch.object(judge, "_has_rejection_comment", return_value=False),
-            patch.object(judge, "_has_changes_requested_review", return_value=True),
+            # Rejection fallback: rejection comment found
+            patch.object(judge, "_has_rejection_comment", return_value=True),
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=MagicMock(returncode=0),
@@ -5067,7 +5063,7 @@ class TestJudgeFallbackChangesRequested:
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -5089,7 +5085,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -5102,7 +5098,7 @@ class TestJudgeFallbackChangesRequested:
             patch.object(judge, "_pr_checks_passing", return_value=True),
             # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
         ):
             result = judge.run(ctx)
@@ -5130,7 +5126,7 @@ class TestJudgeFallbackChangesRequested:
             patch.object(judge, "_pr_checks_passing", return_value=True),
             # Rejection fallback succeeds
             patch.object(judge, "_has_rejection_comment", return_value=True),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=add_label_call,
@@ -5165,7 +5161,7 @@ class TestJudgeFallbackChangesRequested:
             patch.object(judge, "_pr_checks_passing", return_value=True),
             # Rejection fallback succeeds
             patch.object(judge, "_has_rejection_comment", return_value=True),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=MagicMock(returncode=0),
@@ -5184,7 +5180,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -5197,7 +5193,7 @@ class TestJudgeFallbackChangesRequested:
             patch.object(judge, "_pr_checks_passing", return_value=True),
             # Rejection fallback: signals present but label application fails
             patch.object(judge, "_has_rejection_comment", return_value=True),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=MagicMock(returncode=1),  # label application fails
@@ -5215,7 +5211,7 @@ class TestJudgeFallbackChangesRequested:
         ctx = self._make_force_context(mock_context)
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no GitHub reviews on PR (Loom uses comment + label workflow instead)", "log_tail": []}
+        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         call_order: list[str] = []
 
@@ -5270,7 +5266,7 @@ class TestJudgeFallbackChangesRequested:
             patch.object(judge, "_pr_checks_passing", return_value=True),
             # Rejection fallback succeeds
             patch.object(judge, "_has_rejection_comment", return_value=True),
-            patch.object(judge, "_has_changes_requested_review", return_value=False),
+
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
                 return_value=MagicMock(returncode=0),

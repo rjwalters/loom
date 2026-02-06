@@ -1150,8 +1150,8 @@ class TestJudgeRetry:
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
-        # Default judge_max_retries=1, so 1 retry allowed
-        assert ctx.config.judge_max_retries == 1
+        # Default judge_max_retries=3, so 3 retries allowed
+        assert ctx.config.judge_max_retries == 3
 
         curator_inst = MockCurator.return_value
         curator_inst.should_skip.return_value = (True, "skipped via --from")
@@ -1209,6 +1209,8 @@ class TestJudgeRetry:
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
+        # Use judge_max_retries=1 for this test to focus on exhaustion logic
+        ctx.config.judge_max_retries = 1
 
         curator_inst = MockCurator.return_value
         curator_inst.should_skip.return_value = (True, "skipped via --from")
@@ -1410,7 +1412,7 @@ class TestJudgeRetry:
         ]
         assert len(retry_calls) == 1
         assert retry_calls[0].kwargs["attempt"] == 1
-        assert retry_calls[0].kwargs["max_retries"] == 1
+        assert retry_calls[0].kwargs["max_retries"] == 3
         assert "validation failed" in retry_calls[0].kwargs["reason"]
 
 
