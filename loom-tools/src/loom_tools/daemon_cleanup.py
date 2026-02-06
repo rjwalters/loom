@@ -700,6 +700,60 @@ def _terminate_active_sessions(
         log_info("No active tmux sessions to terminate")
 
 
+def _revert_shepherd_labels(
+    state_path: pathlib.Path,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Revert issue labels for working shepherds during shutdown.
+
+    For each shepherd with ``status == "working"`` and a non-null ``issue``,
+    swap ``loom:building`` back to ``loom:issue`` so the issue returns to the
+    ready queue.  Errors are logged but do not prevent shutdown from continuing.
+    """
+    if not state_path.exists():
+        return
+
+    data = read_json_file(state_path)
+    if not isinstance(data, dict):
+        return
+
+    shepherds = data.get("shepherds", {})
+    if not isinstance(shepherds, dict):
+        return
+
+    from loom_tools.common.github import gh_run
+
+    for name, entry in shepherds.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("status") != "working":
+            continue
+        issue_num = entry.get("issue")
+        if issue_num is None:
+            continue
+
+        if dry_run:
+            log_info(
+                f"[DRY-RUN] Would revert issue #{issue_num} labels "
+                f"(loom:building → loom:issue) for {name}"
+            )
+        else:
+            try:
+                gh_run([
+                    "issue", "edit", str(issue_num),
+                    "--remove-label", "loom:building",
+                    "--add-label", "loom:issue",
+                ])
+                log_info(
+                    f"SHUTDOWN: Reverted issue #{issue_num} labels to loom:issue"
+                )
+            except Exception as e:
+                log_warning(
+                    f"SHUTDOWN: Failed to revert labels for #{issue_num}: {e}"
+                )
+
+
 def handle_daemon_shutdown(
     repo_root: pathlib.Path,
     config: CleanupConfig,
@@ -719,7 +773,10 @@ def handle_daemon_shutdown(
     # 2. Terminate all active tmux sessions
     _terminate_active_sessions(state_path, dry_run=dry_run)
 
-    # 3. Finalize daemon-state.json
+    # 3. Revert issue labels for working shepherds before resetting state
+    _revert_shepherd_labels(state_path, dry_run=dry_run)
+
+    # 4. Finalize daemon-state.json
     if state_path.exists():
         log_info("Finalizing daemon-state.json...")
         stopped_at = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -760,7 +817,7 @@ def handle_daemon_shutdown(
                     f"daemon-state.json finalized (running=false, stopped_at={stopped_at})"
                 )
 
-    # 4. Run session reflection if available
+    # 5. Run session reflection if available
     for script_dir in [repo_root / "scripts", repo_root / ".loom" / "scripts"]:
         reflection = script_dir / "session-reflection.sh"
         if reflection.exists() and os.access(reflection, os.X_OK):
