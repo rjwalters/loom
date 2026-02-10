@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
+import subprocess
+from unittest.mock import patch
 
 import pytest
 
@@ -12,6 +15,7 @@ from loom_tools.clean import (
     _get_dir_size,
     check_grace_period,
     check_uncommitted_changes,
+    find_editable_pip_installs,
     main,
     print_summary,
 )
@@ -108,6 +112,7 @@ class TestCleanupStats:
         stats = CleanupStats()
         assert stats.cleaned_worktrees == 0
         assert stats.skipped_open == 0
+        assert stats.skipped_editable == 0
         assert stats.errors == 0
 
 
@@ -132,6 +137,18 @@ class TestPrintSummary:
         print_summary(stats)
         captured = capsys.readouterr()
         assert "Errors: 2" in captured.out
+
+    def test_print_summary_with_skipped_editable(self, capsys: pytest.CaptureFixture[str]) -> None:
+        stats = CleanupStats(skipped_editable=2)
+        print_summary(stats)
+        captured = capsys.readouterr()
+        assert "Skipped (editable pip install): 2" in captured.out
+
+    def test_print_summary_no_skipped_editable_when_zero(self, capsys: pytest.CaptureFixture[str]) -> None:
+        stats = CleanupStats()
+        print_summary(stats)
+        captured = capsys.readouterr()
+        assert "editable pip install" not in captured.out
 
 
 class TestCLI:
@@ -185,6 +202,235 @@ class TestCLI:
         monkeypatch.chdir(mock_repo)
         result = main(["--dry-run", "--force", "--safe", "--grace-period", "1200"])
         assert result == 0
+
+
+class TestFindEditablePipInstalls:
+    """Tests for find_editable_pip_installs function."""
+
+    def _make_run_side_effect(
+        self,
+        worktree_path: str,
+        editable_packages: list[dict[str, str]],
+        show_outputs: dict[str, str],
+    ):
+        """Create a subprocess.run side effect for mocking pip commands.
+
+        Args:
+            worktree_path: The worktree path to use.
+            editable_packages: List of dicts with "name" and "version" for pip list --editable.
+            show_outputs: Dict mapping package name to pip show stdout.
+        """
+
+        def side_effect(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(cmd, 0)
+
+            if "which" in cmd_str:
+                result.stdout = "/usr/bin/python3\n"
+                result.stderr = ""
+                return result
+
+            if "pip list --editable" in cmd_str:
+                result.stdout = json.dumps(editable_packages)
+                result.stderr = ""
+                return result
+
+            if "pip show" in cmd_str:
+                # Extract package name (last argument)
+                pkg_name = cmd[-1]
+                if pkg_name in show_outputs:
+                    result.stdout = show_outputs[pkg_name]
+                    result.stderr = ""
+                else:
+                    result.returncode = 1
+                    result.stdout = ""
+                    result.stderr = f"WARNING: Package(s) not found: {pkg_name}"
+                return result
+
+            result.returncode = 1
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        return side_effect
+
+    def test_editable_install_inside_worktree(self, tmp_path: pathlib.Path) -> None:
+        """Editable install with location inside worktree should be detected."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        side_effect = self._make_run_side_effect(
+            str(worktree),
+            editable_packages=[{"name": "loom-tools", "version": "0.1.0"}],
+            show_outputs={
+                "loom-tools": (
+                    f"Name: loom-tools\n"
+                    f"Version: 0.1.0\n"
+                    f"Location: {worktree}/loom-tools/src\n"
+                    f"Editable project location: {worktree}/loom-tools\n"
+                ),
+            },
+        )
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == ["loom-tools"]
+
+    def test_editable_install_outside_worktree(self, tmp_path: pathlib.Path) -> None:
+        """Editable install with location outside worktree should not be detected."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        other_dir = tmp_path / "other-project"
+        other_dir.mkdir()
+
+        side_effect = self._make_run_side_effect(
+            str(worktree),
+            editable_packages=[{"name": "some-pkg", "version": "1.0.0"}],
+            show_outputs={
+                "some-pkg": (
+                    f"Name: some-pkg\n"
+                    f"Version: 1.0.0\n"
+                    f"Location: {other_dir}/src\n"
+                    f"Editable project location: {other_dir}\n"
+                ),
+            },
+        )
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == []
+
+    def test_pip_not_found(self, tmp_path: pathlib.Path) -> None:
+        """When pip commands fail, should return empty list without error."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        def side_effect(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "which" in cmd_str:
+                result = subprocess.CompletedProcess(cmd, 0)
+                result.stdout = "/usr/bin/python3\n"
+                result.stderr = ""
+                return result
+            # All pip commands fail
+            raise FileNotFoundError("pip not found")
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == []
+
+    def test_pip_returns_error(self, tmp_path: pathlib.Path) -> None:
+        """When pip list returns error code, should return empty list."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        def side_effect(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(cmd, 0)
+            result.stderr = ""
+
+            if "which" in cmd_str:
+                result.stdout = "/usr/bin/python3\n"
+                return result
+
+            if "pip list" in cmd_str:
+                result.returncode = 1
+                result.stdout = ""
+                return result
+
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == []
+
+    def test_no_editable_packages(self, tmp_path: pathlib.Path) -> None:
+        """When no editable packages are installed, should return empty list."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        side_effect = self._make_run_side_effect(
+            str(worktree),
+            editable_packages=[],
+            show_outputs={},
+        )
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == []
+
+    def test_pip_list_returns_invalid_json(self, tmp_path: pathlib.Path) -> None:
+        """When pip list returns invalid JSON, should return empty list."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        def side_effect(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(cmd, 0)
+            result.stderr = ""
+
+            if "which" in cmd_str:
+                result.stdout = "/usr/bin/python3\n"
+                return result
+
+            if "pip list" in cmd_str:
+                result.stdout = "not valid json{{"
+                return result
+
+            result.returncode = 1
+            result.stdout = ""
+            return result
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == []
+
+    def test_location_field_without_editable_prefix(self, tmp_path: pathlib.Path) -> None:
+        """Detect via 'Location:' field when 'Editable project location:' is absent."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        side_effect = self._make_run_side_effect(
+            str(worktree),
+            editable_packages=[{"name": "my-pkg", "version": "0.1.0"}],
+            show_outputs={
+                "my-pkg": (
+                    f"Name: my-pkg\n"
+                    f"Version: 0.1.0\n"
+                    f"Location: {worktree}/my-pkg/src\n"
+                ),
+            },
+        )
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == ["my-pkg"]
+
+    def test_no_python_interpreters(self, tmp_path: pathlib.Path) -> None:
+        """When no Python interpreters found, should return empty list."""
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        def side_effect(cmd, **kwargs):
+            # which fails for all interpreters
+            result = subprocess.CompletedProcess(cmd, 1)
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch("loom_tools.clean.subprocess.run", side_effect=side_effect):
+            result = find_editable_pip_installs(worktree)
+
+        assert result == []
 
 
 class TestDocumentedDivergences:

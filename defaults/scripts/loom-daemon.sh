@@ -85,7 +85,19 @@ if [[ -n "$LOOM_TOOLS" ]] && [[ -x "$LOOM_TOOLS/.venv/bin/loom-daemon" ]]; then
     # Use venv from loom-tools directory
     exec "$LOOM_TOOLS/.venv/bin/loom-daemon" ${args[@]+"${args[@]}"}
 elif command -v loom-daemon &>/dev/null; then
-    # System-installed
+    # System-installed - verify loom_tools can be imported
+    if ! python3 -c "import loom_tools" 2>/dev/null; then
+        echo "[ERROR] loom-daemon is installed but cannot import loom_tools." >&2
+        echo "" >&2
+        echo "  This usually means the editable install source directory was deleted" >&2
+        echo "  (e.g., a worktree was removed while loom-tools was pip install -e'd from it)." >&2
+        echo "" >&2
+        echo "  To fix:" >&2
+        echo "    1. Reinstall loom-tools: pip install loom-tools" >&2
+        echo "    2. Or reinstall from source: pip install -e /path/to/loom/loom-tools" >&2
+        echo "" >&2
+        exit 1
+    fi
     exec loom-daemon ${args[@]+"${args[@]}"}
 else
     echo "[ERROR] Python daemon not available." >&2
