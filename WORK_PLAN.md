@@ -8,53 +8,40 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues requiring immediate attention (`loom:urgent`).
 
-*No urgent issues.*
+- **#2201**: Daemon needs strategy for issues that exceed single-session context budget *(tier:goal-advancing)*
+- **#2205**: Daemon should report when stalled waiting on human input *(tier:goal-supporting)*
+- **#2200**: Installer doesn't copy guard-destructive.sh hook to target repo *(tier:goal-supporting)*
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-*No ready issues.* The backlog is empty -- all approved work is currently being built.
+- **#2202**: Remove orphaned ab_testing.rs backend (1,341 LOC dead code) *(tier:maintenance)*
 
 ## In Progress
 
 Issues actively being worked by shepherds (`loom:building`).
 
-- **#1881**: Split activity database module (db.rs) into domain-specific submodules *(tier:maintenance)*
-- **#1883**: Split commands/activity.rs (4,117 lines) into domain-specific submodules *(tier:maintenance)*
-- **#1888**: Decompose loom-daemon init.rs (2,316 lines) into focused initialization submodules *(tier:maintenance)*
+- **#2199**: Daemon should capture shepherd output on kill for post-mortem debugging *(loom:curated)*
+- **#2198**: Shepherd spawns without writing progress file -- silent failure mode *(loom:curated)*
+- **#2197**: Stale heartbeat detection too slow -- 8+ minutes to reclaim stuck shepherd *(loom:curated)*
 
 ## Proposed
 
 Issues under evaluation (`loom:architect`, `loom:hermit`, `loom:curated`).
 
-- **#1888**: Decompose loom-daemon init.rs -- also has `loom:architect` *(tier:maintenance)*
-- **#1899**: Add post-worktree hook to pre-build daemon binary *(tier:goal-supporting, no workflow label)*
+*No proposed issues awaiting evaluation. All curated issues have been promoted to `loom:issue`.*
 
 ## Epics
 
-Active epics and their phase progress (`loom:epic`).
-
-### #1893: Reshape Loom into Analytics-First Claude Wrapper
-
-Progress: **1/7 phases complete (14%)**
-
-| Phase | Issue | Status |
-|-------|-------|--------|
-| Phase 1 | #1894 Config v3 & State Simplification | CLOSED |
-| Phase 2 | #1895 Side-by-Side Layout (Terminal + Analytics) | OPEN |
-| Phase 3 | #1896 Claude Code Session Manager | OPEN |
-| Phase 4 | #1897 Input Logging Layer | OPEN |
-| Phase 5 | #1898 File-Based Analytics Dashboard | OPEN |
-| Phase 6 | #1901 Rewrite main.ts for Single-Session + Analytics | OPEN |
-| Phase 7 | #1902 Remove Dead Multi-Terminal and Prediction Code | OPEN |
-
-*All remaining phases are `tier:goal-advancing` but not yet promoted to `loom:issue`.*
+No active epics. Previous epic #1893 (Reshape Loom into Analytics-First Claude Wrapper) completed all 7 phases and is now closed.
 
 ## Backlog Balance
 
 | Tier | Count |
 |------|-------|
-| Tier 1 (goal-advancing) | 7 (epic + 6 phases) |
-| Tier 2 (goal-supporting) | 1 (#1899) |
-| Tier 3 (maintenance) | 3 (#1881, #1883, #1888) |
+| Tier 1 (goal-advancing) | 1 (#2201) |
+| Tier 2 (goal-supporting) | 2 (#2205, #2200) |
+| Tier 3 (maintenance) | 1 (#2202) |
+
+**Note:** The backlog is lean. The 3 building issues (#2197-#2199) are all daemon reliability improvements that complement the urgent queue. Once building completes, the pipeline will need new proposals from Architect/Hermit roles.
