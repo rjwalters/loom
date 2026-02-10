@@ -603,6 +603,9 @@ fi
 # This enables scripts in the target repo to find loom-tools in the source repo
 info "Recording Loom source path..."
 echo "$LOOM_ROOT" > .loom/loom-source-path
+# Also write to target repo root — the worktree copy is gitignored and will be
+# lost when the installation worktree is cleaned up after PR merge
+echo "$LOOM_ROOT" > "$TARGET_PATH/.loom/loom-source-path"
 success "Loom source path recorded"
 
 # Store installation metadata (commit hash moved here from CLAUDE.md for idempotency)
