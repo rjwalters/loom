@@ -38,6 +38,7 @@ class DaemonConfig:
     iteration_timeout: int = DEFAULT_ITERATION_TIMEOUT
     force_mode: bool = False
     debug_mode: bool = False
+    timeout_min: int = 0  # 0 = no timeout
 
     # Shepherd configuration
     max_shepherds: int = DEFAULT_MAX_SHEPHERDS
@@ -69,18 +70,21 @@ class DaemonConfig:
         *,
         force_mode: bool = False,
         debug_mode: bool = False,
+        timeout_min: int = 0,
     ) -> DaemonConfig:
         """Create config from environment variables.
 
         Args:
             force_mode: Enable force mode (auto-promote, auto-merge)
             debug_mode: Enable debug logging
+            timeout_min: Stop daemon after N minutes (0 = no timeout)
         """
         return cls(
             poll_interval=env_int("LOOM_POLL_INTERVAL", DEFAULT_POLL_INTERVAL),
             iteration_timeout=env_int("LOOM_ITERATION_TIMEOUT", DEFAULT_ITERATION_TIMEOUT),
             force_mode=force_mode or env_bool("LOOM_FORCE_MODE", False),
             debug_mode=debug_mode or env_bool("LOOM_DEBUG_MODE", False),
+            timeout_min=timeout_min or env_int("LOOM_TIMEOUT_MIN", 0),
             max_shepherds=env_int("LOOM_MAX_SHEPHERDS", DEFAULT_MAX_SHEPHERDS),
             issue_threshold=env_int("LOOM_ISSUE_THRESHOLD", DEFAULT_ISSUE_THRESHOLD),
             issue_strategy=os.environ.get("LOOM_ISSUE_STRATEGY", "fifo"),

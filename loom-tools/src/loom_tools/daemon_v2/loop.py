@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import shutil
 import signal
@@ -77,13 +78,26 @@ def run(ctx: DaemonContext) -> int:
         cleanup_config = load_config()
         handle_daemon_startup(ctx.repo_root, cleanup_config)
 
-        # 10. Main loop
+        # 10. Compute deadline for timeout
+        deadline: float | None = None
+        if ctx.config.timeout_min > 0:
+            deadline = time.time() + ctx.config.timeout_min * 60
+
+        # 11. Main loop
         while ctx.running:
             ctx.iteration += 1
 
             # Check for stop signal
             if check_stop_signal(ctx):
                 log_info(f"Iteration {ctx.iteration}: SHUTDOWN_SIGNAL detected")
+                break
+
+            # Check for timeout
+            if deadline is not None and time.time() >= deadline:
+                log_info(
+                    f"Iteration {ctx.iteration}: TIMEOUT reached "
+                    f"({ctx.config.timeout_min} minutes elapsed)"
+                )
                 break
 
             # Check for session conflict
@@ -279,6 +293,12 @@ def _init_state_file(ctx: DaemonContext) -> None:
     """Initialize or update the daemon state file."""
     timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # Compute timeout_at if configured
+    timeout_at: str | None = None
+    if ctx.config.timeout_min > 0:
+        deadline_dt = now_utc() + datetime.timedelta(minutes=ctx.config.timeout_min)
+        timeout_at = deadline_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
     if ctx.state_file.exists():
         try:
             data = read_json_file(ctx.state_file)
@@ -289,6 +309,7 @@ def _init_state_file(ctx: DaemonContext) -> None:
                 data["iteration"] = 0
                 data["daemon_session_id"] = ctx.session_id
                 data["execution_mode"] = "direct"
+                data["timeout_at"] = timeout_at
                 # Merge persistent failure history into existing state
                 _merge_persistent_failures(ctx, data)
                 write_json_file(ctx.state_file, data)
@@ -305,6 +326,7 @@ def _init_state_file(ctx: DaemonContext) -> None:
         "force_mode": ctx.config.force_mode,
         "execution_mode": "direct",
         "daemon_session_id": ctx.session_id,
+        "timeout_at": timeout_at,
         "shepherds": {},
         "support_roles": {},
         "completed_issues": [],
@@ -426,6 +448,9 @@ def _print_header(ctx: DaemonContext) -> None:
     log_info(f"  Mode: {ctx.config.mode_display()}")
     log_info(f"  Poll interval: {ctx.config.poll_interval}s")
     log_info(f"  Max shepherds: {ctx.config.max_shepherds}")
+    if ctx.config.timeout_min > 0:
+        deadline_dt = now_utc() + datetime.timedelta(minutes=ctx.config.timeout_min)
+        log_info(f"  Timeout: {ctx.config.timeout_min}min (until {deadline_dt.strftime('%H:%M:%S UTC')})")
     log_info(f"  PID file: {ctx.pid_file}")
     log_info(f"  State file: {ctx.state_file}")
     log_info(f"  Stop signal: {ctx.stop_signal}")
