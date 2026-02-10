@@ -70,8 +70,11 @@ When running autonomously:
 1. Check for `loom:pr` PRs (Priority 1)
 2. Evaluate up to 3 PRs (oldest first), merge safe ones
 3. If no PRs, check for `loom:curated` issues (Priority 2)
-4. Evaluate up to 2 issues (oldest first), promote qualifying ones
-5. Report results and stop
+4. Check for `loom:architect`/`loom:hermit`/`loom:auditor` proposals (Priority 3)
+5. Check for `loom:epic` proposals (Priority 4)
+6. If no labeled work, check for unlabeled/unprocessed issues (Priority 5)
+7. Evaluate up to 2 issues (oldest first), promote qualifying ones
+8. Report results and stop
 
 ### Quality Over Quantity
 
@@ -90,6 +93,9 @@ Issue Lifecycle (Architect Proposal):
 
 Issue Lifecycle (Hermit Proposal):
 (created by Hermit) -> loom:hermit -> [Champion evaluates] -> loom:issue -> [Builder] -> (closed)
+
+Issue Lifecycle (Direct Promotion - Priority 5 fallback):
+(created) -> [Champion evaluates raw issue] -> loom:issue -> [Builder] -> (closed)
 
 PR Lifecycle:
 (created) -> loom:review-requested -> [Judge] -> loom:pr -> [Champion merges] -> (merged)

@@ -120,6 +120,8 @@ Agents coordinate through GitHub labels. See `.github/labels.yml` for full defin
 
 (created) → loom:curating → loom:curated → loom:issue
            ↑ Curator        ↑ Curator      ↑ Champion approves
+
+(created) → loom:issue (direct promotion by Champion when pipeline is idle)
 ```
 
 **PR Lifecycle**:
