@@ -307,6 +307,7 @@ class DaemonState:
     blocked_issue_retries: dict[str, BlockedIssueRetry] = field(default_factory=dict)
     recent_failures: list[RecentFailure] = field(default_factory=list)
     transient_retries: dict[str, TransientRetryEntry] = field(default_factory=dict)
+    needs_human_input: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DaemonState:
@@ -361,6 +362,7 @@ class DaemonState:
             blocked_issue_retries=blocked_issue_retries,
             recent_failures=recent_failures,
             transient_retries=transient_retries,
+            needs_human_input=data.get("needs_human_input", []),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -383,6 +385,7 @@ class DaemonState:
             "transient_retries": {
                 k: v.to_dict() for k, v in self.transient_retries.items()
             },
+            "needs_human_input": self.needs_human_input,
         }
         for k in (
             "started_at", "last_poll", "daemon_session_id",

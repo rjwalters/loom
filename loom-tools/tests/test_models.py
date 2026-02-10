@@ -80,6 +80,34 @@ class TestDaemonState:
         assert ds.running is False
         assert ds.shepherds == {}
 
+    def test_needs_human_input_default(self) -> None:
+        ds = DaemonState.from_dict({})
+        assert ds.needs_human_input == []
+
+    def test_needs_human_input_round_trip(self) -> None:
+        blockers = [
+            {"type": "approval_needed", "count": 2, "description": "2 curated issue(s) awaiting approval"},
+            {"type": "proposal_review", "count": 1, "description": "1 architect proposal(s) awaiting review"},
+        ]
+        ds = DaemonState(needs_human_input=blockers)
+        out = ds.to_dict()
+        assert out["needs_human_input"] == blockers
+        ds2 = DaemonState.from_dict(out)
+        assert ds2.needs_human_input == blockers
+
+    def test_needs_human_input_from_existing_state(self) -> None:
+        """needs_human_input field is preserved when loading existing state files."""
+        data = {
+            "running": True,
+            "iteration": 5,
+            "needs_human_input": [
+                {"type": "blocked", "count": 3, "description": "3 blocked issues"},
+            ],
+        }
+        ds = DaemonState.from_dict(data)
+        assert len(ds.needs_human_input) == 1
+        assert ds.needs_human_input[0]["type"] == "blocked"
+
 
 class TestShepherdEntry:
     def test_idle_entry(self) -> None:

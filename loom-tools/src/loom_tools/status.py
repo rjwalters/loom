@@ -265,6 +265,7 @@ def render_shepherds(
                     "completed_issue": " - awaiting next",
                     "rate_limited": " - rate limited",
                     "shutdown_signal": " - shutdown",
+                    "needs_human_input": " - waiting for human input",
                 }
                 reason_display = reason_map.get(entry.idle_reason, f" - {entry.idle_reason}")
 

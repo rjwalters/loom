@@ -951,6 +951,7 @@ def compute_recommended_actions(
     pipeline_health: PipelineHealth | None = None,
     orphaned_prs: list[OrphanedPR] | None = None,
     spinning_prs: list[SpinningPR] | None = None,
+    curated_count: int = 0,
 ) -> tuple[list[str], dict[str, Any]]:
     """Compute recommended actions and demand flags.
 
@@ -1075,6 +1076,41 @@ def compute_recommended_actions(
     if not actions or (len(actions) == 1 and actions[0] == "check_stuck"):
         actions.append("wait")
 
+    # Detect human-input-needed blockers when pipeline has no ready work.
+    # We check ready_count == 0 rather than "wait" in actions because
+    # "promote_proposals" may be present (only applies in force mode) and
+    # would mask the fact that the pipeline is effectively idle.
+    human_input_blockers: list[dict[str, Any]] = []
+    pipeline_idle = ready_count == 0 and building_count == 0
+    if pipeline_idle:
+        if curated_count > 0:
+            human_input_blockers.append({
+                "type": "approval_needed",
+                "count": curated_count,
+                "description": f"{curated_count} curated issue(s) awaiting human approval to become loom:issue",
+            })
+        if architect_count > 0:
+            human_input_blockers.append({
+                "type": "proposal_review",
+                "count": architect_count,
+                "description": f"{architect_count} architect proposal(s) awaiting human review",
+            })
+        if hermit_count > 0:
+            human_input_blockers.append({
+                "type": "proposal_review",
+                "count": hermit_count,
+                "description": f"{hermit_count} hermit proposal(s) awaiting human review",
+            })
+        if blocked_count > 0:
+            human_input_blockers.append({
+                "type": "blocked",
+                "count": blocked_count,
+                "description": f"{blocked_count} issue(s) blocked — may need human intervention",
+            })
+        if human_input_blockers:
+            actions.append("needs_human_input")
+    demand["human_input_blockers"] = human_input_blockers
+
     return actions, demand
 
 
@@ -1164,6 +1200,9 @@ def compute_health(
     ci_status: dict[str, Any] | None = None,
     contradictory_labels: list[dict[str, Any]] | None = None,
     spinning_prs: list[SpinningPR] | None = None,
+    curated_count: int = 0,
+    architect_count: int = 0,
+    hermit_count: int = 0,
 ) -> tuple[str, list[dict[str, str]]]:
     """Compute health status and warnings.
 
@@ -1197,6 +1236,23 @@ def compute_health(
             "code": "proposal_backlog",
             "level": "info",
             "message": f"{total_proposals} proposals awaiting approval, pipeline empty",
+        })
+
+    # needs_human_input — actionable warning when pipeline is idle and human
+    # action can unblock it (curated issues need approval, proposals need review)
+    human_input_items = curated_count + architect_count + hermit_count
+    if ready_count == 0 and building_count == 0 and human_input_items > 0:
+        parts = []
+        if curated_count > 0:
+            parts.append(f"{curated_count} curated issue(s) need approval")
+        if architect_count > 0:
+            parts.append(f"{architect_count} architect proposal(s) need review")
+        if hermit_count > 0:
+            parts.append(f"{hermit_count} hermit proposal(s) need review")
+        warnings.append({
+            "code": "needs_human_input",
+            "level": "warning",
+            "message": f"Pipeline blocked on human input: {', '.join(parts)}",
         })
 
     # no_work_available
@@ -1478,6 +1534,7 @@ def build_snapshot(
         pipeline_health=p_health,
         orphaned_prs=orphaned_prs,
         spinning_prs=spinning_prs,
+        curated_count=curated_count,
     )
 
     # 16. Promotable proposals
@@ -1507,6 +1564,9 @@ def build_snapshot(
         ci_status=ci_status,
         contradictory_labels=contradictory,
         spinning_prs=spinning_prs,
+        curated_count=curated_count,
+        architect_count=architect_count,
+        hermit_count=hermit_count,
     )
 
     # 18. Build support_roles output (schema matches shell)
@@ -1615,6 +1675,7 @@ def build_snapshot(
             "systematic_failure_active": sf.active,
             "health_status": health_status,
             "health_warnings": health_warnings,
+            "needs_human_input": demand.get("human_input_blockers", []),
             "ci_failing": ci_status.get("status") == "failing",
         },
         "config": cfg.to_dict(),
