@@ -291,21 +291,12 @@ def _has_label(item: dict[str, Any], label: str) -> bool:
 
 
 def _collect_usage(repo_root: pathlib.Path) -> dict[str, Any]:
-    """Run check-usage.sh and return its JSON output."""
-    paths = LoomPaths(repo_root)
-    script = paths.scripts_dir / "check-usage.sh"
-    if not script.exists():
-        return {"error": "check-usage.sh not found"}
+    """Query Claude API usage via the Anthropic OAuth API."""
     try:
-        result = subprocess.run(
-            [str(script)],
-            capture_output=True, text=True, timeout=30,
-        )
-        parsed = parse_command_output(result, default={"error": "invalid response"})
-        if isinstance(parsed, dict) and "error" not in parsed:
-            return parsed
-        return {"error": "invalid response"}
-    except (subprocess.TimeoutExpired, OSError):
+        from loom_tools.common.usage import get_usage
+
+        return get_usage(repo_root)
+    except Exception:
         return {"error": "no data"}
 
 

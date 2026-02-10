@@ -1853,22 +1853,17 @@ class BuilderPhase:
 
     def _is_rate_limited(self, ctx: ShepherdContext) -> bool:
         """Check if Claude API usage is too high."""
-        script = ctx.scripts_dir / "check-usage.sh"
-        if not script.is_file():
-            return False
+        from loom_tools.common.usage import get_usage
 
         try:
-            result = ctx.run_script("check-usage.sh", [], check=False)
-            data = parse_command_output(result)
-            if not isinstance(data, dict):
+            data = get_usage(ctx.repo_root)
+            if not isinstance(data, dict) or "error" in data:
                 return False
-
             session_pct = data.get("session_percent", 0)
             if session_pct is None:
                 return False
-
             return float(session_pct) >= ctx.config.rate_limit_threshold
-        except ValueError:
+        except Exception:
             return False
 
     def _get_log_path(self, ctx: ShepherdContext) -> Path:
