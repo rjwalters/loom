@@ -76,6 +76,8 @@ class SnapshotConfig:
     ci_health_check_enabled: bool = True  # Enable CI status monitoring
     # Heartbeat grace period for newly spawned shepherds
     heartbeat_grace_period: int = 600  # 10 minutes
+    # Shorter grace period for shepherds that have already reported heartbeats
+    heartbeat_active_grace_period: int = 180  # 3 minutes
     # Spinning issue detection: auto-escalate after N review cycles
     spinning_review_threshold: int = 3
 
@@ -112,6 +114,7 @@ class SnapshotConfig:
             systematic_failure_max_probes=_int("LOOM_SYSTEMATIC_FAILURE_MAX_PROBES", 3),
             ci_health_check_enabled=os.environ.get("LOOM_CI_HEALTH_CHECK", "true").lower() not in ("false", "0", "no"),
             heartbeat_grace_period=_int("LOOM_HEARTBEAT_GRACE_PERIOD", 600),
+            heartbeat_active_grace_period=_int("LOOM_HEARTBEAT_ACTIVE_GRACE_PERIOD", 180),
             spinning_review_threshold=_int("LOOM_SPINNING_REVIEW_THRESHOLD", 3),
         )
 
@@ -437,11 +440,19 @@ def compute_shepherd_progress(
             except (ValueError, OSError):
                 pass
 
-        # Grace period: don't flag recently spawned shepherds as stale
+        # Grace period: don't flag recently spawned shepherds as stale.
+        # Two-tier: shepherds that have already reported heartbeats use a
+        # shorter grace period so that deaths are detected faster (~3 min
+        # instead of ~10 min).
         if stale and sp.started_at:
             try:
                 spawn_age = _elapsed(sp.started_at, now)
-                if spawn_age < cfg.heartbeat_grace_period:
+                effective_grace = (
+                    cfg.heartbeat_active_grace_period
+                    if sp.last_heartbeat
+                    else cfg.heartbeat_grace_period
+                )
+                if spawn_age < effective_grace:
                     stale = False
             except (ValueError, OSError):
                 pass
@@ -1693,7 +1704,8 @@ ENVIRONMENT VARIABLES:
     LOOM_JUDGE_INTERVAL      Judge re-trigger interval in seconds (default: 300)
     LOOM_ISSUE_STRATEGY      Issue selection strategy (default: fifo)
     LOOM_HEARTBEAT_STALE_THRESHOLD  Heartbeat staleness threshold (default: 120)
-    LOOM_HEARTBEAT_GRACE_PERIOD     Grace period for new shepherds (default: 300)
+    LOOM_HEARTBEAT_GRACE_PERIOD     Grace period for new shepherds (default: 600)
+    LOOM_HEARTBEAT_ACTIVE_GRACE_PERIOD  Shorter grace for active shepherds (default: 180)
     LOOM_TMUX_SOCKET         Tmux socket name (default: loom)
     LOOM_MAX_RETRY_COUNT     Max retries for blocked issues (default: 3)
     LOOM_RETRY_COOLDOWN      Initial retry cooldown in seconds (default: 1800)

@@ -71,6 +71,7 @@ def _cfg(**overrides: object) -> SnapshotConfig:
         "issue_strategy": "fifo",
         "heartbeat_stale_threshold": 120,
         "heartbeat_grace_period": 300,
+        "heartbeat_active_grace_period": 180,
         "tmux_socket": "loom",
         "systematic_failure_cooldown": 1800,
         "systematic_failure_max_probes": 3,
@@ -407,6 +408,65 @@ class TestHeartbeatStaleness:
         """Default grace period via from_env() is 600 seconds."""
         cfg = SnapshotConfig.from_env()
         assert cfg.heartbeat_grace_period == 600
+
+    def test_active_grace_period_detects_death_faster(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd spawned 4 min ago with stale heartbeat -> stale (past active grace, not full grace).
+
+        This is the key fix: shepherds that HAVE reported heartbeats use the
+        shorter active_grace_period (180s) instead of the full grace (600s).
+        Without the two-tier fix, this shepherd would NOT be flagged as stale
+        because spawn_age (240s) < full grace (600s).
+        """
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "2026-01-30T17:56:00Z",  # 240s ago
+            "last_heartbeat": "2026-01-30T17:57:30Z",  # 150s ago — stale
+        }))
+        cfg = _cfg(
+            heartbeat_stale_threshold=120,
+            heartbeat_grace_period=600,
+            heartbeat_active_grace_period=180,
+        )
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is True
+        assert result[0].heartbeat_age_seconds == 150
+
+    def test_active_grace_period_protects_very_new_shepherd(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd spawned 2 min ago with stale heartbeat -> NOT stale (within active grace)."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234",
+            "issue": 100,
+            "status": "working",
+            "started_at": "2026-01-30T17:58:00Z",  # 120s ago
+            "last_heartbeat": "2026-01-30T17:57:30Z",  # 150s ago — stale
+        }))
+        cfg = _cfg(
+            heartbeat_stale_threshold=120,
+            heartbeat_grace_period=600,
+            heartbeat_active_grace_period=180,
+        )
+        result = compute_shepherd_progress(tmp_path, cfg, _now=NOW)
+        assert len(result) == 1
+        assert result[0].heartbeat_stale is False
+
+    def test_active_grace_period_configurable_via_env(self) -> None:
+        """Active grace period configurable via LOOM_HEARTBEAT_ACTIVE_GRACE_PERIOD."""
+        from unittest import mock as _mock
+        with _mock.patch.dict("os.environ", {"LOOM_HEARTBEAT_ACTIVE_GRACE_PERIOD": "240"}):
+            cfg = SnapshotConfig.from_env()
+        assert cfg.heartbeat_active_grace_period == 240
+
+    def test_active_grace_period_default(self) -> None:
+        """Default active grace period is 180 seconds."""
+        cfg = SnapshotConfig()
+        assert cfg.heartbeat_active_grace_period == 180
 
     def test_grace_period_missing_started_at(self, tmp_path: pathlib.Path) -> None:
         """Missing started_at falls back to existing behavior (no grace period applied)."""
