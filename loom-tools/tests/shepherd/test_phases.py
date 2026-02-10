@@ -363,6 +363,14 @@ class TestApprovalPhase:
 class TestBuilderPhase:
     """Test BuilderPhase."""
 
+    @pytest.fixture(autouse=True)
+    def _no_usage_api(self):
+        """Prevent real keychain/API calls from _is_rate_limited."""
+        with patch(
+            "loom_tools.common.usage._read_keychain_token", return_value=None
+        ):
+            yield
+
     def test_should_skip_when_pr_exists(self, mock_context: MagicMock) -> None:
         """Builder should be skipped when PR already exists."""
         builder = BuilderPhase()
@@ -2420,6 +2428,14 @@ class TestBuilderHasUncommittedChanges:
 
 class TestBuilderInterruptedWorkIntegration:
     """Integration tests for builder interrupted work recovery in run()."""
+
+    @pytest.fixture(autouse=True)
+    def _no_usage_api(self):
+        """Prevent real keychain/API calls from _is_rate_limited."""
+        with patch(
+            "loom_tools.common.usage._read_keychain_token", return_value=None
+        ):
+            yield
 
     def test_run_preserves_uncommitted_work_on_abnormal_exit(
         self, mock_context: MagicMock, tmp_path: Path
