@@ -128,8 +128,8 @@ class TestTransformApiResponse:
 
     def test_full_response(self):
         api_data = {
-            "five_hour": {"utilization": 0.42, "resets_at": "2026-01-23T15:00:00Z"},
-            "seven_day": {"utilization": 0.15, "resets_at": "2026-01-27T00:00:00Z"},
+            "five_hour": {"utilization": 42.0, "resets_at": "2026-01-23T15:00:00Z"},
+            "seven_day": {"utilization": 15.0, "resets_at": "2026-01-27T00:00:00Z"},
         }
         result = _transform_api_response(api_data)
         assert result["session_percent"] == 42.0
@@ -140,7 +140,7 @@ class TestTransformApiResponse:
         assert "timestamp" in result
 
     def test_missing_five_hour(self):
-        result = _transform_api_response({"seven_day": {"utilization": 0.3}})
+        result = _transform_api_response({"seven_day": {"utilization": 30.0}})
         assert result["session_percent"] is None
         assert result["session_reset"] is None
         assert result["weekly_all_percent"] == 30.0
@@ -202,8 +202,8 @@ class TestGetUsage:
     def test_success_writes_cache(self, tmp_path):
         (tmp_path / ".loom").mkdir()
         api_data = {
-            "five_hour": {"utilization": 0.6, "resets_at": "2026-01-23T15:00:00Z"},
-            "seven_day": {"utilization": 0.2, "resets_at": "2026-01-27T00:00:00Z"},
+            "five_hour": {"utilization": 60.0, "resets_at": "2026-01-23T15:00:00Z"},
+            "seven_day": {"utilization": 20.0, "resets_at": "2026-01-27T00:00:00Z"},
         }
         with mock.patch("loom_tools.common.usage._read_keychain_token", return_value="tok"):
             with mock.patch("loom_tools.common.usage._call_usage_api", return_value=api_data):
