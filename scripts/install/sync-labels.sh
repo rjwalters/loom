@@ -91,13 +91,13 @@ info "Syncing Loom workflow labels..."
 # Parse YAML file and sync labels
 # YAML format: - name: label-name\n  description: desc\n  color: "HEXCODE"
 label_count=0
-while IFS= read -r line; do
+while IFS= read -u 3 -r line; do
   # Extract label name
   if [[ "$line" =~ ^-\ name:\ (.+)$ ]]; then
     name="${BASH_REMATCH[1]}"
     # Read next two lines for description and color
-    read -r desc_line
-    read -r color_line
+    read -u 3 -r desc_line
+    read -u 3 -r color_line
 
     # Extract description and color
     if [[ "$desc_line" =~ description:\ (.+)$ ]]; then
@@ -141,9 +141,9 @@ while IFS= read -r line; do
       fi
     fi
 
-    ((label_count++))
+    ((label_count++)) || true
   fi
-done < "$LABELS_FILE"
+done 3< "$LABELS_FILE"
 
 if [ "$label_count" -gt 0 ]; then
   success "Synced $label_count labels"
