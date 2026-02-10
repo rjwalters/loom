@@ -163,10 +163,50 @@ def cleanup_dead_session(name: str) -> None:
         pass
 
 
+def _capture_session_output(name: str, session_name: str) -> None:
+    """Best-effort capture of terminal scrollback before killing a session.
+
+    Writes captured output to .loom/logs/<session>-killed-<timestamp>.log.
+    Failures are logged but never prevent the kill from proceeding.
+    """
+    try:
+        repo_root = find_repo_root()
+    except FileNotFoundError:
+        log_warning("Cannot capture session output: not in a git repository")
+        return
+
+    try:
+        from loom_tools.common.tmux_session import TmuxSession
+
+        session = TmuxSession(session_name)
+        output = session.capture_scrollback(lines=200)
+
+        if not output or not output.strip():
+            log_info(f"No scrollback content to capture for {session_name}")
+            return
+
+        log_dir = repo_root / ".loom" / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        kill_log = log_dir / f"{session_name}-killed-{timestamp}.log"
+        kill_log.write_text(output)
+
+        log_info(f"Captured session output to {kill_log}")
+    except Exception as exc:
+        log_warning(f"Failed to capture session output: {exc}")
+
+
 def kill_stuck_session(name: str) -> None:
     """Kill a stuck session with graceful then forced shutdown."""
     session_name = f"{SESSION_PREFIX}{name}"
     log_warning(f"Killing stuck session: {session_name}")
+
+    # Capture scrollback before any shutdown attempts (best-effort)
+    try:
+        _capture_session_output(name, session_name)
+    except Exception as exc:
+        log_warning(f"Failed to capture session output: {exc}")
 
     # Attempt graceful shutdown first
     try:
