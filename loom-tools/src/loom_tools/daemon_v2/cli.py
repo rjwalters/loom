@@ -33,9 +33,12 @@ def show_status(repo_root) -> int:
                     session_id = data.get("daemon_session_id", "unknown")
                     iteration = data.get("iteration", 0)
                     force_mode = data.get("force_mode", False)
+                    timeout_at = data.get("timeout_at")
                     print(f"  Session ID: {session_id}")
                     print(f"  Iteration: {iteration}")
                     print(f"  Force mode: {force_mode}")
+                    if timeout_at:
+                        print(f"  Timeout at: {timeout_at}")
             return 0
         except ProcessLookupError:
             print("Daemon loop not running (stale PID file)")
@@ -124,6 +127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Environment Variables:
+    LOOM_TIMEOUT_MIN            Stop daemon after N minutes (default: 0 = no timeout)
     LOOM_POLL_INTERVAL          Seconds between iterations (default: 120)
     LOOM_MAX_SHEPHERDS          Maximum concurrent shepherds (default: 3)
     LOOM_ISSUE_THRESHOLD        Trigger work generation when issues < this (default: 3)
@@ -141,6 +145,8 @@ To stop the daemon gracefully:
 Examples:
     loom-daemon                 # Start daemon in normal mode
     loom-daemon --force         # Start in force mode (auto-promote, auto-merge)
+    loom-daemon -t 180          # Run for 3 hours then gracefully stop
+    loom-daemon --merge -t 60   # Merge mode for 1 hour
     loom-daemon --status        # Check if daemon is running
     loom-daemon --health        # Show daemon health
 """,
@@ -160,6 +166,13 @@ Examples:
         "--debug", "-d",
         action="store_true",
         help="Enable debug mode for verbose logging",
+    )
+    parser.add_argument(
+        "--timeout-min", "-t",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Stop daemon after N minutes (0 = no timeout)",
     )
     parser.add_argument(
         "--status",
@@ -194,6 +207,7 @@ Examples:
     config = DaemonConfig.from_env(
         force_mode=force_mode,
         debug_mode=args.debug,
+        timeout_min=args.timeout_min,
     )
 
     # Create context and run

@@ -17,6 +17,7 @@
 # Options (user-facing):
 #   --force, -f      Enable force mode (auto-promote proposals, auto-merge)
 #   --merge, -m      Alias for --force (for CLI parity with /loom --merge)
+#   --timeout-min N, -t N  Stop daemon after N minutes (0 = no timeout)
 #   --debug, -d      Enable debug logging
 #   --status         Check if daemon is running
 #   --health         Show daemon health status
