@@ -13,6 +13,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import shutil
@@ -43,6 +44,7 @@ class CleanupStats:
     skipped_not_merged: int = 0
     skipped_grace: int = 0
     skipped_uncommitted: int = 0
+    skipped_editable: int = 0
     cleaned_branches: int = 0
     kept_branches: int = 0
     killed_tmux: int = 0
@@ -268,6 +270,94 @@ def cleanup_worktree(
     return True
 
 
+def find_editable_pip_installs(worktree_path: pathlib.Path) -> list[str]:
+    """Find pip packages with editable installs pointing into a worktree.
+
+    Checks all available Python interpreters for packages installed in
+    editable mode (pip install -e) whose source location is inside the
+    given worktree path.
+
+    Args:
+        worktree_path: Absolute path to the worktree directory.
+
+    Returns:
+        List of package names with editable installs inside the worktree.
+    """
+    packages: list[str] = []
+    worktree_str = str(worktree_path.resolve())
+
+    # Find Python interpreters to check
+    interpreters: list[str] = []
+    for name in ("python3", "python"):
+        try:
+            result = subprocess.run(
+                ["which", name],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                path = result.stdout.strip()
+                if path and path not in interpreters:
+                    interpreters.append(path)
+        except Exception:
+            continue
+
+    # Also check for venvs inside the worktree itself
+    for venv_dir in worktree_path.glob("*/.venv/bin/python"):
+        venv_python = str(venv_dir)
+        if venv_python not in interpreters:
+            interpreters.append(venv_python)
+    for venv_dir in worktree_path.glob(".venv/bin/python"):
+        venv_python = str(venv_dir)
+        if venv_python not in interpreters:
+            interpreters.append(venv_python)
+
+    for interpreter in interpreters:
+        try:
+            # List all installed packages
+            result = subprocess.run(
+                [interpreter, "-m", "pip", "list", "--editable", "--format=json"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if result.returncode != 0:
+                continue
+
+            try:
+                editable_pkgs = json.loads(result.stdout)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            for pkg_info in editable_pkgs:
+                pkg_name = pkg_info.get("name", "")
+                if not pkg_name:
+                    continue
+
+                # Get detailed info to find the editable location
+                show_result = subprocess.run(
+                    [interpreter, "-m", "pip", "show", pkg_name],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if show_result.returncode != 0:
+                    continue
+
+                for line in show_result.stdout.splitlines():
+                    if line.startswith("Editable project location:") or line.startswith("Location:"):
+                        location = line.split(":", 1)[1].strip()
+                        if location.startswith(worktree_str):
+                            if pkg_name not in packages:
+                                packages.append(pkg_name)
+                            break
+
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            continue
+
+    return packages
+
+
 def clean_worktrees(
     repo_root: pathlib.Path,
     stats: CleanupStats,
@@ -314,6 +404,18 @@ def clean_worktrees(
             if active_pids:
                 log_info(f"  Active process(es) using worktree: {active_pids} - preserving")
                 stats.skipped_in_use += 1
+                continue
+
+        # Check for editable pip installs pointing into the worktree
+        editable_pkgs = find_editable_pip_installs(worktree_path)
+        if editable_pkgs:
+            pkg_list = ", ".join(editable_pkgs)
+            if force:
+                log_warning(f"  Editable pip install(s) found ({pkg_list}) - removing anyway (--force)")
+            else:
+                log_warning(f"  Editable pip install(s) found ({pkg_list}) - skipping")
+                log_info("  Use --force to remove anyway, or uninstall first: pip uninstall " + " ".join(editable_pkgs))
+                stats.skipped_editable += 1
                 continue
 
         # Check issue state via GitHub CLI
@@ -626,6 +728,9 @@ def print_summary(stats: CleanupStats, dry_run: bool = False, safe_mode: bool = 
 
     if stats.skipped_in_use > 0:
         print(f"  Skipped (in use by shepherd): {stats.skipped_in_use}")
+
+    if stats.skipped_editable > 0:
+        print(f"  Skipped (editable pip install): {stats.skipped_editable}")
 
     if safe_mode:
         print(f"  Skipped (open/not merged): {stats.skipped_open + stats.skipped_not_merged}")
