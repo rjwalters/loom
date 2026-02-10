@@ -103,8 +103,8 @@ def _transform_api_response(api_data: dict[str, Any]) -> dict[str, Any]:
     API shape (simplified)::
 
         {
-          "five_hour": {"utilization": 0.42, "resets_at": "2026-01-23T15:00:00Z"},
-          "seven_day": {"utilization": 0.15, "resets_at": "2026-01-27T00:00:00Z"}
+          "five_hour": {"utilization": 42.0, "resets_at": "2026-01-23T15:00:00Z"},
+          "seven_day": {"utilization": 15.0, "resets_at": "2026-01-27T00:00:00Z"}
         }
 
     Output shape::
@@ -127,9 +127,9 @@ def _transform_api_response(api_data: dict[str, Any]) -> dict[str, Any]:
     weekly_util = seven.get("utilization")
 
     return {
-        "session_percent": round(session_util * 100, 1) if session_util is not None else None,
+        "session_percent": round(session_util, 1) if session_util is not None else None,
         "session_reset": five.get("resets_at"),
-        "weekly_all_percent": round(weekly_util * 100, 1) if weekly_util is not None else None,
+        "weekly_all_percent": round(weekly_util, 1) if weekly_util is not None else None,
         "weekly_reset": seven.get("resets_at"),
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "data_age_seconds": 0,
