@@ -1,6 +1,5 @@
 // Command modules organized by domain
 
-pub mod ab_testing;
 pub mod activity;
 pub mod config;
 pub mod correlation;
@@ -19,7 +18,6 @@ pub mod weekly_report;
 pub mod workspace;
 
 // Re-export all command functions for easy registration
-pub use ab_testing::*;
 pub use activity::*;
 pub use config::*;
 pub use correlation::*;
