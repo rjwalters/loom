@@ -197,6 +197,22 @@ def _capture_session_output(name: str, session_name: str) -> None:
         log_warning(f"Failed to capture session output: {exc}")
 
 
+def capture_tmux_output(name: str, lines: int = 200) -> str:
+    """Capture the current tmux pane output for a session.
+
+    Uses ``tmux capture-pane`` to read the visible buffer content.
+    Returns the captured output as a string, or empty string on failure.
+    """
+    session_name = f"{SESSION_PREFIX}{name}"
+    try:
+        result = _tmux("capture-pane", "-t", session_name, "-p", "-S", f"-{lines}")
+        if result.returncode == 0:
+            return result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return ""
+
+
 def kill_stuck_session(name: str) -> None:
     """Kill a stuck session with graceful then forced shutdown."""
     session_name = f"{SESSION_PREFIX}{name}"
