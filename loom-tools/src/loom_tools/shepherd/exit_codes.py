@@ -63,6 +63,11 @@ class ShepherdExitCode(IntEnum):
     # Daemon should requeue with backoff (max 3 retries per issue)
     TRANSIENT_ERROR = 7
 
+    # Budget exhausted - session ran out of API budget
+    # Issue is likely too complex for a single session
+    # After 2 occurrences, daemon triggers architect decomposition
+    BUDGET_EXHAUSTED = 8
+
 
 # Convenience mapping for code interpretation
 EXIT_CODE_DESCRIPTIONS = {
@@ -74,6 +79,7 @@ EXIT_CODE_DESCRIPTIONS = {
     ShepherdExitCode.SKIPPED: "Skipped - issue already complete",
     ShepherdExitCode.NO_CHANGES_NEEDED: "No changes needed - problem already resolved",
     ShepherdExitCode.TRANSIENT_ERROR: "Transient API error - safe to retry after backoff",
+    ShepherdExitCode.BUDGET_EXHAUSTED: "Budget exhausted - issue may need decomposition",
 }
 
 

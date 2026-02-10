@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from loom_tools.common.github import gh_run
 from loom_tools.common.issue_failures import (
+    ERROR_CLASS_BLOCK_THRESHOLDS,
     MAX_FAILURES_BEFORE_BLOCK,
     record_failure,
     record_success,
@@ -58,6 +59,34 @@ class CompletionEntry:
     success: bool = True
     pr_merged: bool = False
     is_transient_error: bool = False
+    error_class: str = "shepherd_failure"
+
+
+BUDGET_EXHAUSTION_PATTERNS = (
+    "budget",
+    "session limit",
+    "token limit",
+    "context window",
+    "max turns",
+    "turn limit",
+    "session_budget",
+)
+
+
+def _check_budget_exhaustion(milestones: list[dict[str, Any]]) -> bool:
+    """Check if progress milestones indicate budget exhaustion.
+
+    Looks at error events for patterns matching budget/session limit issues.
+    """
+    for milestone in reversed(milestones):
+        if milestone.get("event") == "error":
+            error_msg = milestone.get("data", {}).get("error", "")
+            for pattern in BUDGET_EXHAUSTION_PATTERNS:
+                if pattern.lower() in error_msg.lower():
+                    return True
+        if milestone.get("event") == "budget_exhausted":
+            return True
+    return False
 
 
 def _check_transient_error(milestones: list[dict[str, Any]]) -> bool:
@@ -127,6 +156,11 @@ def check_completions(ctx: DaemonContext) -> list[CompletionEntry]:
 
             if shepherd_name:
                 is_transient = _check_transient_error(milestones)
+                is_budget = _check_budget_exhaustion(milestones)
+                error_class = (
+                    "budget_exhausted" if is_budget
+                    else "shepherd_failure"
+                )
                 completed.append(CompletionEntry(
                     type="shepherd",
                     name=shepherd_name,
@@ -134,6 +168,7 @@ def check_completions(ctx: DaemonContext) -> list[CompletionEntry]:
                     task_id=task_id,
                     success=False,
                     is_transient_error=is_transient,
+                    error_class=error_class,
                 ))
 
     return completed
@@ -307,7 +342,7 @@ def _record_persistent_failure(
     # Determine error class and phase from shepherd entry
     shepherd_entry = ctx.state.shepherds.get(completion.name) if ctx.state else None
     phase = shepherd_entry.last_phase if shepherd_entry else "unknown"
-    error_class = "shepherd_failure"
+    error_class = completion.error_class
 
     entry = record_failure(
         ctx.repo_root,
@@ -318,11 +353,16 @@ def _record_persistent_failure(
     )
 
     if entry.should_auto_block:
+        threshold = ERROR_CLASS_BLOCK_THRESHOLDS.get(error_class, MAX_FAILURES_BEFORE_BLOCK)
         log_warning(
             f"Issue #{completion.issue} has failed {entry.total_failures} times "
-            f"(>= {MAX_FAILURES_BEFORE_BLOCK}) - auto-labeling as loom:blocked"
+            f"(>= {threshold}) - auto-labeling as loom:blocked"
         )
         _auto_block_issue(completion.issue, entry)
+
+        # Trigger architect decomposition for budget-exhausted issues
+        if error_class == "budget_exhausted":
+            _trigger_decomposition(completion.issue, entry)
 
 
 def _auto_block_issue(issue: int, entry: "IssueFailureEntry") -> None:
@@ -357,6 +397,56 @@ def _auto_block_issue(issue: int, entry: "IssueFailureEntry") -> None:
         )
     except Exception:
         log_warning(f"Failed to auto-block issue #{issue}")
+
+
+def _trigger_decomposition(issue: int, entry: "IssueFailureEntry") -> None:
+    """Create an architect issue to decompose a budget-exhausted issue.
+
+    When an issue repeatedly exhausts the session budget, it likely needs
+    to be broken into smaller sub-issues that can each be completed in a
+    single session.
+    """
+    from loom_tools.common.issue_failures import IssueFailureEntry  # noqa: F811
+
+    try:
+        title = f"[Decompose] Issue #{issue} exceeds single-session budget"
+        body = (
+            f"## Decomposition Request\n\n"
+            f"Issue #{issue} has failed **{entry.total_failures}** times due to "
+            f"**budget exhaustion** (session ran out of API budget before completion).\n\n"
+            f"This indicates the issue is too complex for a single shepherd session.\n\n"
+            f"### Action Required\n\n"
+            f"1. Analyze issue #{issue} and its existing work (check for WIP branches)\n"
+            f"2. Decompose into 2-4 smaller sub-issues that can each be completed "
+            f"in a single session\n"
+            f"3. Create the sub-issues with clear acceptance criteria\n"
+            f"4. Add dependency links between sub-issues if needed\n\n"
+            f"### Context\n\n"
+            f"- **Original issue**: #{issue}\n"
+            f"- **Last phase reached**: `{entry.phase}`\n"
+            f"- **Total failures**: {entry.total_failures}\n"
+            f"- **Error class**: `{entry.error_class}`\n"
+            f"- **First failure**: {entry.first_failure_at or 'unknown'}\n"
+            f"- **Last failure**: {entry.last_failure_at or 'unknown'}\n\n"
+            f"---\n"
+            f"*Auto-generated by daemon budget exhaustion handler*"
+        )
+
+        result = gh_run(
+            [
+                "issue", "create",
+                "--title", title,
+                "--body", body,
+                "--label", "loom:architect",
+            ],
+            check=False,
+        )
+        if result.returncode == 0:
+            log_info(f"Created architect decomposition issue for #{issue}")
+        else:
+            log_warning(f"Failed to create decomposition issue for #{issue}")
+    except Exception:
+        log_warning(f"Failed to create decomposition issue for #{issue}")
 
 
 def _handle_support_role_completion(

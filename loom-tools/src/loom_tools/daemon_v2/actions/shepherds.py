@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
 from loom_tools.common.github import gh_run
+from loom_tools.common.issue_failures import record_failure
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.time_utils import now_utc, parse_iso_timestamp
 from loom_tools.models.daemon_state import ShepherdEntry
@@ -84,12 +85,36 @@ def _find_idle_shepherd(ctx: DaemonContext) -> str | None:
     return None
 
 
+def _has_existing_checkpoint(repo_root: "pathlib.Path", issue_num: int) -> bool:
+    """Check if a previous shepherd left a checkpoint for this issue."""
+    worktree_path = repo_root / ".loom" / "worktrees" / f"issue-{issue_num}"
+    checkpoint_file = worktree_path / ".loom-checkpoint"
+    return checkpoint_file.is_file()
+
+
+def _has_existing_branch(repo_root: "pathlib.Path", issue_num: int) -> bool:
+    """Check if a feature branch exists on remote for this issue."""
+    branch_name = f"feature/issue-{issue_num}"
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", branch_name],
+            capture_output=True, text=True, timeout=15,
+            cwd=repo_root,
+        )
+        return bool(result.stdout.strip())
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
 def _spawn_single_shepherd(
     ctx: DaemonContext,
     shepherd_name: str,
     issue_num: int,
 ) -> bool:
     """Spawn a single shepherd for an issue.
+
+    Detects existing checkpoints and feature branches from prior attempts
+    and passes --resume flag so the shepherd can pick up where it left off.
 
     Returns True if successful.
     """
@@ -105,11 +130,22 @@ def _spawn_single_shepherd(
 
     log_info(f"Claimed issue #{issue_num} for {shepherd_name}")
 
+    # Check for prior work (checkpoint or remote branch)
+    has_checkpoint = _has_existing_checkpoint(ctx.repo_root, issue_num)
+    has_branch = _has_existing_branch(ctx.repo_root, issue_num)
+
     # Build spawn arguments
     args = str(issue_num)
     if ctx.config.force_mode:
         args += " --force"
     args += " --allow-dirty-main"
+
+    if has_checkpoint or has_branch:
+        args += " --resume"
+        log_info(
+            f"Issue #{issue_num} has prior work "
+            f"(checkpoint={has_checkpoint}, branch={has_branch}) - passing --resume"
+        )
 
     # Check for existing session and handle it
     if session_exists(shepherd_name):
@@ -180,6 +216,67 @@ def _unclaim_issue(issue_num: int) -> None:
         pass
 
 
+def _has_budget_exhaustion_warning(snapshot: dict[str, Any]) -> bool:
+    """Check if the snapshot health warnings include session_budget_low."""
+    health_warnings = snapshot.get("computed", {}).get("health_warnings", [])
+    return any(w.get("code") == "session_budget_low" for w in health_warnings)
+
+
+def _preserve_wip(repo_root: "pathlib.Path", issue: int) -> bool:
+    """Commit and push WIP changes in a shepherd's worktree before kill.
+
+    Returns True if WIP was preserved (committed and/or pushed).
+    """
+    worktree_path = repo_root / ".loom" / "worktrees" / f"issue-{issue}"
+    if not worktree_path.is_dir():
+        return False
+
+    try:
+        # Check for uncommitted changes
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, timeout=15,
+            cwd=worktree_path,
+        )
+        has_changes = bool(result.stdout.strip())
+
+        if has_changes:
+            # Stage and commit WIP
+            subprocess.run(
+                ["git", "add", "-A"],
+                capture_output=True, timeout=15,
+                cwd=worktree_path,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "WIP: budget exhausted - preserving partial progress"],
+                capture_output=True, timeout=30,
+                cwd=worktree_path,
+            )
+            log_info(f"STALL-L2: Committed WIP for issue #{issue}")
+
+        # Push the branch if it has a remote tracking branch or commits ahead
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+            cwd=worktree_path,
+        )
+        branch_name = branch_result.stdout.strip()
+        if branch_name:
+            push_result = subprocess.run(
+                ["git", "push", "-u", "origin", branch_name],
+                capture_output=True, timeout=60,
+                cwd=worktree_path,
+            )
+            if push_result.returncode == 0:
+                log_info(f"STALL-L2: Pushed WIP branch {branch_name} for issue #{issue}")
+                return True
+
+        return has_changes
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log_warning(f"STALL-L2: Failed to preserve WIP for issue #{issue}: {e}")
+        return False
+
+
 def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
     """Force reclaim shepherds with stale heartbeats.
 
@@ -188,7 +285,10 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
     2. Stale heartbeats from progress files
 
     For each stale shepherd found:
+    - Detects if stale due to budget exhaustion (session_budget_low)
+    - Preserves WIP (commits and pushes) for budget-exhausted shepherds
     - Kills the tmux session if it exists
+    - Records failure with appropriate error_class
     - Resets the shepherd entry to idle
     - Reverts the issue label from loom:building to loom:issue
 
@@ -199,6 +299,9 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
 
     reclaimed = 0
     timestamp = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Detect budget exhaustion from snapshot health warnings
+    is_budget_exhausted = _has_budget_exhaustion_warning(ctx.snapshot)
 
     # Get stale heartbeat info from snapshot
     shepherd_progress = (
@@ -243,13 +346,33 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         if not is_stale:
             continue
 
+        issue = entry.issue
+
+        # Determine error class for this stale shepherd
+        error_class = "budget_exhausted" if is_budget_exhausted else "shepherd_failure"
+
+        # Preserve WIP before killing (especially important for budget exhaustion)
+        if issue is not None and is_budget_exhausted:
+            _preserve_wip(ctx.repo_root, issue)
+
         # Kill tmux session if it exists
         if session_exists(name):
             log_info(f"STALL-L2: Killing tmux session for {name}")
             kill_stuck_session(name)
 
+        # Record failure in persistent log
+        if issue is not None:
+            phase = entry.last_phase or "unknown"
+            record_failure(
+                ctx.repo_root,
+                issue,
+                error_class=error_class,
+                phase=phase,
+                details=f"Shepherd {name} stale during {phase} phase ({error_class})",
+            )
+            log_info(f"STALL-L2: Recorded {error_class} failure for issue #{issue}")
+
         # Reset shepherd entry to idle
-        issue = entry.issue
         entry.status = "idle"
         entry.issue = None
         entry.task_id = None

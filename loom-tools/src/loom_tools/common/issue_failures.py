@@ -37,8 +37,15 @@ from loom_tools.common.state import read_json_file, write_json_file
 
 logger = logging.getLogger(__name__)
 
-# After this many total failures, auto-block the issue
+# After this many total failures, auto-block the issue (default for most error classes)
 MAX_FAILURES_BEFORE_BLOCK = 5
+
+# Per-error-class block thresholds (lower = block sooner)
+# Budget exhaustion means the issue is too complex for a single session;
+# blocking after 2 failures triggers architect decomposition.
+ERROR_CLASS_BLOCK_THRESHOLDS: dict[str, int] = {
+    "budget_exhausted": 2,
+}
 
 # Backoff schedule: attempt -> iterations to skip
 # 1st failure: 0, 2nd: 2, 3rd: 4, 4th: 8, 5th: auto-block
@@ -91,6 +98,13 @@ class IssueFailureEntry:
             d["last_success_at"] = self.last_success_at
         return d
 
+    @property
+    def block_threshold(self) -> int:
+        """Return the block threshold for this entry's error class."""
+        return ERROR_CLASS_BLOCK_THRESHOLDS.get(
+            self.error_class, MAX_FAILURES_BEFORE_BLOCK
+        )
+
     def backoff_iterations(self) -> int:
         """Calculate number of daemon iterations to skip before retrying.
 
@@ -99,17 +113,19 @@ class IssueFailureEntry:
             2nd failure: 2 iterations
             3rd failure: 4 iterations
             4th failure: 8 iterations
-            5th+: should be auto-blocked (MAX_FAILURES_BEFORE_BLOCK)
+            At threshold: should be auto-blocked
+
+        The threshold is per-error-class (e.g. budget_exhausted blocks after 2).
         """
         if self.total_failures <= 1:
             return 0
-        if self.total_failures >= MAX_FAILURES_BEFORE_BLOCK:
+        if self.total_failures >= self.block_threshold:
             return -1  # Signal: should be auto-blocked
         return BACKOFF_BASE ** (self.total_failures - 1)
 
     @property
     def should_auto_block(self) -> bool:
-        return self.total_failures >= MAX_FAILURES_BEFORE_BLOCK
+        return self.total_failures >= self.block_threshold
 
 
 @dataclass
@@ -255,7 +271,7 @@ def merge_into_daemon_state(
             existing["last_blocked_details"] = entry.details
             if entry.last_failure_at:
                 existing["last_blocked_at"] = entry.last_failure_at
-            if entry.total_failures >= MAX_FAILURES_BEFORE_BLOCK:
+            if entry.should_auto_block:
                 existing["retry_exhausted"] = True
             blocked_issue_retries[issue_key] = existing
 
