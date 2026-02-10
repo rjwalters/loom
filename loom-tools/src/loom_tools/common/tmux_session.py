@@ -50,6 +50,23 @@ class TmuxSession:
         except Exception:
             return ""
 
+    def capture_scrollback(self, lines: int = 200) -> str:
+        """Capture scrollback history from the tmux pane.
+
+        Args:
+            lines: Number of scrollback lines to capture (default 200).
+
+        Returns:
+            The captured scrollback text, or empty string on failure.
+        """
+        try:
+            result = self._run(
+                "capture-pane", "-t", self.name, "-p", "-S", f"-{lines}"
+            )
+            return result.stdout if result.returncode == 0 else ""
+        except Exception:
+            return ""
+
     def send_keys(self, keys: str, *extra: str) -> bool:
         """Send keys to this tmux session.
 

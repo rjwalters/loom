@@ -14,9 +14,11 @@ from loom_tools.agent_spawn import (
     TMUX_SOCKET,
     SpawnConfig,
     SpawnResult,
+    _capture_session_output,
     check_claude_cli,
     check_stop_signals,
     check_tmux,
+    kill_stuck_session,
     run,
     session_exists,
     session_is_alive,
@@ -491,3 +493,132 @@ class TestAnsiStripping:
                 f"pipe-pane should include sed fallback, got: {pipe_cmd}"
             assert ">>" in pipe_cmd, \
                 f"command should append to log file: {pipe_cmd}"
+
+
+class TestCaptureSessionOutput:
+    """Tests for _capture_session_output (pre-kill scrollback capture)."""
+
+    @patch("loom_tools.agent_spawn.find_repo_root")
+    def test_captures_scrollback_to_file(
+        self, mock_root: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        mock_root.return_value = mock_repo
+        fake_output = "line 1\nline 2\nsome agent output\n"
+
+        with patch(
+            "loom_tools.common.tmux_session.TmuxSession.capture_scrollback"
+        ) as mock_scrollback:
+            mock_scrollback.return_value = fake_output
+            _capture_session_output("shepherd-1", "loom-shepherd-1")
+
+        # Should have written a kill log
+        logs = list((mock_repo / ".loom" / "logs").glob("loom-shepherd-1-killed-*.log"))
+        assert len(logs) == 1
+        assert logs[0].read_text() == fake_output
+
+    @patch("loom_tools.agent_spawn.find_repo_root")
+    def test_skips_empty_output(
+        self, mock_root: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        mock_root.return_value = mock_repo
+
+        with patch(
+            "loom_tools.common.tmux_session.TmuxSession.capture_scrollback"
+        ) as mock_scrollback:
+            mock_scrollback.return_value = ""
+            _capture_session_output("shepherd-1", "loom-shepherd-1")
+
+        # No kill log should be written
+        logs = list((mock_repo / ".loom" / "logs").glob("loom-shepherd-1-killed-*.log"))
+        assert len(logs) == 0
+
+    @patch("loom_tools.agent_spawn.find_repo_root")
+    def test_skips_whitespace_only_output(
+        self, mock_root: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        mock_root.return_value = mock_repo
+
+        with patch(
+            "loom_tools.common.tmux_session.TmuxSession.capture_scrollback"
+        ) as mock_scrollback:
+            mock_scrollback.return_value = "   \n\n  \n"
+            _capture_session_output("shepherd-1", "loom-shepherd-1")
+
+        logs = list((mock_repo / ".loom" / "logs").glob("loom-shepherd-1-killed-*.log"))
+        assert len(logs) == 0
+
+    @patch("loom_tools.agent_spawn.find_repo_root")
+    def test_capture_failure_does_not_raise(
+        self, mock_root: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        mock_root.return_value = mock_repo
+
+        with patch(
+            "loom_tools.common.tmux_session.TmuxSession.capture_scrollback"
+        ) as mock_scrollback:
+            mock_scrollback.side_effect = Exception("tmux error")
+            # Should not raise
+            _capture_session_output("shepherd-1", "loom-shepherd-1")
+
+    @patch(
+        "loom_tools.agent_spawn.find_repo_root",
+        side_effect=FileNotFoundError("not in repo"),
+    )
+    def test_not_in_repo_does_not_raise(self, _mock_root: MagicMock) -> None:
+        # Should not raise even outside a repo
+        _capture_session_output("shepherd-1", "loom-shepherd-1")
+
+    @patch("loom_tools.agent_spawn.find_repo_root")
+    def test_creates_log_dir_if_missing(
+        self, mock_root: MagicMock, tmp_path: pathlib.Path
+    ) -> None:
+        # Set up repo without logs dir
+        clear_repo_cache()
+        (tmp_path / ".git").mkdir()
+        (tmp_path / ".loom").mkdir()
+        mock_root.return_value = tmp_path
+
+        with patch(
+            "loom_tools.common.tmux_session.TmuxSession.capture_scrollback"
+        ) as mock_scrollback:
+            mock_scrollback.return_value = "some output\n"
+            _capture_session_output("test", "loom-test")
+
+        assert (tmp_path / ".loom" / "logs").is_dir()
+        logs = list((tmp_path / ".loom" / "logs").glob("loom-test-killed-*.log"))
+        assert len(logs) == 1
+
+
+class TestKillStuckSessionCapture:
+    """Tests that kill_stuck_session captures output before killing."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    @patch("loom_tools.agent_spawn._capture_session_output")
+    def test_capture_called_before_kill(
+        self, mock_capture: MagicMock, mock_tmux: MagicMock
+    ) -> None:
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        kill_stuck_session("shepherd-1")
+
+        mock_capture.assert_called_once_with("shepherd-1", "loom-shepherd-1")
+
+    @patch("loom_tools.agent_spawn._tmux")
+    @patch(
+        "loom_tools.agent_spawn._capture_session_output",
+        side_effect=Exception("capture failed"),
+    )
+    def test_kill_proceeds_when_capture_fails(
+        self, mock_capture: MagicMock, mock_tmux: MagicMock
+    ) -> None:
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+        # Should not raise even if capture throws
+        kill_stuck_session("shepherd-1")
+
+        # tmux should still be called for graceful+force kill
+        tmux_calls = [str(c) for c in mock_tmux.call_args_list]
+        assert any("send-keys" in c for c in tmux_calls)
+        assert any("kill-session" in c for c in tmux_calls)
