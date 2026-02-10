@@ -400,14 +400,14 @@ class TestHeartbeatStaleness:
         assert cfg.heartbeat_grace_period == 900
 
     def test_grace_period_default(self) -> None:
-        """Default grace period is 600 seconds."""
+        """Default grace period is 300 seconds (reduced from 600 in #2198)."""
         cfg = SnapshotConfig()
-        assert cfg.heartbeat_grace_period == 600
+        assert cfg.heartbeat_grace_period == 300
 
     def test_grace_period_default_from_env(self) -> None:
-        """Default grace period via from_env() is 600 seconds."""
+        """Default grace period via from_env() is 300 seconds."""
         cfg = SnapshotConfig.from_env()
-        assert cfg.heartbeat_grace_period == 600
+        assert cfg.heartbeat_grace_period == 300
 
     def test_active_grace_period_detects_death_faster(self, tmp_path: pathlib.Path) -> None:
         """Shepherd spawned 4 min ago with stale heartbeat -> stale (past active grace, not full grace).

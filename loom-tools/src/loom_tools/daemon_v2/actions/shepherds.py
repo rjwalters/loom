@@ -5,7 +5,12 @@ from __future__ import annotations
 import subprocess
 from typing import TYPE_CHECKING, Any
 
-from loom_tools.agent_spawn import spawn_agent, session_exists, kill_stuck_session
+from loom_tools.agent_spawn import (
+    capture_tmux_output,
+    kill_stuck_session,
+    session_exists,
+    spawn_agent,
+)
 from loom_tools.common.github import gh_run
 from loom_tools.common.issue_failures import record_failure
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
@@ -15,10 +20,14 @@ from loom_tools.models.daemon_state import ShepherdEntry
 if TYPE_CHECKING:
     from loom_tools.daemon_v2.context import DaemonContext
 
-# Default grace period for newly spawned shepherds (seconds).
-# A shepherd that has been working longer than this without creating a
-# progress file is considered stuck.
-NO_PROGRESS_GRACE_PERIOD = 600  # 10 minutes
+# Tier 1: Early warning for shepherds that may have failed at startup.
+# After this many seconds without a progress file, log a warning and
+# capture tmux output but do NOT kill the session.
+STARTUP_GRACE_PERIOD = 120  # 2 minutes
+
+# Tier 2: Hard reclaim for shepherds that never created a progress file.
+# After this many seconds, kill the session and save diagnostic output.
+NO_PROGRESS_GRACE_PERIOD = 300  # 5 minutes
 
 
 def spawn_shepherds(ctx: DaemonContext) -> int:
@@ -287,6 +296,7 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
     For each stale shepherd found:
     - Detects if stale due to budget exhaustion (session_budget_low)
     - Preserves WIP (commits and pushes) for budget-exhausted shepherds
+    - Captures tmux output for post-mortem analysis
     - Kills the tmux session if it exists
     - Records failure with appropriate error_class
     - Resets the shepherd entry to idle
@@ -355,8 +365,9 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         if issue is not None and is_budget_exhausted:
             _preserve_wip(ctx.repo_root, issue)
 
-        # Kill tmux session if it exists
+        # Capture tmux output before killing for post-mortem analysis
         if session_exists(name):
+            _save_diagnostic_output(ctx, name)
             log_info(f"STALL-L2: Killing tmux session for {name}")
             kill_stuck_session(name)
 
@@ -381,6 +392,7 @@ def force_reclaim_stale_shepherds(ctx: DaemonContext) -> int:
         entry.idle_reason = "stall_recovery"
         entry.last_issue = issue
         entry.last_completed = timestamp
+        entry.startup_warning_at = None
 
         log_info(f"STALL-L2: Reset {name} to idle")
 
@@ -404,7 +416,13 @@ def _check_no_progress_file(
 ) -> bool:
     """Check if a working shepherd has no progress file past the grace period.
 
-    Returns True if the shepherd should be considered stale.
+    Implements two-tier detection:
+      Tier 1 (startup_grace_period, default 120s): Log a warning, capture tmux
+        output snapshot, and set ``startup_warning_at`` but do NOT reclaim.
+      Tier 2 (no_progress_grace_period, default 300s): Save diagnostic output
+        to ``.loom/logs/`` and return True to trigger reclaim.
+
+    Returns True if the shepherd should be considered stale (Tier 2).
     """
     if entry.started is None or entry.task_id is None:
         return False
@@ -416,32 +434,90 @@ def _check_no_progress_file(
     except (ValueError, OSError):
         return False
 
-    if spawn_age < NO_PROGRESS_GRACE_PERIOD:
+    startup_grace = ctx.config.startup_grace_period
+    hard_reclaim_grace = ctx.config.no_progress_grace_period
+
+    if spawn_age < startup_grace:
         return False
 
     # Check if a progress file exists for this shepherd's task_id
-    progress_file = ctx.repo_root / ".loom" / "progress" / f"shepherd-{entry.task_id}.json"
-    if not progress_file.exists():
-        # Also check snapshot progress data — the task_id in daemon-state is
-        # generated at spawn time and may not match the actual progress file
-        # name. Fall back to checking if *any* progress entry tracks this issue.
-        shepherd_progress = (
-            ctx.snapshot.get("shepherds", {}).get("progress", [])
-            if ctx.snapshot
-            else []
-        )
-        has_progress = any(
-            prog.get("issue") == entry.issue
-            for prog in shepherd_progress
-        )
-        if not has_progress:
-            log_warning(
-                f"WARN:no_progress_file {name} has no progress file "
-                f"after {spawn_age}s (task_id={entry.task_id}, issue=#{entry.issue})"
-            )
-            return True
+    has_progress = _has_progress_data(ctx, entry)
 
-    return False
+    if has_progress:
+        return False
+
+    # --- No progress file found ---
+
+    # Tier 1: Early warning (past startup grace, before hard reclaim)
+    if spawn_age < hard_reclaim_grace:
+        if entry.startup_warning_at is None:
+            entry.startup_warning_at = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            log_warning(
+                f"STALL-T1: {name} has no progress file after {spawn_age}s "
+                f"(task_id={entry.task_id}, issue=#{entry.issue}) — monitoring"
+            )
+            # Capture a tmux output snapshot for debugging
+            if session_exists(name):
+                output = capture_tmux_output(name)
+                if output.strip():
+                    log_info(
+                        f"STALL-T1: {name} tmux snapshot (last lines): "
+                        + output.strip().splitlines()[-1][:200]
+                    )
+        return False
+
+    # Tier 2: Hard reclaim
+    log_warning(
+        f"STALL-T2: {name} has no progress file after {spawn_age}s "
+        f"(task_id={entry.task_id}, issue=#{entry.issue}) — reclaiming"
+    )
+    _save_diagnostic_output(ctx, name)
+    return True
+
+
+def _has_progress_data(ctx: DaemonContext, entry: ShepherdEntry) -> bool:
+    """Check if a shepherd has any associated progress data.
+
+    Checks both the filesystem progress file and the snapshot progress entries
+    since the task_id in daemon-state may not match the progress file name.
+    """
+    progress_file = ctx.repo_root / ".loom" / "progress" / f"shepherd-{entry.task_id}.json"
+    if progress_file.exists():
+        return True
+
+    # Fall back to checking if any snapshot progress entry tracks this issue
+    shepherd_progress = (
+        ctx.snapshot.get("shepherds", {}).get("progress", [])
+        if ctx.snapshot
+        else []
+    )
+    return any(
+        prog.get("issue") == entry.issue
+        for prog in shepherd_progress
+    )
+
+
+def _save_diagnostic_output(ctx: DaemonContext, name: str) -> None:
+    """Capture tmux output and save to a diagnostic log file.
+
+    Saves to ``.loom/logs/stall-diagnostic-{name}-{timestamp}.log`` for
+    post-mortem analysis of stuck/failed shepherd sessions.
+    """
+    output = capture_tmux_output(name, lines=500)
+    if not output.strip():
+        log_info(f"STALL: No tmux output to capture for {name}")
+        return
+
+    log_dir = ctx.repo_root / ".loom" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = now_utc().strftime("%Y%m%d-%H%M%S")
+    diag_file = log_dir / f"stall-diagnostic-{name}-{ts}.log"
+    try:
+        diag_file.write_text(output)
+        log_info(f"STALL: Saved diagnostic output to {diag_file}")
+    except OSError as e:
+        log_warning(f"STALL: Failed to save diagnostic output for {name}: {e}")
 
 
 def _extract_task_id(session_name: str) -> str | None:

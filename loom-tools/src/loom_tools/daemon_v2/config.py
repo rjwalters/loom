@@ -21,6 +21,8 @@ DEFAULT_CHAMPION_INTERVAL = 600  # seconds
 DEFAULT_DOCTOR_INTERVAL = 300  # seconds
 DEFAULT_AUDITOR_INTERVAL = 600  # seconds
 DEFAULT_JUDGE_INTERVAL = 300  # seconds
+DEFAULT_STARTUP_GRACE_PERIOD = 120  # seconds before early warning
+DEFAULT_NO_PROGRESS_GRACE_PERIOD = 300  # seconds before hard reclaim
 DEFAULT_STALL_DIAGNOSTIC_THRESHOLD = 3  # consecutive stalled iterations
 DEFAULT_STALL_RECOVERY_THRESHOLD = 5
 DEFAULT_STALL_RESTART_THRESHOLD = 10
@@ -59,6 +61,10 @@ class DaemonConfig:
     auditor_interval: int = DEFAULT_AUDITOR_INTERVAL
     judge_interval: int = DEFAULT_JUDGE_INTERVAL
 
+    # Shepherd startup detection thresholds
+    startup_grace_period: int = DEFAULT_STARTUP_GRACE_PERIOD
+    no_progress_grace_period: int = DEFAULT_NO_PROGRESS_GRACE_PERIOD
+
     # Stall escalation thresholds
     stall_diagnostic_threshold: int = DEFAULT_STALL_DIAGNOSTIC_THRESHOLD
     stall_recovery_threshold: int = DEFAULT_STALL_RECOVERY_THRESHOLD
@@ -89,6 +95,8 @@ class DaemonConfig:
             issue_threshold=env_int("LOOM_ISSUE_THRESHOLD", DEFAULT_ISSUE_THRESHOLD),
             issue_strategy=os.environ.get("LOOM_ISSUE_STRATEGY", "fifo"),
             max_proposals=env_int("LOOM_MAX_PROPOSALS", DEFAULT_MAX_PROPOSALS),
+            startup_grace_period=env_int("LOOM_STARTUP_GRACE_PERIOD", DEFAULT_STARTUP_GRACE_PERIOD),
+            no_progress_grace_period=env_int("LOOM_NO_PROGRESS_GRACE_PERIOD", DEFAULT_NO_PROGRESS_GRACE_PERIOD),
             architect_cooldown=env_int("LOOM_ARCHITECT_COOLDOWN", DEFAULT_ARCHITECT_COOLDOWN),
             hermit_cooldown=env_int("LOOM_HERMIT_COOLDOWN", DEFAULT_HERMIT_COOLDOWN),
             guide_interval=env_int("LOOM_GUIDE_INTERVAL", DEFAULT_GUIDE_INTERVAL),

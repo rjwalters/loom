@@ -20,6 +20,7 @@ class ShepherdEntry:
     last_issue: int | None = None
     last_completed: str | None = None
     execution_mode: str | None = None
+    startup_warning_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ShepherdEntry:
@@ -36,6 +37,7 @@ class ShepherdEntry:
             last_issue=data.get("last_issue"),
             last_completed=data.get("last_completed"),
             execution_mode=data.get("execution_mode"),
+            startup_warning_at=data.get("startup_warning_at"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -43,7 +45,7 @@ class ShepherdEntry:
         for k in (
             "issue", "task_id", "output_file", "started", "last_phase",
             "pr_number", "idle_since", "idle_reason", "last_issue",
-            "last_completed", "execution_mode",
+            "last_completed", "execution_mode", "startup_warning_at",
         ):
             v = getattr(self, k)
             if v is not None:

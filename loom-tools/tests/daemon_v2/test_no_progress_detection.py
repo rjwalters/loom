@@ -1,6 +1,10 @@
 """Tests for no-progress-file shepherd detection.
 
-Covers the scenario where a shepherd is spawned but never creates a
+Covers two-tier startup detection:
+  Tier 1 (~120s): Early warning — log + tmux capture, do NOT kill.
+  Tier 2 (~300s): Hard reclaim — save diagnostic log, kill and reset.
+
+Also covers the scenario where a shepherd is spawned but never creates a
 progress file (e.g., stuck at a permission prompt). The daemon should
 detect and reclaim such shepherds after the grace period.
 """
@@ -16,7 +20,9 @@ import pytest
 
 from loom_tools.daemon_v2.actions.shepherds import (
     NO_PROGRESS_GRACE_PERIOD,
+    STARTUP_GRACE_PERIOD,
     _check_no_progress_file,
+    _save_diagnostic_output,
     force_reclaim_stale_shepherds,
 )
 from loom_tools.daemon_v2.config import DaemonConfig
@@ -63,6 +69,31 @@ def _ts(seconds_ago: int) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# -----------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------
+
+
+class TestConstants:
+    """Verify grace period constants match expected values."""
+
+    def test_startup_grace_period(self) -> None:
+        assert STARTUP_GRACE_PERIOD == 120
+
+    def test_no_progress_grace_period(self) -> None:
+        assert NO_PROGRESS_GRACE_PERIOD == 300
+
+    def test_config_defaults_match_constants(self) -> None:
+        cfg = DaemonConfig()
+        assert cfg.startup_grace_period == STARTUP_GRACE_PERIOD
+        assert cfg.no_progress_grace_period == NO_PROGRESS_GRACE_PERIOD
+
+
+# -----------------------------------------------------------------------
+# _check_no_progress_file — basic cases
+# -----------------------------------------------------------------------
+
+
 class TestCheckNoProgressFile:
     """Tests for _check_no_progress_file helper."""
 
@@ -71,7 +102,6 @@ class TestCheckNoProgressFile:
             "shepherd-1": {"status": "working", "issue": 42, "task_id": "abc1234"},
         })
         entry = ctx.state.shepherds["shepherd-1"]
-        # started is None — should not flag
         assert _check_no_progress_file(ctx, "shepherd-1", entry) is False
 
     def test_no_task_id(self) -> None:
@@ -79,25 +109,24 @@ class TestCheckNoProgressFile:
             "shepherd-1": {"status": "working", "issue": 42, "started": _ts(600)},
         })
         entry = ctx.state.shepherds["shepherd-1"]
-        # task_id is None — should not flag
         assert _check_no_progress_file(ctx, "shepherd-1", entry) is False
 
-    def test_within_grace_period(self) -> None:
-        """Shepherd spawned less than grace period ago should NOT be flagged."""
+    def test_within_startup_grace_period(self) -> None:
+        """Shepherd within startup grace should trigger neither warning nor reclaim."""
         ctx = _make_ctx(shepherds={
             "shepherd-1": {
                 "status": "working",
                 "issue": 42,
                 "task_id": "abc1234",
-                "started": _ts(60),  # 60 seconds ago — within grace period
+                "started": _ts(60),  # 60s — within startup grace
             },
         })
         entry = ctx.state.shepherds["shepherd-1"]
         assert _check_no_progress_file(ctx, "shepherd-1", entry) is False
+        assert entry.startup_warning_at is None
 
-    def test_past_grace_period_no_progress_file(self, tmp_path: pathlib.Path) -> None:
-        """Shepherd past grace period with no progress file should be flagged."""
-        # Create .loom/progress dir but no progress file
+    def test_past_hard_reclaim_no_progress_file(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd past hard reclaim period with no progress file should be flagged."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
 
@@ -108,18 +137,18 @@ class TestCheckNoProgressFile:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(600),  # 10 minutes ago — past grace period
+                    "started": _ts(310),  # 310s — past 300s hard reclaim
                 },
             },
         )
-        entry = ctx.state.shepherds["shepherd-1"]
-        assert _check_no_progress_file(ctx, "shepherd-1", entry) is True
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+            entry = ctx.state.shepherds["shepherd-1"]
+            assert _check_no_progress_file(ctx, "shepherd-1", entry) is True
 
     def test_past_grace_period_with_progress_file(self, tmp_path: pathlib.Path) -> None:
         """Shepherd past grace period WITH a progress file should NOT be flagged."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
-        # Create matching progress file
         (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
             "task_id": "abc1234",
             "issue": 42,
@@ -141,11 +170,7 @@ class TestCheckNoProgressFile:
         assert _check_no_progress_file(ctx, "shepherd-1", entry) is False
 
     def test_past_grace_period_with_snapshot_progress(self, tmp_path: pathlib.Path) -> None:
-        """Shepherd with matching issue in snapshot progress should NOT be flagged.
-
-        The task_id in daemon-state may not match the progress file name, so
-        we also check if any snapshot progress entry tracks this issue.
-        """
+        """Shepherd with matching issue in snapshot progress should NOT be flagged."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
 
@@ -166,21 +191,17 @@ class TestCheckNoProgressFile:
         entry = ctx.state.shepherds["shepherd-1"]
         assert _check_no_progress_file(ctx, "shepherd-1", entry) is False
 
-    def test_grace_period_constant(self) -> None:
-        """Verify the grace period constant matches the expected value."""
-        assert NO_PROGRESS_GRACE_PERIOD == 600
+
+# -----------------------------------------------------------------------
+# _check_no_progress_file — Tier 1 early warning
+# -----------------------------------------------------------------------
 
 
-class TestForceReclaimNoProgress:
-    """Tests for no-progress-file detection in force_reclaim_stale_shepherds."""
+class TestTier1EarlyWarning:
+    """Tests for Tier 1 early warning (between startup and hard reclaim grace)."""
 
-    @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
-    @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
-    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
-    def test_reclaims_shepherd_with_no_progress(
-        self, mock_session, mock_pid, mock_claude, tmp_path: pathlib.Path
-    ) -> None:
-        """Shepherd past grace period without progress file gets reclaimed."""
+    def test_tier1_warning_fires_sets_startup_warning_at(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd at 130s with no progress triggers warning but NOT reclaim."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
 
@@ -191,7 +212,132 @@ class TestForceReclaimNoProgress:
                     "status": "working",
                     "issue": 42,
                     "task_id": "abc1234",
-                    "started": _ts(600),
+                    "started": _ts(130),  # Past 120s, before 300s
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="some output"):
+                result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is False  # NOT reclaimed
+        assert entry.startup_warning_at is not None
+
+    def test_tier1_warning_not_duplicated(self, tmp_path: pathlib.Path) -> None:
+        """Second call at Tier 1 should not overwrite startup_warning_at."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        first_warning_ts = "2026-01-01T10:00:00Z"
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(200),
+                    "startup_warning_at": first_warning_ts,
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True):
+            with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+                result = _check_no_progress_file(ctx, "shepherd-1", entry)
+
+        assert result is False
+        # Timestamp should be preserved from first warning
+        assert entry.startup_warning_at == first_warning_ts
+
+    def test_healthy_shepherd_unaffected(self, tmp_path: pathlib.Path) -> None:
+        """Shepherd with progress file is never flagged regardless of age."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+        (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
+            "task_id": "abc1234", "issue": 42, "status": "working",
+        }))
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(1000),  # Very old
+                },
+            },
+        )
+        entry = ctx.state.shepherds["shepherd-1"]
+        assert _check_no_progress_file(ctx, "shepherd-1", entry) is False
+        assert entry.startup_warning_at is None
+
+
+# -----------------------------------------------------------------------
+# _save_diagnostic_output
+# -----------------------------------------------------------------------
+
+
+class TestSaveDiagnosticOutput:
+    """Tests for diagnostic output capture and save."""
+
+    def test_saves_diagnostic_file(self, tmp_path: pathlib.Path) -> None:
+        """Verify diagnostic output is written to .loom/logs/."""
+        ctx = _make_ctx(repo_root=tmp_path)
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="Error: permission denied\nStack trace..."):
+            _save_diagnostic_output(ctx, "shepherd-1")
+
+        log_dir = tmp_path / ".loom" / "logs"
+        diag_files = list(log_dir.glob("stall-diagnostic-shepherd-1-*.log"))
+        assert len(diag_files) == 1
+        content = diag_files[0].read_text()
+        assert "Error: permission denied" in content
+
+    def test_no_output_skips_file_creation(self, tmp_path: pathlib.Path) -> None:
+        """No diagnostic file should be created if tmux output is empty."""
+        ctx = _make_ctx(repo_root=tmp_path)
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value=""):
+            _save_diagnostic_output(ctx, "shepherd-1")
+
+        log_dir = tmp_path / ".loom" / "logs"
+        if log_dir.exists():
+            diag_files = list(log_dir.glob("stall-diagnostic-*.log"))
+            assert len(diag_files) == 0
+
+
+# -----------------------------------------------------------------------
+# force_reclaim_stale_shepherds — integration with two-tier detection
+# -----------------------------------------------------------------------
+
+
+class TestForceReclaimNoProgress:
+    """Tests for no-progress-file detection in force_reclaim_stale_shepherds."""
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="some output")
+    @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
+    def test_reclaims_shepherd_past_hard_reclaim(
+        self, mock_session, mock_pid, mock_claude, mock_capture, tmp_path: pathlib.Path
+    ) -> None:
+        """Shepherd past hard reclaim (300s) without progress file gets reclaimed."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(310),  # Past 300s
                 },
             },
         )
@@ -203,14 +349,58 @@ class TestForceReclaimNoProgress:
         assert reclaimed == 1
         assert ctx.state.shepherds["shepherd-1"].status == "idle"
         assert ctx.state.shepherds["shepherd-1"].idle_reason == "stall_recovery"
+        # startup_warning_at should be cleared on reset
+        assert ctx.state.shepherds["shepherd-1"].startup_warning_at is None
+
+    @patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="")
+    @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
+    def test_captures_diagnostic_before_kill(
+        self, mock_session, mock_pid, mock_claude, mock_capture, tmp_path: pathlib.Path
+    ) -> None:
+        """Verify capture_tmux_output is called before kill_stuck_session."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(310),
+                },
+            },
+        )
+
+        call_order: list[str] = []
+
+        def track_capture(name, lines=500):
+            call_order.append("capture")
+            return "diagnostic output"
+
+        def track_kill(name):
+            call_order.append("kill")
+
+        mock_capture.side_effect = track_capture
+
+        with patch("loom_tools.daemon_v2.actions.shepherds.kill_stuck_session", side_effect=track_kill):
+            with patch("loom_tools.daemon_v2.actions.shepherds._unclaim_issue"):
+                force_reclaim_stale_shepherds(ctx)
+
+        assert "capture" in call_order
+        assert "kill" in call_order
+        assert call_order.index("capture") < call_order.index("kill")
 
     @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
     @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
     @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
-    def test_does_not_reclaim_within_grace_period(
+    def test_does_not_reclaim_within_startup_grace(
         self, mock_session, mock_pid, mock_claude, tmp_path: pathlib.Path
     ) -> None:
-        """Shepherd within grace period should NOT be reclaimed."""
+        """Shepherd within startup grace period should NOT be reclaimed."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
 
@@ -230,6 +420,34 @@ class TestForceReclaimNoProgress:
         assert reclaimed == 0
         assert ctx.state.shepherds["shepherd-1"].status == "working"
 
+    @patch("loom_tools.daemon_v2.actions.shepherds.capture_tmux_output", return_value="output")
+    @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
+    @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
+    @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
+    def test_tier1_warning_does_not_reclaim(
+        self, mock_session, mock_pid, mock_claude, mock_capture, tmp_path: pathlib.Path
+    ) -> None:
+        """Shepherd between startup and hard reclaim grace triggers warning, not reclaim."""
+        progress_dir = tmp_path / ".loom" / "progress"
+        progress_dir.mkdir(parents=True)
+
+        ctx = _make_ctx(
+            repo_root=tmp_path,
+            shepherds={
+                "shepherd-1": {
+                    "status": "working",
+                    "issue": 42,
+                    "task_id": "abc1234",
+                    "started": _ts(200),  # Between 120s and 300s
+                },
+            },
+        )
+
+        reclaimed = force_reclaim_stale_shepherds(ctx)
+        assert reclaimed == 0
+        assert ctx.state.shepherds["shepherd-1"].status == "working"
+        assert ctx.state.shepherds["shepherd-1"].startup_warning_at is not None
+
     @patch("loom_tools.agent_spawn._is_claude_running", return_value=True)
     @patch("loom_tools.agent_spawn._get_pane_pid", return_value=12345)
     @patch("loom_tools.daemon_v2.actions.shepherds.session_exists", return_value=True)
@@ -239,7 +457,6 @@ class TestForceReclaimNoProgress:
         """Shepherd with an active progress file should NOT be reclaimed."""
         progress_dir = tmp_path / ".loom" / "progress"
         progress_dir.mkdir(parents=True)
-        # Create matching progress file
         (progress_dir / "shepherd-abc1234.json").write_text(json.dumps({
             "task_id": "abc1234",
             "issue": 42,
@@ -281,6 +498,11 @@ class TestForceReclaimNoProgress:
 
         reclaimed = force_reclaim_stale_shepherds(ctx)
         assert reclaimed == 0
+
+
+# -----------------------------------------------------------------------
+# Proactive reclaim (called every iteration)
+# -----------------------------------------------------------------------
 
 
 class TestProactiveReclaim:
@@ -331,7 +553,6 @@ class TestProactiveReclaim:
         ctx.snapshot["computed"]["active_shepherds"] = 2
         ctx.snapshot["computed"]["available_shepherd_slots"] = 1
 
-        # Simulate reclaim by changing shepherd status
         def reclaim_side_effect(c: DaemonContext) -> int:
             c.state.shepherds["shepherd-1"].status = "idle"
             c.state.shepherds["shepherd-2"].status = "idle"
