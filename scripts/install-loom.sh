@@ -583,6 +583,26 @@ fi
 
 echo ""
 
+# Copy hooks to target (settings.json references .loom/hooks/guard-destructive.sh)
+info "Installing hooks..."
+if [[ -d "$LOOM_ROOT/defaults/hooks" ]]; then
+  mkdir -p .loom/hooks
+  for hook_file in "$LOOM_ROOT/defaults/hooks/"*.sh; do
+    [[ -f "$hook_file" ]] || continue
+    hook_name=$(basename "$hook_file")
+    if [[ -f ".loom/hooks/$hook_name" ]] && [[ "$FORCE_OVERWRITE" != "true" ]] && [[ "$CLEAN_FIRST" != "true" ]]; then
+      info "Skipping existing hook: $hook_name (use --force to overwrite)"
+    else
+      cp "$hook_file" ".loom/hooks/$hook_name"
+      chmod +x ".loom/hooks/$hook_name"
+      success "Installed hook: $hook_name"
+    fi
+  done
+else
+  warning "No hooks directory found in defaults"
+fi
+echo ""
+
 # Set up Python tools (loom-tools package)
 # This creates a virtual environment in loom-tools/.venv and installs loom-shepherd, etc.
 info "Setting up Python tools..."
@@ -626,6 +646,7 @@ EXPECTED_FILES=(
   ".loom/config.json"
   ".loom/roles"
   ".loom/scripts/worktree.sh"
+  ".loom/hooks/guard-destructive.sh"
   "CLAUDE.md"
   ".github/labels.yml"
   ".claude/commands"
