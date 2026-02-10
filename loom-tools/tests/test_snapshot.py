@@ -1749,3 +1749,223 @@ class TestSnapshotConfigSpinning:
         cfg = SnapshotConfig()
         d = cfg.to_dict()
         assert d["spinning_review_threshold"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Human-input-needed blocker detection
+# ---------------------------------------------------------------------------
+
+
+class TestNeedsHumanInputActions:
+    """Tests for needs_human_input in compute_recommended_actions."""
+
+    def _base_kwargs(self) -> dict:
+        return {
+            "ready_count": 0,
+            "building_count": 0,
+            "blocked_count": 0,
+            "total_proposals": 0,
+            "architect_count": 0,
+            "hermit_count": 0,
+            "review_count": 0,
+            "changes_count": 0,
+            "merge_count": 0,
+            "available_shepherd_slots": 3,
+            "needs_work_generation": False,
+            "architect_cooldown_ok": False,
+            "hermit_cooldown_ok": False,
+            "support_roles": {r: SupportRoleState() for r in
+                              ("guide", "champion", "doctor", "auditor", "judge", "architect", "hermit")},
+            "orphaned_count": 0,
+            "invalid_task_id_count": 0,
+            "curated_count": 0,
+        }
+
+    def test_no_blockers_no_action(self) -> None:
+        """Empty pipeline with no curated/proposals → no needs_human_input action."""
+        kw = self._base_kwargs()
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" not in actions
+        assert demand["human_input_blockers"] == []
+
+    def test_curated_issues_trigger_action(self) -> None:
+        """Curated issues awaiting approval trigger needs_human_input."""
+        kw = self._base_kwargs()
+        kw["curated_count"] = 2
+        kw["total_proposals"] = 2
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" in actions
+        assert len(demand["human_input_blockers"]) == 1
+        assert demand["human_input_blockers"][0]["type"] == "approval_needed"
+        assert demand["human_input_blockers"][0]["count"] == 2
+
+    def test_architect_proposals_trigger_action(self) -> None:
+        """Architect proposals trigger needs_human_input."""
+        kw = self._base_kwargs()
+        kw["architect_count"] = 1
+        kw["total_proposals"] = 1
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" in actions
+        blockers = demand["human_input_blockers"]
+        assert any(b["type"] == "proposal_review" for b in blockers)
+
+    def test_hermit_proposals_trigger_action(self) -> None:
+        """Hermit proposals trigger needs_human_input."""
+        kw = self._base_kwargs()
+        kw["hermit_count"] = 1
+        kw["total_proposals"] = 1
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" in actions
+        blockers = demand["human_input_blockers"]
+        assert any(b["type"] == "proposal_review" for b in blockers)
+
+    def test_blocked_issues_trigger_action(self) -> None:
+        """Blocked issues trigger needs_human_input when pipeline is waiting."""
+        kw = self._base_kwargs()
+        kw["blocked_count"] = 3
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" in actions
+        blockers = demand["human_input_blockers"]
+        assert any(b["type"] == "blocked" for b in blockers)
+        assert blockers[0]["count"] == 3
+
+    def test_multiple_blocker_types(self) -> None:
+        """Multiple blocker types all surface."""
+        kw = self._base_kwargs()
+        kw["curated_count"] = 2
+        kw["architect_count"] = 1
+        kw["hermit_count"] = 1
+        kw["blocked_count"] = 1
+        kw["total_proposals"] = 4
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" in actions
+        blockers = demand["human_input_blockers"]
+        assert len(blockers) == 4
+        types = {b["type"] for b in blockers}
+        assert types == {"approval_needed", "proposal_review", "blocked"}
+
+    def test_no_action_when_pipeline_busy(self) -> None:
+        """Human-input blockers don't fire when pipeline is actively working."""
+        kw = self._base_kwargs()
+        kw["ready_count"] = 2  # Has ready work → "spawn_shepherds", no "wait"
+        kw["curated_count"] = 3
+        kw["total_proposals"] = 3
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" not in actions
+        assert demand["human_input_blockers"] == []
+
+    def test_no_false_positive_empty_pipeline(self) -> None:
+        """Genuinely empty pipeline (no issues at all) → no needs_human_input."""
+        kw = self._base_kwargs()
+        actions, demand = compute_recommended_actions(**kw)
+        assert "needs_human_input" not in actions
+        assert demand["human_input_blockers"] == []
+
+
+class TestNeedsHumanInputHealth:
+    """Tests for needs_human_input warning in compute_health."""
+
+    def test_no_warning_when_pipeline_active(self) -> None:
+        """Active pipeline (ready issues) → no needs_human_input warning."""
+        status, warnings = compute_health(
+            ready_count=2, building_count=0, blocked_count=0,
+            total_proposals=3, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            curated_count=2, architect_count=1, hermit_count=0,
+        )
+        assert not any(w["code"] == "needs_human_input" for w in warnings)
+
+    def test_warning_when_idle_with_curated(self) -> None:
+        """Idle pipeline with curated issues → needs_human_input warning (stalled)."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=2, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            curated_count=2, architect_count=0, hermit_count=0,
+        )
+        assert status == "stalled"
+        hi_warns = [w for w in warnings if w["code"] == "needs_human_input"]
+        assert len(hi_warns) == 1
+        assert "2 curated issue(s) need approval" in hi_warns[0]["message"]
+
+    def test_warning_with_mixed_proposals(self) -> None:
+        """Idle pipeline with mixed proposals → detailed message."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=4, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            curated_count=1, architect_count=2, hermit_count=1,
+        )
+        assert status == "stalled"
+        hi_warns = [w for w in warnings if w["code"] == "needs_human_input"]
+        assert len(hi_warns) == 1
+        msg = hi_warns[0]["message"]
+        assert "1 curated issue(s) need approval" in msg
+        assert "2 architect proposal(s) need review" in msg
+        assert "1 hermit proposal(s) need review" in msg
+
+    def test_no_warning_genuinely_empty(self) -> None:
+        """Genuinely empty pipeline → no needs_human_input warning."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=0, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            curated_count=0, architect_count=0, hermit_count=0,
+        )
+        assert not any(w["code"] == "needs_human_input" for w in warnings)
+
+    def test_coexists_with_proposal_backlog(self) -> None:
+        """needs_human_input coexists with proposal_backlog (different levels)."""
+        status, warnings = compute_health(
+            ready_count=0, building_count=0, blocked_count=0,
+            total_proposals=2, stale_heartbeat_count=0, orphaned_count=0,
+            usage_healthy=True, session_percent=50.0,
+            curated_count=2, architect_count=0, hermit_count=0,
+        )
+        codes = [w["code"] for w in warnings]
+        assert "proposal_backlog" in codes
+        assert "needs_human_input" in codes
+        # proposal_backlog is info, needs_human_input is warning
+        pb = next(w for w in warnings if w["code"] == "proposal_backlog")
+        hi = next(w for w in warnings if w["code"] == "needs_human_input")
+        assert pb["level"] == "info"
+        assert hi["level"] == "warning"
+
+
+class TestBuildSnapshotNeedsHumanInput:
+    """Tests for needs_human_input in build_snapshot output."""
+
+    def _mock_pipeline(self) -> dict:
+        return {
+            "ready_issues": [],
+            "building_issues": [],
+            "blocked_issues": [],
+            "architect_proposals": [{"number": 10, "title": "Proposal", "labels": []}],
+            "hermit_proposals": [],
+            "curated_issues": [
+                {"number": 20, "title": "Curated", "labels": [{"name": "loom:curated"}]},
+            ],
+            "review_requested": [],
+            "changes_requested": [],
+            "ready_to_merge": [],
+            "usage": {"session_percent": 50},
+        }
+
+    def test_snapshot_includes_needs_human_input(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir()
+        (loom_dir / "daemon-state.json").write_text("{}")
+
+        snapshot = build_snapshot(
+            cfg=_cfg(),
+            repo_root=tmp_path,
+            _now=NOW,
+            _pipeline_data=self._mock_pipeline(),
+            _tmux_pool=TmuxPool(),
+        )
+        computed = snapshot["computed"]
+        assert "needs_human_input" in computed
+        blockers = computed["needs_human_input"]
+        assert len(blockers) >= 1
+        types = {b["type"] for b in blockers}
+        assert "approval_needed" in types or "proposal_review" in types

@@ -149,13 +149,19 @@ def run_iteration(ctx: DaemonContext) -> IterationResult:
         if spinning_data:
             escalate_spinning_issues(spinning_data)
 
-    # 7. Stall escalation
+    # 7. Update human-input-needed blockers in daemon state
+    if ctx.state is not None and ctx.snapshot is not None:
+        ctx.state.needs_human_input = (
+            ctx.snapshot.get("computed", {}).get("needs_human_input", [])
+        )
+
+    # 8. Stall escalation
     _update_stall_counter(ctx, result)
 
-    # 8. Save state
+    # 9. Save state
     _save_daemon_state(ctx)
 
-    # 9. Build summary
+    # 10. Build summary
     result.summary = _build_summary(ctx, result)
 
     return result
@@ -267,6 +273,12 @@ def _build_summary(ctx: DaemonContext, result: IterationResult) -> str:
     if ctx.consecutive_stalled > 0:
         parts.append(f"stalled={ctx.consecutive_stalled}")
 
+    # Add human-input-needed indicator
+    human_blockers = computed.get("needs_human_input", [])
+    if human_blockers:
+        total = sum(b.get("count", 0) for b in human_blockers)
+        parts.append(f"human_input_needed={total}")
+
     return " ".join(parts)
 
 
@@ -307,10 +319,22 @@ def _update_stall_counter(ctx: DaemonContext, result: IterationResult) -> None:
 
     # Stalled: warning-level issues present and no progress
     ctx.consecutive_stalled += 1
-    log_warning(
-        f"Consecutive stalled iterations: {ctx.consecutive_stalled} "
-        f"(health={health})"
-    )
+
+    # Log specific human-input blockers for actionable stall diagnosis
+    human_blockers = ctx.snapshot.get("computed", {}).get("needs_human_input", [])
+    if human_blockers:
+        blocker_msgs = [b["description"] for b in human_blockers]
+        log_warning(
+            f"Consecutive stalled iterations: {ctx.consecutive_stalled} "
+            f"(health={health}) — waiting on human input:"
+        )
+        for msg in blocker_msgs:
+            log_warning(f"  → {msg}")
+    else:
+        log_warning(
+            f"Consecutive stalled iterations: {ctx.consecutive_stalled} "
+            f"(health={health})"
+        )
 
     # Trigger escalation levels
     if ctx.consecutive_stalled >= ctx.config.stall_restart_threshold:

@@ -248,3 +248,28 @@ class TestRunIterationIntegration:
         assert ctx.snapshot["computed"]["available_shepherd_slots"] == 1
         assert result.completions_handled == 1
         assert "shepherds=2/3" in result.summary
+
+
+class TestBuildSummaryHumanInput:
+    """Tests for human-input-needed indicator in _build_summary."""
+
+    def test_summary_includes_human_input_count(self, tmp_path: pathlib.Path) -> None:
+        """Summary shows human_input_needed when blockers exist."""
+        ctx = _make_ctx(tmp_path)
+        ctx.snapshot["computed"]["needs_human_input"] = [
+            {"type": "approval_needed", "count": 2, "description": "2 curated"},
+            {"type": "proposal_review", "count": 1, "description": "1 architect"},
+        ]
+
+        result = IterationResult(status="success", summary="")
+        summary = _build_summary(ctx, result)
+        assert "human_input_needed=3" in summary
+
+    def test_summary_no_human_input_when_empty(self, tmp_path: pathlib.Path) -> None:
+        """Summary omits human_input_needed when no blockers."""
+        ctx = _make_ctx(tmp_path)
+        ctx.snapshot["computed"]["needs_human_input"] = []
+
+        result = IterationResult(status="success", summary="")
+        summary = _build_summary(ctx, result)
+        assert "human_input_needed" not in summary
