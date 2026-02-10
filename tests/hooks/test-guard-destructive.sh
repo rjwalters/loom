@@ -187,6 +187,36 @@ assert_deny "Block DROP TABLE" \
 assert_deny "Block TRUNCATE TABLE" \
     "psql -c 'TRUNCATE TABLE users;'"
 
+assert_deny "Block reboot" \
+    "reboot"
+
+assert_deny "Block sudo reboot" \
+    "sudo reboot"
+
+assert_deny "Block shutdown" \
+    "shutdown -h now"
+
+assert_deny "Block sudo shutdown" \
+    "sudo shutdown -r +5"
+
+assert_deny "Block halt" \
+    "halt"
+
+assert_deny "Block sudo halt" \
+    "sudo halt"
+
+assert_deny "Block poweroff" \
+    "poweroff"
+
+assert_deny "Block sudo poweroff" \
+    "sudo poweroff"
+
+assert_deny "Block init 0" \
+    "init 0"
+
+assert_deny "Block init 6" \
+    "init 6"
+
 echo ""
 
 # =========================================================================
@@ -262,6 +292,33 @@ assert_ask "Ask for docker rm" \
 assert_ask "Ask for docker rmi" \
     "docker rmi my-image"
 
+assert_ask "Ask for docker restart" \
+    "docker restart my-container"
+
+assert_ask "Ask for systemctl restart" \
+    "systemctl restart nginx"
+
+assert_ask "Ask for systemctl stop" \
+    "systemctl stop apache2"
+
+assert_ask "Ask for systemctl disable" \
+    "systemctl disable sshd"
+
+assert_ask "Ask for kubectl delete" \
+    "kubectl delete pod my-pod"
+
+assert_ask "Ask for kubectl rollout restart" \
+    "kubectl rollout restart deployment/my-app"
+
+assert_ask "Ask for kubectl drain" \
+    "kubectl drain node-1 --ignore-daemonsets"
+
+assert_ask "Ask for sky down" \
+    "sky down my-cluster"
+
+assert_ask "Ask for sky stop" \
+    "sky stop my-cluster"
+
 assert_ask "Ask for cat .ssh" \
     "cat ~/.ssh/id_rsa"
 
@@ -312,6 +369,24 @@ assert_allow "Allow rm single file" \
 
 assert_allow "Allow mkdir" \
     "mkdir -p src/new-dir"
+
+assert_allow "Allow systemctl status (read-only)" \
+    "systemctl status nginx"
+
+assert_allow "Allow kubectl get pods (read-only)" \
+    "kubectl get pods"
+
+assert_allow "Allow kubectl describe (read-only)" \
+    "kubectl describe pod my-pod"
+
+assert_allow "Allow docker ps (read-only)" \
+    "docker ps -a"
+
+assert_allow "Allow docker logs (read-only)" \
+    "docker logs my-container"
+
+assert_allow "Allow sky status (read-only)" \
+    "sky status"
 
 echo ""
 

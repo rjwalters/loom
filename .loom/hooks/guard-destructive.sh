@@ -141,6 +141,14 @@ ALWAYS_BLOCK_PATTERNS=(
     # Docker mass destruction
     'docker system prune'
 
+    # System reboot/shutdown
+    'reboot'
+    'shutdown'
+    'halt'
+    'poweroff'
+    'init 0'
+    'init 6'
+
     # Database destruction
     'DROP DATABASE'
     'DROP TABLE'
@@ -255,6 +263,21 @@ ASK_PATTERNS=(
     'docker rmi'
     'docker stop'
     'docker kill'
+    'docker restart'
+
+    # Service management
+    'systemctl restart'
+    'systemctl stop'
+    'systemctl disable'
+
+    # Kubernetes operations
+    'kubectl delete'
+    'kubectl rollout restart'
+    'kubectl drain'
+
+    # SkyPilot infrastructure
+    'sky down'
+    'sky stop'
 
     # Credential exposure
     'printenv.*SECRET'
