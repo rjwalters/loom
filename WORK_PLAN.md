@@ -8,40 +8,36 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues requiring immediate attention (`loom:urgent`).
 
-- **#2201**: Daemon needs strategy for issues that exceed single-session context budget *(tier:goal-advancing)*
-- **#2205**: Daemon should report when stalled waiting on human input *(tier:goal-supporting)*
-- **#2200**: Installer doesn't copy guard-destructive.sh hook to target repo *(tier:goal-supporting)*
+*No urgent issues. The pipeline is fully drained.*
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#2202**: Remove orphaned ab_testing.rs backend (1,341 LOC dead code) *(tier:maintenance)*
+*No ready issues. All previously approved work has been completed.*
 
 ## In Progress
 
 Issues actively being worked by shepherds (`loom:building`).
 
-- **#2199**: Daemon should capture shepherd output on kill for post-mortem debugging *(loom:curated)*
-- **#2198**: Shepherd spawns without writing progress file -- silent failure mode *(loom:curated)*
-- **#2197**: Stale heartbeat detection too slow -- 8+ minutes to reclaim stuck shepherd *(loom:curated)*
+*No issues currently being built.*
 
 ## Proposed
 
 Issues under evaluation (`loom:architect`, `loom:hermit`, `loom:curated`).
 
-*No proposed issues awaiting evaluation. All curated issues have been promoted to `loom:issue`.*
+*No proposed issues awaiting evaluation. The pipeline needs new proposals from Architect/Hermit roles to generate work.*
 
 ## Epics
 
-No active epics. Previous epic #1893 (Reshape Loom into Analytics-First Claude Wrapper) completed all 7 phases and is now closed.
+No active epics.
 
 ## Backlog Balance
 
 | Tier | Count |
 |------|-------|
-| Tier 1 (goal-advancing) | 1 (#2201) |
-| Tier 2 (goal-supporting) | 2 (#2205, #2200) |
-| Tier 3 (maintenance) | 1 (#2202) |
+| Tier 1 (goal-advancing) | 0 |
+| Tier 2 (goal-supporting) | 0 |
+| Tier 3 (maintenance) | 0 |
 
-**Note:** The backlog is lean. The 3 building issues (#2197-#2199) are all daemon reliability improvements that complement the urgent queue. Once building completes, the pipeline will need new proposals from Architect/Hermit roles.
+**Note:** The backlog is empty. All issues from the previous cycle have been completed, including the 3 urgent daemon reliability items (#2201, #2205, #2200), the ready maintenance item (#2202), and the 3 building items (#2197-#2199). A total of 10 PRs were merged and 8 issues closed on 2026-02-10. The pipeline needs Architect/Hermit proposals or human-created issues to generate new work.
