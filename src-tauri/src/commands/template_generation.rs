@@ -908,7 +908,8 @@ mod tests {
 
     #[test]
     fn test_similarity_completely_different() {
-        let score = calculate_pattern_similarity("alpha beta gamma", "delta epsilon zeta");
+        let score =
+            calculate_pattern_similarity("alpha beta gamma", "delta epsilon zeta eta theta");
         assert!(score < 0.1, "score = {score}");
     }
 

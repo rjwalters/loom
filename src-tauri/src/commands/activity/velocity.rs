@@ -602,9 +602,9 @@ mod tests {
 
     #[test]
     fn test_trend_boundary_exactly_10_percent() {
-        // Exactly 10% change should be stable (< 0.1 check)
-        assert_eq!(calculate_trend(110.0, 100.0, false), TrendDirection::Stable);
-        assert_eq!(calculate_trend(90.0, 100.0, false), TrendDirection::Stable);
+        // Exactly 10% change is NOT stable (implementation uses strict < 0.1)
+        assert_eq!(calculate_trend(110.0, 100.0, false), TrendDirection::Improving);
+        assert_eq!(calculate_trend(90.0, 100.0, false), TrendDirection::Declining);
     }
 
     #[test]

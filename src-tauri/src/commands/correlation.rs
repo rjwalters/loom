@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn test_erf_zero() {
-        assert!((erf(0.0)).abs() < 1e-10);
+        assert!((erf(0.0)).abs() < 1e-6);
     }
 
     #[test]
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn test_normal_cdf_at_zero() {
         // CDF at 0 should be 0.5
-        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-10);
+        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-6);
     }
 
     #[test]

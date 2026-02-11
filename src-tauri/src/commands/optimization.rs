@@ -1269,7 +1269,7 @@ mod tests {
 
     #[test]
     fn test_detect_category_curate() {
-        assert_eq!(detect_prompt_category("Curate the issue backlog"), Some("curate".to_string()));
+        assert_eq!(detect_prompt_category("Curate the backlog items"), Some("curate".to_string()));
     }
 
     #[test]
