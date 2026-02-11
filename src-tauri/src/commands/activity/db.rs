@@ -486,3 +486,59 @@ pub fn open_activity_db(workspace_path: &str) -> SqliteResult<Connection> {
 
     Ok(conn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_cost_zero_tokens() {
+        assert!((calculate_cost(0, 0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_calculate_cost_only_input() {
+        // 1000 prompt tokens at $0.003/1K = $0.003
+        let cost = calculate_cost(1000, 0);
+        assert!((cost - 0.003).abs() < 1e-10, "cost = {cost}");
+    }
+
+    #[test]
+    fn test_calculate_cost_only_output() {
+        // 1000 completion tokens at $0.015/1K = $0.015
+        let cost = calculate_cost(0, 1000);
+        assert!((cost - 0.015).abs() < 1e-10, "cost = {cost}");
+    }
+
+    #[test]
+    fn test_calculate_cost_combined() {
+        // 1000 prompt + 1000 completion = $0.003 + $0.015 = $0.018
+        let cost = calculate_cost(1000, 1000);
+        assert!((cost - 0.018).abs() < 1e-10, "cost = {cost}");
+    }
+
+    #[test]
+    fn test_calculate_cost_large_values() {
+        // 100K prompt + 50K completion
+        let cost = calculate_cost(100_000, 50_000);
+        let expected = (100.0 * 0.003) + (50.0 * 0.015); // 0.3 + 0.75 = 1.05
+        assert!((cost - expected).abs() < 1e-10, "cost = {cost}");
+    }
+
+    #[test]
+    fn test_calculate_cost_proportional() {
+        // Cost should scale linearly
+        let cost_1k = calculate_cost(1000, 1000);
+        let cost_2k = calculate_cost(2000, 2000);
+        assert!((cost_2k - 2.0 * cost_1k).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_open_activity_db_creates_directory() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let workspace = tmp_dir.path().to_str().unwrap();
+        let result = open_activity_db(workspace);
+        assert!(result.is_ok());
+        assert!(tmp_dir.path().join(".loom").join("activity.db").exists());
+    }
+}

@@ -548,6 +548,82 @@ pub struct PeriodComparison {
     pub cycle_time_change_pct: Option<f64>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- calculate_trend tests ----
+
+    #[test]
+    fn test_trend_stable_within_10_percent() {
+        assert_eq!(calculate_trend(105.0, 100.0, false), TrendDirection::Stable);
+        assert_eq!(calculate_trend(95.0, 100.0, false), TrendDirection::Stable);
+    }
+
+    #[test]
+    fn test_trend_improving_higher_is_better() {
+        // current > previous by > 10% and higher is better -> Improving
+        assert_eq!(calculate_trend(120.0, 100.0, false), TrendDirection::Improving);
+    }
+
+    #[test]
+    fn test_trend_declining_higher_is_better() {
+        // current < previous by > 10% and higher is better -> Declining
+        assert_eq!(calculate_trend(80.0, 100.0, false), TrendDirection::Declining);
+    }
+
+    #[test]
+    fn test_trend_improving_lower_is_better() {
+        // current < previous by > 10% and lower is better -> Improving
+        assert_eq!(calculate_trend(80.0, 100.0, true), TrendDirection::Improving);
+    }
+
+    #[test]
+    fn test_trend_declining_lower_is_better() {
+        // current > previous by > 10% and lower is better -> Declining
+        assert_eq!(calculate_trend(120.0, 100.0, true), TrendDirection::Declining);
+    }
+
+    #[test]
+    fn test_trend_previous_zero_current_positive_higher_is_better() {
+        assert_eq!(calculate_trend(10.0, 0.0, false), TrendDirection::Improving);
+    }
+
+    #[test]
+    fn test_trend_previous_zero_current_positive_lower_is_better() {
+        assert_eq!(calculate_trend(10.0, 0.0, true), TrendDirection::Declining);
+    }
+
+    #[test]
+    fn test_trend_both_zero() {
+        assert_eq!(calculate_trend(0.0, 0.0, false), TrendDirection::Stable);
+        assert_eq!(calculate_trend(0.0, 0.0, true), TrendDirection::Stable);
+    }
+
+    #[test]
+    fn test_trend_boundary_exactly_10_percent() {
+        // Exactly 10% change is NOT stable (implementation uses strict < 0.1)
+        assert_eq!(calculate_trend(110.0, 100.0, false), TrendDirection::Improving);
+        assert_eq!(calculate_trend(90.0, 100.0, false), TrendDirection::Declining);
+    }
+
+    #[test]
+    fn test_trend_just_over_10_percent() {
+        // Just over 10% should not be stable
+        assert_eq!(calculate_trend(111.0, 100.0, false), TrendDirection::Improving);
+        assert_eq!(calculate_trend(89.0, 100.0, false), TrendDirection::Declining);
+    }
+
+    // ---- TrendDirection Display ----
+
+    #[test]
+    fn test_trend_direction_display() {
+        assert_eq!(format!("{}", TrendDirection::Improving), "improving");
+        assert_eq!(format!("{}", TrendDirection::Declining), "declining");
+        assert_eq!(format!("{}", TrendDirection::Stable), "stable");
+    }
+}
+
 /// Compare velocity between two time periods
 #[tauri::command]
 pub fn compare_velocity_periods(

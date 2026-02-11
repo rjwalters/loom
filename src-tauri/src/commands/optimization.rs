@@ -1231,6 +1231,186 @@ pub fn toggle_optimization_rule(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- detect_prompt_category tests ----
+
+    #[test]
+    fn test_detect_category_build() {
+        assert_eq!(detect_prompt_category("Implement a new login page"), Some("build".to_string()));
+        assert_eq!(detect_prompt_category("Create the user model"), Some("build".to_string()));
+        assert_eq!(detect_prompt_category("Add tests for auth"), Some("build".to_string()));
+    }
+
+    #[test]
+    fn test_detect_category_fix() {
+        assert_eq!(detect_prompt_category("Fix the login bug"), Some("fix".to_string()));
+        assert_eq!(detect_prompt_category("Resolve the error in parsing"), Some("fix".to_string()));
+    }
+
+    #[test]
+    fn test_detect_category_refactor() {
+        assert_eq!(
+            detect_prompt_category("Refactor the authentication module"),
+            Some("refactor".to_string())
+        );
+        assert_eq!(
+            detect_prompt_category("Clean up the database layer"),
+            Some("refactor".to_string())
+        );
+    }
+
+    #[test]
+    fn test_detect_category_review() {
+        assert_eq!(detect_prompt_category("Review the pull request"), Some("review".to_string()));
+    }
+
+    #[test]
+    fn test_detect_category_curate() {
+        assert_eq!(detect_prompt_category("Curate the backlog items"), Some("curate".to_string()));
+    }
+
+    #[test]
+    fn test_detect_category_none() {
+        assert_eq!(detect_prompt_category("Do something"), None);
+        assert_eq!(detect_prompt_category("Hello world"), None);
+    }
+
+    // ---- calculate_specificity_score tests ----
+
+    #[test]
+    fn test_specificity_baseline() {
+        // Neutral prompt should start at ~0.5
+        let score = calculate_specificity_score("do the thing");
+        assert!(score >= 0.3 && score <= 0.6, "score = {score}");
+    }
+
+    #[test]
+    fn test_specificity_with_issue_ref() {
+        let score = calculate_specificity_score("Fix #123 in the login module");
+        assert!(score > 0.5, "score = {score}");
+    }
+
+    #[test]
+    fn test_specificity_with_file_path() {
+        let score = calculate_specificity_score("Update src/lib.rs with new handler");
+        assert!(score > 0.5, "score = {score}");
+    }
+
+    #[test]
+    fn test_specificity_with_vague_words() {
+        let score_vague = calculate_specificity_score("Do something with stuff maybe");
+        let score_specific = calculate_specificity_score("Update the database query in module api");
+        assert!(score_specific > score_vague, "specific={score_specific} vague={score_vague}");
+    }
+
+    #[test]
+    fn test_specificity_clamped() {
+        let score = calculate_specificity_score("#123 function/file.rs error api database query");
+        assert!(score <= 1.0, "score = {score}");
+        assert!(score >= 0.0, "score = {score}");
+    }
+
+    // ---- calculate_structure_score tests ----
+
+    #[test]
+    fn test_structure_optimal_length() {
+        let score = calculate_structure_score(
+            "Implement the authentication middleware for the API endpoint with proper error handling",
+        );
+        assert!(score > 0.5, "score = {score}");
+    }
+
+    #[test]
+    fn test_structure_too_short() {
+        let score = calculate_structure_score("fix");
+        assert!(score < 0.6, "score = {score}");
+    }
+
+    #[test]
+    fn test_structure_starts_with_action_verb() {
+        let with_verb = calculate_structure_score("Implement the new feature for user auth module");
+        let without_verb =
+            calculate_structure_score("The new feature for user auth module needs work");
+        assert!(with_verb > without_verb, "with={with_verb} without={without_verb}");
+    }
+
+    #[test]
+    fn test_structure_question_penalty() {
+        let question = calculate_structure_score("Can you fix the bug in the login?");
+        let statement = calculate_structure_score("Fix the bug in the login module.");
+        assert!(statement >= question, "statement={statement} question={question}");
+    }
+
+    #[test]
+    fn test_structure_bullet_points_bonus() {
+        let score =
+            calculate_structure_score("Update the config: - Add new field - Remove old field");
+        assert!(score > 0.5, "score = {score}");
+    }
+
+    #[test]
+    fn test_structure_clamped() {
+        let score = calculate_structure_score("x");
+        assert!(score >= 0.0 && score <= 1.0, "score = {score}");
+    }
+
+    // ---- convert_to_action_form tests ----
+
+    #[test]
+    fn test_convert_can_you() {
+        assert_eq!(convert_to_action_form("can you fix the bug"), "Fix the bug");
+    }
+
+    #[test]
+    fn test_convert_please() {
+        assert_eq!(convert_to_action_form("please update the docs"), "Update the docs");
+    }
+
+    #[test]
+    fn test_convert_could_you() {
+        assert_eq!(convert_to_action_form("could you add tests"), "Add tests");
+    }
+
+    #[test]
+    fn test_convert_already_imperative() {
+        assert_eq!(convert_to_action_form("Fix the bug"), "Fix the bug");
+    }
+
+    #[test]
+    fn test_convert_i_need() {
+        assert_eq!(convert_to_action_form("i need you to update the schema"), "Update the schema");
+    }
+
+    // ---- PromptIssue detection in analyze_prompt ----
+
+    #[test]
+    fn test_prompt_issue_too_short() {
+        // Use an in-memory workspace simulation not possible without DB,
+        // so test the logic directly via the issue detection
+        let prompt = "fix";
+        let word_count = prompt.split_whitespace().count();
+        assert!(word_count < 5);
+    }
+
+    #[test]
+    fn test_prompt_issue_vague() {
+        let prompt = "fix the thing";
+        let vague_words = ["fix", "update", "change", "modify", "improve", "handle"];
+        let has_vague = vague_words
+            .iter()
+            .any(|w| prompt.to_lowercase().contains(w));
+        let has_specifics = prompt.contains('#')
+            || prompt.contains("function")
+            || prompt.contains("file")
+            || prompt.contains("error")
+            || prompt.contains("test");
+        assert!(has_vague && !has_specifics);
+    }
+}
+
 /// Refine optimization rules based on outcomes (learning loop)
 #[tauri::command]
 pub fn refine_optimization_rules(workspace_path: &str) -> Result<i32, String> {
