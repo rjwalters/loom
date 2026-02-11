@@ -782,3 +782,125 @@ impl TerminalManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    // ===== pipe_pane_cmd tests =====
+
+    #[test]
+    fn test_pipe_pane_cmd_contains_output_file() {
+        let cmd = pipe_pane_cmd("/tmp/loom-test.out");
+        assert!(cmd.contains("/tmp/loom-test.out"));
+    }
+
+    #[test]
+    fn test_pipe_pane_cmd_uses_sed() {
+        let cmd = pipe_pane_cmd("/tmp/output.out");
+        assert!(cmd.starts_with("sed "));
+    }
+
+    #[test]
+    fn test_pipe_pane_cmd_strips_ansi_escapes() {
+        let cmd = pipe_pane_cmd("/tmp/output.out");
+        // Should contain the ANSI escape stripping pattern
+        assert!(cmd.contains("\\x1b"));
+    }
+
+    #[test]
+    fn test_pipe_pane_cmd_appends_to_file() {
+        let cmd = pipe_pane_cmd("/tmp/output.out");
+        assert!(cmd.contains(">> /tmp/output.out"));
+    }
+
+    // ===== validate_terminal_id tests =====
+
+    #[test]
+    fn test_validate_terminal_id_empty() {
+        let result = TerminalManager::validate_terminal_id("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn test_validate_terminal_id_valid_alphanumeric() {
+        assert!(TerminalManager::validate_terminal_id("terminal1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_terminal_id_valid_with_hyphens() {
+        assert!(TerminalManager::validate_terminal_id("terminal-1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_terminal_id_valid_with_underscores() {
+        assert!(TerminalManager::validate_terminal_id("terminal_1").is_ok());
+    }
+
+    #[test]
+    fn test_validate_terminal_id_rejects_spaces() {
+        let result = TerminalManager::validate_terminal_id("terminal 1");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid terminal ID"));
+    }
+
+    #[test]
+    fn test_validate_terminal_id_rejects_special_chars() {
+        for id in &[
+            "term;rm -rf /",
+            "term$(cmd)",
+            "term`cmd`",
+            "term|pipe",
+            "a/b",
+        ] {
+            assert!(
+                TerminalManager::validate_terminal_id(id).is_err(),
+                "Expected rejection for: {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_terminal_id_rejects_dots() {
+        assert!(TerminalManager::validate_terminal_id("terminal.1").is_err());
+    }
+
+    // ===== handle_tmux_error tests =====
+
+    #[test]
+    fn test_handle_tmux_error_no_server_returns_true() {
+        let result = TerminalManager::handle_tmux_error("no server running on /tmp/tmux", "test");
+        assert!(result, "Should return true when server is dead");
+    }
+
+    #[test]
+    fn test_handle_tmux_error_no_sessions_returns_false() {
+        let result = TerminalManager::handle_tmux_error("no sessions", "test");
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_handle_tmux_error_no_such_session_returns_false() {
+        let result = TerminalManager::handle_tmux_error("no such session: loom-test", "test");
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_handle_tmux_error_other_error_returns_false() {
+        let result = TerminalManager::handle_tmux_error("some other tmux error", "test");
+        assert!(!result);
+    }
+
+    // ===== TerminalManager::new tests =====
+
+    #[test]
+    fn test_terminal_manager_new_is_empty() {
+        let tm = TerminalManager::new();
+        assert!(tm.terminals.is_empty());
+    }
+}

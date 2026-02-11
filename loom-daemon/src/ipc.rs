@@ -688,3 +688,164 @@ fn handle_request(
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::activity::ActivityDb;
+    use tempfile::tempdir;
+
+    fn setup_test_context() -> (Arc<Mutex<TerminalManager>>, Arc<Mutex<ActivityDb>>) {
+        let tm = Arc::new(Mutex::new(TerminalManager::new()));
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test_activity.db");
+        let db = ActivityDb::new(db_path).unwrap();
+        let db = Arc::new(Mutex::new(db));
+        // Keep dir alive so the temp directory isn't deleted
+        std::mem::forget(dir);
+        (tm, db)
+    }
+
+    // ===== Ping/Pong =====
+
+    #[test]
+    fn test_handle_request_ping() {
+        let (tm, db) = setup_test_context();
+        let response = handle_request(Request::Ping, &tm, &db);
+        assert!(matches!(response, Response::Pong));
+    }
+
+    // ===== ListTerminals =====
+
+    #[test]
+    fn test_handle_request_list_terminals_empty() {
+        let (tm, db) = setup_test_context();
+        // Set LOOM_NO_RESTORE to prevent tmux restore attempts
+        std::env::set_var("LOOM_NO_RESTORE", "1");
+        let response = handle_request(Request::ListTerminals, &tm, &db);
+        std::env::remove_var("LOOM_NO_RESTORE");
+        match response {
+            Response::TerminalList { terminals } => {
+                assert!(terminals.is_empty());
+            }
+            other => panic!("Expected TerminalList, got: {other:?}"),
+        }
+    }
+
+    // ===== GetCurrentCommit =====
+
+    #[test]
+    fn test_handle_request_get_current_commit_nonexistent_dir() {
+        let (tm, db) = setup_test_context();
+        let response = handle_request(
+            Request::GetCurrentCommit {
+                working_dir: "/nonexistent/path".to_string(),
+            },
+            &tm,
+            &db,
+        );
+        match response {
+            Response::CurrentCommit { commit } => {
+                assert!(commit.is_none());
+            }
+            other => panic!("Expected CurrentCommit, got: {other:?}"),
+        }
+    }
+
+    // ===== GetTerminalActivity =====
+
+    #[test]
+    fn test_handle_request_get_terminal_activity_empty() {
+        let (tm, db) = setup_test_context();
+        let response = handle_request(
+            Request::GetTerminalActivity {
+                id: "nonexistent".to_string(),
+                limit: 10,
+            },
+            &tm,
+            &db,
+        );
+        match response {
+            Response::TerminalActivity { entries } => {
+                assert!(entries.is_empty());
+            }
+            other => panic!("Expected TerminalActivity, got: {other:?}"),
+        }
+    }
+
+    // ===== GetAllClaims =====
+
+    #[test]
+    fn test_handle_request_get_all_claims_empty() {
+        let (tm, db) = setup_test_context();
+        let response = handle_request(Request::GetAllClaims, &tm, &db);
+        match response {
+            Response::Claims(claims) => {
+                assert!(claims.is_empty());
+            }
+            other => panic!("Expected Claims, got: {other:?}"),
+        }
+    }
+
+    // ===== GetClaimsSummary =====
+
+    #[test]
+    fn test_handle_request_get_claims_summary() {
+        let (tm, db) = setup_test_context();
+        let response = handle_request(
+            Request::GetClaimsSummary {
+                stale_threshold_secs: Some(3600),
+            },
+            &tm,
+            &db,
+        );
+        match response {
+            Response::ClaimsSummary(summary) => {
+                assert_eq!(summary.total_claims, 0);
+            }
+            other => panic!("Expected ClaimsSummary, got: {other:?}"),
+        }
+    }
+
+    // ===== CaptureGitChanges with nonexistent dir =====
+
+    #[test]
+    fn test_handle_request_capture_git_changes_no_repo() {
+        let (tm, db) = setup_test_context();
+        let response = handle_request(
+            Request::CaptureGitChanges {
+                input_id: 1,
+                working_dir: "/nonexistent/path".to_string(),
+                before_commit: None,
+            },
+            &tm,
+            &db,
+        );
+        match response {
+            Response::GitChangesCaptured {
+                files_changed,
+                lines_added,
+                lines_removed,
+            } => {
+                assert_eq!(files_changed, 0);
+                assert_eq!(lines_added, 0);
+                assert_eq!(lines_removed, 0);
+            }
+            other => panic!("Expected GitChangesCaptured, got: {other:?}"),
+        }
+    }
+
+    // ===== get_git_branch tests =====
+
+    #[test]
+    fn test_get_git_branch_none_input() {
+        assert!(get_git_branch(None).is_none());
+    }
+
+    #[test]
+    fn test_get_git_branch_nonexistent_dir() {
+        let dir = "/nonexistent/path".to_string();
+        assert!(get_git_branch(Some(&dir)).is_none());
+    }
+}

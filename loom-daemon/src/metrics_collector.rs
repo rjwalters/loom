@@ -528,3 +528,226 @@ pub fn try_init_metrics_collector(
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    // ===== check_env_enabled tests =====
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_default() {
+        std::env::remove_var("LOOM_GITHUB_METRICS");
+        std::env::remove_var("LOOM_METRICS_INTERVAL");
+        // Default interval is 900 seconds (15 minutes)
+        assert_eq!(check_env_enabled(), Some(900));
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_disabled() {
+        std::env::set_var("LOOM_GITHUB_METRICS", "0");
+        std::env::remove_var("LOOM_METRICS_INTERVAL");
+        assert_eq!(check_env_enabled(), None);
+        std::env::remove_var("LOOM_GITHUB_METRICS");
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_custom_interval() {
+        std::env::remove_var("LOOM_GITHUB_METRICS");
+        std::env::set_var("LOOM_METRICS_INTERVAL", "300");
+        assert_eq!(check_env_enabled(), Some(300));
+        std::env::remove_var("LOOM_METRICS_INTERVAL");
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_invalid_interval_uses_default() {
+        std::env::remove_var("LOOM_GITHUB_METRICS");
+        std::env::set_var("LOOM_METRICS_INTERVAL", "not_a_number");
+        assert_eq!(check_env_enabled(), Some(900));
+        std::env::remove_var("LOOM_METRICS_INTERVAL");
+    }
+
+    // ===== MetricsState persistence tests =====
+
+    #[test]
+    fn test_metrics_state_default() {
+        let state = MetricsState::default();
+        assert!(state.pr_sync.is_none());
+        assert!(state.issue_sync.is_none());
+        assert!(state.commit_sync.is_none());
+    }
+
+    #[test]
+    fn test_metrics_state_load_missing_file_returns_default() {
+        let dir = tempdir().unwrap();
+        let state = MetricsState::load_from_workspace(dir.path().to_str().unwrap()).unwrap();
+        assert!(state.pr_sync.is_none());
+        assert!(state.issue_sync.is_none());
+    }
+
+    #[test]
+    fn test_metrics_state_save_and_load_roundtrip() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().to_str().unwrap();
+
+        // Create .loom directory
+        fs::create_dir_all(dir.path().join(".loom")).unwrap();
+
+        let state = MetricsState {
+            pr_sync: Some("2026-01-01T00:00:00Z".to_string()),
+            issue_sync: Some("2026-01-02T00:00:00Z".to_string()),
+            commit_sync: None,
+        };
+
+        state.save_to_workspace(workspace).unwrap();
+
+        let loaded = MetricsState::load_from_workspace(workspace).unwrap();
+        assert_eq!(loaded.pr_sync, Some("2026-01-01T00:00:00Z".to_string()));
+        assert_eq!(loaded.issue_sync, Some("2026-01-02T00:00:00Z".to_string()));
+        assert!(loaded.commit_sync.is_none());
+    }
+
+    #[test]
+    fn test_metrics_state_load_invalid_json() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+        fs::write(loom_dir.join("metrics_state.json"), "not json").unwrap();
+
+        let result = MetricsState::load_from_workspace(dir.path().to_str().unwrap());
+        assert!(result.is_err());
+    }
+
+    // ===== insert_github_event tests =====
+
+    fn create_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r"
+            CREATE TABLE github_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                activity_id INTEGER,
+                event_type TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                pr_number INTEGER,
+                issue_number INTEGER,
+                commit_sha TEXT,
+                author TEXT
+            );
+
+            CREATE TABLE agent_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                issue_number INTEGER,
+                timestamp DATETIME,
+                outcome TEXT
+            );
+            ",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_insert_github_event_new_event() {
+        let conn = create_test_db();
+        let inserted = insert_github_event(
+            &conn,
+            "pr_merged",
+            "2026-01-15T10:00:00Z",
+            Some(42),
+            None,
+            None,
+            "testuser",
+        )
+        .unwrap();
+        assert!(inserted, "New event should be inserted");
+    }
+
+    #[test]
+    fn test_insert_github_event_duplicate_detection() {
+        let conn = create_test_db();
+
+        // Insert once
+        insert_github_event(
+            &conn,
+            "pr_merged",
+            "2026-01-15T10:00:00Z",
+            Some(42),
+            None,
+            None,
+            "testuser",
+        )
+        .unwrap();
+
+        // Insert duplicate
+        let inserted = insert_github_event(
+            &conn,
+            "pr_merged",
+            "2026-01-15T10:00:00Z",
+            Some(42),
+            None,
+            None,
+            "testuser",
+        )
+        .unwrap();
+        assert!(!inserted, "Duplicate event should not be inserted");
+    }
+
+    #[test]
+    fn test_insert_github_event_issue_event() {
+        let conn = create_test_db();
+        let inserted = insert_github_event(
+            &conn,
+            "issue_closed",
+            "2026-01-15T12:00:00Z",
+            None,
+            Some(100),
+            None,
+            "contributor",
+        )
+        .unwrap();
+        assert!(inserted);
+    }
+
+    #[test]
+    fn test_insert_github_event_correlates_with_activity() {
+        let conn = create_test_db();
+
+        // Insert an activity record to correlate with
+        conn.execute(
+            "INSERT INTO agent_activity (issue_number, timestamp, outcome) VALUES (?1, ?2, ?3)",
+            params![100, "2026-01-15T12:00:00Z", "success"],
+        )
+        .unwrap();
+
+        // Insert event for same issue
+        let inserted = insert_github_event(
+            &conn,
+            "issue_closed",
+            "2026-01-15T12:05:00Z",
+            None,
+            Some(100),
+            None,
+            "testuser",
+        )
+        .unwrap();
+        assert!(inserted);
+
+        // Verify correlation was set
+        let activity_id: Option<i64> = conn
+            .query_row(
+                "SELECT activity_id FROM github_events WHERE issue_number = 100",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(activity_id.is_some());
+    }
+}
