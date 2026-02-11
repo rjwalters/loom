@@ -12,4 +12,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: rjwalters/ghloc@main
+        continue-on-error: true
+
+      - name: Push badge to ghloc branch
+        run: |
+          if [ ! -d .ghloc ]; then
+            echo "No .ghloc directory generated, skipping"
+            exit 0
+          fi
+          cp -r .ghloc /tmp/ghloc-output
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin ghloc || true
+          git checkout --orphan ghloc
+          git rm -rf .
+          cp -r /tmp/ghloc-output .ghloc
+          git add .ghloc
+          git commit -m "Update LOC badge and chart [skip ci]"
+          git push origin ghloc --force

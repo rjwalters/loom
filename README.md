@@ -2,7 +2,7 @@
 
 [![codecov](https://codecov.io/gh/rjwalters/loom/branch/main/graph/badge.svg)](https://codecov.io/gh/rjwalters/loom)
 [![GitHub Release](https://img.shields.io/github/v/release/rjwalters/loom?include_prereleases)](https://github.com/rjwalters/loom/releases)
-[![Lines of Code](https://raw.githubusercontent.com/rjwalters/loom/main/.ghloc/badge.svg)](https://github.com/rjwalters/loom)
+[![Lines of Code](https://raw.githubusercontent.com/rjwalters/loom/ghloc/.ghloc/badge.svg)](https://github.com/rjwalters/loom)
 
 **AI-powered development orchestration using GitHub as the coordination layer.**
 
