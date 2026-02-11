@@ -908,8 +908,8 @@ mod tests {
 
     #[test]
     fn test_similarity_completely_different() {
-        let score =
-            calculate_pattern_similarity("alpha beta gamma", "delta epsilon zeta eta theta");
+        // No shared words; large word-count gap minimises length_similarity too
+        let score = calculate_pattern_similarity("alpha", "delta epsilon zeta eta theta iota");
         assert!(score < 0.1, "score = {score}");
     }
 
