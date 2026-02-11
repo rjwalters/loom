@@ -611,6 +611,108 @@ pub fn get_pattern_catalog_stats(workspace_path: &str) -> Result<PatternCatalogS
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- normalize_prompt_to_pattern tests ----
+
+    #[test]
+    fn test_normalize_replaces_issue_numbers() {
+        assert_eq!(normalize_prompt_to_pattern("Fix issue #123"), "fix issue #n");
+    }
+
+    #[test]
+    fn test_normalize_replaces_multiple_issue_numbers() {
+        assert_eq!(normalize_prompt_to_pattern("Fix #123 and #456"), "fix #n and #n");
+    }
+
+    #[test]
+    fn test_normalize_collapses_whitespace() {
+        assert_eq!(normalize_prompt_to_pattern("Fix   the   bug"), "fix the bug");
+    }
+
+    #[test]
+    fn test_normalize_lowercases() {
+        assert_eq!(normalize_prompt_to_pattern("Fix The BUG"), "fix the bug");
+    }
+
+    #[test]
+    fn test_normalize_trims() {
+        assert_eq!(normalize_prompt_to_pattern("  fix bug  "), "fix bug");
+    }
+
+    #[test]
+    fn test_normalize_empty_string() {
+        assert_eq!(normalize_prompt_to_pattern(""), "");
+    }
+
+    #[test]
+    fn test_normalize_combined() {
+        assert_eq!(
+            normalize_prompt_to_pattern("  Work on   PR #99  and issue #200  "),
+            "work on pr #n and issue #n"
+        );
+    }
+
+    // ---- PatternCategory::from_role tests ----
+
+    #[test]
+    fn test_pattern_category_from_role_builder() {
+        assert_eq!(PatternCategory::from_role("builder"), PatternCategory::Build);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_doctor() {
+        assert_eq!(PatternCategory::from_role("doctor"), PatternCategory::Fix);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_judge() {
+        assert_eq!(PatternCategory::from_role("judge"), PatternCategory::Review);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_curator() {
+        assert_eq!(PatternCategory::from_role("curator"), PatternCategory::Curate);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_architect() {
+        assert_eq!(PatternCategory::from_role("architect"), PatternCategory::Architect);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_hermit() {
+        assert_eq!(PatternCategory::from_role("hermit"), PatternCategory::Simplify);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_unknown() {
+        assert_eq!(PatternCategory::from_role("something"), PatternCategory::General);
+    }
+
+    #[test]
+    fn test_pattern_category_from_role_case_insensitive() {
+        assert_eq!(PatternCategory::from_role("Builder"), PatternCategory::Build);
+        assert_eq!(PatternCategory::from_role("JUDGE"), PatternCategory::Review);
+    }
+
+    // ---- PatternCategory Display ----
+
+    #[test]
+    fn test_pattern_category_display() {
+        assert_eq!(format!("{}", PatternCategory::Build), "build");
+        assert_eq!(format!("{}", PatternCategory::Fix), "fix");
+        assert_eq!(format!("{}", PatternCategory::Refactor), "refactor");
+        assert_eq!(format!("{}", PatternCategory::Review), "review");
+        assert_eq!(format!("{}", PatternCategory::Curate), "curate");
+        assert_eq!(format!("{}", PatternCategory::Architect), "architect");
+        assert_eq!(format!("{}", PatternCategory::Simplify), "simplify");
+        assert_eq!(format!("{}", PatternCategory::General), "general");
+    }
+}
+
 /// Record that a pattern was used (for tracking when patterns are applied)
 #[allow(dead_code, clippy::needless_pass_by_value)]
 #[tauri::command]

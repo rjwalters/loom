@@ -894,6 +894,180 @@ pub fn reactivate_template(workspace_path: String, template_id: i64) -> Result<(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- calculate_pattern_similarity tests ----
+
+    #[test]
+    fn test_similarity_identical() {
+        let score = calculate_pattern_similarity("fix the login bug", "fix the login bug");
+        assert!((score - 1.0).abs() < 1e-10, "score = {score}");
+    }
+
+    #[test]
+    fn test_similarity_completely_different() {
+        let score = calculate_pattern_similarity("alpha beta gamma", "delta epsilon zeta");
+        assert!(score < 0.1, "score = {score}");
+    }
+
+    #[test]
+    fn test_similarity_partial_overlap() {
+        let score = calculate_pattern_similarity("fix the login bug", "fix the signup bug");
+        assert!(score > 0.4 && score < 1.0, "score = {score}");
+    }
+
+    #[test]
+    fn test_similarity_empty_strings() {
+        assert!((calculate_pattern_similarity("", "hello")).abs() < 1e-10);
+        assert!((calculate_pattern_similarity("hello", "")).abs() < 1e-10);
+        assert!((calculate_pattern_similarity("", "")).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_similarity_symmetric() {
+        let a = "implement the search feature";
+        let b = "implement the filter feature";
+        let score_ab = calculate_pattern_similarity(a, b);
+        let score_ba = calculate_pattern_similarity(b, a);
+        assert!((score_ab - score_ba).abs() < 1e-10);
+    }
+
+    // ---- cluster_patterns tests ----
+
+    #[test]
+    fn test_cluster_similar_patterns() {
+        let patterns = vec![
+            (1, "fix the login bug".to_string(), 0.8, 5),
+            (2, "fix the signup bug".to_string(), 0.7, 3),
+            (3, "implement the search feature".to_string(), 0.9, 10),
+            (4, "implement the filter feature".to_string(), 0.85, 8),
+        ];
+        let clusters = cluster_patterns(&patterns, 0.5);
+        // Should cluster "fix" patterns together and "implement" patterns together
+        assert!(clusters.len() >= 2, "clusters = {}", clusters.len());
+    }
+
+    #[test]
+    fn test_cluster_no_similar_patterns() {
+        let patterns = vec![
+            (1, "alpha".to_string(), 0.8, 5),
+            (2, "beta".to_string(), 0.7, 3),
+            (3, "gamma".to_string(), 0.9, 10),
+        ];
+        let clusters = cluster_patterns(&patterns, 0.9);
+        // With high threshold, each pattern should be its own cluster
+        assert_eq!(clusters.len(), 3);
+    }
+
+    #[test]
+    fn test_cluster_empty_input() {
+        let patterns: Vec<(i64, String, f64, i32)> = vec![];
+        let clusters = cluster_patterns(&patterns, 0.5);
+        assert!(clusters.is_empty());
+    }
+
+    // ---- detect_placeholder_type tests ----
+
+    #[test]
+    fn test_placeholder_issue_number() {
+        assert_eq!(detect_placeholder_type("#123", 0, 5), "issue_number");
+    }
+
+    #[test]
+    fn test_placeholder_file_path_slash() {
+        assert_eq!(detect_placeholder_type("src/lib.rs", 0, 5), "file_path");
+    }
+
+    #[test]
+    fn test_placeholder_file_path_dot() {
+        assert_eq!(detect_placeholder_type("config.json", 0, 5), "file_path");
+    }
+
+    #[test]
+    fn test_placeholder_pr_number() {
+        assert_eq!(detect_placeholder_type("pr-123", 0, 5), "pr_number");
+    }
+
+    #[test]
+    fn test_placeholder_function_snake_case() {
+        assert_eq!(detect_placeholder_type("my_function", 0, 5), "function_name");
+    }
+
+    #[test]
+    fn test_placeholder_function_camel_case() {
+        assert_eq!(detect_placeholder_type("myFunction", 0, 5), "function_name");
+    }
+
+    #[test]
+    fn test_placeholder_error_message() {
+        assert_eq!(detect_placeholder_type("errorMessage", 0, 5), "function_name");
+        // Note: "error" alone would match error_message
+        assert_eq!(detect_placeholder_type("error", 0, 5), "error_message");
+    }
+
+    #[test]
+    fn test_placeholder_default() {
+        assert_eq!(detect_placeholder_type("something", 0, 5), "target");
+    }
+
+    // ---- extract_template tests ----
+
+    #[test]
+    fn test_extract_template_empty_cluster() {
+        let cluster = PatternCluster {
+            patterns: vec![],
+            category: String::new(),
+        };
+        assert!(extract_template(&cluster).is_none());
+    }
+
+    #[test]
+    fn test_extract_template_single_pattern() {
+        let cluster = PatternCluster {
+            patterns: vec![(1, "fix the login bug".to_string(), 0.8, 5)],
+            category: "fix".to_string(),
+        };
+        let result = extract_template(&cluster);
+        assert!(result.is_some());
+        let (template, _placeholders, example) = result.unwrap();
+        assert!(!template.is_empty());
+        assert_eq!(example, "fix the login bug");
+    }
+
+    // ---- generate_template_description tests ----
+
+    #[test]
+    fn test_description_build_category() {
+        let desc = generate_template_description("template", "build", &[]);
+        assert!(desc.contains("Implements or creates"));
+    }
+
+    #[test]
+    fn test_description_fix_category() {
+        let desc = generate_template_description("template", "fix", &[]);
+        assert!(desc.contains("Fixes or resolves"));
+    }
+
+    #[test]
+    fn test_description_with_placeholders() {
+        let desc = generate_template_description(
+            "template",
+            "build",
+            &["file_path".to_string(), "issue_number".to_string()],
+        );
+        assert!(desc.contains("{file_path}"));
+        assert!(desc.contains("{issue_number}"));
+    }
+
+    #[test]
+    fn test_description_unknown_category() {
+        let desc = generate_template_description("template", "unknown", &[]);
+        assert!(desc.contains("Performs action on"));
+    }
+}
+
 /// Get template statistics
 #[tauri::command]
 pub fn get_template_stats(workspace_path: &str) -> Result<TemplateStats, String> {

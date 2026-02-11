@@ -915,3 +915,164 @@ pub fn clear_correlation_results(workspace_path: &str) -> Result<i32, String> {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     Ok(deleted as i32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- erf tests ----
+
+    #[test]
+    fn test_erf_zero() {
+        assert!((erf(0.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_erf_positive() {
+        // erf(1) ≈ 0.8427
+        let result = erf(1.0);
+        assert!((result - 0.8427).abs() < 0.01, "erf(1) = {result}");
+    }
+
+    #[test]
+    fn test_erf_negative_symmetry() {
+        // erf(-x) == -erf(x)
+        let x = 0.5;
+        assert!((erf(-x) + erf(x)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_erf_large_input() {
+        // erf(3) should be very close to 1.0
+        assert!((erf(3.0) - 1.0).abs() < 0.001);
+    }
+
+    // ---- normal_cdf tests ----
+
+    #[test]
+    fn test_normal_cdf_at_zero() {
+        // CDF at 0 should be 0.5
+        assert!((normal_cdf(0.0) - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_normal_cdf_large_positive() {
+        // CDF at large positive should approach 1.0
+        assert!(normal_cdf(5.0) > 0.999);
+    }
+
+    #[test]
+    fn test_normal_cdf_large_negative() {
+        // CDF at large negative should approach 0.0
+        assert!(normal_cdf(-5.0) < 0.001);
+    }
+
+    #[test]
+    fn test_normal_cdf_monotonic() {
+        assert!(normal_cdf(-1.0) < normal_cdf(0.0));
+        assert!(normal_cdf(0.0) < normal_cdf(1.0));
+    }
+
+    // ---- pearson_correlation tests ----
+
+    #[test]
+    fn test_pearson_perfect_positive() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![2.0, 4.0, 6.0, 8.0, 10.0];
+        let (r, _p) = pearson_correlation(&x, &y);
+        assert!((r - 1.0).abs() < 1e-10, "r = {r}");
+    }
+
+    #[test]
+    fn test_pearson_perfect_negative() {
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![10.0, 8.0, 6.0, 4.0, 2.0];
+        let (r, _p) = pearson_correlation(&x, &y);
+        assert!((r + 1.0).abs() < 1e-10, "r = {r}");
+    }
+
+    #[test]
+    fn test_pearson_no_correlation() {
+        // Constant y -> zero variance -> returns (0, 1)
+        let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![5.0, 5.0, 5.0, 5.0, 5.0];
+        let (r, p) = pearson_correlation(&x, &y);
+        assert!((r).abs() < 1e-10);
+        assert!((p - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_pearson_too_few_samples() {
+        let x = vec![1.0, 2.0];
+        let y = vec![3.0, 4.0];
+        let (r, p) = pearson_correlation(&x, &y);
+        assert!((r).abs() < 1e-10);
+        assert!((p - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_pearson_mismatched_lengths() {
+        let x = vec![1.0, 2.0, 3.0];
+        let y = vec![1.0, 2.0];
+        let (r, p) = pearson_correlation(&x, &y);
+        assert!((r).abs() < 1e-10);
+        assert!((p - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_pearson_p_value_significant() {
+        // Strong correlation with many points should have low p-value
+        let n = 50;
+        let x: Vec<f64> = (0..n).map(f64::from).collect();
+        let y: Vec<f64> = x.iter().map(|&v| v * 2.0 + 1.0).collect();
+        let (r, p) = pearson_correlation(&x, &y);
+        assert!((r - 1.0).abs() < 1e-10);
+        assert!(p < 0.05, "p = {p}");
+    }
+
+    // ---- chi_square tests ----
+
+    #[test]
+    fn test_chi_square_all_zeros() {
+        let observed = [[0, 0], [0, 0]];
+        let (chi, p) = chi_square_test(&observed);
+        assert!((chi).abs() < 1e-10);
+        assert!((p - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_chi_square_independent() {
+        // When proportions are equal, chi-square should be ~0
+        let observed = [[50, 50], [50, 50]];
+        let (chi, _p) = chi_square_test(&observed);
+        assert!(chi.abs() < 1e-10, "chi = {chi}");
+    }
+
+    #[test]
+    fn test_chi_square_dependent() {
+        // Highly dependent data should produce large chi-square
+        let observed = [[100, 0], [0, 100]];
+        let (chi, p) = chi_square_test(&observed);
+        assert!(chi > 10.0, "chi = {chi}");
+        assert!(p < 0.05, "p = {p}");
+    }
+
+    // ---- chi_square_cdf tests ----
+
+    #[test]
+    fn test_chi_square_cdf_zero() {
+        assert!((chi_square_cdf(0.0, 1.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_chi_square_cdf_negative() {
+        assert!((chi_square_cdf(-1.0, 1.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_chi_square_cdf_df1_known() {
+        // For df=1, chi-square CDF at 3.84 ≈ 0.95
+        let cdf = chi_square_cdf(3.84, 1.0);
+        assert!((cdf - 0.95).abs() < 0.05, "cdf = {cdf}");
+    }
+}
