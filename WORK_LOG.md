@@ -8,6 +8,15 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-02-10
 
+- **PR #2219**: feat: extend guard-destructive hook with system and infrastructure patterns
+- **PR #2218**: feat: detect and surface human-input-needed blockers in daemon
+- **PR #2217**: fix: remove dead A/B testing module (1,341 LOC)
+- **PR #2215**: fix: copy guard-destructive.sh hook to target repos during install
+- **PR #2214**: feat: two-tier startup detection and diagnostic capture for stalled shepherds
+- **PR #2213**: docs: Guide document maintenance update
+- **PR #2212**: feat: two-tier heartbeat grace period for faster stale shepherd detection
+- **PR #2211**: feat: capture terminal scrollback before killing stuck sessions
+- **PR #2210**: feat: classify budget-exhausted shepherds and trigger architect decomposition
 - **PR #2209**: feat: add -t/--timeout-min flag for time-bounded daemon runs
 - **PR #2208**: fix: remove incorrect 100x scaling of usage API utilization
 - **PR #2206**: feat: replace SQLite usage checking with direct Anthropic OAuth API
@@ -17,8 +26,16 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 - **PR #2190**: Bump the all-dependencies group with 6 updates
 - **PR #2189**: Bump the production-dependencies group with 2 updates
 - **PR #2188**: Bump the dev-dependencies group with 4 updates
+- **Issue #2216** (closed): Add prompt hook to prevent agents from restarting servers/infrastructure
 - **Issue #2207** (closed): Add -t/--timeout-min flag to /loom for time-bounded daemon runs
+- **Issue #2205** (closed): Daemon should report when stalled waiting on human input
 - **Issue #2203** (closed): Champion should be able to promote or close any open issue
+- **Issue #2202** (closed): Remove orphaned ab_testing.rs backend (1,341 LOC dead code)
+- **Issue #2201** (closed): Daemon needs strategy for issues that exceed single-session context budget
+- **Issue #2200** (closed): Installer doesn't copy guard-destructive.sh hook to target repo
+- **Issue #2199** (closed): Daemon should capture shepherd output on kill for post-mortem debugging
+- **Issue #2198** (closed): Shepherd spawns without writing progress file -- silent failure mode
+- **Issue #2197** (closed): Stale heartbeat detection too slow -- 8+ minutes to reclaim stuck shepherd
 - **Issue #2196** (closed): Daemon should auto-resolve contradictory labels
 - **Issue #2194** (closed): Installation does not create .loom/loom-source-path file
 - **Issue #2192** (closed): loom-daemon breaks after worktree cleanup: editable install points to deleted path
