@@ -70,23 +70,30 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
+      - name: Get app version
+        id: version
+        run: |
+          APP_VERSION=$(jq -r '.version' src-tauri/tauri.conf.json)
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Create universal binary (optional)
         run: |
           # Create universal DMG filename
           VERSION="${{ github.event.release.tag_name || inputs.tag || 'dev' }}"
+          APP_VERSION="${{ steps.version.outputs.app_version }}"
 
           # The individual .app bundles are in:
           # - target/aarch64-apple-darwin/release/bundle/macos/Loom.app
           # - target/x86_64-apple-darwin/release/bundle/macos/Loom.app
 
           # Rename DMGs with version and architecture
-          if [ -f "target/aarch64-apple-darwin/release/bundle/dmg/Loom_0.1.0_aarch64.dmg" ]; then
-            cp "target/aarch64-apple-darwin/release/bundle/dmg/Loom_0.1.0_aarch64.dmg" \
+          if [ -f "target/aarch64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_aarch64.dmg" ]; then
+            cp "target/aarch64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_aarch64.dmg" \
                "target/Loom-${VERSION}-aarch64.dmg"
           fi
 
-          if [ -f "target/x86_64-apple-darwin/release/bundle/dmg/Loom_0.1.0_x64.dmg" ]; then
-            cp "target/x86_64-apple-darwin/release/bundle/dmg/Loom_0.1.0_x64.dmg" \
+          if [ -f "target/x86_64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_x64.dmg" ]; then
+            cp "target/x86_64-apple-darwin/release/bundle/dmg/Loom_${APP_VERSION}_x64.dmg" \
                "target/Loom-${VERSION}-x64.dmg"
           fi
 
