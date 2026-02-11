@@ -147,6 +147,24 @@ class TestCleanLine:
     def test_plain_text_unchanged(self) -> None:
         assert clean_line("Hello, world!") == "Hello, world!"
 
+    # -- Trailing \r regression tests (issue #2230) --
+
+    def test_trailing_cr_preserves_content(self) -> None:
+        """Line ending with \\r should return content, not None."""
+        assert clean_line("echo HELLO\r") == "echo HELLO"
+
+    def test_trailing_cr_with_ansi(self) -> None:
+        """ANSI-wrapped line ending with \\r should return stripped content."""
+        assert clean_line("\x1b[32mecho HELLO\x1b[0m\r") == "echo HELLO"
+
+    def test_trailing_cr_only(self) -> None:
+        """A bare \\r with no content should return None (blank)."""
+        assert clean_line("\r") is None
+
+    def test_trailing_multiple_cr(self) -> None:
+        """Multiple trailing \\r characters should still preserve content."""
+        assert clean_line("content\r\r\r") == "content"
+
 
 # ---------------------------------------------------------------------------
 # TestMain — integration tests for main()

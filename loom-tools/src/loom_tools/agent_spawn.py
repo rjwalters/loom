@@ -574,8 +574,11 @@ def spawn_agent(
     # blank line suppression, and duplicate line collapsing.
     # Falls back to basic sed stripping if Python filter is unavailable.
     strip_ansi_cmd = (
-        f"python3 -m loom_tools.log_filter >> '{log_file}' 2>/dev/null "
-        f"|| sed -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; "
+        f"python3 -u -m loom_tools.log_filter >> '{log_file}' 2>/dev/null "
+        f"|| sed -l -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; "
+        f"s/\\x1b\\][^\\x07]*\\x07//g' "
+        f">> '{log_file}' 2>/dev/null "
+        f"|| sed -u -E 's/\\x1b\\[[?0-9;]*[a-zA-Z]//g; "
         f"s/\\x1b\\][^\\x07]*\\x07//g' "
         f">> '{log_file}'"
     )

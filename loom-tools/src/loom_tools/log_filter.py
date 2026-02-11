@@ -29,6 +29,10 @@ def clean_line(raw: str) -> str | None:
 
     Returns the cleaned line, or None if the line should be suppressed.
     """
+    # Strip trailing \r before splitting so that "content\r" doesn't
+    # resolve to an empty last segment (which would be suppressed as blank).
+    raw = raw.rstrip("\r")
+
     # Process carriage returns: keep only the last segment
     # This handles spinner animation where lines are overwritten with \r
     if "\r" in raw:
@@ -71,7 +75,7 @@ def main() -> None:
     dup_count = 0
 
     try:
-        for raw_line in sys.stdin:
+        for raw_line in iter(sys.stdin.readline, ""):
             # Remove trailing newline for processing
             raw = raw_line.rstrip("\n")
 

@@ -487,8 +487,8 @@ class TestAnsiStripping:
             pipe_pane_call = pipe_pane_calls[0]
             pipe_cmd = pipe_pane_call[0][3] if len(pipe_pane_call[0]) > 3 else ""
 
-            assert "python3 -m loom_tools.log_filter" in pipe_cmd, \
-                f"pipe-pane should use Python log filter, got: {pipe_cmd}"
+            assert "python3 -u -m loom_tools.log_filter" in pipe_cmd, \
+                f"pipe-pane should use Python log filter with -u flag, got: {pipe_cmd}"
             assert "sed" in pipe_cmd, \
                 f"pipe-pane should include sed fallback, got: {pipe_cmd}"
             assert ">>" in pipe_cmd, \

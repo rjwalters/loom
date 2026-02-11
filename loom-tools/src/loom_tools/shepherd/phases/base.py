@@ -302,7 +302,12 @@ def _is_instant_exit(log_path: Path) -> bool:
 
         content = log_path.read_text()
         stripped = strip_ansi(content)
-        return len(stripped.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+        # Exclude log header lines (e.g. "# Loom Agent Log", "# Session: ...")
+        # so that a log with only the header is correctly detected as instant exit.
+        non_header = "\n".join(
+            line for line in stripped.splitlines() if not line.startswith("# ")
+        )
+        return len(non_header.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
     except OSError:
         return False
 
