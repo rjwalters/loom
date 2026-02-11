@@ -784,3 +784,180 @@ fn extract_configured_terminal_ids(workspace: &Path) -> Option<HashSet<String>> 
 
     Some(ids)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    // ===== rotate_log_file tests =====
+
+    #[test]
+    fn test_rotate_log_file_no_file_exists() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        // Should succeed silently when file doesn't exist
+        rotate_log_file(&log_path, 1024, 10).unwrap();
+    }
+
+    #[test]
+    fn test_rotate_log_file_under_limit() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+        fs::write(&log_path, "small content").unwrap();
+
+        // File is under the 1MB limit, should not rotate
+        rotate_log_file(&log_path, 1024 * 1024, 10).unwrap();
+
+        // Original file should still exist
+        assert!(log_path.exists());
+        assert_eq!(fs::read_to_string(&log_path).unwrap(), "small content");
+    }
+
+    #[test]
+    fn test_rotate_log_file_at_limit() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+
+        // Create file that exceeds limit (100 bytes, limit is 50)
+        let content = "x".repeat(100);
+        fs::write(&log_path, &content).unwrap();
+
+        rotate_log_file(&log_path, 50, 5).unwrap();
+
+        // Original file should be moved to .1
+        assert!(!log_path.exists());
+        let rotated = dir.path().join("daemon.log.1");
+        assert!(rotated.exists());
+        assert_eq!(fs::read_to_string(rotated).unwrap(), content);
+    }
+
+    #[test]
+    fn test_rotate_log_file_shifts_existing() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+
+        // Create existing rotated file
+        fs::write(dir.path().join("daemon.log.1"), "old content").unwrap();
+
+        // Create current log that exceeds limit
+        fs::write(&log_path, "x".repeat(100)).unwrap();
+
+        rotate_log_file(&log_path, 50, 5).unwrap();
+
+        // Old .1 should be shifted to .2
+        assert!(dir.path().join("daemon.log.2").exists());
+        assert_eq!(fs::read_to_string(dir.path().join("daemon.log.2")).unwrap(), "old content");
+
+        // Current should be at .1
+        assert!(dir.path().join("daemon.log.1").exists());
+    }
+
+    #[test]
+    fn test_rotate_log_file_removes_oldest() {
+        let dir = tempdir().unwrap();
+        let log_path = dir.path().join("daemon.log");
+
+        // Create file at max_files position (should be removed)
+        fs::write(dir.path().join("daemon.log.3"), "oldest").unwrap();
+
+        // Create current log that exceeds limit
+        fs::write(&log_path, "x".repeat(100)).unwrap();
+
+        rotate_log_file(&log_path, 50, 3).unwrap();
+
+        // The oldest file (.3) should have been removed, current becomes .1
+        assert!(dir.path().join("daemon.log.1").exists());
+    }
+
+    // ===== extract_configured_terminal_ids tests =====
+
+    #[test]
+    fn test_extract_terminal_ids_missing_config() {
+        let dir = tempdir().unwrap();
+        let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_terminal_ids_invalid_json() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+        fs::write(loom_dir.join("config.json"), "not valid json").unwrap();
+
+        let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_terminal_ids_no_terminals_key() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+        fs::write(loom_dir.join("config.json"), r#"{"other": "data"}"#).unwrap();
+
+        let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_terminal_ids_empty_terminals() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+        fs::write(loom_dir.join("config.json"), r#"{"terminals": []}"#).unwrap();
+
+        let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_extract_terminal_ids_valid_config() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+
+        let config = r#"{
+            "nextAgentNumber": 3,
+            "terminals": [
+                {"id": "terminal-1", "name": "Builder", "role": "builder"},
+                {"id": "terminal-2", "name": "Judge", "role": "judge"},
+                {"id": "shepherd-1", "name": "Shepherd", "role": "shepherd"}
+            ]
+        }"#;
+        fs::write(loom_dir.join("config.json"), config).unwrap();
+
+        let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_some());
+        let ids = result.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains("terminal-1"));
+        assert!(ids.contains("terminal-2"));
+        assert!(ids.contains("shepherd-1"));
+    }
+
+    #[test]
+    fn test_extract_terminal_ids_skips_entries_without_id() {
+        let dir = tempdir().unwrap();
+        let loom_dir = dir.path().join(".loom");
+        fs::create_dir_all(&loom_dir).unwrap();
+
+        let config = r#"{
+            "terminals": [
+                {"id": "terminal-1", "name": "Builder"},
+                {"name": "No ID"},
+                {"id": "terminal-3", "name": "Third"}
+            ]
+        }"#;
+        fs::write(loom_dir.join("config.json"), config).unwrap();
+
+        let result = extract_configured_terminal_ids(dir.path());
+        assert!(result.is_some());
+        let ids = result.unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains("terminal-1"));
+        assert!(ids.contains("terminal-3"));
+    }
+}

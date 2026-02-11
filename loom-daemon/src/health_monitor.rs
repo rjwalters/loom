@@ -194,3 +194,64 @@ pub fn check_env_enabled() -> Option<u64> {
         Some(60)
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::sync::atomic::Ordering;
+
+    // ===== TmuxHealthState::default tests =====
+
+    #[test]
+    fn test_default_state_server_alive() {
+        let state = TmuxHealthState::default();
+        assert!(state.server_alive.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_default_state_session_count_zero() {
+        let state = TmuxHealthState::default();
+        assert_eq!(state.last_session_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_default_state_crash_count_zero() {
+        let state = TmuxHealthState::default();
+        assert_eq!(state.crash_count.load(Ordering::Relaxed), 0);
+    }
+
+    // ===== check_env_enabled tests =====
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_unset_returns_default() {
+        std::env::remove_var("LOOM_TMUX_HEALTH_MONITOR");
+        assert_eq!(check_env_enabled(), Some(60));
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_zero_disables() {
+        std::env::set_var("LOOM_TMUX_HEALTH_MONITOR", "0");
+        assert_eq!(check_env_enabled(), None);
+        std::env::remove_var("LOOM_TMUX_HEALTH_MONITOR");
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_custom_interval() {
+        std::env::set_var("LOOM_TMUX_HEALTH_MONITOR", "30");
+        assert_eq!(check_env_enabled(), Some(30));
+        std::env::remove_var("LOOM_TMUX_HEALTH_MONITOR");
+    }
+
+    #[test]
+    #[serial]
+    fn test_check_env_enabled_invalid_value_returns_default() {
+        std::env::set_var("LOOM_TMUX_HEALTH_MONITOR", "not_a_number");
+        assert_eq!(check_env_enabled(), Some(60));
+        std::env::remove_var("LOOM_TMUX_HEALTH_MONITOR");
+    }
+}
