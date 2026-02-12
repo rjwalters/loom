@@ -11,7 +11,7 @@ import pytest
 
 from loom_tools.shepherd.config import ExecutionMode, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
-from loom_tools.shepherd.errors import IssueBlockedError
+from loom_tools.shepherd.errors import IssueBlockedError, IssueIsEpicError
 
 
 def _make_context(tmp_path: Path, issue: int = 42, task_id: str = "abc1234") -> ShepherdContext:
@@ -374,3 +374,93 @@ class TestRunScriptMissingScript:
         result = ctx.run_script("test-script.sh", [], check=False)
         assert result.returncode == 0
         assert "ok" in result.stdout
+
+
+def _mock_gh_issue(labels: list[str], title: str = "Test Issue", issue: int = 42) -> MagicMock:
+    """Create a mock subprocess result for gh issue view."""
+    result = MagicMock()
+    result.returncode = 0
+    result.stdout = json.dumps({
+        "url": f"https://github.com/test/repo/issues/{issue}",
+        "state": "OPEN",
+        "title": title,
+        "labels": [{"name": name} for name in labels],
+    })
+    return result
+
+
+def _mock_run_for_issue(gh_result: MagicMock):
+    """Create a side_effect function that returns gh_result for issue view."""
+    def mock_run(cmd, **kwargs):
+        if "issue" in cmd and "view" in cmd:
+            return gh_result
+        # Default: fail silently (e.g. git ls-remote)
+        result = MagicMock()
+        result.returncode = 1
+        result.stdout = ""
+        return result
+    return mock_run
+
+
+class TestValidateIssueEpicRejection:
+    """Tests for epic/tracking issue detection in validate_issue()."""
+
+    def test_loom_epic_label_raises_error(self, tmp_path: Path) -> None:
+        """Issue with loom:epic label raises IssueIsEpicError."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:epic", "loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
+            with pytest.raises(IssueIsEpicError, match="epic"):
+                ctx.validate_issue()
+
+    def test_epic_label_raises_error(self, tmp_path: Path) -> None:
+        """Issue with plain 'epic' label raises IssueIsEpicError."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["epic"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
+            with pytest.raises(IssueIsEpicError, match="epic"):
+                ctx.validate_issue()
+
+    def test_epic_phase_label_is_allowed(self, tmp_path: Path) -> None:
+        """Issue with loom:epic-phase label is NOT rejected (concrete work item)."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:epic-phase", "loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
+            meta = ctx.validate_issue()
+
+        assert meta["title"] == "Test Issue"
+
+    def test_epic_with_epic_phase_is_allowed(self, tmp_path: Path) -> None:
+        """Issue with both loom:epic and loom:epic-phase passes (phase takes precedence)."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:epic", "loom:epic-phase", "loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
+            meta = ctx.validate_issue()
+
+        assert meta["title"] == "Test Issue"
+
+    def test_epic_with_loom_issue_rejected(self, tmp_path: Path) -> None:
+        """Epic rejection takes priority even when loom:issue is also present."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:epic", "loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
+            with pytest.raises(IssueIsEpicError):
+                ctx.validate_issue()
+
+    def test_epic_rejected_even_in_force_mode(self, tmp_path: Path) -> None:
+        """Epic rejection applies even with --force (epics are not implementable)."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+        gh_result = _mock_gh_issue(["loom:epic"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
+            with pytest.raises(IssueIsEpicError):
+                ctx.validate_issue()

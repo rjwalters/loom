@@ -64,6 +64,18 @@ class IssueClosedError(ShepherdError):
         super().__init__(f"Issue #{issue} is already {state}")
 
 
+class IssueIsEpicError(ShepherdError):
+    """Issue is an epic/tracking issue that cannot be implemented directly."""
+
+    def __init__(self, issue: int) -> None:
+        self.issue = issue
+        super().__init__(
+            f"Issue #{issue} is an epic (tracking issue). "
+            "Epics cannot be implemented directly. "
+            "Decompose into individual issues and shepherd those instead."
+        )
+
+
 class PRNotFoundError(ShepherdError):
     """Pull request not found for issue."""
 
