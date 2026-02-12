@@ -1418,8 +1418,10 @@ class BuilderPhase:
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return None
 
-        # Run baseline tests on main
-        baseline_result = self._run_baseline_tests(ctx, test_cmd, display_name)
+        # Run baseline tests on main using the same command as the worktree
+        baseline_result = self._run_baseline_tests(
+            ctx, test_cmd, display_name, use_provided_cmd=True
+        )
 
         log_info(f"Running tests: {display_name}")
         ctx.report_milestone("heartbeat", action=f"verifying tests: {display_name}")
