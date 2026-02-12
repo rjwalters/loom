@@ -15,6 +15,7 @@ from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.errors import (
     IssueBlockedError,
     IssueClosedError,
+    IssueIsEpicError,
     IssueNotFoundError,
 )
 from loom_tools.shepherd.labels import LabelCache, remove_issue_label
@@ -181,6 +182,12 @@ class ShepherdContext:
         # Pre-populate label cache
         labels = {label["name"] for label in meta.get("labels", [])}
         self.label_cache.set_issue_labels(issue, labels)
+
+        # Check for epic labels — epics cannot be implemented directly.
+        # loom:epic-phase issues are individual work items and are allowed through.
+        if "loom:epic-phase" not in labels:
+            if "loom:epic" in labels or "epic" in labels:
+                raise IssueIsEpicError(issue)
 
         # Check for blocked label
         if "loom:blocked" in labels:

@@ -16,6 +16,7 @@ from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.errors import (
     IssueBlockedError,
     IssueClosedError,
+    IssueIsEpicError,
     IssueNotFoundError,
     ShepherdError,
     ShutdownSignal,
@@ -347,6 +348,9 @@ def orchestrate(ctx: ShepherdContext) -> int:
             ctx.validate_issue()
         except IssueClosedError as e:
             log_info(f"Issue #{ctx.config.issue} is already {e.state} - no orchestration needed")
+            return ShepherdExitCode.SKIPPED
+        except IssueIsEpicError as e:
+            log_info(str(e))
             return ShepherdExitCode.SKIPPED
 
         log_info(f"Issue: #{ctx.config.issue}")
