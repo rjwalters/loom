@@ -681,13 +681,21 @@ class BuilderPhase:
         """Ensure project dependencies are installed in the worktree.
 
         Checks for package.json with missing node_modules and runs
-        ``pnpm install --frozen-lockfile`` when needed.
+        ``pnpm install --frozen-lockfile`` when needed.  Also checks for
+        pyproject.toml with missing .venv and runs ``uv sync`` when needed.
 
         Returns True if dependencies are ready (already present or
         successfully installed), False if installation failed.
         Installation failure is non-fatal -- callers should continue
         gracefully.
         """
+        ok = True
+        ok = self._ensure_node_deps(worktree) and ok
+        ok = self._ensure_python_deps(worktree) and ok
+        return ok
+
+    def _ensure_node_deps(self, worktree: Path) -> bool:
+        """Install Node dependencies if package.json exists but node_modules is missing."""
         pkg_json = worktree / "package.json"
         node_modules = worktree / "node_modules"
 
@@ -717,6 +725,39 @@ class BuilderPhase:
             return False
         except OSError as e:
             log_warning(f"Could not run pnpm install: {e}")
+            return False
+
+    def _ensure_python_deps(self, worktree: Path) -> bool:
+        """Sync Python venv if pyproject.toml exists but .venv is missing."""
+        pyproject = worktree / "pyproject.toml"
+        venv = worktree / ".venv"
+
+        if not pyproject.is_file() or venv.is_dir():
+            return True
+
+        log_info(".venv missing, running uv sync")
+        try:
+            result = subprocess.run(
+                ["uv", "sync"],
+                cwd=worktree,
+                text=True,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            )
+            if result.returncode == 0:
+                log_success("Python dependencies synced successfully")
+                return True
+            log_warning(
+                f"uv sync failed (exit code {result.returncode}): "
+                f"{(result.stderr or result.stdout or '').strip()[:200]}"
+            )
+            return False
+        except subprocess.TimeoutExpired:
+            log_warning("uv sync timed out after 120s")
+            return False
+        except OSError as e:
+            log_warning(f"Could not run uv sync: {e}")
             return False
 
     def _classify_changed_files(self, files: list[str]) -> set[str]:
