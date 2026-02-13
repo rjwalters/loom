@@ -3875,6 +3875,99 @@ class TestBuilderEnsureDependencies:
         assert result is False
 
 
+class TestBuilderEnsurePythonDeps:
+    """Test builder phase Python dependency installation via uv sync."""
+
+    def test_runs_uv_sync_when_venv_missing(self, tmp_path: Path) -> None:
+        """Should run uv sync when pyproject.toml exists but .venv is missing."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"')
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=completed,
+        ) as mock_run:
+            result = builder._ensure_python_deps(tmp_path)
+
+        assert result is True
+        mock_run.assert_called_once()
+        call_args = mock_run.call_args
+        assert call_args[0][0] == ["uv", "sync"]
+        assert call_args[1]["cwd"] == tmp_path
+
+    def test_noop_when_venv_exists(self, tmp_path: Path) -> None:
+        """Should be a no-op when .venv already exists."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"')
+        (tmp_path / ".venv").mkdir()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            result = builder._ensure_python_deps(tmp_path)
+
+        assert result is True
+        mock_run.assert_not_called()
+
+    def test_noop_when_no_pyproject(self, tmp_path: Path) -> None:
+        """Should be a no-op when no pyproject.toml exists."""
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+        ) as mock_run:
+            result = builder._ensure_python_deps(tmp_path)
+
+        assert result is True
+        mock_run.assert_not_called()
+
+    def test_handles_uv_sync_failure(self, tmp_path: Path) -> None:
+        """Should return False on uv sync failure without raising."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"')
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="", stderr="error: Failed to resolve dependencies"
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=completed,
+        ):
+            result = builder._ensure_python_deps(tmp_path)
+
+        assert result is False
+
+    def test_handles_uv_timeout(self, tmp_path: Path) -> None:
+        """Should return False on timeout without raising."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"')
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="uv sync", timeout=120),
+        ):
+            result = builder._ensure_python_deps(tmp_path)
+
+        assert result is False
+
+    def test_handles_uv_not_found(self, tmp_path: Path) -> None:
+        """Should return False on OSError (uv not installed) without raising."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "test"')
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=OSError("uv not found"),
+        ):
+            result = builder._ensure_python_deps(tmp_path)
+
+        assert result is False
+
+
 class TestJudgePhase:
     """Test JudgePhase."""
 
