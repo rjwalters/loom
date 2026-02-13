@@ -356,6 +356,50 @@ class TestRunValidation:
         assert run(config) == 1
 
 
+class TestClaudeCodeEnvUnset:
+    """Test that CLAUDECODE env var is unset in tmux sessions (issue #2240)."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_spawn_agent_unsets_claudecode(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent must call set-environment -u CLAUDECODE on the tmux session."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        # Create required role file and wrapper script
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+        )
+
+        # Find the set-environment -u CLAUDECODE call
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        unset_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and "-u" in c
+            and "CLAUDECODE" in c
+        ]
+        assert len(unset_calls) == 1, (
+            f"Expected exactly one 'set-environment -u CLAUDECODE' call, "
+            f"got {len(unset_calls)}. All tmux calls: {tmux_calls}"
+        )
+
+
 class TestAnsiStripping:
     """Tests for ANSI escape sequence stripping in log output."""
 

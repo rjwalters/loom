@@ -5629,6 +5629,104 @@ class TestRunWorkerPhaseMissingScripts:
         assert exit_code == 0
 
 
+class TestRunWorkerPhaseClaudeCodeEnv:
+    """Test run_worker_phase strips CLAUDECODE from environment (issue #2240)."""
+
+    def test_claudecode_stripped_from_subprocess_env(self, tmp_path: Path) -> None:
+        """CLAUDECODE env var must be removed before spawning subprocesses."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        captured_env = {}
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            captured_env.update(kwargs.get("env", {}))
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=False,
+            ),
+            patch.dict("os.environ", {"CLAUDECODE": "1"}, clear=False),
+        ):
+            run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert "CLAUDECODE" not in captured_env
+        assert captured_env.get("LOOM_STUCK_ACTION") == "retry"
+
+    def test_works_when_claudecode_not_set(self, tmp_path: Path) -> None:
+        """No error when CLAUDECODE is not in the environment."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        env_without_claudecode = {
+            k: v for k, v in __import__("os").environ.items() if k != "CLAUDECODE"
+        }
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=False,
+            ),
+            patch.dict("os.environ", env_without_claudecode, clear=True),
+        ):
+            exit_code = run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 0
+
+
 class TestRunWorkerPhaseIdleThreshold:
     """Test run_worker_phase min-idle-elapsed threshold configuration."""
 

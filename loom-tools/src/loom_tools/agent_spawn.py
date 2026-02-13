@@ -590,6 +590,8 @@ def spawn_agent(
     _tmux("set-environment", "-t", session_name, "LOOM_TERMINAL_ID", name)
     _tmux("set-environment", "-t", session_name, "LOOM_WORKSPACE", str(working_dir))
     _tmux("set-environment", "-t", session_name, "LOOM_ROLE", role)
+    # Unset CLAUDECODE to prevent nested session guard from blocking subprocess
+    _tmux("set-environment", "-t", session_name, "-u", "CLAUDECODE")
 
     # Build the role slash command
     role_cmd = f"/{role}"
