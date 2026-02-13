@@ -347,6 +347,7 @@ run_with_retry() {
         # stdout with a pipe fd, causing Claude to switch to non-interactive --print mode.
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
         set +e  # Temporarily disable errexit to capture exit code
+        unset CLAUDECODE  # Prevent nested session guard from blocking subprocess
         script -q "${temp_output}" claude "$@"
         exit_code=$?
         set -e

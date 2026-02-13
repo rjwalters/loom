@@ -428,6 +428,7 @@ def run_worker_phase(
 
     # Set LOOM_STUCK_ACTION for retry behavior
     env = os.environ.copy()
+    env.pop("CLAUDECODE", None)  # Prevent nested session guard from blocking subprocess
     env["LOOM_STUCK_ACTION"] = "retry"
 
     # Launch wait process (non-blocking) so we can poll for heartbeats
