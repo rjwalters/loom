@@ -140,7 +140,8 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_token_usage_metric_id ON token_usage(metric_id);
             CREATE INDEX IF NOT EXISTS idx_token_usage_timestamp ON token_usage(timestamp);
             CREATE INDEX IF NOT EXISTS idx_token_usage_model ON token_usage(model);
-            CREATE INDEX IF NOT EXISTS idx_token_usage_provider ON token_usage(provider);
+            -- NOTE: idx_token_usage_provider is created in migrate_token_usage_table()
+            -- because the provider column may not exist in older databases.
 
             -- GitHub events for correlating agent activity with GitHub actions
             CREATE TABLE IF NOT EXISTS github_events (
@@ -511,5 +512,95 @@ fn migrate_token_usage_table(conn: &Connection) {
                 }
             }
         }
+    }
+
+    // Create index on provider column after it's been added.
+    // This index was moved out of the main execute_batch because the provider
+    // column may not exist in older databases until this migration runs.
+    if let Err(e) = conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_token_usage_provider ON token_usage(provider)",
+        [],
+    ) {
+        log::debug!("Could not create idx_token_usage_provider: {e} (may be expected)");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn test_init_schema_fresh_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // Verify token_usage table has all columns including provider
+        let has_provider: bool = conn
+            .prepare("SELECT provider FROM token_usage LIMIT 0")
+            .is_ok();
+        assert!(has_provider, "provider column should exist");
+
+        // Verify idx_token_usage_provider index exists
+        let index_exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_token_usage_provider'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(index_exists, "idx_token_usage_provider should exist");
+    }
+
+    #[test]
+    fn test_init_schema_with_old_token_usage_table() {
+        // Regression test for issue #2264: init_schema crashes when existing
+        // token_usage table lacks the provider column because the execute_batch
+        // tried to create an index on a non-existent column.
+        let conn = Connection::open_in_memory().unwrap();
+
+        // Create the OLD token_usage schema (without new columns)
+        conn.execute_batch(
+            r"
+            CREATE TABLE token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_id INTEGER,
+                metric_id INTEGER,
+                timestamp DATETIME NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                model TEXT,
+                estimated_cost_usd REAL DEFAULT 0.0
+            );
+            ",
+        )
+        .unwrap();
+
+        // This must NOT panic — it was the crash scenario in #2264
+        init_schema(&conn).unwrap();
+
+        // Verify migration added the new columns
+        for col in ["provider", "tokens_cache_read", "tokens_cache_write", "duration_ms"] {
+            let ok = conn
+                .prepare(&format!("SELECT {col} FROM token_usage LIMIT 0"))
+                .is_ok();
+            assert!(ok, "column {col} should exist after migration");
+        }
+
+        // Verify the provider index was created
+        let index_exists: bool = conn
+            .prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_token_usage_provider'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(index_exists, "idx_token_usage_provider should exist after migration");
+    }
+
+    #[test]
+    fn test_init_schema_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // Calling a second time should not error
+        init_schema(&conn).unwrap();
     }
 }
