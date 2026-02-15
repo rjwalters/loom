@@ -22,6 +22,7 @@ jobs:
       frontend: ${{ steps.filter.outputs.frontend }}
       backend: ${{ steps.filter.outputs.backend }}
       mcp: ${{ steps.filter.outputs.mcp }}
+      scripts: ${{ steps.filter.outputs.scripts }}
     steps:
       - uses: dorny/paths-filter@v3
         id: filter
@@ -46,6 +47,10 @@ jobs:
               - '.github/workflows/ci.yml'
             mcp:
               - 'mcp-loom/**'
+              - '.github/workflows/ci.yml'
+            scripts:
+              - 'scripts/**'
+              - 'defaults/**'
               - '.github/workflows/ci.yml'
 
   frontend-lint:
@@ -157,3 +162,14 @@ jobs:
         run: cd mcp-loom && npm install && npm run build
       - name: Verify build output
         run: test -f mcp-loom/dist/index.js
+
+  installer-tests:
+    name: Installer Integration Tests
+    needs: changes
+    if: always() && (github.event_name == 'push' || needs.changes.outputs.scripts == 'true')
+    # macOS runner required: uninstall-loom.sh uses sed -i '' (macOS syntax)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run installer tests
+        run: bash scripts/test-installer.sh
