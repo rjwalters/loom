@@ -16,11 +16,11 @@
   - Warn: pedantic, perf, style, unwrap_used, expect_used
 - Commands: `npm run format:rust`, `npm run clippy`
 
-**Git Hooks (husky + lint-staged)**:
+**Git Hooks (.githooks/pre-commit)**:
 - Pre-commit hook auto-formats staged files
 - TS/JS files: Biome formatting + linting
 - Rust files: rustfmt formatting
-- Configured in `.husky/pre-commit` and `package.json`
+- Configured in `.githooks/pre-commit` (plain shell script, zero npm dependencies)
 
 **CI/CD (GitHub Actions)**:
 - Workflow: `.github/workflows/ci.yml`

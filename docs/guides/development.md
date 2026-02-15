@@ -126,11 +126,13 @@ pnpm run daemon:check
 
 ### Git Hooks
 
-Pre-commit hooks are automatically set up via [husky](https://typicode.github.io/husky/) and [lint-staged](https://github.com/lint-staged/lint-staged).
+Pre-commit hooks live in `.githooks/pre-commit` (a plain shell script, no dependencies).
+
+The hooks path is activated by `git config core.hooksPath .githooks`, which runs automatically via the `prepare` script on `pnpm install`.
 
 When you commit:
 1. **TypeScript/JavaScript files** are automatically formatted and linted with Biome
-2. **Rust files** are automatically formatted with rustfmt and linted with clippy
+2. **Rust files** are automatically formatted with rustfmt
 
 If there are errors that can't be auto-fixed, the commit will be blocked.
 
@@ -277,7 +279,7 @@ If builds fail:
 If pre-commit hooks fail:
 1. Check the error output for specific issues
 2. Try manual fixes: `pnpm run lint:fix && pnpm run format:rust:write`
-3. If hooks are misconfigured, reinstall: `rm -rf .husky && npx husky init`
+3. If hooks are misconfigured, reconfigure: `git config core.hooksPath .githooks`
 
 ## Additional Resources
 

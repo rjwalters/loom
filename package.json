@@ -54,7 +54,7 @@
     "worktree:return": "./.loom/scripts/worktree-return.sh",
     "clean": "./clean.sh",
     "clean:full": "./clean.sh && pnpm install",
-    "prepare": "husky"
+    "prepare": "git config core.hooksPath .githooks"
   },
   "repository": {
     "type": "git",
@@ -89,27 +89,11 @@
     "@vitest/ui": "^4.0.18",
     "autoprefixer": "^10.4.24",
     "happy-dom": "^20.5.3",
-    "husky": "^9.1.7",
-    "lint-staged": "^16.2.7",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
     "typescript": "^5.9.3",
     "vite": "^7.3.1",
     "vitest": "^4.0.18"
-  },
-  "lint-staged": {
-    "src/**/*.{ts,tsx,js,jsx,json}": [
-      "biome check --write"
-    ],
-    "e2e/**/*.{ts,tsx}": [
-      "biome check --write"
-    ],
-    "defaults/**/*.json": [
-      "biome check --write"
-    ],
-    "*.rs": [
-      "cargo fmt --"
-    ]
   },
   "pnpm": {
     "overrides": {
