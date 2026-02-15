@@ -7,6 +7,7 @@ import pathlib
 import pytest
 
 from loom_tools.common.claude_config import (
+    _SHARED_CONFIG_FILES,
     cleanup_agent_config_dir,
     cleanup_all_agent_config_dirs,
     setup_agent_config_dir,
@@ -79,6 +80,48 @@ class TestSetupAgentConfigDir:
         assert dir1 != dir2
         assert dir1.is_dir()
         assert dir2.is_dir()
+
+    def test_claude_json_in_shared_config_files(self) -> None:
+        """Ensure .claude.json is in shared config list to prevent onboarding prompts."""
+        assert ".claude.json" in _SHARED_CONFIG_FILES
+
+    def test_symlinks_claude_json_when_exists(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify .claude.json is symlinked when it exists in ~/.claude/."""
+        # Create a fake home .claude dir with .claude.json
+        fake_home_claude = mock_repo / "fake-home-claude"
+        fake_home_claude.mkdir()
+        (fake_home_claude / ".claude.json").write_text('{"onboardingComplete":true}')
+
+        # Patch Path.home() to use our fake home so setup_agent_config_dir
+        # finds fake_home_claude as ~/.claude
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").symlink_to(fake_home_claude)
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        config_dir = setup_agent_config_dir("test-agent", mock_repo)
+        dst = config_dir / ".claude.json"
+        assert dst.is_symlink(), ".claude.json should be symlinked"
+        assert dst.resolve() == (fake_home_claude / ".claude.json").resolve()
+
+    def test_missing_claude_json_skipped_gracefully(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify no error when .claude.json does not exist in ~/.claude/."""
+        # Create a fake home .claude dir WITHOUT .claude.json
+        fake_home_claude = mock_repo / "fake-home-claude"
+        fake_home_claude.mkdir()
+
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").symlink_to(fake_home_claude)
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        config_dir = setup_agent_config_dir("test-agent", mock_repo)
+        dst = config_dir / ".claude.json"
+        assert not dst.exists(), ".claude.json should not exist when source is missing"
 
 
 class TestCleanupAgentConfigDir:

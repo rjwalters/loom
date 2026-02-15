@@ -22,6 +22,7 @@ _SHARED_CONFIG_FILES = [
     "config.json",
     "mcp.json",
     ".mcp.json",
+    ".claude.json",
 ]
 
 # Shared directories to symlink from ~/.claude/ (read-only caches)
