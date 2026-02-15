@@ -9707,3 +9707,302 @@ class TestRunPhaseWithRetryInstantExit:
 
         assert exit_code == 0
         assert call_count == 3
+
+
+class TestBuilderFilterBuildArtifacts:
+    """Test _filter_build_artifacts separates meaningful changes from artifacts."""
+
+    def test_empty_input(self) -> None:
+        builder = BuilderPhase()
+        meaningful, artifacts = builder._filter_build_artifacts([])
+        assert meaningful == []
+        assert artifacts == []
+
+    def test_all_meaningful(self) -> None:
+        builder = BuilderPhase()
+        lines = ["M  src/main.py", "A  src/util.py", "?? new_file.rs"]
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == lines
+        assert artifacts == []
+
+    def test_all_artifacts(self) -> None:
+        builder = BuilderPhase()
+        lines = [
+            "M  Cargo.lock",
+            "?? node_modules",
+            "M  target/debug/build",
+            "M  .loom-checkpoint",
+            "M  .loom-in-use",
+            "M  pnpm-lock.yaml",
+            "?? .venv",
+        ]
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == []
+        assert artifacts == lines
+
+    def test_mixed_input(self) -> None:
+        builder = BuilderPhase()
+        lines = [
+            "M  src/lib.rs",
+            "M  Cargo.lock",
+            "A  src/new.py",
+            "?? node_modules",
+        ]
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == ["M  src/lib.rs", "A  src/new.py"]
+        assert artifacts == ["M  Cargo.lock", "?? node_modules"]
+
+    def test_target_subdir_is_artifact(self) -> None:
+        builder = BuilderPhase()
+        lines = ["M  target/release/binary"]
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == []
+        assert artifacts == lines
+
+    def test_quoted_paths(self) -> None:
+        """git status --porcelain quotes paths with special chars."""
+        builder = BuilderPhase()
+        lines = ['M  "Cargo.lock"']
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == []
+        assert artifacts == lines
+
+
+class TestBuilderDiagnosticsArtifactFiltering:
+    """Test _gather_diagnostics filters build artifacts correctly."""
+
+    def test_only_artifacts_not_counted_as_uncommitted(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should report has_uncommitted_changes=False for artifacts only."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "loom-builder-issue-42.log").write_text("log\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = "M  Cargo.lock\n?? node_modules\n"
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["has_uncommitted_changes"] is False
+        assert diag["uncommitted_file_count"] == 0
+        assert diag["artifact_file_count"] == 2
+        assert diag["total_uncommitted_file_count"] == 2
+
+    def test_mixed_files_counts_only_meaningful(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Diagnostics should count only meaningful files, not artifacts."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "loom-builder-issue-42.log").write_text("log\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = "M  src/main.py\nM  Cargo.lock\nA  src/util.py\n"
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["has_uncommitted_changes"] is True
+        assert diag["uncommitted_file_count"] == 2
+        assert diag["artifact_file_count"] == 1
+        assert diag["total_uncommitted_file_count"] == 3
+
+    def test_summary_shows_only_artifacts_note(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Summary should note 'only build artifacts' when no meaningful changes."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "loom-builder-issue-42.log").write_text("log\n")
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                result.stdout = "M  Cargo.lock\n"
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=fake_run,
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert "only build artifacts (1 files)" in diag["summary"]
+
+
+class TestBuilderHasIncompleteWorkWithArtifacts:
+    """Test _has_incomplete_work correctly ignores build artifacts."""
+
+    def test_only_artifacts_not_incomplete(self) -> None:
+        """Artifacts-only diagnostics should not be considered incomplete work."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,  # artifacts filtered out
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
+
+class TestBuilderIsNoChangesNeededWithArtifacts:
+    """Test _is_no_changes_needed when only artifacts exist."""
+
+    def test_only_artifacts_means_no_changes_needed(self) -> None:
+        """When only build artifacts are present, no real changes were needed."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,  # artifacts filtered out
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+
+class TestBuilderStaleWorktreeWithArtifacts:
+    """Test _is_stale_worktree treats artifact-only changes as stale."""
+
+    def test_only_artifacts_is_stale(self, tmp_path: Path) -> None:
+        """Worktree with only build artifacts should be considered stale."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            def run_side_effect(cmd, **kwargs):
+                result = MagicMock()
+                if "status" in cmd:
+                    result.returncode = 0
+                    result.stdout = "M  Cargo.lock\n?? node_modules\n"
+                elif "log" in cmd:
+                    result.returncode = 0
+                    result.stdout = ""  # No commits ahead
+                return result
+
+            mock_run.side_effect = run_side_effect
+            assert builder._is_stale_worktree(worktree) is True
+
+    def test_meaningful_changes_not_stale(self, tmp_path: Path) -> None:
+        """Worktree with meaningful changes should not be stale."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            def run_side_effect(cmd, **kwargs):
+                result = MagicMock()
+                if "status" in cmd:
+                    result.returncode = 0
+                    result.stdout = "M  src/main.py\nM  Cargo.lock\n"
+                elif "log" in cmd:
+                    result.returncode = 0
+                    result.stdout = ""
+                return result
+
+            mock_run.side_effect = run_side_effect
+            assert builder._is_stale_worktree(worktree) is False
+
+    def test_mixed_artifacts_and_code_not_stale(self, tmp_path: Path) -> None:
+        """Worktree with both artifacts and real code is not stale."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+
+        with patch("subprocess.run") as mock_run:
+            def run_side_effect(cmd, **kwargs):
+                result = MagicMock()
+                if "status" in cmd:
+                    result.returncode = 0
+                    result.stdout = (
+                        "M  Cargo.lock\n"
+                        "M  pnpm-lock.yaml\n"
+                        "A  src/new_feature.rs\n"
+                    )
+                elif "log" in cmd:
+                    result.returncode = 0
+                    result.stdout = ""
+                return result
+
+            mock_run.side_effect = run_side_effect
+            assert builder._is_stale_worktree(worktree) is False
