@@ -348,6 +348,13 @@ run_with_retry() {
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
         set +e  # Temporarily disable errexit to capture exit code
         unset CLAUDECODE  # Prevent nested session guard from blocking subprocess
+        # Export per-agent config dir if set (for session isolation)
+        if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+            export CLAUDE_CONFIG_DIR
+        fi
+        if [[ -n "${TMPDIR:-}" ]]; then
+            export TMPDIR
+        fi
         script -q "${temp_output}" claude "$@"
         exit_code=$?
         set -e

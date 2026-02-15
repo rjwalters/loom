@@ -400,6 +400,102 @@ class TestClaudeCodeEnvUnset:
         )
 
 
+class TestClaudeConfigDirIsolation:
+    """Test that CLAUDE_CONFIG_DIR is set for per-agent session isolation."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_spawn_agent_sets_claude_config_dir(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent must set CLAUDE_CONFIG_DIR via tmux set-environment."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        # Create required role file and wrapper script
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+        )
+
+        # Find the set-environment CLAUDE_CONFIG_DIR call
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        config_dir_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and "CLAUDE_CONFIG_DIR" in c
+        ]
+        assert len(config_dir_calls) == 1, (
+            f"Expected exactly one 'set-environment CLAUDE_CONFIG_DIR' call, "
+            f"got {len(config_dir_calls)}. All tmux calls: {tmux_calls}"
+        )
+
+        # Verify the path points to .loom/claude-config/test-builder
+        config_dir_value = config_dir_calls[0][-1]
+        assert "claude-config/test-builder" in config_dir_value
+
+        # Verify the config dir was actually created
+        expected_dir = mock_repo / ".loom" / "claude-config" / "test-builder"
+        assert expected_dir.is_dir()
+        assert (expected_dir / "tmp").is_dir()
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_spawn_agent_sets_tmpdir(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent must set TMPDIR to the agent's tmp dir."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+        )
+
+        # Find the set-environment TMPDIR call
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        tmpdir_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and "TMPDIR" in c
+            and "-u" not in c
+        ]
+        assert len(tmpdir_calls) == 1, (
+            f"Expected exactly one 'set-environment TMPDIR' call, "
+            f"got {len(tmpdir_calls)}. All tmux calls: {tmux_calls}"
+        )
+
+        # Verify path ends with /tmp
+        tmpdir_value = tmpdir_calls[0][-1]
+        assert tmpdir_value.endswith("/tmp")
+        assert "claude-config/test-builder" in tmpdir_value
+
+
 class TestAnsiStripping:
     """Tests for ANSI escape sequence stripping in log output."""
 
