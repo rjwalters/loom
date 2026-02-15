@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 from pathlib import Path
 from typing import Literal
+
+from loom_tools.common.github import gh_issue_view, gh_run
 
 # Entity type for generic label operations
 EntityType = Literal["issue", "pr"]
@@ -44,22 +44,13 @@ class LabelCache:
     def __init__(self, repo_root: Path | None = None) -> None:
         self._labels: dict[tuple[EntityType, int], set[str]] = {}
         self._repo_root = repo_root
-        self._gh_cmd = self._find_gh_cmd()
-
-    def _find_gh_cmd(self) -> str:
-        """Return gh-cached if available, otherwise gh."""
-        if self._repo_root:
-            gh_cached = self._repo_root / ".loom" / "scripts" / "gh-cached"
-            if gh_cached.is_file() and gh_cached.stat().st_mode & 0o111:
-                return str(gh_cached)
-        return "gh"
 
     def _run_gh(self, args: list[str]) -> str:
-        """Run gh command and return stdout."""
-        cmd = [self._gh_cmd, *args]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, cwd=self._repo_root
-        )
+        """Run gh command and return stdout.
+
+        Delegates to the centralized ``gh_run`` for consistent behavior.
+        """
+        result = gh_run(args, check=False, cwd=self._repo_root)
         if result.returncode != 0:
             return ""
         return result.stdout.strip()
@@ -317,9 +308,10 @@ def add_label(
     Returns:
         True if successful
     """
-    cmd = ["gh", entity_type, "edit", str(number), "--add-label", label]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False, cwd=repo_root
+    result = gh_run(
+        [entity_type, "edit", str(number), "--add-label", label],
+        check=False,
+        cwd=repo_root,
     )
     return result.returncode == 0
 
@@ -338,8 +330,11 @@ def remove_label(
     Returns:
         True if successful (or label didn't exist)
     """
-    cmd = ["gh", entity_type, "edit", str(number), "--remove-label", label]
-    subprocess.run(cmd, capture_output=True, text=True, check=False, cwd=repo_root)
+    gh_run(
+        [entity_type, "edit", str(number), "--remove-label", label],
+        check=False,
+        cwd=repo_root,
+    )
     # Always return True - label may not have existed
     return True
 
@@ -399,20 +394,18 @@ def transition_labels(
                     # Remove all other labels in the group
                     effective_remove |= group - {label}
 
-    cmd = ["gh", entity_type, "edit", str(number)]
+    args: list[str] = [entity_type, "edit", str(number)]
 
     # Add --remove-label flags first (order doesn't matter to gh, but
     # conceptually we remove the old state before adding the new)
     for label in sorted(effective_remove):
-        cmd.extend(["--remove-label", label])
+        args.extend(["--remove-label", label])
 
     # Add --add-label flags
     for label in add or []:
-        cmd.extend(["--add-label", label])
+        args.extend(["--add-label", label])
 
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False, cwd=repo_root
-    )
+    result = gh_run(args, check=False, cwd=repo_root)
     return result.returncode == 0
 
 
@@ -463,18 +456,15 @@ def transition_pr_labels(
 def get_issue_metadata(issue: int, repo_root: Path | None = None) -> dict | None:
     """Fetch issue metadata (url, state, title, labels) in a single API call.
 
+    Uses the dual-mode GitHub API layer (GraphQL with REST fallback).
+
     Returns None if issue doesn't exist.
     """
-    cmd = ["gh", "issue", "view", str(issue), "--json", "url,state,title,labels"]
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, check=False, cwd=repo_root
+    return gh_issue_view(
+        issue,
+        fields=["url", "state", "title", "labels"],
+        cwd=repo_root,
     )
-    if result.returncode != 0 or not result.stdout.strip():
-        return None
-    try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return None
 
 
 def get_pr_for_issue(
@@ -491,17 +481,14 @@ def get_pr_for_issue(
     Returns PR number if found, None otherwise.
     """
 
-    def _run_gh(args: list[str]) -> str:
-        cmd = ["gh", *args]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, cwd=repo_root
-        )
+    def _run(args: list[str]) -> str:
+        result = gh_run(args, check=False, cwd=repo_root)
         if result.returncode != 0:
             return ""
         return result.stdout.strip()
 
     # Method 1: Branch-based lookup (deterministic, no indexing lag)
-    output = _run_gh(
+    output = _run(
         [
             "pr",
             "list",
@@ -523,7 +510,7 @@ def get_pr_for_issue(
 
     # Methods 2-4: Search body for linking keywords (has indexing lag)
     for pattern in [f"Closes #{issue}", f"Fixes #{issue}", f"Resolves #{issue}"]:
-        output = _run_gh(
+        output = _run(
             [
                 "pr",
                 "list",

@@ -10,9 +10,10 @@ and add diagnostic comments to the issue for manual intervention.
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
+
+from loom_tools.common.github import gh_entity_edit, gh_issue_comment, gh_issue_view, gh_pr_view
 
 if TYPE_CHECKING:
     from loom_tools.shepherd.context import ShepherdContext
@@ -65,26 +66,16 @@ class ContractViolation:
 
 def _check_issue_exists(ctx: ShepherdContext) -> bool:
     """Check that the issue exists."""
-    result = subprocess.run(
-        ["gh", "issue", "view", str(ctx.config.issue), "--json", "state"],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0
+    meta = gh_issue_view(ctx.config.issue, fields=["state"], cwd=ctx.repo_root)
+    return meta is not None
 
 
 def _check_issue_open(ctx: ShepherdContext) -> bool:
     """Check that the issue is in OPEN state."""
-    result = subprocess.run(
-        ["gh", "issue", "view", str(ctx.config.issue), "--json", "state", "--jq", ".state"],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0 and result.stdout.strip().upper() == "OPEN"
+    meta = gh_issue_view(ctx.config.issue, fields=["state"], cwd=ctx.repo_root)
+    if meta is None:
+        return False
+    return meta.get("state", "").upper() == "OPEN"
 
 
 def _check_issue_has_loom_issue_label(ctx: ShepherdContext) -> bool:
@@ -113,14 +104,10 @@ def _check_pr_is_open(ctx: ShepherdContext) -> bool:
     if ctx.pr_number is None:
         return False
 
-    result = subprocess.run(
-        ["gh", "pr", "view", str(ctx.pr_number), "--json", "state", "--jq", ".state"],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.returncode == 0 and result.stdout.strip().upper() == "OPEN"
+    meta = gh_pr_view(ctx.pr_number, fields=["state"], cwd=ctx.repo_root)
+    if meta is None:
+        return False
+    return meta.get("state", "").upper() == "OPEN"
 
 
 def _check_pr_has_review_requested(ctx: ShepherdContext) -> bool:
@@ -293,6 +280,8 @@ def apply_contract_violation(
 ) -> None:
     """Apply failure label and add diagnostic comment for a contract violation.
 
+    Uses the dual-mode GitHub API layer for all operations.
+
     Args:
         ctx: Shepherd context
         violation: The contract violation to apply
@@ -301,20 +290,12 @@ def apply_contract_violation(
 
     # Apply failure label if specified
     if violation.contract.failure_label:
-        subprocess.run(
-            [
-                "gh",
-                "issue",
-                "edit",
-                str(issue),
-                "--remove-label",
-                "loom:building",
-                "--add-label",
-                violation.contract.failure_label,
-            ],
+        gh_entity_edit(
+            "issue",
+            issue,
+            remove_labels=["loom:building"],
+            add_labels=[violation.contract.failure_label],
             cwd=ctx.repo_root,
-            capture_output=True,
-            check=False,
         )
 
     # Add diagnostic comment
@@ -331,9 +312,4 @@ def apply_contract_violation(
         "Check the issue/PR labels and state before retrying."
     )
 
-    subprocess.run(
-        ["gh", "issue", "comment", str(issue), "--body", comment],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        check=False,
-    )
+    gh_issue_comment(issue, comment, cwd=ctx.repo_root)

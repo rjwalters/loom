@@ -8,9 +8,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from loom_tools.common.github import gh_issue_view
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
-from loom_tools.common.state import read_json_file, safe_parse_json
+from loom_tools.common.state import read_json_file
 from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.errors import (
     IssueBlockedError,
@@ -138,6 +139,7 @@ class ShepherdContext:
         """Validate issue exists and is in valid state.
 
         Fetches issue metadata and pre-populates label cache.
+        Uses the dual-mode GitHub API layer (GraphQL with REST fallback).
 
         Returns:
             Issue metadata dict
@@ -149,21 +151,14 @@ class ShepherdContext:
         """
         issue = self.config.issue
 
-        # Fetch metadata
-        cmd = ["gh", "issue", "view", str(issue), "--json", "url,state,title,labels"]
-        result = subprocess.run(
-            cmd,
+        # Fetch metadata via dual-mode API layer
+        meta = gh_issue_view(
+            issue,
+            fields=["url", "state", "title", "labels"],
             cwd=self.repo_root,
-            text=True,
-            capture_output=True,
-            check=False,
         )
 
-        if result.returncode != 0 or not result.stdout.strip():
-            raise IssueNotFoundError(issue)
-
-        meta = safe_parse_json(result.stdout)
-        if not isinstance(meta, dict):
+        if meta is None:
             raise IssueNotFoundError(issue)
 
         # Verify it's an issue, not a PR
