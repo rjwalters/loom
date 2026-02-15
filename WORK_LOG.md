@@ -6,6 +6,38 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-02-13
+
+- **PR #2242**: chore: bump version to v0.2.2
+- **PR #2241**: fix: strip CLAUDECODE env var to prevent nested session guard
+- **PR #2239**: Add uv sync to shepherd worktree dependency setup
+- **Issue #2240** (closed): Shepherd fails: Claude Code v2.1.39 nested session guard blocks subprocess spawning
+- **Issue #2238** (closed): Shepherd worktree missing Python venv — uv sync not run
+
+### 2026-02-12
+
+- **PR #2237**: feat: reject epic/tracking issues before builder phase
+- **PR #2235**: fix: use same test command for baseline comparison in scoped tests
+- **Issue #2236** (closed): Shepherd should reject epic/tracking issues before builder phase
+- **Issue #2234** (closed): Scoped test baseline uses wrong command (auto-detects instead of using scoped command)
+
+### 2026-02-11
+
+- **PR #2233**: docs: rewrite contributing guide for AI-developed project
+- **PR #2232**: test: improve test coverage for src-tauri Rust backend
+- **PR #2231**: fix: resolve pipe-pane log capture issues with trailing CR and buffering
+- **PR #2229**: feat: add unit tests for loom-daemon core modules
+- **PR #2228**: fix: push ghloc badge to separate branch to avoid ruleset conflict
+- **PR #2224**: chore: add ghloc lines-of-code badge to README
+- **PR #2223**: chore: bump version to 0.2.1 and fix release workflow
+- **PR #2222**: feat: improve /imagine bootstrapper with planning artifacts and starter issues
+- **PR #2221**: docs: Guide document maintenance update
+- **PR #2220**: fix: update time crate to 0.3.47 to resolve RUSTSEC-2026-0009
+- **Issue #2230** (closed): Fix pipe-pane log capture: buffering + trailing CR bugs drop all output
+- **Issue #2227** (closed): Improve test coverage for TypeScript frontend modules
+- **Issue #2226** (closed): Improve test coverage for src-tauri Rust backend
+- **Issue #2225** (closed): Improve test coverage for loom-daemon core modules
+
 ### 2026-02-10
 
 - **PR #2219**: feat: extend guard-destructive hook with system and infrastructure patterns
