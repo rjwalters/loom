@@ -66,7 +66,7 @@ EXIT CODES:
     3  SHUTDOWN           - Shutdown signal received
     4  NEEDS_INTERVENTION - Stuck/blocked, needs human intervention
     5  SKIPPED            - Issue already complete (no action needed)
-    6  NO_CHANGES_NEEDED  - Problem already resolved, issue closed
+    6  NO_CHANGES_NEEDED  - No changes determined, issue marked blocked
 
 NOTE:
     Force mode does NOT skip the Judge phase. Code review always runs because
@@ -336,7 +336,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         - SHUTDOWN (3): Shutdown signal received
         - NEEDS_INTERVENTION (4): Stuck/blocked, needs human intervention
         - SKIPPED (5): Issue already complete
-        - NO_CHANGES_NEEDED (6): Problem already resolved, issue closed
+        - NO_CHANGES_NEEDED (6): No changes determined, issue marked blocked
     """
     start_time = time.time()
     completed_phases: list[str] = []
@@ -623,10 +623,10 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status == PhaseStatus.SKIPPED:
                 # Check if this is "no changes needed" (different from regular skip)
                 if result.data.get("no_changes_needed"):
-                    # Close the issue and exit successfully
+                    # Mark as blocked for human review
                     _handle_no_changes_needed(ctx, result)
                     log_success(
-                        f"Issue #{ctx.config.issue} closed - no changes needed"
+                        f"Issue #{ctx.config.issue} marked blocked - builder could not determine changes needed"
                     )
                     return ShepherdExitCode.NO_CHANGES_NEEDED
                 completed_phases.append(f"Builder ({result.message})")
@@ -1359,9 +1359,9 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
 def _handle_no_changes_needed(ctx: ShepherdContext, result: "PhaseResult") -> None:
     """Handle the case where Builder determined no changes are needed.
 
-    This closes the issue gracefully with an explanatory comment, indicating
-    that the reported problem doesn't exist or is already resolved on main.
-    No failure labels are applied since this is a valid completion state.
+    Marks the issue as blocked with an explanatory comment so a human can
+    review whether the issue is truly resolved or needs better specification.
+    The builder should never close issues — only PR merges close issues.
     """
     import subprocess
 
@@ -1372,25 +1372,27 @@ def _handle_no_changes_needed(ctx: ShepherdContext, result: "PhaseResult") -> No
     }.get(reason, "No changes were determined to be necessary.")
 
     # Build comment body
-    comment_body = f"""**Shepherd complete: No changes needed**
+    comment_body = f"""**Shepherd: Builder could not determine changes needed**
 
 {reason_text}
 
-The Builder phase analyzed this issue and determined that:
-- No code changes are required
-- The issue can be safely closed
+The Builder phase analyzed this issue but could not identify code changes to make.
+This issue has been marked as `loom:blocked` for human review.
 
-If this is incorrect, please reopen the issue with additional context about the problem.
+Possible next steps:
+- Add more implementation guidance to the issue description
+- Verify the issue is still relevant
+- Close the issue manually if it is truly resolved
 """
 
-    # Close the issue with the comment
+    # Add explanatory comment
     subprocess.run(
         [
             "gh",
             "issue",
-            "close",
+            "comment",
             str(ctx.config.issue),
-            "--comment",
+            "--body",
             comment_body,
         ],
         cwd=ctx.repo_root,
@@ -1398,7 +1400,7 @@ If this is incorrect, please reopen the issue with additional context about the 
         check=False,
     )
 
-    # Remove loom:building label if present (issue is now closed anyway)
+    # Transition labels: remove loom:building, add loom:blocked
     subprocess.run(
         [
             "gh",
@@ -1407,23 +1409,13 @@ If this is incorrect, please reopen the issue with additional context about the 
             str(ctx.config.issue),
             "--remove-label",
             "loom:building",
+            "--add-label",
+            "loom:blocked",
         ],
         cwd=ctx.repo_root,
         capture_output=True,
         check=False,
     )
-
-    # Clean up worktree if it exists
-    if ctx.worktree_path and ctx.worktree_path.is_dir():
-        from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
-
-        if is_worktree_safe_to_remove(ctx.worktree_path):
-            subprocess.run(
-                ["git", "worktree", "remove", str(ctx.worktree_path), "--force"],
-                cwd=ctx.repo_root,
-                capture_output=True,
-                check=False,
-            )
 
 
 def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
