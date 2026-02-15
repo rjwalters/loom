@@ -1293,9 +1293,27 @@ main() {
                 local elapsed=$((now - start_time))
                 local elapsed_min=$((elapsed / 60))
                 local phase_desc="${phase:-agent}"
+
+                # Check for wrapper retry state (issue #2296).
+                # When claude-wrapper.sh is in exponential backoff, report that
+                # instead of the generic "running" heartbeat so operators can
+                # distinguish "wrapper retrying" from "claude actively working".
+                local heartbeat_action="${phase_desc} running (${elapsed_min}m elapsed)"
+                local retry_state_file="${REPO_ROOT}/.loom/retry-state/${name}.json"
+                if [[ -f "$retry_state_file" ]]; then
+                    local retry_status retry_attempt retry_max
+                    retry_status=$(jq -r '.status // ""' "$retry_state_file" 2>/dev/null || echo "")
+                    retry_attempt=$(jq -r '.attempt // 0' "$retry_state_file" 2>/dev/null || echo "0")
+                    retry_max=$(jq -r '.max_retries // 0' "$retry_state_file" 2>/dev/null || echo "0")
+                    if [[ "$retry_status" == "backoff" ]]; then
+                        heartbeat_action="${phase_desc} wrapper retrying (attempt ${retry_attempt}/${retry_max}, ${elapsed_min}m elapsed)"
+                        log_warn "Wrapper in backoff: attempt ${retry_attempt}/${retry_max} for '${name}'"
+                    fi
+                fi
+
                 "$SCRIPT_DIR/report-milestone.sh" heartbeat \
                     --task-id "$task_id" \
-                    --action "${phase_desc} running (${elapsed_min}m elapsed)" \
+                    --action "$heartbeat_action" \
                     --quiet 2>/dev/null || true
             fi
         fi
