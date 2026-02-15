@@ -88,18 +88,31 @@ fn main() {
                 }
             }
 
-            // Initialize daemon manager
-            let mut daemon_manager = daemon_manager::DaemonManager::new()
+            // Initialize daemon manager (just sets socket path, cannot fail in practice)
+            let daemon_manager = daemon_manager::DaemonManager::new()
                 .map_err(|e| format!("Failed to create daemon manager: {e}"))?;
 
-            // Ensure daemon is running
-            tauri::async_runtime::block_on(async {
-                daemon_manager.ensure_daemon_running(is_production).await
-            })
-            .map_err(|e| format!("Failed to start/connect to daemon: {e}"))?;
-
             // Store daemon manager in app state for cleanup on quit
-            app.manage(std::sync::Mutex::new(daemon_manager));
+            app.manage(tokio::sync::Mutex::new(daemon_manager));
+
+            // Connect to daemon in background - don't block app launch
+            // The frontend's HealthMonitor will track daemon connectivity
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let daemon_state =
+                    app_handle.state::<tokio::sync::Mutex<daemon_manager::DaemonManager>>();
+                let mut dm = daemon_state.lock().await;
+
+                if let Err(e) = dm.ensure_daemon_running(is_production).await {
+                    safe_eprintln!(
+                        "[Loom] Daemon not available: {e}\n\
+                         [Loom] The app will continue without daemon connectivity.\n\
+                         [Loom] Daemon status is shown in the UI health monitor."
+                    );
+                } else {
+                    safe_eprintln!("[Loom] Daemon connected successfully");
+                }
+            });
 
             // Start MCP command file watcher
             let window = app
@@ -121,9 +134,9 @@ fn main() {
 
                 // Get daemon manager from app state
                 if let Some(daemon_manager_mutex) =
-                    window.try_state::<std::sync::Mutex<daemon_manager::DaemonManager>>()
+                    window.try_state::<tokio::sync::Mutex<daemon_manager::DaemonManager>>()
                 {
-                    if let Ok(mut daemon_manager) = daemon_manager_mutex.lock() {
+                    if let Ok(mut daemon_manager) = daemon_manager_mutex.try_lock() {
                         // Kill daemon if we spawned it (production mode only)
                         daemon_manager.kill_daemon();
                     }
