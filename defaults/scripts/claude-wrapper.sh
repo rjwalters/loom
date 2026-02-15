@@ -345,6 +345,8 @@ run_with_retry() {
         # Use macOS `script` to preserve TTY (so Claude CLI sees isatty(stdout) = true)
         # while still capturing output to a file. A plain pipe (`| tee`) would replace
         # stdout with a pipe fd, causing Claude to switch to non-interactive --print mode.
+        # Falls back to direct execution when no TTY is available (e.g., when spawned
+        # from Claude Code's Bash tool rather than a tmux terminal).
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
         set +e  # Temporarily disable errexit to capture exit code
         unset CLAUDECODE  # Prevent nested session guard from blocking subprocess
@@ -355,8 +357,16 @@ run_with_retry() {
         if [[ -n "${TMPDIR:-}" ]]; then
             export TMPDIR
         fi
-        script -q "${temp_output}" claude "$@"
-        exit_code=$?
+        if [ -t 0 ]; then
+            # TTY available - use script to preserve interactive mode
+            script -q "${temp_output}" claude "$@"
+            exit_code=$?
+        else
+            # No TTY (socket/pipe) - run claude directly, tee output for error detection
+            log_info "No TTY available, running claude directly (non-interactive mode)"
+            claude "$@" 2>&1 | tee "${temp_output}"
+            exit_code=${PIPESTATUS[0]}
+        fi
         set -e
         stop_output_monitor "${monitor_pid_file}"
 
