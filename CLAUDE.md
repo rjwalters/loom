@@ -190,7 +190,7 @@ gh pr create --label "loom:review-requested"
 
 ### Workspace Configuration
 
-Configuration stored in `.loom/config.json` (gitignored):
+Configuration stored in `.loom/config.json` (committed to git for team sharing):
 
 ```json
 {
