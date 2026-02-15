@@ -2,8 +2,253 @@ use crate::types::{TerminalId, TerminalInfo};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Per-agent `CLAUDE_CONFIG_DIR` isolation.
+///
+/// Creates isolated Claude Code config directories for each terminal so concurrent
+/// terminals don't fight over sessions, lock files, and temp directories in the
+/// shared `~/.claude/` directory.
+///
+/// Mirrors the Python implementation in `loom_tools.common.claude_config`.
+mod claude_config {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    /// Shared config files to symlink from ~/.claude/ (read-only).
+    /// Must match the Python `_SHARED_CONFIG_FILES` list.
+    const SHARED_CONFIG_FILES: &[&str] = &[
+        "settings.json",
+        "config.json",
+        "mcp.json",
+        ".mcp.json",
+        ".claude.json",
+    ];
+
+    /// Shared directories to symlink from ~/.claude/ (read-only caches).
+    /// Must match the Python `_SHARED_CONFIG_DIRS` list.
+    const SHARED_CONFIG_DIRS: &[&str] = &["statsig"];
+
+    /// Mutable directories that each agent needs its own copy of.
+    /// Must match the Python `_MUTABLE_DIRS` list.
+    const MUTABLE_DIRS: &[&str] = &[
+        "projects",
+        "todos",
+        "debug",
+        "file-history",
+        "session-env",
+        "tasks",
+        "plans",
+        "shell-snapshots",
+        "tmp",
+    ];
+
+    /// Create an isolated `CLAUDE_CONFIG_DIR` for a terminal.
+    ///
+    /// Creates `.loom/claude-config/{agent_name}/` with symlinks to shared
+    /// read-only config from `~/.claude/` and fresh directories for mutable state.
+    ///
+    /// Idempotent — safe to call multiple times.
+    pub fn setup_agent_config_dir(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
+        let config_dir = repo_root
+            .join(".loom")
+            .join("claude-config")
+            .join(agent_name);
+
+        if let Err(e) = fs::create_dir_all(&config_dir) {
+            log::warn!("Failed to create agent config dir {}: {e}", config_dir.display());
+            return None;
+        }
+
+        let home_claude = if let Some(home) = dirs::home_dir() {
+            home.join(".claude")
+        } else {
+            log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
+            return Some(config_dir);
+        };
+
+        // Symlink shared config files
+        for filename in SHARED_CONFIG_FILES {
+            let src = home_claude.join(filename);
+            let dst = config_dir.join(filename);
+            if src.exists() && !dst.exists() {
+                if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                    log::debug!("Failed to symlink {}: {e}", dst.display());
+                }
+            }
+        }
+
+        // Symlink shared directories
+        for dirname in SHARED_CONFIG_DIRS {
+            let src = home_claude.join(dirname);
+            let dst = config_dir.join(dirname);
+            if src.exists() && !dst.exists() {
+                if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
+                    log::debug!("Failed to symlink dir {}: {e}", dst.display());
+                }
+            }
+        }
+
+        // Create mutable directories
+        for dirname in MUTABLE_DIRS {
+            let dir = config_dir.join(dirname);
+            if let Err(e) = fs::create_dir_all(&dir) {
+                log::debug!("Failed to create mutable dir {}: {e}", dir.display());
+            }
+        }
+
+        Some(config_dir)
+    }
+
+    /// Remove one agent's config directory.
+    pub fn cleanup_agent_config_dir(agent_name: &str, repo_root: &Path) -> bool {
+        let config_dir = repo_root
+            .join(".loom")
+            .join("claude-config")
+            .join(agent_name);
+
+        if config_dir.is_dir() {
+            if let Err(e) = fs::remove_dir_all(&config_dir) {
+                log::warn!("Failed to remove agent config dir {}: {e}", config_dir.display());
+                return false;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_setup_creates_config_dir_and_mutable_dirs() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+
+            // Create .loom directory so the path is valid
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let result = setup_agent_config_dir("terminal-1", repo_root);
+            assert!(result.is_some());
+
+            let config_dir = result.unwrap();
+            assert!(config_dir.is_dir());
+            assert_eq!(config_dir, repo_root.join(".loom/claude-config/terminal-1"));
+
+            // Verify mutable directories were created
+            for dirname in MUTABLE_DIRS {
+                assert!(config_dir.join(dirname).is_dir(), "Mutable dir '{dirname}' should exist");
+            }
+        }
+
+        #[test]
+        fn test_setup_is_idempotent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let first = setup_agent_config_dir("terminal-2", repo_root);
+            let second = setup_agent_config_dir("terminal-2", repo_root);
+
+            assert_eq!(first, second);
+            assert!(first.unwrap().is_dir());
+        }
+
+        #[test]
+        fn test_setup_creates_symlinks_to_home_claude() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let result = setup_agent_config_dir("terminal-3", repo_root);
+            assert!(result.is_some());
+
+            let config_dir = result.unwrap();
+
+            // Check that symlinks were created for files that exist in ~/.claude/
+            let home_claude = dirs::home_dir().unwrap().join(".claude");
+            for filename in SHARED_CONFIG_FILES {
+                let src = home_claude.join(filename);
+                let dst = config_dir.join(filename);
+                if src.exists() {
+                    assert!(dst.symlink_metadata().is_ok(), "Symlink should exist for {filename}");
+                }
+            }
+
+            for dirname in SHARED_CONFIG_DIRS {
+                let src = home_claude.join(dirname);
+                let dst = config_dir.join(dirname);
+                if src.exists() {
+                    assert!(
+                        dst.symlink_metadata().is_ok(),
+                        "Symlink should exist for dir {dirname}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn test_setup_skips_missing_home_claude_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            // This should not panic even if ~/.claude/ files are missing
+            let result = setup_agent_config_dir("terminal-4", repo_root);
+            assert!(result.is_some());
+        }
+
+        #[test]
+        fn test_cleanup_removes_config_dir() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            // Set up first
+            let config_dir = setup_agent_config_dir("terminal-5", repo_root).unwrap();
+            assert!(config_dir.is_dir());
+
+            // Cleanup
+            let removed = cleanup_agent_config_dir("terminal-5", repo_root);
+            assert!(removed);
+            assert!(!config_dir.exists());
+        }
+
+        #[test]
+        fn test_cleanup_returns_false_for_nonexistent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let removed = cleanup_agent_config_dir("nonexistent", repo_root);
+            assert!(!removed);
+        }
+
+        #[test]
+        fn test_setup_does_not_overwrite_existing_symlinks() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            // First setup
+            let config_dir = setup_agent_config_dir("terminal-6", repo_root).unwrap();
+
+            // Create a custom file at one of the symlink destinations
+            let custom_file = config_dir.join("settings.json");
+            // Remove any existing symlink first
+            let _ = fs::remove_file(&custom_file);
+            fs::write(&custom_file, "custom").unwrap();
+
+            // Second setup should not overwrite the custom file
+            setup_agent_config_dir("terminal-6", repo_root);
+            let contents = fs::read_to_string(&custom_file).unwrap();
+            assert_eq!(contents, "custom");
+        }
+    }
+}
 
 /// Build the pipe-pane command string that strips ANSI escape sequences from output.
 ///
@@ -46,6 +291,69 @@ impl TerminalManager {
         }
 
         Ok(())
+    }
+
+    /// Derive the repository root from a working directory or `LOOM_WORKSPACE` env var.
+    fn find_repo_root(working_dir: Option<&str>) -> Option<PathBuf> {
+        working_dir
+            .map(Path::new)
+            .and_then(|p| {
+                p.ancestors()
+                    .find(|ancestor| ancestor.join(".loom").is_dir())
+            })
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var("LOOM_WORKSPACE").ok().map(PathBuf::from))
+    }
+
+    /// Set up per-agent `CLAUDE_CONFIG_DIR` isolation for a tmux session.
+    ///
+    /// Creates an isolated config directory and sets `CLAUDE_CONFIG_DIR` and `TMPDIR`
+    /// environment variables on the tmux session.
+    fn setup_config_dir_isolation(
+        terminal_id: &str,
+        working_dir: Option<&str>,
+        tmux_session: &str,
+    ) {
+        let Some(repo_root) = Self::find_repo_root(working_dir) else {
+            log::debug!(
+                "No repo root found for terminal {terminal_id}; skipping CLAUDE_CONFIG_DIR isolation"
+            );
+            return;
+        };
+
+        let Some(config_dir) = claude_config::setup_agent_config_dir(terminal_id, &repo_root)
+        else {
+            return;
+        };
+
+        let config_dir_str = config_dir.to_string_lossy();
+        let tmp_dir_str = config_dir.join("tmp").to_string_lossy().to_string();
+
+        // Set CLAUDE_CONFIG_DIR on the tmux session
+        let _ = Command::new("tmux")
+            .args(["-L", "loom"])
+            .args([
+                "set-environment",
+                "-t",
+                tmux_session,
+                "CLAUDE_CONFIG_DIR",
+                &config_dir_str,
+            ])
+            .output();
+
+        // Set TMPDIR on the tmux session
+        let _ = Command::new("tmux")
+            .args(["-L", "loom"])
+            .args([
+                "set-environment",
+                "-t",
+                tmux_session,
+                "TMPDIR",
+                &tmp_dir_str,
+            ])
+            .output();
+
+        log::info!("Set CLAUDE_CONFIG_DIR={config_dir_str} for session {tmux_session}");
     }
 
     /// Handle tmux command errors with consistent logging
@@ -267,6 +575,9 @@ impl TerminalManager {
         }
         log::info!("pipe-pane setup successful for session {tmux_session}");
 
+        // Set up per-agent CLAUDE_CONFIG_DIR isolation
+        Self::setup_config_dir_isolation(&id, working_dir.as_deref(), &tmux_session);
+
         let info = TerminalInfo {
             id: id.clone(),
             name,
@@ -399,6 +710,13 @@ impl TerminalManager {
         // Clean up the output file
         let output_file = format!("/tmp/loom-{id}.out");
         let _ = std::fs::remove_file(output_file);
+
+        // Clean up per-agent CLAUDE_CONFIG_DIR
+        if let Some(root) = Self::find_repo_root(info.working_dir.as_deref()) {
+            if claude_config::cleanup_agent_config_dir(id, &root) {
+                log::info!("Cleaned up CLAUDE_CONFIG_DIR for terminal {id}");
+            }
+        }
 
         self.terminals.remove(id);
         Ok(())
