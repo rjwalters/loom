@@ -28,7 +28,10 @@ from loom_tools.shepherd.phases.base import (
     INSTANT_EXIT_MAX_RETRIES,
     INSTANT_EXIT_MIN_OUTPUT_CHARS,
     INSTANT_EXIT_THRESHOLD_SECONDS,
+    MCP_FAILURE_BACKOFF_SECONDS,
+    MCP_FAILURE_MAX_RETRIES,
     _is_instant_exit,
+    _is_mcp_failure,
     _print_heartbeat,
     _read_heartbeats,
     run_phase_with_retry,
@@ -10031,3 +10034,338 @@ class TestBuilderStaleWorktreeWithArtifacts:
 
             mock_run.side_effect = run_side_effect
             assert builder._is_stale_worktree(worktree) is False
+
+
+# ---------------------------------------------------------------------------
+# MCP failure detection tests (issue #2279)
+# ---------------------------------------------------------------------------
+
+
+class TestIsMcpFailure:
+    """Test _is_mcp_failure helper function."""
+
+    def test_no_log_file_returns_false(self, tmp_path: Path) -> None:
+        """Missing log file should not be flagged as MCP failure."""
+        assert _is_mcp_failure(tmp_path / "nonexistent.log") is False
+
+    def test_log_with_mcp_failure_pattern_returns_true(self, tmp_path: Path) -> None:
+        """Log containing 'MCP server failed' should be flagged."""
+        log = tmp_path / "session.log"
+        log.write_text("bypasspermissionson · 1 MCP server failed · /mcp\n")
+        assert _is_mcp_failure(log) is True
+
+    def test_log_with_mcp_failed_pattern_returns_true(self, tmp_path: Path) -> None:
+        """Log containing 'MCP.*failed' regex should be flagged."""
+        log = tmp_path / "session.log"
+        log.write_text("1 MCP server(s) failed to initialize\n")
+        assert _is_mcp_failure(log) is True
+
+    def test_log_without_mcp_pattern_returns_false(self, tmp_path: Path) -> None:
+        """Normal log content should not be flagged as MCP failure."""
+        log = tmp_path / "session.log"
+        log.write_text("Claude CLI started successfully. Working on issue #42...\n")
+        assert _is_mcp_failure(log) is False
+
+    def test_case_insensitive_match(self, tmp_path: Path) -> None:
+        """MCP failure pattern matching should be case-insensitive."""
+        log = tmp_path / "session.log"
+        log.write_text("mcp SERVER FAILED\n")
+        assert _is_mcp_failure(log) is True
+
+    def test_ansi_content_stripped(self, tmp_path: Path) -> None:
+        """ANSI escape codes should be stripped before pattern matching."""
+        log = tmp_path / "session.log"
+        log.write_text("\x1b[0m1 MCP server failed\x1b[0m\n")
+        assert _is_mcp_failure(log) is True
+
+    def test_empty_log_returns_false(self, tmp_path: Path) -> None:
+        """Empty log should not be flagged as MCP failure."""
+        log = tmp_path / "session.log"
+        log.write_text("")
+        assert _is_mcp_failure(log) is False
+
+
+class TestRunWorkerPhaseMcpFailure:
+    """Test that run_worker_phase detects MCP failures and returns code 7."""
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script in ("agent-spawn.sh", "agent-wait-bg.sh", "agent-destroy.sh"):
+            (scripts_dir / script).touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+        return ctx
+
+    def test_mcp_failure_returns_code_7(self, mock_context: MagicMock) -> None:
+        """When MCP failure detected in log, return exit code 7."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=True
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        # MCP failure (7) takes priority over generic instant-exit (6)
+        assert exit_code == 7
+
+    def test_mcp_failure_checked_before_instant_exit(
+        self, mock_context: MagicMock
+    ) -> None:
+        """MCP failure should be checked before generic instant-exit."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=True
+            ) as mock_mcp,
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit"
+            ) as mock_instant,
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 7
+        mock_mcp.assert_called_once()
+        # _is_instant_exit should NOT be called when MCP failure is detected
+        mock_instant.assert_not_called()
+
+
+class TestRunPhaseWithRetryMcpFailure:
+    """Test that run_phase_with_retry retries on MCP failure (code 7)."""
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(
+            issue=42, task_id="test-123", stuck_max_retries=2
+        )
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        return ctx
+
+    def test_retries_on_mcp_failure_then_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry on code 7 and return 0 when the retry succeeds."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 7 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        mock_sleep.assert_called_once_with(MCP_FAILURE_BACKOFF_SECONDS[0])
+
+    def test_exhausts_retries_returns_code_7(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return 7 after exhausting all MCP failure retries."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=7,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 7
+
+    def test_mcp_retry_count_matches_constant(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry exactly MCP_FAILURE_MAX_RETRIES times."""
+        call_count = 0
+
+        def count_calls(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 7
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=count_calls,
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # 1 initial call + MCP_FAILURE_MAX_RETRIES retries
+        assert call_count == 1 + MCP_FAILURE_MAX_RETRIES
+
+    def test_mcp_backoff_timing(self, mock_context: MagicMock) -> None:
+        """Should use exponential backoff from MCP_FAILURE_BACKOFF_SECONDS."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=7,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
+        assert sleep_values == MCP_FAILURE_BACKOFF_SECONDS
+
+    def test_mcp_reports_error_and_heartbeat_milestones(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should report error milestone with will_retry and heartbeat milestone."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 7 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        milestone_calls = mock_context.report_milestone.call_args_list
+        assert len(milestone_calls) == 2
+        # First call: error with will_retry
+        assert milestone_calls[0].args[0] == "error"
+        assert "MCP" in milestone_calls[0].kwargs["error"]
+        assert milestone_calls[0].kwargs["will_retry"] is True
+        # Second call: heartbeat with MCP retry info
+        assert milestone_calls[1].args[0] == "heartbeat"
+        assert "MCP" in milestone_calls[1].kwargs["action"]
+
+    def test_mcp_and_instant_exit_have_separate_counters(
+        self, mock_context: MagicMock
+    ) -> None:
+        """MCP retries (code 7) and instant-exit retries (code 6) are independent."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 7  # MCP failure
+            elif call_count == 2:
+                return 6  # Instant exit
+            else:
+                return 0  # Success
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3

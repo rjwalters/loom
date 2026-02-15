@@ -116,6 +116,139 @@ check_stop_signal() {
     return 1
 }
 
+# Resolve workspace root for MCP config lookup.
+# In worktrees, WORKSPACE may point to the worktree itself; the MCP config
+# (.mcp.json) lives in the git common directory (the main checkout).
+resolve_mcp_workspace() {
+    # If .mcp.json exists in WORKSPACE, use it directly
+    if [[ -f "${WORKSPACE}/.mcp.json" ]]; then
+        echo "${WORKSPACE}"
+        return
+    fi
+
+    # In a worktree, try the git common directory (main checkout)
+    local common_dir
+    if common_dir=$(git -C "${WORKSPACE}" rev-parse --git-common-dir 2>/dev/null); then
+        # common_dir is the .git dir; parent is the repo root
+        local repo_root
+        repo_root=$(cd "${common_dir}/.." 2>/dev/null && pwd)
+        if [[ -f "${repo_root}/.mcp.json" ]]; then
+            echo "${repo_root}"
+            return
+        fi
+    fi
+
+    # Fallback to WORKSPACE
+    echo "${WORKSPACE}"
+}
+
+# Pre-flight check: verify MCP server can start
+# Attempts to launch the mcp-loom Node.js server and checks for the startup
+# message on stderr. If the dist/ directory is missing or stale, attempts
+# a rebuild before retrying.
+check_mcp_server() {
+    local mcp_workspace
+    mcp_workspace=$(resolve_mcp_workspace)
+
+    local mcp_config="${mcp_workspace}/.mcp.json"
+    if [[ ! -f "${mcp_config}" ]]; then
+        log_warn "MCP config not found at ${mcp_config} - skipping MCP pre-flight"
+        return 0  # Non-fatal: MCP may not be configured
+    fi
+
+    # Extract the MCP server entry point from .mcp.json
+    local mcp_entry
+    mcp_entry=$(python3 -c "
+import json, sys
+with open('${mcp_config}') as f:
+    cfg = json.load(f)
+servers = cfg.get('mcpServers', {})
+for name, srv in servers.items():
+    args = srv.get('args', [])
+    if args:
+        print(args[-1])
+        sys.exit(0)
+" 2>/dev/null || echo "")
+
+    if [[ -z "${mcp_entry}" ]]; then
+        log_warn "Could not extract MCP entry point from ${mcp_config} - skipping MCP pre-flight"
+        return 0
+    fi
+
+    # Check if the entry point file exists
+    if [[ ! -f "${mcp_entry}" ]]; then
+        log_warn "MCP entry point missing: ${mcp_entry}"
+        _try_mcp_rebuild "${mcp_entry}"
+        return $?
+    fi
+
+    # Smoke test: start MCP server and verify it emits the startup message
+    # The MCP server writes "Loom MCP server running on stdio" to stderr on success.
+    # Use a short timeout - we just need to see the startup message.
+    local mcp_stderr
+    mcp_stderr=$(timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
+
+    if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
+        log_info "MCP server health check passed"
+        return 0
+    fi
+
+    # MCP server failed to start - log the error
+    log_warn "MCP server health check failed"
+    if [[ -n "${mcp_stderr}" ]]; then
+        log_warn "MCP stderr: ${mcp_stderr}"
+    fi
+
+    # Attempt rebuild and retry
+    _try_mcp_rebuild "${mcp_entry}"
+    return $?
+}
+
+# Attempt to rebuild the MCP server and re-verify
+_try_mcp_rebuild() {
+    local mcp_entry="$1"
+
+    # Derive the package directory from the entry point
+    # e.g., /path/to/mcp-loom/dist/index.js -> /path/to/mcp-loom
+    local mcp_dir
+    mcp_dir=$(dirname "$(dirname "${mcp_entry}")")
+
+    if [[ ! -f "${mcp_dir}/package.json" ]]; then
+        log_error "MCP package directory not found at ${mcp_dir} - cannot rebuild"
+        return 1
+    fi
+
+    log_info "Attempting MCP server rebuild in ${mcp_dir}..."
+
+    # Run npm build (suppressing verbose output)
+    if (cd "${mcp_dir}" && npm run build 2>&1 | tail -5) >&2; then
+        log_info "MCP rebuild completed"
+    else
+        log_error "MCP rebuild failed"
+        return 1
+    fi
+
+    # Re-check after rebuild
+    if [[ ! -f "${mcp_entry}" ]]; then
+        log_error "MCP entry point still missing after rebuild: ${mcp_entry}"
+        return 1
+    fi
+
+    local mcp_stderr
+    mcp_stderr=$(timeout 5 node "${mcp_entry}" </dev/null 2>&1 || true)
+
+    if echo "${mcp_stderr}" | grep -qi "running on stdio"; then
+        log_info "MCP server health check passed after rebuild"
+        return 0
+    fi
+
+    log_error "MCP server still fails after rebuild"
+    if [[ -n "${mcp_stderr}" ]]; then
+        log_error "MCP stderr after rebuild: ${mcp_stderr}"
+    fi
+    return 1
+}
+
 # Pre-flight check: verify Claude CLI is available
 check_cli_available() {
     if ! command -v claude &>/dev/null; then
@@ -175,6 +308,8 @@ is_transient_error() {
         "500 Internal Server Error"
         "overloaded"
         "temporarily unavailable"
+        "MCP server failed"
+        "MCP.*failed"
     )
 
     for pattern in "${patterns[@]}"; do
@@ -432,6 +567,11 @@ run_preflight_checks() {
     fi
 
     check_api_reachable  # Non-fatal, just logs
+
+    if ! check_mcp_server; then
+        log_error "MCP server pre-flight check failed"
+        return 1
+    fi
 
     log_info "Pre-flight checks passed"
     return 0

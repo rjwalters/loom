@@ -160,6 +160,18 @@ class JudgePhase:
                 data={"instant_exit": True},
             )
 
+        if exit_code == 7:
+            # MCP server failure: Claude CLI exited because MCP server failed to init
+            self._mark_issue_blocked(
+                ctx, "judge_mcp_failure", "MCP server failure after retry"
+            )
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="judge MCP server failure after retry (MCP server failed to initialize)",
+                phase_name="judge",
+                data={"mcp_failure": True},
+            )
+
         # Invalidate caches BEFORE validation so the first attempt
         # fetches fresh data instead of stale cached labels.
         ctx.label_cache.invalidate_pr(ctx.pr_number)

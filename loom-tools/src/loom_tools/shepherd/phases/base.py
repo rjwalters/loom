@@ -35,6 +35,21 @@ INSTANT_EXIT_MIN_OUTPUT_CHARS = 100
 INSTANT_EXIT_MAX_RETRIES = 3
 INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
 
+# MCP failure detection patterns (case-insensitive).
+# These patterns appear in Claude CLI output when the MCP server fails
+# to initialize, causing an immediate exit with no useful work done.
+MCP_FAILURE_PATTERNS = [
+    "MCP server failed",
+    "MCP.*failed",
+    "mcp server failed",
+]
+
+# Maximum retries for MCP failure detection, with longer backoff.
+# MCP failures are often systemic (stale build, resource contention)
+# so we use longer backoff than instant-exit.
+MCP_FAILURE_MAX_RETRIES = 3
+MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
+
 
 class PhaseStatus(Enum):
     """Result status of phase execution."""
@@ -274,6 +289,37 @@ def _print_heartbeat(action: str) -> None:
     print(f"\033[2m[{ts}] \u27f3 {action}\033[0m", file=sys.stderr)
 
 
+def _is_mcp_failure(log_path: Path) -> bool:
+    """Check if a session log indicates an MCP server initialization failure.
+
+    Detects cases where the Claude CLI exits immediately because the MCP
+    server (mcp-loom) failed to initialize.  This is a distinct failure mode
+    from generic instant-exits (API errors, network issues) because it
+    typically has a systemic cause (stale build, resource contention) that
+    benefits from different retry/backoff strategy.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the log contains MCP failure indicators.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        import re
+
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        for pattern in MCP_FAILURE_PATTERNS:
+            if re.search(pattern, stripped, re.IGNORECASE):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def _is_instant_exit(log_path: Path) -> bool:
     """Check if a session log indicates an instant-exit (transient spawn failure).
 
@@ -346,6 +392,7 @@ def run_worker_phase(
         - 4: Agent stuck after retry
         - 5: Failures are pre-existing (Doctor only)
         - 6: Instant exit detected (session < 5s with no meaningful output)
+        - 7: MCP server failure detected (session exited due to MCP init failure)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir
@@ -477,9 +524,18 @@ def run_worker_phase(
     # Detect instant-exit: session completed (exit 0) but ran for < 5s with
     # no meaningful output.  Return synthetic exit code 6 so the retry layer
     # can handle it with backoff.  See issue #2135.
+    #
+    # Check for MCP failure first (exit code 7) since it's a more specific
+    # failure mode with different retry/backoff strategy.  See issue #2279.
     if wait_exit == 0:
         paths = LoomPaths(ctx.repo_root)
         log_path = paths.worker_log_file(role, ctx.config.issue)
+        if _is_mcp_failure(log_path):
+            log_warning(
+                f"MCP server failure detected for {role} session '{name}': "
+                f"MCP server failed to initialize (log: {log_path})"
+            )
+            return 7
         if _is_instant_exit(log_path):
             log_warning(
                 f"Instant-exit detected for {role} session '{name}': "
@@ -503,18 +559,22 @@ def run_phase_with_retry(
     pr_number: int | None = None,
     args: str | None = None,
 ) -> int:
-    """Run a phase with automatic retry on stuck or instant-exit detection.
+    """Run a phase with automatic retry on stuck, instant-exit, or MCP failure.
 
     On exit code 4 (stuck), retries up to max_retries times.
     On exit code 6 (instant exit), retries up to INSTANT_EXIT_MAX_RETRIES
     times with exponential backoff.
+    On exit code 7 (MCP failure), retries up to MCP_FAILURE_MAX_RETRIES
+    times with longer backoff (MCP failures are often systemic).
 
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
-                   6=instant-exit after retries, other=error
+                   6=instant-exit after retries, 7=MCP failure after retries,
+                   other=error
     """
     stuck_retries = 0
     instant_exit_retries = 0
+    mcp_failure_retries = 0
 
     while True:
         exit_code = run_worker_phase(
@@ -527,6 +587,40 @@ def run_phase_with_retry(
             pr_number=pr_number,
             args=args,
         )
+
+        # --- MCP failure handling (exit code 7) ---
+        # MCP failures are systemic (stale build, resource contention) so
+        # use longer backoff than generic instant-exits.  See issue #2279.
+        if exit_code == 7:
+            mcp_failure_retries += 1
+            if mcp_failure_retries > MCP_FAILURE_MAX_RETRIES:
+                log_warning(
+                    f"MCP server failure persisted for {role} after "
+                    f"{MCP_FAILURE_MAX_RETRIES} retries"
+                )
+                return 7  # Caller should treat as failure
+
+            backoff_idx = min(
+                mcp_failure_retries - 1, len(MCP_FAILURE_BACKOFF_SECONDS) - 1
+            )
+            backoff = MCP_FAILURE_BACKOFF_SECONDS[backoff_idx]
+
+            ctx.report_milestone(
+                "error",
+                error=f"MCP server failure detected for {role}",
+                will_retry=True,
+            )
+            ctx.report_milestone(
+                "heartbeat",
+                action=(
+                    f"retrying MCP failure {role} "
+                    f"(attempt {mcp_failure_retries}/{MCP_FAILURE_MAX_RETRIES}, "
+                    f"backoff {backoff}s)"
+                ),
+            )
+
+            time.sleep(backoff)
+            continue
 
         # --- Instant-exit handling (exit code 6) ---
         if exit_code == 6:
