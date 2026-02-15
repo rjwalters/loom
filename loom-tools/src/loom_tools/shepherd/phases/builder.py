@@ -2229,25 +2229,37 @@ class BuilderPhase:
         """Check if diagnostics indicate incomplete work that could be completed.
 
         Returns True if the worktree exists and any of these conditions hold:
-        - Has uncommitted changes (needs: stage, commit, push, PR)
         - Has commits ahead of main (needs: push, PR)
+        - Has uncommitted changes AND a checkpoint exists (builder made progress)
         - Remote branch exists but no PR (needs: PR creation)
         - PR exists but missing loom:review-requested label (needs: label)
         - Checkpoint indicates recoverable stage (tested, committed, pushed)
 
-        This pattern suggests the builder made progress but didn't complete
-        the commit/push/PR workflow.
+        When uncommitted changes exist but no checkpoint is present and
+        commits_ahead == 0, returns False — the builder never started
+        meaningful work, so a full retry is more appropriate than a
+        completion phase.
         """
         if not diag.get("worktree_exists"):
             return False
 
-        has_local_work = (
-            diag.get("has_uncommitted_changes", False)
-            or diag.get("commits_ahead", 0) > 0
-        )
+        commits_ahead = diag.get("commits_ahead", 0)
 
-        if has_local_work:
+        if commits_ahead > 0:
+            # Real builder progress — always treat as incomplete
             return True
+
+        if diag.get("has_uncommitted_changes", False):
+            # Uncommitted changes exist but no commits ahead.
+            # Only treat as incomplete if a checkpoint proves the builder
+            # actually started meaningful work.  Without a checkpoint,
+            # the builder never progressed past initialisation and a
+            # full retry is more appropriate than a completion phase.
+            checkpoint_stage = diag.get("checkpoint_stage")
+            if checkpoint_stage is not None:
+                return True
+            # No checkpoint → builder never started, not incomplete
+            return False
 
         # Remote branch exists but no PR — just needs PR creation
         if diag.get("remote_branch_exists") and diag.get("pr_number") is None:
@@ -2829,7 +2841,25 @@ class BuilderPhase:
         if not self._has_uncommitted_changes(ctx):
             return False
 
-        log_info(f"Builder interrupted with uncommitted changes, preserving work")
+        # Filter build artifacts — don't create WIP commits for artifact-only
+        # changes (e.g. Cargo.lock from post-worktree hooks)
+        status_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode == 0 and status_result.stdout.strip():
+            porcelain_lines = status_result.stdout.strip().splitlines()
+            meaningful, _ = self._filter_build_artifacts(porcelain_lines)
+            if not meaningful:
+                log_info(
+                    "Skipping WIP commit: only build artifact files are "
+                    "uncommitted (no meaningful changes)"
+                )
+                return False
+
+        log_info("Builder interrupted with uncommitted changes, preserving work")
 
         # Stage all changes
         stage_result = subprocess.run(
