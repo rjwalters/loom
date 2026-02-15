@@ -194,9 +194,43 @@ pub fn initialize_workspace(
             .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
     }
 
+    // Copy hooks/ directory - same clean-then-copy logic as roles/scripts
+    // Hooks were previously only installed by install-loom.sh, not by loom-daemon init.
+    // This caused hooks to be lost during reinstall when the install script's hook
+    // copy step was skipped or the worktree didn't preserve them.
+    let hooks_src = defaults.join("hooks");
+    let hooks_dst = loom_path.join("hooks");
+    if hooks_src.exists() {
+        if is_reinstall {
+            clean_managed_dir(&hooks_dst, ".loom/hooks", &mut report)
+                .map_err(|e| format!("Failed to clean hooks directory: {e}"))?;
+        }
+        copy_dir_with_report(&hooks_src, &hooks_dst, ".loom/hooks", &mut report)
+            .map_err(|e| format!("Failed to copy hooks directory: {e}"))?;
+
+        // Ensure hooks are executable
+        if let Ok(entries) = std::fs::read_dir(&hooks_dst) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("sh") {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Ok(metadata) = std::fs::metadata(&path) {
+                            let mut perms = metadata.permissions();
+                            perms.set_mode(perms.mode() | 0o111);
+                            let _ = std::fs::set_permissions(&path, perms);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Verify copied files match their sources
     verify_copied_files(&roles_src, &roles_dst, ".loom/roles", &mut report, None);
     verify_copied_files(&scripts_src, &scripts_dst, ".loom/scripts", &mut report, None);
+    verify_copied_files(&hooks_src, &hooks_dst, ".loom/hooks", &mut report, None);
 
     // Copy .loom-specific README
     let loom_readme_src = defaults.join(".loom-README.md");
@@ -558,5 +592,88 @@ mod tests {
             "Expected no verification failures, got: {:?}",
             report.verification_failures
         );
+    }
+
+    #[test]
+    fn test_hooks_installed_on_fresh_install() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with hooks
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("hooks")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(defaults.join("hooks").join("guard-destructive.sh"), "#!/bin/bash\n# guard hook")
+            .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Hook should be installed
+        let hook_path = workspace
+            .join(".loom")
+            .join("hooks")
+            .join("guard-destructive.sh");
+        assert!(hook_path.exists(), "Hook file should be installed");
+        let content = fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(content, "#!/bin/bash\n# guard hook");
+
+        // Report should list the hook as added
+        assert!(report
+            .added
+            .contains(&".loom/hooks/guard-destructive.sh".to_string()));
+    }
+
+    #[test]
+    fn test_hooks_preserved_on_reinstall() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with hooks
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("hooks")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults.join("hooks").join("guard-destructive.sh"),
+            "#!/bin/bash\n# updated guard hook v2",
+        )
+        .unwrap();
+
+        // Simulate existing installation with old hook
+        fs::create_dir_all(workspace.join(".loom").join("hooks")).unwrap();
+        fs::write(
+            workspace
+                .join(".loom")
+                .join("hooks")
+                .join("guard-destructive.sh"),
+            "#!/bin/bash\n# old guard hook v1",
+        )
+        .unwrap();
+
+        // Run reinstall
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok());
+
+        // Hook should have new content (clean-then-copy)
+        let hook_path = workspace
+            .join(".loom")
+            .join("hooks")
+            .join("guard-destructive.sh");
+        assert!(hook_path.exists(), "Hook file should exist after reinstall");
+        let content = fs::read_to_string(&hook_path).unwrap();
+        assert_eq!(content, "#!/bin/bash\n# updated guard hook v2");
     }
 }
