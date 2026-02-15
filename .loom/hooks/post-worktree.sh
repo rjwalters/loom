@@ -55,5 +55,8 @@ if cargo build --release -p loom-daemon --manifest-path "$WORKTREE_PATH/Cargo.to
     echo "  loom-daemon build complete"
 else
     echo "  loom-daemon build failed (non-fatal, worktree still usable)"
-    exit 0
 fi
+
+# Restore Cargo.lock — the build output is in target/ (gitignored),
+# but cargo may update the lockfile which confuses shepherd diagnostics.
+git -C "$WORKTREE_PATH" checkout -- Cargo.lock 2>/dev/null || true
