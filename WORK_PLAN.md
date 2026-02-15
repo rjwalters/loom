@@ -8,28 +8,40 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues requiring immediate attention (`loom:urgent`).
 
-- **#2250**: install-loom.sh: hook files deleted during reinstall — Safety hooks silently disabled after reinstall, agents lose destructive command protection
-- **#2249**: Fresh install doesn't include loom CLI script or hooks directory — Fresh install produces non-functional Loom installation
-- **#2247**: Reinstall deletes custom project-specific slash commands — Data loss of user's custom commands during reinstall
+- **#2264**: Runtime crash on startup: daemon schema migration ordering bug — SQLite error on startup when existing `activity.db` has older schema; migration ordering creates indexes before columns exist
+- **#2250**: install-loom.sh: hook files deleted during reinstall — Safety hooks silently disabled after reinstall, agents lose destructive command protection (PR #2294 in review)
+- **#2247**: Reinstall deletes custom project-specific slash commands — Data loss of user's custom commands during reinstall (PR #2286 in review)
 
-All 3 urgent issues are **installer bugs** discovered during reinstall testing. They collectively break the install/reinstall pathway.
+Two of the 3 urgent issues (#2250, #2247) have active PRs awaiting Judge review. #2264 is a newly identified crash bug.
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#2253**: App crashes on launch when daemon is unavailable (SIGABRT in did_finish_launching) — Tauri app crash on startup
-- **#2248**: Fresh install gitignores .loom/config.json but previous install tracked it — Git state conflict on upgrade
-- **#2246**: Reinstall uninstall step fails on non-empty worktree directories — Installer cleanup failure
-- **#2244**: Add dual-mode GitHub API layer with REST fallback — Infrastructure reliability improvement
+- **#2290**: Replace husky/lint-staged with simple .githooks/ directory — Remove 2 devDependencies and 17 stub files; fixes worktree hook breakage (#2284)
 
 ## In Progress
 
-No issues currently being built.
+Issues currently being built (`loom:building`).
+
+- **#2291**: post-worktree hook: full cargo rebuild causes lock contention and blocks parallel worktrees
+
+## PRs Awaiting Review
+
+Pull requests with `loom:review-requested` label.
+
+- **PR #2297**: fix: add TTY fallback in claude-wrapper for non-terminal contexts
+- **PR #2295**: fix: copy loom-daemon binary instead of rebuilding in worktrees
+- **PR #2294**: fix: install hooks via loom-daemon init to prevent loss during reinstall
+- **PR #2286**: fix: preserve custom slash commands during reinstall
 
 ## Proposed
 
-No issues awaiting evaluation.
+Issues awaiting Champion evaluation.
+
+- **#2296**: Shepherd cannot detect when builder wrapper is in retry loop vs actively working *(curated)*
+- **#2284**: Pre-commit hook hangs in worktrees: npx not found in node_modules/.bin *(curated)*
+- **#2262**: Complete analytics pipeline UI integration (Phases 3-5) *(architect)*
 
 ## Epics
 
@@ -40,7 +52,7 @@ No active epics.
 | Tier | Count |
 |------|-------|
 | Tier 1 (goal-advancing) | 0 |
-| Tier 2 (goal-supporting) | 5 |
-| Tier 3 (maintenance) | 2 |
+| Tier 2 (goal-supporting) | 3 |
+| Tier 3 (maintenance) | 1 |
 
-**Note:** The backlog is 7 issues total (3 urgent + 4 ready). Five are installer-related bugs, one is a Tauri crash bug, and one is an API infrastructure feature. No issues are currently building — the pipeline is idle and ready for builders. Tier labels have been assigned: installer and stability bugs as goal-supporting, upgrade edge cases as maintenance.
+**Note:** The backlog is lean — only 4 issues with `loom:issue` (3 urgent + 1 ready) and 1 actively building. The pipeline is healthy with 4 PRs awaiting review, 2 of which address urgent issues. The focus has shifted from installer bugs (largely resolved today with 14 PRs merged) to runtime stability (#2264 crash) and build infrastructure (#2290 husky removal, #2291 cargo lock contention). No Tier 1 goal-advancing issues exist; consider promoting from proposals when current urgent work clears.
