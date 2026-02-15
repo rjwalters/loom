@@ -2382,6 +2382,43 @@ class TestBuilderCommitInterruptedWork:
 
         assert result is False
 
+    def test_commit_interrupted_work_artifacts_only_skips_commit(
+        self, tmp_path: Path, mock_context: MagicMock
+    ) -> None:
+        """Should return False when only build artifact files are uncommitted."""
+        builder = BuilderPhase()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config.issue = 42
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "status --porcelain" in cmd_str:
+                result.stdout = "M  Cargo.lock\n"  # Only artifact
+            return result
+
+        calls: list[str] = []
+
+        def tracking_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            calls.append(cmd_str)
+            return fake_run(cmd, **kwargs)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=tracking_run,
+        ):
+            result = builder._commit_interrupted_work(mock_context, "test reason")
+
+        assert result is False
+        # Should NOT have called git add or git commit
+        assert not any("add -A" in c for c in calls), "Should not stage artifacts"
+        assert not any("commit -m" in c for c in calls), "Should not create commit"
+
 
 class TestBuilderHasUncommittedChanges:
     """Test BuilderPhase._has_uncommitted_changes helper."""
@@ -6793,7 +6830,8 @@ class TestBuilderHasIncompleteWork:
         diag = {"worktree_exists": False}
         assert builder._has_incomplete_work(diag) is False
 
-    def test_uncommitted_changes_returns_true(self) -> None:
+    def test_uncommitted_changes_no_checkpoint_returns_false(self) -> None:
+        """Uncommitted changes without a checkpoint means builder never started."""
         builder = BuilderPhase()
         diag = {
             "worktree_exists": True,
@@ -6802,6 +6840,20 @@ class TestBuilderHasIncompleteWork:
             "remote_branch_exists": False,
             "pr_number": None,
             "pr_has_review_label": False,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
+    def test_uncommitted_changes_with_checkpoint_returns_true(self) -> None:
+        """Uncommitted changes with a checkpoint means builder made progress."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "checkpoint_stage": "implementing",
         }
         assert builder._has_incomplete_work(diag) is True
 
