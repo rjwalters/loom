@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && exec \"$ROOT/.loom/hooks/guard-destructive.sh\" || exit 0'"
+            "command": "bash -c 'ROOT=$(cd \"$(git rev-parse --git-common-dir 2>/dev/null)/..\" 2>/dev/null && pwd) && [ -x \"$ROOT/.loom/hooks/guard-destructive.sh\" ] && exec \"$ROOT/.loom/hooks/guard-destructive.sh\" || exit 0'"
           }
         ]
       }
