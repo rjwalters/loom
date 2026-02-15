@@ -129,10 +129,18 @@ main() {
                     log_info "CWD: $current_cwd"
                     log_info "Worktree: $worktree_real"
                 else
-                    log_info "Removing worktree: $worktree_path"
-                    git -C "$repo_root" worktree remove "$worktree_path" --force 2>/dev/null || true
-                    worktree_cleaned=true
-                    log_success "Removed worktree: $worktree_path"
+                    # Safety check: Don't remove worktree if other processes have their CWD inside it
+                    local active_pids
+                    active_pids=$(lsof +d "$worktree_real" -F pt 2>/dev/null | awk '/^p/{pid=substr($0,2)} /^tcwd/{print pid}' | grep -v "$$" || true)
+                    if [[ -n "$active_pids" ]]; then
+                        log_warn "Skipping worktree removal: active processes detected (PIDs: $(echo "$active_pids" | tr '\n' ' '))"
+                        log_info "Use 'loom-clean' for deferred cleanup after processes exit"
+                    else
+                        log_info "Removing worktree: $worktree_path"
+                        git -C "$repo_root" worktree remove "$worktree_path" --force 2>/dev/null || true
+                        worktree_cleaned=true
+                        log_success "Removed worktree: $worktree_path"
+                    fi
                 fi
             fi
         fi
