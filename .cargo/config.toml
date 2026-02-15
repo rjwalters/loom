@@ -39,6 +39,11 @@ rustflags = [
     "-A", "clippy::module_name_repetitions",
 ]
 
+[target.aarch64-apple-darwin]
+# Ad-hoc sign test binaries before execution to prevent _dyld_start hangs
+# on macOS ARM64. See issue #2298.
+runner = ".cargo/macos-test-runner.sh"
+
 [alias]
 # Convenient aliases for common tasks
 clippy-all = "clippy --workspace --all-targets --all-features"
