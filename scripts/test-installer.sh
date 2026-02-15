@@ -481,8 +481,8 @@ else
   fail "Custom command file was removed in non-clean mode"
 fi
 
-# Test 28: Clean uninstall removes all files including custom
-echo "Test 28: Uninstall --yes --clean removes custom files"
+# Test 28: Clean uninstall removes Loom-owned custom files but preserves shared dir custom files
+echo "Test 28: Uninstall --yes --clean removes Loom-owned custom files"
 CLEAN_REPO="$TEST_DIR/clean-test"
 create_temp_repo "$CLEAN_REPO"
 simulate_loom_install "$CLEAN_REPO"
@@ -490,15 +490,33 @@ simulate_loom_install "$CLEAN_REPO"
 echo "custom config" > "$CLEAN_REPO/.loom/my-custom-config.txt"
 mkdir -p "$CLEAN_REPO/.loom/roles"
 echo "custom role" > "$CLEAN_REPO/.loom/roles/my-custom-role.md"
+mkdir -p "$CLEAN_REPO/.claude/commands"
+echo "custom command" > "$CLEAN_REPO/.claude/commands/my-custom-cmd.md"
+mkdir -p "$CLEAN_REPO/.claude/agents"
+echo "custom agent" > "$CLEAN_REPO/.claude/agents/my-custom-agent.md"
 git -C "$CLEAN_REPO" add -A
 git -C "$CLEAN_REPO" commit -m "Add custom file" --quiet
 
 "$UNINSTALL_SCRIPT" --yes --local --clean "$CLEAN_REPO" > /dev/null 2>&1 || true
 
 if [[ ! -f "$CLEAN_REPO/.loom/roles/my-custom-role.md" ]]; then
-  pass "Custom role file removed in clean mode"
+  pass "Custom role in Loom-owned dir removed in clean mode"
 else
-  fail "Custom role file preserved in clean mode (should be removed)"
+  fail "Custom role in Loom-owned dir preserved in clean mode (should be removed)"
+fi
+
+# Test 28b: Custom commands in shared directories (.claude/) preserved even in clean mode
+echo "Test 28b: Uninstall --clean preserves custom commands in shared directories"
+if [[ -f "$CLEAN_REPO/.claude/commands/my-custom-cmd.md" ]]; then
+  pass "Custom command in .claude/commands/ preserved in clean mode"
+else
+  fail "Custom command in .claude/commands/ removed in clean mode (should be preserved)"
+fi
+
+if [[ -f "$CLEAN_REPO/.claude/agents/my-custom-agent.md" ]]; then
+  pass "Custom agent in .claude/agents/ preserved in clean mode"
+else
+  fail "Custom agent in .claude/agents/ removed in clean mode (should be preserved)"
 fi
 echo ""
 
