@@ -8,25 +8,35 @@ Prioritized roadmap of upcoming work, maintained by the Guide role.
 
 Issues requiring immediate attention (`loom:urgent`).
 
-*No urgent issues. The pipeline is fully drained.*
+- **#2250**: install-loom.sh: hook files deleted during reinstall — Safety hooks silently disabled after reinstall, agents lose destructive command protection
+- **#2249**: Fresh install doesn't include loom CLI script or hooks directory — Fresh install produces non-functional Loom installation
+- **#2247**: Reinstall deletes custom project-specific slash commands — Data loss of user's custom commands during reinstall
+
+All 3 urgent issues are **installer bugs** discovered during reinstall testing. They collectively break the install/reinstall pathway.
 
 ## Ready
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-*No ready issues. All previously approved work has been completed.*
+- **#2248**: Fresh install gitignores .loom/config.json but previous install tracked it
 
 ## In Progress
 
-Issues actively being worked by shepherds (`loom:building`).
+Issues actively being worked by builders (`loom:building`).
 
-*No issues currently being built.*
+- **#2245**: Loom reinstall leaves working tree in broken state with uncommitted deletions (PR #2252 in review)
+- **#2244**: Add dual-mode GitHub API layer with REST fallback (building, no PR yet)
+- **#2243**: Worktree cleanup breaks shell when CWD is inside deleted worktree (PR #2251 in review)
+
+## Under Curation
+
+- **#2246**: Reinstall uninstall step fails on non-empty worktree directories (`loom:curating`)
 
 ## Proposed
 
 Issues under evaluation (`loom:architect`, `loom:hermit`, `loom:curated`).
 
-*No proposed issues awaiting evaluation. The pipeline needs new proposals from Architect/Hermit roles to generate work.*
+*No proposed issues awaiting evaluation.*
 
 ## Epics
 
@@ -40,4 +50,4 @@ No active epics.
 | Tier 2 (goal-supporting) | 0 |
 | Tier 3 (maintenance) | 0 |
 
-**Note:** The backlog is empty. All issues from the previous cycle have been completed, including the 3 urgent daemon reliability items (#2201, #2205, #2200), the ready maintenance item (#2202), and the 3 building items (#2197-#2199). A total of 10 PRs were merged and 8 issues closed on 2026-02-10. The pipeline needs Architect/Hermit proposals or human-created issues to generate new work.
+**Note:** The current backlog is entirely installer-related bugs (7 issues total: 3 urgent, 1 ready, 1 curating, 2 building with PRs in review). This is a focused cluster of related problems discovered during reinstall testing on 2026-02-14. No tier labels have been assigned yet — all are bugs rather than feature work. Once the installer issues are resolved, the pipeline will need new proposals from Architect/Hermit to generate feature work.
