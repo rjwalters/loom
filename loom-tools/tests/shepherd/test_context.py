@@ -351,16 +351,54 @@ class TestValidateIssueBlockedLabel:
 
 
 class TestRunScriptMissingScript:
-    """Tests for run_script() when scripts are missing (issue #2147)."""
+    """Tests for run_script() when scripts are missing (issues #2147, #2289)."""
 
-    def test_missing_script_raises_file_not_found(self, tmp_path: Path) -> None:
-        """run_script() raises FileNotFoundError for missing scripts."""
+    def test_missing_script_falls_back_to_main_branch(self, tmp_path: Path) -> None:
+        """run_script() extracts script from main when missing on current branch."""
         ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
         # scripts_dir exists but the script file does not
         (tmp_path / ".loom" / "scripts").mkdir(parents=True, exist_ok=True)
 
-        with pytest.raises(FileNotFoundError, match="predate Loom installation"):
-            ctx.run_script("nonexistent.sh", [])
+        # Mock subprocess.run: first call is git show (success), second is script execution
+        git_show_result = MagicMock()
+        git_show_result.returncode = 0
+        git_show_result.stdout = "#!/bin/sh\necho ok\n"
+
+        exec_result = MagicMock()
+        exec_result.returncode = 0
+        exec_result.stdout = "ok\n"
+
+        call_count = 0
+
+        def mock_run(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # git show main:.loom/scripts/nonexistent.sh
+                assert cmd[0] == "git"
+                assert cmd[1] == "show"
+                assert "main:.loom/scripts/test-script.sh" in cmd[2]
+                return git_show_result
+            # Script execution from temp file
+            return exec_result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run):
+            result = ctx.run_script("test-script.sh", [], check=False)
+            assert result.returncode == 0
+
+    def test_missing_script_raises_when_not_on_main_either(self, tmp_path: Path) -> None:
+        """run_script() raises FileNotFoundError when script missing on both branches."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+        (tmp_path / ".loom" / "scripts").mkdir(parents=True, exist_ok=True)
+
+        # Mock git show to fail (script not on main either)
+        git_show_result = MagicMock()
+        git_show_result.returncode = 1
+        git_show_result.stdout = ""
+
+        with patch("loom_tools.shepherd.context.subprocess.run", return_value=git_show_result):
+            with pytest.raises(FileNotFoundError, match="could not extract from main"):
+                ctx.run_script("nonexistent.sh", [])
 
     def test_existing_script_runs_normally(self, tmp_path: Path) -> None:
         """run_script() works normally when the script file exists."""
@@ -384,6 +422,64 @@ class TestRunScriptMissingScript:
             call_kwargs = mock_run.call_args
             assert str(call_kwargs[0][0][0]).endswith("test-script.sh")
             assert call_kwargs[1]["stdin"] is not None  # stdin=DEVNULL
+
+    def test_fallback_passes_args_to_extracted_script(self, tmp_path: Path) -> None:
+        """run_script() passes arguments correctly when using main branch fallback."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+        (tmp_path / ".loom" / "scripts").mkdir(parents=True, exist_ok=True)
+
+        git_show_result = MagicMock()
+        git_show_result.returncode = 0
+        git_show_result.stdout = "#!/bin/sh\necho $1\n"
+
+        exec_result = MagicMock()
+        exec_result.returncode = 0
+        exec_result.stdout = "42\n"
+
+        calls = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "git":
+                return git_show_result
+            return exec_result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run):
+            ctx.run_script("merge-pr.sh", ["42", "--auto"], check=False)
+
+        # Second call should be the temp script with args
+        assert len(calls) == 2
+        exec_cmd = calls[1]
+        assert "42" in exec_cmd
+        assert "--auto" in exec_cmd
+
+    def test_fallback_cleans_up_temp_file(self, tmp_path: Path) -> None:
+        """run_script() removes temp file after execution."""
+        ctx = _make_context(tmp_path, issue=42, task_id="abc1234")
+        (tmp_path / ".loom" / "scripts").mkdir(parents=True, exist_ok=True)
+
+        git_show_result = MagicMock()
+        git_show_result.returncode = 0
+        git_show_result.stdout = "#!/bin/sh\necho ok\n"
+
+        exec_result = MagicMock()
+        exec_result.returncode = 0
+
+        temp_paths: list[str] = []
+
+        def mock_run(cmd, **kwargs):
+            if cmd[0] == "git":
+                return git_show_result
+            # Capture the temp file path
+            temp_paths.append(cmd[0])
+            return exec_result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run):
+            ctx.run_script("test-script.sh", [], check=False)
+
+        # Temp file should have been cleaned up
+        assert len(temp_paths) == 1
+        assert not Path(temp_paths[0]).exists()
 
 
 def _mock_gh_issue(labels: list[str], title: str = "Test Issue", issue: int = 42) -> MagicMock:

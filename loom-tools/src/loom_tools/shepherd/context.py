@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -108,6 +110,11 @@ class ShepherdContext:
     ) -> subprocess.CompletedProcess[str]:
         """Run a script from .loom/scripts.
 
+        If the script is not found on the current branch (e.g. after
+        ``gh pr checkout`` switches to a PR branch that predates the
+        script), it is extracted from the ``main`` branch via
+        ``git show`` and executed from a temporary file.
+
         Args:
             script_name: Name of script (e.g., "worktree.sh")
             args: Arguments to pass to script
@@ -118,24 +125,89 @@ class ShepherdContext:
             CompletedProcess result
 
         Raises:
-            FileNotFoundError: If the script does not exist (e.g. the
-                working tree is on a branch that predates Loom installation).
+            FileNotFoundError: If the script does not exist on the
+                current branch *and* cannot be extracted from main.
         """
         script_path = self.scripts_dir / script_name
-        if not script_path.is_file():
-            raise FileNotFoundError(
-                f"Script not found: {script_path} — "
-                "the branch may predate Loom installation"
+        if script_path.is_file():
+            cmd = [str(script_path), *args]
+            return subprocess.run(
+                cmd,
+                cwd=self.repo_root,
+                text=True,
+                capture_output=capture,
+                check=check,
+                stdin=subprocess.DEVNULL,
             )
-        cmd = [str(script_path), *args]
-        return subprocess.run(
-            cmd,
-            cwd=self.repo_root,
-            text=True,
-            capture_output=capture,
-            check=check,
-            stdin=subprocess.DEVNULL,
+
+        # Fallback: extract from main branch (handles PR branch checkouts)
+        logger = logging.getLogger(__name__)
+        git_path = f".loom/scripts/{script_name}"
+        logger.warning(
+            "Script not found at %s — attempting to extract from main branch",
+            script_path,
         )
+        return self._run_script_from_main(
+            git_path, script_name, args, check=check, capture=capture
+        )
+
+    def _run_script_from_main(
+        self,
+        git_path: str,
+        script_name: str,
+        args: list[str],
+        *,
+        check: bool = True,
+        capture: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        """Extract a script from the main branch and execute it.
+
+        Uses ``git show main:<path>`` to read the script content, writes
+        it to a temporary file, and runs it.
+
+        Raises:
+            FileNotFoundError: If the script cannot be extracted from main.
+        """
+        result = subprocess.run(
+            ["git", "show", f"main:{git_path}"],
+            cwd=self.repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise FileNotFoundError(
+                f"Script not found: .loom/scripts/{script_name} — "
+                "not on current branch and could not extract from main"
+            )
+
+        # Write to a temp file and execute
+        fd, tmp_path = tempfile.mkstemp(suffix=f"-{script_name}", prefix="loom-")
+        try:
+            os.write(fd, result.stdout.encode())
+            os.close(fd)
+            os.chmod(tmp_path, 0o755)
+
+            logger = logging.getLogger(__name__)
+            logger.info(
+                "Running %s extracted from main branch (temp: %s)",
+                script_name,
+                tmp_path,
+            )
+            cmd = [tmp_path, *args]
+            return subprocess.run(
+                cmd,
+                cwd=self.repo_root,
+                text=True,
+                capture_output=capture,
+                check=check,
+                stdin=subprocess.DEVNULL,
+            )
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def validate_issue(self) -> dict[str, Any]:
         """Validate issue exists and is in valid state.
