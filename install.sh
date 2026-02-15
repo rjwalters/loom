@@ -48,6 +48,32 @@ header() {
   echo -e "${CYAN}$*${NC}"
 }
 
+# Install hooks and CLI wrapper that loom-daemon init doesn't handle
+install_hooks_and_cli() {
+  local loom_root="$1"
+  local target="$2"
+
+  # Install hooks
+  if [[ -d "$loom_root/defaults/hooks" ]]; then
+    mkdir -p "$target/.loom/hooks"
+    for hook_file in "$loom_root/defaults/hooks/"*.sh; do
+      [[ -f "$hook_file" ]] || continue
+      hook_name=$(basename "$hook_file")
+      cp "$hook_file" "$target/.loom/hooks/$hook_name"
+      chmod +x "$target/.loom/hooks/$hook_name"
+    done
+    success "Installed hooks"
+  fi
+
+  # Install CLI wrapper
+  if [[ -f "$loom_root/defaults/.loom/bin/loom" ]]; then
+    mkdir -p "$target/.loom/bin"
+    cp "$loom_root/defaults/.loom/bin/loom" "$target/.loom/bin/loom"
+    chmod +x "$target/.loom/bin/loom"
+    success "Installed .loom/bin/loom CLI"
+  fi
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -421,6 +447,10 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
     # Run loom-daemon init
     "$LOOM_ROOT/target/release/loom-daemon" init --force --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
       error "Installation failed"
+
+    # Install hooks and CLI wrapper (not handled by loom-daemon init)
+    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+
     echo ""
     success "Quick reinstallation complete!"
     exit 0
@@ -558,6 +588,9 @@ case "$METHOD" in
       "$LOOM_ROOT/target/release/loom-daemon" init $FORCE_FLAG --defaults "$LOOM_ROOT/defaults" "$TARGET_PATH" || \
         error "Installation failed"
     fi
+
+    # Install hooks and CLI wrapper (not handled by loom-daemon init)
+    install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
 
     echo ""
     success "Quick installation complete!"
