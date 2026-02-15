@@ -607,11 +607,8 @@ mod tests {
         fs::create_dir_all(defaults.join("hooks")).unwrap();
         fs::write(defaults.join("config.json"), "{}").unwrap();
         fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
-        fs::write(
-            defaults.join("hooks").join("guard-destructive.sh"),
-            "#!/bin/bash\n# guard hook",
-        )
-        .unwrap();
+        fs::write(defaults.join("hooks").join("guard-destructive.sh"), "#!/bin/bash\n# guard hook")
+            .unwrap();
 
         let result =
             initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
