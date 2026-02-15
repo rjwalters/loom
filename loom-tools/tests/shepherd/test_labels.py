@@ -109,20 +109,16 @@ class TestLabelCache:
         assert cache.has_pr_label(42, "pr_label") is True
         assert cache.has_pr_label(42, "issue_label") is False
 
-    def test_finds_gh_cached_when_available(self) -> None:
-        """Should use gh-cached when available."""
-        repo_root = Path("/fake/repo")
-
-        with patch.object(Path, "is_file", return_value=True):
-            with patch.object(Path, "stat") as mock_stat:
-                mock_stat.return_value.st_mode = 0o755
-                cache = LabelCache(repo_root)
-                assert "gh-cached" in cache._gh_cmd
-
-    def test_falls_back_to_gh(self) -> None:
-        """Should fall back to gh when gh-cached not available."""
-        cache = LabelCache()
-        assert cache._gh_cmd == "gh"
+    def test_run_gh_delegates_to_common_gh_run(self) -> None:
+        """_run_gh should delegate to common.github.gh_run."""
+        cache = LabelCache(Path("/fake/repo"))
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_gh:
+            mock_gh.return_value.returncode = 0
+            mock_gh.return_value.stdout = "label1\nlabel2\n"
+            result = cache._run_gh(["issue", "view", "42", "--json", "labels"])
+        assert result == "label1\nlabel2"
+        mock_gh.assert_called_once()
+        assert mock_gh.call_args[1]["cwd"] == Path("/fake/repo")
 
 
 class TestGenericLabelOperations:
@@ -206,7 +202,7 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_add_and_remove(self) -> None:
         """transition_labels should use single gh command with both flags."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 0
             result = transition_labels(
                 "issue",
@@ -219,14 +215,14 @@ class TestAtomicLabelTransitions:
             mock_run.assert_called_once()
             call_args = mock_run.call_args[0][0]
             assert call_args == [
-                "gh", "issue", "edit", "42",
+                "issue", "edit", "42",
                 "--remove-label", "loom:issue",
                 "--add-label", "loom:building",
             ]
 
     def test_transition_labels_add_only(self) -> None:
         """transition_labels should work with only add."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 0
             result = transition_labels("issue", 42, add=["loom:building"])
 
@@ -238,7 +234,7 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_remove_only(self) -> None:
         """transition_labels should work with only remove."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 0
             result = transition_labels("issue", 42, remove=["loom:issue"])
 
@@ -250,7 +246,7 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_noop(self) -> None:
         """transition_labels should return True with no changes."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             result = transition_labels("issue", 42)
 
             assert result is True
@@ -258,7 +254,7 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_failure(self) -> None:
         """transition_labels should return False on failure."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 1
             result = transition_labels(
                 "issue",
@@ -271,7 +267,7 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_multiple_add_remove(self) -> None:
         """transition_labels should handle multiple labels."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 0
             result = transition_labels(
                 "issue",
@@ -292,7 +288,7 @@ class TestAtomicLabelTransitions:
 
     def test_transition_labels_pr(self) -> None:
         """transition_labels should work for PRs."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 0
             result = transition_labels(
                 "pr",
@@ -303,7 +299,7 @@ class TestAtomicLabelTransitions:
 
             assert result is True
             call_args = mock_run.call_args[0][0]
-            assert call_args[:4] == ["gh", "pr", "edit", "100"]
+            assert call_args[:3] == ["pr", "edit", "100"]
 
     def test_transition_issue_labels_convenience(self) -> None:
         """transition_issue_labels should delegate to transition_labels."""
@@ -346,8 +342,8 @@ class TestAtomicLabelTransitions:
             )
 
     def test_transition_labels_with_repo_root(self) -> None:
-        """transition_labels should pass repo_root to subprocess."""
-        with patch("loom_tools.shepherd.labels.subprocess.run") as mock_run:
+        """transition_labels should pass repo_root to gh_run."""
+        with patch("loom_tools.shepherd.labels.gh_run") as mock_run:
             mock_run.return_value.returncode = 0
             repo_root = Path("/fake/repo")
             transition_labels(
