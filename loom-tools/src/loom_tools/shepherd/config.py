@@ -18,6 +18,7 @@ class Phase(Enum):
     JUDGE = "judge"
     DOCTOR = "doctor"
     MERGE = "merge"
+    REFLECTION = "reflection"
 
 
 class ExecutionMode(Enum):
@@ -187,6 +188,9 @@ class ShepherdConfig:
 
     # Worktree marker file name
     worktree_marker_file: str = ".loom-in-use"
+
+    # Reflection phase control
+    no_reflect: bool = False
 
     @property
     def is_force_mode(self) -> bool:
