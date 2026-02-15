@@ -567,7 +567,7 @@ If you need to clean up worktrees:
 
 ### Workspace Configuration
 
-Configuration is stored in `.loom/config.json` (gitignored, local to your machine):
+Configuration is stored in `.loom/config.json` (committed to git for team sharing):
 
 ```json
 {

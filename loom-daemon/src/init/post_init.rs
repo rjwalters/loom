@@ -51,9 +51,10 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
     let gitignore_path = workspace_path.join(".gitignore");
 
     // Ephemeral/runtime files that should be ignored.
-    // Keep in sync with the Loom source repo's .gitignore (lines 36–75).
+    // Keep in sync with the Loom source repo's .gitignore (lines 36–78).
     let ephemeral_patterns = [
         ".loom-in-use",
+        ".loom-checkpoint",
         ".loom/.daemon.pid",
         ".loom/.daemon.log",
         ".loom/daemon.sock",
@@ -64,6 +65,7 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
         ".loom/[0-9][0-9]-daemon-state.json",
         ".loom/stuck-history.json",
         ".loom/alerts.json",
+        ".loom/issue-failures.json",
         ".loom/health-metrics.json",
         ".loom/interventions/",
         ".loom/worktrees/",
@@ -80,10 +82,15 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
         ".loom/manifest.json",
         ".loom/stuck-config.json",
         ".loom/metrics/",
+        ".loom/usage-cache.json",
         ".loom/*.log",
         ".loom/*.sock",
         ".loom/logs/",
     ];
+
+    // Legacy patterns that should be removed during migration.
+    // These overly broad patterns block config.json from being tracked.
+    let legacy_patterns_to_remove = [".loom/*.json", ".loom/config.json"];
 
     if gitignore_path.exists() {
         let contents = fs::read_to_string(&gitignore_path)
@@ -92,9 +99,47 @@ pub fn update_gitignore(workspace_path: &Path) -> Result<(), String> {
         let mut new_contents = contents.clone();
         let mut modified = false;
 
+        // Remove legacy patterns that block config.json from being tracked.
+        // Older installs and /imagine used `.loom/*.json` which is too broad.
+        for legacy in &legacy_patterns_to_remove {
+            // Remove lines that exactly match the legacy pattern (with optional trailing whitespace)
+            let filtered: Vec<&str> = new_contents
+                .lines()
+                .filter(|line| line.trim() != *legacy)
+                .collect();
+            let joined = filtered.join("\n");
+            // Preserve trailing newline
+            let joined = if new_contents.ends_with('\n') && !joined.ends_with('\n') {
+                format!("{joined}\n")
+            } else {
+                joined
+            };
+            if joined != new_contents {
+                new_contents = joined;
+                modified = true;
+            }
+        }
+
+        // Also remove negation patterns that were paired with the legacy *.json glob
+        let negation_legacy = "!.loom/roles/*.json";
+        let filtered: Vec<&str> = new_contents
+            .lines()
+            .filter(|line| line.trim() != negation_legacy)
+            .collect();
+        let joined = filtered.join("\n");
+        let joined = if new_contents.ends_with('\n') && !joined.ends_with('\n') {
+            format!("{joined}\n")
+        } else {
+            joined
+        };
+        if joined != new_contents {
+            new_contents = joined;
+            modified = true;
+        }
+
         // Add ephemeral patterns if not present
         for pattern in &ephemeral_patterns {
-            if !contents.contains(pattern) {
+            if !new_contents.contains(pattern) {
                 if !new_contents.ends_with('\n') {
                     new_contents.push('\n');
                 }
@@ -139,6 +184,7 @@ mod tests {
 
         // Spot-check key runtime patterns
         assert!(contents.contains(".loom-in-use"));
+        assert!(contents.contains(".loom-checkpoint"));
         assert!(contents.contains(".loom/daemon-state.json"));
         assert!(contents.contains(".loom/worktrees/"));
         assert!(contents.contains(".loom/progress/"));
@@ -147,7 +193,13 @@ mod tests {
         assert!(contents.contains(".loom/daemon-metrics.json"));
         assert!(contents.contains(".loom/[0-9][0-9]-daemon-state.json"));
         assert!(contents.contains(".loom/activity.db"));
+        assert!(contents.contains(".loom/issue-failures.json"));
+        assert!(contents.contains(".loom/usage-cache.json"));
         assert!(contents.contains("# Loom runtime state"));
+
+        // config.json must NOT be gitignored
+        assert!(!contents.contains(".loom/config.json"));
+        assert!(!contents.contains(".loom/*.json"));
     }
 
     #[test]
@@ -200,6 +252,7 @@ mod tests {
 
         let expected = [
             ".loom-in-use",
+            ".loom-checkpoint",
             ".loom/.daemon.pid",
             ".loom/.daemon.log",
             ".loom/daemon.sock",
@@ -210,6 +263,7 @@ mod tests {
             ".loom/[0-9][0-9]-daemon-state.json",
             ".loom/stuck-history.json",
             ".loom/alerts.json",
+            ".loom/issue-failures.json",
             ".loom/health-metrics.json",
             ".loom/interventions/",
             ".loom/worktrees/",
@@ -226,6 +280,7 @@ mod tests {
             ".loom/manifest.json",
             ".loom/stuck-config.json",
             ".loom/metrics/",
+            ".loom/usage-cache.json",
             ".loom/*.log",
             ".loom/*.sock",
             ".loom/logs/",
@@ -237,5 +292,44 @@ mod tests {
                 "Missing pattern in generated .gitignore: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn removes_legacy_broad_json_pattern() {
+        let tmp = TempDir::new().unwrap();
+        let gitignore = tmp.path().join(".gitignore");
+
+        // Simulate a gitignore from an older install or /imagine with the legacy patterns
+        fs::write(
+            &gitignore,
+            "node_modules/\n\n# Loom\n.loom/config.json\n.loom/state.json\n.loom/*.json\n!.loom/roles/*.json\n.loom/worktrees/\n",
+        )
+        .unwrap();
+
+        update_gitignore(tmp.path()).unwrap();
+
+        let contents = fs::read_to_string(&gitignore).unwrap();
+
+        // Legacy patterns must be removed
+        assert!(
+            !contents.contains(".loom/*.json"),
+            "Legacy .loom/*.json pattern should have been removed"
+        );
+        assert!(
+            !contents.contains(".loom/config.json"),
+            "Legacy .loom/config.json pattern should have been removed"
+        );
+        assert!(
+            !contents.contains("!.loom/roles/*.json"),
+            "Legacy negation pattern should have been removed"
+        );
+
+        // Specific ephemeral patterns should be added instead
+        assert!(contents.contains(".loom/daemon-state.json"));
+        assert!(contents.contains(".loom/state.json"));
+        assert!(contents.contains(".loom/worktrees/"));
+
+        // Non-Loom content preserved
+        assert!(contents.contains("node_modules/"));
     }
 }

@@ -178,14 +178,27 @@ build/
 .DS_Store
 Thumbs.db
 
-# Loom
-.loom/config.json
+# Loom runtime state (don't commit these)
+.loom-in-use
 .loom/state.json
 .loom/daemon-state.json
-.loom/*.json
-!.loom/roles/*.json
+.loom/[0-9][0-9]-daemon-state.json
+.loom/daemon-metrics.json
+.loom/health-metrics.json
+.loom/stuck-history.json
+.loom/alerts.json
+.loom/manifest.json
 .loom/worktrees/
 .loom/interventions/
+.loom/claims/
+.loom/signals/
+.loom/status/
+.loom/progress/
+.loom/diagnostics/
+.loom/metrics/
+.loom/logs/
+.loom/*.log
+.loom/*.sock
 EOF
 
 # Initial commit
