@@ -722,7 +722,7 @@ If more than 3 PRs qualify for auto-merge, select the 3 oldest (by creation date
 
 ## Error Handling
 
-If `gh pr merge` fails for any reason:
+If the merge fails for any reason:
 
 1. **Capture error message**
 2. **Add comment to PR** with error details

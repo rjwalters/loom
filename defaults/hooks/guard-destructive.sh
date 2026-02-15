@@ -294,6 +294,14 @@ for pattern in "${ASK_PATTERNS[@]}"; do
 done
 
 # =============================================================================
+# LOOM: Prefer merge-pr.sh over gh pr merge
+# =============================================================================
+
+if echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; then
+    deny "Use ./.loom/scripts/merge-pr.sh <PR_NUMBER> instead of 'gh pr merge'. The script merges via the GitHub API without local checkout, which avoids worktree errors."
+fi
+
+# =============================================================================
 # ALLOW - Everything else passes through
 # =============================================================================
 

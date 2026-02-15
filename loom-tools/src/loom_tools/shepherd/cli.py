@@ -934,7 +934,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         else:
             completed_phases.append("Merge (awaiting merge)")
             log_info(f"PR #{ctx.pr_number} is approved and ready for Champion to merge ({elapsed}s)")
-            log_info(f"To merge manually: gh pr merge {ctx.pr_number} --squash --delete-branch")
+            log_info(f"To merge manually: ./.loom/scripts/merge-pr.sh {ctx.pr_number}")
 
         # ─── Complete ─────────────────────────────────────────────────────
         duration = int(time.time() - start_time)
