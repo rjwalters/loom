@@ -645,6 +645,12 @@ fi
 
 echo ""
 
+# Configure git hooks path so .githooks/ pre-commit works without husky/npx
+info "Configuring git hooks path..."
+git config core.hooksPath .githooks
+success "Set core.hooksPath to .githooks"
+echo ""
+
 # Copy hooks to target (settings.json references .loom/hooks/guard-destructive.sh)
 info "Installing hooks..."
 if [[ -d "$LOOM_ROOT/defaults/hooks" ]]; then

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Pre-commit hook: auto-format staged files
+# Replaces husky + lint-staged with a plain shell script.
+# Activate with: git config core.hooksPath .githooks
+
+# Format staged TypeScript/JSON files with Biome
+STAGED_TS=$(git diff --cached --name-only --diff-filter=d -- 'src/**/*.ts' 'src/**/*.tsx' 'src/**/*.js' 'src/**/*.jsx' 'e2e/**/*.ts' 'e2e/**/*.tsx' 'defaults/**/*.json')
+if [ -n "$STAGED_TS" ]; then
+  echo "$STAGED_TS" | xargs pnpm biome check --write
+  echo "$STAGED_TS" | xargs git add
+fi
+
+# Format staged Rust files with rustfmt
+STAGED_RS=$(git diff --cached --name-only --diff-filter=d -- '*.rs')
+if [ -n "$STAGED_RS" ]; then
+  echo "$STAGED_RS" | xargs cargo fmt --
+  echo "$STAGED_RS" | xargs git add
+fi
