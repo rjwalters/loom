@@ -31,7 +31,9 @@ from loom_tools.shepherd.phases import (
     MergePhase,
     PhaseStatus,
     PreflightPhase,
+    ReflectionPhase,
 )
+from loom_tools.shepherd.phases.reflection import RunSummary
 from loom_tools.shepherd.phases.base import PhaseResult
 
 
@@ -147,6 +149,13 @@ EXAMPLES:
         action="store_true",
         dest="allow_dirty_main",
         help="Proceed even if main repo has uncommitted changes",
+    )
+
+    parser.add_argument(
+        "--no-reflect",
+        action="store_true",
+        dest="no_reflect",
+        help="Skip post-run reflection phase",
     )
 
     # Deprecated flags
@@ -306,6 +315,7 @@ def _create_config(args: argparse.Namespace) -> ShepherdConfig:
         start_from=start_from,
         stop_after=args.stop_after,
         quality_gates=quality_gates,
+        no_reflect=args.no_reflect,
     )
 
     if args.task_id:
@@ -341,6 +351,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
     start_time = time.time()
     completed_phases: list[str] = []
     phase_durations: dict[str, int] = {}
+    run_warnings: list[str] = []
 
     try:
         # Validate issue
@@ -856,6 +867,19 @@ def orchestrate(ctx: ShepherdContext) -> int:
         else:
             ctx.report_milestone("completed")
 
+        # ─── PHASE 7: Reflection ─────────────────────────────────────────
+        _run_reflection(
+            ctx,
+            exit_code=ShepherdExitCode.SUCCESS,
+            duration=duration,
+            phase_durations=phase_durations,
+            completed_phases=completed_phases,
+            judge_retries=judge_retries,
+            doctor_attempts=doctor_attempts,
+            test_fix_attempts=test_fix_attempts,
+            warnings=run_warnings,
+        )
+
         _print_phase_header("SHEPHERD ORCHESTRATION COMPLETE")
         print(file=sys.stderr)
         log_info(f"Issue: #{ctx.config.issue} - {ctx.issue_title}")
@@ -898,6 +922,50 @@ def orchestrate(ctx: ShepherdContext) -> int:
     except ShepherdError as e:
         log_error(str(e))
         return ShepherdExitCode.NEEDS_INTERVENTION
+
+
+def _run_reflection(
+    ctx: ShepherdContext,
+    *,
+    exit_code: int,
+    duration: int,
+    phase_durations: dict[str, int],
+    completed_phases: list[str],
+    judge_retries: int = 0,
+    doctor_attempts: int = 0,
+    test_fix_attempts: int = 0,
+    warnings: list[str] | None = None,
+) -> None:
+    """Run the reflection phase (best-effort, never affects exit code).
+
+    Analyzes the shepherd run and optionally files upstream issues.
+    """
+    skip, reason = ReflectionPhase().should_skip(ctx)
+    if skip:
+        log_info(f"Skipping reflection phase ({reason})")
+        return
+
+    summary = RunSummary(
+        issue=ctx.config.issue,
+        issue_title=ctx.issue_title,
+        mode=ctx.config.mode.value,
+        task_id=ctx.config.task_id,
+        duration=duration,
+        exit_code=exit_code,
+        phase_durations=phase_durations,
+        completed_phases=completed_phases,
+        judge_retries=judge_retries,
+        doctor_attempts=doctor_attempts,
+        test_fix_attempts=test_fix_attempts,
+        warnings=warnings or [],
+    )
+
+    try:
+        _print_phase_header("PHASE 7: REFLECTION")
+        reflection = ReflectionPhase(run_summary=summary)
+        reflection.run(ctx)
+    except Exception as exc:
+        log_warning(f"Reflection phase failed (non-fatal): {exc}")
 
 
 def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
