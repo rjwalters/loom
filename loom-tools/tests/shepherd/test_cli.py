@@ -88,6 +88,31 @@ class TestParseArgs:
         args = _parse_args(["42"])
         assert args.allow_dirty_main is False
 
+    def test_parses_skip_builder(self) -> None:
+        """Should parse --skip-builder flag."""
+        args = _parse_args(["42", "--skip-builder"])
+        assert args.skip_builder is True
+
+    def test_skip_builder_default_false(self) -> None:
+        """--skip-builder should default to False."""
+        args = _parse_args(["42"])
+        assert args.skip_builder is False
+
+    def test_parses_pr_number(self) -> None:
+        """Should parse --pr with integer."""
+        args = _parse_args(["42", "--pr", "312"])
+        assert args.pr_number == 312
+
+    def test_pr_default_none(self) -> None:
+        """--pr should default to None."""
+        args = _parse_args(["42"])
+        assert args.pr_number is None
+
+    def test_pr_rejects_non_integer(self) -> None:
+        """--pr should reject non-integer values."""
+        with pytest.raises(SystemExit):
+            _parse_args(["42", "--pr", "abc"])
+
 
 class TestCreateConfig:
     """Test config creation from args."""
@@ -151,6 +176,27 @@ class TestCreateConfig:
         args = _parse_args(["42", "--task-id", "abc1234"])
         config = _create_config(args)
         assert config.task_id == "abc1234"
+
+    def test_skip_builder(self) -> None:
+        """--skip-builder should set skip_builder."""
+        args = _parse_args(["42", "--skip-builder"])
+        config = _create_config(args)
+        assert config.skip_builder is True
+        assert config.pr_number_override is None
+
+    def test_pr_number_sets_skip_builder(self) -> None:
+        """--pr should set pr_number_override and imply skip_builder."""
+        args = _parse_args(["42", "--pr", "312"])
+        config = _create_config(args)
+        assert config.pr_number_override == 312
+        assert config.skip_builder is True
+
+    def test_skip_builder_default(self) -> None:
+        """Default config should have skip_builder=False."""
+        args = _parse_args(["42"])
+        config = _create_config(args)
+        assert config.skip_builder is False
+        assert config.pr_number_override is None
 
 
 class TestAutoNavigateOutOfWorktree:

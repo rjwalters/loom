@@ -398,6 +398,46 @@ class TestBuilderPhase:
 
         assert skip is False
 
+    def test_should_skip_with_pr_override(self, mock_context: MagicMock) -> None:
+        """Builder should skip when --pr override is set."""
+        builder = BuilderPhase()
+        mock_context.config.pr_number_override = 312
+
+        skip, reason = builder.should_skip(mock_context)
+
+        assert skip is True
+        assert "--pr 312" in reason
+        assert mock_context.pr_number == 312
+
+    def test_should_skip_with_skip_builder_flag(self, mock_context: MagicMock) -> None:
+        """Builder should skip when --skip-builder is set and PR exists."""
+        builder = BuilderPhase()
+        mock_context.config.skip_builder = True
+        mock_context.config.pr_number_override = None
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=200
+        ):
+            skip, reason = builder.should_skip(mock_context)
+
+        assert skip is True
+        assert "--skip-builder" in reason
+        assert "PR #200" in reason
+        assert mock_context.pr_number == 200
+
+    def test_skip_builder_falls_through_when_no_pr(self, mock_context: MagicMock) -> None:
+        """--skip-builder should not skip if no PR can be auto-detected."""
+        builder = BuilderPhase()
+        mock_context.config.skip_builder = True
+        mock_context.config.pr_number_override = None
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+        ):
+            skip, reason = builder.should_skip(mock_context)
+
+        assert skip is False
+
     def test_worktree_failure_includes_error_detail(
         self, mock_context: MagicMock
     ) -> None:

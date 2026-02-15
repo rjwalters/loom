@@ -94,9 +94,24 @@ class BuilderPhase:
         """Check if builder phase should be skipped.
 
         Skip if:
+        - --pr <N> specifies an existing PR number directly
+        - --skip-builder flag with auto-detected PR
         - --from argument skips this phase (requires existing PR)
         - PR already exists for this issue
         """
+        # Check --pr <N> override (skip builder, use specified PR)
+        if ctx.config.pr_number_override is not None:
+            ctx.pr_number = ctx.config.pr_number_override
+            return True, f"skipped via --pr {ctx.config.pr_number_override}"
+
+        # Check --skip-builder (skip builder, auto-detect PR)
+        if ctx.config.skip_builder:
+            pr = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+            if pr is None:
+                return False, ""
+            ctx.pr_number = pr
+            return True, f"skipped via --skip-builder (PR #{pr})"
+
         # Check --from argument
         if ctx.config.should_skip_phase(Phase.BUILDER):
             # Verify PR exists
