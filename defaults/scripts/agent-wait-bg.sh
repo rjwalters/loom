@@ -380,6 +380,15 @@ check_stuck_at_prompt() {
         command_at_prompt=true
     fi
 
+    # Check for interactive theme/style picker prompts from Claude Code onboarding.
+    # These appear when CLAUDE_CONFIG_DIR is isolated without .claude.json.
+    # Patterns: "Choose the text style", "Choose a theme", numbered option lines like "❯ 1. Dark mode"
+    STUCK_AT_THEME_PICKER=false
+    if echo "$pane_content" | grep -qE '(Choose the text style|Choose a theme|❯[[:space:]]*[0-9]+\.)'; then
+        command_at_prompt=true
+        STUCK_AT_THEME_PICKER=true
+    fi
+
     # Check for processing indicators that show Claude is working
     local processing=false
     if echo "$pane_content" | grep -qE "$PROCESSING_INDICATORS"; then
@@ -400,6 +409,13 @@ check_stuck_at_prompt() {
 attempt_prompt_stuck_recovery() {
     local session_name="$1"
     local role_cmd="$2"
+
+    # Theme picker stuck: Enter won't help, kill session so it can be respawned
+    if [[ "${STUCK_AT_THEME_PICKER:-false}" == "true" ]]; then
+        log_warn "Theme picker detected in $session_name - killing session for respawn"
+        tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+        return 1  # Signal failure so caller knows session was killed
+    fi
 
     # Strategy 1: Try an Enter key nudge first
     # The command is typically already visible at the prompt and just needs Enter to trigger processing
