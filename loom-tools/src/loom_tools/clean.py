@@ -22,6 +22,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from loom_tools.common.claude_config import cleanup_all_agent_config_dirs
 from loom_tools.common.github import gh_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
@@ -48,6 +49,7 @@ class CleanupStats:
     cleaned_branches: int = 0
     kept_branches: int = 0
     killed_tmux: int = 0
+    cleaned_config_dirs: int = 0
     errors: int = 0
 
 
@@ -655,6 +657,34 @@ def clean_tmux_sessions(
         log_success("No Loom tmux sessions found")
 
 
+def clean_agent_config(
+    repo_root: pathlib.Path,
+    stats: CleanupStats,
+    dry_run: bool = False,
+) -> None:
+    """Clean up per-agent Claude config directories."""
+    paths = LoomPaths(repo_root)
+    base_dir = paths.claude_config_base_dir
+
+    if not base_dir.is_dir():
+        log_success("No agent config directories found")
+        return
+
+    count = sum(1 for child in base_dir.iterdir() if child.is_dir())
+    if count == 0:
+        log_success("No agent config directories found")
+        return
+
+    if dry_run:
+        log_info(f"Would remove {count} agent config dir(s) from {base_dir}")
+    else:
+        removed = cleanup_all_agent_config_dirs(repo_root)
+        log_success(f"Removed {removed} agent config dir(s)")
+        count = removed
+
+    stats.cleaned_config_dirs = count
+
+
 def clean_build_artifacts(
     repo_root: pathlib.Path,
     dry_run: bool = False,
@@ -750,6 +780,12 @@ def print_summary(stats: CleanupStats, dry_run: bool = False, safe_mode: bool = 
         else:
             print(f"  Killed: {stats.killed_tmux} tmux session(s)")
 
+    if stats.cleaned_config_dirs > 0:
+        if dry_run:
+            print(f"  Would remove: {stats.cleaned_config_dirs} agent config dir(s)")
+        else:
+            print(f"  Removed: {stats.cleaned_config_dirs} agent config dir(s)")
+
     if stats.errors > 0:
         print(f"  Errors: {stats.errors}")
 
@@ -766,6 +802,7 @@ Standard cleanup:
   - Stale worktrees (for closed issues)
   - Merged local branches for closed issues
   - Loom tmux sessions (loom-*)
+  - Per-agent Claude config directories (.loom/claude-config/)
 
 Deep cleanup (--deep):
   - All of the above, plus:
@@ -871,6 +908,7 @@ Examples:
         print("  - Orphaned worktrees (git worktree prune)")
         print("  - Local branches for closed issues")
         print("  - Loom tmux sessions (loom-*)")
+        print("  - Per-agent config directories (.loom/claude-config/)")
 
         if args.safe:
             print()
@@ -947,6 +985,13 @@ Examples:
         print("Cleaning Loom Tmux Sessions")
         print()
         clean_tmux_sessions(stats, dry_run=args.dry_run)
+        print()
+
+    # Cleanup: Agent Config Directories
+    if all_targets:
+        print("Cleaning Agent Config Directories")
+        print()
+        clean_agent_config(repo_root, stats, dry_run=args.dry_run)
         print()
 
     # Deep Cleanup: Build Artifacts
