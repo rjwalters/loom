@@ -8,9 +8,36 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 ### 2026-02-15
 
+- **PR #2293**: feat: wire run_warnings and add failure-path reflection coverage
+- **PR #2285**: feat: per-agent CLAUDE_CONFIG_DIR isolation for concurrent session stability
+- **PR #2278**: fix: stop gitignoring .loom/config.json so it stays tracked across reinstalls
+- **PR #2277**: docs: add build verification guidance to builder role definitions
+- **PR #2275**: feat: shepherd post-run reflection phase
+- **PR #2274**: fix: mark issues as blocked instead of closing when builder finds no changes
+- **PR #2273**: feat: kill orphaned claude processes during terminal/session lifecycle
+- **PR #2272**: Add installer integration test suite
+- **PR #2266**: fix: use remove_dir_all for robust worktree directory cleanup
+- **PR #2265**: fix: filter build artifacts from builder diagnostics
+- **PR #2263**: fix: install hooks and CLI wrapper in quick install mode
+- **PR #2259**: docs: Guide triage cycle — update WORK_LOG and WORK_PLAN
+- **PR #2256**: fix: prevent app crash when daemon is unavailable on launch
+- **PR #2255**: feat: add dual-mode GitHub API layer with REST fallback
 - **PR #2254**: docs: update WORK_LOG and WORK_PLAN for installer bug triage
 - **PR #2252**: fix: ensure main working tree is clean after loom install
 - **PR #2251**: fix: prevent unsafe worktree removal during merge and agent destroy
+- **Issue #2276** (closed): Reflection phase: wire run_warnings and add failure-path coverage
+- **Issue #2271** (closed): Shepherd: post-run self-reflection and upstream issue creation
+- **Issue #2269** (closed): Builder should never close issues — use loom:blocked instead
+- **Issue #2268** (closed): Feature: Kill orphaned claude processes during terminal/session lifecycle
+- **Issue #2267** (closed): PR #2266 may not fix the actual uninstall failure described in #2246
+- **Issue #2261** (closed): Add installer integration test suite for install/reinstall/uninstall paths
+- **Issue #2260** (closed): Remove unused analytics pipeline (~5500 LOC)
+- **Issue #2258** (closed): Builder generates non-compilable Rust code (holds MutexGuard across .await)
+- **Issue #2257** (closed): Builder gets stuck at planning checkpoint without progressing
+- **Issue #2253** (closed): App crashes on launch when daemon is unavailable
+- **Issue #2249** (closed): Fresh install doesn't include loom CLI script or hooks directory
+- **Issue #2248** (closed): Fresh install gitignores .loom/config.json but previous install tracked it
+- **Issue #2246** (closed): Reinstall uninstall step fails on non-empty worktree directories
 - **Issue #2245** (closed): Loom reinstall leaves working tree in broken state with uncommitted deletions
 - **Issue #2243** (closed): Worktree cleanup breaks shell when CWD is inside deleted worktree
 
