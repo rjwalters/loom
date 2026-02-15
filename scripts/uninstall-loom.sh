@@ -493,17 +493,51 @@ fi
 
 # Handle unknown files
 REMOVE_UNKNOWN_FILES=()
+PRESERVED_CUSTOM_FILES=()
 if [[ ${#UNKNOWN_FILES[@]} -gt 0 ]]; then
   if [[ "$CLEAN_MODE" == "true" ]]; then
-    # Clean mode: remove all unknown files (user explicitly requested clean reinstall)
-    REMOVE_UNKNOWN_FILES=("${UNKNOWN_FILES[@]}")
-    if [[ ${#UNKNOWN_FILES[@]} -le 20 ]]; then
-      info "Unknown files in Loom directories (removing in clean mode):"
-      for f in "${UNKNOWN_FILES[@]}"; do
-        echo "  - $f (will remove)"
+    # Clean mode: remove unknown files from Loom-OWNED directories only
+    # NEVER remove unknown files from SHARED directories (.claude/commands/, .claude/agents/)
+    # because those may contain custom project-specific commands not installed by Loom
+    #
+    # Shared directories: directories where both Loom and users put files
+    # Loom-owned directories: directories that Loom fully manages (.loom/*)
+    SHARED_DIR_PREFIXES=(".claude/commands/" ".claude/agents/")
+
+    for f in "${UNKNOWN_FILES[@]}"; do
+      is_shared=false
+      for shared_prefix in "${SHARED_DIR_PREFIXES[@]}"; do
+        if [[ "$f" == "$shared_prefix"* ]]; then
+          is_shared=true
+          break
+        fi
       done
-    else
-      info "${#UNKNOWN_FILES[@]} unknown files in Loom directories (removing in clean mode)"
+
+      if [[ "$is_shared" == "true" ]]; then
+        # Preserve custom files in shared directories
+        PRESERVED_CUSTOM_FILES+=("$f")
+      else
+        REMOVE_UNKNOWN_FILES+=("$f")
+      fi
+    done
+
+    # Report what will be removed vs preserved
+    if [[ ${#REMOVE_UNKNOWN_FILES[@]} -gt 0 ]]; then
+      if [[ ${#REMOVE_UNKNOWN_FILES[@]} -le 20 ]]; then
+        info "Unknown files in Loom-owned directories (removing in clean mode):"
+        for f in "${REMOVE_UNKNOWN_FILES[@]}"; do
+          echo "  - $f (will remove)"
+        done
+      else
+        info "${#REMOVE_UNKNOWN_FILES[@]} unknown files in Loom-owned directories (removing in clean mode)"
+      fi
+    fi
+
+    if [[ ${#PRESERVED_CUSTOM_FILES[@]} -gt 0 ]]; then
+      info "Custom files in shared directories (preserved):"
+      for f in "${PRESERVED_CUSTOM_FILES[@]}"; do
+        echo "  - $f (preserved - not installed by Loom)"
+      done
     fi
   elif [[ "$NON_INTERACTIVE" == "true" ]]; then
     if [[ ${#UNKNOWN_FILES[@]} -le 20 ]]; then
