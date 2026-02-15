@@ -580,7 +580,12 @@ mod tests {
         init_schema(&conn).unwrap();
 
         // Verify migration added the new columns
-        for col in ["provider", "tokens_cache_read", "tokens_cache_write", "duration_ms"] {
+        for col in [
+            "provider",
+            "tokens_cache_read",
+            "tokens_cache_write",
+            "duration_ms",
+        ] {
             let ok = conn
                 .prepare(&format!("SELECT {col} FROM token_usage LIMIT 0"))
                 .is_ok();
