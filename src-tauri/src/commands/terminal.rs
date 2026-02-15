@@ -227,14 +227,130 @@ pub async fn kill_all_loom_sessions() -> Result<(), String> {
 
     let sessions = String::from_utf8_lossy(&output.stdout);
 
-    // Kill each loom session
+    // Kill each loom session with process tree cleanup
     for session_name in sessions.lines() {
         if session_name.starts_with("loom-") {
+            // Kill process tree before destroying session to prevent orphans
+            kill_session_process_tree(session_name, true);
             let _ = Command::new("tmux")
                 .args(["-L", "loom", "kill-session", "-t", session_name])
                 .output();
         }
     }
 
+    // Sweep for any orphaned claude processes
+    sweep_orphaned_claude_processes();
+
     Ok(())
+}
+
+/// Kill the process tree rooted at a tmux session's pane processes.
+/// Mirrors the logic in `loom-daemon/src/terminal.rs::kill_process_tree`.
+fn kill_session_process_tree(session_name: &str, force: bool) {
+    use std::process::Command;
+
+    let pane_output = Command::new("tmux")
+        .args([
+            "-L",
+            "loom",
+            "list-panes",
+            "-t",
+            session_name,
+            "-F",
+            "#{pane_pid}",
+        ])
+        .output();
+
+    let pane_pids: Vec<String> = match pane_output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(std::string::ToString::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if pane_pids.is_empty() {
+        return;
+    }
+
+    let mut all_pids: Vec<String> = Vec::new();
+    for pane_pid in &pane_pids {
+        collect_descendants(pane_pid, &mut all_pids);
+        all_pids.push(pane_pid.clone());
+    }
+
+    if all_pids.is_empty() {
+        return;
+    }
+
+    if force {
+        for pid in &all_pids {
+            let _ = Command::new("kill").args(["-9", pid]).output();
+        }
+    } else {
+        for pid in &all_pids {
+            let _ = Command::new("kill").args(["-15", pid]).output();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        for pid in &all_pids {
+            if Command::new("kill")
+                .args(["-0", pid])
+                .output()
+                .is_ok_and(|o| o.status.success())
+            {
+                let _ = Command::new("kill").args(["-9", pid]).output();
+            }
+        }
+    }
+}
+
+/// Recursively collect all descendant PIDs of a given PID (depth-first)
+fn collect_descendants(parent_pid: &str, pids: &mut Vec<String>) {
+    use std::process::Command;
+
+    if let Ok(output) = Command::new("pgrep").args(["-P", parent_pid]).output() {
+        if output.status.success() {
+            let children: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(std::string::ToString::to_string)
+                .collect();
+            for child in &children {
+                collect_descendants(child, pids);
+                pids.push(child.clone());
+            }
+        }
+    }
+}
+
+/// Sweep for orphaned claude processes with no controlling terminal (TTY ??)
+fn sweep_orphaned_claude_processes() {
+    use std::process::Command;
+
+    // Find claude processes with no controlling terminal
+    let ps_output = Command::new("ps").args(["aux"]).output();
+    let Ok(output) = ps_output else { return };
+    if !output.status.success() {
+        return;
+    }
+
+    let ps_text = String::from_utf8_lossy(&output.stdout);
+    let orphan_pids: Vec<&str> = ps_text
+        .lines()
+        .filter(|line| line.contains("claude") && !line.contains("grep"))
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // ps aux format: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+            if fields.len() > 7 && fields[6] == "??" {
+                Some(fields[1])
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for pid in orphan_pids {
+        let _ = Command::new("kill").args(["-9", pid]).output();
+    }
 }

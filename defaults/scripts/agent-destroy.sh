@@ -17,6 +17,11 @@ set -euo pipefail
 TMUX_SOCKET="loom"
 SESSION_PREFIX="loom-"
 
+# Source the process tree kill helper
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=kill-session-tree.sh
+source "$SCRIPT_DIR/kill-session-tree.sh"
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -95,16 +100,16 @@ main() {
         worktree_path=$(tmux -L "$TMUX_SOCKET" show-environment -t "$session_name" LOOM_WORKSPACE 2>/dev/null | sed 's/^LOOM_WORKSPACE=//' || true)
 
         if [[ "$force" == "true" ]]; then
-            tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+            kill_session_tree "$session_name" "--force" "$TMUX_SOCKET"
         else
             # Graceful: send Ctrl-C then exit
             tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" C-c 2>/dev/null || true
             sleep 1
             tmux -L "$TMUX_SOCKET" send-keys -t "$session_name" "exit" C-m 2>/dev/null || true
             sleep 2
-            # Force kill if still alive
+            # Kill process tree and session if still alive
             if tmux -L "$TMUX_SOCKET" has-session -t "$session_name" 2>/dev/null; then
-                tmux -L "$TMUX_SOCKET" kill-session -t "$session_name" 2>/dev/null || true
+                kill_session_tree "$session_name" "" "$TMUX_SOCKET"
             fi
         fi
         log_success "Destroyed session: $session_name"

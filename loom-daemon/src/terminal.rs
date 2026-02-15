@@ -65,6 +65,102 @@ impl TerminalManager {
         }
     }
 
+    /// Kill the process tree rooted at a tmux session's pane processes.
+    ///
+    /// When tmux kill-session sends SIGHUP, it doesn't propagate across process group
+    /// boundaries. The `claude` CLI is typically behind a wrapper/timeout chain that
+    /// creates separate process groups, so it survives session destruction as an orphan.
+    ///
+    /// This method kills the entire process tree first (SIGTERM then SIGKILL escalation),
+    /// then destroys the tmux session.
+    fn kill_process_tree(session_name: &str, force: bool) {
+        // Get pane PIDs for this session
+        let pane_output = Command::new("tmux")
+            .args(["-L", "loom"])
+            .args(["list-panes", "-t", session_name, "-F", "#{pane_pid}"])
+            .output();
+
+        let pane_pids: Vec<String> = match pane_output {
+            Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(std::string::ToString::to_string)
+                .collect(),
+            _ => {
+                log::debug!("Could not get pane PIDs for session {session_name}");
+                Vec::new()
+            }
+        };
+
+        if pane_pids.is_empty() {
+            return;
+        }
+
+        // Collect all descendant PIDs (depth-first for bottom-up kill)
+        let mut all_pids: Vec<String> = Vec::new();
+        for pane_pid in &pane_pids {
+            Self::collect_descendants(pane_pid, &mut all_pids);
+            all_pids.push(pane_pid.clone());
+        }
+
+        if all_pids.is_empty() {
+            return;
+        }
+
+        log::info!(
+            "Killing process tree for session {session_name}: {} process(es)",
+            all_pids.len()
+        );
+
+        if force {
+            // Force mode: SIGKILL immediately
+            for pid in &all_pids {
+                let _ = Command::new("kill").args(["-9", pid]).output();
+            }
+        } else {
+            // Graceful mode: SIGTERM first
+            for pid in &all_pids {
+                let _ = Command::new("kill").args(["-15", pid]).output();
+            }
+
+            // Brief wait for processes to terminate
+            std::thread::sleep(std::time::Duration::from_secs(1));
+
+            // Escalate to SIGKILL for any survivors
+            for pid in &all_pids {
+                // Check if process is still alive (kill -0)
+                if Command::new("kill")
+                    .args(["-0", pid])
+                    .output()
+                    .is_ok_and(|o| o.status.success())
+                {
+                    let _ = Command::new("kill").args(["-9", pid]).output();
+                }
+            }
+        }
+    }
+
+    /// Recursively collect all descendant PIDs of a given PID (depth-first)
+    fn collect_descendants(parent_pid: &str, pids: &mut Vec<String>) {
+        let output = Command::new("pgrep").args(["-P", parent_pid]).output();
+
+        if let Ok(output) = output {
+            if output.status.success() {
+                let children: Vec<String> = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(std::string::ToString::to_string)
+                    .collect();
+
+                for child in &children {
+                    // Recurse into grandchildren first (depth-first)
+                    Self::collect_descendants(child, pids);
+                    pids.push(child.clone());
+                }
+            }
+        }
+    }
+
     pub fn create_terminal(
         &mut self,
         config_id: &str,
@@ -289,12 +385,16 @@ impl TerminalManager {
             .args(["pipe-pane", "-t", &info.tmux_session])
             .spawn();
 
-        // Kill the tmux session
-        Command::new("tmux")
+        // Kill process tree before destroying tmux session
+        // This prevents orphaned claude processes that survive SIGHUP
+        Self::kill_process_tree(&info.tmux_session, false);
+
+        // Kill the tmux session (may already be dead from kill_process_tree)
+        let _ = Command::new("tmux")
             .args(["-L", "loom"])
             .args(["kill-session", "-t", &info.tmux_session])
-            .spawn()?
-            .wait()?;
+            .spawn()
+            .and_then(|mut c| c.wait());
 
         // Clean up the output file
         let output_file = format!("/tmp/loom-{id}.out");
@@ -607,6 +707,11 @@ impl TerminalManager {
             }
 
             log::info!("Cleaning stale tmux session: {session}");
+
+            // Kill process tree before destroying the stale session
+            Self::kill_process_tree(session, true);
+
+            // Force kill the session (may already be dead)
             let result = Command::new("tmux")
                 .args(["-L", "loom"])
                 .args(["kill-session", "-t", session])
@@ -618,7 +723,11 @@ impl TerminalManager {
                 }
                 Ok(out) => {
                     let stderr = String::from_utf8_lossy(&out.stderr);
-                    log::warn!("Failed to kill stale session {session}: {stderr}");
+                    // Session may already be dead from kill_process_tree
+                    if !stderr.contains("no such session") {
+                        log::warn!("Failed to kill stale session {session}: {stderr}");
+                    }
+                    cleaned += 1;
                 }
                 Err(e) => {
                     log::warn!("Failed to kill stale session {session}: {e}");
@@ -771,12 +880,15 @@ impl TerminalManager {
             return Err(anyhow!("Tmux session '{session_name}' does not exist"));
         }
 
-        // Kill the session
-        Command::new("tmux")
+        // Kill process tree before destroying the session
+        Self::kill_process_tree(session_name, false);
+
+        // Kill the session (may already be dead from kill_process_tree)
+        let _ = Command::new("tmux")
             .args(["-L", "loom"])
             .args(["kill-session", "-t", session_name])
-            .spawn()?
-            .wait()?;
+            .spawn()
+            .and_then(|mut c| c.wait());
 
         log::info!("Killed tmux session: {session_name}");
         Ok(())
