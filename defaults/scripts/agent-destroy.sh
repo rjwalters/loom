@@ -151,8 +151,19 @@ main() {
         fi
     fi
 
+    # Clean up per-agent CLAUDE_CONFIG_DIR
+    local config_cleaned=false
+    if repo_root=$(find_repo_root 2>/dev/null); then
+        local config_dir="$repo_root/.loom/claude-config/$name"
+        if [[ -d "$config_dir" ]]; then
+            rm -rf "$config_dir"
+            config_cleaned=true
+            log_success "Removed agent config dir: $config_dir"
+        fi
+    fi
+
     if [[ "$json_output" == "true" ]]; then
-        echo "{\"status\":\"destroyed\",\"name\":\"$name\",\"session\":\"$session_name\",\"session_existed\":$session_existed,\"worktree_cleaned\":$worktree_cleaned}"
+        echo "{\"status\":\"destroyed\",\"name\":\"$name\",\"session\":\"$session_name\",\"session_existed\":$session_existed,\"worktree_cleaned\":$worktree_cleaned,\"config_cleaned\":$config_cleaned}"
     fi
 
     exit 0

@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from loom_tools.common.claude_config import setup_agent_config_dir
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 
@@ -593,6 +594,11 @@ def spawn_agent(
     # Unset CLAUDECODE to prevent nested session guard from blocking subprocess
     _tmux("set-environment", "-t", session_name, "-u", "CLAUDECODE")
 
+    # Create per-agent CLAUDE_CONFIG_DIR for session isolation
+    config_dir = setup_agent_config_dir(name, repo_root)
+    _tmux("set-environment", "-t", session_name, "CLAUDE_CONFIG_DIR", str(config_dir))
+    _tmux("set-environment", "-t", session_name, "TMPDIR", str(config_dir / "tmp"))
+
     # Build the role slash command
     role_cmd = f"/{role}"
     if args:
@@ -603,6 +609,7 @@ def spawn_agent(
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
         claude_cmd = (
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
+            f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
             f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""
         )
     else:

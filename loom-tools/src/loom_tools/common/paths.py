@@ -30,6 +30,7 @@ class LoomPaths:
     ROLES_DIR = "roles"
     DIAGNOSTICS_DIR = "diagnostics"
     METRICS_DIR = "metrics"
+    CLAUDE_CONFIG_DIR = "claude-config"
 
     # State file names
     DAEMON_STATE_FILE = "daemon-state.json"
@@ -96,6 +97,22 @@ class LoomPaths:
     def metrics_dir(self) -> Path:
         """Path to .loom/metrics directory."""
         return self.loom_dir / self.METRICS_DIR
+
+    @property
+    def claude_config_base_dir(self) -> Path:
+        """Path to .loom/claude-config/ directory."""
+        return self.loom_dir / self.CLAUDE_CONFIG_DIR
+
+    def agent_claude_config_dir(self, agent_name: str) -> Path:
+        """Path to per-agent Claude config directory.
+
+        Args:
+            agent_name: The agent name (e.g., "builder-1", "shepherd-2").
+
+        Returns:
+            Path to .loom/claude-config/{agent_name}/
+        """
+        return self.claude_config_base_dir / agent_name
 
     @property
     def daemon_state_file(self) -> Path:
