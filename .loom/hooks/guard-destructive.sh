@@ -17,9 +17,11 @@
 # diagnostics, and results in an "allow" decision to prevent infinite retry
 # loops in Claude Code.
 
-# Determine log directory relative to this script's location
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd 2>/dev/null || echo ".")"
-HOOK_ERROR_LOG="${SCRIPT_DIR}/../logs/hook-errors.log"
+# Determine main repo root via git-common-dir (works from worktrees and subdirectories)
+# Falls back to script location if git is unavailable
+MAIN_ROOT="$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)" || \
+MAIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd 2>/dev/null || echo ".")"
+HOOK_ERROR_LOG="${MAIN_ROOT}/.loom/logs/hook-errors.log"
 
 # Log a diagnostic error message (best-effort, never fails the script)
 log_hook_error() {
@@ -51,10 +53,19 @@ if [[ -z "$COMMAND" ]]; then
     exit 0
 fi
 
-# Resolve repo root from cwd (handles worktree paths safely)
+# Resolve repo root from cwd using git-common-dir (works correctly in worktrees).
+# show-toplevel returns the worktree root, but git-common-dir always points to
+# the main repo's .git dir, so its parent is the true repository root.
 REPO_ROOT=""
 if [[ -n "$CWD" ]] && [[ -d "$CWD" ]]; then
-    REPO_ROOT=$(git -C "$CWD" rev-parse --show-toplevel 2>/dev/null || true)
+    COMMON_GIT_DIR=$(git -C "$CWD" rev-parse --git-common-dir 2>/dev/null || true)
+    if [[ -n "$COMMON_GIT_DIR" ]]; then
+        if [[ "$COMMON_GIT_DIR" = /* ]]; then
+            REPO_ROOT=$(cd "$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)
+        else
+            REPO_ROOT=$(cd "$CWD/$COMMON_GIT_DIR/.." 2>/dev/null && pwd || true)
+        fi
+    fi
 elif [[ -n "$CWD" ]]; then
     # CWD doesn't exist (e.g., deleted worktree) — log but continue without repo root
     log_hook_error "cwd does not exist: $CWD — skipping repo root resolution"
