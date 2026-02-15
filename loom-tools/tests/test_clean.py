@@ -15,10 +15,12 @@ from loom_tools.clean import (
     _get_dir_size,
     check_grace_period,
     check_uncommitted_changes,
+    clean_agent_config,
     find_editable_pip_installs,
     main,
     print_summary,
 )
+from loom_tools.common.repo import clear_repo_cache
 
 
 @pytest.fixture
@@ -149,6 +151,24 @@ class TestPrintSummary:
         print_summary(stats)
         captured = capsys.readouterr()
         assert "editable pip install" not in captured.out
+
+    def test_print_summary_with_config_dirs(self, capsys: pytest.CaptureFixture[str]) -> None:
+        stats = CleanupStats(cleaned_config_dirs=3)
+        print_summary(stats)
+        captured = capsys.readouterr()
+        assert "Removed: 3 agent config dir(s)" in captured.out
+
+    def test_print_summary_config_dirs_dry_run(self, capsys: pytest.CaptureFixture[str]) -> None:
+        stats = CleanupStats(cleaned_config_dirs=2)
+        print_summary(stats, dry_run=True)
+        captured = capsys.readouterr()
+        assert "Would remove: 2 agent config dir(s)" in captured.out
+
+    def test_print_summary_no_config_dirs_when_zero(self, capsys: pytest.CaptureFixture[str]) -> None:
+        stats = CleanupStats()
+        print_summary(stats)
+        captured = capsys.readouterr()
+        assert "agent config dir" not in captured.out
 
 
 class TestCLI:
@@ -431,6 +451,83 @@ class TestFindEditablePipInstalls:
             result = find_editable_pip_installs(worktree)
 
         assert result == []
+
+
+class TestCleanAgentConfig:
+    """Tests for clean_agent_config function."""
+
+    def test_removes_agent_config_dirs(self, mock_repo: pathlib.Path) -> None:
+        """Agent config dirs are removed when present."""
+        config_base = mock_repo / ".loom" / "claude-config"
+        config_base.mkdir()
+        (config_base / "builder-1").mkdir()
+        (config_base / "shepherd-2").mkdir()
+
+        stats = CleanupStats()
+        clean_agent_config(mock_repo, stats)
+
+        assert stats.cleaned_config_dirs == 2
+        # Dirs should actually be removed
+        assert not (config_base / "builder-1").exists()
+        assert not (config_base / "shepherd-2").exists()
+
+    def test_dry_run_does_not_remove(self, mock_repo: pathlib.Path) -> None:
+        """Dry run counts dirs but does not remove them."""
+        config_base = mock_repo / ".loom" / "claude-config"
+        config_base.mkdir()
+        (config_base / "agent-1").mkdir()
+        (config_base / "agent-2").mkdir()
+        (config_base / "agent-3").mkdir()
+
+        stats = CleanupStats()
+        clean_agent_config(mock_repo, stats, dry_run=True)
+
+        assert stats.cleaned_config_dirs == 3
+        # Dirs should still exist
+        assert (config_base / "agent-1").exists()
+        assert (config_base / "agent-2").exists()
+        assert (config_base / "agent-3").exists()
+
+    def test_no_config_dir(self, mock_repo: pathlib.Path) -> None:
+        """No error when claude-config directory does not exist."""
+        stats = CleanupStats()
+        clean_agent_config(mock_repo, stats)
+        assert stats.cleaned_config_dirs == 0
+
+    def test_empty_config_dir(self, mock_repo: pathlib.Path) -> None:
+        """No error when claude-config directory is empty."""
+        config_base = mock_repo / ".loom" / "claude-config"
+        config_base.mkdir()
+
+        stats = CleanupStats()
+        clean_agent_config(mock_repo, stats)
+        assert stats.cleaned_config_dirs == 0
+
+    def test_not_called_with_scope_flags(self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Config dir cleanup should not run with --worktrees-only."""
+        config_base = mock_repo / ".loom" / "claude-config"
+        config_base.mkdir()
+        (config_base / "agent-1").mkdir()
+
+        clear_repo_cache()
+        monkeypatch.chdir(mock_repo)
+        main(["--dry-run", "--force", "--worktrees-only"])
+
+        # Dir should still exist (cleanup was skipped)
+        assert (config_base / "agent-1").exists()
+
+    def test_called_in_standard_mode(self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Config dir cleanup runs in standard mode."""
+        config_base = mock_repo / ".loom" / "claude-config"
+        config_base.mkdir()
+        (config_base / "agent-1").mkdir()
+
+        clear_repo_cache()
+        monkeypatch.chdir(mock_repo)
+        main(["--force"])
+
+        # Dir should be removed
+        assert not (config_base / "agent-1").exists()
 
 
 class TestDocumentedDivergences:
