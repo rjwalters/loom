@@ -24,7 +24,7 @@ class ShepherdExitCode(IntEnum):
     | 3         | Shutdown signal received      | Clean exit, requeue               |
     | 4         | Stuck/blocked, needs help     | Alert human                       |
     | 5         | Skipped (already complete)    | No action                         |
-    | 6         | No changes needed             | Close issue, mark complete        |
+    | 6         | No changes needed             | Mark blocked, await human review  |
     | 7         | Transient API error           | Requeue issue, retry after backoff|
 
     Using IntEnum allows these to be used directly as exit codes:
@@ -55,7 +55,7 @@ class ShepherdExitCode(IntEnum):
     SKIPPED = 5
 
     # Builder analyzed issue and determined no changes are needed
-    # The reported problem doesn't exist or is already resolved on main
+    # Issue is marked blocked for human review — builder never closes issues
     NO_CHANGES_NEEDED = 6
 
     # Transient API error (500, rate limit, network issue, etc.)
@@ -77,7 +77,7 @@ EXIT_CODE_DESCRIPTIONS = {
     ShepherdExitCode.SHUTDOWN: "Shutdown signal received",
     ShepherdExitCode.NEEDS_INTERVENTION: "Stuck/blocked - needs human intervention",
     ShepherdExitCode.SKIPPED: "Skipped - issue already complete",
-    ShepherdExitCode.NO_CHANGES_NEEDED: "No changes needed - problem already resolved",
+    ShepherdExitCode.NO_CHANGES_NEEDED: "No changes needed - marked blocked for human review",
     ShepherdExitCode.TRANSIENT_ERROR: "Transient API error - safe to retry after backoff",
     ShepherdExitCode.BUDGET_EXHAUSTED: "Budget exhausted - issue may need decomposition",
 }

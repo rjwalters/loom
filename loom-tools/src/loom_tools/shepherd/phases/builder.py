@@ -361,7 +361,6 @@ class BuilderPhase:
                         data={
                             "no_changes_needed": True,
                             "reason": "already_resolved",
-                            "close_issue": True,
                             "diagnostics": diag,
                         },
                     )
@@ -523,7 +522,6 @@ class BuilderPhase:
                         data={
                             "no_changes_needed": True,
                             "reason": "already_resolved",
-                            "close_issue": True,
                             "diagnostics": diag,
                         },
                     )
