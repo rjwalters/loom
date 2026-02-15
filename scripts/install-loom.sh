@@ -276,6 +276,23 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
 
   # Check if Loom is installed (has .loom directory)
   if [[ -d "$TARGET_PATH/.loom" ]]; then
+    # Preserve uncommitted user changes before uninstall
+    # The uninstall --local mode runs 'git add -A' which would stage user changes
+    # along with uninstall deletions, and our cleanup would discard them
+    STASHED_USER_CHANGES=false
+    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
+       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+      warning "Working tree has uncommitted changes"
+      info "Stashing user changes to preserve them during clean install..."
+      if git -C "$TARGET_PATH" stash push -m "loom-install: preserving user changes before --clean" 2>/dev/null; then
+        STASHED_USER_CHANGES=true
+        success "User changes stashed"
+      else
+        warning "Failed to stash changes - uncommitted changes may be lost during --clean install"
+        warning "Consider committing your changes first, then retry"
+      fi
+    fi
+
     info "Running local uninstall to clean existing installation..."
 
     # Build uninstall flags from current flags
@@ -299,8 +316,53 @@ if [[ "$CLEAN_FIRST" == "true" ]]; then
     # main working directory. The fresh install will happen in a worktree, so
     # main must stay clean to avoid leftover staged changes after completion.
     info "Cleaning staged changes from uninstall..."
-    git -C "$TARGET_PATH" restore --staged . 2>/dev/null || true
-    git -C "$TARGET_PATH" checkout -- . 2>/dev/null || true
+
+    CLEANUP_FAILED=false
+
+    if ! git -C "$TARGET_PATH" restore --staged . 2>/dev/null; then
+      warning "Failed to unstage changes from uninstall"
+      CLEANUP_FAILED=true
+    fi
+
+    if ! git -C "$TARGET_PATH" checkout -- . 2>/dev/null; then
+      warning "Failed to restore files from uninstall"
+      CLEANUP_FAILED=true
+    fi
+
+    # Also clean any untracked files left by the uninstall process
+    # (only remove files in Loom-managed directories, not user files)
+    git -C "$TARGET_PATH" clean -fd .loom/ .claude/ .codex/ .github/labels.yml 2>/dev/null || true
+
+    # Verify the working tree is clean
+    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
+       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+      CLEANUP_FAILED=true
+    fi
+
+    if [[ "$CLEANUP_FAILED" == "true" ]]; then
+      echo ""
+      warning "Working tree may not be fully clean after uninstall cleanup"
+      warning "Remaining changes:"
+      git -C "$TARGET_PATH" status --short 2>/dev/null || true
+      echo ""
+      warning "To fix manually after installation:"
+      warning "  cd $TARGET_PATH"
+      warning "  git restore --staged ."
+      warning "  git checkout -- ."
+    else
+      success "Working tree is clean after uninstall cleanup"
+    fi
+
+    # Restore stashed user changes
+    if [[ "$STASHED_USER_CHANGES" == "true" ]]; then
+      info "Restoring stashed user changes..."
+      if git -C "$TARGET_PATH" stash pop 2>/dev/null; then
+        success "User changes restored"
+      else
+        warning "Failed to restore stashed user changes automatically"
+        warning "Run 'git stash pop' in $TARGET_PATH to recover your changes"
+      fi
+    fi
 
     echo ""
   else
@@ -850,8 +912,20 @@ if [[ "$PR_URL_RAW" == *"NO_CHANGES_NEEDED"* ]]; then
   # Since no changes are needed, we restore those files to their original state
   if [[ "$CLEAN_FIRST" == "true" ]]; then
     info "Restoring files staged by uninstall..."
-    git -C "$TARGET_PATH" restore --staged . 2>/dev/null || true
-    git -C "$TARGET_PATH" checkout -- . 2>/dev/null || true
+    if ! git -C "$TARGET_PATH" restore --staged . 2>/dev/null; then
+      warning "Failed to unstage changes - run 'git restore --staged .' in $TARGET_PATH"
+    fi
+    if ! git -C "$TARGET_PATH" checkout -- . 2>/dev/null; then
+      warning "Failed to restore files - run 'git checkout -- .' in $TARGET_PATH"
+    fi
+
+    # Verify cleanup
+    if ! git -C "$TARGET_PATH" diff --quiet 2>/dev/null || \
+       ! git -C "$TARGET_PATH" diff --staged --quiet 2>/dev/null; then
+      warning "Working tree still has changes after cleanup:"
+      git -C "$TARGET_PATH" status --short 2>/dev/null || true
+      warning "To fix: cd $TARGET_PATH && git restore --staged . && git checkout -- ."
+    fi
   fi
 
   # Disable error trap and exit successfully
@@ -885,6 +959,43 @@ fi
 MERGE_STATUS="${MERGE_STATUS:-manual}"
 
 success "Pull request created"
+echo ""
+
+# ============================================================================
+# Post-Install Verification: Ensure main working tree is clean
+# ============================================================================
+CURRENT_STEP="Verify Working Tree"
+header "Verifying main working directory..."
+echo ""
+
+cd "$TARGET_PATH"
+VERIFY_CLEAN=true
+
+# Check for staged changes
+if ! git diff --staged --quiet 2>/dev/null; then
+  VERIFY_CLEAN=false
+  warning "Main working directory has staged changes after installation"
+fi
+
+# Check for unstaged changes
+if ! git diff --quiet 2>/dev/null; then
+  VERIFY_CLEAN=false
+  warning "Main working directory has unstaged changes after installation"
+fi
+
+if [[ "$VERIFY_CLEAN" == "true" ]]; then
+  success "Main working directory is clean"
+else
+  echo ""
+  warning "Unexpected changes detected in main working directory:"
+  git status --short 2>/dev/null || true
+  echo ""
+  warning "To clean up manually:"
+  warning "  cd $TARGET_PATH"
+  warning "  git restore --staged ."
+  warning "  git checkout -- ."
+fi
+
 echo ""
 
 # ============================================================================
