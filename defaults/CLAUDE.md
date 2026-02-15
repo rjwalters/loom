@@ -39,6 +39,10 @@ Additional options for `install-loom.sh`:
 - `--force` or `-f`: Force overwrite existing files and enable auto-merge
 - `--clean`: Uninstall first, then fresh install
 
+## Critical Rules
+
+**Never use `gh pr merge`** — Always use `./.loom/scripts/merge-pr.sh <PR_NUMBER>` instead. The `gh pr merge` command attempts a local checkout which fails in worktrees. The merge script uses the GitHub API directly. A PreToolUse hook enforces this.
+
 ## Three-Layer Architecture
 
 Loom uses a three-layer orchestration architecture for scalable automation:
