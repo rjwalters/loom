@@ -38,6 +38,7 @@ class ShepherdContext:
     pr_number: int | None = None
     worktree_path: Path | None = None
     completed_phases: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     # Caches
     label_cache: LabelCache = field(init=False)
@@ -133,6 +134,7 @@ class ShepherdContext:
             text=True,
             capture_output=capture,
             check=check,
+            stdin=subprocess.DEVNULL,
         )
 
     def validate_issue(self) -> dict[str, Any]:
@@ -221,11 +223,12 @@ class ShepherdContext:
                 check=False,
             )
             if result.returncode == 0 and result.stdout.strip():
-                logger.warning(
-                    "Stale branch %s exists on remote. "
-                    "Previous attempt may have left artifacts.",
-                    branch_name,
+                msg = (
+                    f"Stale branch {branch_name} exists on remote. "
+                    "Previous attempt may have left artifacts."
                 )
+                logger.warning(msg)
+                self.warnings.append(msg)
         except OSError:
             # git not available or other OS error — skip the check
             pass

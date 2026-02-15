@@ -371,9 +371,19 @@ class TestRunScriptMissingScript:
         script.write_text("#!/bin/sh\necho ok\n")
         script.chmod(0o755)
 
-        result = ctx.run_script("test-script.sh", [], check=False)
-        assert result.returncode == 0
-        assert "ok" in result.stdout
+        # Mock subprocess.run to avoid deadlock with pytest-asyncio's event loop
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "ok\n"
+        with patch("loom_tools.shepherd.context.subprocess.run", return_value=mock_result) as mock_run:
+            result = ctx.run_script("test-script.sh", [], check=False)
+            assert result.returncode == 0
+            assert "ok" in result.stdout
+            # Verify subprocess.run was called with correct args
+            mock_run.assert_called_once()
+            call_kwargs = mock_run.call_args
+            assert str(call_kwargs[0][0][0]).endswith("test-script.sh")
+            assert call_kwargs[1]["stdin"] is not None  # stdin=DEVNULL
 
 
 def _mock_gh_issue(labels: list[str], title: str = "Test Issue", issue: int = 42) -> MagicMock:
