@@ -329,6 +329,10 @@ PR_NUMBER=$1
 
 echo "Attempting to merge PR #$PR_NUMBER..."
 
+# Ensure we're on main so .loom/scripts exists (issue #2289)
+# merge-pr.sh may not exist on PR branches checked out via gh pr checkout
+git checkout main 2>/dev/null || true
+
 # Use merge-pr.sh for worktree-safe merge via GitHub API
 # --auto enables auto-merge if ruleset requires wait
 ./.loom/scripts/merge-pr.sh "$PR_NUMBER" --auto || {

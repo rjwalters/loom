@@ -48,9 +48,14 @@ class MergePhase:
                     data={"merged": True},
                 )
             except FileNotFoundError as exc:
+                self._mark_issue_blocked(
+                    ctx,
+                    "script_not_found",
+                    f"merge-pr.sh not found on current branch or main: {exc}",
+                )
                 return PhaseResult(
                     status=PhaseStatus.FAILED,
-                    message=str(exc),
+                    message=f"merge-pr.sh not available: {exc}",
                     phase_name="merge",
                 )
             except subprocess.CalledProcessError:
