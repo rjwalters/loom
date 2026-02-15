@@ -185,7 +185,9 @@ pub fn clean_managed_dir(dst: &Path, prefix: &str, report: &mut InitReport) -> i
 
         if file_type.is_dir() {
             clean_managed_dir(&entry_path, &rel_path, report)?;
-            fs::remove_dir(&entry_path)?;
+            // Use remove_dir_all for robustness: handles unexpected files
+            // (e.g., .DS_Store, git metadata) that the recursive clean may miss
+            fs::remove_dir_all(&entry_path)?;
         } else {
             fs::remove_file(&entry_path)?;
             report.removed.push(rel_path);
