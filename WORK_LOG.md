@@ -6,6 +6,14 @@ Entries are grouped by date, newest first. Each entry references the merged PR o
 
 <!-- Maintained automatically by the Guide triage agent. Manual edits are fine but may be overwritten. -->
 
+### 2026-02-15
+
+- **PR #2254**: docs: update WORK_LOG and WORK_PLAN for installer bug triage
+- **PR #2252**: fix: ensure main working tree is clean after loom install
+- **PR #2251**: fix: prevent unsafe worktree removal during merge and agent destroy
+- **Issue #2245** (closed): Loom reinstall leaves working tree in broken state with uncommitted deletions
+- **Issue #2243** (closed): Worktree cleanup breaks shell when CWD is inside deleted worktree
+
 ### 2026-02-13
 
 - **PR #2242**: chore: bump version to v0.2.2

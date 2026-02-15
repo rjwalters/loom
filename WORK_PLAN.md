@@ -18,25 +18,18 @@ All 3 urgent issues are **installer bugs** discovered during reinstall testing. 
 
 Human-approved issues ready for implementation (`loom:issue`).
 
-- **#2248**: Fresh install gitignores .loom/config.json but previous install tracked it
+- **#2253**: App crashes on launch when daemon is unavailable (SIGABRT in did_finish_launching) — Tauri app crash on startup
+- **#2248**: Fresh install gitignores .loom/config.json but previous install tracked it — Git state conflict on upgrade
+- **#2246**: Reinstall uninstall step fails on non-empty worktree directories — Installer cleanup failure
+- **#2244**: Add dual-mode GitHub API layer with REST fallback — Infrastructure reliability improvement
 
 ## In Progress
 
-Issues actively being worked by builders (`loom:building`).
-
-- **#2245**: Loom reinstall leaves working tree in broken state with uncommitted deletions (PR #2252 in review)
-- **#2244**: Add dual-mode GitHub API layer with REST fallback (building, no PR yet)
-- **#2243**: Worktree cleanup breaks shell when CWD is inside deleted worktree (PR #2251 in review)
-
-## Under Curation
-
-- **#2246**: Reinstall uninstall step fails on non-empty worktree directories (`loom:curating`)
+No issues currently being built.
 
 ## Proposed
 
-Issues under evaluation (`loom:architect`, `loom:hermit`, `loom:curated`).
-
-*No proposed issues awaiting evaluation.*
+No issues awaiting evaluation.
 
 ## Epics
 
@@ -47,7 +40,7 @@ No active epics.
 | Tier | Count |
 |------|-------|
 | Tier 1 (goal-advancing) | 0 |
-| Tier 2 (goal-supporting) | 0 |
-| Tier 3 (maintenance) | 0 |
+| Tier 2 (goal-supporting) | 5 |
+| Tier 3 (maintenance) | 2 |
 
-**Note:** The current backlog is entirely installer-related bugs (7 issues total: 3 urgent, 1 ready, 1 curating, 2 building with PRs in review). This is a focused cluster of related problems discovered during reinstall testing on 2026-02-14. No tier labels have been assigned yet — all are bugs rather than feature work. Once the installer issues are resolved, the pipeline will need new proposals from Architect/Hermit to generate feature work.
+**Note:** The backlog is 7 issues total (3 urgent + 4 ready). Five are installer-related bugs, one is a Tauri crash bug, and one is an API infrastructure feature. No issues are currently building — the pipeline is idle and ready for builders. Tier labels have been assigned: installer and stability bugs as goal-supporting, upgrade edge cases as maintenance.
