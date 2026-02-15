@@ -42,6 +42,16 @@ TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
 # Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this
 WORKSPACE="${LOOM_WORKSPACE:-$(pwd 2>/dev/null || echo "$HOME")}"
 
+# Retry state file for external observability (see issue #2296).
+# When TERMINAL_ID is set, the wrapper writes its retry/backoff state to this
+# file so agent-wait-bg.sh and the shepherd can distinguish "wrapper retrying"
+# from "claude actively working".
+RETRY_STATE_DIR="${WORKSPACE}/.loom/retry-state"
+RETRY_STATE_FILE=""
+if [[ -n "${TERMINAL_ID}" ]]; then
+    RETRY_STATE_FILE="${RETRY_STATE_DIR}/${TERMINAL_ID}.json"
+fi
+
 # Logging helpers
 log_info() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*" >&2
@@ -53,6 +63,39 @@ log_warn() {
 
 log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2
+}
+
+# Write retry state to a JSON file for external observability (issue #2296).
+# Called when entering backoff or starting a new attempt so the shepherd
+# and agent-wait-bg.sh can see what the wrapper is doing.
+write_retry_state() {
+    if [[ -z "${RETRY_STATE_FILE}" ]]; then
+        return
+    fi
+    local status="$1"
+    local attempt="$2"
+    local last_error="${3:-}"
+    local next_retry_at="${4:-}"
+
+    mkdir -p "${RETRY_STATE_DIR}"
+    cat > "${RETRY_STATE_FILE}" <<EOJSON
+{
+  "status": "${status}",
+  "attempt": ${attempt},
+  "max_retries": ${MAX_RETRIES},
+  "last_error": $(printf '%s' "${last_error}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""'),
+  "next_retry_at": "${next_retry_at}",
+  "terminal_id": "${TERMINAL_ID}",
+  "updated_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+}
+EOJSON
+}
+
+# Remove the retry state file on exit (success or permanent failure).
+clear_retry_state() {
+    if [[ -n "${RETRY_STATE_FILE}" ]] && [[ -f "${RETRY_STATE_FILE}" ]]; then
+        rm -f "${RETRY_STATE_FILE}"
+    fi
 }
 
 # Recover from deleted working directory
@@ -465,6 +508,7 @@ run_with_retry() {
         fi
 
         log_info "Attempt ${attempt}/${MAX_RETRIES}: Starting Claude CLI"
+        write_retry_state "running" "${attempt}"
 
         # Run Claude CLI, capturing both stdout and stderr
         # We need to capture output while also displaying it in real-time
@@ -511,6 +555,7 @@ run_with_retry() {
         # Check exit code
         if [[ "${exit_code}" -eq 0 ]]; then
             log_info "Claude CLI completed successfully"
+            clear_retry_state
             return 0
         fi
 
@@ -520,6 +565,7 @@ run_with_retry() {
         if ! is_transient_error "${output}" "${exit_code}"; then
             log_error "Non-transient error detected - not retrying"
             log_error "Output: ${output}"
+            clear_retry_state
             return "${exit_code}"
         fi
 
@@ -535,6 +581,14 @@ run_with_retry() {
 
         if [[ "${attempt}" -lt "${MAX_RETRIES}" ]]; then
             log_warn "Transient error detected. Waiting $(format_duration "${wait_time}") before retry..."
+
+            # Truncate error output for the retry state file (first 200 chars)
+            local error_snippet="${output:0:200}"
+            local next_retry_ts
+            next_retry_ts=$(date -u -v+"${wait_time}"S '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                || date -u -d "+${wait_time} seconds" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
+                || echo "")
+            write_retry_state "backoff" "${attempt}" "${error_snippet}" "${next_retry_ts}"
 
             # Sleep with periodic stop signal checks
             local elapsed=0
@@ -555,6 +609,7 @@ run_with_retry() {
 
     log_error "Max retries (${MAX_RETRIES}) exceeded"
     log_error "Last error: ${output}"
+    clear_retry_state
     return 1
 }
 
@@ -579,6 +634,9 @@ run_preflight_checks() {
 
 # Main entry point
 main() {
+    # Ensure retry state file is cleaned up on exit (normal or abnormal)
+    trap clear_retry_state EXIT
+
     log_info "Claude wrapper starting"
     log_info "Arguments: $*"
     log_info "Workspace: ${WORKSPACE}"

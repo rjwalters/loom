@@ -57,6 +57,7 @@ Thumbs.db
 .loom/signals/
 .loom/status/
 .loom/progress/
+.loom/retry-state/
 .loom/diagnostics/
 .loom/guide-docs-state.json
 .loom/metrics_state.json
