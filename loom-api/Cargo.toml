@@ -16,7 +16,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-tempfile = "3.24"
+tempfile = "3.25"
 tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
