@@ -9,6 +9,7 @@ import {
   isDashboardVisible,
   showIntelligenceDashboard,
 } from "./intelligence-dashboard";
+import * as promptOptimization from "./prompt-optimization";
 import { AppState, setAppState } from "./state";
 
 // Mock localStorage before any imports that might use it
@@ -42,6 +43,19 @@ vi.mock("./agent-metrics", () => ({
   getTrendIcon: vi.fn((t) =>
     t === "improving" ? "\u2191" : t === "declining" ? "\u2193" : "\u2192"
   ),
+}));
+
+vi.mock("./prompt-optimization", () => ({
+  getOptimizationStats: vi.fn(),
+  getOptimizationTypeName: vi.fn((type: string) => {
+    const names: Record<string, string> = {
+      length: "Length Adjustment",
+      specificity: "Specificity Enhancement",
+      structure: "Structure Improvement",
+      pattern: "Pattern Matching",
+    };
+    return names[type] ?? type;
+  }),
 }));
 
 vi.mock("./logger", () => ({
@@ -100,6 +114,15 @@ describe("Intelligence Dashboard", () => {
     vi.mocked(agentMetrics.getAgentMetrics).mockResolvedValue(mockMetrics);
     vi.mocked(agentMetrics.getMetricsByRole).mockResolvedValue(mockRoleMetrics);
     vi.mocked(agentMetrics.getVelocitySummary).mockResolvedValue(mockVelocity);
+    vi.mocked(promptOptimization.getOptimizationStats).mockResolvedValue({
+      total_suggestions: 0,
+      accepted_suggestions: 0,
+      rejected_suggestions: 0,
+      pending_suggestions: 0,
+      acceptance_rate: 0,
+      avg_improvement_when_accepted: 0,
+      suggestions_by_type: [],
+    });
   });
 
   afterEach(() => {
