@@ -29,10 +29,9 @@ from loom_tools.shepherd.phases.base import (
     INSTANT_EXIT_BACKOFF_SECONDS,
     INSTANT_EXIT_MAX_RETRIES,
     INSTANT_EXIT_MIN_OUTPUT_CHARS,
-    INSTANT_EXIT_THRESHOLD_SECONDS,
     MCP_FAILURE_BACKOFF_SECONDS,
-    MCP_FAILURE_DURATION_THRESHOLD,
     MCP_FAILURE_MAX_RETRIES,
+    MCP_FAILURE_MIN_OUTPUT_CHARS,
     _is_instant_exit,
     _is_mcp_failure,
     _print_heartbeat,
@@ -9836,37 +9835,28 @@ class TestIsInstantExit:
         """Missing log file should not be flagged as instant exit."""
         assert _is_instant_exit(tmp_path / "nonexistent.log") is False
 
-    def test_short_session_no_output_returns_true(self, tmp_path: Path) -> None:
-        """Log with <5s duration and minimal content is an instant exit."""
+    def test_no_output_returns_true(self, tmp_path: Path) -> None:
+        """Log with only ANSI escape sequences is an instant exit."""
         log = tmp_path / "session.log"
         # Write only ANSI escape sequences (no meaningful content)
         log.write_text("\x1b[?2026l\x1b[0m\n")
-        # File ctime and mtime will be nearly identical (0s apart)
         assert _is_instant_exit(log) is True
 
-    def test_short_session_with_output_returns_false(self, tmp_path: Path) -> None:
-        """Log with <5s duration but meaningful content is NOT an instant exit."""
+    def test_meaningful_output_returns_false(self, tmp_path: Path) -> None:
+        """Log with meaningful content is NOT an instant exit."""
         log = tmp_path / "session.log"
         # Write enough meaningful content to exceed threshold
         log.write_text("x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1))
         assert _is_instant_exit(log) is False
 
-    def test_long_session_no_output_returns_false(self, tmp_path: Path) -> None:
-        """Log with >=5s duration but empty content is NOT an instant exit.
-
-        This tests that the duration check happens first (short-circuit).
-        """
-        import os
-
+    def test_header_only_returns_true(self, tmp_path: Path) -> None:
+        """Log with only header lines is an instant exit."""
         log = tmp_path / "session.log"
-        log.write_text("\x1b[?2026l")
-        # Fake a 10-second session by backdating the ctime via atime/mtime
-        stat = log.stat()
-        os.utime(log, (stat.st_atime, stat.st_mtime + 10))
-        assert _is_instant_exit(log) is False
+        log.write_text("# Loom Agent Log\n# Session: test\n")
+        assert _is_instant_exit(log) is True
 
     def test_empty_log_returns_true(self, tmp_path: Path) -> None:
-        """Completely empty log with 0s duration is an instant exit."""
+        """Completely empty log is an instant exit."""
         log = tmp_path / "session.log"
         log.write_text("")
         assert _is_instant_exit(log) is True
@@ -10499,7 +10489,7 @@ class TestIsMcpFailure:
         assert _is_mcp_failure(tmp_path / "nonexistent.log") is False
 
     def test_log_with_mcp_failure_pattern_returns_true(self, tmp_path: Path) -> None:
-        """Log containing 'MCP server failed' should be flagged."""
+        """Log containing 'MCP server failed' with minimal output should be flagged."""
         log = tmp_path / "session.log"
         log.write_text("bypasspermissionson · 1 MCP server failed · /mcp\n")
         assert _is_mcp_failure(log) is True
@@ -10537,55 +10527,50 @@ class TestIsMcpFailure:
     def test_productive_session_with_mcp_pattern_returns_false(
         self, tmp_path: Path
     ) -> None:
-        """Long-running session with MCP status-bar text should NOT be flagged.
+        """Session with substantial output and MCP status-bar text should NOT be flagged.
 
-        This is the false-positive scenario from issue #2374: the builder
+        This is the false-positive scenario from issues #2374/#2381: the builder
         runs for minutes doing real work, but the Claude CLI status bar
         shows '1 MCP server failed', triggering a spurious retry.
+        The output volume gate (not duration) correctly filters these.
         """
         log = tmp_path / "session.log"
+        # Generate enough output to exceed MCP_FAILURE_MIN_OUTPUT_CHARS
+        productive_output = "Implementing feature for issue #42...\n" * 30
         log.write_text(
             "Claude CLI started. Loading /builder skill.\n"
             "bypasspermissionson · 1 MCP server failed · /mcp\n"
-            "Running git log --oneline -20 main\n"
-            "Implementing feature for issue #42...\n"
+            f"{productive_output}"
         )
-        # Simulate a session that ran for well over the threshold
-        stat = log.stat()
-        os.utime(log, (stat.st_atime, stat.st_mtime + MCP_FAILURE_DURATION_THRESHOLD + 60))
+        assert len(productive_output) >= MCP_FAILURE_MIN_OUTPUT_CHARS
         assert _is_mcp_failure(log) is False
 
-    def test_short_session_with_mcp_pattern_returns_true(
+    def test_minimal_output_with_mcp_pattern_returns_true(
         self, tmp_path: Path
     ) -> None:
-        """Short-lived session with MCP pattern IS a real MCP failure."""
+        """Session with minimal output and MCP pattern IS a real MCP failure."""
         log = tmp_path / "session.log"
         log.write_text("1 MCP server failed\n")
-        # File just created: ctime == mtime, duration 0 < threshold
         assert _is_mcp_failure(log) is True
 
-    def test_session_above_threshold_returns_false(
+    def test_header_lines_excluded_from_output_volume(
         self, tmp_path: Path
     ) -> None:
-        """Session clearly above the duration threshold should NOT be flagged."""
+        """Header lines (starting with #) should not count toward output volume."""
         log = tmp_path / "session.log"
-        log.write_text("1 MCP server failed\n")
-        stat = log.stat()
-        # Use threshold + 5 to safely clear any floating-point rounding
-        # from os.utime updating st_ctime.
-        os.utime(log, (stat.st_atime, stat.st_mtime + MCP_FAILURE_DURATION_THRESHOLD + 5))
+        # Lots of header lines but minimal non-header content
+        headers = "# Loom Agent Log\n# Session: test\n" * 50
+        log.write_text(f"{headers}1 MCP server failed\n")
+        assert _is_mcp_failure(log) is True
+
+    def test_substantial_non_header_output_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        """Session with enough non-header output should NOT be flagged."""
+        log = tmp_path / "session.log"
+        real_work = "x" * MCP_FAILURE_MIN_OUTPUT_CHARS
+        log.write_text(f"# Header\n{real_work}\n1 MCP server failed\n")
         assert _is_mcp_failure(log) is False
-
-    def test_session_well_below_threshold_returns_true(
-        self, tmp_path: Path
-    ) -> None:
-        """Session well below the duration threshold should be flagged."""
-        log = tmp_path / "session.log"
-        log.write_text("1 MCP server failed\n")
-        stat = log.stat()
-        # 10 seconds is well below the 30-second threshold
-        os.utime(log, (stat.st_atime, stat.st_mtime + 10))
-        assert _is_mcp_failure(log) is True
 
 
 class TestRunWorkerPhaseMcpFailure:
