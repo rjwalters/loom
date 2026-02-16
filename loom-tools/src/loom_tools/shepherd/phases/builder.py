@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -85,6 +86,26 @@ _BUILD_ARTIFACT_PATTERNS: list[str] = [
     "pnpm-lock.yaml",
     ".venv",
 ]
+
+
+def _build_worktree_env(worktree_path: Path | None) -> dict[str, str] | None:
+    """Build environment with PYTHONPATH set for worktree imports.
+
+    When running pytest in a worktree, the editable install's .pth file
+    causes Python to resolve imports from the main repo instead of the
+    worktree's modified source. Prepending the worktree's loom-tools/src
+    to PYTHONPATH ensures imports resolve from the worktree first.
+
+    Returns None if no override is needed (non-worktree or no loom-tools/src).
+    """
+    if worktree_path is None:
+        return None
+    worktree_src = worktree_path / "loom-tools" / "src"
+    if not worktree_src.is_dir():
+        return None
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{worktree_src}:{env.get('PYTHONPATH', '')}"
+    return env
 
 
 class BuilderPhase:
@@ -1303,6 +1324,7 @@ class BuilderPhase:
                     capture_output=True,
                     timeout=_TEST_VERIFY_TIMEOUT,
                     check=False,
+                    env=_build_worktree_env(ctx.worktree_path),
                 )
             except subprocess.TimeoutExpired:
                 elapsed = int(time.time() - test_start)
@@ -1629,6 +1651,7 @@ class BuilderPhase:
                 capture_output=True,
                 timeout=_TEST_VERIFY_TIMEOUT,
                 check=False,
+                env=_build_worktree_env(ctx.worktree_path),
             )
         except subprocess.TimeoutExpired:
             elapsed = int(time.time() - test_start)
@@ -1814,6 +1837,7 @@ class BuilderPhase:
                 capture_output=True,
                 timeout=_TEST_VERIFY_TIMEOUT,
                 check=False,
+                env=_build_worktree_env(ctx.worktree_path),
             )
         except subprocess.TimeoutExpired:
             elapsed = int(time.time() - test_start)

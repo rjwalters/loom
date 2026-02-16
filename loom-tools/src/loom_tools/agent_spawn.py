@@ -599,6 +599,16 @@ def spawn_agent(
     _tmux("set-environment", "-t", session_name, "CLAUDE_CONFIG_DIR", str(config_dir))
     _tmux("set-environment", "-t", session_name, "TMPDIR", str(config_dir / "tmp"))
 
+    # Set PYTHONPATH so pytest in worktrees resolves imports from the worktree's
+    # source instead of the main repo's editable install (see issue #2358)
+    worktree_src = working_dir / "loom-tools" / "src"
+    pythonpath_prefix = ""
+    if worktree_src.is_dir():
+        existing = os.environ.get("PYTHONPATH", "")
+        pythonpath_val = f"{worktree_src}:{existing}" if existing else str(worktree_src)
+        _tmux("set-environment", "-t", session_name, "PYTHONPATH", pythonpath_val)
+        pythonpath_prefix = f"PYTHONPATH='{pythonpath_val}' "
+
     # Build the role slash command
     role_cmd = f"/{role}"
     if args:
@@ -608,6 +618,7 @@ def spawn_agent(
     wrapper_script = repo_root / ".loom" / "scripts" / "claude-wrapper.sh"
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
         claude_cmd = (
+            f"{pythonpath_prefix}"
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
             f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
             f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""
