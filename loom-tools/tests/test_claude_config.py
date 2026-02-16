@@ -8,6 +8,7 @@ import pytest
 
 from loom_tools.common.claude_config import (
     _SHARED_CONFIG_FILES,
+    _keychain_service_name,
     _resolve_state_file,
     cleanup_agent_config_dir,
     cleanup_all_agent_config_dirs,
@@ -168,6 +169,28 @@ class TestResolveStateFile:
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
         # Returns the fallback path even if it doesn't exist
         assert _resolve_state_file() == fake_home / ".claude.json"
+
+
+class TestKeychainServiceName:
+    """Tests for _keychain_service_name."""
+
+    def test_produces_deterministic_hash(self) -> None:
+        name1 = _keychain_service_name(pathlib.Path("/some/config/dir"))
+        name2 = _keychain_service_name(pathlib.Path("/some/config/dir"))
+        assert name1 == name2
+
+    def test_different_dirs_produce_different_names(self) -> None:
+        name1 = _keychain_service_name(pathlib.Path("/dir/agent-1"))
+        name2 = _keychain_service_name(pathlib.Path("/dir/agent-2"))
+        assert name1 != name2
+
+    def test_format_matches_claude_code(self) -> None:
+        """Service name format: 'Claude Code-credentials-<8hex>'."""
+        name = _keychain_service_name(pathlib.Path("/any/path"))
+        assert name.startswith("Claude Code-credentials-")
+        suffix = name.split("-")[-1]
+        assert len(suffix) == 8
+        int(suffix, 16)  # Should be valid hex
 
 
 class TestCleanupAgentConfigDir:
