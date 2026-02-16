@@ -303,6 +303,50 @@ check_cli_available() {
     return 0
 }
 
+# Pre-flight check: verify authentication status
+# Uses `claude auth status --json` to confirm the CLI is logged in.
+# When CLAUDE_CONFIG_DIR is set, passes it through so the check uses
+# the same config the session will use.
+check_auth_status() {
+    local auth_output
+    local auth_exit_code
+
+    # Unset CLAUDECODE to avoid nested-session guard when running inside
+    # a Claude Code session (e.g., during testing or shepherd-spawned builds).
+    auth_output=$(CLAUDECODE='' claude auth status --json 2>&1) || auth_exit_code=$?
+    auth_exit_code="${auth_exit_code:-0}"
+
+    if [[ "${auth_exit_code}" -ne 0 ]]; then
+        log_error "Authentication check command failed (exit ${auth_exit_code})"
+        log_error "Output: ${auth_output}"
+        if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+            log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+            log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
+        else
+            log_error "Run: claude auth login"
+        fi
+        return 1
+    fi
+
+    # Parse the loggedIn field from JSON output
+    local logged_in
+    logged_in=$(echo "${auth_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
+
+    if [[ "${logged_in}" != "True" ]]; then
+        log_error "Authentication check failed: not logged in"
+        if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+            log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+            log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
+        else
+            log_error "Run: claude auth login"
+        fi
+        return 1
+    fi
+
+    log_info "Authentication check passed (logged in)"
+    return 0
+}
+
 # Pre-flight check: verify API is reachable
 # Uses a lightweight HEAD request to api.anthropic.com
 check_api_reachable() {
@@ -622,6 +666,11 @@ run_preflight_checks() {
     fi
 
     check_api_reachable  # Non-fatal, just logs
+
+    if ! check_auth_status; then
+        log_error "Authentication pre-flight check failed"
+        return 1
+    fi
 
     if ! check_mcp_server; then
         log_error "MCP server pre-flight check failed"
