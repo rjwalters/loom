@@ -157,6 +157,9 @@ class ShepherdConfig:
     doctor_timeout: int = field(
         default_factory=lambda: env_int("LOOM_DOCTOR_TIMEOUT", 3600)
     )
+    doctor_test_fix_timeout: int = field(
+        default_factory=lambda: env_int("LOOM_DOCTOR_TEST_FIX_TIMEOUT", 600)
+    )
     poll_interval: int = field(
         default_factory=lambda: env_int("LOOM_POLL_INTERVAL", 5)
     )

@@ -690,12 +690,12 @@ class DoctorPhase:
         else:
             args = f"--test-fix {ctx.config.issue}"
 
-        # Run doctor worker with retry
+        # Run doctor worker with retry (shorter timeout for focused test-fix)
         exit_code = run_phase_with_retry(
             ctx,
             role="doctor",
             name=f"doctor-test-fix-{ctx.config.issue}",
-            timeout=ctx.config.doctor_timeout,
+            timeout=ctx.config.doctor_test_fix_timeout,
             max_retries=ctx.config.stuck_max_retries,
             phase="doctor",
             worktree=ctx.worktree_path,
@@ -710,8 +710,23 @@ class DoctorPhase:
             )
 
         if exit_code == 4:
-            # Doctor stuck - diagnose what was accomplished
+            # Doctor stuck - check if it made commits before getting stuck
             diagnostics = self._diagnose_doctor_outcome(ctx, commits_before)
+            if diagnostics.made_progress:
+                log_info(
+                    "[doctor-test-fix] subprocess stuck but commits detected"
+                    " - treating as success"
+                )
+                ctx.report_milestone(
+                    "heartbeat",
+                    action="doctor-test-fix stuck but committed fix, treating as success",
+                )
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message="doctor applied test fixes (subprocess hung after commit)",
+                    phase_name="doctor",
+                    data=diagnostics.to_dict(),
+                )
             return PhaseResult(
                 status=PhaseStatus.STUCK,
                 message="doctor stuck during test-fix after retry",
