@@ -1144,6 +1144,9 @@ def _run_reflection(
         log_info(f"Skipping reflection phase ({reason})")
         return
 
+    # Best-effort: read builder log for error extraction
+    log_content = _read_builder_log(ctx)
+
     summary = RunSummary(
         issue=ctx.config.issue,
         issue_title=ctx.issue_title,
@@ -1157,6 +1160,7 @@ def _run_reflection(
         doctor_attempts=doctor_attempts,
         test_fix_attempts=test_fix_attempts,
         warnings=warnings or [],
+        log_content=log_content,
     )
 
     try:
@@ -1165,6 +1169,24 @@ def _run_reflection(
         reflection.run(ctx)
     except Exception as exc:
         log_warning(f"Reflection phase failed (non-fatal): {exc}")
+
+
+def _read_builder_log(ctx: ShepherdContext) -> str:
+    """Read the builder log file for error extraction (best-effort).
+
+    Returns the last portion of the log file, or empty string if unavailable.
+    """
+    from pathlib import Path
+
+    try:
+        log_path = Path(ctx.repo_root) / ".loom" / "logs" / f"loom-builder-issue-{ctx.config.issue}.log"
+        if not log_path.is_file():
+            return ""
+        content = log_path.read_text(errors="replace")
+        # Return the last 10KB to keep memory bounded while capturing errors
+        return content[-10240:] if len(content) > 10240 else content
+    except (OSError, TypeError):
+        return ""
 
 
 def _mark_builder_test_failure(ctx: ShepherdContext) -> None:

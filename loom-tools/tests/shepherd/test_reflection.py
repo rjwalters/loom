@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -12,14 +13,16 @@ from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import PhaseStatus
 from loom_tools.shepherd.phases.reflection import (
+    DUPLICATE_RECENCY_DAYS,
     HIGH_RETRY_THRESHOLD,
     REFLECTION_ISSUE_LABEL,
-    SLOW_PHASE_THRESHOLD_SECONDS,
     TITLE_PREFIX,
     UPSTREAM_REPO,
     Finding,
     ReflectionPhase,
     RunSummary,
+    _extract_error_context,
+    _is_recent_duplicate,
 )
 
 
@@ -76,13 +79,29 @@ class TestReflectionPhaseAnalysis:
         findings = phase._analyze_run(clean_summary)
         assert len(findings) == 0
 
-    def test_detects_slow_phase(self, clean_summary: RunSummary) -> None:
-        clean_summary.phase_durations["Builder"] = SLOW_PHASE_THRESHOLD_SECONDS + 100
+    def test_no_slow_phase_finding(self, clean_summary: RunSummary) -> None:
+        """slow_phase category has been removed — slow phases should not produce findings."""
+        clean_summary.phase_durations["Builder"] = 600
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
         slow_findings = [f for f in findings if f.category == "slow_phase"]
-        assert len(slow_findings) == 1
-        assert "Builder" in slow_findings[0].title
+        assert len(slow_findings) == 0
+
+    def test_no_missing_baseline_finding(self, clean_summary: RunSummary) -> None:
+        """missing_baseline category has been removed."""
+        clean_summary.warnings = ["No baseline health cache found"]
+        phase = ReflectionPhase(run_summary=clean_summary)
+        findings = phase._analyze_run(clean_summary)
+        baseline_findings = [f for f in findings if f.category == "missing_baseline"]
+        assert len(baseline_findings) == 0
+
+    def test_no_stale_artifacts_finding(self, clean_summary: RunSummary) -> None:
+        """stale_artifacts category has been removed."""
+        clean_summary.warnings = ["Stale branch feature/issue-42 exists on remote"]
+        phase = ReflectionPhase(run_summary=clean_summary)
+        findings = phase._analyze_run(clean_summary)
+        stale_findings = [f for f in findings if f.category == "stale_artifacts"]
+        assert len(stale_findings) == 0
 
     def test_detects_excessive_judge_retries(self, clean_summary: RunSummary) -> None:
         clean_summary.judge_retries = HIGH_RETRY_THRESHOLD
@@ -112,44 +131,142 @@ class TestReflectionPhaseAnalysis:
         assert len(retry_findings) == 1
         assert "test-fix" in retry_findings[0].title.lower()
 
-    def test_detects_builder_failure(self, clean_summary: RunSummary) -> None:
-        clean_summary.exit_code = 1  # BUILDER_FAILED
+    def test_builder_failure_with_diagnostics(self, clean_summary: RunSummary) -> None:
+        """builder_failure finding includes extracted error context."""
+        clean_summary.exit_code = 1
+        clean_summary.log_content = (
+            "some output\n"
+            "Traceback (most recent call last):\n"
+            '  File "foo.py", line 10, in main\n'
+            "ImportError: No module named 'missing_module'\n"
+            "more output\n"
+        )
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
         failure_findings = [f for f in findings if f.category == "builder_failure"]
         assert len(failure_findings) == 1
         assert failure_findings[0].severity == "bug"
+        assert "ImportError" in failure_findings[0].details
 
-    def test_detects_stale_artifacts(self, clean_summary: RunSummary) -> None:
-        clean_summary.warnings = ["Stale branch feature/issue-42 exists on remote"]
+    def test_builder_failure_skipped_without_log_content(
+        self, clean_summary: RunSummary
+    ) -> None:
+        """builder_failure is NOT filed when no error can be extracted."""
+        clean_summary.exit_code = 1
+        clean_summary.log_content = ""
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
-        stale_findings = [f for f in findings if f.category == "stale_artifacts"]
-        assert len(stale_findings) == 1
+        failure_findings = [f for f in findings if f.category == "builder_failure"]
+        assert len(failure_findings) == 0
 
-    def test_detects_missing_baseline(self, clean_summary: RunSummary) -> None:
-        clean_summary.warnings = ["No baseline health cache found"]
+    def test_builder_failure_skipped_with_unparseable_log(
+        self, clean_summary: RunSummary
+    ) -> None:
+        """builder_failure is NOT filed when log has no actionable errors."""
+        clean_summary.exit_code = 1
+        clean_summary.log_content = "INFO: Starting build\nINFO: Build complete\n"
         phase = ReflectionPhase(run_summary=clean_summary)
         findings = phase._analyze_run(clean_summary)
-        baseline_findings = [
-            f for f in findings if f.category == "missing_baseline"
-        ]
-        assert len(baseline_findings) == 1
-
-    def test_multiple_findings(self, clean_summary: RunSummary) -> None:
-        clean_summary.phase_durations["Judge"] = 600
-        clean_summary.judge_retries = 3
-        clean_summary.warnings = ["Stale branch exists"]
-        phase = ReflectionPhase(run_summary=clean_summary)
-        findings = phase._analyze_run(clean_summary)
-        assert len(findings) >= 3
+        failure_findings = [f for f in findings if f.category == "builder_failure"]
+        assert len(failure_findings) == 0
 
 
-class TestReflectionPhaseDuplicateCheck:
-    """Test duplicate issue detection."""
+class TestErrorExtraction:
+    """Test _extract_error_context helper."""
+
+    def test_empty_log(self) -> None:
+        assert _extract_error_context("") == ""
+
+    def test_python_traceback(self) -> None:
+        log = (
+            "some preamble\n"
+            "Traceback (most recent call last):\n"
+            '  File "foo.py", line 1\n'
+            "ImportError: no module\n"
+            "trailing text\n"
+        )
+        result = _extract_error_context(log)
+        assert "Traceback" in result
+        assert "ImportError" in result
+
+    def test_rust_error(self) -> None:
+        log = "error[E0277]: the trait bound is not satisfied\n  --> src/main.rs:5\n\n"
+        result = _extract_error_context(log)
+        assert "error[E0277]" in result
+
+    def test_typescript_error(self) -> None:
+        log = "src/app.ts(5,3): error TS2304: Cannot find name 'foo'.\n"
+        result = _extract_error_context(log)
+        assert "error TS2304" in result
+
+    def test_git_fatal(self) -> None:
+        log = "fatal: not a git repository (or any parent up to mount point /)\n"
+        result = _extract_error_context(log)
+        assert "fatal:" in result
+
+    def test_generic_error(self) -> None:
+        log = "Error: something went wrong\n"
+        result = _extract_error_context(log)
+        assert "Error:" in result
+
+    def test_no_error_pattern(self) -> None:
+        log = "INFO: all good\nDEBUG: done\n"
+        assert _extract_error_context(log) == ""
+
+    def test_truncation(self) -> None:
+        log = "Traceback (most recent call last):\n" + "x" * 2000 + "\nValueError: big\n"
+        result = _extract_error_context(log)
+        assert "truncated" in result
+
+
+class TestRecursiveReflectionGuard:
+    """Test that reflection doesn't file issues about reflection issues."""
 
     @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
-    def test_skips_when_duplicate_exists(
+    def test_skips_when_source_is_reflection_issue(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        clean_summary.issue_title = "[shepherd-reflection] Builder failed to create PR"
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+            severity="bug",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        assert phase._should_file_issue(finding, mock_context) is False
+        # subprocess.run should never be called (skipped before search)
+        mock_run.assert_not_called()
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_does_not_skip_normal_issue(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        clean_summary.issue_title = "Normal issue title"
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([]),
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        assert phase._should_file_issue(finding, mock_context) is True
+
+
+class TestDuplicateDetection:
+    """Test duplicate issue detection with stable titles."""
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_skips_when_open_duplicate_exists(
         self,
         mock_run: MagicMock,
         mock_context: MagicMock,
@@ -157,15 +274,72 @@ class TestReflectionPhaseDuplicateCheck:
     ) -> None:
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout=json.dumps([{"number": 100, "title": "existing issue"}]),
+            stdout=json.dumps([{
+                "number": 100,
+                "title": "[shepherd-reflection] Builder failed to create PR",
+                "closedAt": None,
+            }]),
         )
         finding = Finding(
-            category="slow_phase",
-            title="Slow Builder phase",
+            category="builder_failure",
+            title="Builder failed to create PR",
             details="details",
         )
         phase = ReflectionPhase(run_summary=clean_summary)
         assert phase._should_file_issue(finding, mock_context) is False
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_skips_when_recently_closed_duplicate_exists(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        recently_closed = (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).isoformat()
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([{
+                "number": 100,
+                "title": "[shepherd-reflection] Builder failed to create PR",
+                "closedAt": recently_closed,
+            }]),
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        assert phase._should_file_issue(finding, mock_context) is False
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_files_when_old_closed_duplicate(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        """Closed more than DUPLICATE_RECENCY_DAYS ago — OK to refile."""
+        old_closed = (
+            datetime.now(timezone.utc) - timedelta(days=DUPLICATE_RECENCY_DAYS + 1)
+        ).isoformat()
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([{
+                "number": 100,
+                "title": "[shepherd-reflection] Builder failed to create PR",
+                "closedAt": old_closed,
+            }]),
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        assert phase._should_file_issue(finding, mock_context) is True
 
     @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
     def test_files_when_no_duplicate(
@@ -178,15 +352,129 @@ class TestReflectionPhaseDuplicateCheck:
             returncode=0,
             stdout=json.dumps([]),
         )
-        from loom_tools.shepherd.phases.reflection import Finding
-
         finding = Finding(
-            category="slow_phase",
-            title="Slow Builder phase",
+            category="builder_failure",
+            title="Builder failed to create PR",
             details="details",
         )
         phase = ReflectionPhase(run_summary=clean_summary)
         assert phase._should_file_issue(finding, mock_context) is True
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_searches_all_states(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        """Verify the gh issue list call uses --state all."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([]),
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        phase._should_file_issue(finding, mock_context)
+
+        call_args = mock_run.call_args[0][0]
+        state_idx = call_args.index("--state")
+        assert call_args[state_idx + 1] == "all"
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_searches_by_stable_title(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        """Verify the search query uses the stable title, not category."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout=json.dumps([]),
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        phase._should_file_issue(finding, mock_context)
+
+        call_args = mock_run.call_args[0][0]
+        search_idx = call_args.index("--search")
+        search_query = call_args[search_idx + 1]
+        assert search_query == f"{TITLE_PREFIX} Builder failed to create PR"
+
+
+class TestIsRecentDuplicate:
+    """Test _is_recent_duplicate helper directly."""
+
+    def test_open_issue_is_duplicate(self) -> None:
+        issue = {
+            "title": "[shepherd-reflection] Builder failed to create PR",
+            "closedAt": None,
+        }
+        assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is True
+
+    def test_recently_closed_is_duplicate(self) -> None:
+        closed = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        issue = {
+            "title": "[shepherd-reflection] Builder failed to create PR",
+            "closedAt": closed,
+        }
+        assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is True
+
+    def test_old_closed_is_not_duplicate(self) -> None:
+        closed = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        issue = {
+            "title": "[shepherd-reflection] Builder failed to create PR",
+            "closedAt": closed,
+        }
+        assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is False
+
+    def test_unrelated_title_is_not_duplicate(self) -> None:
+        issue = {
+            "title": "Completely unrelated issue",
+            "closedAt": None,
+        }
+        assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is False
+
+
+class TestStableTitles:
+    """Test that filed issues use stable titles without variable data."""
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_title_has_no_variable_suffix(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        """Filed title should be stable (e.g., no '(358s)' suffix)."""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="https://github.com/rjwalters/loom/issues/999\n",
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+            severity="bug",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        phase._file_upstream_issue(finding, clean_summary, mock_context)
+
+        call_args = mock_run.call_args[0][0]
+        title_idx = call_args.index("--title")
+        title = call_args[title_idx + 1]
+        assert title == "[shepherd-reflection] Builder failed to create PR"
+        # No variable data like durations
+        assert "(" not in title
+        assert "s)" not in title
 
 
 class TestReflectionPhaseFileUpstream:
@@ -244,7 +532,9 @@ class TestReflectionPhaseRun:
         mock_context: MagicMock,
         clean_summary: RunSummary,
     ) -> None:
-        clean_summary.exit_code = 1  # Builder failure triggers a finding
+        # Builder failure with error context triggers a finding
+        clean_summary.exit_code = 1
+        clean_summary.log_content = "Error: something broke\n"
         phase = ReflectionPhase(run_summary=clean_summary)
         result = phase.run(mock_context)
         assert result.status == PhaseStatus.SUCCESS
