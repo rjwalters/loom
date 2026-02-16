@@ -36,6 +36,7 @@ Thumbs.db
 # Loom runtime state (don't commit these)
 .loom-in-use
 .loom-checkpoint
+.loom-test-failure-context.json
 .loom/.daemon.pid
 .loom/.daemon.log
 .loom/daemon.sock
