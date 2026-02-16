@@ -28,6 +28,9 @@ UPSTREAM_REPO = "rjwalters/loom"
 # Title prefix for searchability
 TITLE_PREFIX = "[shepherd-reflection]"
 
+# Label applied to reflection-filed issues (goes through normal triage pipeline)
+REFLECTION_ISSUE_LABEL = "loom:triage"
+
 
 @dataclass
 class Finding:
@@ -301,7 +304,7 @@ class ReflectionPhase(BasePhase):
                     "--title",
                     title,
                     "--label",
-                    finding.severity,
+                    REFLECTION_ISSUE_LABEL,
                     "--body",
                     body,
                 ],
