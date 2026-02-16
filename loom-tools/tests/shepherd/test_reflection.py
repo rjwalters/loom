@@ -13,9 +13,11 @@ from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import PhaseStatus
 from loom_tools.shepherd.phases.reflection import (
     HIGH_RETRY_THRESHOLD,
+    REFLECTION_ISSUE_LABEL,
     SLOW_PHASE_THRESHOLD_SECONDS,
     TITLE_PREFIX,
     UPSTREAM_REPO,
+    Finding,
     ReflectionPhase,
     RunSummary,
 )
@@ -157,8 +159,6 @@ class TestReflectionPhaseDuplicateCheck:
             returncode=0,
             stdout=json.dumps([{"number": 100, "title": "existing issue"}]),
         )
-        from loom_tools.shepherd.phases.reflection import Finding
-
         finding = Finding(
             category="slow_phase",
             title="Slow Builder phase",
@@ -187,6 +187,35 @@ class TestReflectionPhaseDuplicateCheck:
         )
         phase = ReflectionPhase(run_summary=clean_summary)
         assert phase._should_file_issue(finding, mock_context) is True
+
+
+class TestReflectionPhaseFileUpstream:
+    """Test _file_upstream_issue uses the correct label."""
+
+    @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
+    def test_uses_loom_triage_label(
+        self,
+        mock_run: MagicMock,
+        mock_context: MagicMock,
+        clean_summary: RunSummary,
+    ) -> None:
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="https://github.com/rjwalters/loom/issues/999\n",
+        )
+        finding = Finding(
+            category="builder_failure",
+            title="Builder failed to create PR",
+            details="details",
+            severity="bug",
+        )
+        phase = ReflectionPhase(run_summary=clean_summary)
+        result = phase._file_upstream_issue(finding, clean_summary, mock_context)
+        assert result is True
+        # Verify the gh issue create call used loom:triage, not the severity
+        call_args = mock_run.call_args[0][0]
+        label_idx = call_args.index("--label")
+        assert call_args[label_idx + 1] == REFLECTION_ISSUE_LABEL
 
 
 class TestReflectionPhaseRun:
