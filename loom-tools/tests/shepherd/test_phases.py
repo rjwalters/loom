@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -4880,6 +4881,87 @@ class TestJudgeDiagnostics:
 
         assert diag["failure_mode"] == "doctor_fixed_awaiting_outcome"
         assert "Doctor applied fixes" in diag["failure_explanation"]
+
+    def test_stale_log_detected_when_ctime_before_phase_start(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Issue #2327: Flag log as stale when ctime predates phase_start_time."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        # Create a log file with content
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text("Syntax theme: Monokai Extended\nold output\n")
+
+        judge = JudgePhase()
+
+        # phase_start_time is in the future relative to the log file's ctime
+        future_time = time.time() + 100
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx, phase_start_time=future_time)
+
+        assert diag["log_is_stale"] is True
+        assert "session_duration_seconds" not in diag
+        assert diag["failure_mode"] == "stale_log_from_previous_run"
+        assert "STALE" in diag["summary"]
+        assert "previous run" in diag["failure_explanation"]
+
+    def test_log_not_stale_when_ctime_after_phase_start(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Issue #2327: Log created after phase start should not be flagged stale."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        # Create a log file (its ctime will be "now")
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text("judge started\njudge finished\n")
+
+        judge = JudgePhase()
+
+        # phase_start_time is in the past relative to the log file's ctime
+        past_time = time.time() - 100
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            diag = judge._gather_diagnostics(ctx, phase_start_time=past_time)
+
+        assert diag["log_is_stale"] is False
+        assert "session_duration_seconds" in diag
+
+    def test_log_not_stale_when_phase_start_time_zero(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Issue #2327: Default phase_start_time=0.0 should skip stale detection."""
+        ctx = self._make_context(mock_context)
+        ctx.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        log_file = log_dir / "loom-judge-issue-42.log"
+        log_file.write_text("some output\n")
+
+        judge = JudgePhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            return_value=MagicMock(returncode=1, stdout=""),
+        ):
+            # Default call without phase_start_time
+            diag = judge._gather_diagnostics(ctx)
+
+        assert diag["log_is_stale"] is False
+        assert "session_duration_seconds" in diag
 
 
 class TestHasApprovalComment:
