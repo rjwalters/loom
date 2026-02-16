@@ -588,6 +588,21 @@ def run_phase_with_retry(
             args=args,
         )
 
+        # --- Pre-retry approval check (judge phase only) ---
+        # If the judge already completed its work (applied loom:pr or
+        # loom:changes-requested) before the MCP/instant-exit failure
+        # occurred, skip the retry entirely.  See issue #2335.
+        if exit_code in (6, 7) and phase == "judge" and ctx.pr_number is not None:
+            ctx.label_cache.invalidate_pr(ctx.pr_number)
+            if ctx.has_pr_label("loom:pr") or ctx.has_pr_label(
+                "loom:changes-requested"
+            ):
+                log_warning(
+                    f"Judge already completed (PR #{ctx.pr_number} has outcome label), "
+                    f"skipping retry despite exit code {exit_code}"
+                )
+                return 0
+
         # --- MCP failure handling (exit code 7) ---
         # MCP failures are systemic (stale build, resource contention) so
         # use longer backoff than generic instant-exits.  See issue #2279.
