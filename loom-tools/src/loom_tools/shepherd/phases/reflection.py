@@ -8,6 +8,7 @@ are identified.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -19,7 +20,6 @@ if TYPE_CHECKING:
     from loom_tools.shepherd.context import ShepherdContext
 
 # Thresholds for flagging anomalies
-SLOW_PHASE_THRESHOLD_SECONDS = 300  # 5 minutes
 HIGH_RETRY_THRESHOLD = 2
 
 # Upstream repo for filing issues
@@ -31,12 +31,15 @@ TITLE_PREFIX = "[shepherd-reflection]"
 # Label applied to reflection-filed issues (goes through normal triage pipeline)
 REFLECTION_ISSUE_LABEL = "loom:triage"
 
+# Duplicate detection: how recently closed issues block re-filing (days)
+DUPLICATE_RECENCY_DAYS = 7
+
 
 @dataclass
 class Finding:
     """A single actionable finding from run analysis."""
 
-    category: str  # e.g., "slow_phase", "excessive_retries", "builder_failure"
+    category: str  # e.g., "excessive_retries", "builder_failure"
     title: str  # Short title for the finding
     details: str  # Detailed description with context
     severity: str = "enhancement"  # "enhancement" or "bug"
@@ -58,6 +61,7 @@ class RunSummary:
     doctor_attempts: int = 0
     test_fix_attempts: int = 0
     warnings: list[str] = field(default_factory=list)
+    log_content: str = ""
 
 
 class ReflectionPhase(BasePhase):
@@ -110,25 +114,13 @@ class ReflectionPhase(BasePhase):
         return True
 
     def _analyze_run(self, summary: RunSummary) -> list[Finding]:
-        """Analyze run data and return actionable findings."""
-        findings: list[Finding] = []
+        """Analyze run data and return actionable findings.
 
-        # Check for slow phases
-        for phase_name, duration in summary.phase_durations.items():
-            if duration > SLOW_PHASE_THRESHOLD_SECONDS:
-                findings.append(
-                    Finding(
-                        category="slow_phase",
-                        title=f"Slow {phase_name} phase ({duration}s)",
-                        details=(
-                            f"The {phase_name} phase took {duration}s "
-                            f"(threshold: {SLOW_PHASE_THRESHOLD_SECONDS}s). "
-                            f"Issue #{summary.issue}: {summary.issue_title}. "
-                            f"Mode: {summary.mode}."
-                        ),
-                        severity="enhancement",
-                    )
-                )
+        Only produces findings that are genuinely actionable:
+        - excessive_retries: Retries above threshold indicate systemic issues
+        - builder_failure: Only filed when error context can be extracted
+        """
+        findings: list[Finding] = []
 
         # Check for excessive retries
         if summary.judge_retries >= HIGH_RETRY_THRESHOLD:
@@ -173,63 +165,42 @@ class ReflectionPhase(BasePhase):
                 )
             )
 
-        # Check for builder failure (non-zero exit)
+        # Check for builder failure (non-zero exit) with diagnostic extraction
         if summary.exit_code == 1:  # BUILDER_FAILED
-            findings.append(
-                Finding(
-                    category="builder_failure",
-                    title="Builder failed to create PR",
-                    details=(
-                        f"Builder phase failed for issue #{summary.issue}: "
-                        f"{summary.issue_title}. "
-                        f"Completed phases: {', '.join(summary.completed_phases)}."
-                    ),
-                    severity="bug",
+            error_context = _extract_error_context(summary.log_content)
+            if error_context:
+                findings.append(
+                    Finding(
+                        category="builder_failure",
+                        title="Builder failed to create PR",
+                        details=(
+                            f"Builder phase failed for issue #{summary.issue}: "
+                            f"{summary.issue_title}.\n\n"
+                            f"**Error context:**\n```\n{error_context}\n```\n\n"
+                            f"Completed phases: {', '.join(summary.completed_phases)}."
+                        ),
+                        severity="bug",
+                    )
                 )
-            )
-
-        # Check for stale artifacts in warnings
-        stale_warnings = [w for w in summary.warnings if "stale" in w.lower()]
-        if stale_warnings:
-            findings.append(
-                Finding(
-                    category="stale_artifacts",
-                    title="Stale artifacts detected at startup",
-                    details=(
-                        f"Stale artifacts were found during issue #{summary.issue} "
-                        f"orchestration: {'; '.join(stale_warnings)}. "
-                        f"Consider auto-cleanup before builder phase."
-                    ),
-                    severity="enhancement",
-                )
-            )
-
-        # Check for missing baseline
-        baseline_warnings = [
-            w for w in summary.warnings if "baseline" in w.lower()
-        ]
-        if baseline_warnings:
-            findings.append(
-                Finding(
-                    category="missing_baseline",
-                    title="Baseline health cache missing",
-                    details=(
-                        f"No baseline health cache was available during "
-                        f"issue #{summary.issue} orchestration. "
-                        f"This reduces confidence in test results."
-                    ),
-                    severity="enhancement",
-                )
-            )
 
         return findings
 
     def _should_file_issue(
         self, finding: Finding, ctx: ShepherdContext
     ) -> bool:
-        """Check if an issue should be filed (no duplicates)."""
-        # Search for existing open issues with similar title
-        search_query = f"{TITLE_PREFIX} {finding.category}"
+        """Check if an issue should be filed (no duplicates, no recursion)."""
+        # Guard: don't file reflection issues about reflection issues
+        source_title = getattr(self.run_summary, "issue_title", "") or ""
+        if source_title.startswith(TITLE_PREFIX):
+            log_info(
+                f"  Skipping (recursive: source issue is a reflection issue)"
+            )
+            return False
+
+        # Build stable search title (matches what _file_upstream_issue creates)
+        stable_title = f"{TITLE_PREFIX} {finding.title}"
+
+        # Search for existing issues (both open and recently closed)
         try:
             result = subprocess.run(
                 [
@@ -239,13 +210,13 @@ class ReflectionPhase(BasePhase):
                     "--repo",
                     UPSTREAM_REPO,
                     "--search",
-                    search_query,
+                    stable_title,
                     "--state",
-                    "open",
+                    "all",
                     "--json",
-                    "number,title",
+                    "number,title,closedAt",
                     "--limit",
-                    "5",
+                    "10",
                 ],
                 cwd=ctx.repo_root,
                 capture_output=True,
@@ -254,11 +225,12 @@ class ReflectionPhase(BasePhase):
             )
             if result.returncode == 0 and result.stdout.strip():
                 existing = json.loads(result.stdout)
-                if existing:
-                    log_info(
-                        f"  Skipping (existing issue #{existing[0]['number']})"
-                    )
-                    return False
+                for issue in existing:
+                    if _is_recent_duplicate(issue, stable_title):
+                        log_info(
+                            f"  Skipping (duplicate issue #{issue['number']})"
+                        )
+                        return False
         except (json.JSONDecodeError, OSError):
             # If we can't check, err on the side of not filing
             return False
@@ -325,3 +297,80 @@ class ReflectionPhase(BasePhase):
         except OSError as exc:
             log_warning(f"  Failed to file issue: {exc}")
             return False
+
+
+# --- Helper functions ---
+
+
+# Patterns to extract actionable errors from shepherd/builder logs.
+# Order matters: first match wins.
+_ERROR_PATTERNS: list[re.Pattern[str]] = [
+    # Python tracebacks (capture from "Traceback" through the error line)
+    re.compile(
+        r"(Traceback \(most recent call last\):.*?^\w+(?:Error|Exception):.+)",
+        re.MULTILINE | re.DOTALL,
+    ),
+    # Rust/cargo errors
+    re.compile(r"(error\[E\d+\]:.*?)(?:\n\n|\Z)", re.DOTALL),
+    # TypeScript compiler errors
+    re.compile(r"(error TS\d+:.+)", re.MULTILINE),
+    # Git errors
+    re.compile(r"(fatal: .+)", re.MULTILINE),
+    # Generic "Error:" lines (last resort)
+    re.compile(r"((?:Error|ERROR):.+)", re.MULTILINE),
+]
+
+# Maximum characters of error context to include in a filed issue.
+_MAX_ERROR_CONTEXT = 1500
+
+
+def _extract_error_context(log_content: str) -> str:
+    """Extract the first actionable error from log content.
+
+    Returns the matched error text (truncated to _MAX_ERROR_CONTEXT),
+    or empty string if nothing actionable was found.
+    """
+    if not log_content:
+        return ""
+
+    for pattern in _ERROR_PATTERNS:
+        match = pattern.search(log_content)
+        if match:
+            context = match.group(1).strip()
+            if len(context) > _MAX_ERROR_CONTEXT:
+                context = context[:_MAX_ERROR_CONTEXT] + "\n... (truncated)"
+            return context
+
+    return ""
+
+
+def _is_recent_duplicate(
+    issue: dict[str, Any], stable_title: str
+) -> bool:
+    """Check if an existing issue is a recent duplicate.
+
+    An issue is a duplicate if its title matches the stable title prefix.
+    Open issues are always duplicates; closed issues are duplicates only
+    if closed within DUPLICATE_RECENCY_DAYS.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    existing_title = issue.get("title", "")
+    # Match if the existing title starts with the same prefix
+    # (stable_title is the full "[shepherd-reflection] Builder failed to create PR")
+    if stable_title not in existing_title and existing_title not in stable_title:
+        return False
+
+    closed_at = issue.get("closedAt")
+    if not closed_at:
+        # Issue is open — it's a duplicate
+        return True
+
+    # Closed issue — only counts if closed recently
+    try:
+        closed_time = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
+        cutoff = datetime.now(timezone.utc) - timedelta(days=DUPLICATE_RECENCY_DAYS)
+        return closed_time > cutoff
+    except (ValueError, TypeError):
+        # Can't parse date — treat as duplicate to be safe
+        return True
