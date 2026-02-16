@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-02-15
+
+### Summary
+
+Reliability and stability release focused on shepherd pipeline hardening, per-agent config isolation, and analytics integration.
+
+### Added
+
+- Shepherd reflection phase for post-run analysis and upstream issue filing (#2275)
+- Per-agent `CLAUDE_CONFIG_DIR` isolation for concurrent session stability (#2285, #2313)
+- Analytics pipeline UI integration (Phases 3-5) (#2373)
+- Pre-implementation reproducibility check in builder phase (#2363)
+- Dedicated timeout and stuck recovery for doctor test-fix phase (#2347)
+- MCP server failure detection and recovery in shepherd pipeline (#2310)
+- Dual-mode GitHub API layer with REST fallback (#2255)
+- Pre-flight auth check in claude-wrapper.sh (#2332)
+- `--skip-builder` and `--pr` flags for shepherd (#2314)
+- Installer integration test suite for install/reinstall/uninstall paths (#2272)
+- Kill orphaned claude processes during terminal/session lifecycle (#2273)
+- Wrapper retry state reporting for shepherd observability (#2311)
+
+### Fixed
+
+- Detect already-merged PRs in shepherd validation to prevent unnecessary builder runs (#2384)
+- Replace broken `st_mtime`-`st_ctime` duration gate with output volume check (#2382)
+- Remove `mcp.json` from shared config symlinks to fix MCP init failures (#2380)
+- Duration gate for MCP failure detection to prevent false positives (#2377)
+- Label cleanup handler for shepherd partial failures (#2372)
+- Broaden shepherd builder recovery to use PR existence as primary signal (#2371)
+- Detect `loom:changes-requested` label in judge unexpected-result branch (#2364)
+- Set PYTHONPATH in worktree subprocesses to resolve imports correctly (#2361)
+- Push doctor test-fix commits to remote before re-verification (#2351)
+- Shepherd recovers from builder non-zero exit when PR already created (#2346)
+- Check for existing judge approval before retrying on MCP/exit failures (#2340)
+- Ensure agents skip Claude Code onboarding wizard (#2336)
+- Clone macOS Keychain credentials for per-agent config dir isolation (#2323)
+- Baseline comparison parses biome/clippy errors and detects cross-tool mismatches (#2331)
+- Regression guard for doctor test-fix loop (#2317)
+- Prevent theme picker from blocking agents in isolated config dirs (#2302)
+- TTY fallback in claude-wrapper to avoid hanging when no terminal available (#2297)
+- Prevent unsafe worktree removal during merge and agent destroy (#2251)
+- Enforce `merge-pr.sh` over `gh pr merge` to prevent worktree errors (#2306)
+- Ad-hoc sign Rust test binaries on macOS to prevent `_dyld_start` hangs (#2304)
+
+### Changed
+
+- Replace husky/lint-staged with plain `.githooks/` directory (#2305)
+- Split loom-daemon into lib + binary to prevent test hang (#2337)
+
 ## [0.2.0] - 2026-01-24
 
 ### Summary
@@ -156,6 +205,7 @@ Existing v0.1.x installations can upgrade cleanly:
 - Installation script for target repositories
 - Quickstart templates for webapp, desktop, and API projects
 
-[Unreleased]: https://github.com/rjwalters/loom/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rjwalters/loom/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/rjwalters/loom/compare/v0.2.0...v0.2.3
 [0.2.0]: https://github.com/rjwalters/loom/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rjwalters/loom/releases/tag/v0.1.0
