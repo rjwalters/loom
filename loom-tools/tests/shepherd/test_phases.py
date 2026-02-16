@@ -55,6 +55,7 @@ def mock_context() -> MagicMock:
     ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
     ctx.pr_number = None
     ctx.label_cache = MagicMock()
+    ctx.warnings = []
     return ctx
 
 
@@ -9999,6 +10000,8 @@ class TestRunPhaseWithRetryInstantExit:
         ctx.repo_root = Path("/fake/repo")
         ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
         ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
         return ctx
 
     def test_retries_on_instant_exit_then_succeeds(
@@ -10637,6 +10640,8 @@ class TestRunPhaseWithRetryMcpFailure:
         ctx.repo_root = Path("/fake/repo")
         ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
         ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
         return ctx
 
     def test_retries_on_mcp_failure_then_succeeds(
