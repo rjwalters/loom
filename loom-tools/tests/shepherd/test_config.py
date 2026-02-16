@@ -159,6 +159,22 @@ class TestShepherdConfig:
         assert config.should_skip_phase(Phase.JUDGE) is True
         assert config.should_skip_phase(Phase.MERGE) is False
 
+    def test_doctor_test_fix_timeout_default(self) -> None:
+        """doctor_test_fix_timeout should default to 600."""
+        config = ShepherdConfig(issue=42)
+        assert config.doctor_test_fix_timeout == 600
+
+    def test_doctor_test_fix_timeout_env_override(self) -> None:
+        """LOOM_DOCTOR_TEST_FIX_TIMEOUT env var should override default."""
+        with patch.dict(os.environ, {"LOOM_DOCTOR_TEST_FIX_TIMEOUT": "120"}):
+            config = ShepherdConfig(issue=42)
+            assert config.doctor_test_fix_timeout == 120
+
+    def test_doctor_test_fix_timeout_explicit(self) -> None:
+        """doctor_test_fix_timeout can be explicitly set."""
+        config = ShepherdConfig(issue=42, doctor_test_fix_timeout=300)
+        assert config.doctor_test_fix_timeout == 300
+
     def test_get_phase_timeout(self) -> None:
         """Phase timeouts should be returned correctly."""
         config = ShepherdConfig(

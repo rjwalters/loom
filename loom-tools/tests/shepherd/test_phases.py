@@ -9137,10 +9137,10 @@ class TestDoctorLabelRecovery:
 class TestDoctorTestFixWithDiagnostics:
     """Test run_test_fix includes diagnostics in failure results."""
 
-    def test_stuck_result_includes_diagnostics(
+    def test_stuck_with_commits_recovers_as_success(
         self, mock_context: MagicMock
     ) -> None:
-        """run_test_fix STUCK result should include diagnostics."""
+        """run_test_fix STUCK with commits should recover as SUCCESS."""
         from loom_tools.shepherd.phases.doctor import DoctorDiagnostics
 
         doctor = DoctorPhase()
@@ -9158,7 +9158,8 @@ class TestDoctorTestFixWithDiagnostics:
             mock_run.return_value = 4  # Stuck
             result = doctor.run_test_fix(mock_context, {})
 
-        assert result.status == PhaseStatus.STUCK
+        assert result.status == PhaseStatus.SUCCESS
+        assert "hung after commit" in result.message
         assert result.data.get("commits_made") == 1
 
     def test_failed_result_includes_failure_mode(
