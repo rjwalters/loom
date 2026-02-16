@@ -308,6 +308,35 @@ class BuilderPhase:
             # Unexpected non-zero exit from builder subprocess
             diag = self._gather_diagnostics(ctx)
 
+            # Check if the builder actually completed its work despite
+            # the non-zero exit.  This happens when e.g. MCP retries
+            # cause a duplicate-worktree error (exit code 7) after the
+            # PR was already created successfully.
+            if (
+                diag.get("checkpoint_stage") == "pr_created"
+                and diag.get("pr_number") is not None
+            ):
+                pr = diag["pr_number"]
+                log_warning(
+                    f"Builder exited with code {exit_code} but checkpoint "
+                    f"shows pr_created and PR #{pr} exists — treating as success"
+                )
+                ctx.pr_number = pr
+                ctx.report_milestone("pr_created", pr_number=pr)
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"builder phase complete - PR #{pr} created "
+                        f"(recovered from exit code {exit_code})"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "pr_number": pr,
+                        "exit_code": exit_code,
+                        "recovered_from_checkpoint": True,
+                    },
+                )
+
             # If there are uncommitted changes, preserve them as a WIP commit
             if diag.get("has_uncommitted_changes"):
                 reason = f"builder exited with code {exit_code}"
