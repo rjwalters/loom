@@ -8,6 +8,7 @@ import pytest
 
 from loom_tools.common.claude_config import (
     _SHARED_CONFIG_FILES,
+    _resolve_state_file,
     cleanup_agent_config_dir,
     cleanup_all_agent_config_dirs,
     setup_agent_config_dir,
@@ -81,47 +82,92 @@ class TestSetupAgentConfigDir:
         assert dir1.is_dir()
         assert dir2.is_dir()
 
-    def test_claude_json_in_shared_config_files(self) -> None:
-        """Ensure .claude.json is in shared config list to prevent onboarding prompts."""
-        assert ".claude.json" in _SHARED_CONFIG_FILES
+    def test_claude_json_not_in_shared_config_files(self) -> None:
+        """State file .claude.json is handled separately, not in shared list."""
+        assert ".claude.json" not in _SHARED_CONFIG_FILES
 
-    def test_symlinks_claude_json_when_exists(
+    def test_symlinks_state_file_from_home_root(
         self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Verify .claude.json is symlinked when it exists in ~/.claude/."""
-        # Create a fake home .claude dir with .claude.json
-        fake_home_claude = mock_repo / "fake-home-claude"
-        fake_home_claude.mkdir()
-        (fake_home_claude / ".claude.json").write_text('{"onboardingComplete":true}')
+        """Verify .claude.json is symlinked from ~/.claude.json (home root).
 
-        # Patch Path.home() to use our fake home so setup_agent_config_dir
-        # finds fake_home_claude as ~/.claude
+        Claude Code stores onboarding state (hasCompletedOnboarding) in
+        ~/.claude.json, not ~/.claude/.claude.json. When CLAUDE_CONFIG_DIR
+        is overridden, Claude looks for $CLAUDE_CONFIG_DIR/.claude.json.
+        """
         fake_home = mock_repo / "fake-home"
         fake_home.mkdir()
-        (fake_home / ".claude").symlink_to(fake_home_claude)
+        (fake_home / ".claude").mkdir()
+        # State file lives at ~/.claude.json (home root)
+        state_file = fake_home / ".claude.json"
+        state_file.write_text('{"hasCompletedOnboarding":true}')
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
         dst = config_dir / ".claude.json"
         assert dst.is_symlink(), ".claude.json should be symlinked"
-        assert dst.resolve() == (fake_home_claude / ".claude.json").resolve()
+        assert dst.resolve() == state_file.resolve()
 
-    def test_missing_claude_json_skipped_gracefully(
+    def test_symlinks_state_file_prefers_config_json(
         self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Verify no error when .claude.json does not exist in ~/.claude/."""
-        # Create a fake home .claude dir WITHOUT .claude.json
-        fake_home_claude = mock_repo / "fake-home-claude"
-        fake_home_claude.mkdir()
-
+        """When ~/.claude/.config.json exists, it takes precedence."""
         fake_home = mock_repo / "fake-home"
         fake_home.mkdir()
-        (fake_home / ".claude").symlink_to(fake_home_claude)
+        (fake_home / ".claude").mkdir()
+        # Both files exist
+        (fake_home / ".claude.json").write_text('{"fallback":true}')
+        preferred = fake_home / ".claude" / ".config.json"
+        preferred.write_text('{"hasCompletedOnboarding":true}')
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+
+        config_dir = setup_agent_config_dir("test-agent", mock_repo)
+        dst = config_dir / ".claude.json"
+        assert dst.is_symlink(), ".claude.json should be symlinked"
+        assert dst.resolve() == preferred.resolve()
+
+    def test_missing_state_file_skipped_gracefully(
+        self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Verify no error when neither state file exists."""
+        fake_home = mock_repo / "fake-home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
         dst = config_dir / ".claude.json"
         assert not dst.exists(), ".claude.json should not exist when source is missing"
+
+
+class TestResolveStateFile:
+    """Tests for _resolve_state_file."""
+
+    def test_prefers_config_json(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        preferred = fake_home / ".claude" / ".config.json"
+        preferred.write_text("{}")
+        (fake_home / ".claude.json").write_text("{}")
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+        assert _resolve_state_file() == preferred
+
+    def test_falls_back_to_home_claude_json(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        (fake_home / ".claude").mkdir()
+        fallback = fake_home / ".claude.json"
+        fallback.write_text("{}")
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+        assert _resolve_state_file() == fallback
+
+    def test_returns_fallback_path_when_neither_exists(self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
+        # Returns the fallback path even if it doesn't exist
+        assert _resolve_state_file() == fake_home / ".claude.json"
 
 
 class TestCleanupAgentConfigDir:

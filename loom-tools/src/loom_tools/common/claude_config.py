@@ -22,7 +22,6 @@ _SHARED_CONFIG_FILES = [
     "config.json",
     "mcp.json",
     ".mcp.json",
-    ".claude.json",
 ]
 
 # Shared directories to symlink from ~/.claude/ (read-only caches)
@@ -42,6 +41,29 @@ _MUTABLE_DIRS = [
     "shell-snapshots",
     "tmp",
 ]
+
+
+def _resolve_state_file() -> Path:
+    """Resolve the Claude Code state file path.
+
+    Claude Code stores onboarding state (hasCompletedOnboarding, theme, etc.)
+    in a state file. The resolution order is:
+
+    1. ~/.claude/.config.json  (if it exists)
+    2. ~/.claude.json          (fallback, most common)
+
+    When CLAUDE_CONFIG_DIR is overridden (as we do for per-agent isolation),
+    Claude looks for .claude.json inside that directory. We must symlink
+    the resolved source file so agents inherit the onboarding-complete state.
+
+    Returns:
+        Path to the state file (may not exist on a fresh system).
+    """
+    home_claude = Path.home() / ".claude"
+    preferred = home_claude / ".config.json"
+    if preferred.exists():
+        return preferred
+    return Path.home() / ".claude.json"
 
 
 def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
@@ -65,12 +87,22 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
 
     home_claude = Path.home() / ".claude"
 
-    # Symlink shared config files
+    # Symlink shared config files from ~/.claude/
     for filename in _SHARED_CONFIG_FILES:
         src = home_claude / filename
         dst = config_dir / filename
         if src.exists() and not dst.exists():
             dst.symlink_to(src)
+
+    # Symlink Claude Code state file (onboarding completion, theme, etc.).
+    # The state file lives at ~/.claude.json (or ~/.claude/.config.json),
+    # NOT inside ~/.claude/. When CLAUDE_CONFIG_DIR is overridden, Claude
+    # looks for $CLAUDE_CONFIG_DIR/.claude.json. Without this symlink,
+    # every agent session hits the first-run onboarding wizard.
+    state_src = _resolve_state_file()
+    state_dst = config_dir / ".claude.json"
+    if state_src.exists() and not state_dst.exists():
+        state_dst.symlink_to(state_src)
 
     # Symlink shared directories
     for dirname in _SHARED_CONFIG_DIRS:
