@@ -360,15 +360,17 @@ class BuilderPhase:
             # Check if the builder actually completed its work despite
             # the non-zero exit.  This happens when e.g. MCP retries
             # cause a duplicate-worktree error (exit code 7) after the
-            # PR was already created successfully.
-            if (
-                diag.get("checkpoint_stage") == "pr_created"
-                and diag.get("pr_number") is not None
-            ):
+            # PR was already created successfully, or when the builder
+            # creates a PR but fails before updating its checkpoint
+            # (e.g., MCP server failure after gh pr create).
+            # The PR's existence is a stronger signal than checkpoint
+            # stage — recover whenever diagnostics show a PR exists.
+            if diag.get("pr_number") is not None:
                 pr = diag["pr_number"]
+                checkpoint = diag.get("checkpoint_stage", "unknown")
                 log_warning(
-                    f"Builder exited with code {exit_code} but checkpoint "
-                    f"shows pr_created and PR #{pr} exists — treating as success"
+                    f"Builder exited with code {exit_code} but PR #{pr} "
+                    f"exists (checkpoint={checkpoint}) — treating as success"
                 )
                 ctx.pr_number = pr
                 ctx.report_milestone("pr_created", pr_number=pr)
@@ -383,6 +385,7 @@ class BuilderPhase:
                         "pr_number": pr,
                         "exit_code": exit_code,
                         "recovered_from_checkpoint": True,
+                        "checkpoint_stage": checkpoint,
                     },
                 )
 

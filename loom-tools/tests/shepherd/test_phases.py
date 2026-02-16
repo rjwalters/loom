@@ -654,12 +654,64 @@ class TestBuilderPhase:
         assert result.data.get("recovered_from_checkpoint") is True
         assert mock_context.pr_number == 100
 
+    def test_nonzero_exit_with_pr_but_stale_checkpoint_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Builder non-zero exit with PR existing but stale checkpoint should succeed.
+
+        When the builder creates a PR but fails before updating its checkpoint
+        (e.g., MCP server failure after gh pr create), diagnostics show the PR
+        exists even though checkpoint is still at an early stage like 'planning'.
+        The PR's existence is a stronger signal than checkpoint stage.
+        Regression test for #2367.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": (
+                "worktree exists; remote branch exists; "
+                "PR #200 (with loom:review-requested); checkpoint=planning"
+            ),
+            "checkpoint_stage": "planning",
+            "pr_number": 200,
+            "pr_has_review_label": True,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=7,
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #200" in result.message
+        assert "recovered from exit code 7" in result.message
+        assert result.data.get("pr_number") == 200
+        assert result.data.get("recovered_from_checkpoint") is True
+        assert result.data.get("checkpoint_stage") == "planning"
+        assert mock_context.pr_number == 200
+
     def test_nonzero_exit_without_pr_created_checkpoint_fails(
         self, mock_context: MagicMock
     ) -> None:
-        """Builder non-zero exit without pr_created checkpoint should fail.
+        """Builder non-zero exit without PR should fail.
 
-        When the builder exits non-zero and there is no pr_created checkpoint,
+        When the builder exits non-zero and there is no PR,
         the normal failure path should still apply.
         """
         mock_context.check_shutdown.return_value = False
