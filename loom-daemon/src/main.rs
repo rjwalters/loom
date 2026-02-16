@@ -1,27 +1,18 @@
-mod activity;
-mod errors;
-mod git_parser;
-mod git_utils;
-mod github_parser;
-mod health_monitor;
-mod init;
-mod ipc;
-mod metrics_collector;
-mod role_validation;
-mod terminal;
-mod types;
+use loom_daemon::activity::{self, ActivityDb, StatsQueries};
+use loom_daemon::health_monitor;
+use loom_daemon::ipc::IpcServer;
+use loom_daemon::metrics_collector;
+use loom_daemon::role_validation;
+use loom_daemon::terminal::TerminalManager;
+use loom_daemon::{extract_configured_terminal_ids, rotate_log_file};
 
-use activity::{ActivityDb, StatsQueries};
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
-use ipc::IpcServer;
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use terminal::TerminalManager;
 
 /// Loom daemon - terminal multiplexing and workspace orchestration
 #[derive(Parser)]
@@ -185,7 +176,7 @@ async fn main() -> Result<()> {
     // Start health monitoring (enabled by default)
     if let Some(interval) = health_monitor::check_env_enabled() {
         let (_health_handle, _health_state) = health_monitor::start_tmux_health_monitor(interval);
-        log::info!("✅ tmux health monitoring enabled (interval: {interval}s)");
+        log::info!("tmux health monitoring enabled (interval: {interval}s)");
         // Note: health_handle is dropped here, but the thread keeps running
         // health_state could be stored for querying crash status if needed
     }
@@ -235,46 +226,11 @@ fn check_tmux_installed() -> Result<()> {
         .ok_or_else(|| anyhow!("tmux not installed. Install with: brew install tmux"))
 }
 
-/// Rotate log file if it exceeds max size
-/// Keeps last 10 files (log.1, log.2, ..., log.10)
-fn rotate_log_file(log_path: &std::path::Path, max_size: u64, max_files: usize) -> Result<()> {
-    // Check if rotation is needed
-    if !log_path.exists() {
-        return Ok(());
-    }
-
-    let metadata = fs::metadata(log_path)?;
-    if metadata.len() < max_size {
-        return Ok(()); // No rotation needed
-    }
-
-    // Remove oldest rotated file if it exists (log.10)
-    let oldest_file = format!("{}.{max_files}", log_path.display());
-    let _ = fs::remove_file(&oldest_file); // Ignore error if file doesn't exist
-
-    // Shift existing rotated files (log.9 -> log.10, log.8 -> log.9, etc.)
-    for i in (1..max_files).rev() {
-        let old_path = format!("{}.{i}", log_path.display());
-        let new_path = format!("{}.{}", log_path.display(), i + 1);
-        if std::path::Path::new(&old_path).exists() {
-            let _ = fs::rename(&old_path, &new_path); // Ignore errors
-        }
-    }
-
-    // Rotate current log file to log.1
-    let rotated_path = format!("{}.1", log_path.display());
-    fs::rename(log_path, rotated_path)?;
-
-    Ok(())
-}
-
 fn setup_logging() -> Result<()> {
-    // Get log file path: ~/.loom/daemon.log
     let log_path = dirs::home_dir()
         .ok_or_else(|| anyhow!("No home directory"))?
         .join(".loom/daemon.log");
 
-    // Create .loom directory if it doesn't exist
     if let Some(parent) = log_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -282,13 +238,11 @@ fn setup_logging() -> Result<()> {
     // Rotate log file if it exceeds 10MB (keeps last 10 files)
     rotate_log_file(&log_path, 10 * 1024 * 1024, 10)?;
 
-    // Open log file in append mode
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)?;
 
-    // Configure env_logger to write to file
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .format(|buf, record| {
@@ -329,7 +283,6 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             force,
             dry_run,
         } => {
-            // Convert workspace path to absolute path
             let workspace_path = std::path::Path::new(&workspace);
             let absolute_workspace = if workspace_path.is_absolute() {
                 workspace_path.to_path_buf()
@@ -361,58 +314,52 @@ fn handle_cli_command(command: Commands) -> Result<()> {
             println!("  Workspace: {workspace_str}");
             println!("  Defaults:  {defaults}");
 
-            match init::initialize_workspace(workspace_str, &defaults, force) {
+            match loom_daemon::init::initialize_workspace(workspace_str, &defaults, force) {
                 Ok(report) => {
-                    // Handle self-installation (Loom source repo)
                     if report.is_self_install {
-                        println!("\n✅ Loom source repository detected!");
+                        println!("\nLoom source repository detected!");
                         println!("\nMode: Validation only (self-installation)");
                         println!("\nValidating configuration...");
 
                         if let Some(ref validation) = report.validation {
-                            // Print validation results
                             println!(
-                                "  ✓ .loom/roles/    - {} role definitions found",
+                                "  .loom/roles/    - {} role definitions found",
                                 validation.roles_found.len()
                             );
                             println!(
-                                "  ✓ .loom/scripts/  - {} scripts found",
+                                "  .loom/scripts/  - {} scripts found",
                                 validation.scripts_found.len()
                             );
                             println!(
-                                "  ✓ .claude/commands/ - {} slash commands found",
+                                "  .claude/commands/ - {} slash commands found",
                                 validation.commands_found.len()
                             );
 
                             if validation.has_claude_md {
-                                println!("  ✓ CLAUDE.md       - Present");
+                                println!("  CLAUDE.md       - Present");
                             } else {
-                                println!("  ✗ CLAUDE.md       - Missing");
+                                println!("  CLAUDE.md       - Missing");
                             }
 
                             if validation.has_labels_yml {
-                                println!("  ✓ .github/labels.yml - Present");
+                                println!("  .github/labels.yml - Present");
                             } else {
-                                println!("  ✗ .github/labels.yml - Missing");
+                                println!("  .github/labels.yml - Missing");
                             }
 
-                            // Print any issues found
                             if validation.issues.is_empty() {
-                                println!("\n✅ Loom source repository is properly configured");
+                                println!("\nLoom source repository is properly configured");
                             } else {
-                                println!("\n⚠️  Issues found:");
+                                println!("\nIssues found:");
                                 for issue in &validation.issues {
                                     println!("  - {issue}");
                                 }
                             }
 
-                            // Print role details
                             println!("\nRoles found: {}", validation.roles_found.join(", "));
                         }
 
-                        println!(
-                            "\nℹ️  Self-installation skips file copying to prevent data loss."
-                        );
+                        println!("\nSelf-installation skips file copying to prevent data loss.");
                         println!("   The Loom repo's .loom/ directory IS the source of truth.");
                         println!("\nTo use Loom orchestration:");
                         println!("  - Open Claude Code terminals with /builder, /judge, etc.");
@@ -421,19 +368,17 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                         return Ok(());
                     }
 
-                    // Normal installation output
-                    println!("\n✅ Loom workspace initialized successfully!");
+                    println!("\nLoom workspace initialized successfully!");
                     println!("\nFiles installed:");
-                    println!("  📁 .loom/          - Configuration directory");
-                    println!("  📄 .loom/config.json - Terminal configuration");
-                    println!("  📁 .loom/roles/    - Agent role definitions");
-                    println!("  📄 CLAUDE.md       - AI context documentation");
-                    println!("  📁 .claude/        - Claude Code configuration");
-                    println!("  📁 .codex/         - Codex configuration");
-                    println!("  📁 .github/        - GitHub workflow templates");
-                    println!("  📄 .gitignore      - Updated with Loom patterns");
+                    println!("  .loom/          - Configuration directory");
+                    println!("  .loom/config.json - Terminal configuration");
+                    println!("  .loom/roles/    - Agent role definitions");
+                    println!("  CLAUDE.md       - AI context documentation");
+                    println!("  .claude/        - Claude Code configuration");
+                    println!("  .codex/         - Codex configuration");
+                    println!("  .github/        - GitHub workflow templates");
+                    println!("  .gitignore      - Updated with Loom patterns");
 
-                    // Print report of what was added vs preserved vs removed
                     if !report.added.is_empty()
                         || !report.preserved.is_empty()
                         || !report.removed.is_empty()
@@ -450,9 +395,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                             for file in &report.preserved {
                                 println!("  = {file}");
                             }
-                            println!(
-                                "\n  ℹ️  Preserved files were not overwritten. To update them,"
-                            );
+                            println!("\n  Preserved files were not overwritten. To update them,");
                             println!("     delete them and run install again, or use --force.");
                         }
                         if !report.updated.is_empty() {
@@ -469,11 +412,11 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                         }
                         if !report.verification_failures.is_empty() {
                             eprintln!(
-                                "\n⚠️  Verification failures ({}):",
+                                "\nVerification failures ({}):",
                                 report.verification_failures.len()
                             );
                             for failure in &report.verification_failures {
-                                eprintln!("  ✗ {failure}");
+                                eprintln!("  {failure}");
                             }
                             eprintln!("\n  Some scripts may not have been updated correctly.");
                             eprintln!(
@@ -483,7 +426,9 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     }
 
                     println!("\nNext steps:");
-                    println!("  1. Commit the changes: git add -A && git commit -m 'Add Loom configuration'");
+                    println!(
+                        "  1. Commit the changes: git add -A && git commit -m 'Add Loom configuration'"
+                    );
                     println!("  2. Choose your workflow:");
                     println!("     Manual Mode (recommended to start):");
                     println!("       cd {workspace_str} && claude");
@@ -493,7 +438,7 @@ fn handle_cli_command(command: Commands) -> Result<()> {
                     Ok(())
                 }
                 Err(e) => {
-                    eprintln!("\n❌ Failed to initialize workspace: {e}");
+                    eprintln!("\nFailed to initialize workspace: {e}");
                     std::process::exit(1);
                 }
             }
@@ -509,7 +454,6 @@ fn handle_stats_command(
     weekly: bool,
     format: &str,
 ) -> Result<()> {
-    // Get database path
     let loom_dir = dirs::home_dir()
         .ok_or_else(|| anyhow!("No home directory"))?
         .join(".loom");
@@ -526,7 +470,6 @@ fn handle_stats_command(
 
     let is_json = format == "json";
 
-    // If issue filter is specified, show cost per issue
     if let Some(issue_num) = issue {
         let costs = db.get_cost_per_issue(Some(issue_num))?;
 
@@ -555,7 +498,6 @@ fn handle_stats_command(
         return Ok(());
     }
 
-    // If role filter is specified, show effectiveness for that role
     if let Some(role_filter) = role {
         let effectiveness = db.get_agent_effectiveness(Some(role_filter))?;
 
@@ -574,7 +516,6 @@ fn handle_stats_command(
         return Ok(());
     }
 
-    // If weekly flag, show weekly velocity
     if weekly {
         let velocity = db.get_weekly_velocity()?;
 
@@ -595,7 +536,6 @@ fn handle_stats_command(
         return Ok(());
     }
 
-    // Default: show overall summary
     let summary = db.get_stats_summary()?;
     let effectiveness = db.get_agent_effectiveness(None)?;
 
@@ -639,7 +579,6 @@ fn handle_stats_command(
             }
         }
 
-        // Show top 5 most expensive issues
         let top_issues = db.get_cost_per_issue(None)?;
         if !top_issues.is_empty() {
             println!("\n=== Top 5 Most Expensive Issues ===\n");
@@ -659,7 +598,6 @@ fn handle_stats_command(
     Ok(())
 }
 
-/// Print agent effectiveness in a readable format.
 fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!("Role: {}", agent.agent_role);
     println!("  Total Prompts:      {}", agent.total_prompts);
@@ -670,7 +608,6 @@ fn print_agent_effectiveness(agent: &activity::AgentEffectiveness) {
     println!();
 }
 
-/// Handle the validate subcommand - check role configuration completeness.
 fn handle_validate_command(
     workspace: &str,
     format: &str,
@@ -679,7 +616,6 @@ fn handle_validate_command(
 ) -> Result<()> {
     use role_validation::{format_validation_result, validate_from_file, ValidationMode};
 
-    // Convert workspace path to absolute path
     let workspace_path = std::path::Path::new(workspace);
     let absolute_workspace = if workspace_path.is_absolute() {
         workspace_path.to_path_buf()
@@ -711,26 +647,22 @@ fn handle_validate_command(
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
-        // Print header
         if verbose {
             println!("\nValidating role configuration...");
             println!("  Config: {}", config_path.display());
             println!();
         }
 
-        // Print formatted result
         let output = format_validation_result(&result, verbose);
         if !output.is_empty() {
             print!("{output}");
         }
 
-        // Print success message if no warnings
         if result.warnings.is_empty() && result.errors.is_empty() {
             println!("All role dependencies are satisfied.");
         }
     }
 
-    // Determine exit code
     if !result.errors.is_empty() {
         std::process::exit(1);
     } else if !result.warnings.is_empty() && strict {
@@ -738,226 +670,4 @@ fn handle_validate_command(
     }
 
     Ok(())
-}
-
-/// Extract configured terminal IDs from workspace config.json
-///
-/// Reads the workspace's `.loom/config.json` and extracts the `id` field from
-/// each terminal entry. This enables configuration-based session filtering
-/// during `restore_from_tmux()` (Issue #1952).
-///
-/// Returns None if config file doesn't exist or can't be parsed.
-fn extract_configured_terminal_ids(workspace: &Path) -> Option<HashSet<String>> {
-    let config_path = workspace.join(".loom").join("config.json");
-
-    let config_str = match fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::debug!("Could not read config at {}: {e}", config_path.display());
-            return None;
-        }
-    };
-
-    // Parse JSON to extract terminal IDs
-    // Config structure: { "terminals": [{ "id": "terminal-1", ... }, ...] }
-    let config: serde_json::Value = match serde_json::from_str(&config_str) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Could not parse config at {}: {e}", config_path.display());
-            return None;
-        }
-    };
-
-    let terminals = config.get("terminals")?.as_array()?;
-
-    let ids: HashSet<String> = terminals
-        .iter()
-        .filter_map(|t| t.get("id")?.as_str().map(String::from))
-        .collect();
-
-    if ids.is_empty() {
-        log::debug!("No terminal IDs found in config");
-        return None;
-    }
-
-    log::info!("📋 Loaded {} configured terminal IDs from {}", ids.len(), config_path.display());
-
-    Some(ids)
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    // ===== rotate_log_file tests =====
-
-    #[test]
-    fn test_rotate_log_file_no_file_exists() {
-        let dir = tempdir().unwrap();
-        let log_path = dir.path().join("daemon.log");
-        // Should succeed silently when file doesn't exist
-        rotate_log_file(&log_path, 1024, 10).unwrap();
-    }
-
-    #[test]
-    fn test_rotate_log_file_under_limit() {
-        let dir = tempdir().unwrap();
-        let log_path = dir.path().join("daemon.log");
-        fs::write(&log_path, "small content").unwrap();
-
-        // File is under the 1MB limit, should not rotate
-        rotate_log_file(&log_path, 1024 * 1024, 10).unwrap();
-
-        // Original file should still exist
-        assert!(log_path.exists());
-        assert_eq!(fs::read_to_string(&log_path).unwrap(), "small content");
-    }
-
-    #[test]
-    fn test_rotate_log_file_at_limit() {
-        let dir = tempdir().unwrap();
-        let log_path = dir.path().join("daemon.log");
-
-        // Create file that exceeds limit (100 bytes, limit is 50)
-        let content = "x".repeat(100);
-        fs::write(&log_path, &content).unwrap();
-
-        rotate_log_file(&log_path, 50, 5).unwrap();
-
-        // Original file should be moved to .1
-        assert!(!log_path.exists());
-        let rotated = dir.path().join("daemon.log.1");
-        assert!(rotated.exists());
-        assert_eq!(fs::read_to_string(rotated).unwrap(), content);
-    }
-
-    #[test]
-    fn test_rotate_log_file_shifts_existing() {
-        let dir = tempdir().unwrap();
-        let log_path = dir.path().join("daemon.log");
-
-        // Create existing rotated file
-        fs::write(dir.path().join("daemon.log.1"), "old content").unwrap();
-
-        // Create current log that exceeds limit
-        fs::write(&log_path, "x".repeat(100)).unwrap();
-
-        rotate_log_file(&log_path, 50, 5).unwrap();
-
-        // Old .1 should be shifted to .2
-        assert!(dir.path().join("daemon.log.2").exists());
-        assert_eq!(fs::read_to_string(dir.path().join("daemon.log.2")).unwrap(), "old content");
-
-        // Current should be at .1
-        assert!(dir.path().join("daemon.log.1").exists());
-    }
-
-    #[test]
-    fn test_rotate_log_file_removes_oldest() {
-        let dir = tempdir().unwrap();
-        let log_path = dir.path().join("daemon.log");
-
-        // Create file at max_files position (should be removed)
-        fs::write(dir.path().join("daemon.log.3"), "oldest").unwrap();
-
-        // Create current log that exceeds limit
-        fs::write(&log_path, "x".repeat(100)).unwrap();
-
-        rotate_log_file(&log_path, 50, 3).unwrap();
-
-        // The oldest file (.3) should have been removed, current becomes .1
-        assert!(dir.path().join("daemon.log.1").exists());
-    }
-
-    // ===== extract_configured_terminal_ids tests =====
-
-    #[test]
-    fn test_extract_terminal_ids_missing_config() {
-        let dir = tempdir().unwrap();
-        let result = extract_configured_terminal_ids(dir.path());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_terminal_ids_invalid_json() {
-        let dir = tempdir().unwrap();
-        let loom_dir = dir.path().join(".loom");
-        fs::create_dir_all(&loom_dir).unwrap();
-        fs::write(loom_dir.join("config.json"), "not valid json").unwrap();
-
-        let result = extract_configured_terminal_ids(dir.path());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_terminal_ids_no_terminals_key() {
-        let dir = tempdir().unwrap();
-        let loom_dir = dir.path().join(".loom");
-        fs::create_dir_all(&loom_dir).unwrap();
-        fs::write(loom_dir.join("config.json"), r#"{"other": "data"}"#).unwrap();
-
-        let result = extract_configured_terminal_ids(dir.path());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_terminal_ids_empty_terminals() {
-        let dir = tempdir().unwrap();
-        let loom_dir = dir.path().join(".loom");
-        fs::create_dir_all(&loom_dir).unwrap();
-        fs::write(loom_dir.join("config.json"), r#"{"terminals": []}"#).unwrap();
-
-        let result = extract_configured_terminal_ids(dir.path());
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_extract_terminal_ids_valid_config() {
-        let dir = tempdir().unwrap();
-        let loom_dir = dir.path().join(".loom");
-        fs::create_dir_all(&loom_dir).unwrap();
-
-        let config = r#"{
-            "nextAgentNumber": 3,
-            "terminals": [
-                {"id": "terminal-1", "name": "Builder", "role": "builder"},
-                {"id": "terminal-2", "name": "Judge", "role": "judge"},
-                {"id": "shepherd-1", "name": "Shepherd", "role": "shepherd"}
-            ]
-        }"#;
-        fs::write(loom_dir.join("config.json"), config).unwrap();
-
-        let result = extract_configured_terminal_ids(dir.path());
-        assert!(result.is_some());
-        let ids = result.unwrap();
-        assert_eq!(ids.len(), 3);
-        assert!(ids.contains("terminal-1"));
-        assert!(ids.contains("terminal-2"));
-        assert!(ids.contains("shepherd-1"));
-    }
-
-    #[test]
-    fn test_extract_terminal_ids_skips_entries_without_id() {
-        let dir = tempdir().unwrap();
-        let loom_dir = dir.path().join(".loom");
-        fs::create_dir_all(&loom_dir).unwrap();
-
-        let config = r#"{
-            "terminals": [
-                {"id": "terminal-1", "name": "Builder"},
-                {"name": "No ID"},
-                {"id": "terminal-3", "name": "Third"}
-            ]
-        }"#;
-        fs::write(loom_dir.join("config.json"), config).unwrap();
-
-        let result = extract_configured_terminal_ids(dir.path());
-        assert!(result.is_some());
-        let ids = result.unwrap();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains("terminal-1"));
-        assert!(ids.contains("terminal-3"));
-    }
 }
