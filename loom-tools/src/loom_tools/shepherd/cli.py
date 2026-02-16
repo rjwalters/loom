@@ -663,6 +663,11 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         status="success",
                     )
 
+                    # Push doctor's fixes to remote immediately so CI starts
+                    # and work is preserved even if the shepherd crashes.
+                    if not builder.push_branch(ctx):
+                        log_warning("Could not push doctor fixes to remote, continuing anyway")
+
                 # Re-run test verification
                 _print_phase_header(f"PHASE 3c: TEST VERIFICATION (after Doctor attempt {test_fix_attempts})")
                 test_start = time.time()
