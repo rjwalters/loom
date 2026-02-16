@@ -18,13 +18,9 @@ mod claude_config {
 
     /// Shared config files to symlink from ~/.claude/ (read-only).
     /// Must match the Python `_SHARED_CONFIG_FILES` list.
-    const SHARED_CONFIG_FILES: &[&str] = &[
-        "settings.json",
-        "config.json",
-        "mcp.json",
-        ".mcp.json",
-        ".claude.json",
-    ];
+    /// NOTE: .claude.json is NOT here — it lives at ~/.claude.json (home root),
+    /// not inside ~/.claude/. It's handled separately via resolve_state_file().
+    const SHARED_CONFIG_FILES: &[&str] = &["settings.json", "config.json", "mcp.json", ".mcp.json"];
 
     /// Shared directories to symlink from ~/.claude/ (read-only caches).
     /// Must match the Python `_SHARED_CONFIG_DIRS` list.
@@ -50,6 +46,105 @@ mod claude_config {
     /// read-only config from `~/.claude/` and fresh directories for mutable state.
     ///
     /// Idempotent — safe to call multiple times.
+    /// Resolve the Claude Code state file path.
+    ///
+    /// Resolution order:
+    /// 1. ~/.claude/.config.json  (if it exists)
+    /// 2. ~/.claude.json          (fallback, most common)
+    fn resolve_state_file(home: &Path) -> PathBuf {
+        let preferred = home.join(".claude").join(".config.json");
+        if preferred.exists() {
+            return preferred;
+        }
+        home.join(".claude.json")
+    }
+
+    /// Build the keychain service name Claude Code uses for a config dir.
+    ///
+    /// Claude Code v2.1.42+ appends a SHA-256 hash of the config dir path
+    /// to the keychain service name when CLAUDE_CONFIG_DIR is set.
+    fn keychain_service_name(config_dir: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(config_dir.to_string_lossy().as_bytes());
+        let hash = format!("{:x}", hasher.finalize());
+        format!("Claude Code-credentials-{}", &hash[..8])
+    }
+
+    /// Clone macOS Keychain credentials to the per-config-dir service name.
+    fn clone_keychain_credentials(config_dir: &Path) {
+        let account = std::env::var("USER").unwrap_or_else(|_| "claude-code-user".to_string());
+        let target_service = keychain_service_name(config_dir);
+
+        // Check if target already has a credential
+        let check = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-a",
+                &account,
+                "-s",
+                &target_service,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if check.is_ok_and(|s| s.success()) {
+            return; // Already exists
+        }
+
+        // Read the default credential
+        let read = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-a",
+                &account,
+                "-w",
+                "-s",
+                "Claude Code-credentials",
+            ])
+            .output();
+        let cred = match read {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => {
+                log::debug!("No default Claude Code keychain credential found");
+                return;
+            }
+        };
+
+        if cred.is_empty() {
+            return;
+        }
+
+        let cred_hex = hex::encode(cred.as_bytes());
+
+        // Write to the hashed service name
+        let write = std::process::Command::new("security")
+            .args([
+                "add-generic-password",
+                "-U",
+                "-a",
+                &account,
+                "-s",
+                &target_service,
+                "-X",
+                &cred_hex,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        match write {
+            Ok(s) if s.success() => {
+                log::debug!("Cloned keychain credential to {target_service}");
+            }
+            _ => {
+                log::warn!("Failed to clone keychain credential to {target_service}");
+            }
+        }
+    }
+
     pub fn setup_agent_config_dir(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
         let config_dir = repo_root
             .join(".loom")
@@ -61,14 +156,16 @@ mod claude_config {
             return None;
         }
 
-        let home_claude = if let Some(home) = dirs::home_dir() {
-            home.join(".claude")
-        } else {
-            log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
-            return Some(config_dir);
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
+                return Some(config_dir);
+            }
         };
+        let home_claude = home.join(".claude");
 
-        // Symlink shared config files
+        // Symlink shared config files from ~/.claude/
         for filename in SHARED_CONFIG_FILES {
             let src = home_claude.join(filename);
             let dst = config_dir.join(filename);
@@ -76,6 +173,18 @@ mod claude_config {
                 if let Err(e) = std::os::unix::fs::symlink(&src, &dst) {
                     log::debug!("Failed to symlink {}: {e}", dst.display());
                 }
+            }
+        }
+
+        // Symlink Claude Code state file (onboarding completion, theme, etc.).
+        // The state file lives at ~/.claude.json (or ~/.claude/.config.json),
+        // NOT inside ~/.claude/. When CLAUDE_CONFIG_DIR is overridden, Claude
+        // looks for $CLAUDE_CONFIG_DIR/.claude.json.
+        let state_src = resolve_state_file(&home);
+        let state_dst = config_dir.join(".claude.json");
+        if state_src.exists() && !state_dst.exists() {
+            if let Err(e) = std::os::unix::fs::symlink(&state_src, &state_dst) {
+                log::debug!("Failed to symlink state file: {e}");
             }
         }
 
@@ -97,6 +206,9 @@ mod claude_config {
                 log::debug!("Failed to create mutable dir {}: {e}", dir.display());
             }
         }
+
+        // Clone macOS Keychain credentials to the per-config-dir service name.
+        clone_keychain_credentials(&config_dir);
 
         Some(config_dir)
     }

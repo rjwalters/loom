@@ -11,10 +11,15 @@ Each agent gets .loom/claude-config/{agent-name}/ with:
 
 from __future__ import annotations
 
+import hashlib
+import logging
 import shutil
+import subprocess
 from pathlib import Path
 
 from loom_tools.common.paths import LoomPaths
+
+log = logging.getLogger(__name__)
 
 # Shared config files to symlink from ~/.claude/ (read-only)
 _SHARED_CONFIG_FILES = [
@@ -66,6 +71,83 @@ def _resolve_state_file() -> Path:
     return Path.home() / ".claude.json"
 
 
+def _keychain_service_name(config_dir: Path) -> str:
+    """Build the keychain service name Claude Code uses for a given config dir.
+
+    Claude Code v2.1.42+ appends a SHA-256 hash of the resolved config dir
+    path to the keychain service name when CLAUDE_CONFIG_DIR is set:
+
+        "Claude Code-credentials"              (default, no override)
+        "Claude Code-credentials-<8hex>"       (with CLAUDE_CONFIG_DIR)
+
+    This means credentials stored under the default name are invisible when
+    the config dir is overridden. We must clone them to the hashed name.
+    """
+    h = hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+    return f"Claude Code-credentials-{h}"
+
+
+def _clone_keychain_credentials(config_dir: Path) -> bool:
+    """Clone macOS Keychain credentials to the hashed service name.
+
+    Reads the OAuth credential from the default ``Claude Code-credentials``
+    keychain entry and writes it to the per-config-dir hashed entry so that
+    ``claude auth status`` returns ``loggedIn: true`` when
+    ``CLAUDE_CONFIG_DIR`` is overridden.
+
+    No-op on non-macOS or when the default credential doesn't exist.
+
+    Returns:
+        True if credentials were cloned, False otherwise.
+    """
+    import platform
+
+    if platform.system() != "Darwin":
+        return False
+
+    import getpass
+
+    account = getpass.getuser()
+    target_service = _keychain_service_name(config_dir)
+
+    # Check if the target already has a credential
+    check = subprocess.run(
+        ["security", "find-generic-password", "-a", account, "-s", target_service],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode == 0:
+        return False  # Already exists
+
+    # Read the default credential
+    read = subprocess.run(
+        ["security", "find-generic-password", "-a", account, "-w",
+         "-s", "Claude Code-credentials"],
+        capture_output=True,
+        text=True,
+    )
+    if read.returncode != 0 or not read.stdout.strip():
+        log.debug("No default Claude Code keychain credential found")
+        return False
+
+    cred = read.stdout.strip()
+    cred_hex = cred.encode().hex()
+
+    # Write to the hashed service name
+    write = subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-a", account, "-s", target_service, "-X", cred_hex],
+        capture_output=True,
+        text=True,
+    )
+    if write.returncode != 0:
+        log.warning("Failed to clone keychain credential: %s", write.stderr.strip())
+        return False
+
+    log.debug("Cloned keychain credential to %s", target_service)
+    return True
+
+
 def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     """Create an isolated CLAUDE_CONFIG_DIR for an agent.
 
@@ -114,6 +196,12 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     # Create mutable directories
     for dirname in _MUTABLE_DIRS:
         (config_dir / dirname).mkdir(exist_ok=True)
+
+    # Clone macOS Keychain credentials to the per-config-dir service name.
+    # Claude Code v2.1.42+ hashes the config dir path into the keychain
+    # service name, so credentials stored under the default name are
+    # invisible when CLAUDE_CONFIG_DIR is overridden.
+    _clone_keychain_credentials(config_dir)
 
     return config_dir
 
