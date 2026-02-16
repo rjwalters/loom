@@ -54,29 +54,57 @@ def _ensure_onboarding_complete(state_path: Path) -> None:
     Claude Code requires both ``hasCompletedOnboarding = true`` and a truthy
     ``theme`` value to bypass the first-run wizard.  If the state file is
     missing, dangling (broken symlink), or doesn't contain these fields, we
-    replace it with a minimal standalone file so agents never hit the wizard.
+    merge the required fields into the existing data (preserving all other
+    fields) rather than replacing the entire file.
     """
     import json
 
+    # Required fields that must be present to skip the onboarding wizard.
+    required_fields = {
+        "hasCompletedOnboarding": True,
+        "theme": "dark",
+        "effortCalloutDismissed": True,
+        "opusProMigrationComplete": True,
+    }
+
+    existing_data: dict = {}
     try:
         if state_path.exists():
-            data = json.loads(state_path.read_text())
-            if data.get("hasCompletedOnboarding") is True and data.get("theme"):
-                return  # Already has the required fields
+            existing_data = json.loads(state_path.read_text())
+            if isinstance(existing_data, dict):
+                # Check if all required fields are already present and valid.
+                has_onboarding = existing_data.get("hasCompletedOnboarding") is True
+                has_theme = bool(existing_data.get("theme"))
+                has_effort = existing_data.get("effortCalloutDismissed") is True
+                has_opus = existing_data.get("opusProMigrationComplete") is True
+                if has_onboarding and has_theme and has_effort and has_opus:
+                    return  # All required fields present
+            else:
+                existing_data = {}
     except (json.JSONDecodeError, OSError):
-        pass
+        existing_data = {}
+
+    # Merge: fill in only the missing required fields, preserving everything else.
+    merged = {**existing_data}
+    for key, default_value in required_fields.items():
+        if key == "theme":
+            # Only set theme if missing or empty
+            if not merged.get("theme"):
+                merged["theme"] = default_value
+        else:
+            # Only set if not already the correct value
+            if merged.get(key) is not default_value:
+                merged[key] = default_value
 
     # Remove whatever is there (dangling symlink, corrupt file, etc.)
+    # so we can write a standalone file.
     try:
         state_path.unlink()
     except FileNotFoundError:
         pass
 
-    state_path.write_text(json.dumps({
-        "hasCompletedOnboarding": True,
-        "theme": "dark",
-    }))
-    log.debug("Wrote fallback .claude.json with onboarding-complete state")
+    state_path.write_text(json.dumps(merged))
+    log.debug("Wrote merged .claude.json with onboarding-complete state")
 
 
 def _resolve_state_file() -> Path:

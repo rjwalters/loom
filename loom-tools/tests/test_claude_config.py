@@ -100,9 +100,12 @@ class TestSetupAgentConfigDir:
         fake_home = mock_repo / "fake-home"
         fake_home.mkdir()
         (fake_home / ".claude").mkdir()
-        # State file lives at ~/.claude.json (home root)
+        # State file lives at ~/.claude.json (home root) — include all required fields
         state_file = fake_home / ".claude.json"
-        state_file.write_text('{"hasCompletedOnboarding":true,"theme":"dark"}')
+        state_file.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
@@ -120,7 +123,10 @@ class TestSetupAgentConfigDir:
         # Both files exist
         (fake_home / ".claude.json").write_text('{"fallback":true}')
         preferred = fake_home / ".claude" / ".config.json"
-        preferred.write_text('{"hasCompletedOnboarding":true,"theme":"dark"}')
+        preferred.write_text(
+            '{"hasCompletedOnboarding":true,"theme":"dark",'
+            '"effortCalloutDismissed":true,"opusProMigrationComplete":true}'
+        )
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
@@ -146,6 +152,8 @@ class TestSetupAgentConfigDir:
         data = json.loads(dst.read_text())
         assert data["hasCompletedOnboarding"] is True
         assert data["theme"] == "dark"
+        assert data["effortCalloutDismissed"] is True
+        assert data["opusProMigrationComplete"] is True
 
 
 class TestEnsureOnboardingComplete:
@@ -155,10 +163,17 @@ class TestEnsureOnboardingComplete:
         import json
 
         state = tmp_path / ".claude.json"
-        state.write_text(json.dumps({"hasCompletedOnboarding": True, "theme": "monokai"}))
+        original = {
+            "hasCompletedOnboarding": True,
+            "theme": "monokai",
+            "effortCalloutDismissed": True,
+            "opusProMigrationComplete": True,
+        }
+        state.write_text(json.dumps(original))
         _ensure_onboarding_complete(state)
         data = json.loads(state.read_text())
         assert data["theme"] == "monokai"  # unchanged
+        assert data == original
 
     def test_writes_fallback_when_file_missing(self, tmp_path: pathlib.Path) -> None:
         import json
@@ -169,6 +184,8 @@ class TestEnsureOnboardingComplete:
         data = json.loads(state.read_text())
         assert data["hasCompletedOnboarding"] is True
         assert data["theme"] == "dark"
+        assert data["effortCalloutDismissed"] is True
+        assert data["opusProMigrationComplete"] is True
 
     def test_replaces_dangling_symlink(self, tmp_path: pathlib.Path) -> None:
         import json
@@ -184,23 +201,31 @@ class TestEnsureOnboardingComplete:
         data = json.loads(state.read_text())
         assert data["hasCompletedOnboarding"] is True
 
-    def test_replaces_file_missing_theme(self, tmp_path: pathlib.Path) -> None:
+    def test_merges_missing_theme_preserves_existing(self, tmp_path: pathlib.Path) -> None:
         import json
 
         state = tmp_path / ".claude.json"
-        state.write_text(json.dumps({"hasCompletedOnboarding": True}))
+        state.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "effortCalloutDismissed": True,
+            "opusProMigrationComplete": True,
+        }))
         _ensure_onboarding_complete(state)
         data = json.loads(state.read_text())
         assert data["theme"] == "dark"
+        assert data["hasCompletedOnboarding"] is True
+        assert data["effortCalloutDismissed"] is True
+        assert data["opusProMigrationComplete"] is True
 
-    def test_replaces_file_missing_onboarding(self, tmp_path: pathlib.Path) -> None:
+    def test_merges_missing_onboarding_preserves_existing(self, tmp_path: pathlib.Path) -> None:
         import json
 
         state = tmp_path / ".claude.json"
-        state.write_text(json.dumps({"theme": "dark"}))
+        state.write_text(json.dumps({"theme": "dark", "customField": "preserved"}))
         _ensure_onboarding_complete(state)
         data = json.loads(state.read_text())
         assert data["hasCompletedOnboarding"] is True
+        assert data["customField"] == "preserved"
 
     def test_replaces_corrupt_json(self, tmp_path: pathlib.Path) -> None:
         import json
@@ -211,13 +236,53 @@ class TestEnsureOnboardingComplete:
         data = json.loads(state.read_text())
         assert data["hasCompletedOnboarding"] is True
         assert data["theme"] == "dark"
+        assert data["effortCalloutDismissed"] is True
+        assert data["opusProMigrationComplete"] is True
+
+    def test_preserves_effort_callout_when_only_theme_missing(self, tmp_path: pathlib.Path) -> None:
+        """Regression test: merging must not drop effortCalloutDismissed."""
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "effortCalloutDismissed": True,
+        }))
+        _ensure_onboarding_complete(state)
+        data = json.loads(state.read_text())
+        assert data["theme"] == "dark"
+        assert data["effortCalloutDismissed"] is True
+        assert data["opusProMigrationComplete"] is True
+        assert data["hasCompletedOnboarding"] is True
+
+    def test_preserves_user_theme_choice(self, tmp_path: pathlib.Path) -> None:
+        """User's theme choice is not overwritten by the fallback."""
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "theme": "monokai",
+            "effortCalloutDismissed": True,
+            "opusProMigrationComplete": True,
+            "someOtherSetting": 42,
+        }))
+        _ensure_onboarding_complete(state)
+        data = json.loads(state.read_text())
+        assert data["theme"] == "monokai"
+        assert data["someOtherSetting"] == 42
 
     def test_preserves_valid_symlink(self, tmp_path: pathlib.Path) -> None:
-        """When symlink target has the required fields, it's left alone."""
+        """When symlink target has all required fields, it's left alone."""
         import json
 
         target = tmp_path / "real-state.json"
-        target.write_text(json.dumps({"hasCompletedOnboarding": True, "theme": "light"}))
+        target.write_text(json.dumps({
+            "hasCompletedOnboarding": True,
+            "theme": "light",
+            "effortCalloutDismissed": True,
+            "opusProMigrationComplete": True,
+        }))
         state = tmp_path / ".claude.json"
         state.symlink_to(target)
 

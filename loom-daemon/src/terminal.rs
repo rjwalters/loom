@@ -150,35 +150,63 @@ mod claude_config {
     /// Claude Code requires both `hasCompletedOnboarding = true` and a truthy
     /// `theme` value to bypass the first-run wizard.  If the state file is
     /// missing, dangling (broken symlink), or doesn't contain these fields, we
-    /// replace it with a minimal standalone file so agents never hit the wizard.
+    /// merge the required fields into the existing data (preserving all other
+    /// fields) rather than replacing the entire file.
     fn ensure_onboarding_complete(state_path: &Path) {
-        // Check if the existing file (resolving symlinks) has the required fields.
+        // Try to read existing data (resolving symlinks).
+        let mut existing_data = serde_json::Map::new();
         if state_path.exists() {
             if let Ok(contents) = fs::read_to_string(state_path) {
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) {
-                    if data.get("hasCompletedOnboarding") == Some(&serde_json::Value::Bool(true))
-                        && data
-                            .get("theme")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|s| !s.is_empty())
-                    {
-                        return; // Already has the required fields
+                if let Ok(serde_json::Value::Object(map)) =
+                    serde_json::from_str::<serde_json::Value>(&contents)
+                {
+                    // Check if all required fields are already present.
+                    let has_onboarding =
+                        map.get("hasCompletedOnboarding") == Some(&serde_json::Value::Bool(true));
+                    let has_theme = map
+                        .get("theme")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|s| !s.is_empty());
+                    let has_effort =
+                        map.get("effortCalloutDismissed") == Some(&serde_json::Value::Bool(true));
+                    let has_opus =
+                        map.get("opusProMigrationComplete") == Some(&serde_json::Value::Bool(true));
+                    if has_onboarding && has_theme && has_effort && has_opus {
+                        return; // All required fields present
                     }
+                    existing_data = map;
                 }
             }
         }
 
+        // Merge: fill in only the missing required fields, preserving everything else.
+        existing_data
+            .entry("hasCompletedOnboarding")
+            .or_insert(serde_json::Value::Bool(true));
+        if existing_data
+            .get("theme")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            existing_data
+                .insert("theme".to_string(), serde_json::Value::String("dark".to_string()));
+        }
+        existing_data
+            .entry("effortCalloutDismissed")
+            .or_insert(serde_json::Value::Bool(true));
+        existing_data
+            .entry("opusProMigrationComplete")
+            .or_insert(serde_json::Value::Bool(true));
+
         // Remove whatever is there (dangling symlink, corrupt file, etc.)
+        // so we can write a standalone file.
         let _ = fs::remove_file(state_path);
 
-        let fallback = serde_json::json!({
-            "hasCompletedOnboarding": true,
-            "theme": "dark",
-        });
-        if let Err(e) = fs::write(state_path, fallback.to_string()) {
-            log::warn!("Failed to write fallback .claude.json: {e}");
+        let merged = serde_json::Value::Object(existing_data);
+        if let Err(e) = fs::write(state_path, merged.to_string()) {
+            log::warn!("Failed to write merged .claude.json: {e}");
         } else {
-            log::debug!("Wrote fallback .claude.json with onboarding-complete state");
+            log::debug!("Wrote merged .claude.json with onboarding-complete state");
         }
     }
 
@@ -389,13 +417,19 @@ mod claude_config {
                 serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
             assert_eq!(data["hasCompletedOnboarding"], true);
             assert_eq!(data["theme"], "dark");
+            assert_eq!(data["effortCalloutDismissed"], true);
+            assert_eq!(data["opusProMigrationComplete"], true);
         }
 
         #[test]
         fn test_ensure_onboarding_noop_when_complete() {
             let tmp = tempfile::tempdir().unwrap();
             let state = tmp.path().join(".claude.json");
-            fs::write(&state, r#"{"hasCompletedOnboarding":true,"theme":"monokai"}"#).unwrap();
+            fs::write(
+                &state,
+                r#"{"hasCompletedOnboarding":true,"theme":"monokai","effortCalloutDismissed":true,"opusProMigrationComplete":true}"#,
+            )
+            .unwrap();
             ensure_onboarding_complete(&state);
             let data: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
@@ -403,14 +437,48 @@ mod claude_config {
         }
 
         #[test]
-        fn test_ensure_onboarding_replaces_incomplete() {
+        fn test_ensure_onboarding_merges_missing_theme_preserves_existing() {
             let tmp = tempfile::tempdir().unwrap();
             let state = tmp.path().join(".claude.json");
-            fs::write(&state, r#"{"hasCompletedOnboarding":true}"#).unwrap();
+            fs::write(
+                &state,
+                r#"{"hasCompletedOnboarding":true,"effortCalloutDismissed":true,"opusProMigrationComplete":true}"#,
+            )
+            .unwrap();
             ensure_onboarding_complete(&state);
             let data: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
             assert_eq!(data["theme"], "dark");
+            assert_eq!(data["hasCompletedOnboarding"], true);
+            assert_eq!(data["effortCalloutDismissed"], true);
+            assert_eq!(data["opusProMigrationComplete"], true);
+        }
+
+        #[test]
+        fn test_ensure_onboarding_preserves_effort_callout_when_theme_missing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            fs::write(&state, r#"{"hasCompletedOnboarding":true,"effortCalloutDismissed":true}"#)
+                .unwrap();
+            ensure_onboarding_complete(&state);
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["theme"], "dark");
+            assert_eq!(data["effortCalloutDismissed"], true);
+            assert_eq!(data["opusProMigrationComplete"], true);
+            assert_eq!(data["hasCompletedOnboarding"], true);
+        }
+
+        #[test]
+        fn test_ensure_onboarding_preserves_custom_fields() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            fs::write(&state, r#"{"theme":"dark","customField":"preserved"}"#).unwrap();
+            ensure_onboarding_complete(&state);
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["hasCompletedOnboarding"], true);
+            assert_eq!(data["customField"], "preserved");
         }
 
         #[test]
@@ -423,6 +491,8 @@ mod claude_config {
                 serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
             assert_eq!(data["hasCompletedOnboarding"], true);
             assert_eq!(data["theme"], "dark");
+            assert_eq!(data["effortCalloutDismissed"], true);
+            assert_eq!(data["opusProMigrationComplete"], true);
         }
 
         #[test]
@@ -439,6 +509,24 @@ mod claude_config {
             let data: serde_json::Value =
                 serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
             assert_eq!(data["hasCompletedOnboarding"], true);
+            assert_eq!(data["effortCalloutDismissed"], true);
+            assert_eq!(data["opusProMigrationComplete"], true);
+        }
+
+        #[test]
+        fn test_ensure_onboarding_preserves_user_theme() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            fs::write(
+                &state,
+                r#"{"hasCompletedOnboarding":true,"theme":"monokai","effortCalloutDismissed":true,"opusProMigrationComplete":true,"someOther":42}"#,
+            )
+            .unwrap();
+            ensure_onboarding_complete(&state);
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["theme"], "monokai");
+            assert_eq!(data["someOther"], 42);
         }
 
         #[test]
@@ -458,6 +546,8 @@ mod claude_config {
                 serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
             assert_eq!(data["hasCompletedOnboarding"], true);
             assert_eq!(data["theme"], "dark");
+            assert_eq!(data["effortCalloutDismissed"], true);
+            assert_eq!(data["opusProMigrationComplete"], true);
         }
 
         #[test]
