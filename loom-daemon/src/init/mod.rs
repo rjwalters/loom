@@ -123,139 +123,124 @@ pub fn initialize_workspace(
     // Check for self-installation (Loom source repo)
     if is_loom_source_repo(workspace) {
         report.is_self_install = true;
-
-        // Run validation instead of copying files
-        let validation = validate_loom_source_repo(workspace);
-        report.validation = Some(validation);
-
-        // Update .gitignore (this is safe even for self-install)
+        report.validation = Some(validate_loom_source_repo(workspace));
         update_gitignore(workspace)?;
-
         return Ok(report);
     }
 
     // Resolve defaults path (development mode or bundled resource)
     let defaults = resolve_defaults_path(defaults_path)?;
-
-    // Determine if this is a fresh install or reinstall
     let is_reinstall = loom_path.exists();
-
-    // Note: We no longer delete .loom directory in force mode.
-    // Force mode now means "overwrite default files but preserve custom files"
-    // This allows reinstallation to update Loom while keeping project-specific roles.
-    let _ = (is_reinstall, force); // Silence unused warning, these affect behavior below
+    let _ = (is_reinstall, force); // These affect behavior in called functions
 
     // Create .loom directory if it doesn't exist
     fs::create_dir_all(&loom_path).map_err(|e| format!("Failed to create .loom directory: {e}"))?;
 
-    // Copy config.json (always overwrite - this is Loom's config, not user data)
-    let config_src = defaults.join("config.json");
-    let config_dst = loom_path.join("config.json");
-    if config_src.exists() {
-        let existed = config_dst.exists();
-        fs::copy(&config_src, &config_dst)
-            .map_err(|e| format!("Failed to copy config.json: {e}"))?;
+    // Copy config and README files
+    copy_single_file(&defaults, &loom_path, "config.json", ".loom/config.json", &mut report)?;
+    copy_single_file(&defaults, &loom_path, ".loom-README.md", ".loom/README.md", &mut report)?;
+
+    // Sync managed directories (clean stale files on reinstall, then copy fresh)
+    sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &mut report)?;
+    sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &mut report)?;
+    sync_managed_dir(&defaults, &loom_path, "hooks", is_reinstall, &mut report)?;
+    make_hooks_executable(&loom_path.join("hooks"));
+
+    // Update .gitignore and setup scaffolding
+    update_gitignore(workspace)?;
+    setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
+
+    // Verify all copied files match their sources
+    verify_all_copied_files(workspace, &defaults, &loom_path, &mut report);
+
+    // Generate installation manifest (.loom/manifest.json)
+    generate_manifest(workspace);
+
+    Ok(report)
+}
+
+/// Copy a single file from defaults to the loom directory, tracking in report.
+fn copy_single_file(
+    defaults: &Path,
+    loom_path: &Path,
+    src_name: &str,
+    report_name: &str,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src = defaults.join(src_name);
+    // The destination may differ from the source name (e.g., ".loom-README.md" → "README.md")
+    let dst_name = report_name.strip_prefix(".loom/").unwrap_or(src_name);
+    let dst = loom_path.join(dst_name);
+    if src.exists() {
+        let existed = dst.exists();
+        fs::copy(&src, &dst).map_err(|e| format!("Failed to copy {src_name}: {e}"))?;
         if existed {
-            report.updated.push(".loom/config.json".to_string());
+            report.updated.push(report_name.to_string());
         } else {
-            report.added.push(".loom/config.json".to_string());
+            report.added.push(report_name.to_string());
         }
     }
+    Ok(())
+}
 
-    // Copy roles/ directory
-    // - Fresh install: copy all from defaults
-    // - Reinstall: clean directory first to remove stale files, then copy fresh
-    //
-    // On reinstall, the entire managed directory is cleaned before copying.
-    // This ensures files removed from defaults (e.g., scripts ported to Python)
-    // don't linger in the target repo and confuse agents.
-    let roles_src = defaults.join("roles");
-    let roles_dst = loom_path.join("roles");
-    if roles_src.exists() {
+/// Sync a managed directory: clean stale files on reinstall, then copy fresh from defaults.
+fn sync_managed_dir(
+    defaults: &Path,
+    loom_path: &Path,
+    dir_name: &str,
+    is_reinstall: bool,
+    report: &mut InitReport,
+) -> Result<(), String> {
+    let src = defaults.join(dir_name);
+    let dst = loom_path.join(dir_name);
+    let report_prefix = format!(".loom/{dir_name}");
+    if src.exists() {
         if is_reinstall {
-            // Reinstall: clean stale files then copy fresh from defaults
-            clean_managed_dir(&roles_dst, ".loom/roles", &mut report)
-                .map_err(|e| format!("Failed to clean roles directory: {e}"))?;
+            clean_managed_dir(&dst, &report_prefix, report)
+                .map_err(|e| format!("Failed to clean {dir_name} directory: {e}"))?;
         }
-        copy_dir_with_report(&roles_src, &roles_dst, ".loom/roles", &mut report)
-            .map_err(|e| format!("Failed to copy roles directory: {e}"))?;
+        copy_dir_with_report(&src, &dst, &report_prefix, report)
+            .map_err(|e| format!("Failed to copy {dir_name} directory: {e}"))?;
     }
+    Ok(())
+}
 
-    // Copy scripts/ directory - same clean-then-copy logic as roles
-    let scripts_src = defaults.join("scripts");
-    let scripts_dst = loom_path.join("scripts");
-    if scripts_src.exists() {
-        if is_reinstall {
-            // Reinstall: clean stale files then copy fresh from defaults
-            clean_managed_dir(&scripts_dst, ".loom/scripts", &mut report)
-                .map_err(|e| format!("Failed to clean scripts directory: {e}"))?;
-        }
-        copy_dir_with_report(&scripts_src, &scripts_dst, ".loom/scripts", &mut report)
-            .map_err(|e| format!("Failed to copy scripts directory: {e}"))?;
-    }
-
-    // Copy hooks/ directory - same clean-then-copy logic as roles/scripts
-    // Hooks were previously only installed by install-loom.sh, not by loom-daemon init.
-    // This caused hooks to be lost during reinstall when the install script's hook
-    // copy step was skipped or the worktree didn't preserve them.
-    let hooks_src = defaults.join("hooks");
-    let hooks_dst = loom_path.join("hooks");
-    if hooks_src.exists() {
-        if is_reinstall {
-            clean_managed_dir(&hooks_dst, ".loom/hooks", &mut report)
-                .map_err(|e| format!("Failed to clean hooks directory: {e}"))?;
-        }
-        copy_dir_with_report(&hooks_src, &hooks_dst, ".loom/hooks", &mut report)
-            .map_err(|e| format!("Failed to copy hooks directory: {e}"))?;
-
-        // Ensure hooks are executable
-        if let Ok(entries) = std::fs::read_dir(&hooks_dst) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("sh") {
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        if let Ok(metadata) = std::fs::metadata(&path) {
-                            let mut perms = metadata.permissions();
-                            perms.set_mode(perms.mode() | 0o111);
-                            let _ = std::fs::set_permissions(&path, perms);
-                        }
+/// Ensure all `.sh` files in the hooks directory are executable.
+fn make_hooks_executable(hooks_dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(hooks_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("sh") {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&path) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(perms.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&path, perms);
                     }
                 }
             }
         }
     }
+}
 
-    // Verify copied files match their sources
-    verify_copied_files(&roles_src, &roles_dst, ".loom/roles", &mut report, None);
-    verify_copied_files(&scripts_src, &scripts_dst, ".loom/scripts", &mut report, None);
-    verify_copied_files(&hooks_src, &hooks_dst, ".loom/hooks", &mut report, None);
-
-    // Copy .loom-specific README
-    let loom_readme_src = defaults.join(".loom-README.md");
-    let loom_readme_dst = loom_path.join("README.md");
-    if loom_readme_src.exists() {
-        let existed = loom_readme_dst.exists();
-        fs::copy(&loom_readme_src, &loom_readme_dst)
-            .map_err(|e| format!("Failed to copy .loom-README.md: {e}"))?;
-        if existed {
-            report.updated.push(".loom/README.md".to_string());
-        } else {
-            report.added.push(".loom/README.md".to_string());
-        }
+/// Verify all copied files and scaffolding directories match their sources.
+fn verify_all_copied_files(
+    workspace: &Path,
+    defaults: &Path,
+    loom_path: &Path,
+    report: &mut InitReport,
+) {
+    // Verify .loom managed directories (no template substitution needed)
+    for dir_name in &["roles", "scripts", "hooks"] {
+        let src = defaults.join(dir_name);
+        let dst = loom_path.join(dir_name);
+        let prefix = format!(".loom/{dir_name}");
+        verify_copied_files(&src, &dst, &prefix, report, None);
     }
 
-    // Update .gitignore with Loom ephemeral patterns
-    update_gitignore(workspace)?;
-
-    // Setup repository scaffolding (CLAUDE.md, .claude/, .codex/)
-    setup_repository_scaffolding(workspace, &defaults, force, &mut report)?;
-
-    // Verify scaffolding directories match their sources.
-    // Template context is provided so that files with template variables
-    // (e.g., .github/workflows/label-external-issues.yml) are substituted
-    // before comparison, avoiding false-positive content mismatches.
+    // Verify scaffolding directories with template context for variable substitution
     let repo_info = git::extract_repo_info(workspace);
     let template_ctx = TemplateContext {
         repo_owner: repo_info.as_ref().map(|(o, _)| o.clone()),
@@ -264,24 +249,11 @@ pub fn initialize_workspace(
     };
     let ctx = Some(&template_ctx);
 
-    let claude_src = defaults.join(".claude");
-    let claude_dst = workspace.join(".claude");
-    verify_copied_files(&claude_src, &claude_dst, ".claude", &mut report, ctx);
-
-    let codex_src = defaults.join(".codex");
-    let codex_dst = workspace.join(".codex");
-    verify_copied_files(&codex_src, &codex_dst, ".codex", &mut report, ctx);
-
-    let github_src = defaults.join(".github");
-    let github_dst = workspace.join(".github");
-    verify_copied_files(&github_src, &github_dst, ".github", &mut report, ctx);
-
-    // Generate installation manifest using verify-install.sh
-    // This creates .loom/manifest.json with SHA-256 checksums of all
-    // installed files (computed on the rendered output, not source templates).
-    generate_manifest(workspace);
-
-    Ok(report)
+    for dir_name in &[".claude", ".codex", ".github"] {
+        let src = defaults.join(dir_name);
+        let dst = workspace.join(dir_name);
+        verify_copied_files(&src, &dst, dir_name, report, ctx);
+    }
 }
 
 #[cfg(test)]
