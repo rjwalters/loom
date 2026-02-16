@@ -605,6 +605,97 @@ class TestBuilderPhase:
         assert result.data.get("exit_code") == 1
         assert result.data.get("diagnostics") == fake_diag
 
+    def test_nonzero_exit_with_pr_created_checkpoint_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Builder non-zero exit with pr_created checkpoint should succeed.
+
+        When the builder creates a PR successfully but then exits with a
+        non-zero code (e.g., code 7 due to MCP retry), the shepherd should
+        continue to the judge phase since the work is complete.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = None
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": (
+                "worktree exists; remote branch exists; "
+                "PR #100 (with loom:review-requested); checkpoint=pr_created"
+            ),
+            "checkpoint_stage": "pr_created",
+            "pr_number": 100,
+            "pr_has_review_label": True,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=7,
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "PR #100" in result.message
+        assert "recovered from exit code 7" in result.message
+        assert result.data.get("pr_number") == 100
+        assert result.data.get("recovered_from_checkpoint") is True
+        assert mock_context.pr_number == 100
+
+    def test_nonzero_exit_without_pr_created_checkpoint_fails(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Builder non-zero exit without pr_created checkpoint should fail.
+
+        When the builder exits non-zero and there is no pr_created checkpoint,
+        the normal failure path should still apply.
+        """
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": (
+                "worktree exists; remote branch exists; no PR; "
+                "checkpoint=implementing"
+            ),
+            "checkpoint_stage": "implementing",
+            "pr_number": None,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=7,
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "exited with code 7" in result.message
+
     def test_stuck_builder_includes_log_path(self, mock_context: MagicMock) -> None:
         """Builder stuck (exit 4) should include log file path in data."""
         mock_context.check_shutdown.return_value = False
