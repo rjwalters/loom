@@ -503,6 +503,9 @@ def _make_ctx(
     ctx.issue_title = "Test issue"
     ctx.pr_number = 100
     ctx.report_milestone = MagicMock(return_value=True)
+    # Default has_pr_label to False so label-detection code paths
+    # don't interfere with tests that don't explicitly test them.
+    ctx.has_pr_label.return_value = False
     return ctx
 
 
@@ -1463,6 +1466,97 @@ class TestJudgeRetry:
         assert retry_calls[0].kwargs["attempt"] == 1
         assert retry_calls[0].kwargs["max_retries"] == 3
         assert "validation failed" in retry_calls[0].kwargs["reason"]
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_unexpected_result_with_changes_requested_label_enters_doctor(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockDoctor: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Unexpected judge result with loom:changes-requested label should enter doctor loop.
+
+        When the judge returns an unexpected result (no approved/changes_requested
+        data) but the loom:changes-requested label is present, the shepherd should
+        detect the label and route to the doctor loop instead of retrying the judge.
+        See issue #2345.
+        """
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (unexpected result, but label present)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Doctor (fixes changes)
+            10,    # doctor phase_start
+            20,    # doctor elapsed
+            # Judge attempt 2 (approves after doctor fix)
+            20,    # judge phase_start
+            30,    # judge elapsed
+            # Merge
+            30,    # merge phase_start
+            35,    # merge elapsed
+            35,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: first call returns unexpected result (no approved/changes_requested),
+        # second call approves after doctor fixes.
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _success_result("judge"),  # unexpected: no approved or changes_requested
+            _success_result("judge", approved=True),
+        ]
+
+        # Configure has_pr_label to return True only for loom:changes-requested
+        def label_side_effect(label: str) -> bool:
+            return label == "loom:changes-requested"
+        ctx.has_pr_label.side_effect = label_side_effect
+
+        MockDoctor.return_value.run.return_value = _success_result("doctor")
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Label cache should have been invalidated
+        ctx.label_cache.invalidate_pr.assert_called()
+
+        # Doctor should have been invoked (changes_requested detected via label)
+        MockDoctor.return_value.run.assert_called_once()
+
+        # No judge_retry milestones — label detection should skip retry
+        retry_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "judge_retry"
+        ]
+        assert len(retry_calls) == 0
+
+        # Doctor phase_completed milestone should be present
+        doctor_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "phase_completed" and c.kwargs.get("phase") == "doctor"
+        ]
+        assert len(doctor_calls) == 1
 
 
 class TestMarkJudgeExhausted:
