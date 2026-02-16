@@ -120,6 +120,12 @@ class JudgePhase:
         # Report phase entry
         ctx.report_milestone("phase_entered", phase="judge")
 
+        # Record phase start time for stale log detection (issue #2327).
+        # When MCP retry creates a new session, the old log file may persist
+        # with content from a much earlier run.  _gather_diagnostics uses
+        # this timestamp to flag such stale logs.
+        phase_start_time = time.time()
+
         # Run judge worker with retry
         exit_code = run_phase_with_retry(
             ctx,
@@ -221,7 +227,7 @@ class JudgePhase:
                     data={"changes_requested": True, "fallback_used": True},
                 )
             else:
-                diag = self._gather_diagnostics(ctx)
+                diag = self._gather_diagnostics(ctx, phase_start_time)
                 # Add context about loom:review-requested state (issue #1998)
                 if ctx.has_pr_label("loom:review-requested"):
                     diag["intermediate_state"] = "doctor_fixed_awaiting_judging"
@@ -590,7 +596,9 @@ class JudgePhase:
         except OSError:
             return False
 
-    def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
+    def _gather_diagnostics(
+        self, ctx: ShepherdContext, phase_start_time: float = 0.0
+    ) -> dict[str, Any]:
         """Collect diagnostic info when judge validation fails.
 
         Inspects the judge worker log file, PR judging state, and comments
@@ -601,6 +609,12 @@ class JudgePhase:
         - Agent started but didn't complete (loom:reviewing but no outcome)
         - Agent completed judging but label failed (comment exists, no label)
         - Agent left no signals (timeout without work)
+
+        Args:
+            ctx: Shepherd context.
+            phase_start_time: Unix timestamp of when the current judge phase
+                attempt started.  Used to detect stale log files from previous
+                runs (issue #2327).
 
         All commands are best-effort; failures are recorded but never raised.
         """
@@ -613,6 +627,7 @@ class JudgePhase:
         # Check for meaningful output (issue #1978) - detects agents that spawn
         # but produce only terminal escape sequences like "\x1b[?2026l"
         diag["has_meaningful_output"] = self._has_meaningful_output(log_path)
+        diag["log_is_stale"] = False
         if log_path.is_file():
             try:
                 lines = log_path.read_text().splitlines()
@@ -621,10 +636,22 @@ class JudgePhase:
                 stat = log_path.stat()
                 diag["log_mtime"] = stat.st_mtime
                 diag["log_size_bytes"] = stat.st_size
-                # Calculate approximate session duration from file timestamps
+                # Detect stale log from a previous run (issue #2327).
+                # If the log file was created before this phase attempt
+                # started, the content belongs to an earlier session and
+                # the session duration would be meaningless.
                 ctime = stat.st_ctime  # Creation time (when session started)
                 mtime = stat.st_mtime  # Modification time (last output)
-                diag["session_duration_seconds"] = int(mtime - ctime)
+                if phase_start_time > 0 and ctime < phase_start_time:
+                    diag["log_is_stale"] = True
+                    log_warning(
+                        f"Stale judge log detected: log created at "
+                        f"{ctime:.0f}, phase started at "
+                        f"{phase_start_time:.0f} (issue #2327)"
+                    )
+                else:
+                    # Only report session duration for current-session logs
+                    diag["session_duration_seconds"] = int(mtime - ctime)
             except OSError:
                 diag["log_tail"] = []
         else:
@@ -671,6 +698,12 @@ class JudgePhase:
         # Categorize the failure to help with debugging
         if not diag["log_exists"]:
             diag["failure_mode"] = "agent_never_ran"
+        elif diag["log_is_stale"]:
+            # Issue #2327: Log file belongs to a previous run; current
+            # session output is unavailable.  This typically happens when
+            # MCP retry creates a new tmux session but the old log content
+            # persists from a much earlier run.
+            diag["failure_mode"] = "stale_log_from_previous_run"
         elif has_review_requested and not has_outcome_label:
             # Issue #1998: Doctor applied fixes, PR has loom:review-requested,
             # but judge hasn't applied outcome label yet. This takes precedence
@@ -715,8 +748,10 @@ class JudgePhase:
         else:
             parts.append("no loom labels on PR")
 
-        # Log tail
-        if diag["log_tail"]:
+        # Log tail — flag stale output so operators don't misinterpret it
+        if diag["log_is_stale"]:
+            parts.append("log file is STALE (from a previous run)")
+        elif diag["log_tail"]:
             last_line = diag["log_tail"][-1].strip()
             parts.append(f"last output: {last_line!r}")
         elif diag["log_exists"]:
@@ -724,7 +759,7 @@ class JudgePhase:
         else:
             parts.append(f"log file not found ({diag['log_file']})")
 
-        # Session duration (if available)
+        # Session duration (if available; omitted for stale logs)
         if "session_duration_seconds" in diag:
             duration = diag["session_duration_seconds"]
             parts.append(f"session duration: {duration}s")
@@ -741,6 +776,12 @@ class JudgePhase:
             "doctor_fixed_awaiting_outcome": (
                 "PR has loom:review-requested (Doctor applied fixes) but judge "
                 "did not apply outcome label (loom:pr or loom:changes-requested)"
+            ),
+            # Issue #2327: Log file is from a previous run
+            "stale_log_from_previous_run": (
+                "Log file predates current phase attempt — content is from a "
+                "previous run (MCP retry likely created a new session but the "
+                "old log was not rotated)"
             ),
             "unknown": "Unable to determine failure mode",
         }
