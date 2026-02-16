@@ -8,6 +8,7 @@ import pytest
 
 from loom_tools.common.claude_config import (
     _SHARED_CONFIG_FILES,
+    _ensure_onboarding_complete,
     _keychain_service_name,
     _resolve_state_file,
     cleanup_agent_config_dir,
@@ -101,7 +102,7 @@ class TestSetupAgentConfigDir:
         (fake_home / ".claude").mkdir()
         # State file lives at ~/.claude.json (home root)
         state_file = fake_home / ".claude.json"
-        state_file.write_text('{"hasCompletedOnboarding":true}')
+        state_file.write_text('{"hasCompletedOnboarding":true,"theme":"dark"}')
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
@@ -119,7 +120,7 @@ class TestSetupAgentConfigDir:
         # Both files exist
         (fake_home / ".claude.json").write_text('{"fallback":true}')
         preferred = fake_home / ".claude" / ".config.json"
-        preferred.write_text('{"hasCompletedOnboarding":true}')
+        preferred.write_text('{"hasCompletedOnboarding":true,"theme":"dark"}')
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: fake_home))
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
@@ -127,10 +128,12 @@ class TestSetupAgentConfigDir:
         assert dst.is_symlink(), ".claude.json should be symlinked"
         assert dst.resolve() == preferred.resolve()
 
-    def test_missing_state_file_skipped_gracefully(
+    def test_missing_state_file_writes_fallback(
         self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Verify no error when neither state file exists."""
+        """When neither state file exists, a fallback is written."""
+        import json
+
         fake_home = mock_repo / "fake-home"
         fake_home.mkdir()
         (fake_home / ".claude").mkdir()
@@ -138,7 +141,90 @@ class TestSetupAgentConfigDir:
 
         config_dir = setup_agent_config_dir("test-agent", mock_repo)
         dst = config_dir / ".claude.json"
-        assert not dst.exists(), ".claude.json should not exist when source is missing"
+        assert dst.exists(), "Fallback .claude.json should be written"
+        assert not dst.is_symlink(), "Should be a real file, not a symlink"
+        data = json.loads(dst.read_text())
+        assert data["hasCompletedOnboarding"] is True
+        assert data["theme"] == "dark"
+
+
+class TestEnsureOnboardingComplete:
+    """Tests for _ensure_onboarding_complete."""
+
+    def test_noop_when_file_has_required_fields(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.write_text(json.dumps({"hasCompletedOnboarding": True, "theme": "monokai"}))
+        _ensure_onboarding_complete(state)
+        data = json.loads(state.read_text())
+        assert data["theme"] == "monokai"  # unchanged
+
+    def test_writes_fallback_when_file_missing(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        _ensure_onboarding_complete(state)
+        assert state.exists()
+        data = json.loads(state.read_text())
+        assert data["hasCompletedOnboarding"] is True
+        assert data["theme"] == "dark"
+
+    def test_replaces_dangling_symlink(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.symlink_to(tmp_path / "nonexistent-target")
+        assert state.is_symlink()
+        assert not state.exists()  # dangling
+
+        _ensure_onboarding_complete(state)
+        assert state.exists()
+        assert not state.is_symlink()  # replaced with real file
+        data = json.loads(state.read_text())
+        assert data["hasCompletedOnboarding"] is True
+
+    def test_replaces_file_missing_theme(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.write_text(json.dumps({"hasCompletedOnboarding": True}))
+        _ensure_onboarding_complete(state)
+        data = json.loads(state.read_text())
+        assert data["theme"] == "dark"
+
+    def test_replaces_file_missing_onboarding(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.write_text(json.dumps({"theme": "dark"}))
+        _ensure_onboarding_complete(state)
+        data = json.loads(state.read_text())
+        assert data["hasCompletedOnboarding"] is True
+
+    def test_replaces_corrupt_json(self, tmp_path: pathlib.Path) -> None:
+        import json
+
+        state = tmp_path / ".claude.json"
+        state.write_text("not valid json{{{")
+        _ensure_onboarding_complete(state)
+        data = json.loads(state.read_text())
+        assert data["hasCompletedOnboarding"] is True
+        assert data["theme"] == "dark"
+
+    def test_preserves_valid_symlink(self, tmp_path: pathlib.Path) -> None:
+        """When symlink target has the required fields, it's left alone."""
+        import json
+
+        target = tmp_path / "real-state.json"
+        target.write_text(json.dumps({"hasCompletedOnboarding": True, "theme": "light"}))
+        state = tmp_path / ".claude.json"
+        state.symlink_to(target)
+
+        _ensure_onboarding_complete(state)
+        assert state.is_symlink()  # symlink preserved
+        data = json.loads(state.read_text())
+        assert data["theme"] == "light"
 
 
 class TestResolveStateFile:
