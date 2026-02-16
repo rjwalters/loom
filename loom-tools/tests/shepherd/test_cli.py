@@ -2374,3 +2374,235 @@ class TestDoctorTestFixLoop:
 
         result = orchestrate(ctx)
         assert result == ShepherdExitCode.SHUTDOWN
+
+
+class TestDoctorRegressionGuard:
+    """Test that the doctor test-fix loop aborts when doctor makes things worse."""
+
+    @patch("loom_tools.shepherd.cli._run_reflection")
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_regression_aborts_loop(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        mock_mark_failure: MagicMock,
+        mock_reflection: MagicMock,
+    ) -> None:
+        """When doctor increases error count, loop should abort immediately."""
+        time_values = [
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Doctor attempt 1
+            100,   # doctor phase_start
+            150,   # doctor elapsed
+            # Test re-verification
+            150,   # test_start
+            160,   # test elapsed
+            # Regression detected → duration calc for _run_reflection
+            160,
+        ]
+        mock_time.time = MagicMock(side_effect=time_values)
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Builder reports 1 new error
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "new_error_count": 1},
+        )
+        # After Doctor, tests have 5 new errors (regression)
+        builder_inst.run_test_verification_only.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "new_error_count": 5},
+        )
+
+        # Doctor succeeds (but makes things worse)
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.PR_TESTS_FAILED
+
+        # Doctor was called only once (aborted after regression detected)
+        assert doctor_inst.run_test_fix.call_count == 1
+        # Marked as test failure
+        mock_mark_failure.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli._run_reflection")
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_same_error_count_continues(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        mock_mark_failure: MagicMock,
+        mock_reflection: MagicMock,
+    ) -> None:
+        """When doctor keeps same error count, loop should continue retrying."""
+        # test_fix_max_retries defaults to 2
+        time_values = [
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+        ]
+        # Two Doctor attempts, each followed by test re-verification
+        for i in range(2):
+            time_values.extend([
+                100 + i * 100,   # doctor phase_start
+                150 + i * 100,   # doctor elapsed
+                150 + i * 100,   # test_start
+                160 + i * 100,   # test elapsed
+            ])
+        time_values.append(360)  # _run_reflection duration
+
+        mock_time.time = MagicMock(side_effect=time_values)
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Same error count throughout (1 new error)
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "new_error_count": 1},
+        )
+        builder_inst.run_test_verification_only.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "new_error_count": 1},
+        )
+
+        # Doctor succeeds each time but tests still fail with same count
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.PR_TESTS_FAILED
+
+        # Doctor was called max times (2) — not short-circuited
+        assert doctor_inst.run_test_fix.call_count == 2
+
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_doctor_reduces_errors_continues(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+    ) -> None:
+        """When doctor reduces error count, loop should continue (and succeed if tests pass)."""
+        time_values = [
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Doctor attempt 1
+            100,   # doctor phase_start
+            150,   # doctor elapsed
+            # Test re-verification (passes)
+            150,   # test_start
+            160,   # test elapsed
+            # Completion validation
+            160,   # completion_start
+            170,   # completion elapsed
+            # Judge
+            170,   # judge phase_start
+            220,   # judge elapsed
+            # Merge
+            220,   # merge phase_start
+            230,   # merge elapsed
+            230,   # duration calc
+        ]
+        mock_time.time = MagicMock(side_effect=time_values)
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Builder reports 3 new errors
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "new_error_count": 3},
+        )
+        # After Doctor, tests pass
+        builder_inst.run_test_verification_only.return_value = None
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+
+        # Doctor succeeds
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        # Judge approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        # Merge
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.SUCCESS
+
+        # Doctor was called once, tests passed
+        assert doctor_inst.run_test_fix.call_count == 1
+        mock_mark_failure.assert_not_called()
