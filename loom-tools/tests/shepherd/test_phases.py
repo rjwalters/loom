@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -30,6 +31,7 @@ from loom_tools.shepherd.phases.base import (
     INSTANT_EXIT_MIN_OUTPUT_CHARS,
     INSTANT_EXIT_THRESHOLD_SECONDS,
     MCP_FAILURE_BACKOFF_SECONDS,
+    MCP_FAILURE_DURATION_THRESHOLD,
     MCP_FAILURE_MAX_RETRIES,
     _is_instant_exit,
     _is_mcp_failure,
@@ -10531,6 +10533,59 @@ class TestIsMcpFailure:
         log = tmp_path / "session.log"
         log.write_text("")
         assert _is_mcp_failure(log) is False
+
+    def test_productive_session_with_mcp_pattern_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        """Long-running session with MCP status-bar text should NOT be flagged.
+
+        This is the false-positive scenario from issue #2374: the builder
+        runs for minutes doing real work, but the Claude CLI status bar
+        shows '1 MCP server failed', triggering a spurious retry.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "Claude CLI started. Loading /builder skill.\n"
+            "bypasspermissionson · 1 MCP server failed · /mcp\n"
+            "Running git log --oneline -20 main\n"
+            "Implementing feature for issue #42...\n"
+        )
+        # Simulate a session that ran for well over the threshold
+        stat = log.stat()
+        os.utime(log, (stat.st_atime, stat.st_mtime + MCP_FAILURE_DURATION_THRESHOLD + 60))
+        assert _is_mcp_failure(log) is False
+
+    def test_short_session_with_mcp_pattern_returns_true(
+        self, tmp_path: Path
+    ) -> None:
+        """Short-lived session with MCP pattern IS a real MCP failure."""
+        log = tmp_path / "session.log"
+        log.write_text("1 MCP server failed\n")
+        # File just created: ctime == mtime, duration 0 < threshold
+        assert _is_mcp_failure(log) is True
+
+    def test_session_above_threshold_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        """Session clearly above the duration threshold should NOT be flagged."""
+        log = tmp_path / "session.log"
+        log.write_text("1 MCP server failed\n")
+        stat = log.stat()
+        # Use threshold + 5 to safely clear any floating-point rounding
+        # from os.utime updating st_ctime.
+        os.utime(log, (stat.st_atime, stat.st_mtime + MCP_FAILURE_DURATION_THRESHOLD + 5))
+        assert _is_mcp_failure(log) is False
+
+    def test_session_well_below_threshold_returns_true(
+        self, tmp_path: Path
+    ) -> None:
+        """Session well below the duration threshold should be flagged."""
+        log = tmp_path / "session.log"
+        log.write_text("1 MCP server failed\n")
+        stat = log.stat()
+        # 10 seconds is well below the 30-second threshold
+        os.utime(log, (stat.st_atime, stat.st_mtime + 10))
+        assert _is_mcp_failure(log) is True
 
 
 class TestRunWorkerPhaseMcpFailure:
