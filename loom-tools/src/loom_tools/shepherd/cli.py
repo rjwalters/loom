@@ -874,6 +874,45 @@ def orchestrate(ctx: ShepherdContext) -> int:
             # Judge succeeded — reset retry counter for this loop iteration
             judge_retries = 0
 
+            # For results that lack expected data flags, check PR labels.
+            # The judge may have completed its work (applied loom:pr or
+            # loom:changes-requested) even though the result object doesn't
+            # carry the corresponding flag.  See issue #2345.
+            if not result.data.get("approved") and not result.data.get(
+                "changes_requested"
+            ):
+                ctx.label_cache.invalidate_pr(ctx.pr_number)
+                if ctx.has_pr_label("loom:pr"):
+                    log_info(
+                        f"Judge already approved PR #{ctx.pr_number} "
+                        f"(loom:pr label present), skipping retry"
+                    )
+                    pr_approved = True
+                    completed_phases.append(
+                        "Judge (approved, detected from labels)"
+                    )
+                    ctx.report_milestone(
+                        "phase_completed",
+                        phase="judge",
+                        duration_seconds=elapsed,
+                        status="approved",
+                    )
+                    break
+                elif ctx.has_pr_label("loom:changes-requested"):
+                    log_info(
+                        f"Judge already requested changes on PR #{ctx.pr_number} "
+                        f"(loom:changes-requested label present), skipping retry"
+                    )
+                    # Override result so the changes_requested path below
+                    # routes to the Doctor loop.
+                    result = PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message="judge completed (detected from labels)",
+                        phase_name="judge",
+                        data={"changes_requested": True},
+                    )
+                    # Fall through to elif result.data.get("changes_requested")
+
             if result.data.get("approved"):
                 pr_approved = True
                 completed_phases.append("Judge (approved)")
@@ -967,25 +1006,10 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     status="success",
                 )
             else:
-                # Unexpected result — neither approved, changes_requested,
-                # nor FAILED/STUCK. Check if the judge already completed
-                # its work before retrying.  See issue #2335.
-                ctx.label_cache.invalidate_pr(ctx.pr_number)
-                if ctx.has_pr_label("loom:pr"):
-                    log_info(
-                        f"Judge already approved PR #{ctx.pr_number} "
-                        f"(loom:pr label present), skipping retry"
-                    )
-                    pr_approved = True
-                    completed_phases.append("Judge (approved, detected post-failure)")
-                    ctx.report_milestone(
-                        "phase_completed",
-                        phase="judge",
-                        duration_seconds=elapsed,
-                        status="approved",
-                    )
-                    break
-                elif judge_retries < ctx.config.judge_max_retries:
+                # Truly unexpected result with no label fallback (labels
+                # were already checked in the pre-check above) — retry
+                # or exhaust.  See issues #2335 and #2345.
+                if judge_retries < ctx.config.judge_max_retries:
                     judge_retries += 1
                     log_warning(
                         f"Judge returned unexpected result ({result.message}), "
