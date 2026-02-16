@@ -774,7 +774,7 @@ class DoctorPhase:
         }
 
         try:
-            context_file.write_text(json.dumps(context_data, indent=2))
+            context_file.write_text(json.dumps(context_data, indent=2) + "\n")
             return context_file
         except OSError:
             return None

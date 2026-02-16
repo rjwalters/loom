@@ -1326,6 +1326,39 @@ class BuilderPhase:
         # One side parsed, other didn't — can't reliably compare
         return False
 
+    def _compute_new_error_count(
+        self, worktree_output: str, baseline_output: str | None
+    ) -> int | None:
+        """Compute the number of new errors introduced by the worktree.
+
+        Uses structured failure count parsing to determine how many errors
+        the worktree introduces beyond baseline. Used by the orchestrator
+        to detect regressions across doctor test-fix iterations.
+
+        Returns:
+            The number of new errors (worktree - baseline), or None if
+            failure counts could not be parsed.
+        """
+        worktree_count = self._parse_failure_count(worktree_output)
+        if worktree_count is None:
+            # Fall back to error line counting
+            worktree_lines = set(self._extract_error_lines(worktree_output))
+            if not worktree_lines:
+                return None
+            if baseline_output is None:
+                return len(worktree_lines)
+            baseline_lines = set(self._extract_error_lines(baseline_output))
+            return len(worktree_lines - baseline_lines)
+
+        if baseline_output is None:
+            return worktree_count
+
+        baseline_count = self._parse_failure_count(baseline_output)
+        if baseline_count is None:
+            return worktree_count
+
+        return max(0, worktree_count - baseline_count)
+
     # Patterns for non-deterministic content that should be normalized
     # before line-based comparison to avoid false positives.
     _NORMALIZE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -1582,17 +1615,29 @@ class BuilderPhase:
         if ctx.worktree_path:
             changed_files = get_changed_files(cwd=ctx.worktree_path)
 
+        # Compute new error count for regression detection across doctor iterations
+        new_error_count = self._compute_new_error_count(
+            output,
+            baseline_result.stdout + "\n" + baseline_result.stderr
+            if baseline_result is not None and baseline_result.returncode != 0
+            else None,
+        )
+
+        data: dict[str, object] = {
+            "test_failure": True,
+            "test_output_tail": tail_text,
+            "test_summary": summary or "",
+            "test_command": display_name,
+            "changed_files": changed_files,
+        }
+        if new_error_count is not None:
+            data["new_error_count"] = new_error_count
+
         return PhaseResult(
             status=PhaseStatus.FAILED,
             message=f"test verification failed ({display_name}, exit code {result.returncode})",
             phase_name="builder",
-            data={
-                "test_failure": True,
-                "test_output_tail": tail_text,
-                "test_summary": summary or "",
-                "test_command": display_name,
-                "changed_files": changed_files,
-            },
+            data=data,
         )
 
     def _run_test_verification(self, ctx: ShepherdContext) -> PhaseResult | None:
@@ -1907,17 +1952,31 @@ class BuilderPhase:
         if ctx.worktree_path:
             changed_files = get_changed_files(cwd=ctx.worktree_path)
 
+        # Compute new error count for regression detection across doctor iterations
+        baseline_output_for_count = (
+            baseline_result.stdout + "\n" + baseline_result.stderr
+            if baseline_result is not None and baseline_result.returncode != 0
+            else None
+        )
+        new_error_count = self._compute_new_error_count(
+            primary_output, baseline_output_for_count
+        )
+
+        data: dict[str, object] = {
+            "test_failure": True,
+            "test_output_tail": tail_text,
+            "test_summary": summary or "",
+            "test_command": display_name,
+            "changed_files": changed_files,
+        }
+        if new_error_count is not None:
+            data["new_error_count"] = new_error_count
+
         return PhaseResult(
             status=PhaseStatus.FAILED,
             message=f"test verification failed ({display_name}, exit code {result.returncode})",
             phase_name="builder",
-            data={
-                "test_failure": True,
-                "test_output_tail": tail_text,
-                "test_summary": summary or "",
-                "test_command": display_name,
-                "changed_files": changed_files,
-            },
+            data=data,
         )
 
     def _is_rate_limited(self, ctx: ShepherdContext) -> bool:
@@ -3016,7 +3075,7 @@ class BuilderPhase:
             }
             context_file = ctx.worktree_path / ".loom-test-failure-context.json"
             try:
-                context_file.write_text(json.dumps(context_data, indent=2))
+                context_file.write_text(json.dumps(context_data, indent=2) + "\n")
                 log_info(f"Wrote test failure context to {context_file}")
             except OSError as e:
                 log_warning(f"Could not write test failure context: {e}")

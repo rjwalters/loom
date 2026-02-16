@@ -499,6 +499,7 @@ def orchestrate(ctx: ShepherdContext) -> int:
         test_fix_attempts = 0
         builder_total_elapsed = 0
         doctor_total_elapsed_test_fix = 0
+        prev_error_count: int | None = None  # Track errors for regression detection
 
         if skip:
             log_info(f"Skipping builder phase ({reason})")
@@ -518,6 +519,46 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK)
                 and result.data.get("test_failure")
             ):
+                # Track error count for regression detection
+                current_error_count = result.data.get("new_error_count")
+                if prev_error_count is None:
+                    # First iteration — record initial error count
+                    prev_error_count = current_error_count
+                elif (
+                    current_error_count is not None
+                    and prev_error_count is not None
+                    and current_error_count > prev_error_count
+                ):
+                    # Doctor made things worse — abort immediately
+                    log_error(
+                        f"Doctor introduced regressions "
+                        f"({prev_error_count} → {current_error_count} new errors), "
+                        f"aborting test-fix loop"
+                    )
+                    phase_durations["Builder"] = builder_total_elapsed
+                    if doctor_total_elapsed_test_fix > 0:
+                        phase_durations["Doctor (test-fix)"] = doctor_total_elapsed_test_fix
+                    ctx.report_milestone(
+                        "phase_completed",
+                        phase="builder",
+                        duration_seconds=builder_total_elapsed,
+                        status="doctor_regression",
+                    )
+                    _mark_builder_test_failure(ctx)
+                    _run_reflection(
+                        ctx,
+                        exit_code=ShepherdExitCode.PR_TESTS_FAILED,
+                        duration=int(time.time() - start_time),
+                        phase_durations=phase_durations,
+                        completed_phases=completed_phases,
+                        test_fix_attempts=test_fix_attempts,
+                        warnings=run_warnings,
+                    )
+                    return ShepherdExitCode.PR_TESTS_FAILED
+                else:
+                    # Update tracked count (same or improved)
+                    prev_error_count = current_error_count
+
                 test_fix_attempts += 1
 
                 if test_fix_attempts > ctx.config.test_fix_max_retries:
