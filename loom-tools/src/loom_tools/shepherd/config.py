@@ -192,6 +192,10 @@ class ShepherdConfig:
     # Reflection phase control
     no_reflect: bool = False
 
+    # Skip builder and use existing PR
+    skip_builder: bool = False
+    pr_number_override: int | None = None
+
     @property
     def is_force_mode(self) -> bool:
         """True if running in force mode (auto-approve, auto-merge)."""

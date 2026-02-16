@@ -91,6 +91,12 @@ EXAMPLES:
     # Stop after curation (for review before building)
     loom-shepherd 42 --to curated
 
+    # Skip builder, auto-detect existing PR, run judge + merge
+    loom-shepherd 42 --skip-builder --merge
+
+    # Skip builder, use specific PR number
+    loom-shepherd 42 --pr 312 --merge
+
     # Resume from judge phase (PR already exists)
     loom-shepherd 42 --from judge --force
 """,
@@ -156,6 +162,20 @@ EXAMPLES:
         action="store_true",
         dest="no_reflect",
         help="Skip post-run reflection phase",
+    )
+
+    parser.add_argument(
+        "--skip-builder",
+        action="store_true",
+        dest="skip_builder",
+        help="Skip builder phase and auto-detect existing PR for the issue",
+    )
+
+    parser.add_argument(
+        "--pr",
+        type=int,
+        dest="pr_number",
+        help="Skip builder phase and use specified PR number directly",
     )
 
     # Deprecated flags
@@ -309,6 +329,14 @@ def _create_config(args: argparse.Namespace) -> ShepherdConfig:
     if args.strict_quality:
         quality_gates = QualityGates.strict()
 
+    # Handle --skip-builder and --pr
+    skip_builder = getattr(args, "skip_builder", False)
+    pr_number_override = getattr(args, "pr_number", None)
+
+    # --pr implies --skip-builder
+    if pr_number_override is not None:
+        skip_builder = True
+
     config = ShepherdConfig(
         issue=args.issue,
         mode=mode,
@@ -316,6 +344,8 @@ def _create_config(args: argparse.Namespace) -> ShepherdConfig:
         stop_after=args.stop_after,
         quality_gates=quality_gates,
         no_reflect=args.no_reflect,
+        skip_builder=skip_builder,
+        pr_number_override=pr_number_override,
     )
 
     if args.task_id:
