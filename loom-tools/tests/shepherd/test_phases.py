@@ -3031,6 +3031,133 @@ class TestBuilderParseFailureCount:
         assert builder._parse_failure_count(output) == 0
 
 
+    def test_biome_single_error(self) -> None:
+        """Should parse biome 'Found 1 error.' output."""
+        builder = BuilderPhase()
+        output = "Checked 251 files in 70ms. No fixes applied.\nFound 1 error.\n"
+        assert builder._parse_failure_count(output) == 1
+
+    def test_biome_multiple_errors(self) -> None:
+        """Should parse biome 'Found N errors.' output."""
+        builder = BuilderPhase()
+        output = "Checked 251 files in 70ms. No fixes applied.\nFound 3 errors.\n"
+        assert builder._parse_failure_count(output) == 3
+
+    def test_clippy_single_error(self) -> None:
+        """Should parse clippy 'due to 1 previous error' output."""
+        builder = BuilderPhase()
+        output = (
+            "error: could not compile `loom-daemon` (bin \"loom-daemon\") "
+            "due to 1 previous error\n"
+        )
+        assert builder._parse_failure_count(output) == 1
+
+    def test_clippy_multiple_errors(self) -> None:
+        """Should parse clippy 'due to N previous errors' output."""
+        builder = BuilderPhase()
+        output = (
+            "error: could not compile `loom-daemon` (bin \"loom-daemon\") "
+            "due to 23 previous errors\n"
+            "warning: build failed, waiting for other jobs to finish...\n"
+            "error: could not compile `loom-daemon` (bin \"loom-daemon\" test) "
+            "due to 23 previous errors\n"
+        )
+        assert builder._parse_failure_count(output) == 23
+
+    def test_biome_pass_no_errors(self) -> None:
+        """Biome output with no errors should not return a count."""
+        builder = BuilderPhase()
+        output = "Checked 250 files in 77ms. No fixes applied.\n"
+        assert builder._parse_failure_count(output) is None
+
+
+class TestBuilderIdentifyFailureTool:
+    """Test builder phase failure tool identification."""
+
+    def test_biome_output(self) -> None:
+        builder = BuilderPhase()
+        output = "Checked 251 files in 70ms. No fixes applied.\nFound 1 error.\n"
+        assert builder._identify_failure_tool(output) == "biome"
+
+    def test_clippy_output(self) -> None:
+        builder = BuilderPhase()
+        output = (
+            "error: this function has too many lines (108/100)\n"
+            "error: could not compile `loom-daemon` due to 1 previous error\n"
+        )
+        assert builder._identify_failure_tool(output) == "clippy"
+
+    def test_cargo_test_output(self) -> None:
+        builder = BuilderPhase()
+        output = "test result: FAILED. 8 passed; 2 failed; 0 ignored\n"
+        assert builder._identify_failure_tool(output) == "cargo_test"
+
+    def test_pytest_output(self) -> None:
+        builder = BuilderPhase()
+        output = "========================= 1 failed, 14 passed in 2.45s ========================\n"
+        assert builder._identify_failure_tool(output) == "pytest"
+
+    def test_vitest_output(self) -> None:
+        builder = BuilderPhase()
+        output = " Tests  2 failed, 3 passed\n"
+        assert builder._identify_failure_tool(output) == "vitest"
+
+    def test_unknown_output(self) -> None:
+        builder = BuilderPhase()
+        output = "Build complete.\nAll good.\n"
+        assert builder._identify_failure_tool(output) is None
+
+
+class TestBuilderCompareTestResultsToolAwareness:
+    """Test that _compare_test_results handles cross-tool comparisons correctly."""
+
+    def test_same_tool_same_count_is_preexisting(self) -> None:
+        """Both sides fail at clippy with same error count → pre-existing."""
+        builder = BuilderPhase()
+        baseline = (
+            "error: could not compile `loom-daemon` due to 23 previous errors\n"
+        )
+        worktree = (
+            "error: could not compile `loom-daemon` due to 23 previous errors\n"
+        )
+        assert builder._compare_test_results(baseline, worktree) is None
+
+    def test_same_tool_higher_count_is_new(self) -> None:
+        """Worktree has more clippy errors than baseline → new failure."""
+        builder = BuilderPhase()
+        baseline = (
+            "error: could not compile `loom-daemon` due to 1 previous error\n"
+        )
+        worktree = (
+            "error: could not compile `loom-daemon` due to 5 previous errors\n"
+        )
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_different_tools_is_new_failure(self) -> None:
+        """Baseline fails at clippy, worktree fails at biome → new failure."""
+        builder = BuilderPhase()
+        baseline = (
+            "error: could not compile `loom-daemon` due to 23 previous errors\n"
+        )
+        worktree = (
+            "Checked 251 files in 70ms. No fixes applied.\nFound 1 error.\n"
+        )
+        # Even though biome count (1) < clippy count (23), these are
+        # different tools — the biome error is genuinely new
+        assert builder._compare_test_results(baseline, worktree) is True
+
+    def test_same_tool_lower_count_is_preexisting(self) -> None:
+        """Worktree has fewer errors of the same tool → pre-existing."""
+        builder = BuilderPhase()
+        baseline = (
+            "error: could not compile `loom-daemon` due to 23 previous errors\n"
+        )
+        worktree = (
+            "error: could not compile `loom-daemon` due to 1 previous error\n"
+        )
+        assert builder._compare_test_results(baseline, worktree) is None
+
+
 class TestBuilderExtractFailingTestNames:
     """Test builder phase failing test name extraction."""
 

@@ -1061,11 +1061,62 @@ class BuilderPhase:
                 found_any_summary = True
                 continue
 
+            # biome: "Found 1 error." or "Found 3 errors."
+            m = re.match(r"Found\s+(\d+)\s+errors?\.?$", stripped)
+            if m:
+                failure_counts.append(int(m.group(1)))
+                found_any_summary = True
+                continue
+
+            # clippy: "could not compile `foo` due to 23 previous errors"
+            m = re.search(r"due to (\d+) previous errors?", stripped)
+            if m:
+                failure_counts.append(int(m.group(1)))
+                found_any_summary = True
+                continue
+
         if not found_any_summary:
             return None
 
         # Return worst result (highest failure count)
         return max(failure_counts)
+
+    def _identify_failure_tool(self, output: str) -> str | None:
+        """Identify which tool produced the failure output.
+
+        Scans the output for tool-specific markers to determine which
+        pipeline stage failed. Returns the tool name or None if
+        unrecognizable. Used by _compare_test_results to avoid
+        cross-tool count comparisons.
+        """
+        for line in output.splitlines():
+            stripped = line.strip()
+
+            # biome: "Found N error(s)." or biome check header
+            if re.match(r"Found\s+\d+\s+errors?\.?$", stripped):
+                return "biome"
+
+            # clippy: "could not compile ... due to N previous errors"
+            if "due to" in stripped and "previous error" in stripped:
+                return "clippy"
+
+            # cargo test: "test result:" lines
+            if stripped.startswith("test result:"):
+                return "cargo_test"
+
+            # cargo multi-target: "error: N target(s) failed:"
+            if re.match(r"error:\s+\d+\s+targets?\s+failed", stripped):
+                return "cargo_test"
+
+            # pytest: "N failed, M passed in Xs" or "N passed in Xs"
+            if re.search(r"\d+\s+(failed|passed)\s+in\s+\d", stripped):
+                return "pytest"
+
+            # vitest/jest: "Tests  N failed" or "Tests  N passed"
+            if re.match(r"\s*Tests?\s+\d+\s+(failed|passed)", stripped):
+                return "vitest"
+
+        return None
 
     def _extract_failing_test_names(self, output: str) -> set[str]:
         """Extract individual failing test names from test output.
@@ -1298,6 +1349,20 @@ class BuilderPhase:
 
         # If we can parse both counts, use count-based comparison
         if baseline_count is not None and worktree_count is not None:
+            # Check if both outputs are from the same tool.  When the
+            # pipeline fails at different stages (e.g. biome vs clippy),
+            # comparing counts across tools is meaningless.
+            baseline_tool = self._identify_failure_tool(baseline_output)
+            worktree_tool = self._identify_failure_tool(worktree_output)
+            if (
+                baseline_tool is not None
+                and worktree_tool is not None
+                and baseline_tool != worktree_tool
+            ):
+                # Different tools failed — worktree likely regressed at
+                # an earlier (or different) pipeline stage.
+                return True
+
             if worktree_count <= baseline_count:
                 # Worktree has same or fewer failures — pre-existing
                 return None
