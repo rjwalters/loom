@@ -2916,6 +2916,15 @@ class BuilderPhase:
 
         log_info(f"Cleaned up worktree and reverted labels for issue #{ctx.config.issue}")
 
+    def push_branch(self, ctx: ShepherdContext) -> bool:
+        """Push the current branch to remote.
+
+        Returns True if the push succeeded or the branch was already pushed.
+        Public wrapper so the shepherd orchestrator can trigger a push
+        (e.g. after the doctor applies test fixes).
+        """
+        return self._push_branch(ctx)
+
     def _push_branch(self, ctx: ShepherdContext) -> bool:
         """Push the current branch to remote.
 

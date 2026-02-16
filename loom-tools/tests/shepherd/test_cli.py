@@ -2652,3 +2652,236 @@ class TestDoctorRegressionGuard:
         # Doctor was called once, tests passed
         assert doctor_inst.run_test_fix.call_count == 1
         mock_mark_failure.assert_not_called()
+
+
+class TestPostDoctorPush:
+    """Test that doctor fixes are pushed to remote before test re-verification (#2342)."""
+
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_push_called_after_doctor_success(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+    ) -> None:
+        """push_branch should be called after Doctor successfully applies fixes."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            100,   # doctor phase_start
+            200,   # doctor elapsed
+            200,   # test_start
+            210,   # test elapsed
+            210,   # completion_start
+            220,   # completion elapsed
+            220,   # judge phase_start
+            270,   # judge elapsed
+            270,   # merge phase_start
+            280,   # merge elapsed
+            280,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "test_output_tail": "FAILED", "test_command": "pnpm test"},
+        )
+        builder_inst.run_test_verification_only.return_value = None  # tests pass
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+        builder_inst.push_branch.return_value = True
+
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.SUCCESS
+
+        # push_branch was called after Doctor succeeded
+        builder_inst.push_branch.assert_called_once_with(ctx)
+
+    @patch("loom_tools.shepherd.cli._run_reflection")
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_push_not_called_after_doctor_failure(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        mock_mark_failure: MagicMock,
+        mock_reflection: MagicMock,
+    ) -> None:
+        """push_branch should NOT be called when Doctor fails."""
+        time_values = [
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+        ]
+        # Two Doctor attempts (max retries=2), each fails then test re-verify
+        for i in range(2):
+            time_values.extend([
+                100 + i * 100,   # doctor phase_start
+                150 + i * 100,   # doctor elapsed
+                150 + i * 100,   # test_start
+                160 + i * 100,   # test elapsed
+            ])
+        time_values.append(360)  # _run_reflection duration
+
+        mock_time.time = MagicMock(side_effect=time_values)
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+        builder_inst.run_test_verification_only.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True},
+        )
+
+        # Doctor fails each time
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="could not fix tests",
+            phase_name="doctor",
+        )
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.PR_TESTS_FAILED
+
+        # push_branch should NOT have been called since Doctor failed
+        builder_inst.push_branch.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_push_failure_is_nonfatal(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+    ) -> None:
+        """Push failure after Doctor success should log warning but not block the loop."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            100,   # doctor phase_start
+            200,   # doctor elapsed
+            200,   # test_start
+            210,   # test elapsed
+            210,   # completion_start
+            220,   # completion elapsed
+            220,   # judge phase_start
+            270,   # judge elapsed
+            270,   # merge phase_start
+            280,   # merge elapsed
+            280,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "test_output_tail": "FAILED", "test_command": "pnpm test"},
+        )
+        builder_inst.run_test_verification_only.return_value = None  # tests pass
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+        # Push fails
+        builder_inst.push_branch.return_value = False
+
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        # Should still succeed despite push failure
+        assert result == ShepherdExitCode.SUCCESS
+
+        # push_branch was called but returned False
+        builder_inst.push_branch.assert_called_once_with(ctx)
+        # Workflow continued successfully
+        mock_mark_failure.assert_not_called()
