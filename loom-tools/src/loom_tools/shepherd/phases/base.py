@@ -44,6 +44,13 @@ MCP_FAILURE_PATTERNS = [
     "mcp server failed",
 ]
 
+# Minimum session duration (seconds) below which an MCP failure pattern
+# indicates a genuine MCP initialisation failure.  Sessions that ran longer
+# than this threshold are considered productive — the "MCP server failed"
+# text is just Claude CLI status-bar noise, not a real failure.
+# See issue #2374.
+MCP_FAILURE_DURATION_THRESHOLD = 30
+
 # Maximum retries for MCP failure detection, with longer backoff.
 # MCP failures are often systemic (stale build, resource contention)
 # so we use longer backoff than instant-exit.
@@ -298,17 +305,32 @@ def _is_mcp_failure(log_path: Path) -> bool:
     typically has a systemic cause (stale build, resource contention) that
     benefits from different retry/backoff strategy.
 
+    To avoid false positives on productive sessions (where the Claude CLI
+    status bar may show "1 MCP server failed" as informational text), the
+    function first checks session duration.  Sessions that ran longer than
+    ``MCP_FAILURE_DURATION_THRESHOLD`` seconds are assumed productive — the
+    MCP text is status-bar noise, not a real failure.  See issue #2374.
+
     Args:
         log_path: Path to the worker session log file.
 
     Returns:
-        True if the log contains MCP failure indicators.
+        True if the log contains MCP failure indicators **and** the session
+        was short-lived (below the duration threshold).
     """
     if not log_path.is_file():
         return False
 
     try:
         import re
+
+        # Only flag as MCP failure if the session was short-lived.
+        # Long-running sessions are productive; the pattern is just
+        # status-bar text, not a real failure.
+        stat = log_path.stat()
+        duration = int(stat.st_mtime - stat.st_ctime)
+        if duration >= MCP_FAILURE_DURATION_THRESHOLD:
+            return False
 
         content = log_path.read_text()
         stripped = strip_ansi(content)
