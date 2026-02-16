@@ -5,7 +5,7 @@ agents don't fight over sessions, lock files, and temp directories in the
 shared ~/.claude/ directory.
 
 Each agent gets .loom/claude-config/{agent-name}/ with:
-- Symlinks to shared read-only config (settings.json, config.json, etc.)
+- Symlinks to shared read-only config (settings.json, config.json)
 - Fresh empty directories for mutable per-session state
 """
 
@@ -22,11 +22,13 @@ from loom_tools.common.paths import LoomPaths
 log = logging.getLogger(__name__)
 
 # Shared config files to symlink from ~/.claude/ (read-only)
+# Note: mcp.json / .mcp.json are intentionally excluded — they are
+# project-scoped configs that Claude Code discovers from the working
+# directory / git root.  Symlinking them from ~/.claude/ shadows the
+# correct project-level config and causes MCP initialization failures.
 _SHARED_CONFIG_FILES = [
     "settings.json",
     "config.json",
-    "mcp.json",
-    ".mcp.json",
 ]
 
 # Shared directories to symlink from ~/.claude/ (read-only caches)
