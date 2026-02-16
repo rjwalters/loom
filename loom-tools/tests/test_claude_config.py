@@ -88,6 +88,11 @@ class TestSetupAgentConfigDir:
         """State file .claude.json is handled separately, not in shared list."""
         assert ".claude.json" not in _SHARED_CONFIG_FILES
 
+    def test_mcp_json_not_in_shared_config_files(self) -> None:
+        """MCP configs are project-scoped, not user-global — must not be symlinked."""
+        assert "mcp.json" not in _SHARED_CONFIG_FILES
+        assert ".mcp.json" not in _SHARED_CONFIG_FILES
+
     def test_symlinks_state_file_from_home_root(
         self, mock_repo: pathlib.Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
