@@ -800,12 +800,41 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 raise ShutdownSignal(result.message)
 
             if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
+                # Before retrying, check if the judge already completed its
+                # work (applied loom:pr or loom:changes-requested) before the
+                # failure was detected.  See issue #2335.
+                ctx.label_cache.invalidate_pr(ctx.pr_number)
+                if ctx.has_pr_label("loom:pr"):
+                    log_info(
+                        f"Judge already approved PR #{ctx.pr_number} "
+                        f"(loom:pr label present), skipping retry"
+                    )
+                    result = PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message="judge approved (detected post-failure)",
+                        phase_name="judge",
+                        data={"approved": True},
+                    )
+                    # Fall through to the approved handling below
+                elif ctx.has_pr_label("loom:changes-requested"):
+                    log_info(
+                        f"Judge already requested changes on PR #{ctx.pr_number} "
+                        f"(loom:changes-requested label present), skipping retry"
+                    )
+                    result = PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message="judge completed (detected post-failure)",
+                        phase_name="judge",
+                        data={"changes_requested": True},
+                    )
+                    # Fall through to the changes_requested handling below
+
                 # Judge returned FAILED/STUCK with no label outcome.
                 # Retry the judge phase before giving up (defense-in-depth
                 # for cases where the judge worker silently fails without
                 # submitting a review, leaving no loom:pr or
                 # loom:changes-requested label).
-                if judge_retries < ctx.config.judge_max_retries:
+                elif judge_retries < ctx.config.judge_max_retries:
                     judge_retries += 1
                     log_warning(
                         f"Judge phase failed ({result.message}), "
@@ -818,24 +847,24 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         reason=result.message,
                     )
                     continue
-
-                log_error(
-                    f"Judge phase failed after {judge_retries} "
-                    f"retry attempt(s): {result.message}"
-                )
-                _mark_judge_exhausted(ctx, judge_retries)
-                _run_reflection(
-                    ctx,
-                    exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                    duration=int(time.time() - start_time),
-                    phase_durations=phase_durations,
-                    completed_phases=completed_phases,
-                    judge_retries=judge_retries,
-                    doctor_attempts=doctor_attempts,
-                    test_fix_attempts=test_fix_attempts,
-                    warnings=run_warnings,
-                )
-                return ShepherdExitCode.NEEDS_INTERVENTION
+                else:
+                    log_error(
+                        f"Judge phase failed after {judge_retries} "
+                        f"retry attempt(s): {result.message}"
+                    )
+                    _mark_judge_exhausted(ctx, judge_retries)
+                    _run_reflection(
+                        ctx,
+                        exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
+                        duration=int(time.time() - start_time),
+                        phase_durations=phase_durations,
+                        completed_phases=completed_phases,
+                        judge_retries=judge_retries,
+                        doctor_attempts=doctor_attempts,
+                        test_fix_attempts=test_fix_attempts,
+                        warnings=run_warnings,
+                    )
+                    return ShepherdExitCode.NEEDS_INTERVENTION
 
             # Judge succeeded — reset retry counter for this loop iteration
             judge_retries = 0
@@ -934,8 +963,24 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 )
             else:
                 # Unexpected result — neither approved, changes_requested,
-                # nor FAILED/STUCK. Treat as a judge failure and retry.
-                if judge_retries < ctx.config.judge_max_retries:
+                # nor FAILED/STUCK. Check if the judge already completed
+                # its work before retrying.  See issue #2335.
+                ctx.label_cache.invalidate_pr(ctx.pr_number)
+                if ctx.has_pr_label("loom:pr"):
+                    log_info(
+                        f"Judge already approved PR #{ctx.pr_number} "
+                        f"(loom:pr label present), skipping retry"
+                    )
+                    pr_approved = True
+                    completed_phases.append("Judge (approved, detected post-failure)")
+                    ctx.report_milestone(
+                        "phase_completed",
+                        phase="judge",
+                        duration_seconds=elapsed,
+                        status="approved",
+                    )
+                    break
+                elif judge_retries < ctx.config.judge_max_retries:
                     judge_retries += 1
                     log_warning(
                         f"Judge returned unexpected result ({result.message}), "
@@ -948,24 +993,24 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         reason=result.message,
                     )
                     continue
-
-                log_error(
-                    f"Judge phase returned unexpected result after {judge_retries} "
-                    f"retry attempt(s): {result.message}"
-                )
-                _mark_judge_exhausted(ctx, judge_retries)
-                _run_reflection(
-                    ctx,
-                    exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                    duration=int(time.time() - start_time),
-                    phase_durations=phase_durations,
-                    completed_phases=completed_phases,
-                    judge_retries=judge_retries,
-                    doctor_attempts=doctor_attempts,
-                    test_fix_attempts=test_fix_attempts,
-                    warnings=run_warnings,
-                )
-                return ShepherdExitCode.NEEDS_INTERVENTION
+                else:
+                    log_error(
+                        f"Judge phase returned unexpected result after {judge_retries} "
+                        f"retry attempt(s): {result.message}"
+                    )
+                    _mark_judge_exhausted(ctx, judge_retries)
+                    _run_reflection(
+                        ctx,
+                        exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
+                        duration=int(time.time() - start_time),
+                        phase_durations=phase_durations,
+                        completed_phases=completed_phases,
+                        judge_retries=judge_retries,
+                        doctor_attempts=doctor_attempts,
+                        test_fix_attempts=test_fix_attempts,
+                        warnings=run_warnings,
+                    )
+                    return ShepherdExitCode.NEEDS_INTERVENTION
 
         # Print skipped header if Doctor never ran (Judge approved first try)
         if doctor_attempts == 0 and not skip:
