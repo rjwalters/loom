@@ -19,7 +19,7 @@ mod claude_config {
     /// Shared config files to symlink from ~/.claude/ (read-only).
     /// Must match the Python `_SHARED_CONFIG_FILES` list.
     /// NOTE: .claude.json is NOT here — it lives at ~/.claude.json (home root),
-    /// not inside ~/.claude/. It's handled separately via resolve_state_file().
+    /// not inside ~/.claude/. It's handled separately via `resolve_state_file()`.
     const SHARED_CONFIG_FILES: &[&str] = &["settings.json", "config.json", "mcp.json", ".mcp.json"];
 
     /// Shared directories to symlink from ~/.claude/ (read-only caches).
@@ -62,7 +62,7 @@ mod claude_config {
     /// Build the keychain service name Claude Code uses for a config dir.
     ///
     /// Claude Code v2.1.42+ appends a SHA-256 hash of the config dir path
-    /// to the keychain service name when CLAUDE_CONFIG_DIR is set.
+    /// to the keychain service name when `CLAUDE_CONFIG_DIR` is set.
     fn keychain_service_name(config_dir: &Path) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -193,12 +193,9 @@ mod claude_config {
             return None;
         }
 
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
-                return Some(config_dir);
-            }
+        let Some(home) = dirs::home_dir() else {
+            log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
+            return Some(config_dir);
         };
         let home_claude = home.join(".claude");
 
