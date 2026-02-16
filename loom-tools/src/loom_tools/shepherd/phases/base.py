@@ -21,14 +21,9 @@ if TYPE_CHECKING:
 # How often (in seconds) to poll the progress file during agent-wait-bg.sh
 _HEARTBEAT_POLL_INTERVAL = 5
 
-# Minimum session duration (seconds) to consider a session as having run
-# successfully. Sessions shorter than this with no meaningful output are
-# treated as transient spawn failures (e.g., Claude API error on startup).
-# See issue #2135.
-INSTANT_EXIT_THRESHOLD_SECONDS = 5
-
-# Minimum characters of non-ANSI content required for "meaningful output".
-# Matches the threshold used in judge.py for consistency.
+# Minimum characters of non-header content required for "meaningful output".
+# Sessions with less than this are treated as transient spawn failures
+# (e.g., Claude API error on startup).  See issues #2135, #2381.
 INSTANT_EXIT_MIN_OUTPUT_CHARS = 100
 
 # Maximum retries for instant-exit detection, with exponential backoff.
@@ -44,12 +39,12 @@ MCP_FAILURE_PATTERNS = [
     "mcp server failed",
 ]
 
-# Minimum session duration (seconds) below which an MCP failure pattern
-# indicates a genuine MCP initialisation failure.  Sessions that ran longer
-# than this threshold are considered productive — the "MCP server failed"
-# text is just Claude CLI status-bar noise, not a real failure.
-# See issue #2374.
-MCP_FAILURE_DURATION_THRESHOLD = 30
+# Minimum characters of non-header output for a session to be considered
+# "productive" when checking MCP failure patterns.  Sessions with more output
+# than this are assumed to have done real work — the "MCP server failed" text
+# is just Claude CLI status-bar noise, not a real failure.
+# See issues #2374 and #2381.
+MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 
 # Maximum retries for MCP failure detection, with longer backoff.
 # MCP failures are often systemic (stale build, resource contention)
@@ -307,16 +302,20 @@ def _is_mcp_failure(log_path: Path) -> bool:
 
     To avoid false positives on productive sessions (where the Claude CLI
     status bar may show "1 MCP server failed" as informational text), the
-    function first checks session duration.  Sessions that ran longer than
-    ``MCP_FAILURE_DURATION_THRESHOLD`` seconds are assumed productive — the
-    MCP text is status-bar noise, not a real failure.  See issue #2374.
+    function checks output volume.  Sessions that produced substantial
+    non-header output are assumed productive — the MCP text is status-bar
+    noise, not a real failure.  See issues #2374 and #2381.
+
+    Note: A previous implementation used ``st_mtime - st_ctime`` as a
+    duration gate, but this is always ~0 for actively-written log files
+    because writing updates both timestamps simultaneously.
 
     Args:
         log_path: Path to the worker session log file.
 
     Returns:
         True if the log contains MCP failure indicators **and** the session
-        was short-lived (below the duration threshold).
+        produced minimal output (below the output volume threshold).
     """
     if not log_path.is_file():
         return False
@@ -324,16 +323,17 @@ def _is_mcp_failure(log_path: Path) -> bool:
     try:
         import re
 
-        # Only flag as MCP failure if the session was short-lived.
-        # Long-running sessions are productive; the pattern is just
-        # status-bar text, not a real failure.
-        stat = log_path.stat()
-        duration = int(stat.st_mtime - stat.st_ctime)
-        if duration >= MCP_FAILURE_DURATION_THRESHOLD:
-            return False
-
         content = log_path.read_text()
         stripped = strip_ansi(content)
+
+        # If the session produced substantial output beyond headers,
+        # it was productive — MCP text is just status bar noise.
+        non_header = "\n".join(
+            line for line in stripped.splitlines() if not line.startswith("# ")
+        )
+        if len(non_header.strip()) >= MCP_FAILURE_MIN_OUTPUT_CHARS:
+            return False
+
         for pattern in MCP_FAILURE_PATTERNS:
             if re.search(pattern, stripped, re.IGNORECASE):
                 return True
@@ -345,12 +345,16 @@ def _is_mcp_failure(log_path: Path) -> bool:
 def _is_instant_exit(log_path: Path) -> bool:
     """Check if a session log indicates an instant-exit (transient spawn failure).
 
-    A session is considered an instant exit when:
-    - The log file exists but is very short-lived (< INSTANT_EXIT_THRESHOLD_SECONDS)
-    - AND has no meaningful output (< INSTANT_EXIT_MIN_OUTPUT_CHARS non-ANSI chars)
+    A session is considered an instant exit when the log file exists but has
+    no meaningful output (< INSTANT_EXIT_MIN_OUTPUT_CHARS non-header chars).
 
     This detects cases where the Claude CLI spawns but immediately exits due to
     transient API errors, without producing any substantive work.
+
+    Note: A previous implementation also checked ``st_mtime - st_ctime`` as
+    a duration gate, but this is always ~0 for actively-written log files
+    because writing updates both timestamps simultaneously.  The output-size
+    check alone is sufficient and reliable.  See issue #2381.
 
     Args:
         log_path: Path to the worker session log file.
@@ -363,11 +367,6 @@ def _is_instant_exit(log_path: Path) -> bool:
         return False
 
     try:
-        stat = log_path.stat()
-        duration = int(stat.st_mtime - stat.st_ctime)
-        if duration >= INSTANT_EXIT_THRESHOLD_SECONDS:
-            return False
-
         content = log_path.read_text()
         stripped = strip_ansi(content)
         # Exclude log header lines (e.g. "# Loom Agent Log", "# Session: ...")
@@ -561,8 +560,7 @@ def run_worker_phase(
         if _is_instant_exit(log_path):
             log_warning(
                 f"Instant-exit detected for {role} session '{name}': "
-                f"session completed in <{INSTANT_EXIT_THRESHOLD_SECONDS}s "
-                f"with no meaningful output (log: {log_path})"
+                f"session produced no meaningful output (log: {log_path})"
             )
             return 6
 
