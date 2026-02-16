@@ -35,6 +35,11 @@ import {
 } from "./agent-metrics";
 import { Logger } from "./logger";
 import { ModalBuilder } from "./modal-builder";
+import {
+  getOptimizationStats,
+  getOptimizationTypeName,
+  type OptimizationStats,
+} from "./prompt-optimization";
 import { getAppState } from "./state";
 
 const logger = Logger.forComponent("intelligence-dashboard");
@@ -53,6 +58,7 @@ interface DashboardData {
   roleMetrics: RoleMetrics[];
   velocity: VelocitySummary;
   terminals: TerminalStatus[];
+  optimizationStats: OptimizationStats;
 }
 
 /**
@@ -139,11 +145,12 @@ async function refreshDashboard(
     }
 
     // Fetch all data in parallel
-    const [today, week, roleMetrics, velocity] = await Promise.all([
+    const [today, week, roleMetrics, velocity, optimizationStats] = await Promise.all([
       getAgentMetrics(workspacePath, "today"),
       getAgentMetrics(workspacePath, "week"),
       getMetricsByRole(workspacePath, "week"),
       getVelocitySummary(workspacePath),
+      getOptimizationStats(workspacePath),
     ]);
 
     // Get terminal status from app state
@@ -155,6 +162,7 @@ async function refreshDashboard(
       roleMetrics,
       velocity,
       terminals,
+      optimizationStats,
     };
 
     modal.setContent(createDashboardContent(data));
@@ -269,6 +277,9 @@ function createDashboardContent(data: DashboardData): string {
 
     <!-- Performance by Role -->
     ${createRolePerformanceSection(data.roleMetrics)}
+
+    <!-- Prompt Optimization -->
+    ${createOptimizationSection(data.optimizationStats)}
 
     <!-- Last updated timestamp -->
     <div class="mt-6 text-xs text-gray-400 dark:text-gray-500 text-center">
@@ -544,6 +555,78 @@ function createRoleRow(metrics: RoleMetrics): string {
         </div>
       </td>
     </tr>
+  `;
+}
+
+/**
+ * Create prompt optimization stats section
+ */
+function createOptimizationSection(stats: OptimizationStats): string {
+  if (stats.total_suggestions === 0) {
+    return `
+      <div class="mb-6">
+        <h3 class="text-sm font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide mb-3">Prompt Optimization</h3>
+        <div class="p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 text-center text-gray-500 dark:text-gray-400 text-sm">
+          No optimization data yet. Suggestions are generated as agents work.
+        </div>
+      </div>
+    `;
+  }
+
+  const typeRows = stats.suggestions_by_type
+    .map(
+      (t) => `
+      <tr class="border-b border-gray-100 dark:border-gray-800">
+        <td class="px-4 py-2 text-gray-800 dark:text-gray-200">${getOptimizationTypeName(t.optimization_type)}</td>
+        <td class="text-right px-4 py-2 text-gray-600 dark:text-gray-400">${t.count}</td>
+        <td class="text-right px-4 py-2 text-gray-600 dark:text-gray-400">${Math.round(t.acceptance_rate * 100)}%</td>
+        <td class="text-right px-4 py-2 text-gray-600 dark:text-gray-400">+${Math.round(t.avg_improvement * 100)}%</td>
+      </tr>
+    `
+    )
+    .join("");
+
+  return `
+    <div class="mb-6">
+      <h3 class="text-sm font-semibold text-gray-600 dark:text-gray-400 uppercase tracking-wide mb-3">Prompt Optimization</h3>
+      <div class="grid grid-cols-4 gap-4 mb-3">
+        <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-center">
+          <div class="text-xs text-gray-500 dark:text-gray-400">Total</div>
+          <div class="text-xl font-bold text-gray-900 dark:text-gray-100">${stats.total_suggestions}</div>
+        </div>
+        <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-center">
+          <div class="text-xs text-gray-500 dark:text-gray-400">Accepted</div>
+          <div class="text-xl font-bold text-green-600 dark:text-green-400">${stats.accepted_suggestions}</div>
+        </div>
+        <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-center">
+          <div class="text-xs text-gray-500 dark:text-gray-400">Acceptance Rate</div>
+          <div class="text-xl font-bold text-gray-900 dark:text-gray-100">${Math.round(stats.acceptance_rate * 100)}%</div>
+        </div>
+        <div class="p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 text-center">
+          <div class="text-xs text-gray-500 dark:text-gray-400">Avg Improvement</div>
+          <div class="text-xl font-bold text-blue-600 dark:text-blue-400">+${Math.round(stats.avg_improvement_when_accepted * 100)}%</div>
+        </div>
+      </div>
+      ${
+        stats.suggestions_by_type.length > 0
+          ? `
+        <div class="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="border-b border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800">
+                <th class="text-left px-4 py-2 font-medium text-gray-700 dark:text-gray-300">Type</th>
+                <th class="text-right px-4 py-2 font-medium text-gray-700 dark:text-gray-300">Count</th>
+                <th class="text-right px-4 py-2 font-medium text-gray-700 dark:text-gray-300">Acceptance</th>
+                <th class="text-right px-4 py-2 font-medium text-gray-700 dark:text-gray-300">Improvement</th>
+              </tr>
+            </thead>
+            <tbody>${typeRows}</tbody>
+          </table>
+        </div>
+      `
+          : ""
+      }
+    </div>
   `;
 }
 
