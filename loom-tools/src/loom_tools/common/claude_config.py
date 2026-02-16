@@ -48,6 +48,37 @@ _MUTABLE_DIRS = [
 ]
 
 
+def _ensure_onboarding_complete(state_path: Path) -> None:
+    """Ensure .claude.json has the fields required to skip the onboarding wizard.
+
+    Claude Code requires both ``hasCompletedOnboarding = true`` and a truthy
+    ``theme`` value to bypass the first-run wizard.  If the state file is
+    missing, dangling (broken symlink), or doesn't contain these fields, we
+    replace it with a minimal standalone file so agents never hit the wizard.
+    """
+    import json
+
+    try:
+        if state_path.exists():
+            data = json.loads(state_path.read_text())
+            if data.get("hasCompletedOnboarding") is True and data.get("theme"):
+                return  # Already has the required fields
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    # Remove whatever is there (dangling symlink, corrupt file, etc.)
+    try:
+        state_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    state_path.write_text(json.dumps({
+        "hasCompletedOnboarding": True,
+        "theme": "dark",
+    }))
+    log.debug("Wrote fallback .claude.json with onboarding-complete state")
+
+
 def _resolve_state_file() -> Path:
     """Resolve the Claude Code state file path.
 
@@ -185,6 +216,11 @@ def setup_agent_config_dir(agent_name: str, repo_root: Path) -> Path:
     state_dst = config_dir / ".claude.json"
     if state_src.exists() and not state_dst.exists():
         state_dst.symlink_to(state_src)
+
+    # Fallback: ensure the state file has onboarding-complete fields.
+    # If the symlink wasn't created (source missing), is dangling, or the
+    # target doesn't contain the required fields, write a standalone file.
+    _ensure_onboarding_complete(state_dst)
 
     # Symlink shared directories
     for dirname in _SHARED_CONFIG_DIRS:

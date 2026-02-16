@@ -19,7 +19,7 @@ mod claude_config {
     /// Shared config files to symlink from ~/.claude/ (read-only).
     /// Must match the Python `_SHARED_CONFIG_FILES` list.
     /// NOTE: .claude.json is NOT here — it lives at ~/.claude.json (home root),
-    /// not inside ~/.claude/. It's handled separately via resolve_state_file().
+    /// not inside ~/.claude/. It's handled separately via `resolve_state_file()`.
     const SHARED_CONFIG_FILES: &[&str] = &["settings.json", "config.json", "mcp.json", ".mcp.json"];
 
     /// Shared directories to symlink from ~/.claude/ (read-only caches).
@@ -62,7 +62,7 @@ mod claude_config {
     /// Build the keychain service name Claude Code uses for a config dir.
     ///
     /// Claude Code v2.1.42+ appends a SHA-256 hash of the config dir path
-    /// to the keychain service name when CLAUDE_CONFIG_DIR is set.
+    /// to the keychain service name when `CLAUDE_CONFIG_DIR` is set.
     fn keychain_service_name(config_dir: &Path) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -145,6 +145,43 @@ mod claude_config {
         }
     }
 
+    /// Ensure `.claude.json` has the fields required to skip the onboarding wizard.
+    ///
+    /// Claude Code requires both `hasCompletedOnboarding = true` and a truthy
+    /// `theme` value to bypass the first-run wizard.  If the state file is
+    /// missing, dangling (broken symlink), or doesn't contain these fields, we
+    /// replace it with a minimal standalone file so agents never hit the wizard.
+    fn ensure_onboarding_complete(state_path: &Path) {
+        // Check if the existing file (resolving symlinks) has the required fields.
+        if state_path.exists() {
+            if let Ok(contents) = fs::read_to_string(state_path) {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if data.get("hasCompletedOnboarding") == Some(&serde_json::Value::Bool(true))
+                        && data
+                            .get("theme")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                    {
+                        return; // Already has the required fields
+                    }
+                }
+            }
+        }
+
+        // Remove whatever is there (dangling symlink, corrupt file, etc.)
+        let _ = fs::remove_file(state_path);
+
+        let fallback = serde_json::json!({
+            "hasCompletedOnboarding": true,
+            "theme": "dark",
+        });
+        if let Err(e) = fs::write(state_path, fallback.to_string()) {
+            log::warn!("Failed to write fallback .claude.json: {e}");
+        } else {
+            log::debug!("Wrote fallback .claude.json with onboarding-complete state");
+        }
+    }
+
     pub fn setup_agent_config_dir(agent_name: &str, repo_root: &Path) -> Option<PathBuf> {
         let config_dir = repo_root
             .join(".loom")
@@ -156,12 +193,9 @@ mod claude_config {
             return None;
         }
 
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
-                return Some(config_dir);
-            }
+        let Some(home) = dirs::home_dir() else {
+            log::warn!("Could not determine home directory for CLAUDE_CONFIG_DIR setup");
+            return Some(config_dir);
         };
         let home_claude = home.join(".claude");
 
@@ -187,6 +221,11 @@ mod claude_config {
                 log::debug!("Failed to symlink state file: {e}");
             }
         }
+
+        // Fallback: ensure the state file has onboarding-complete fields.
+        // If the symlink wasn't created (source missing), is dangling, or the
+        // target doesn't contain the required fields, write a standalone file.
+        ensure_onboarding_complete(&state_dst);
 
         // Symlink shared directories
         for dirname in SHARED_CONFIG_DIRS {
@@ -338,6 +377,87 @@ mod claude_config {
 
             let removed = cleanup_agent_config_dir("nonexistent", repo_root);
             assert!(!removed);
+        }
+
+        #[test]
+        fn test_ensure_onboarding_writes_fallback_when_missing() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            ensure_onboarding_complete(&state);
+            assert!(state.exists());
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["hasCompletedOnboarding"], true);
+            assert_eq!(data["theme"], "dark");
+        }
+
+        #[test]
+        fn test_ensure_onboarding_noop_when_complete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            fs::write(&state, r#"{"hasCompletedOnboarding":true,"theme":"monokai"}"#).unwrap();
+            ensure_onboarding_complete(&state);
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["theme"], "monokai"); // unchanged
+        }
+
+        #[test]
+        fn test_ensure_onboarding_replaces_incomplete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            fs::write(&state, r#"{"hasCompletedOnboarding":true}"#).unwrap();
+            ensure_onboarding_complete(&state);
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["theme"], "dark");
+        }
+
+        #[test]
+        fn test_ensure_onboarding_replaces_corrupt_json() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            fs::write(&state, "not valid json{{{").unwrap();
+            ensure_onboarding_complete(&state);
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["hasCompletedOnboarding"], true);
+            assert_eq!(data["theme"], "dark");
+        }
+
+        #[test]
+        fn test_ensure_onboarding_replaces_dangling_symlink() {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join(".claude.json");
+            let nonexistent = tmp.path().join("nonexistent");
+            std::os::unix::fs::symlink(&nonexistent, &state).unwrap();
+            assert!(state.symlink_metadata().is_ok()); // symlink exists
+            assert!(!state.exists()); // but target doesn't
+
+            ensure_onboarding_complete(&state);
+            assert!(state.exists());
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["hasCompletedOnboarding"], true);
+        }
+
+        #[test]
+        fn test_setup_creates_fallback_state_when_no_home_state() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo_root = tmp.path();
+            fs::create_dir_all(repo_root.join(".loom")).unwrap();
+
+            let result = setup_agent_config_dir("terminal-fallback", repo_root);
+            assert!(result.is_some());
+            let config_dir = result.unwrap();
+
+            // Even without a home state file, .claude.json should exist
+            let state = config_dir.join(".claude.json");
+            assert!(state.exists(), ".claude.json should exist as fallback");
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+            assert_eq!(data["hasCompletedOnboarding"], true);
+            assert_eq!(data["theme"], "dark");
         }
 
         #[test]
