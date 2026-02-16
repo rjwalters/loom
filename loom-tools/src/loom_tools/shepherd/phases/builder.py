@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -41,6 +42,26 @@ logger = logging.getLogger(__name__)
 
 # Default timeout for test verification (seconds)
 _TEST_VERIFY_TIMEOUT = 300
+
+# Pre-implementation reproducibility check settings
+_REPRODUCIBILITY_RUNS = 3  # Number of times to run each test for flakiness
+_REPRODUCIBILITY_TIMEOUT = 120  # seconds per run
+
+# Regex to extract fenced code blocks and inline code from markdown
+_CODE_BLOCK_RE = re.compile(r"```(?:\w+)?\n(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+
+# Test command prefixes recognized for reproducibility checking
+_TEST_CMD_PREFIXES = [
+    "python -m pytest",
+    "pytest",
+    "cargo test",
+    "pnpm check:ci:lite",
+    "pnpm check:ci",
+    "pnpm check",
+    "pnpm test",
+    "npm test",
+]
 
 # File extensions mapped to language categories for scoped test verification
 _LANGUAGE_EXTENSIONS: dict[str, str] = {
@@ -245,6 +266,13 @@ class BuilderPhase:
             )
             ctx.label_cache.invalidate_issue(ctx.config.issue)
             return quality_result
+
+        # Pre-implementation reproducibility check (issue #2316)
+        # Before creating a worktree and running the builder, verify that
+        # the bug described in the issue is still reproducible on main.
+        repro_result = self._run_reproducibility_check(ctx)
+        if repro_result is not None:
+            return repro_result
 
         # Check for and recover from stale worktree (issue #1995)
         # A stale worktree is one left behind by a previous builder that crashed
@@ -703,6 +731,193 @@ class BuilderPhase:
         except OSError:
             pass
         return None
+
+    def _fetch_issue_comments(self, ctx: ShepherdContext) -> list[str]:
+        """Fetch issue comment bodies from GitHub.
+
+        Returns a list of comment body strings, or an empty list if the
+        fetch fails or there are no comments.
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "issue",
+                    "view",
+                    str(ctx.config.issue),
+                    "--json",
+                    "comments",
+                ],
+                cwd=ctx.repo_root,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+                return [
+                    c["body"]
+                    for c in data.get("comments", [])
+                    if c.get("body")
+                ]
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+        return []
+
+    def _parse_test_command(self, line: str) -> list[str] | None:
+        """Parse a single line to check if it's a recognized test command.
+
+        Strips common shell prompt prefixes (``$``) and checks against
+        ``_TEST_CMD_PREFIXES``.  Returns the parsed command as a list of
+        arguments, or ``None`` if the line is not a test command.
+        """
+        stripped = line.lstrip("$ ").strip()
+        if not stripped or stripped.startswith("#"):
+            return None
+
+        for prefix in _TEST_CMD_PREFIXES:
+            if stripped.startswith(prefix) and (
+                len(stripped) == len(prefix)
+                or stripped[len(prefix)] in (" ", "\t")
+            ):
+                try:
+                    return shlex.split(stripped)
+                except ValueError:
+                    return None
+
+        return None
+
+    def _extract_test_commands(self, text: str) -> list[tuple[list[str], str]]:
+        """Extract runnable test commands from issue markdown text.
+
+        Searches fenced code blocks and inline code spans for recognized
+        test invocations (``pytest``, ``cargo test``, ``pnpm test``, etc.).
+
+        Returns a deduplicated list of ``(command_args, display_name)``
+        tuples.
+        """
+        commands: list[tuple[list[str], str]] = []
+        seen: set[str] = set()
+
+        # Extract from fenced code blocks
+        for match in _CODE_BLOCK_RE.finditer(text):
+            block = match.group(1)
+            for line in block.strip().splitlines():
+                cmd = self._parse_test_command(line.strip())
+                if cmd is not None:
+                    key = " ".join(cmd)
+                    if key not in seen:
+                        seen.add(key)
+                        commands.append((cmd, key))
+
+        # Extract from inline code spans
+        for match in _INLINE_CODE_RE.finditer(text):
+            code = match.group(1).strip()
+            cmd = self._parse_test_command(code)
+            if cmd is not None:
+                key = " ".join(cmd)
+                if key not in seen:
+                    seen.add(key)
+                    commands.append((cmd, key))
+
+        return commands
+
+    def _run_reproducibility_check(
+        self, ctx: ShepherdContext
+    ) -> PhaseResult | None:
+        """Check if the bug described in the issue is still reproducible.
+
+        Extracts test commands from the issue body and comments, then runs
+        them on the repo root (main branch) multiple times.  If every
+        command passes on all runs, the bug is considered already fixed and
+        a ``PhaseResult`` with ``no_changes_needed`` is returned.
+
+        Returns:
+            ``None`` if any test still fails or no commands were found
+            (the caller should proceed with the normal builder workflow).
+            A ``PhaseResult`` with ``SKIPPED`` status when all tests pass
+            reliably, indicating no implementation is needed.
+        """
+        body = self._fetch_issue_body(ctx)
+        if body is None:
+            return None
+
+        comments = self._fetch_issue_comments(ctx)
+        full_text = body + "\n" + "\n".join(comments)
+
+        commands = self._extract_test_commands(full_text)
+        if not commands:
+            log_info(
+                f"No test commands found in issue #{ctx.config.issue}, "
+                "skipping reproducibility check"
+            )
+            return None
+
+        log_info(
+            f"Reproducibility check: found {len(commands)} test command(s) "
+            f"in issue #{ctx.config.issue}"
+        )
+        ctx.report_milestone(
+            "heartbeat",
+            action="running pre-implementation reproducibility check",
+        )
+
+        for cmd_args, display_name in commands:
+            for run_num in range(1, _REPRODUCIBILITY_RUNS + 1):
+                log_info(
+                    f"Reproducibility run {run_num}/{_REPRODUCIBILITY_RUNS}: "
+                    f"{display_name}"
+                )
+                try:
+                    result = subprocess.run(
+                        cmd_args,
+                        cwd=ctx.repo_root,
+                        text=True,
+                        capture_output=True,
+                        timeout=_REPRODUCIBILITY_TIMEOUT,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        log_info(
+                            f"Test still fails on main (run {run_num}): "
+                            f"{display_name} (exit code {result.returncode})"
+                        )
+                        # Bug is still reproducible — proceed normally
+                        return None
+                except subprocess.TimeoutExpired:
+                    log_info(
+                        f"Test timed out on main (run {run_num}): "
+                        f"{display_name}"
+                    )
+                    return None
+                except OSError as e:
+                    log_warning(
+                        f"Could not run test command: {display_name}: {e}"
+                    )
+                    return None
+
+        # All commands passed on every run
+        log_info(
+            f"All test commands pass on main "
+            f"({_REPRODUCIBILITY_RUNS} runs each) for issue "
+            f"#{ctx.config.issue} — bug appears already fixed"
+        )
+
+        return PhaseResult(
+            status=PhaseStatus.SKIPPED,
+            message=(
+                "no changes needed - bug already fixed on main "
+                "(pre-implementation verification)"
+            ),
+            phase_name="builder",
+            data={
+                "no_changes_needed": True,
+                "reason": "already_resolved",
+                "pre_implementation_check": True,
+                "test_commands": [display for _, display in commands],
+                "runs_per_command": _REPRODUCIBILITY_RUNS,
+            },
+        )
 
     def _run_quality_validation(self, ctx: ShepherdContext) -> PhaseResult | None:
         """Run pre-flight quality validation on the issue body.
