@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from loom_tools.common.github import gh_issue_view
+from loom_tools.common.github import gh_issue_view, gh_list
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file
@@ -245,6 +245,9 @@ class ShepherdContext:
         if state != "OPEN":
             raise IssueClosedError(issue, state)
 
+        # Check for already-merged PR (issue is OPEN but work is done)
+        self._check_merged_pr(issue)
+
         # Check for stale remote branch
         self._check_stale_branch(issue)
 
@@ -276,6 +279,39 @@ class ShepherdContext:
         self.issue_title = meta.get("title", f"Issue #{issue}")
 
         return meta
+
+    def _check_merged_pr(self, issue: int) -> None:
+        """Check if a PR for this issue has already been merged.
+
+        When an issue is still OPEN but its PR has already been merged
+        (e.g., due to label re-application or missed auto-close), the
+        shepherd should exit early rather than running the builder phase
+        unnecessarily.
+
+        Raises:
+            IssueClosedError: If a merged PR is found for this issue's branch.
+        """
+        branch_name = NamingConventions.branch_name(issue)
+        try:
+            merged_prs = gh_list(
+                "pr",
+                head=branch_name,
+                state="merged",
+                fields=["number"],
+                limit=1,
+            )
+            if merged_prs:
+                pr_num = merged_prs[0].get("number", "?")
+                raise IssueClosedError(
+                    issue, f"RESOLVED by merged PR #{pr_num}"
+                )
+        except IssueClosedError:
+            raise
+        except Exception:
+            # Non-critical check — if gh fails, proceed with orchestration
+            logging.getLogger(__name__).debug(
+                "Could not check for merged PRs for issue #%d", issue
+            )
 
     def _check_stale_branch(self, issue: int) -> None:
         """Check for existing remote branch and log a warning if found.

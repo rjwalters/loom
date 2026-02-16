@@ -11,7 +11,7 @@ import pytest
 
 from loom_tools.shepherd.config import ExecutionMode, ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
-from loom_tools.shepherd.errors import IssueBlockedError, IssueIsEpicError
+from loom_tools.shepherd.errors import IssueBlockedError, IssueClosedError, IssueIsEpicError
 
 
 def _make_context(tmp_path: Path, issue: int = 42, task_id: str = "abc1234") -> ShepherdContext:
@@ -570,3 +570,76 @@ class TestValidateIssueEpicRejection:
         with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)):
             with pytest.raises(IssueIsEpicError):
                 ctx.validate_issue()
+
+
+class TestValidateIssueMergedPR:
+    """Tests for merged-PR detection in validate_issue()."""
+
+    def test_merged_pr_raises_issue_closed_error(self, tmp_path: Path) -> None:
+        """Issue with a merged PR raises IssueClosedError."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=[{"number": 100}]):
+            with pytest.raises(IssueClosedError, match="RESOLVED by merged PR #100"):
+                ctx.validate_issue()
+
+    def test_no_merged_pr_proceeds_normally(self, tmp_path: Path) -> None:
+        """Issue without a merged PR proceeds through validation."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=[]):
+            meta = ctx.validate_issue()
+
+        assert meta["title"] == "Test Issue"
+
+    def test_gh_list_failure_does_not_block(self, tmp_path: Path) -> None:
+        """If gh_list raises an exception, validation proceeds normally."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:issue"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)), \
+             patch("loom_tools.shepherd.context.gh_list", side_effect=OSError("network error")):
+            meta = ctx.validate_issue()
+
+        assert meta["title"] == "Test Issue"
+
+    def test_merged_pr_checked_before_stale_branch(self, tmp_path: Path) -> None:
+        """Merged PR check runs before stale branch check (early exit)."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:issue"])
+
+        stale_branch_called = False
+
+        original_check_stale = ctx._check_stale_branch
+
+        def tracking_check_stale(issue: int) -> None:
+            nonlocal stale_branch_called
+            stale_branch_called = True
+            original_check_stale(issue)
+
+        ctx._check_stale_branch = tracking_check_stale
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=[{"number": 200}]):
+            with pytest.raises(IssueClosedError):
+                ctx.validate_issue()
+
+        # Stale branch check should not have been reached
+        assert not stale_branch_called
+
+    def test_merged_pr_error_state_contains_pr_number(self, tmp_path: Path) -> None:
+        """IssueClosedError.state includes the PR number for clear messaging."""
+        ctx = _make_context(tmp_path, issue=42)
+        gh_result = _mock_gh_issue(["loom:building"])
+
+        with patch("subprocess.run", side_effect=_mock_run_for_issue(gh_result)), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=[{"number": 333}]):
+            with pytest.raises(IssueClosedError) as exc_info:
+                ctx.validate_issue()
+
+        assert exc_info.value.state == "RESOLVED by merged PR #333"
+        assert exc_info.value.issue == 42
