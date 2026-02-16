@@ -14,6 +14,7 @@ import pytest
 from loom_tools.shepherd.cli import (
     _auto_navigate_out_of_worktree,
     _check_main_repo_clean,
+    _cleanup_labels_on_failure,
     _is_loom_runtime,
     _create_config,
     _format_diagnostics_for_comment,
@@ -2979,3 +2980,193 @@ class TestPostDoctorPush:
         builder_inst.push_branch.assert_called_once_with(ctx)
         # Workflow continued successfully
         mock_mark_failure.assert_not_called()
+
+
+class TestCleanupLabelsOnFailure:
+    """Test _cleanup_labels_on_failure defense-in-depth handler."""
+
+    def _make_cleanup_ctx(
+        self,
+        issue_labels: set[str] | None = None,
+    ) -> MagicMock:
+        """Create a mock ShepherdContext for cleanup tests."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+        ctx.label_cache = MagicMock()
+        if issue_labels is not None:
+            ctx.label_cache.get_issue_labels.return_value = issue_labels
+        return ctx
+
+    def test_no_cleanup_on_success(self) -> None:
+        """Should not attempt cleanup when exit code is SUCCESS."""
+        ctx = self._make_cleanup_ctx()
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.SUCCESS)
+        ctx.label_cache.get_issue_labels.assert_not_called()
+
+    def test_no_cleanup_on_skipped(self) -> None:
+        """Should not attempt cleanup when exit code is SKIPPED."""
+        ctx = self._make_cleanup_ctx()
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.SKIPPED)
+        ctx.label_cache.get_issue_labels.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_reverts_building_to_issue_on_failure(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should revert loom:building → loom:issue when no failure label exists."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_transition.assert_called_once_with(
+            42,
+            add=["loom:issue"],
+            remove=["loom:building"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_reverts_building_on_shutdown(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should revert loom:building → loom:issue on shutdown signal."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.SHUTDOWN)
+
+        mock_transition.assert_called_once_with(
+            42,
+            add=["loom:issue"],
+            remove=["loom:building"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_no_revert_when_failure_label_present(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should not revert to loom:issue when a loom:failed:* label exists."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:failed:builder-tests", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.PR_TESTS_FAILED)
+
+        # No transition needed - _mark_* already handled it
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_removes_contradictory_labels_alongside_failure_label(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should remove loom:building when it coexists with a failure label."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:failed:builder", "loom:building", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_transition.assert_called_once_with(
+            42,
+            remove=["loom:building"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_removes_multiple_contradictory_labels(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should remove both loom:building and loom:blocked if alongside failure label."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={
+                "loom:failed:builder-tests",
+                "loom:building",
+                "loom:blocked",
+                "loom:curated",
+            }
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.PR_TESTS_FAILED)
+
+        mock_transition.assert_called_once_with(
+            42,
+            remove=["loom:blocked", "loom:building"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_no_action_when_no_building_label(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should do nothing when issue doesn't have loom:building."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:curated", "loom:triage"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_survives_api_failure(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should not raise when GitHub API is unreachable."""
+        ctx = self._make_cleanup_ctx()
+        ctx.label_cache.get_issue_labels.side_effect = RuntimeError("API down")
+
+        # Should not raise
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.NEEDS_INTERVENTION)
+
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_survives_transition_failure(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should not raise when label transition fails."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        mock_transition.side_effect = RuntimeError("API error")
+
+        # Should not raise
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+
+class TestMainCleanupIntegration:
+    """Test that main() calls _cleanup_labels_on_failure on failure."""
+
+    def test_cleanup_called_on_orchestrate_failure(self) -> None:
+        """main should call cleanup when orchestrate returns a failure exit code."""
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=ShepherdExitCode.BUILDER_FAILED), \
+             patch("loom_tools.shepherd.cli.ShepherdContext") as MockCtx, \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup:
+            ctx = MockCtx.return_value
+            result = main(["42"])
+            assert result == ShepherdExitCode.BUILDER_FAILED
+            mock_cleanup.assert_called_once_with(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+    def test_cleanup_not_called_on_success(self) -> None:
+        """main should not call cleanup when orchestrate succeeds."""
+        with patch("loom_tools.shepherd.cli.orchestrate", return_value=ShepherdExitCode.SUCCESS), \
+             patch("loom_tools.shepherd.cli.ShepherdContext"), \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup:
+            result = main(["42"])
+            assert result == ShepherdExitCode.SUCCESS
+            mock_cleanup.assert_not_called()
+
+    def test_cleanup_called_on_unhandled_exception(self) -> None:
+        """main should call cleanup when orchestrate raises an unhandled exception."""
+        with patch("loom_tools.shepherd.cli.orchestrate", side_effect=RuntimeError("MCP crash")), \
+             patch("loom_tools.shepherd.cli.ShepherdContext") as MockCtx, \
+             patch("loom_tools.shepherd.cli.find_repo_root", return_value=Path("/fake/repo")), \
+             patch("loom_tools.shepherd.cli._auto_navigate_out_of_worktree"), \
+             patch("loom_tools.shepherd.cli._cleanup_labels_on_failure") as mock_cleanup:
+            ctx = MockCtx.return_value
+            with pytest.raises(RuntimeError, match="MCP crash"):
+                main(["42"])
+            mock_cleanup.assert_called_once_with(ctx, ShepherdExitCode.NEEDS_INTERVENTION)

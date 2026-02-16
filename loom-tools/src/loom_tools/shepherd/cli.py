@@ -22,6 +22,7 @@ from loom_tools.shepherd.errors import (
     ShutdownSignal,
 )
 from loom_tools.shepherd.exit_codes import ShepherdExitCode
+from loom_tools.shepherd.labels import transition_issue_labels
 from loom_tools.shepherd.phases import (
     ApprovalPhase,
     BuilderPhase,
@@ -1810,6 +1811,74 @@ def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
     detect_systematic_failure(ctx.repo_root)
 
 
+def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
+    """Best-effort cleanup of stale workflow labels when shepherd fails.
+
+    This is defense-in-depth: known failure modes already handle their own
+    label cleanup via _mark_* functions. This handler catches cases where
+    an unhandled exception or unexpected failure path leaves the issue in
+    an inconsistent label state (e.g., loom:building stuck on a dead issue).
+
+    Rules:
+    - On success/skip: no cleanup needed
+    - If a _mark_* handler already set a loom:failed:* label: remove any
+      contradictory state labels (loom:building, loom:blocked)
+    - If loom:building is present with no failure label: revert to loom:issue
+    - PR labels are left intact (Judge/Champion manage those)
+    """
+    # No cleanup needed on success or skip
+    if exit_code in (ShepherdExitCode.SUCCESS, ShepherdExitCode.SKIPPED):
+        return
+
+    issue = ctx.config.issue
+
+    try:
+        # Fetch current labels fresh from API (cache may be stale after crash)
+        current_labels = ctx.label_cache.get_issue_labels(issue, refresh=True)
+    except Exception:
+        # Can't reach GitHub API - nothing we can do
+        return
+
+    # Check if a _mark_* handler already set a failure label
+    has_failure_label = any(l.startswith("loom:failed:") for l in current_labels)
+
+    if has_failure_label:
+        # _mark_* already handled the transition - just clean up any
+        # contradictory state labels that shouldn't coexist with a failure label
+        contradictory = {"loom:building", "loom:blocked"} & current_labels
+        if contradictory:
+            try:
+                transition_issue_labels(
+                    issue,
+                    remove=sorted(contradictory),
+                    repo_root=ctx.repo_root,
+                )
+                log_info(
+                    f"Label cleanup: removed contradictory labels "
+                    f"{sorted(contradictory)} from issue #{issue}"
+                )
+            except Exception:
+                pass
+        return
+
+    # No failure label was set - revert loom:building to loom:issue
+    # so the issue returns to the ready pool for retry
+    if "loom:building" in current_labels:
+        try:
+            transition_issue_labels(
+                issue,
+                add=["loom:issue"],
+                remove=["loom:building"],
+                repo_root=ctx.repo_root,
+            )
+            log_info(
+                f"Label cleanup: reverted issue #{issue} "
+                f"from loom:building to loom:issue"
+            )
+        except Exception:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for loom-shepherd CLI."""
     args = _parse_args(argv)
@@ -1833,9 +1902,16 @@ def main(argv: list[str] | None = None) -> int:
     _print_phase_header("SHEPHERD ORCHESTRATION STARTED")
     print(file=sys.stderr)
 
+    exit_code = ShepherdExitCode.NEEDS_INTERVENTION
     try:
-        return orchestrate(ctx)
+        exit_code = orchestrate(ctx)
+        return exit_code
+    except Exception:
+        exit_code = ShepherdExitCode.NEEDS_INTERVENTION
+        raise
     finally:
+        if exit_code not in (ShepherdExitCode.SUCCESS, ShepherdExitCode.SKIPPED):
+            _cleanup_labels_on_failure(ctx, exit_code)
         _remove_worktree_marker(ctx)
 
 
