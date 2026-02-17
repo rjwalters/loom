@@ -458,6 +458,19 @@ def orchestrate(ctx: ShepherdContext) -> int:
             _print_phase_header("STOPPING: Reached --to curated")
             return ShepherdExitCode.SUCCESS
 
+        # ─── POST-CURATOR: Re-check issue state ─────────────────────────
+        # The curator may have flagged the issue as blocked (e.g. duplicate).
+        # Re-read labels and abort if loom:blocked was added during this pipeline,
+        # even in merge mode — merge mode overrides *pre-existing* blocks, not
+        # fresh signals from the current pipeline's curator.
+        ctx.label_cache.invalidate_issue(ctx.config.issue)
+        if ctx.has_issue_label("loom:blocked"):
+            log_warning("Curator flagged issue as blocked — aborting pipeline")
+            ctx.report_milestone(
+                "blocked", reason="curator_blocked", details="Curator added loom:blocked during this pipeline"
+            )
+            return ShepherdExitCode.NO_CHANGES_NEEDED
+
         # ─── PHASE 2: Approval Gate ───────────────────────────────────────
         _print_phase_header("PHASE 2: APPROVAL GATE")
         phase_start = time.time()
