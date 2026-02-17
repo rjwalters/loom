@@ -24,6 +24,8 @@ from loom_tools.shepherd.cli import (
     _mark_builder_no_pr,
     _mark_judge_exhausted,
     _parse_args,
+    _post_fallback_failure_comment,
+    _record_fallback_failure,
     main,
     orchestrate,
 )
@@ -3744,3 +3746,237 @@ class TestRebasePhaseIntegration:
         assert result == ShepherdExitCode.NEEDS_INTERVENTION
         # Merge should NOT be called
         MockMerge.return_value.run.assert_not_called()
+
+
+class TestPostFallbackFailureComment:
+    """Test _post_fallback_failure_comment helper (issue #2525)."""
+
+    @patch("subprocess.run")
+    def test_posts_comment_with_exit_code(self, mock_run: MagicMock) -> None:
+        """Should post a comment including exit code and description."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:3] == ["gh", "issue", "comment"]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "Shepherd fallback cleanup" in body
+        assert "1" in body  # exit code
+        assert "Builder failed" in body
+
+    @patch("subprocess.run")
+    def test_systemic_failure_identified_as_infrastructure(
+        self, mock_run: MagicMock
+    ) -> None:
+        """Should identify auth/API failures as infrastructure failures."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "infrastructure failure" in body
+        assert "authentication tokens" in body
+
+    @patch("subprocess.run")
+    def test_non_auth_failure_gives_generic_advice(
+        self, mock_run: MagicMock
+    ) -> None:
+        """Non-systemic failures should give generic investigation advice."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.NEEDS_INTERVENTION)
+
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        body_idx = cmd.index("--body") + 1
+        body = cmd[body_idx]
+        assert "manual investigation" in body
+        assert "infrastructure failure" not in body
+
+    @patch("subprocess.run")
+    def test_survives_subprocess_failure(self, mock_run: MagicMock) -> None:
+        """Should not raise when gh command fails."""
+        mock_run.side_effect = OSError("command not found")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        # Should not raise
+        _post_fallback_failure_comment(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+
+class TestRecordFallbackFailure:
+    """Test _record_fallback_failure helper (issue #2525)."""
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_auth_failure_class(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+    ) -> None:
+        """Should record auth_infrastructure_failure for systemic exit code."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        mock_record.assert_called_once_with(
+            Path("/fake/repo"),
+            42,
+            error_class="auth_infrastructure_failure",
+            phase="builder",
+            details="Builder failed due to auth/API infrastructure issue (fallback cleanup)",
+        )
+        mock_detect.assert_called_once_with(Path("/fake/repo"))
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_unknown_failure_class(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+    ) -> None:
+        """Should record builder_unknown_failure for non-systemic exit codes."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_record.assert_called_once_with(
+            Path("/fake/repo"),
+            42,
+            error_class="builder_unknown_failure",
+            phase="builder",
+            details="Builder failed without specific handler (exit code 1, fallback cleanup)",
+        )
+        mock_detect.assert_called_once_with(Path("/fake/repo"))
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_survives_record_failure(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+    ) -> None:
+        """Should not raise when record_blocked_reason fails."""
+        mock_record.side_effect = RuntimeError("disk full")
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        # Should not raise
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+
+class TestCleanupFallbackIntegration:
+    """Test that _cleanup_labels_on_failure calls the new fallback helpers (issue #2525)."""
+
+    def _make_cleanup_ctx(
+        self,
+        issue_labels: set[str] | None = None,
+    ) -> MagicMock:
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.pr_number = None
+        ctx.repo_root = Path("/fake/repo")
+        ctx.label_cache = MagicMock()
+        if issue_labels is not None:
+            ctx.label_cache.get_issue_labels.return_value = issue_labels
+        return ctx
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_fallback_comment_posted_on_building_revert(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Fallback path should post comment when reverting loom:building → loom:issue."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_comment.assert_called_once_with(ctx, ShepherdExitCode.BUILDER_FAILED)
+        mock_record.assert_called_once_with(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_no_fallback_comment_when_mark_handler_ran(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Should NOT post fallback comment when _mark_* handler already set failure label."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:failed:builder-tests", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.PR_TESTS_FAILED)
+
+        mock_comment.assert_not_called()
+        mock_record.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_no_fallback_comment_when_no_building_label(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Should NOT post fallback comment when issue doesn't have loom:building."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:curated", "loom:triage"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        mock_comment.assert_not_called()
+        mock_record.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli._record_fallback_failure")
+    @patch("loom_tools.shepherd.cli._post_fallback_failure_comment")
+    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    def test_fallback_with_systemic_failure_exit_code(
+        self,
+        mock_transition: MagicMock,
+        mock_pr_cleanup: MagicMock,
+        mock_comment: MagicMock,
+        mock_record: MagicMock,
+    ) -> None:
+        """Fallback should pass systemic failure exit code to helpers."""
+        ctx = self._make_cleanup_ctx(
+            issue_labels={"loom:building", "loom:curated"}
+        )
+        _cleanup_labels_on_failure(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+        mock_comment.assert_called_once_with(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+        mock_record.assert_called_once_with(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
