@@ -130,11 +130,15 @@ DEGRADED_SCAN_TAIL_LINES = 100
 _DEGRADED_SCAN_INTERVAL = 30
 
 # Wall-clock duration threshold (in seconds) for ghost detection.
-# Sessions shorter than this with no meaningful output are classified as
-# ghost sessions.  Uses wall-clock timing from run_worker_phase() instead
-# of unreliable file timestamps (st_mtime - st_ctime), which read as ~0
-# when pipe-pane fails to capture output.  See issue #2639.
-GHOST_SESSION_WALL_CLOCK_THRESHOLD = 5.0
+# Ghost detection is content-first: sessions with no meaningful output
+# are classified as ghosts if they also ran for less than this threshold.
+# The threshold is wide (30s) because MCP initialization delays can push
+# ghost sessions to 7s+ of wall-clock time while producing only spinner
+# output.  See issues #2639, #2659.
+#
+# Sessions exceeding this threshold with no meaningful output are
+# classified as low-output (exit code 6) instead of ghost (exit code 10).
+GHOST_SESSION_WALL_CLOCK_THRESHOLD = 30.0
 
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
@@ -780,24 +784,29 @@ def _is_auth_failure(log_path: Path) -> bool:
 def _is_ghost_session(
     log_path: Path, *, wall_clock_duration: float | None = None
 ) -> bool:
-    """Check if a session log indicates a ghost session (instant exit, no work).
+    """Check if a session log indicates a ghost session (no meaningful work).
 
-    A ghost session is one where the CLI process spawned but exited almost
-    immediately without producing any meaningful output.  This is distinct
-    from low-output sessions (which may have *some* output) and MCP failures
-    (which have specific MCP error patterns).
+    A ghost session is one where the CLI process spawned but produced no
+    meaningful output — only spinner noise, ``(thinking)`` lines, and
+    startup boilerplate.  This is distinct from low-output sessions (which
+    exceed the duration threshold) and MCP failures (which have specific
+    MCP error patterns).
 
-    Ghost sessions are detected by combining two signals:
-    1. No meaningful CLI output (same check as ``_is_low_output_session``)
-    2. Very short session duration
+    Detection is **content-first**: the log is analysed for meaningful
+    output *before* checking duration.  Duration acts as a secondary
+    signal to distinguish ghost sessions (infrastructure failures) from
+    long-running stuck sessions.  See issue #2659.
 
-    For duration, **wall-clock timing** from ``run_worker_phase()`` is
-    preferred over file timestamps.  The ``st_mtime - st_ctime`` heuristic
-    is unreliable when pipe-pane fails to capture output — the log file
-    appears unmodified (mtime == ctime) even though the session ran for
-    10-20 seconds, causing false-positive ghost detection.  See issue #2639.
-    The fallback file-timestamp path uses a 2-second threshold to account
-    for filesystem timestamp jitter.  See issue #2644.
+    1. If the log contains meaningful CLI output → **not a ghost**.
+    2. If no meaningful output, check duration:
+       - Wall-clock ≤ GHOST_SESSION_WALL_CLOCK_THRESHOLD (30s) → ghost.
+       - File-timestamp fallback ≤ same threshold → ghost.
+       - Duration exceeds threshold → not a ghost (classified as
+         low-output via exit code 6 instead).
+
+    The wide 30s threshold accommodates MCP initialization delays that
+    can push ghost sessions to 7s+ of wall-clock time while producing
+    only spinner output.  See issues #2639, #2644, #2659.
 
     These represent infrastructure-level failures (API blip, spawn race,
     resource contention) rather than agent failures, and should be retried
@@ -811,38 +820,37 @@ def _is_ghost_session(
             of file timestamps for duration estimation.  See issue #2639.
 
     Returns:
-        True if the session appears to be a ghost (instant exit, no work).
+        True if the session appears to be a ghost (no meaningful work).
     """
     if not log_path.is_file():
         return False
 
     try:
-        # Prefer wall-clock duration (accurate) over file timestamps (fragile).
-        # File timestamps (st_mtime - st_ctime) are unreliable when pipe-pane
-        # fails to capture output — the log file appears unmodified even though
-        # the session ran for 10-20s.  See issue #2639.
-        if wall_clock_duration is not None:
-            if wall_clock_duration > GHOST_SESSION_WALL_CLOCK_THRESHOLD:
-                # Session ran for more than the threshold — not a ghost.
-                return False
-        else:
-            # Fallback to file timestamp heuristic (legacy path).
-            # Use a 2-second threshold to account for filesystem timestamp
-            # jitter and sessions that emit a spinner frame before dying.
-            # See issue #2644.
-            stat = log_path.stat()
-            duration = stat.st_mtime - stat.st_ctime
-            if duration > 2.0:
-                # Session ran for more than 2 seconds — not a ghost.
-                return False
-
         content = log_path.read_text()
         stripped = strip_ansi(content)
 
-        # Check for meaningful output after the CLI start sentinel.
+        # Content-first: check for meaningful output before duration.
+        # This avoids false negatives where MCP init delays push ghost
+        # sessions past the old 5s duration gate.  See issue #2659.
         cli_output = _get_cli_output(stripped)
         cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
-        return len(cleaned.strip()) < LOW_OUTPUT_MIN_CHARS
+        if len(cleaned.strip()) >= LOW_OUTPUT_MIN_CHARS:
+            # Meaningful output present — not a ghost regardless of duration.
+            return False
+
+        # No meaningful output.  Use duration as a secondary signal to
+        # distinguish ghost (infrastructure failure, < 30s) from
+        # stuck/killed sessions (> 30s, classified as low-output instead).
+        if wall_clock_duration is not None:
+            return wall_clock_duration <= GHOST_SESSION_WALL_CLOCK_THRESHOLD
+        else:
+            # Fallback to file timestamp heuristic (legacy path).
+            # File timestamps are unreliable (see issues #2639, #2644, #2659)
+            # but still useful as a rough upper bound when wall-clock timing
+            # is unavailable.
+            stat = log_path.stat()
+            duration = stat.st_mtime - stat.st_ctime
+            return duration <= GHOST_SESSION_WALL_CLOCK_THRESHOLD
     except OSError:
         return False
 
@@ -1356,12 +1364,11 @@ def run_worker_phase(
         )
         return 9
 
-    # Check for ghost session (exit code 10) — instant exit with no work.
-    # Ghost sessions are a specific subtype of low-output where the session
-    # lasted < 2s.  These are infrastructure failures that should be retried
-    # on a separate budget.  Check before MCP/low-output to avoid consuming
-    # their retry budgets.  See issues #2604, #2644.
-    # Use wall-clock timing for reliable duration estimation.  See issue #2639.
+    # Check for ghost session (exit code 10) — no meaningful work produced.
+    # Content-first detection: sessions with only spinner/boilerplate output
+    # and duration ≤ 30s are infrastructure failures retried on a separate
+    # budget.  Check before MCP/low-output to avoid consuming their retry
+    # budgets.  See issues #2604, #2644, #2659.
     if wait_exit != 0 and _is_ghost_session(log_path, wall_clock_duration=elapsed):
         errors = extract_log_errors(log_path)
         cause = _classify_ghost_cause(log_path)
