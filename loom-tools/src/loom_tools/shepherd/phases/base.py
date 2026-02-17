@@ -56,6 +56,7 @@ LOW_OUTPUT_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
     "auth_timeout": (0, []),
     "auth_lock_contention": (1, [60]),
     "api_unreachable": (1, [30]),
+    "wrapper_crash": (0, []),
     "unknown": (LOW_OUTPUT_MAX_RETRIES, list(LOW_OUTPUT_BACKOFF_SECONDS)),
 }
 
@@ -740,7 +741,8 @@ def _classify_low_output_cause(log_path: Path) -> str:
 
     Returns:
         A cause string: ``"auth_timeout"``, ``"auth_lock_contention"``,
-        ``"api_unreachable"``, or ``"unknown"`` (generic transient failure).
+        ``"api_unreachable"``, ``"wrapper_crash"``, or ``"unknown"``
+        (generic transient failure).
     """
     if not log_path.is_file():
         return "unknown"
@@ -756,6 +758,10 @@ def _classify_low_output_cause(log_path: Path) -> str:
         return "auth_lock_contention"
     if "API endpoint" in content and "unreachable" in content:
         return "api_unreachable"
+    if "syntax error near unexpected token" in content or (
+        "syntax error" in content and "unexpected end of file" in content
+    ):
+        return "wrapper_crash"
     return "unknown"
 
 
