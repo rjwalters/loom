@@ -595,18 +595,21 @@ def validate_builder(
                 "builder", issue, ValidationStatus.SATISFIED,
                 f"Issue #{issue} is closed with merged PR #{merged_pr}",
             )
-        # No PR found — builder closed the issue without implementing anything
+        # No PR found — builder closed the issue without implementing anything.
+        # Reopen the issue to prevent destruction of legitimate feature requests.
         if not check_only:
+            _run_gh(["issue", "reopen", str(issue)], repo_root)
             _mark_phase_failed(
                 issue, "builder",
                 "Issue was closed without an associated PR. "
-                "Builder may have abandoned the issue instead of implementing it.",
+                "Builder may have abandoned the issue instead of implementing it. "
+                "Issue has been automatically reopened.",
                 repo_root,
                 failure_label="loom:failed:builder",
             )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED,
-            f"Issue #{issue} was closed without a PR — builder abandoned issue",
+            f"Issue #{issue} was closed without a PR — builder abandoned issue (reopened)",
         )
 
     # Find existing PR

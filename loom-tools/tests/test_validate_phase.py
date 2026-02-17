@@ -442,16 +442,21 @@ class TestValidateBuilder:
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
     def test_issue_closed_without_pr_fails(self, mock_gh: MagicMock, mock_find: MagicMock, mock_phase_failed: MagicMock, tmp_path: Path):
-        """Issue closed + no PR = builder abandoned issue."""
+        """Issue closed + no PR = builder abandoned issue, issue reopened."""
         repo = _make_repo(tmp_path)
         mock_gh.side_effect = [
             _completed(stdout="CLOSED\n"),  # issue state
             _completed(stdout="\n"),         # merged PR search returns nothing
+            _completed(stdout=""),           # issue reopen
         ]
         mock_find.return_value = None  # no open PR
         result = validate_builder(42, repo)
         assert result.status == ValidationStatus.FAILED
         assert "abandoned" in result.message.lower()
+        assert "reopened" in result.message.lower()
+        # Verify issue was reopened
+        reopen_call = mock_gh.call_args_list[2]
+        assert "reopen" in reopen_call[0][0]
         mock_phase_failed.assert_called_once()
         call_kwargs = mock_phase_failed.call_args[1]
         assert call_kwargs.get("failure_label") == "loom:failed:builder"
