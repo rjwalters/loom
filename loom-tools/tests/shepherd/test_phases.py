@@ -61,6 +61,7 @@ def mock_context() -> MagicMock:
     ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
     ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
     ctx.pr_number = None
+    ctx.issue_title = "Fix something for issue #42"
     ctx.label_cache = MagicMock()
     ctx.warnings = []
     return ctx
@@ -8796,7 +8797,8 @@ class TestBuilderDirectCompletion:
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
         assert "--title" in call_args
-        assert "Issue #42" in call_args
+        title_idx = call_args.index("--title")
+        assert call_args[title_idx + 1] == "Fix something for issue #42"
         assert "--label" in call_args
         assert "loom:review-requested" in call_args
         assert "--body" in call_args
