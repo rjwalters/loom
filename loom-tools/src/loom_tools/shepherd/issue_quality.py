@@ -83,6 +83,31 @@ _AC_HEADING_RE = re.compile(
 # Checkbox pattern used in acceptance criteria lists.
 _CHECKBOX_RE = re.compile(r"^\s*-\s*\[[ x]\]", re.MULTILINE)
 
+# Numbered list items with action verbs (e.g., "1. Ensure X", "2. Verify Y").
+_NUMBERED_ACTION_RE = re.compile(
+    r"^\s*\d+\.\s+(?:ensure|verify|confirm|check|validate|test|add|update|implement|create|remove|fix)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Requirement statements using "should", "must", or "shall" with a subject.
+_REQUIREMENT_STMT_RE = re.compile(
+    r"(?:^|\.\s+)\S.{0,80}?\b(?:should|must|shall)\b\s+\S",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Bug report pattern: "Observed Behavior" + "Expected Behavior" headings.
+_OBSERVED_BEHAVIOR_RE = re.compile(
+    r"^#{1,3}\s+(?:observed|actual|current)\s+behavio(?:u?r)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_EXPECTED_BEHAVIOR_RE = re.compile(
+    r"^#{1,3}\s+expected\s+behavio(?:u?r)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Minimum number of file references to count as "well-researched".
+_MIN_FILE_REFS_FOR_QUALITY = 3
+
 # Heading pattern for test plan section.
 _TEST_PLAN_RE = re.compile(
     r"^#{1,3}\s+test(?:ing)?\s+plan",
@@ -96,6 +121,39 @@ _FILE_REF_RE = re.compile(
     r"|`[^`]+\.(?:py|ts|tsx|js|jsx|sh|rs|go|json|yaml|yml|toml|md)`"  # backtick-quoted
     r")",
 )
+
+
+def _has_content_quality_signals(issue_body: str) -> bool:
+    """Check if issue body has content-quality signals beyond formal headings.
+
+    Recognizes well-specified issues that use alternative structures instead
+    of formal ``## Acceptance Criteria`` headings or checkbox syntax.
+
+    Returns True when the body contains at least one quality signal:
+    - Numbered action items (e.g. "1. Ensure ...")
+    - Requirement statements ("should", "must", "shall")
+    - Bug report pattern (Observed + Expected Behavior headings)
+    - Multiple file/code references (3+, indicating well-researched issue)
+    """
+    # Numbered action items
+    if len(_NUMBERED_ACTION_RE.findall(issue_body)) >= 2:
+        return True
+
+    # Requirement statements
+    if len(_REQUIREMENT_STMT_RE.findall(issue_body)) >= 2:
+        return True
+
+    # Bug report pattern (need both headings)
+    if _OBSERVED_BEHAVIOR_RE.search(issue_body) and _EXPECTED_BEHAVIOR_RE.search(
+        issue_body
+    ):
+        return True
+
+    # Multiple file references indicate well-researched issue
+    if len(_FILE_REF_RE.findall(issue_body)) >= _MIN_FILE_REFS_FOR_QUALITY:
+        return True
+
+    return False
 
 
 def validate_issue_quality(issue_body: str) -> ValidationResult:
@@ -125,8 +183,9 @@ def validate_issue_quality(issue_body: str) -> ValidationResult:
     # Check 1: Has acceptance criteria section (Warning)
     has_ac_heading = bool(_AC_HEADING_RE.search(issue_body))
     has_checkboxes = bool(_CHECKBOX_RE.search(issue_body))
+    has_quality_signals = _has_content_quality_signals(issue_body)
 
-    if not has_ac_heading and not has_checkboxes:
+    if not has_ac_heading and not has_checkboxes and not has_quality_signals:
         findings.append(
             QualityFinding(
                 severity=Severity.WARNING,
@@ -212,8 +271,9 @@ def validate_issue_quality_with_gates(
     # Check 1: Has acceptance criteria section
     has_ac_heading = bool(_AC_HEADING_RE.search(issue_body))
     has_checkboxes = bool(_CHECKBOX_RE.search(issue_body))
+    has_quality_signals = _has_content_quality_signals(issue_body)
 
-    if not has_ac_heading and not has_checkboxes:
+    if not has_ac_heading and not has_checkboxes and not has_quality_signals:
         findings.append(
             QualityFinding(
                 severity=_gate_level_to_severity(quality_gates.acceptance_criteria),
