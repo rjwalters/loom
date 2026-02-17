@@ -3087,22 +3087,29 @@ class BuilderPhase:
     ) -> bool:
         """Attempt to complete mechanical operations directly in Python.
 
-        Handles simple operations (push branch, create PR, add label) without
-        spawning a full agent. Returns True if all remaining steps were
-        completed.
+        Handles simple operations (stage+commit, push branch, create PR, add
+        label) without spawning a full agent. Returns True if all remaining
+        steps were completed.
         """
         steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
 
         # Only handle purely mechanical steps directly
-        mechanical_steps = {"push_branch", "add_review_label", "create_pr"}
+        mechanical_steps = {
+            "stage_and_commit",
+            "push_branch",
+            "add_review_label",
+            "create_pr",
+        }
         if not steps or not set(steps).issubset(mechanical_steps):
             return False
 
         # Safety guard: refuse to create a PR when there are 0 commits
-        # ahead of main.  A PR with an empty diff is useless and creates
-        # cleanup work.  This guards against edge cases where
-        # _diagnose_remaining_steps logic is bypassed.
-        if "create_pr" in steps and diag.get("commits_ahead", 0) == 0:
+        # ahead of main and no stage_and_commit step will produce one.
+        if (
+            "create_pr" in steps
+            and diag.get("commits_ahead", 0) == 0
+            and "stage_and_commit" not in steps
+        ):
             log_warning(
                 f"Direct completion: refusing to create PR for issue "
                 f"#{ctx.config.issue} with 0 commits ahead of main"
@@ -3115,7 +3122,13 @@ class BuilderPhase:
         )
 
         for step in steps:
-            if step == "push_branch":
+            if step == "stage_and_commit":
+                if not self._stage_and_commit(ctx):
+                    log_warning("Direct completion: stage_and_commit failed")
+                    return False
+                log_success("Direct completion: changes committed")
+
+            elif step == "push_branch":
                 if not self._push_branch(ctx):
                     log_warning("Direct completion: push failed")
                     return False
@@ -3544,6 +3557,76 @@ class BuilderPhase:
         (e.g. after the doctor applies test fixes).
         """
         return self._push_branch(ctx)
+
+    def _stage_and_commit(self, ctx: ShepherdContext) -> bool:
+        """Stage meaningful changes and create a commit in the worktree.
+
+        Stages all non-artifact files (respects .gitignore) and commits with
+        a descriptive message.  Returns True if a commit was created.
+        """
+        if not ctx.worktree_path or not ctx.worktree_path.is_dir():
+            return False
+
+        # Get current status
+        status_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if status_result.returncode != 0 or not status_result.stdout.strip():
+            log_warning("Direct completion: no changes to commit")
+            return False
+
+        porcelain_lines = status_result.stdout.strip().splitlines()
+        meaningful, _ = self._filter_build_artifacts(porcelain_lines)
+        if not meaningful:
+            log_warning(
+                "Direct completion: only build artifacts uncommitted, "
+                "nothing meaningful to commit"
+            )
+            return False
+
+        # Extract file paths from porcelain lines (format: "XY filename")
+        files_to_stage = []
+        for line in meaningful:
+            path = line[3:].strip().strip('"') if len(line) > 3 else line.strip()
+            if path:
+                files_to_stage.append(path)
+
+        if not files_to_stage:
+            return False
+
+        # Stage the files
+        stage_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "add", "--"] + files_to_stage,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if stage_result.returncode != 0:
+            log_warning(
+                f"Direct completion: git add failed: "
+                f"{(stage_result.stderr or '').strip()[:200]}"
+            )
+            return False
+
+        # Commit
+        commit_msg = f"feat: implement changes for issue #{ctx.config.issue}"
+        commit_result = subprocess.run(
+            ["git", "-C", str(ctx.worktree_path), "commit", "-m", commit_msg],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if commit_result.returncode != 0:
+            log_warning(
+                f"Direct completion: git commit failed: "
+                f"{(commit_result.stderr or '').strip()[:200]}"
+            )
+            return False
+
+        return True
 
     def _push_branch(self, ctx: ShepherdContext) -> bool:
         """Push the current branch to remote.

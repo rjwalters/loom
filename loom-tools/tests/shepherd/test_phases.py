@@ -8176,9 +8176,12 @@ class TestBuilderDirectCompletion:
         assert "100" in call_args
         assert "--add-label" in call_args
 
-    def test_non_mechanical_steps_returns_false(self, mock_context: MagicMock) -> None:
-        """Should return False when non-mechanical steps remain."""
+    def test_stage_commit_push_create_pr(self, mock_context: MagicMock) -> None:
+        """Should handle full stage+commit+push+create_pr flow directly."""
         builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.worktree_path = Path("/fake/worktree")
+        mock_context.config = ShepherdConfig(issue=42)
         diag = {
             "has_uncommitted_changes": True,
             "commits_ahead": 0,
@@ -8186,8 +8189,18 @@ class TestBuilderDirectCompletion:
             "pr_number": None,
             "pr_has_review_label": False,
         }
-        result = builder._direct_completion(mock_context, diag)
-        assert result is False
+
+        with (
+            patch.object(builder, "_stage_and_commit", return_value=True),
+            patch.object(builder, "_push_branch", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
 
     def test_push_failure_returns_false(self, mock_context: MagicMock) -> None:
         """Should return False when push fails."""
@@ -8337,11 +8350,14 @@ class TestBuilderDirectCompletion:
         call_args = mock_run.call_args[0][0]
         assert "feature/issue-55" in call_args
 
-    def test_stage_and_commit_with_create_pr_returns_false(
+    def test_stage_and_commit_failure_returns_false(
         self, mock_context: MagicMock
     ) -> None:
-        """Multi-step with non-mechanical stage_and_commit should fall through."""
+        """Should return False when stage_and_commit fails."""
         builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.worktree_path = Path("/fake/worktree")
+        mock_context.config = ShepherdConfig(issue=42)
         diag = {
             "has_uncommitted_changes": True,
             "commits_ahead": 0,
@@ -8349,7 +8365,126 @@ class TestBuilderDirectCompletion:
             "pr_number": None,
             "pr_has_review_label": False,
         }
-        result = builder._direct_completion(mock_context, diag)
+
+        with patch.object(builder, "_stage_and_commit", return_value=False):
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is False
+
+
+class TestBuilderStageAndCommit:
+    """Test _stage_and_commit for direct mechanical staging and committing."""
+
+    def test_stages_and_commits_meaningful_files(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should stage meaningful files and create a commit."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # First call: git status --porcelain
+            status_result = MagicMock(
+                returncode=0, stdout=" M src/main.py\n M src/utils.py\n"
+            )
+            # Second call: git add
+            add_result = MagicMock(returncode=0, stderr="")
+            # Third call: git commit
+            commit_result = MagicMock(returncode=0, stderr="")
+            mock_run.side_effect = [status_result, add_result, commit_result]
+
+            result = builder._stage_and_commit(mock_context)
+
+        assert result is True
+        # Verify git add was called with the specific files
+        add_call = mock_run.call_args_list[1]
+        add_args = add_call[0][0]
+        assert add_args[:4] == ["git", "-C", str(tmp_path), "add"]
+        assert "src/main.py" in add_args
+        assert "src/utils.py" in add_args
+        # Verify commit message references the issue
+        commit_call = mock_run.call_args_list[2]
+        commit_args = commit_call[0][0]
+        assert "commit" in commit_args
+        assert any("issue #42" in arg for arg in commit_args)
+
+    def test_no_worktree_returns_false(self, mock_context: MagicMock) -> None:
+        """Should return False when worktree path is not set."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = None
+        result = builder._stage_and_commit(mock_context)
+        assert result is False
+
+    def test_no_changes_returns_false(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return False when there are no changes to commit."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            result = builder._stage_and_commit(mock_context)
+
+        assert result is False
+
+    def test_only_artifacts_returns_false(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return False when only build artifacts are uncommitted."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout=" M Cargo.lock\n"
+            )
+            result = builder._stage_and_commit(mock_context)
+
+        assert result is False
+
+    def test_git_add_failure_returns_false(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return False when git add fails."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            status_result = MagicMock(returncode=0, stdout=" M src/main.py\n")
+            add_result = MagicMock(returncode=1, stderr="error: could not add")
+            mock_run.side_effect = [status_result, add_result]
+            result = builder._stage_and_commit(mock_context)
+
+        assert result is False
+
+    def test_git_commit_failure_returns_false(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should return False when git commit fails."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = tmp_path
+        mock_context.config = ShepherdConfig(issue=42)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            status_result = MagicMock(returncode=0, stdout=" M src/main.py\n")
+            add_result = MagicMock(returncode=0, stderr="")
+            commit_result = MagicMock(returncode=1, stderr="nothing to commit")
+            mock_run.side_effect = [status_result, add_result, commit_result]
+            result = builder._stage_and_commit(mock_context)
+
         assert result is False
 
 
