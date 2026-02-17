@@ -3830,6 +3830,16 @@ class BuilderPhase:
         if not steps or not set(steps).issubset(mechanical_steps):
             return False
 
+        # Safety guard: refuse when the worktree is on a protected branch.
+        # This is a bug condition — see issue #2744.
+        actual_branch = diag.get("branch")
+        if actual_branch in ("main", "master"):
+            log_warning(
+                f"Direct completion: worktree is on '{actual_branch}', "
+                f"refusing to proceed"
+            )
+            return False
+
         # Safety guard: refuse to create a PR when there are 0 commits
         # ahead of main AND we're not about to create one via stage_and_commit.
         if (
@@ -3872,10 +3882,9 @@ class BuilderPhase:
                     )
 
             elif step == "create_pr":
-                branch = diag.get(
-                    "branch",
-                    NamingConventions.branch_name(ctx.config.issue),
-                )
+                # Always use canonical branch name, never diag["branch"]
+                # which could be "main" if the worktree drifted.  See #2744.
+                branch = NamingConventions.branch_name(ctx.config.issue)
                 # Guard against stale diagnostics: re-check if a PR already
                 # exists for this branch before creating a new one.
                 check_result = subprocess.run(
@@ -4002,6 +4011,17 @@ class BuilderPhase:
 
         steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
 
+        # Safety: detect when worktree is on a protected branch.
+        # Instructions always use NamingConventions.branch_name() regardless,
+        # but log a warning for visibility.  See issue #2744.
+        actual_branch = diag.get("branch")
+        if actual_branch in ("main", "master"):
+            log_warning(
+                f"Completion phase: worktree is on '{actual_branch}' instead "
+                f"of a feature branch — instructions will use "
+                f"'{NamingConventions.branch_name(ctx.config.issue)}'"
+            )
+
         # Build targeted completion instructions based on remaining steps
         instructions: list[str] = []
 
@@ -4015,13 +4035,13 @@ class BuilderPhase:
                 instructions.append("- Stage and commit all changes")
 
         if "push_branch" in steps:
-            branch = diag.get("branch", f"feature/issue-{ctx.config.issue}")
+            branch = NamingConventions.branch_name(ctx.config.issue)
             instructions.append(
                 f"- Push branch to remote: git push -u origin {branch}"
             )
 
         if "create_pr" in steps:
-            branch = diag.get("branch", f"feature/issue-{ctx.config.issue}")
+            branch = NamingConventions.branch_name(ctx.config.issue)
             instructions.append(
                 f"- First check if a PR already exists: "
                 f"gh pr list --head {branch} --state open"
