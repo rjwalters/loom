@@ -935,6 +935,58 @@ class TestBuilderPhase:
         assert "exited with code 6" in result.message
         mock_cleanup.assert_called_once()
 
+    def test_generic_exit_code_stale_worktree_cleaned_up(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Any non-zero exit with stale worktree should clean it up (issue #2685).
+
+        Previously only exit codes 6/7 triggered stale worktree cleanup.
+        Any non-zero exit can leave a stale worktree that blocks the next
+        shepherd attempt.
+        """
+        mock_context.check_shutdown.return_value = False
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+        fake_diag = {
+            "summary": (
+                "worktree exists (branch=feature/issue-42, commits_ahead=0, "
+                "uncommitted=none); remote branch missing; no PR"
+            ),
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue",
+                return_value=None,
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=1,  # Generic non-zero exit (not 6 or 7)
+            ),
+            patch.object(builder, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(builder, "_create_worktree_marker"),
+            patch.object(
+                builder, "_is_stale_worktree", side_effect=[False, True]
+            ),
+            patch.object(builder, "_cleanup_stale_worktree") as mock_cleanup,
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "exited with code 1" in result.message
+        mock_cleanup.assert_called_once()
+
     def test_stuck_builder_includes_log_path(self, mock_context: MagicMock) -> None:
         """Builder stuck (exit 4) should include log file path in data."""
         mock_context.check_shutdown.return_value = False
@@ -9606,6 +9658,7 @@ class TestBuilderStaleWorktreeRecovery:
 
         # Create real mock context with real Path
         ctx = MagicMock()
+        ctx.config.issue = 42
         worktree = tmp_path / "issue-42"
         worktree.mkdir()
         ctx.worktree_path = worktree
@@ -9616,16 +9669,17 @@ class TestBuilderStaleWorktreeRecovery:
             ) as mock_run,
             patch.object(builder, "_remove_stale_worktree") as mock_remove,
         ):
-            # Fetch succeeds
-            # Reset succeeds
-            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            # Branch check returns correct branch, fetch and reset succeed
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="feature/issue-42\n", stderr=""
+            )
 
             builder._reset_stale_worktree(ctx)
 
             # Should not call remove since reset succeeded
             mock_remove.assert_not_called()
-            # Should have run fetch and reset
-            assert mock_run.call_count == 2
+            # Should have run: branch check, fetch, and reset
+            assert mock_run.call_count == 3
 
     def test_reset_stale_worktree_falls_back_to_remove(
         self, tmp_path: Path
@@ -9635,6 +9689,7 @@ class TestBuilderStaleWorktreeRecovery:
 
         # Create real mock context with real Path
         ctx = MagicMock()
+        ctx.config.issue = 42
         worktree = tmp_path / "issue-42"
         worktree.mkdir()
         ctx.worktree_path = worktree
@@ -9647,7 +9702,10 @@ class TestBuilderStaleWorktreeRecovery:
         ):
             def run_side_effect(cmd, **kwargs):
                 result = MagicMock()
-                if "fetch" in cmd:
+                if "rev-parse" in cmd:
+                    result.returncode = 0
+                    result.stdout = "feature/issue-42\n"
+                elif "fetch" in cmd:
                     result.returncode = 0
                 elif "reset" in cmd:
                     result.returncode = 1  # Reset fails
@@ -9661,6 +9719,42 @@ class TestBuilderStaleWorktreeRecovery:
 
             # Should call remove as fallback
             mock_remove.assert_called_once_with(ctx)
+
+    def test_reset_stale_worktree_branch_mismatch_removes(
+        self, tmp_path: Path
+    ) -> None:
+        """Stale worktree with wrong branch name is removed for clean recreation.
+
+        When a previous builder used a different branch naming convention
+        (e.g., issue-N vs feature/issue-N), reset-in-place would preserve the
+        mismatch.  The worktree should be fully removed so worktree.sh can
+        recreate with the correct branch name.  See issue #2685.
+        """
+        builder = BuilderPhase()
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        ctx.worktree_path = worktree
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+            patch.object(builder, "_remove_stale_worktree") as mock_remove,
+        ):
+            # Branch name doesn't match expected feature/issue-42
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="issue-42\n", stderr=""
+            )
+
+            builder._reset_stale_worktree(ctx)
+
+            # Should remove (not reset) due to branch name mismatch
+            mock_remove.assert_called_once_with(ctx)
+            # Should NOT have called fetch or reset (only branch check)
+            assert mock_run.call_count == 1
 
     def test_remove_stale_worktree_cleans_up(self, tmp_path: Path) -> None:
         """Remove stale worktree removes worktree, local branch, and remote branch."""
