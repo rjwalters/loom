@@ -1890,6 +1890,12 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = find_repo_root()
     _auto_navigate_out_of_worktree(repo_root)
 
+    # --force / --merge implies --allow-dirty-main: the user wants fully
+    # autonomous operation and the builder works in an isolated worktree,
+    # so uncommitted main changes shouldn't block.
+    if args.force:
+        args.allow_dirty_main = True
+
     # Pre-flight check: warn if main repo has uncommitted changes.
     # This prevents confusion when tests pass in main but fail in worktrees
     # (or vice versa) due to uncommitted local changes.
