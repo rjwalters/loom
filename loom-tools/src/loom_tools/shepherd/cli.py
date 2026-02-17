@@ -514,8 +514,11 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 _mark_baseline_blocked(ctx, result)
                 return ShepherdExitCode.NEEDS_INTERVENTION
 
+            # Store preflight result so builder can skip baseline tests
+            ctx.preflight_baseline_status = result.data.get("baseline_status")
+
             # Capture missing baseline warning for reflection
-            if result.data.get("baseline_status") == "unknown":
+            if ctx.preflight_baseline_status == "unknown":
                 run_warnings.append("No baseline health cache found")
 
             # Log result inline (no header for passing checks)
