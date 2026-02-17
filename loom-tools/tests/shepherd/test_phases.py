@@ -5957,13 +5957,50 @@ class TestStaleBranchDetection:
     def test_warns_when_stale_branch_exists(
         self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Should log warning when remote branch feature/issue-N exists."""
+        """Should log warning when remote branch feature/issue-N exists with no open PR."""
         ls_remote_output = "abc123\trefs/heads/feature/issue-42\n"
         completed = subprocess.CompletedProcess(
             args=[], returncode=0, stdout=ls_remote_output, stderr=""
         )
         with patch(
             "loom_tools.shepherd.context.subprocess.run", return_value=completed
+        ), patch("loom_tools.shepherd.context.gh_list", return_value=[]):
+            with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
+                ShepherdContext._check_stale_branch(mock_context, 42)
+
+        assert any("Stale branch feature/issue-42" in r.message for r in caplog.records)
+
+    def test_no_warning_when_branch_has_open_pr(
+        self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Should not warn when branch has an open PR (branch is not stale)."""
+        ls_remote_output = "abc123\trefs/heads/feature/issue-42\n"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=ls_remote_output, stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.context.subprocess.run", return_value=completed
+        ), patch(
+            "loom_tools.shepherd.context.gh_list", return_value=[{"number": 100}]
+        ):
+            with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
+                ShepherdContext._check_stale_branch(mock_context, 42)
+
+        assert not any("Stale branch" in r.message for r in caplog.records)
+
+    def test_warns_when_pr_check_fails(
+        self, mock_context: MagicMock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Should still warn if the open-PR check raises an exception."""
+        ls_remote_output = "abc123\trefs/heads/feature/issue-42\n"
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=ls_remote_output, stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.context.subprocess.run", return_value=completed
+        ), patch(
+            "loom_tools.shepherd.context.gh_list",
+            side_effect=RuntimeError("gh failed"),
         ):
             with caplog.at_level(logging.WARNING, logger="loom_tools.shepherd.context"):
                 ShepherdContext._check_stale_branch(mock_context, 42)
