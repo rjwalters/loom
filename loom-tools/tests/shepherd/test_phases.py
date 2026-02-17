@@ -7013,6 +7013,61 @@ class TestJudgeInfrastructureBypass:
         assert "validation failed" in result.message
         mock_bypass.assert_called_once()
         mock_mark_failed.assert_called_once()
+        # Verify quiet=True is passed so no comment is posted during
+        # intermediate failures — the CLI retry loop handles comments
+        # when retries are exhausted (#2661).
+        _, kwargs = mock_mark_failed.call_args
+        assert kwargs.get("quiet") is True
+
+    def test_mark_phase_failed_uses_quiet_to_defer_comments(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_mark_phase_failed is called with quiet=True to defer comments.
+
+        The judge phase should not post 'Phase contract failed' comments
+        on intermediate failures.  The CLI-level _mark_judge_exhausted()
+        handles comments once all retries are truly exhausted (#2661).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        fake_diag = {
+            "summary": "no judge comments",
+            "session_duration_seconds": 10,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed"
+            ) as mock_mark_failed,
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+        mock_mark_failed.assert_called_once_with(
+            ctx.config.issue,
+            "judge",
+            f"Judge phase did not produce a review decision on PR #{ctx.pr_number}.",
+            ctx.repo_root,
+            failure_label="loom:failed:judge",
+            quiet=True,
+        )
 
 
 class TestMergePhase:
