@@ -894,6 +894,16 @@ run_with_retry() {
             esac
         done
 
+        # Record log file line count before CLI runs so we can detect whether
+        # pipe-pane captured the output (avoids duplicate appends).  Issue #2569.
+        local _pre_log_lines=0
+        if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID:-}" ]]; then
+            local _log_file="${WORKSPACE}/.loom/logs/loom-${TERMINAL_ID}.log"
+            if [[ -f "$_log_file" ]]; then
+                _pre_log_lines=$(wc -l < "$_log_file")
+            fi
+        fi
+
         if [[ "$_has_slash_cmd" == "true" ]]; then
             # Slash command prompt detected - use --print for reliable execution
             log_info "Slash command detected in arguments, using --print mode"
@@ -917,12 +927,25 @@ run_with_retry() {
 
         # In --print mode, pipe-pane may not flush before session exit.
         # Append captured output to the log file so log-based heuristics
-        # (_is_instant_exit, _is_mcp_failure) have content to analyze
+        # (_is_low_output_session, _is_mcp_failure) have content to analyze
         # and post-mortem debugging is possible.  See issue #2550.
-        if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID}" ]]; then
+        # Only append if pipe-pane did NOT already capture sufficient output
+        # (detected by comparing log line counts before/after CLI).  Issue #2569.
+        if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID:-}" ]]; then
             local _log_file="${WORKSPACE}/.loom/logs/loom-${TERMINAL_ID}.log"
             if [[ -f "$_log_file" && -s "${temp_output}" ]]; then
-                cat "${temp_output}" >> "$_log_file"
+                local _post_log_lines
+                _post_log_lines=$(wc -l < "$_log_file")
+                local _log_growth=$(( _post_log_lines - _pre_log_lines ))
+                local _temp_lines
+                _temp_lines=$(wc -l < "${temp_output}")
+                # Only append if pipe-pane captured less than half the expected
+                # output.  Some wrapper log lines may appear in the log from
+                # pipe-pane even when CLI output is not flushed, so a threshold
+                # avoids false negatives.
+                if [[ $_log_growth -lt $(( _temp_lines / 2 )) ]]; then
+                    cat "${temp_output}" >> "$_log_file"
+                fi
             fi
         fi
 
