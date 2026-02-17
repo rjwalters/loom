@@ -9,7 +9,12 @@ import sys
 import time
 from pathlib import Path
 
-from loom_tools.common.git import get_uncommitted_files, parse_porcelain_path
+from loom_tools.common.git import (
+    attempt_rebase,
+    get_uncommitted_files,
+    is_branch_behind,
+    parse_porcelain_path,
+)
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import NamingConventions
 from loom_tools.common.repo import find_repo_root
@@ -602,6 +607,82 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     )
                     _mark_builder_test_failure(ctx)
                     return ShepherdExitCode.PR_TESTS_FAILED
+
+                # Check if failing tests are in files the builder didn't modify.
+                # If so, try rebasing onto latest main first — the fix may
+                # already exist upstream, avoiding a wasted Doctor attempt.
+                if test_fix_attempts == 1:  # Only on first attempt
+                    failing_test_files = set(result.data.get("failing_test_files", []))
+                    changed_files = set(result.data.get("changed_files", []))
+
+                    if failing_test_files and not (failing_test_files & changed_files):
+                        log_warning(
+                            f"Failing tests are in files not modified by builder: "
+                            f"{sorted(failing_test_files)}"
+                        )
+
+                        if is_branch_behind(cwd=ctx.worktree_path):
+                            log_info(
+                                "Branch is behind origin/main, "
+                                "attempting rebase before Doctor"
+                            )
+                            ctx.report_milestone(
+                                "heartbeat",
+                                action="rebasing onto main (failing tests in unmodified files)",
+                            )
+
+                            success, detail = attempt_rebase(cwd=ctx.worktree_path)
+                            if success:
+                                log_success(
+                                    "Rebase succeeded, re-running test verification"
+                                )
+
+                                # Push rebased branch
+                                if not builder.push_branch(ctx):
+                                    log_warning(
+                                        "Could not push rebased branch, "
+                                        "continuing anyway"
+                                    )
+
+                                # Re-run tests after rebase
+                                _print_phase_header(
+                                    "PHASE 3b: TEST VERIFICATION (after rebase)"
+                                )
+                                test_start = time.time()
+                                test_result = builder.run_test_verification_only(ctx)
+                                test_elapsed = int(time.time() - test_start)
+                                builder_total_elapsed += test_elapsed
+
+                                if test_result is None:
+                                    # Tests pass after rebase — skip Doctor
+                                    log_success(
+                                        f"Tests pass after rebase ({test_elapsed}s)"
+                                    )
+                                    result = PhaseResult(
+                                        status=PhaseStatus.SUCCESS,
+                                        message="builder complete (tests fixed by rebase)",
+                                        phase_name="builder",
+                                        data={"test_fixed_by_rebase": True},
+                                    )
+                                    break
+                                else:
+                                    # Tests still fail — continue to Doctor
+                                    log_warning(
+                                        f"Tests still fail after rebase "
+                                        f"({test_elapsed}s)"
+                                    )
+                                    result = test_result
+                                    elapsed = test_elapsed
+                            else:
+                                log_warning(
+                                    f"Rebase failed ({detail}), "
+                                    f"proceeding to Doctor"
+                                )
+                        else:
+                            log_info(
+                                "Branch is up-to-date with main, "
+                                "proceeding to Doctor"
+                            )
 
                 # Route to Doctor for test fix
                 log_warning(
