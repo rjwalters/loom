@@ -12444,6 +12444,76 @@ class TestStripSpinnerNoise:
         result = _strip_spinner_noise(text)
         assert len(result.strip()) == 0
 
+    def test_strips_extended_thinking_phrases(self) -> None:
+        """Extended thinking phrases like 'Bloviating…' should be stripped.
+
+        Claude's extended thinking mode uses many creative gerund phrases
+        beyond the original fixed list.  See issue #2421.
+        """
+        text = (
+            "real output\n"
+            "Bloviating…\n"
+            "Mulling...\n"
+            "Cogitating…\n"
+            "Ruminating...\n"
+            "Pondering…\n"
+            "more output\n"
+        )
+        result = _strip_spinner_noise(text)
+        assert "Bloviating" not in result
+        assert "Mulling" not in result
+        assert "Cogitating" not in result
+        assert "Ruminating" not in result
+        assert "Pondering" not in result
+        assert "real output" in result
+        assert "more output" in result
+
+
+class TestIsMcpFailureExtendedThinking:
+    """Test that extended thinking output doesn't defeat MCP failure detection.
+
+    Regression tests for issue #2421: completion agents entering extended
+    thinking mode produce ~17KB of spinner text without executing tool calls,
+    causing _is_mcp_failure() to incorrectly classify the session as productive.
+    """
+
+    def test_extended_thinking_output_not_counted_as_productive(
+        self, tmp_path: Path
+    ) -> None:
+        """Extended thinking phrases should be stripped before volume check."""
+        log = tmp_path / "session.log"
+        # Simulate extended thinking output from issue #2421
+        thinking_output = (
+            "Bloviating…\n" * 20
+            + "Mulling...\n" * 20
+            + "Cogitating…\n" * 20
+            + "(thinking)\n" * 50
+            + "Pondering…\n" * 20
+        )
+        assert len(thinking_output) >= MCP_FAILURE_MIN_OUTPUT_CHARS
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "bypasspermissionson · 1 MCP server failed · /mcp\n"
+            + thinking_output
+        )
+        assert _is_mcp_failure(log) is True
+
+    def test_extended_thinking_with_real_work_not_flagged(
+        self, tmp_path: Path
+    ) -> None:
+        """Session with extended thinking AND real work should NOT be flagged."""
+        log = tmp_path / "session.log"
+        real_work = "Reading file /src/main.py\nEditing /src/main.py\n" * 30
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "1 MCP server failed\n"
+            + "Bloviating…\n" * 10
+            + "Mulling...\n" * 10
+            + "(thinking)\n" * 10
+            + real_work
+        )
+        assert _is_mcp_failure(log) is False
+
 
 class TestRunWorkerPhaseMcpFailure:
     """Test that run_worker_phase detects MCP failures and returns code 7."""

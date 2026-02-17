@@ -69,11 +69,14 @@ MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 # capture can produce garbled spinner frames (interleaved characters from
 # animated spinners) and repeated "(thinking)" lines that inflate the
 # character count without representing productive work.  See issue #2465.
-# Regex for known spinner phrases matched per-line (already stripped).
-# Matches "Tinkering…", "Thinking...", "Processing...", etc.
+# Regex for spinner/thinking phrases matched per-line (already stripped).
+# Matches any single capitalized word followed by ellipsis, e.g.
+# "Tinkering…", "Thinking...", "Bloviating…", "Mulling...", etc.
+# Claude's extended thinking mode uses many creative gerund phrases
+# beyond the original fixed list, so we match the general pattern
+# instead of enumerating them.  See issue #2421.
 _SPINNER_PHRASE_RE = re.compile(
-    r"^(?:Tinkering|Thinking|Processing|Analyzing|Loading|Working)"
-    r"(?:…|\.{2,3})$"
+    r"^[A-Z][a-z]+(?:…|\.{2,3})$"
 )
 
 # Characters used by Claude CLI animated spinners.  Lines dominated by
