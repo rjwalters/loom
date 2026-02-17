@@ -7459,6 +7459,7 @@ class TestBuilderIsNoChangesNeeded:
             "commits_ahead": 0,
             "remote_branch_exists": False,
             "pr_number": None,
+            "log_cli_output_length": 1000,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -7511,11 +7512,12 @@ class TestBuilderIsNoChangesNeeded:
         assert builder._is_no_changes_needed(diag) is False
 
     def test_handles_missing_keys_gracefully(self) -> None:
-        """Should handle missing keys by treating them as falsy."""
+        """Missing keys should not crash; missing output defaults to degraded."""
         builder = BuilderPhase()
-        # Only worktree_exists is provided, all others should default
+        # Only worktree_exists is provided, all others should default.
+        # Missing log_cli_output_length defaults to 0 → degraded session → False
         diag = {"worktree_exists": True}
-        assert builder._is_no_changes_needed(diag) is True
+        assert builder._is_no_changes_needed(diag) is False
 
 
 class TestBuilderStaleWorktreeRecovery:
@@ -10602,6 +10604,7 @@ class TestBuilderIsNoChangesNeededWithArtifacts:
             "commits_ahead": 0,
             "remote_branch_exists": False,
             "pr_number": None,
+            "log_cli_output_length": 1000,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -10637,6 +10640,7 @@ class TestBuilderMainBranchDirtyDetection:
             "main_branch_dirty": False,
             "main_dirty_file_count": 0,
             "main_dirty_files": [],
+            "log_cli_output_length": 1000,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -10649,6 +10653,7 @@ class TestBuilderMainBranchDirtyDetection:
             "commits_ahead": 0,
             "remote_branch_exists": False,
             "pr_number": None,
+            "log_cli_output_length": 1000,
             # main_branch_dirty not present — backwards compatibility
         }
         # Missing key defaults to False via .get(), so no changes needed is valid
@@ -10674,6 +10679,7 @@ class TestBuilderImplementationActivityDetection:
             "pr_number": None,
             "main_branch_dirty": False,
             "log_has_implementation_activity": True,
+            "log_cli_output_length": 3000,
         }
         assert builder._is_no_changes_needed(diag) is False
 
@@ -10688,11 +10694,15 @@ class TestBuilderImplementationActivityDetection:
             "pr_number": None,
             "main_branch_dirty": False,
             "log_has_implementation_activity": False,
+            "log_cli_output_length": 1000,
         }
         assert builder._is_no_changes_needed(diag) is True
 
     def test_missing_activity_key_defaults_safe(self) -> None:
-        """Missing log_has_implementation_activity defaults to False (no block)."""
+        """Missing log_has_implementation_activity defaults to False (no block).
+
+        But missing log_cli_output_length defaults to 0 → degraded session.
+        """
         builder = BuilderPhase()
         diag = {
             "worktree_exists": True,
@@ -10701,8 +10711,9 @@ class TestBuilderImplementationActivityDetection:
             "remote_branch_exists": False,
             "pr_number": None,
             # log_has_implementation_activity not present — backwards compat
+            # log_cli_output_length not present → defaults to 0 → degraded
         }
-        assert builder._is_no_changes_needed(diag) is True
+        assert builder._is_no_changes_needed(diag) is False
 
     def test_activity_with_git_work_still_returns_false(self) -> None:
         """Implementation activity + git artifacts = not 'no changes needed'."""
@@ -10716,6 +10727,92 @@ class TestBuilderImplementationActivityDetection:
             "log_has_implementation_activity": True,
         }
         # Already False due to has_uncommitted_changes — activity is redundant
+        assert builder._is_no_changes_needed(diag) is False
+
+
+class TestBuilderSessionQualityGate:
+    """Test _is_no_changes_needed rejects degraded/short sessions.
+
+    When the builder session produces too little output, it was degraded or
+    failed silently — not intentionally concluding 'no changes needed.'
+    See issue #2436.
+    """
+
+    def test_degraded_session_blocks_no_changes_needed(self) -> None:
+        """Session with near-zero output should NOT be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_cli_output_length": 50,  # Way below threshold
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_zero_output_blocks_no_changes_needed(self) -> None:
+        """Session with zero output should NOT be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_cli_output_length": 0,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_sufficient_output_allows_no_changes_needed(self) -> None:
+        """Session with enough output can conclude 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_cli_output_length": 1000,
+            "log_has_implementation_activity": False,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_output_at_threshold_allows_no_changes_needed(self) -> None:
+        """Session output exactly at threshold should allow 'no changes needed'."""
+        from loom_tools.shepherd.phases.builder import _MIN_ANALYSIS_OUTPUT_CHARS
+
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_cli_output_length": _MIN_ANALYSIS_OUTPUT_CHARS,
+            "log_has_implementation_activity": False,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_output_just_below_threshold_blocks(self) -> None:
+        """Session output just below threshold should block."""
+        from loom_tools.shepherd.phases.builder import _MIN_ANALYSIS_OUTPUT_CHARS
+
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_cli_output_length": _MIN_ANALYSIS_OUTPUT_CHARS - 1,
+            "log_has_implementation_activity": False,
+        }
         assert builder._is_no_changes_needed(diag) is False
 
 
