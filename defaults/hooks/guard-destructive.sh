@@ -302,6 +302,26 @@ if echo "$COMMAND" | grep -qE 'gh\s+pr\s+merge'; then
 fi
 
 # =============================================================================
+# LOOM: Block pip install -e inside worktrees (issue #2495)
+#
+# Editable pip installs overwrite a global .pth file in site-packages.
+# When multiple builders run in parallel worktrees, each 'pip install -e .'
+# clobbers the .pth to point at its own worktree, causing all other Python
+# processes to import from the wrong source tree.
+#
+# PYTHONPATH is already set by agent-spawn.sh and _build_worktree_env()
+# so editable installs are unnecessary inside worktrees.
+# =============================================================================
+
+WORKTREE_PATH="${LOOM_WORKTREE_PATH:-}"
+if [[ -n "$WORKTREE_PATH" ]]; then
+    if echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*-e\s' || \
+       echo "$COMMAND" | grep -qE '(pip|pip3|uv pip)\s+install\s+.*--editable\s'; then
+        deny "BLOCKED: 'pip install -e' is not allowed inside worktrees. Editable installs overwrite the global .pth file, breaking parallel builders (see issue #2495). PYTHONPATH is already configured for this worktree — imports resolve correctly without editable installs."
+    fi
+fi
+
+# =============================================================================
 # ALLOW - Everything else passes through
 # =============================================================================
 

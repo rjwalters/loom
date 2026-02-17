@@ -45,6 +45,65 @@ run_guard() {
     return $exit_code
 }
 
+# Run the guard with LOOM_WORKTREE_PATH set (simulates worktree context)
+run_guard_in_worktree() {
+    local cmd="$1"
+    local cwd="${2:-$REPO_ROOT}"
+    local output
+    local exit_code
+    output=$(LOOM_WORKTREE_PATH="$cwd" make_input "$cmd" "$cwd" | LOOM_WORKTREE_PATH="$cwd" "$GUARD" 2>&1) || exit_code=$?
+    exit_code=${exit_code:-0}
+    echo "$output"
+    return $exit_code
+}
+
+# Assert the guard denies a command when inside a worktree
+assert_deny_in_worktree() {
+    local description="$1"
+    local cmd="$2"
+    local cwd="${3:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+
+    local output
+    output=$(run_guard_in_worktree "$cmd" "$cwd") || true
+
+    if echo "$output" | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: deny"
+        echo -e "       Got: $output"
+    fi
+}
+
+# Assert the guard allows a command when inside a worktree
+assert_allow_in_worktree() {
+    local description="$1"
+    local cmd="$2"
+    local cwd="${3:-$REPO_ROOT}"
+    TOTAL=$((TOTAL + 1))
+
+    local output
+    local exit_code=0
+    output=$(run_guard_in_worktree "$cmd" "$cwd") || exit_code=$?
+
+    if [[ $exit_code -eq 0 ]] && \
+       ! echo "$output" | jq -e '.hookSpecificOutput.permissionDecision' >/dev/null 2>&1; then
+        PASS=$((PASS + 1))
+        echo -e "  ${GREEN}PASS${NC}: $description"
+    else
+        FAIL=$((FAIL + 1))
+        echo -e "  ${RED}FAIL${NC}: $description"
+        echo -e "       Command: $cmd"
+        echo -e "       Expected: allow (exit 0, no decision)"
+        echo -e "       Exit code: $exit_code"
+        echo -e "       Got: $output"
+    fi
+}
+
 # Assert the guard denies a command
 assert_deny() {
     local description="$1"
@@ -387,6 +446,45 @@ assert_allow "Allow docker logs (read-only)" \
 
 assert_allow "Allow sky status (read-only)" \
     "sky status"
+
+echo ""
+
+# =========================================================================
+echo -e "${YELLOW}--- pip install -e WORKTREE GUARD (issue #2495) ---${NC}"
+# =========================================================================
+
+# Should DENY editable installs when LOOM_WORKTREE_PATH is set
+assert_deny_in_worktree "Block pip install -e in worktree" \
+    "pip install -e ."
+
+assert_deny_in_worktree "Block pip install -e ./loom-tools in worktree" \
+    "pip install -e ./loom-tools"
+
+assert_deny_in_worktree "Block pip3 install -e in worktree" \
+    "pip3 install -e ."
+
+assert_deny_in_worktree "Block pip install --editable in worktree" \
+    "pip install --editable ."
+
+assert_deny_in_worktree "Block uv pip install -e in worktree" \
+    "uv pip install -e ./loom-tools"
+
+assert_deny_in_worktree "Block pip install -e with absolute path in worktree" \
+    "pip install -e /Users/dev/project/loom-tools"
+
+# Should ALLOW non-editable pip installs in worktree
+assert_allow_in_worktree "Allow pip install (non-editable) in worktree" \
+    "pip install pytest"
+
+assert_allow_in_worktree "Allow pip install -r requirements.txt in worktree" \
+    "pip install -r requirements.txt"
+
+# Should ALLOW editable installs outside worktrees (no LOOM_WORKTREE_PATH)
+assert_allow "Allow pip install -e outside worktree" \
+    "pip install -e ."
+
+assert_allow "Allow pip install -e ./loom-tools outside worktree" \
+    "pip install -e ./loom-tools"
 
 echo ""
 
