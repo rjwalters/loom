@@ -115,26 +115,43 @@ async fn test_create_terminal_with_working_dir() {
     let session_name = format!("loom-{terminal_id}-default-0");
     assert!(tmux_session_exists(&session_name));
 
-    // Wait longer for terminal shell to fully initialize with custom working directory
-    tokio::time::sleep(tokio::time::Duration::from_millis(2000)).await;
+    // Wait for terminal shell to fully initialize, retrying if the session
+    // isn't ready yet.  tmux sessions can take a variable amount of time to
+    // become responsive depending on shell startup scripts.
+    let mut output = String::new();
+    let mut captured = false;
+    for attempt in 0..5 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
 
-    // Send pwd command to verify working directory
-    client
-        .send_input(&terminal_id, "pwd\r")
-        .await
-        .expect("Failed to send pwd command");
+        if !tmux_session_exists(&session_name) {
+            if attempt < 4 {
+                continue;
+            }
+            panic!("tmux session '{session_name}' exited before we could capture output");
+        }
 
-    // Wait for command to execute and output to appear
-    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        // Send pwd command to verify working directory
+        client
+            .send_input(&terminal_id, "pwd\r")
+            .await
+            .expect("Failed to send pwd command");
 
-    // Capture terminal output
-    let output = capture_terminal_output(&session_name).expect("Failed to capture terminal output");
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+
+        if let Ok(captured_output) = capture_terminal_output(&session_name) {
+            if captured_output.contains(&working_dir) {
+                output = captured_output;
+                captured = true;
+                break;
+            }
+            output = captured_output;
+        }
+    }
 
     // Verify working directory appears in output
-    // The output should contain the actual directory path from pwd command
     assert!(
-        output.contains(&working_dir),
-        "Expected working directory '{working_dir}' in output, got: '{output}'"
+        captured,
+        "Expected working directory '{working_dir}' in output after retries, got: '{output}'"
     );
 
     // Cleanup
