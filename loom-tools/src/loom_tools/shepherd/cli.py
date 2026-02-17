@@ -2144,10 +2144,15 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
     """Record failure metadata when the fallback cleanup path fires.
 
     Feeds into the systematic failure detector so repeated fallback
-    recycling triggers escalation.
+    recycling triggers escalation.  When a systematic failure pattern
+    is detected (≥N consecutive failures with the same error class),
+    escalates the issue from ``loom:issue`` to ``loom:blocked`` to
+    prevent further wasteful automated attempts.
 
     Best-effort — never raises.
     """
+    import subprocess
+
     from loom_tools.common.systematic_failure import (
         detect_systematic_failure,
         record_blocked_reason,
@@ -2169,7 +2174,43 @@ def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
             phase="builder",
             details=details,
         )
-        detect_systematic_failure(ctx.repo_root)
+        sf = detect_systematic_failure(ctx.repo_root)
+
+        # Escalate: when systematic failure is detected, block the issue
+        # to prevent further automated pickup (see issue #2707)
+        if sf is not None:
+            transition_issue_labels(
+                ctx.config.issue,
+                add=["loom:blocked"],
+                remove=["loom:issue"],
+                repo_root=ctx.repo_root,
+            )
+            log_warning(
+                f"Systematic failure escalation: issue #{ctx.config.issue} "
+                f"moved to loom:blocked (pattern={sf.pattern}, count={sf.count})"
+            )
+            subprocess.run(
+                [
+                    "gh", "issue", "comment", str(ctx.config.issue),
+                    "--body",
+                    f"**Systematic failure detected** — this issue has failed "
+                    f"**{sf.count}** consecutive times with the same error "
+                    f"pattern (`{sf.pattern}`). It has been moved to "
+                    f"`loom:blocked` to prevent further automated attempts.\n\n"
+                    f"### Recovery\n\n"
+                    f"Investigate the failure pattern and either fix the "
+                    f"underlying issue or add more guidance to the issue "
+                    f"description, then remove the `loom:blocked` label to "
+                    f"re-enable automated processing.\n\n"
+                    f"```bash\n"
+                    f"gh issue edit {ctx.config.issue} --remove-label "
+                    f"loom:blocked --add-label loom:issue\n"
+                    f"```",
+                ],
+                cwd=ctx.repo_root,
+                capture_output=True,
+                check=False,
+            )
     except Exception:
         pass
 
