@@ -1640,6 +1640,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -1800,6 +1801,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -1884,6 +1886,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -1911,6 +1914,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         mock_context.worktree_path = worktree_mock
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -1958,6 +1962,7 @@ test result: ok. 17 passed; 0 failed; 0 ignored
         mock_context.worktree_path = worktree_mock
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -1969,6 +1974,20 @@ test result: ok. 17 passed; 0 failed; 0 ignored
                 side_effect=OSError("pnpm not found"),
             ),
         ):
+            result = builder._run_test_verification(mock_context)
+
+        assert result is None
+
+    def test_run_test_verification_skips_zero_artifacts(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should skip test verification when builder produced zero artifacts."""
+        builder = BuilderPhase()
+        worktree_mock = MagicMock()
+        worktree_mock.is_dir.return_value = True
+        mock_context.worktree_path = worktree_mock
+
+        with patch.object(builder, "_has_builder_artifacts", return_value=False):
             result = builder._run_test_verification(mock_context)
 
         assert result is None
@@ -2317,6 +2336,7 @@ class TestBuilderScopedTestVerification:
 
         # Simulate only Python files changed
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder, "_ensure_dependencies"
             ),
@@ -2349,6 +2369,7 @@ class TestBuilderScopedTestVerification:
 
         # Simulate config file changed
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(builder, "_ensure_dependencies"),
             patch(
                 "loom_tools.shepherd.phases.builder.get_changed_files",
@@ -2379,6 +2400,7 @@ class TestBuilderScopedTestVerification:
 
         # Simulate no changed files (git diff fails or returns empty)
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(builder, "_ensure_dependencies"),
             patch(
                 "loom_tools.shepherd.phases.builder.get_changed_files",
@@ -2664,6 +2686,7 @@ class TestBuilderPreserveOnTestFailure:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -2691,6 +2714,7 @@ class TestBuilderPreserveOnTestFailure:
         mock_context.worktree_path = worktree_mock
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -2770,6 +2794,7 @@ class TestBuilderTestFailureContext:
         )
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -2836,6 +2861,7 @@ class TestBuilderTestFailureContext:
         test_output = "FAIL tests/test_example.py\n1 failed\n"
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4544,6 +4570,7 @@ class TestBuilderFallbackComparison:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4620,6 +4647,7 @@ class TestBuilderFallbackComparison:
             args=[], returncode=2, stdout="Error: critical crash\n", stderr=""
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4679,6 +4707,7 @@ class TestBuilderFallbackNameComparison:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4825,6 +4854,7 @@ class TestBuilderFallbackNameComparison:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4875,6 +4905,7 @@ class TestBuilderFallbackNameComparison:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4927,6 +4958,7 @@ class TestBuilderZeroFailuresNonZeroExit:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -4974,6 +5006,7 @@ class TestBuilderZeroFailuresNonZeroExit:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -5021,6 +5054,7 @@ class TestBuilderZeroFailuresNonZeroExit:
             stderr="",
         )
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -11252,6 +11286,7 @@ class TestBuilderSupplementalVerification:
             return supp_worktree_fail  # Supplemental test in worktree
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
@@ -11322,6 +11357,7 @@ class TestBuilderSupplementalVerification:
             return supp_worktree_fail
 
         with (
+            patch.object(builder, "_has_builder_artifacts", return_value=True),
             patch.object(
                 builder,
                 "_detect_test_command",
