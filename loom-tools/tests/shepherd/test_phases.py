@@ -5229,6 +5229,8 @@ class TestJudgeFallbackApproval:
         gh_run_results = [
             # _has_approval_comment: gh pr view --json comments
             MagicMock(returncode=0, stdout="LGTM, looks good!\n"),
+            # _has_rejection_comment: gh pr view --json comments (no rejection)
+            MagicMock(returncode=0, stdout="LGTM, looks good!\n"),
             # _pr_checks_passing: gh pr view --json statusCheckRollup,mergeable
             MagicMock(
                 returncode=0,
@@ -5348,6 +5350,7 @@ class TestJudgeFallbackApproval:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_pr_checks_passing", return_value=True),
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
@@ -5380,6 +5383,7 @@ class TestJudgeFallbackApproval:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_pr_checks_passing", return_value=True),
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
@@ -5408,6 +5412,7 @@ class TestJudgeFallbackApproval:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_pr_checks_passing", return_value=True),
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
@@ -5453,6 +5458,7 @@ class TestJudgeFallbackApproval:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_has_rejection_comment", return_value=False),
             patch.object(judge, "_pr_checks_passing", return_value=True),
             patch(
                 "loom_tools.shepherd.phases.judge.subprocess.run",
@@ -5479,6 +5485,89 @@ class TestJudgeFallbackApproval:
         # but the key assertion is that we succeed despite has_pr_label returning False.
         # Before the fix, this test would fail because the code would reach line 211
         # and call has_pr_label("loom:pr") which returns False, causing a failure.
+
+    def test_fallback_approval_defers_when_both_approval_and_rejection_present(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Fallback approval should defer to rejection when both signals are present.
+
+        This is the core fix for issue #2598: when a judge review contains both
+        approval signals (e.g., ✅ in a code quality checklist) and rejection
+        signals (e.g., ❌ Changes Requested), the rejection must win. The
+        approval fallback should return False so the rejection fallback handles it.
+        """
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        with (
+            patch.object(judge, "validate", return_value=False),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            # Both approval and rejection signals present
+            patch.object(judge, "_has_approval_comment", return_value=True),
+            patch.object(judge, "_has_rejection_comment", return_value=True),
+            patch.object(judge, "_pr_checks_passing", return_value=True),
+            # Rejection fallback applies loom:changes-requested
+            patch(
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=MagicMock(returncode=0),
+            ),
+        ):
+            result = judge.run(ctx)
+
+        # Should route to changes-requested, NOT approval
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("changes_requested") is True
+        assert result.data.get("fallback_used") is True
+        assert "changes requested" in result.message.lower()
+
+    def test_try_fallback_approval_returns_false_with_mixed_signals(
+        self, mock_context: MagicMock
+    ) -> None:
+        """_try_fallback_approval should return False when rejection signals coexist.
+
+        Directly tests the fix for issue #2598: a checklist-style review with
+        ✅ items (code quality) and ❌ verdict triggers both approval and rejection
+        detection. The method must return False to let the rejection fallback handle it.
+        """
+        ctx = self._make_force_context(mock_context)
+
+        judge = JudgePhase()
+
+        mixed_comment = (
+            "❌ **Changes Requested**\n"
+            "\n"
+            "## Code Quality\n"
+            "✅ Shell scripts use `date -u` for UTC\n"
+            "✅ Proper error handling\n"
+            "\n"
+            "## Missing Work\n"
+            "- Script A not updated\n"
+            "- Script B not updated\n"
+        )
+
+        gh_run_results = [
+            # _has_approval_comment: gh pr view --json comments
+            MagicMock(returncode=0, stdout=mixed_comment),
+            # _has_rejection_comment: gh pr view --json comments
+            MagicMock(returncode=0, stdout=mixed_comment),
+            # _pr_checks_passing: gh pr view --json statusCheckRollup,mergeable
+            MagicMock(
+                returncode=0,
+                stdout=json.dumps({"mergeable": "MERGEABLE", "statusCheckRollup": []}),
+            ),
+        ]
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.subprocess.run",
+            side_effect=gh_run_results,
+        ):
+            result = judge._try_fallback_approval(ctx)
+
+        assert result is False
 
 
 class TestJudgeDiagnostics:
@@ -6206,6 +6295,8 @@ class TestJudgeFallbackChangesRequested:
 
         gh_run_results = [
             # _try_fallback_approval -> _has_approval_comment: no approval
+            MagicMock(returncode=0, stdout="Changes requested\n"),
+            # _try_fallback_approval -> _has_rejection_comment
             MagicMock(returncode=0, stdout="Changes requested\n"),
             # _try_fallback_approval -> _pr_checks_passing
             MagicMock(
