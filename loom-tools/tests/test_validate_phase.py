@@ -21,6 +21,8 @@ from loom_tools.validate_phase import (
     main,
     _parse_args,
     _gather_builder_diagnostics,
+    _is_minimal_pr_body,
+    _enrich_minimal_pr_body,
     VALID_PHASES,
 )
 
@@ -396,6 +398,7 @@ class TestValidateBuilder:
         mock_gh.side_effect = [
             _completed(stdout="OPEN\n"),           # issue state
             _completed(stdout="fix: a good title\n"),  # PR title (generic check)
+            _completed(stdout="## Summary\nGood body\n---TITLE---\nfix: a good title\n"),  # PR body+title (enrich check)
             _completed(stdout="loom:building\n"),  # PR labels
         ]
         mock_find.return_value = (100, "closes_keyword")
@@ -1161,3 +1164,122 @@ class TestCLI:
         with pytest.raises(SystemExit) as exc:
             main(["curator", "42"])
         assert exc.value.code == 0  # recovered counts as success
+
+
+# ---------------------------------------------------------------------------
+# PR body enrichment tests
+# ---------------------------------------------------------------------------
+
+
+class TestIsMinimalPrBody:
+    """Tests for _is_minimal_pr_body detection."""
+
+    def test_empty_body_is_minimal(self):
+        assert _is_minimal_pr_body("", 42) is True
+
+    def test_null_body_is_minimal(self):
+        assert _is_minimal_pr_body("null", 42) is True
+
+    def test_closes_only_is_minimal(self):
+        assert _is_minimal_pr_body("Closes #42", 42) is True
+
+    def test_fixes_only_is_minimal(self):
+        assert _is_minimal_pr_body("Fixes #42", 42) is True
+
+    def test_closes_with_whitespace_is_minimal(self):
+        assert _is_minimal_pr_body("  Closes #42  \n", 42) is True
+
+    def test_short_text_plus_closes_is_minimal(self):
+        assert _is_minimal_pr_body("short\n\nCloses #42", 42) is True
+
+    def test_structured_body_not_minimal(self):
+        body = "## Summary\nDid something useful.\n\nCloses #42"
+        assert _is_minimal_pr_body(body, 42) is False
+
+    def test_long_text_not_minimal(self):
+        body = "This is a longer description that explains what was done and why it matters.\n\nCloses #42"
+        assert _is_minimal_pr_body(body, 42) is False
+
+    def test_body_with_changes_section_not_minimal(self):
+        body = "## Changes\n- Updated foo\n- Fixed bar\n\nCloses #42"
+        assert _is_minimal_pr_body(body, 42) is False
+
+
+class TestEnrichMinimalPrBody:
+    """Tests for _enrich_minimal_pr_body auto-enrichment."""
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("subprocess.run")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_enriches_closes_only_body(
+        self, mock_gh: MagicMock, mock_run: MagicMock, mock_milestone: MagicMock
+    ):
+        repo = Path("/fake/repo")
+
+        # First call: pr view (body + title)
+        # Second call: issue view (title)
+        mock_gh.side_effect = [
+            _completed(0, "Closes #42\n---TITLE---\nfix: improve error handling"),
+            _completed(0, "Builder creates minimal PR bodies"),
+        ]
+        # subprocess.run for gh pr edit
+        mock_run.return_value = _completed(0)
+
+        _enrich_minimal_pr_body(42, 42, repo, "task-1", None)
+
+        # Should have called gh pr edit with enriched body
+        mock_run.assert_called_once()
+        edit_args = mock_run.call_args[0][0]
+        assert edit_args[:3] == ["gh", "pr", "edit"]
+        assert edit_args[4] == "--body"
+        new_body = edit_args[5]
+        assert "## Summary" in new_body
+        assert "improve error handling" in new_body
+        assert "Closes #42" in new_body
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("subprocess.run")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_skips_already_structured_body(
+        self, mock_gh: MagicMock, mock_run: MagicMock, mock_milestone: MagicMock
+    ):
+        repo = Path("/fake/repo")
+
+        mock_gh.return_value = _completed(
+            0, "## Summary\nGood description.\n\nCloses #42\n---TITLE---\nfix: good title"
+        )
+
+        _enrich_minimal_pr_body(42, 42, repo, "task-1", None)
+
+        # Should NOT call gh pr edit
+        mock_run.assert_not_called()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("subprocess.run")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_includes_diff_stat_when_worktree_available(
+        self, mock_gh: MagicMock, mock_run: MagicMock, mock_milestone: MagicMock
+    ):
+        repo = Path("/fake/repo")
+        worktree = "/fake/worktree"
+
+        mock_gh.side_effect = [
+            _completed(0, "Closes #42\n---TITLE---\nfix: update config"),
+            _completed(0, "Update config handling"),
+        ]
+        # subprocess.run calls: git rev-parse, git diff --stat, gh pr edit
+        mock_run.side_effect = [
+            _completed(0, "origin/main"),  # default branch lookup
+            _completed(0, " src/config.py | 5 +++--\n 1 file changed"),  # diff stat
+            _completed(0),  # gh pr edit
+        ]
+
+        _enrich_minimal_pr_body(42, 42, repo, "task-1", worktree)
+
+        # Should have called gh pr edit with diff stat in body
+        edit_call = mock_run.call_args_list[2]
+        assert edit_call[0][0][4] == "--body"
+        new_body = edit_call[0][0][5]
+        assert "## Summary" in new_body
+        assert "## Changes" in new_body
+        assert "src/config.py" in new_body

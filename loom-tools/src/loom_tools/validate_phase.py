@@ -721,6 +721,10 @@ def validate_builder(
         if not check_only:
             _warn_generic_pr_title(pr_num, issue, repo_root, task_id)
 
+        # Enrich minimal PR bodies (e.g. just "Closes #N") with summary
+        if not check_only:
+            _enrich_minimal_pr_body(pr_num, issue, repo_root, task_id, worktree)
+
         # Check for loom:review-requested label
         r = _run_gh(
             ["pr", "view", str(pr_num), "--json", "labels", "--jq", ".labels[].name"],
@@ -1172,6 +1176,123 @@ def _ensure_pr_body_references_issue(
         _report_milestone(
             "heartbeat", task_id, repo_root,
             action=f"recovery: added 'Closes #{issue}' to PR #{pr} body",
+        )
+
+
+def _is_minimal_pr_body(body: str, issue: int) -> bool:
+    """Return True if the PR body lacks a meaningful summary.
+
+    A "minimal" body is one that only contains a ``Closes #N`` reference
+    (possibly with whitespace or a bare issue title echo) but no structured
+    sections like ``## Summary``.
+    """
+    if not body or body == "null":
+        return True
+
+    # Strip close references and whitespace
+    stripped = re.sub(
+        r"(Closes|Fixes|Resolves)\s+#\d+", "", body, flags=re.IGNORECASE
+    ).strip()
+
+    # If nothing meaningful remains, it's minimal
+    if not stripped:
+        return True
+
+    # If the body has structured sections, it's not minimal
+    if re.search(r"^##\s+\w+", body, re.MULTILINE):
+        return False
+
+    # If the remaining text is very short (< 40 chars), treat as minimal
+    # This catches cases like just echoing the issue title
+    if len(stripped) < 40:
+        return True
+
+    return False
+
+
+def _enrich_minimal_pr_body(
+    pr: int,
+    issue: int,
+    repo_root: Path,
+    task_id: str | None,
+    worktree: str | None,
+) -> None:
+    """Enrich a minimal PR body with summary and diff context.
+
+    When the builder creates a PR with just ``Closes #N`` and no summary,
+    this function replaces the body with a structured template including
+    the issue title as summary and the diff stat as change context.
+    """
+    r = _run_gh(
+        ["pr", "view", str(pr), "--json", "body,title", "--jq", ".body + \"\\n---TITLE---\\n\" + .title"],
+        repo_root,
+    )
+    if r.returncode != 0:
+        return
+
+    parts = r.stdout.split("\n---TITLE---\n")
+    body = parts[0].strip() if parts else ""
+    pr_title = parts[1].strip() if len(parts) > 1 else ""
+
+    if not _is_minimal_pr_body(body, issue):
+        return
+
+    # Fetch issue title for summary context
+    r = _run_gh(
+        ["issue", "view", str(issue), "--json", "title", "--jq", ".title"],
+        repo_root,
+    )
+    issue_title = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+    # Build enriched body
+    enriched_parts: list[str] = ["## Summary"]
+
+    # Use PR title as primary summary (it should describe the change)
+    if pr_title:
+        # Strip conventional commit prefix for the summary line
+        summary = re.sub(r"^(fix|feat|refactor|docs|chore|perf|test|style|ci|build):\s*", "", pr_title)
+        enriched_parts.append(summary)
+    elif issue_title:
+        enriched_parts.append(issue_title)
+    else:
+        enriched_parts.append(f"Address issue #{issue}")
+
+    enriched_parts.append("")
+
+    # Add diff stat if worktree is available
+    if worktree:
+        default_branch_r = subprocess.run(
+            ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "origin/HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        default_branch = (
+            default_branch_r.stdout.strip()
+            if default_branch_r.returncode == 0 and default_branch_r.stdout.strip()
+            else "origin/main"
+        )
+        diff_r = subprocess.run(
+            ["git", "-C", worktree, "diff", "--stat", f"{default_branch}...HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if diff_r.returncode == 0 and diff_r.stdout.strip():
+            enriched_parts.append("## Changes")
+            enriched_parts.append("")
+            enriched_parts.append("```")
+            enriched_parts.append(diff_r.stdout.strip())
+            enriched_parts.append("```")
+            enriched_parts.append("")
+
+    enriched_parts.append(f"Closes #{issue}")
+
+    new_body = "\n".join(enriched_parts)
+    r = subprocess.run(
+        ["gh", "pr", "edit", str(pr), "--body", new_body],
+        capture_output=True, text=True, check=False, cwd=repo_root,
+    )
+    if r.returncode == 0:
+        _report_milestone(
+            "heartbeat", task_id, repo_root,
+            action=f"recovery: enriched minimal PR #{pr} body with summary and changes",
         )
 
 
