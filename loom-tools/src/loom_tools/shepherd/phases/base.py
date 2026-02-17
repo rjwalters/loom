@@ -43,6 +43,12 @@ _AUTH_FAILURE_SENTINEL = "# AUTH_PREFLIGHT_FAILED"
 INSTANT_EXIT_MAX_RETRIES = 3
 INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
 
+# If a single instant-exit attempt takes longer than this (in seconds),
+# the failure is likely an infrastructure issue (auth timeouts, lock
+# contention) rather than a transient blip.  Skip further retries to
+# avoid burning 9+ minutes on futile attempts.  See issue #2519.
+INSTANT_EXIT_MAX_ATTEMPT_SECONDS = 90
+
 # How often (in seconds) to extend the file-based claim during worker polling.
 # The claim TTL is 2 hours; extending every 30 minutes provides ample margin.
 _CLAIM_EXTEND_INTERVAL = 1800
@@ -921,6 +927,11 @@ def run_phase_with_retry(
     On exit code 8 (planning stall), returns immediately (not retryable).
     On exit code 9 (auth failure), returns immediately (not retryable).
 
+    For exit codes 6 and 7, if a single attempt takes longer than
+    INSTANT_EXIT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
+    because the failure is likely an infrastructure issue rather than
+    a transient blip.  See issue #2519.
+
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
                    6=instant-exit after retries, 7=MCP failure after retries,
@@ -931,6 +942,7 @@ def run_phase_with_retry(
     mcp_failure_retries = 0
 
     while True:
+        attempt_start = time.monotonic()
         exit_code = run_worker_phase(
             ctx,
             role=role,
@@ -942,6 +954,7 @@ def run_phase_with_retry(
             args=args,
             planning_timeout=planning_timeout,
         )
+        attempt_elapsed = time.monotonic() - attempt_start
 
         # --- Planning stall (exit code 8) ---
         # Not retryable: the builder was unable to progress past
@@ -976,6 +989,15 @@ def run_phase_with_retry(
         # MCP failures are systemic (stale build, resource contention) so
         # use longer backoff than generic instant-exits.  See issue #2279.
         if exit_code == 7:
+            # Same elapsed-time guard as instant-exit.  See issue #2519.
+            if attempt_elapsed > INSTANT_EXIT_MAX_ATTEMPT_SECONDS:
+                log_warning(
+                    f"MCP failure attempt for {role} took {attempt_elapsed:.0f}s "
+                    f"(>{INSTANT_EXIT_MAX_ATTEMPT_SECONDS}s), "
+                    f"likely infrastructure issue — not retrying"
+                )
+                return 7
+
             mcp_failure_retries += 1
             if mcp_failure_retries > MCP_FAILURE_MAX_RETRIES:
                 log_warning(
@@ -1008,6 +1030,17 @@ def run_phase_with_retry(
 
         # --- Instant-exit handling (exit code 6) ---
         if exit_code == 6:
+            # If the attempt took a long time, the failure is likely an
+            # infrastructure issue (auth timeouts, lock contention) rather
+            # than a transient blip — retrying won't help.  See issue #2519.
+            if attempt_elapsed > INSTANT_EXIT_MAX_ATTEMPT_SECONDS:
+                log_warning(
+                    f"Instant-exit attempt for {role} took {attempt_elapsed:.0f}s "
+                    f"(>{INSTANT_EXIT_MAX_ATTEMPT_SECONDS}s), "
+                    f"likely infrastructure issue — not retrying"
+                )
+                return 6
+
             instant_exit_retries += 1
             if instant_exit_retries > INSTANT_EXIT_MAX_RETRIES:
                 log_warning(

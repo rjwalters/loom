@@ -26,6 +26,7 @@ from loom_tools.shepherd.phases import (
 )
 from loom_tools.shepherd.phases.base import (
     INSTANT_EXIT_BACKOFF_SECONDS,
+    INSTANT_EXIT_MAX_ATTEMPT_SECONDS,
     INSTANT_EXIT_MAX_RETRIES,
     INSTANT_EXIT_MIN_OUTPUT_CHARS,
     MCP_FAILURE_BACKOFF_SECONDS,
@@ -11448,6 +11449,185 @@ class TestRunPhaseWithRetryInstantExit:
 
         assert exit_code == 0
         assert call_count == 3
+
+
+class TestInstantExitElapsedTimeGuard:
+    """Test elapsed-time guard on instant-exit and MCP failure retries.
+
+    When a single attempt takes longer than INSTANT_EXIT_MAX_ATTEMPT_SECONDS,
+    the failure is likely an infrastructure issue and retries should be
+    skipped entirely.  See issue #2519.
+    """
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        ctx.pr_number = None
+        ctx.report_milestone = MagicMock()
+        return ctx
+
+    def test_instant_exit_skips_retry_when_attempt_is_slow(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return 6 immediately if the attempt took >90s."""
+        # Simulate time.monotonic() advancing by 120s during the attempt
+        clock = [0.0]
+
+        def mock_run_worker(*args, **kwargs):
+            clock[0] += 120.0  # Simulate 120s elapsed
+            return 6
+
+        original_monotonic = time.monotonic
+
+        def mock_monotonic():
+            return clock[0]
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base.time.monotonic",
+                side_effect=mock_monotonic,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 6
+
+    def test_instant_exit_retries_when_attempt_is_fast(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry normally if the attempt took <90s."""
+        call_count = 0
+        clock = [0.0]
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            clock[0] += 5.0  # Simulate 5s elapsed (fast)
+            # First call: instant exit; second call: success
+            return 6 if call_count == 1 else 0
+
+        def mock_monotonic():
+            return clock[0]
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base.time.monotonic",
+                side_effect=mock_monotonic,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        # Fast attempt should retry normally and succeed on second try
+        assert call_count == 2
+        assert exit_code == 0
+
+    def test_mcp_failure_skips_retry_when_attempt_is_slow(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return 7 immediately if MCP attempt took >90s."""
+        clock = [0.0]
+
+        def mock_run_worker(*args, **kwargs):
+            clock[0] += 120.0
+            return 7
+
+        def mock_monotonic():
+            return clock[0]
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base.time.monotonic",
+                side_effect=mock_monotonic,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 7
+
+    def test_elapsed_guard_only_on_first_slow_attempt(
+        self, mock_context: MagicMock
+    ) -> None:
+        """A fast first attempt retries; a slow second attempt stops."""
+        call_count = 0
+        clock = [0.0]
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                clock[0] += 5.0  # Fast first attempt
+            else:
+                clock[0] += 120.0  # Slow second attempt
+            return 6
+
+        def mock_monotonic():
+            return clock[0]
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base.time.monotonic",
+                side_effect=mock_monotonic,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        # First attempt fast (retries), second attempt slow (stops)
+        assert call_count == 2
+        assert exit_code == 6
+
+    def test_constant_value_is_90(self) -> None:
+        """Verify the threshold constant is 90 seconds as specified."""
+        assert INSTANT_EXIT_MAX_ATTEMPT_SECONDS == 90
 
 
 class TestRunWorkerPhasePlanningStall:
