@@ -29,8 +29,10 @@ VALIDATION_RETRY_DELAY_SECONDS = 2
 # session is detected (judge ran but produced no review output).
 # Zero-work sessions are NOT infrastructure failures and should not
 # trigger the infrastructure bypass — they are retried instead.
-# See issue #2679.
-ZERO_WORK_MAX_RETRIES = 1
+# Increased from 1 to 2: observed cases needing 3 total attempts
+# (original + 2 retries) before the judge produces a review.
+# See issues #2657, #2679.
+ZERO_WORK_MAX_RETRIES = 2
 
 # Failure modes that indicate a zero-work session.  These are modes
 # where the judge ran (or attempted to run) but produced no review
@@ -257,10 +259,14 @@ class JudgePhase:
                 ctx.label_cache.invalidate_pr(ctx.pr_number)
 
         if not validated:
-            # In force mode, attempt fallback detection before giving up.
-            # First try approval (judge approved but failed to apply loom:pr label),
-            # then try changes-requested (judge rejected but failed to apply
-            # loom:changes-requested label).
+            # Attempt fallback comment-based detection before giving up.
+            # The judge applies comment and label in separate API calls;
+            # if the comment succeeded but the label failed, we can recover
+            # by detecting the comment and applying the missing label.
+            #
+            # Issue #2657: Previously this was force-mode only, but the
+            # judge frequently posts comments without labels in all modes.
+            # Enabling fallback in all modes reduces unnecessary retries.
             #
             # Issue #1998: After Doctor applies fixes, the PR may have
             # loom:review-requested but neither loom:pr nor loom:changes-requested.
@@ -271,75 +277,73 @@ class JudgePhase:
             # re-querying GitHub labels. The `gh pr edit` return code is
             # authoritative - if it succeeded, the label was applied. Querying
             # GitHub API immediately after can race with label propagation.
-            if ctx.config.is_force_mode and self._try_fallback_approval(ctx):
+            if self._try_fallback_approval(ctx):
                 # Fallback already applied loom:pr — trust it and return success
                 return PhaseResult(
                     status=PhaseStatus.SUCCESS,
-                    message=f"[force-mode] Fallback approval applied to PR #{ctx.pr_number}",
+                    message=f"Fallback approval applied to PR #{ctx.pr_number}",
                     phase_name="judge",
                     data={"approved": True, "fallback_used": True},
                 )
-            elif ctx.config.is_force_mode and self._try_fallback_changes_requested(ctx):
+            if self._try_fallback_changes_requested(ctx):
                 # Fallback detected changes-requested — route to doctor loop
                 return PhaseResult(
                     status=PhaseStatus.SUCCESS,
-                    message=f"[force-mode] Fallback detected changes requested on PR #{ctx.pr_number}",
+                    message=f"Fallback detected changes requested on PR #{ctx.pr_number}",
                     phase_name="judge",
                     data={"changes_requested": True, "fallback_used": True},
                 )
-            else:
-                # Gather diagnostics BEFORE marking failed, so we can
-                # detect zero-work sessions and retry (issue #2679).
-                diag = self._gather_diagnostics(ctx, phase_start_time)
 
-                # Check if this is a zero-work session (judge ran but
-                # produced no review output).  Zero-work sessions are
-                # NOT infrastructure failures — they should be retried,
-                # not bypassed (issue #2679).  Previously this path used
-                # _try_infrastructure_bypass which auto-approved PRs
-                # without any code review.
-                if (
-                    ctx.config.is_force_mode
-                    and self._is_zero_work_session(diag)
-                ):
-                    retry_result = self._retry_judge_for_zero_work(ctx, diag)
-                    if retry_result is not None:
-                        return retry_result
-                    # Retry also failed — fall through to mark blocked.
-                    # Do NOT use infrastructure bypass: this is a judge
-                    # failure, not an infrastructure issue.
+            # Fallback comment detection failed — no comments found either.
+            # Gather diagnostics BEFORE marking failed, so we can
+            # detect zero-work sessions and retry (issue #2679).
+            diag = self._gather_diagnostics(ctx, phase_start_time)
 
-                # All internal recovery paths exhausted.  Do NOT post a
-                # failure comment here — the CLI-level retry loop may
-                # re-run the judge phase, and premature comments create
-                # noise (#2661).  The CLI's _mark_judge_exhausted()
-                # handles the comment + label once *all* retries are
-                # truly exhausted.
-                from loom_tools.validate_phase import _mark_phase_failed
+            # Check if this is a zero-work session (judge ran but
+            # produced no review output).  Zero-work sessions are
+            # NOT infrastructure failures — they should be retried,
+            # not bypassed (issues #2657, #2679).
+            # Issue #2657: Previously force-mode only; now retries
+            # in all modes since zero-work is a transient agent issue.
+            if self._is_zero_work_session(diag):
+                retry_result = self._retry_judge_for_zero_work(ctx, diag)
+                if retry_result is not None:
+                    return retry_result
+                # Retry also failed — fall through to mark blocked.
+                # Do NOT use infrastructure bypass: this is a judge
+                # failure, not an infrastructure issue.
 
-                _mark_phase_failed(
-                    ctx.config.issue,
-                    "judge",
-                    f"Judge phase did not produce a review decision on PR #{ctx.pr_number}.",
-                    ctx.repo_root,
-                    failure_label="loom:blocked",
-                    quiet=True,
+            # All internal recovery paths exhausted.  Do NOT post a
+            # failure comment here — the CLI-level retry loop may
+            # re-run the judge phase, and premature comments create
+            # noise (#2661).  The CLI's _mark_judge_exhausted()
+            # handles the comment + label once *all* retries are
+            # truly exhausted.
+            from loom_tools.validate_phase import _mark_phase_failed
+
+            _mark_phase_failed(
+                ctx.config.issue,
+                "judge",
+                f"Judge phase did not produce a review decision on PR #{ctx.pr_number}.",
+                ctx.repo_root,
+                failure_label="loom:blocked",
+                quiet=True,
+            )
+            # Add context about loom:review-requested state (issue #1998)
+            if ctx.has_pr_label("loom:review-requested"):
+                diag["intermediate_state"] = "doctor_fixed_awaiting_judging"
+                log_info(
+                    f"PR #{ctx.pr_number} has loom:review-requested (Doctor applied fixes) "
+                    "but judge did not produce outcome label"
                 )
-                # Add context about loom:review-requested state (issue #1998)
-                if ctx.has_pr_label("loom:review-requested"):
-                    diag["intermediate_state"] = "doctor_fixed_awaiting_judging"
-                    log_info(
-                        f"PR #{ctx.pr_number} has loom:review-requested (Doctor applied fixes) "
-                        "but judge did not produce outcome label"
-                    )
-                return PhaseResult(
-                    status=PhaseStatus.FAILED,
-                    message=(
-                        f"judge phase validation failed: {diag['summary']}"
-                    ),
-                    phase_name="judge",
-                    data=diag,
-                )
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    f"judge phase validation failed: {diag['summary']}"
+                ),
+                phase_name="judge",
+                data=diag,
+            )
 
         # Standard validation passed — check the result labels.
         # Cache was already invalidated above, but invalidate once more
@@ -394,16 +398,21 @@ class JudgePhase:
         return result.satisfied
 
     def _try_fallback_approval(self, ctx: ShepherdContext) -> bool:
-        """Attempt fallback approval detection in force mode.
+        """Attempt fallback approval detection via comment signals.
 
-        When the standard label-based validation fails in force mode, check
-        for approval signals in PR comments combined with healthy PR status
-        (CI checks passing and mergeable state). If both conditions are met,
-        apply the loom:pr label and return True.
+        When the standard label-based validation fails, check for approval
+        signals in PR comments.  If found (and no conflicting rejection
+        signals), apply the loom:pr label and return True.
 
         This handles the scenario where the judge worker approved the PR
         (left an approval comment) but failed to apply the label due to a
         GitHub API error or timing issue.
+
+        Issue #2657: Previously required force mode and passing CI checks.
+        Now works in all modes — the judge's explicit approval comment is a
+        stronger signal than CI status (the judge already evaluated the code).
+        CI checks are still required when no judge comment exists (see
+        ``_try_infrastructure_bypass``).
 
         Returns:
             True if fallback approval was detected and label applied.
@@ -411,16 +420,15 @@ class JudgePhase:
         assert ctx.pr_number is not None
 
         log_warning(
-            f"[force-mode] Label validation failed for PR #{ctx.pr_number}, "
+            f"Label validation failed for PR #{ctx.pr_number}, "
             "attempting fallback approval detection"
         )
 
         has_approval = self._has_approval_comment(ctx)
         has_rejection = self._has_rejection_comment(ctx)
-        checks_ok = self._pr_checks_passing(ctx)
 
         if not has_approval:
-            log_info("[force-mode] No approval comment found in PR — fallback denied")
+            log_info("No approval comment found in PR — fallback denied")
             return False
 
         # Rejection signals override approval signals (issue #2598).
@@ -428,19 +436,17 @@ class JudgePhase:
         # passing items and ❌ for the overall verdict), this is a rejection.
         if has_rejection:
             log_info(
-                "[force-mode] Both approval and rejection signals found "
+                "Both approval and rejection signals found "
                 "— deferring to rejection fallback"
             )
             return False
 
-        if not checks_ok:
-            log_info("[force-mode] PR checks not passing — fallback denied")
-            return False
-
-        # Both signals present — apply the label for consistency
+        # Judge explicitly approved — apply the missing label.
+        # No CI check required: the judge already reviewed the code.
+        # CI checks are only required for infrastructure bypass (no review).
         log_warning(
-            f"[force-mode] Fallback approval: PR #{ctx.pr_number} has approval "
-            "comment and passing checks — applying loom:pr label"
+            f"Fallback approval: PR #{ctx.pr_number} has approval "
+            "comment but missing loom:pr label — applying label"
         )
 
         result = subprocess.run(
@@ -457,19 +463,18 @@ class JudgePhase:
             check=False,
         )
         if result.returncode != 0:
-            log_warning("[force-mode] Failed to apply loom:pr label via fallback")
+            log_warning("Failed to apply loom:pr label via fallback")
             return False
 
         ctx.label_cache.invalidate_pr(ctx.pr_number)
         return True
 
     def _try_fallback_changes_requested(self, ctx: ShepherdContext) -> bool:
-        """Attempt fallback changes-requested detection in force mode.
+        """Attempt fallback changes-requested detection via comment signals.
 
-        When the standard label-based validation fails in force mode, check
-        for rejection signals in PR comments. If found, apply the
-        loom:changes-requested label and return True so the caller can route
-        to the doctor loop.
+        When the standard label-based validation fails, check for rejection
+        signals in PR comments. If found, apply the loom:changes-requested
+        label and return True so the caller can route to the doctor loop.
 
         This handles the scenario where the judge worker requested changes
         (left a rejection comment) but failed to apply the label due to a
@@ -479,13 +484,15 @@ class JudgePhase:
         rather than GitHub's native review API, so only comment-based
         detection is used here.
 
+        Issue #2657: Now works in all modes, not just force mode.
+
         Returns:
             True if fallback changes-requested was detected and label applied.
         """
         assert ctx.pr_number is not None
 
         log_warning(
-            f"[force-mode] Approval fallback failed for PR #{ctx.pr_number}, "
+            f"Approval fallback failed for PR #{ctx.pr_number}, "
             "attempting fallback changes-requested detection"
         )
 
@@ -493,12 +500,12 @@ class JudgePhase:
 
         if not has_rejection:
             log_info(
-                "[force-mode] No rejection comment found — fallback denied"
+                "No rejection comment found — fallback denied"
             )
             return False
 
         log_warning(
-            f"[force-mode] Fallback changes-requested: PR #{ctx.pr_number} has "
+            f"Fallback changes-requested: PR #{ctx.pr_number} has "
             "rejection comment — applying loom:changes-requested label"
         )
 
@@ -517,7 +524,7 @@ class JudgePhase:
         )
         if result.returncode != 0:
             log_warning(
-                "[force-mode] Failed to apply loom:changes-requested label via fallback"
+                "Failed to apply loom:changes-requested label via fallback"
             )
             return False
 
@@ -655,11 +662,12 @@ class JudgePhase:
     def _retry_judge_for_zero_work(
         self, ctx: ShepherdContext, original_diag: dict[str, Any]
     ) -> PhaseResult | None:
-        """Retry the judge phase once after a zero-work session (issue #2679).
+        """Retry the judge phase after a zero-work session (issues #2657, #2679).
 
         When the judge runs but produces no review output, this is likely
         a transient agent issue (not an infrastructure failure).  Re-run the
-        full judge pipeline (worker + validation) once before giving up.
+        full judge pipeline (worker + validation) up to
+        ``ZERO_WORK_MAX_RETRIES`` times before giving up.
 
         Args:
             ctx: Shepherd context.
@@ -667,104 +675,112 @@ class JudgePhase:
 
         Returns:
             PhaseResult on success (judge produced a review decision),
-            or None if the retry also failed.
+            or None if all retries also failed.
         """
         assert ctx.pr_number is not None
 
         failure_mode = original_diag.get("failure_mode", "unknown")
         duration = original_diag.get("session_duration_seconds", "N/A")
 
+        for retry_num in range(1, ZERO_WORK_MAX_RETRIES + 1):
+            log_warning(
+                f"[judge] Zero-work session detected "
+                f"(failure mode: {failure_mode}, duration: {duration}s). "
+                f"Retry {retry_num}/{ZERO_WORK_MAX_RETRIES} — "
+                f"this is NOT an infrastructure issue (issues #2657, #2679)."
+            )
+
+            ctx.report_milestone(
+                "judge_retry",
+                attempt=retry_num,
+                max_retries=ZERO_WORK_MAX_RETRIES,
+                reason=f"zero-work session ({failure_mode})",
+            )
+
+            # Re-run the judge worker
+            phase_start_time = time.time()
+            exit_code = run_phase_with_retry(
+                ctx,
+                role="judge",
+                name=f"judge-issue-{ctx.config.issue}-zw-retry-{retry_num}",
+                timeout=ctx.config.judge_timeout,
+                max_retries=ctx.config.stuck_max_retries,
+                phase="judge",
+                pr_number=ctx.pr_number,
+                args=str(ctx.pr_number),
+            )
+
+            if exit_code != 0:
+                log_warning(
+                    f"[judge] Zero-work retry {retry_num} exited with code {exit_code}"
+                )
+                # Continue to next retry instead of giving up immediately
+                continue
+
+            # Validate the retry's output
+            ctx.label_cache.invalidate_pr(ctx.pr_number)
+            validated = False
+            for attempt in range(VALIDATION_MAX_RETRIES):
+                if self.validate(ctx, check_only=True):
+                    validated = True
+                    break
+                if attempt < VALIDATION_MAX_RETRIES - 1:
+                    time.sleep(VALIDATION_RETRY_DELAY_SECONDS)
+                    ctx.label_cache.invalidate_pr(ctx.pr_number)
+
+            if not validated:
+                # Check if fallback can recover
+                if self._try_fallback_approval(ctx):
+                    return PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message=(
+                            f"Fallback approval applied to PR #{ctx.pr_number} "
+                            f"(after zero-work retry {retry_num})"
+                        ),
+                        phase_name="judge",
+                        data={"approved": True, "fallback_used": True, "zero_work_retried": True},
+                    )
+                if self._try_fallback_changes_requested(ctx):
+                    return PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message=(
+                            f"Fallback detected changes requested on PR #{ctx.pr_number} "
+                            f"(after zero-work retry {retry_num})"
+                        ),
+                        phase_name="judge",
+                        data={"changes_requested": True, "fallback_used": True, "zero_work_retried": True},
+                    )
+
+                # This retry also produced zero work — update diagnostics
+                # for the next iteration's failure_mode/duration.
+                diag = self._gather_diagnostics(ctx, phase_start_time)
+                failure_mode = diag.get("failure_mode", "unknown")
+                duration = diag.get("session_duration_seconds", "N/A")
+                continue
+
+            # Retry succeeded — check result labels
+            ctx.label_cache.invalidate_pr(ctx.pr_number)
+            if ctx.has_pr_label("loom:pr"):
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=f"PR #{ctx.pr_number} approved by Judge (after zero-work retry {retry_num})",
+                    phase_name="judge",
+                    data={"approved": True, "zero_work_retried": True},
+                )
+
+            if ctx.has_pr_label("loom:changes-requested"):
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=f"Judge requested changes on PR #{ctx.pr_number} (after zero-work retry {retry_num})",
+                    phase_name="judge",
+                    data={"changes_requested": True, "zero_work_retried": True},
+                )
+
         log_warning(
-            f"[judge] Zero-work session detected "
-            f"(failure mode: {failure_mode}, duration: {duration}s). "
-            f"Retrying judge phase — this is NOT an infrastructure issue (issue #2679)."
+            f"[judge] Zero-work session persists after {ZERO_WORK_MAX_RETRIES} retries. "
+            "This is a judge failure, NOT an infrastructure issue — "
+            "marking blocked (issues #2657, #2679)."
         )
-
-        ctx.report_milestone(
-            "judge_retry",
-            attempt=1,
-            max_retries=ZERO_WORK_MAX_RETRIES,
-            reason=f"zero-work session ({failure_mode})",
-        )
-
-        # Re-run the judge worker
-        phase_start_time = time.time()
-        exit_code = run_phase_with_retry(
-            ctx,
-            role="judge",
-            name=f"judge-issue-{ctx.config.issue}-zw-retry",
-            timeout=ctx.config.judge_timeout,
-            max_retries=ctx.config.stuck_max_retries,
-            phase="judge",
-            pr_number=ctx.pr_number,
-            args=str(ctx.pr_number),
-        )
-
-        if exit_code != 0:
-            log_warning(
-                f"[judge] Zero-work retry exited with code {exit_code}"
-            )
-            return None
-
-        # Validate the retry's output
-        ctx.label_cache.invalidate_pr(ctx.pr_number)
-        validated = False
-        for attempt in range(VALIDATION_MAX_RETRIES):
-            if self.validate(ctx, check_only=True):
-                validated = True
-                break
-            if attempt < VALIDATION_MAX_RETRIES - 1:
-                time.sleep(VALIDATION_RETRY_DELAY_SECONDS)
-                ctx.label_cache.invalidate_pr(ctx.pr_number)
-
-        if not validated:
-            # Check if fallback can recover
-            if self._try_fallback_approval(ctx):
-                return PhaseResult(
-                    status=PhaseStatus.SUCCESS,
-                    message=(
-                        f"[force-mode] Fallback approval applied to PR #{ctx.pr_number} "
-                        "(after zero-work retry)"
-                    ),
-                    phase_name="judge",
-                    data={"approved": True, "fallback_used": True, "zero_work_retried": True},
-                )
-            if self._try_fallback_changes_requested(ctx):
-                return PhaseResult(
-                    status=PhaseStatus.SUCCESS,
-                    message=(
-                        f"[force-mode] Fallback detected changes requested on PR #{ctx.pr_number} "
-                        "(after zero-work retry)"
-                    ),
-                    phase_name="judge",
-                    data={"changes_requested": True, "fallback_used": True, "zero_work_retried": True},
-                )
-
-            log_warning(
-                "[judge] Zero-work session persists after retry. "
-                "This is a judge failure, NOT an infrastructure issue — "
-                "marking blocked (issue #2679)."
-            )
-            return None
-
-        # Retry succeeded — check result labels
-        ctx.label_cache.invalidate_pr(ctx.pr_number)
-        if ctx.has_pr_label("loom:pr"):
-            return PhaseResult(
-                status=PhaseStatus.SUCCESS,
-                message=f"PR #{ctx.pr_number} approved by Judge (after zero-work retry)",
-                phase_name="judge",
-                data={"approved": True, "zero_work_retried": True},
-            )
-
-        if ctx.has_pr_label("loom:changes-requested"):
-            return PhaseResult(
-                status=PhaseStatus.SUCCESS,
-                message=f"Judge requested changes on PR #{ctx.pr_number} (after zero-work retry)",
-                phase_name="judge",
-                data={"changes_requested": True, "zero_work_retried": True},
-            )
-
         return None
 
     def _has_approval_comment(self, ctx: ShepherdContext) -> bool:
