@@ -12183,6 +12183,26 @@ class TestBuilderFilterBuildArtifacts:
         assert meaningful == []
         assert artifacts == lines
 
+    def test_no_changes_marker_is_artifact(self) -> None:
+        """The .no-changes-needed marker file should be treated as an artifact."""
+        builder = BuilderPhase()
+        lines = ["?? .no-changes-needed"]
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == []
+        assert artifacts == lines
+
+    def test_no_changes_marker_among_meaningful_files(self) -> None:
+        """Marker should be filtered while real changes remain meaningful."""
+        builder = BuilderPhase()
+        lines = [
+            "M  src/main.py",
+            "?? .no-changes-needed",
+            "A  src/util.py",
+        ]
+        meaningful, artifacts = builder._filter_build_artifacts(lines)
+        assert meaningful == ["M  src/main.py", "A  src/util.py"]
+        assert artifacts == ["?? .no-changes-needed"]
+
 
 class TestBuilderDiagnosticsArtifactFiltering:
     """Test _gather_diagnostics filters build artifacts correctly."""
@@ -12369,6 +12389,111 @@ class TestBuilderIsNoChangesNeededWithArtifacts:
             "no_changes_marker_exists": False,
         }
         assert builder._is_no_changes_needed(diag) is False
+
+
+class TestBuilderNoChangesMarkerIntegration:
+    """Integration tests for .no-changes-needed marker with real worktree files.
+
+    These tests create a real marker file on disk and exercise the full
+    _gather_diagnostics() → _is_no_changes_needed() path to catch integration
+    bugs where the marker file is present but counted as uncommitted changes.
+    """
+
+    @staticmethod
+    def _make_fake_run(
+        wt_dir: Path, repo_root: Path
+    ) -> object:
+        """Create a fake subprocess.run that distinguishes worktree vs main."""
+        wt_str = str(wt_dir)
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status" in cmd_str and "--porcelain" in cmd_str:
+                # Worktree status: marker file is only uncommitted file
+                # Main branch status: clean (no worktree escape)
+                if wt_str in cmd_str:
+                    result.stdout = "?? .no-changes-needed\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "pr" in cmd_str and "list" in cmd_str:
+                result.stdout = ""
+            elif "issue" in cmd_str and "view" in cmd_str:
+                result.stdout = "loom:building\n"
+            return result
+
+        return fake_run
+
+    def test_gather_diagnostics_with_only_marker_file(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """_gather_diagnostics reports has_uncommitted_changes=False when only
+        the .no-changes-needed marker file is uncommitted."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        # Create real marker file on disk
+        (wt_dir / ".no-changes-needed").write_text(
+            "Bug is already fixed on main"
+        )
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        (log_dir / "loom-builder-issue-42.log").write_text("log\n")
+
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=self._make_fake_run(wt_dir, tmp_path),
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["has_uncommitted_changes"] is False
+        assert diag["no_changes_marker_exists"] is True
+        assert diag["artifact_file_count"] == 1
+        assert diag["uncommitted_file_count"] == 0
+
+    def test_is_no_changes_needed_with_real_marker_diagnostics(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """End-to-end: _is_no_changes_needed returns True when diagnostics
+        come from a worktree containing only the .no-changes-needed marker."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        (wt_dir / ".no-changes-needed").write_text(
+            "Feature already exists in codebase"
+        )
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+        # Log must include CLI start sentinel and enough output to pass
+        # the session quality gate (_MIN_ANALYSIS_OUTPUT_CHARS = 500)
+        log_content = "# CLAUDE_CLI_START\n" + "analysis output line\n" * 100
+        (log_dir / "loom-builder-issue-42.log").write_text(log_content)
+
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            side_effect=self._make_fake_run(wt_dir, tmp_path),
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert builder._is_no_changes_needed(diag) is True
 
 
 class TestBuilderMainBranchDirtyDetection:
