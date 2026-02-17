@@ -831,11 +831,7 @@ start_startup_monitor() {
             local matched_pattern=""
             for pattern in \
                 "MCP server failed" \
-                "MCP servers failed" \
-                "plugins failed to install" \
-                "plugins failed" \
-                "plugin failed to install" \
-                "plugin failed"; do
+                "MCP servers failed"; do
                 if echo "${head_content}" | grep -qi "${pattern}" 2>/dev/null; then
                     found_failure=true
                     matched_pattern="${pattern}"

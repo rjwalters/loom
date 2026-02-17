@@ -90,14 +90,15 @@ _SUBSTANTIVE_OUTPUT_MIN_CHARS = 2000
 # produces less output than implementation (Edit/Write).
 _MIN_ANALYSIS_OUTPUT_CHARS = 500
 
-# Patterns that indicate MCP server or plugin failures in the CLI output.
+# Patterns that indicate MCP server failures in the CLI output.
 # Unlike _is_mcp_failure() in base.py which gates on output volume (allowing
 # sessions with substantial output to pass), these markers are checked
 # unconditionally in _is_no_changes_needed() because thinking spinners can
 # inflate output volume without any real tool calls.  See issue #2464.
+# Note: plugin failures are cosmetic (marketplace plugins, not MCP servers)
+# and should NOT be included here.  See issue #2662.
 _MCP_FAILURE_MARKER_PATTERNS = [
     *MCP_FAILURE_PATTERNS,
-    r"plugins?\s+failed\s+to\s+install",
 ]
 _MCP_FAILURE_MARKER_RE = re.compile(
     "|".join(_MCP_FAILURE_MARKER_PATTERNS), re.IGNORECASE
