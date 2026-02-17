@@ -91,9 +91,20 @@ MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 # with no meaningful output — the CLI spawned but never did any work.
 # These are infrastructure failures (API blip, spawn race) that should
 # NOT consume the main retry budget intended for legitimate failures.
-# See issue #2604.
+# See issues #2604, #2644.
 GHOST_SESSION_MAX_RETRIES = 3
-GHOST_SESSION_RETRY_DELAY_SECONDS = 5
+GHOST_SESSION_BACKOFF_SECONDS = [10, 30, 60]
+
+# Cause-specific retry strategies for ghost session classification.
+# Maps root cause → (max_retries, backoff_seconds).
+# Similar to LOW_OUTPUT_RETRY_STRATEGIES.  See issue #2644.
+GHOST_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
+    "auth_failure": (0, []),           # Auth issues won't resolve with retries
+    "mcp_init_failure": (1, [30]),     # MCP might recover after rebuild
+    "api_unreachable": (1, [30]),      # API blip might be transient
+    "wrapper_crash": (0, []),          # Script errors won't self-heal
+    "unknown": (GHOST_SESSION_MAX_RETRIES, list(GHOST_SESSION_BACKOFF_SECONDS)),
+}
 
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
@@ -746,13 +757,16 @@ def _is_ghost_session(log_path: Path) -> bool:
 
     Ghost sessions are detected by combining two signals:
     1. No meaningful CLI output (same check as ``_is_low_output_session``)
-    2. Very short session duration (log file mtime == ctime, indicating the
-       file was written once and never updated — the session lasted < 1s)
+    2. Very short session duration (log file mtime ≈ ctime, indicating the
+       file was written once and never updated — the session lasted < 2s)
+
+    The 2-second threshold accounts for minor filesystem timestamp jitter
+    and sessions that manage to emit a spinner frame before dying.
 
     These represent infrastructure-level failures (API blip, spawn race,
     resource contention) rather than agent failures, and should be retried
     on a separate budget to preserve the main retry budget for legitimate
-    failures.  See issue #2604.
+    failures.  See issues #2604, #2644.
 
     Args:
         log_path: Path to the worker session log file.
@@ -767,9 +781,12 @@ def _is_ghost_session(log_path: Path) -> bool:
         stat = log_path.stat()
         # Session duration: time between file creation and last modification.
         # A ghost session writes the log once and exits — mtime ≈ ctime.
+        # Use a 2-second threshold to account for filesystem timestamp
+        # jitter and sessions that emit a spinner frame before dying.
+        # See issue #2644.
         duration = stat.st_mtime - stat.st_ctime
-        if duration > 1.0:
-            # Session ran for more than 1 second — not a ghost.
+        if duration > 2.0:
+            # Session ran for more than 2 seconds — not a ghost.
             return False
 
         content = log_path.read_text()
@@ -818,6 +835,59 @@ def _classify_low_output_cause(log_path: Path) -> str:
         "syntax error" in content and "unexpected end of file" in content
     ):
         return "wrapper_crash"
+    return "unknown"
+
+
+def _classify_ghost_cause(log_path: Path) -> str:
+    """Classify the root cause of a ghost session from the worker log.
+
+    Ghost sessions (0s duration, no meaningful output) can have several root
+    causes.  This function parses the log for known patterns and returns a
+    cause string used to select a retry strategy from
+    ``GHOST_RETRY_STRATEGIES``.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        A cause string: ``"auth_failure"``, ``"mcp_init_failure"``,
+        ``"api_unreachable"``, ``"wrapper_crash"``, or ``"unknown"``.
+
+    See issue #2644.
+    """
+    if not log_path.is_file():
+        return "unknown"
+
+    try:
+        content = strip_ansi(log_path.read_text())
+    except OSError:
+        return "unknown"
+
+    # Check for auth-related failures
+    if _AUTH_FAILURE_SENTINEL in content:
+        return "auth_failure"
+    if "Authentication check timed out" in content:
+        return "auth_failure"
+    if "Authentication check failed" in content:
+        return "auth_failure"
+    if "Auth cache lock held" in content:
+        return "auth_failure"
+
+    # Check for MCP initialization failure
+    for pattern in MCP_FAILURE_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            return "mcp_init_failure"
+
+    # Check for API unreachable
+    if "API endpoint" in content and "unreachable" in content:
+        return "api_unreachable"
+
+    # Check for wrapper script crash
+    if "syntax error near unexpected token" in content or (
+        "syntax error" in content and "unexpected end of file" in content
+    ):
+        return "wrapper_crash"
+
     return "unknown"
 
 
@@ -1077,14 +1147,17 @@ def run_worker_phase(
 
     # Check for ghost session (exit code 10) — instant exit with no work.
     # Ghost sessions are a specific subtype of low-output where the session
-    # lasted < 1s.  These are infrastructure failures that should be retried
+    # lasted < 2s.  These are infrastructure failures that should be retried
     # on a separate budget.  Check before MCP/low-output to avoid consuming
-    # their retry budgets.  See issue #2604.
+    # their retry budgets.  See issues #2604, #2644.
     if wait_exit != 0 and _is_ghost_session(log_path):
+        errors = extract_log_errors(log_path)
+        cause = _classify_ghost_cause(log_path)
+        detail = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"[WARN] Ghost session detected for {role} session '{name}' "
-            f"(0s duration, no meaningful output, exit code {wait_exit}, "
-            f"log: {log_path})"
+            f"Ghost session detected for {role} session '{name}' "
+            f"(cause: {cause}{detail}, "
+            f"exit code {wait_exit}, log: {log_path})"
         )
         return 10
 
@@ -1133,11 +1206,11 @@ def run_phase_with_retry(
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
     On exit code 9 (auth failure), returns immediately (not retryable).
-    On exit code 10 (ghost session), retries up to GHOST_SESSION_MAX_RETRIES
-    times on a **separate** budget that does not deplete the main retry
-    counters.  Ghost sessions are infrastructure failures (0s duration,
-    no output) that should not consume the budget intended for legitimate
-    review failures.  See issue #2604.
+    On exit code 10 (ghost session), classifies the root cause from the
+    worker log and uses a cause-specific retry strategy from
+    ``GHOST_RETRY_STRATEGIES``.  Retries on a **separate** budget that does
+    not deplete the main retry counters.  Uses escalating backoff (default
+    [10, 30, 60]s) instead of a fixed delay.  See issues #2604, #2644.
 
     For exit codes 6 and 7, if a single attempt takes longer than
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
@@ -1203,31 +1276,57 @@ def run_phase_with_retry(
         # Ghost sessions are infrastructure-level failures (0s duration, no
         # output) that should NOT deplete the main retry budget.  They use a
         # separate counter so that legitimate failures (stuck, low-output,
-        # MCP) retain their full retry budget.  See issue #2604.
+        # MCP) retain their full retry budget.  See issues #2604, #2644.
         if exit_code == 10:
-            ghost_retries += 1
-            if ghost_retries > GHOST_SESSION_MAX_RETRIES:
+            # Classify root cause and select cause-specific retry strategy.
+            # See issue #2644.
+            paths = LoomPaths(ctx.repo_root)
+            log_path = paths.worker_log_file(role, ctx.config.issue)
+            ghost_cause = _classify_ghost_cause(log_path)
+            cause_max_retries, cause_backoff = GHOST_RETRY_STRATEGIES.get(
+                ghost_cause, GHOST_RETRY_STRATEGIES["unknown"]
+            )
+
+            # Fail fast for causes that won't resolve with retries.
+            if cause_max_retries == 0:
                 log_warning(
-                    f"Ghost session persisted for {role} after "
-                    f"{GHOST_SESSION_MAX_RETRIES} retries"
+                    f"Ghost session for {role} classified as '{ghost_cause}': "
+                    f"not retryable, failing fast"
                 )
                 return 10
 
+            ghost_retries += 1
+            if ghost_retries > cause_max_retries:
+                errors = extract_log_errors(log_path)
+                detail = f": {errors[-1]}" if errors else ""
+                log_warning(
+                    f"Ghost session ({ghost_cause}) persisted for {role} after "
+                    f"{cause_max_retries} retries{detail}"
+                )
+                return 10
+
+            # Use cause-specific escalating backoff schedule.
+            backoff_idx = min(
+                ghost_retries - 1, max(0, len(cause_backoff) - 1)
+            )
+            backoff = cause_backoff[backoff_idx]
+
             ctx.report_milestone(
                 "error",
-                error=f"ghost session detected for {role} (0s duration, no output)",
+                error=f"ghost session detected for {role} (cause: {ghost_cause}, 0s duration, no output)",
                 will_retry=True,
             )
             ctx.report_milestone(
                 "heartbeat",
                 action=(
                     f"retrying ghost session {role} "
-                    f"(attempt {ghost_retries}/{GHOST_SESSION_MAX_RETRIES}, "
-                    f"backoff {GHOST_SESSION_RETRY_DELAY_SECONDS}s)"
+                    f"(cause: {ghost_cause}, "
+                    f"attempt {ghost_retries}/{cause_max_retries}, "
+                    f"backoff {backoff}s)"
                 ),
             )
 
-            time.sleep(GHOST_SESSION_RETRY_DELAY_SECONDS)
+            time.sleep(backoff)
             continue
 
         # --- MCP failure handling (exit code 7) ---
