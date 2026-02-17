@@ -8012,8 +8012,8 @@ class TestBuilderIsNoChangesNeeded:
         diag = {"worktree_exists": False}
         assert builder._is_no_changes_needed(diag) is False
 
-    def test_worktree_with_no_work_returns_true(self) -> None:
-        """Worktree exists but no work done = no changes needed."""
+    def test_worktree_with_no_work_and_marker_returns_true(self) -> None:
+        """Worktree exists, no work done, marker present = no changes needed."""
         builder = BuilderPhase()
         diag = {
             "worktree_exists": True,
@@ -8022,8 +8022,22 @@ class TestBuilderIsNoChangesNeeded:
             "remote_branch_exists": False,
             "pr_number": None,
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
+
+    def test_worktree_with_no_work_no_marker_returns_false(self) -> None:
+        """Worktree exists, no work done, no marker = builder failure (#2403)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "no_changes_marker_exists": False,
+        }
+        assert builder._is_no_changes_needed(diag) is False
 
     def test_uncommitted_changes_returns_false(self) -> None:
         """Uncommitted changes mean work in progress, not no changes needed."""
@@ -8074,10 +8088,11 @@ class TestBuilderIsNoChangesNeeded:
         assert builder._is_no_changes_needed(diag) is False
 
     def test_handles_missing_keys_gracefully(self) -> None:
-        """Missing keys should not crash; missing output defaults to degraded."""
+        """Missing keys default safely — missing output defaults to degraded, no marker means False."""
         builder = BuilderPhase()
         # Only worktree_exists is provided, all others should default.
         # Missing log_cli_output_length defaults to 0 → degraded session → False
+        # Without no_changes_marker_exists, defaults to False (safe).
         diag = {"worktree_exists": True}
         assert builder._is_no_changes_needed(diag) is False
 
@@ -11651,8 +11666,8 @@ class TestBuilderHasIncompleteWorkWithArtifacts:
 class TestBuilderIsNoChangesNeededWithArtifacts:
     """Test _is_no_changes_needed when only artifacts exist."""
 
-    def test_only_artifacts_means_no_changes_needed(self) -> None:
-        """When only build artifacts are present, no real changes were needed."""
+    def test_only_artifacts_with_marker_means_no_changes_needed(self) -> None:
+        """When only build artifacts + marker file, no real changes were needed."""
         builder = BuilderPhase()
         diag = {
             "worktree_exists": True,
@@ -11661,8 +11676,22 @@ class TestBuilderIsNoChangesNeededWithArtifacts:
             "remote_branch_exists": False,
             "pr_number": None,
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
+
+    def test_only_artifacts_without_marker_returns_false(self) -> None:
+        """Only build artifacts but no marker = builder failure (#2403)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,  # artifacts filtered out
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "no_changes_marker_exists": False,
+        }
+        assert builder._is_no_changes_needed(diag) is False
 
 
 class TestBuilderMainBranchDirtyDetection:
@@ -11684,8 +11713,8 @@ class TestBuilderMainBranchDirtyDetection:
         # Should NOT be treated as "no changes needed" — builder escaped worktree
         assert builder._is_no_changes_needed(diag) is False
 
-    def test_main_clean_allows_no_changes_needed(self) -> None:
-        """When main is clean and worktree is clean, no changes needed is valid."""
+    def test_main_clean_with_marker_allows_no_changes_needed(self) -> None:
+        """When main is clean, worktree is clean, marker exists = valid."""
         builder = BuilderPhase()
         diag = {
             "worktree_exists": True,
@@ -11697,6 +11726,7 @@ class TestBuilderMainBranchDirtyDetection:
             "main_dirty_file_count": 0,
             "main_dirty_files": [],
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -11710,6 +11740,7 @@ class TestBuilderMainBranchDirtyDetection:
             "remote_branch_exists": False,
             "pr_number": None,
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
             # main_branch_dirty not present — backwards compatibility
         }
         # Missing key defaults to False via .get(), so no changes needed is valid
@@ -11751,6 +11782,7 @@ class TestBuilderImplementationActivityDetection:
             "main_branch_dirty": False,
             "log_has_implementation_activity": False,
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -11834,6 +11866,7 @@ class TestBuilderSessionQualityGate:
             "main_branch_dirty": False,
             "log_cli_output_length": 1000,
             "log_has_implementation_activity": False,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -11851,6 +11884,7 @@ class TestBuilderSessionQualityGate:
             "main_branch_dirty": False,
             "log_cli_output_length": _MIN_ANALYSIS_OUTPUT_CHARS,
             "log_has_implementation_activity": False,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -11927,6 +11961,7 @@ class TestBuilderMcpFailureMarkerDetection:
             "log_has_implementation_activity": False,
             "log_cli_output_length": 1000,
             "log_has_mcp_failure_markers": False,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -11942,6 +11977,7 @@ class TestBuilderMcpFailureMarkerDetection:
             "main_branch_dirty": False,
             "log_has_implementation_activity": False,
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
             # log_has_mcp_failure_markers not present — backwards compat
         }
         assert builder._is_no_changes_needed(diag) is True
@@ -12312,6 +12348,91 @@ class TestBuilderMainDirtyBaseline:
             baseline = builder._snapshot_main_dirty(mock_context)
 
         assert baseline == set()
+
+
+class TestBuilderGatherDiagnosticsNoChangesMarker:
+    """Test that _gather_diagnostics detects the .no-changes-needed marker."""
+
+    def test_diagnostics_detects_marker_when_present(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should set no_changes_marker_exists=True when marker file exists."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        # Create the marker file
+        (wt_dir / ".no-changes-needed").write_text("already fixed")
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["no_changes_marker_exists"] is True
+
+    def test_diagnostics_detects_missing_marker(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should set no_changes_marker_exists=False when no marker file."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        # No marker file created
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["no_changes_marker_exists"] is False
 
 
 class TestBuilderStaleWorktreeWithArtifacts:

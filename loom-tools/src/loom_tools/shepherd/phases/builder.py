@@ -98,6 +98,14 @@ _MCP_FAILURE_MARKER_RE = re.compile(
     "|".join(_MCP_FAILURE_MARKER_PATTERNS), re.IGNORECASE
 )
 
+# Marker file name the builder writes to explicitly signal "no changes needed."
+# The builder agent creates this file in the worktree root when it deliberately
+# determines no code changes are required (e.g. bug already fixed on main).
+# Without this marker, an empty worktree is treated as a builder failure
+# (crash, timeout, OOM kill) rather than an intentional "no changes" decision.
+# See issue #2403.
+NO_CHANGES_MARKER = ".no-changes-needed"
+
 # File extensions mapped to language categories for scoped test verification
 _LANGUAGE_EXTENSIONS: dict[str, str] = {
     # Python
@@ -2784,6 +2792,10 @@ class BuilderPhase:
             diag["uncommitted_file_count"] = len(meaningful_files)
             diag["artifact_file_count"] = len(artifact_files)
             diag["total_uncommitted_file_count"] = len(uncommitted_files)
+
+            # Check for explicit "no changes needed" marker (issue #2403)
+            marker_path = wt / NO_CHANGES_MARKER
+            diag["no_changes_marker_exists"] = marker_path.is_file()
         else:
             diag["branch"] = None
             diag["commits_ahead"] = 0
@@ -2791,6 +2803,7 @@ class BuilderPhase:
             diag["uncommitted_file_count"] = 0
             diag["artifact_file_count"] = 0
             diag["total_uncommitted_file_count"] = 0
+            diag["no_changes_marker_exists"] = False
 
         # -- Remote branch ---------------------------------------------------
         branch_name = NamingConventions.branch_name(ctx.config.issue)
@@ -3089,18 +3102,13 @@ class BuilderPhase:
     def _is_no_changes_needed(self, diag: dict[str, Any]) -> bool:
         """Check if diagnostics indicate "no changes needed" condition.
 
-        Returns True when all of these conditions hold:
-        - Worktree exists (builder analyzed the issue)
-        - No commits ahead of main (builder made no changes)
-        - No uncommitted changes in worktree (no work in progress)
-        - No remote branch exists (nothing pushed)
-        - No PR exists (nothing created)
-        - Main branch is clean (no worktree escape detected)
-        - Builder log does NOT show implementation activity (Edit/Write calls)
+        Requires an **explicit positive signal** — the builder must have
+        written a ``.no-changes-needed`` marker file in the worktree root
+        to confirm it deliberately decided no code changes are required.
 
-        This pattern indicates the builder analyzed the issue and determined
-        that no changes are required - the reported problem either doesn't
-        exist or is already resolved on main.
+        Without the marker file, an empty worktree is treated as a builder
+        failure (crash, timeout, OOM kill) rather than an intentional "no
+        changes" decision.  See issue #2403.
 
         If the builder log shows substantive implementation activity (Edit/Write
         tool calls with significant output), the builder was actively working
@@ -3168,6 +3176,18 @@ class BuilderPhase:
                 "Builder log shows implementation activity (Edit/Write tool "
                 "calls) but no git artifacts — treating as builder failure, "
                 "not 'no changes needed'"
+            )
+            return False
+
+        # Require explicit marker file from the builder (issue #2403).
+        # Without this positive signal, an empty worktree is
+        # indistinguishable from a builder that was killed/crashed before
+        # producing any work.
+        if not diag.get("no_changes_marker_exists", False):
+            log_warning(
+                "No .no-changes-needed marker file found in worktree — "
+                "treating empty worktree as builder failure, not "
+                "'no changes needed' (issue #2403)"
             )
             return False
 
