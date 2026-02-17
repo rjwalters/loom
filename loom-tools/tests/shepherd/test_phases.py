@@ -11116,6 +11116,187 @@ class TestBuilderGatherDiagnosticsMainBranch:
         assert "WARNING: main branch dirty" in diag["summary"]
 
 
+class TestBuilderMainDirtyBaseline:
+    """Test that pre-existing dirty files on main are excluded from escape detection."""
+
+    def test_pre_existing_dirty_files_ignored(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Dirty files present before builder should not trigger escape warning."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+        # Simulate baseline snapshot taken before builder spawn.
+        # Note: .strip().splitlines() strips leading space from 1st line.
+        builder._main_dirty_baseline = {"M src/lib.rs", " M src/parser.rs"}
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # Same dirty files as baseline — no new files
+                    result.stdout = " M src/lib.rs\n M src/parser.rs\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is False
+        assert diag["main_dirty_file_count"] == 0
+        assert "WARNING" not in diag["summary"]
+        assert "pre-existing" in diag["summary"]
+
+    def test_new_dirty_files_detected(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """New dirty files that weren't in baseline should trigger escape warning."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+        # Baseline had one file (first line after .strip() loses leading space)
+        builder._main_dirty_baseline = {"M src/lib.rs"}
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # One pre-existing + one NEW file
+                    result.stdout = " M src/lib.rs\n M src/new_file.rs\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is True
+        assert diag["main_dirty_file_count"] == 1
+        assert diag["main_dirty_files"] == [" M src/new_file.rs"]
+        assert "WARNING: main branch dirty (1 NEW files)" in diag["summary"]
+
+    def test_no_baseline_flags_all_dirty(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Without baseline (None), all dirty files should be flagged."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+        # No baseline set (default None)
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    result.stdout = " M src/lib.rs\n M src/parser.rs\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is True
+        assert diag["main_dirty_file_count"] == 2
+
+    def test_snapshot_main_dirty(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """_snapshot_main_dirty should return set of porcelain lines."""
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        fake_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=" M src/lib.rs\n M src/parser.rs\n", stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=fake_result
+        ):
+            baseline = builder._snapshot_main_dirty(mock_context)
+
+        # .strip() removes leading whitespace from entire string,
+        # so first line loses its leading space from porcelain format
+        assert baseline == {"M src/lib.rs", " M src/parser.rs"}
+
+    def test_snapshot_main_dirty_clean(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """_snapshot_main_dirty should return empty set when main is clean."""
+        mock_context.repo_root = tmp_path
+
+        builder = BuilderPhase()
+
+        fake_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", return_value=fake_result
+        ):
+            baseline = builder._snapshot_main_dirty(mock_context)
+
+        assert baseline == set()
+
+
 class TestBuilderStaleWorktreeWithArtifacts:
     """Test _is_stale_worktree treats artifact-only changes as stale."""
 
