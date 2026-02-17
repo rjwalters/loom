@@ -957,6 +957,7 @@ class BuilderPhase:
                     f"Reproducibility run {run_num}/{_REPRODUCIBILITY_RUNS}: "
                     f"{display_name}"
                 )
+                pre_dirty = self._get_dirty_files(ctx.repo_root)
                 try:
                     result = subprocess.run(
                         cmd_args,
@@ -966,23 +967,26 @@ class BuilderPhase:
                         timeout=_REPRODUCIBILITY_TIMEOUT,
                         check=False,
                     )
-                    if result.returncode != 0:
-                        log_info(
-                            f"Test still fails on main (run {run_num}): "
-                            f"{display_name} (exit code {result.returncode})"
-                        )
-                        # Bug is still reproducible — proceed normally
-                        return None
                 except subprocess.TimeoutExpired:
+                    self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
                     log_info(
                         f"Test timed out on main (run {run_num}): "
                         f"{display_name}"
                     )
                     return None
                 except OSError as e:
+                    self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
                     log_warning(
                         f"Could not run test command: {display_name}: {e}"
                     )
+                    return None
+                self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
+                if result.returncode != 0:
+                    log_info(
+                        f"Test still fails on main (run {run_num}): "
+                        f"{display_name} (exit code {result.returncode})"
+                    )
+                    # Bug is still reproducible — proceed normally
                     return None
 
         # All commands passed on every run

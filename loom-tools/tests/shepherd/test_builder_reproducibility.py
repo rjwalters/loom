@@ -262,6 +262,15 @@ class TestBuilderFetchIssueComments:
 class TestBuilderReproducibilityCheck:
     """Test _run_reproducibility_check pre-implementation verification."""
 
+    @pytest.fixture(autouse=True)
+    def _no_artifact_cleanup(self) -> None:
+        """Disable artifact cleanup so subprocess.run mocks aren't affected."""
+        with (
+            patch.object(BuilderPhase, "_get_dirty_files", return_value=set()),
+            patch.object(BuilderPhase, "_cleanup_new_artifacts"),
+        ):
+            yield
+
     def test_no_commands_skips_check(self, mock_context: MagicMock) -> None:
         """Should return None (proceed) when no test commands found."""
         builder = BuilderPhase()
@@ -538,3 +547,102 @@ class TestBuilderReproducibilityCheck:
         assert result is not None
         assert result.status == PhaseStatus.SKIPPED
         assert result.data["no_changes_needed"] is True
+
+    def test_cleanup_called_after_each_run(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should clean up test artifacts after each reproducibility run."""
+        builder = BuilderPhase()
+        body_response = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Run `pytest tests/test_foo.py` to reproduce.",
+            stderr="",
+        )
+        comments_response = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"comments": []}', stderr=""
+        )
+        test_fail = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="1 failed", stderr=""
+        )
+
+        call_count = 0
+
+        def mock_run(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return body_response
+            if call_count == 2:
+                return comments_response
+            return test_fail
+
+        dirty_files = {"coverage/lcov.info", "dist/bundle.js"}
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_run,
+            ),
+            patch.object(
+                BuilderPhase,
+                "_get_dirty_files",
+                return_value=dirty_files,
+            ) as mock_get_dirty,
+            patch.object(
+                BuilderPhase, "_cleanup_new_artifacts"
+            ) as mock_cleanup,
+        ):
+            result = builder._run_reproducibility_check(mock_context)
+
+        assert result is None
+        mock_get_dirty.assert_called_once_with(mock_context.repo_root)
+        mock_cleanup.assert_called_once_with(
+            mock_context.repo_root, dirty_files
+        )
+
+    def test_cleanup_called_on_timeout(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should clean up artifacts even when test times out."""
+        builder = BuilderPhase()
+        body_response = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="Run `pytest tests/test_slow.py` to reproduce.",
+            stderr="",
+        )
+        comments_response = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout='{"comments": []}', stderr=""
+        )
+
+        call_count = 0
+
+        def mock_run(cmd, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return body_response
+            if call_count == 2:
+                return comments_response
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=120)
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=mock_run,
+            ),
+            patch.object(
+                BuilderPhase,
+                "_get_dirty_files",
+                return_value=set(),
+            ) as mock_get_dirty,
+            patch.object(
+                BuilderPhase, "_cleanup_new_artifacts"
+            ) as mock_cleanup,
+        ):
+            result = builder._run_reproducibility_check(mock_context)
+
+        assert result is None
+        mock_get_dirty.assert_called_once()
+        mock_cleanup.assert_called_once()
