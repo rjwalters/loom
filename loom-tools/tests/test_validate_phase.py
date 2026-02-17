@@ -394,8 +394,9 @@ class TestValidateBuilder:
     def test_pr_missing_label_recovery(self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path):
         repo = _make_repo(tmp_path)
         mock_gh.side_effect = [
-            _completed(stdout="OPEN\n"),
-            _completed(stdout="loom:building\n"),
+            _completed(stdout="OPEN\n"),           # issue state
+            _completed(stdout="fix: a good title\n"),  # PR title (generic check)
+            _completed(stdout="loom:building\n"),  # PR labels
         ]
         mock_find.return_value = (100, "closes_keyword")
         mock_run.return_value = _completed(returncode=0)
@@ -500,6 +501,72 @@ class TestValidateBuilder:
         mock_find.return_value = (55, "caller_cached")
         result = validate_builder(42, repo, pr_number=55, check_only=True)
         assert result.status == ValidationStatus.SATISFIED
+
+
+# ---------------------------------------------------------------------------
+# _warn_generic_pr_title
+# ---------------------------------------------------------------------------
+
+
+class TestWarnGenericPrTitle:
+    """Tests for the generic PR title anti-pattern detection."""
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_generic_title_triggers_warning(self, mock_gh, mock_milestone, tmp_path):
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="feat: implement changes for issue #42\n")
+
+        from loom_tools.validate_phase import _warn_generic_pr_title
+        _warn_generic_pr_title(10, 42, repo, "task123")
+
+        mock_milestone.assert_called_once()
+        call_kwargs = mock_milestone.call_args
+        assert "warning" in call_kwargs.kwargs.get("action", call_kwargs[1].get("action", ""))
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_good_title_no_warning(self, mock_gh, mock_milestone, tmp_path):
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="fix: validate PR title format in phase validator\n")
+
+        from loom_tools.validate_phase import _warn_generic_pr_title
+        _warn_generic_pr_title(10, 42, repo, "task123")
+
+        mock_milestone.assert_not_called()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_address_issue_pattern(self, mock_gh, mock_milestone, tmp_path):
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="fix: address issue #2557\n")
+
+        from loom_tools.validate_phase import _warn_generic_pr_title
+        _warn_generic_pr_title(10, 2557, repo, "task123")
+
+        mock_milestone.assert_called_once()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_bare_issue_number_pattern(self, mock_gh, mock_milestone, tmp_path):
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="Issue #123\n")
+
+        from loom_tools.validate_phase import _warn_generic_pr_title
+        _warn_generic_pr_title(10, 123, repo, "task123")
+
+        mock_milestone.assert_called_once()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_gh_failure_is_noop(self, mock_gh, mock_milestone, tmp_path):
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(returncode=1)
+
+        from loom_tools.validate_phase import _warn_generic_pr_title
+        _warn_generic_pr_title(10, 42, repo, "task123")
+
+        mock_milestone.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
