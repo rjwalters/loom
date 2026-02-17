@@ -1982,7 +1982,7 @@ class BuilderPhase:
 
             # New failure from supplemental test
             combined = (result.stdout + "\n" + result.stderr).strip()
-            tail_lines = combined.splitlines()[-10:]
+            tail_lines = combined.splitlines()[-50:]
             summary = self._parse_test_summary(combined)
             changed_files = get_changed_files(cwd=ctx.worktree_path) if ctx.worktree_path else []
 
@@ -2445,7 +2445,7 @@ class BuilderPhase:
 
         # Tests failed with new errors
         summary = self._parse_test_summary(output)
-        tail_lines = output.strip().splitlines()[-10:]
+        tail_lines = output.strip().splitlines()[-50:]
         tail_text = "\n".join(tail_lines)
 
         if summary:
@@ -2453,7 +2453,7 @@ class BuilderPhase:
         else:
             log_error(f"Tests failed (exit code {result.returncode}, {elapsed}s)")
 
-        log_info(f"Test output (last 10 lines):\n{tail_text}")
+        log_info(f"Test output (last 50 lines):\n{tail_text}")
         ctx.report_milestone(
             "heartbeat",
             action=f"test verification failed ({elapsed}s)",
@@ -2830,7 +2830,7 @@ class BuilderPhase:
         # Tests failed with new errors (or no baseline available)
         summary = self._parse_test_summary(primary_output)
         combined = primary_output.strip()
-        tail_lines = combined.splitlines()[-10:]
+        tail_lines = combined.splitlines()[-50:]
         tail_text = "\n".join(tail_lines)
 
         if summary:
@@ -2838,7 +2838,7 @@ class BuilderPhase:
         else:
             log_error(f"Tests failed (exit code {result.returncode}, {elapsed}s)")
 
-        log_info(f"Test output (last 10 lines):\n{tail_text}")
+        log_info(f"Test output (last 50 lines):\n{tail_text}")
         ctx.report_milestone(
             "heartbeat",
             action=f"test verification failed ({elapsed}s)",
