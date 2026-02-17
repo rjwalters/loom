@@ -992,11 +992,12 @@ def run_worker_phase(
     # Detect failure modes from the session log file and return synthetic
     # exit codes so the retry layer can handle each appropriately.
     #
-    # Check on ALL exit codes, not just 0.  A degraded CLI session may exit
-    # with a non-zero code (e.g., 2 for API error) while still producing no
-    # meaningful output — this is functionally the same as an instant-exit
-    # and should be retried rather than treated as a builder error.
-    # See issue #2446.
+    # Only reclassify non-zero exits.  A successful process (exit 0) should
+    # never be overridden by log pattern matching — the exit code is the
+    # ground truth for success.  Non-zero exits may be reclassified because
+    # a degraded CLI session can exit with e.g. code 2 while producing no
+    # meaningful output, which is functionally an instant-exit.
+    # See issues #2446, #2540, #2549.
     paths = LoomPaths(ctx.repo_root)
     log_path = paths.worker_log_file(role, ctx.config.issue)
 
@@ -1014,7 +1015,7 @@ def run_worker_phase(
 
     # Check for MCP failure (exit code 7) — more specific than instant-exit,
     # with different retry/backoff strategy.  See issues #2135, #2279.
-    if _is_mcp_failure(log_path):
+    if wait_exit != 0 and _is_mcp_failure(log_path):
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
@@ -1022,7 +1023,7 @@ def run_worker_phase(
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 7
-    if _is_instant_exit(log_path):
+    if wait_exit != 0 and _is_instant_exit(log_path):
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
