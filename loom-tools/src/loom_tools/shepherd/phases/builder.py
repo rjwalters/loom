@@ -42,7 +42,7 @@ from loom_tools.shepherd.phases.base import (
 logger = logging.getLogger(__name__)
 
 # Default timeout for test verification (seconds)
-_TEST_VERIFY_TIMEOUT = 300
+_TEST_VERIFY_TIMEOUT = int(os.environ.get("LOOM_TEST_VERIFY_TIMEOUT", "300"))
 
 # Pre-implementation reproducibility check settings
 _REPRODUCIBILITY_RUNS = 3  # Number of times to run each test for flakiness
