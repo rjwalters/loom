@@ -777,6 +777,43 @@ class TestBuilderPhase:
         assert "log_file" in result.data
         assert "loom-builder-issue-42.log" in result.data["log_file"]
 
+    def test_planning_stall_returns_failed(self, mock_context: MagicMock) -> None:
+        """Builder exit code 8 (planning stall) should return FAILED with details.
+
+        When the builder stays in the 'planning' checkpoint beyond the
+        planning_timeout, run_phase_with_retry returns exit code 8.  The
+        builder phase should report this as a clear failure with the
+        planning_stall flag.  See issue #2443.
+        """
+        mock_context.check_shutdown.return_value = False
+        mock_context.config.planning_timeout = 600
+        wt_mock = MagicMock()
+        wt_mock.is_dir.return_value = True
+        wt_mock.__bool__ = lambda self: True
+        mock_context.worktree_path = wt_mock
+
+        builder = BuilderPhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.get_pr_for_issue", return_value=None
+            ),
+            patch("loom_tools.shepherd.phases.builder.transition_issue_labels"),
+            patch(
+                "loom_tools.shepherd.phases.builder.run_phase_with_retry",
+                return_value=8,
+            ),
+            patch.object(builder, "_cleanup_stale_worktree"),
+            patch.object(builder, "_create_worktree_marker"),
+        ):
+            result = builder.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "planning" in result.message
+        assert "stall" in result.message.lower()
+        assert result.data.get("planning_stall") is True
+        assert result.data.get("planning_timeout") == 600
+
 
 class TestBuilderDiagnostics:
     """Test BuilderPhase._gather_diagnostics helper."""
@@ -10850,6 +10887,272 @@ class TestRunPhaseWithRetryInstantExit:
 
         assert exit_code == 0
         assert call_count == 3
+
+
+class TestRunWorkerPhasePlanningStall:
+    """Test planning stall detection in run_worker_phase (exit code 8).
+
+    When a builder stays in the 'planning' checkpoint stage beyond the
+    planning_timeout, the worker should be terminated and exit code 8
+    returned.  See issue #2443.
+    """
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        """Create a mock ShepherdContext with real tmp dirs."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script in ("agent-spawn.sh", "agent-wait-bg.sh", "agent-destroy.sh"):
+            (scripts_dir / script).touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+        return ctx
+
+    def test_planning_stall_returns_code_8(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When checkpoint stays at 'planning' beyond timeout, return code 8."""
+        # Create a worktree directory with a planning checkpoint
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        checkpoint_file = worktree / ".loom-checkpoint"
+        checkpoint_file.write_text(
+            '{"stage": "planning", "timestamp": "2026-01-01T00:00:00Z", "issue": 42}'
+        )
+
+        poll_count = 0
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            # Keep returning None (still running) so the loop iterates
+            nonlocal poll_count
+
+            def poll_side_effect():
+                nonlocal poll_count
+                poll_count += 1
+                return None  # Always "still running"
+
+            proc.poll = poll_side_effect
+            proc.terminate = MagicMock()
+            proc.wait = MagicMock()
+            proc.returncode = 0
+            return proc
+
+        # Use a very small planning_timeout so the test runs quickly.
+        # Monotonic clock advances: first seen at 100.0, then checked at 200.0
+        # (100s elapsed > 8s timeout -> stall detected).
+        monotonic_call = [0]
+
+        def advancing_monotonic():
+            monotonic_call[0] += 1
+            return monotonic_call[0] * 100.0
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch("time.monotonic", side_effect=advancing_monotonic),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+                worktree=worktree,
+                planning_timeout=8,  # 8 seconds, exceeded on 2nd poll iteration
+            )
+
+        assert exit_code == 8
+
+    def test_no_stall_when_checkpoint_advances(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """No stall if checkpoint advances past planning before timeout."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        checkpoint_file = worktree / ".loom-checkpoint"
+        # Start with planning, then advance to implementing
+        checkpoint_file.write_text(
+            '{"stage": "planning", "timestamp": "2026-01-01T00:00:00Z", "issue": 42}'
+        )
+
+        poll_count = 0
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            nonlocal poll_count
+
+            def poll_side_effect():
+                nonlocal poll_count
+                poll_count += 1
+                # On second poll, advance checkpoint past planning
+                if poll_count == 2:
+                    checkpoint_file.write_text(
+                        '{"stage": "implementing", "timestamp": "2026-01-01T00:01:00Z", "issue": 42}'
+                    )
+                # Finish on third poll
+                if poll_count >= 3:
+                    return 0
+                return None
+
+            proc.poll = poll_side_effect
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=False
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+                worktree=worktree,
+                planning_timeout=600,
+            )
+
+        # Should complete normally, not stall
+        assert exit_code == 0
+
+    def test_no_stall_when_planning_timeout_zero(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Planning stall detection disabled when planning_timeout=0."""
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        checkpoint_file = worktree / ".loom-checkpoint"
+        checkpoint_file.write_text(
+            '{"stage": "planning", "timestamp": "2026-01-01T00:00:00Z", "issue": 42}'
+        )
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0  # Finishes immediately
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=False
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+                worktree=worktree,
+                planning_timeout=0,  # Disabled
+            )
+
+        assert exit_code == 0
+
+
+class TestRunPhaseWithRetryPlanningStall:
+    """Test that run_phase_with_retry does NOT retry on planning stall (code 8).
+
+    Planning stalls are not transient — retrying won't help.
+    See issue #2443.
+    """
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(
+            issue=42, task_id="test-123", stuck_max_retries=2
+        )
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
+        return ctx
+
+    def test_planning_stall_returns_immediately(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 8 should be returned immediately without retry."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 8
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase",
+            side_effect=mock_run_worker,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=3,
+                phase="builder",
+            )
+
+        assert exit_code == 8
+        # Only called once — no retries
+        assert call_count == 1
+
+    def test_planning_timeout_passed_through(
+        self, mock_context: MagicMock
+    ) -> None:
+        """planning_timeout should be forwarded to run_worker_phase."""
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase",
+            return_value=0,
+        ) as mock_run:
+            run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+                planning_timeout=300,
+            )
+
+        # Verify planning_timeout was passed to run_worker_phase
+        _, kwargs = mock_run.call_args
+        assert kwargs["planning_timeout"] == 300
 
 
 class TestBuilderFilterBuildArtifacts:
