@@ -6830,14 +6830,15 @@ class TestJudgeInfrastructureBypass:
         assert "NOT" in captured["body"]
         assert "low output" in captured["body"]
 
-    def test_bypass_on_zero_work_validation_failure_force_mode(
+    def test_zero_work_retries_judge_instead_of_bypass_force_mode(
         self, mock_context: MagicMock
     ) -> None:
-        """Zero-work validation failure in force mode: bypass succeeds when CI passes.
+        """Zero-work validation failure in force mode: retry succeeds.
 
-        When the judge CLI exits code 0 but does no work (0s duration, no comments,
-        no labels), the exit-code-based ghost detection is skipped (issue #2540).
-        The bypass should be attempted in the validation failure path (issue #2636).
+        When the judge CLI exits code 0 but does no work (0s duration, no
+        comments, no labels), the judge should be retried instead of
+        bypassed.  Infrastructure bypass must NOT be used for zero-work
+        sessions (issue #2679).
         """
         ctx = self._make_force_context(mock_context)
         judge = JudgePhase()
@@ -6846,12 +6847,23 @@ class TestJudgeInfrastructureBypass:
         fake_diag = {
             "summary": "no judge comments; session duration: 0s",
             "session_duration_seconds": 0,
+            "failure_mode": "agent_started_no_work",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": True,
             "log_tail": [],
             "pr_reviews": [],
             "pr_labels": [],
+            "has_approval_comment": False,
+            "has_rejection_comment": False,
         }
+
+        # Retry succeeds — judge approves on second attempt
+        retry_result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message="PR #100 approved by Judge (after zero-work retry)",
+            phase_name="judge",
+            data={"approved": True, "zero_work_retried": True},
+        )
 
         with (
             patch(
@@ -6866,30 +6878,28 @@ class TestJudgeInfrastructureBypass:
             ),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
             patch.object(
+                judge, "_retry_judge_for_zero_work", return_value=retry_result
+            ) as mock_retry,
+            patch.object(
                 judge, "_try_infrastructure_bypass"
             ) as mock_bypass,
         ):
-            # Bypass succeeds
-            mock_bypass.return_value = PhaseResult(
-                status=PhaseStatus.SUCCESS,
-                message="[force-mode] Infrastructure bypass applied",
-                phase_name="judge",
-                data={"approved": True, "infrastructure_bypass": True},
-            )
             result = judge.run(ctx)
 
         assert result.status == PhaseStatus.SUCCESS
-        assert result.data.get("infrastructure_bypass") is True
-        mock_bypass.assert_called_once()
-        assert "zero-work session" in mock_bypass.call_args.kwargs["failure_reason"]
+        assert result.data.get("zero_work_retried") is True
+        # Infrastructure bypass must NOT be called
+        mock_bypass.assert_not_called()
+        # Retry should be called with the diagnostics
+        mock_retry.assert_called_once_with(ctx, fake_diag)
 
-    def test_bypass_not_attempted_for_nonzero_duration_validation_failure(
+    def test_no_retry_for_nonzero_duration_validation_failure(
         self, mock_context: MagicMock
     ) -> None:
-        """Validation failure with real session duration should NOT attempt bypass.
+        """Validation failure with real session duration should NOT retry.
 
         When the judge ran for a meaningful duration but still failed validation,
-        this is not an infrastructure failure — do not bypass (issue #2636).
+        this is not a zero-work session — do not retry or bypass (issue #2679).
         """
         ctx = self._make_force_context(mock_context)
         judge = JudgePhase()
@@ -6898,11 +6908,14 @@ class TestJudgeInfrastructureBypass:
         fake_diag = {
             "summary": "no judge comments; session duration: 30s",
             "session_duration_seconds": 30,
+            "failure_mode": "started_reviewing_incomplete",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": True,
             "log_tail": ["some output"],
             "pr_reviews": [],
             "pr_labels": [],
+            "has_approval_comment": False,
+            "has_rejection_comment": False,
         }
 
         with (
@@ -6917,6 +6930,9 @@ class TestJudgeInfrastructureBypass:
                 judge, "_try_fallback_changes_requested", return_value=False
             ),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_retry_judge_for_zero_work"
+            ) as mock_retry,
             patch.object(
                 judge, "_try_infrastructure_bypass"
             ) as mock_bypass,
@@ -6925,15 +6941,16 @@ class TestJudgeInfrastructureBypass:
             result = judge.run(ctx)
 
         assert result.status == PhaseStatus.FAILED
-        # Bypass should NOT be attempted for sessions with real duration
+        # Neither retry nor bypass should be attempted
+        mock_retry.assert_not_called()
         mock_bypass.assert_not_called()
 
-    def test_bypass_not_attempted_for_zero_work_default_mode(
+    def test_retry_not_attempted_for_zero_work_default_mode(
         self, mock_context: MagicMock
     ) -> None:
-        """Zero-work validation failure outside force mode should NOT attempt bypass.
+        """Zero-work validation failure outside force mode should NOT retry.
 
-        Infrastructure bypass is only available in force mode (issue #2636).
+        Zero-work retry is only available in force mode (issue #2679).
         """
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
@@ -6942,11 +6959,14 @@ class TestJudgeInfrastructureBypass:
         fake_diag = {
             "summary": "no judge comments; session duration: 0s",
             "session_duration_seconds": 0,
+            "failure_mode": "agent_started_no_work",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": True,
             "log_tail": [],
             "pr_reviews": [],
             "pr_labels": [],
+            "has_approval_comment": False,
+            "has_rejection_comment": False,
         }
 
         with (
@@ -6958,6 +6978,9 @@ class TestJudgeInfrastructureBypass:
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
             patch.object(
+                judge, "_retry_judge_for_zero_work"
+            ) as mock_retry,
+            patch.object(
                 judge, "_try_infrastructure_bypass"
             ) as mock_bypass,
             patch("loom_tools.validate_phase._mark_phase_failed"),
@@ -6965,15 +6988,17 @@ class TestJudgeInfrastructureBypass:
             result = judge.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
+        mock_retry.assert_not_called()
         mock_bypass.assert_not_called()
 
-    def test_bypass_denied_falls_through_to_failure_for_zero_work(
+    def test_zero_work_retry_fails_falls_through_to_failure(
         self, mock_context: MagicMock
     ) -> None:
-        """Zero-work bypass denied (CI fails) should fall through to FAILED.
+        """Zero-work retry fails: should fall through to FAILED, NOT bypass.
 
-        When the infrastructure bypass is attempted but denied (e.g., CI not
-        passing), the normal failure path should execute (issue #2636).
+        When zero-work retry is attempted but also fails, the judge marks
+        the issue as blocked.  Infrastructure bypass must NOT be used
+        (issue #2679).
         """
         ctx = self._make_force_context(mock_context)
         judge = JudgePhase()
@@ -6981,11 +7006,14 @@ class TestJudgeInfrastructureBypass:
         fake_diag = {
             "summary": "no judge comments; session duration: 0s",
             "session_duration_seconds": 0,
+            "failure_mode": "agent_started_no_work",
             "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
             "log_exists": True,
             "log_tail": [],
             "pr_reviews": [],
             "pr_labels": [],
+            "has_approval_comment": False,
+            "has_rejection_comment": False,
         }
 
         with (
@@ -7000,8 +7028,12 @@ class TestJudgeInfrastructureBypass:
                 judge, "_try_fallback_changes_requested", return_value=False
             ),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            # Retry returns None (also failed)
             patch.object(
-                judge, "_try_infrastructure_bypass", return_value=None
+                judge, "_retry_judge_for_zero_work", return_value=None
+            ) as mock_retry,
+            patch.object(
+                judge, "_try_infrastructure_bypass"
             ) as mock_bypass,
             patch(
                 "loom_tools.validate_phase._mark_phase_failed"
@@ -7011,11 +7043,12 @@ class TestJudgeInfrastructureBypass:
 
         assert result.status == PhaseStatus.FAILED
         assert "validation failed" in result.message
-        mock_bypass.assert_called_once()
+        # Retry was attempted
+        mock_retry.assert_called_once()
+        # Infrastructure bypass must NOT be called for zero-work
+        mock_bypass.assert_not_called()
+        # Issue should be marked blocked
         mock_mark_failed.assert_called_once()
-        # Verify quiet=True is passed so no comment is posted during
-        # intermediate failures — the CLI retry loop handles comments
-        # when retries are exhausted (#2661).
         _, kwargs = mock_mark_failed.call_args
         assert kwargs.get("quiet") is True
 
@@ -7068,6 +7101,157 @@ class TestJudgeInfrastructureBypass:
             failure_label="loom:failed:judge",
             quiet=True,
         )
+
+
+class TestJudgeZeroWorkRetry:
+    """Test zero-work session detection and retry (issue #2679)."""
+
+    def test_is_zero_work_session_agent_started_no_work(self) -> None:
+        """failure_mode=agent_started_no_work is zero-work."""
+        judge = JudgePhase()
+        diag = {"failure_mode": "agent_started_no_work"}
+        assert judge._is_zero_work_session(diag) is True
+
+    def test_is_zero_work_session_agent_never_ran(self) -> None:
+        """failure_mode=agent_never_ran is zero-work."""
+        judge = JudgePhase()
+        diag = {"failure_mode": "agent_never_ran"}
+        assert judge._is_zero_work_session(diag) is True
+
+    def test_is_zero_work_session_no_meaningful_output(self) -> None:
+        """failure_mode=agent_started_no_meaningful_output is zero-work."""
+        judge = JudgePhase()
+        diag = {"failure_mode": "agent_started_no_meaningful_output"}
+        assert judge._is_zero_work_session(diag) is True
+
+    def test_is_zero_work_session_stale_log(self) -> None:
+        """failure_mode=stale_log_from_previous_run is zero-work."""
+        judge = JudgePhase()
+        diag = {"failure_mode": "stale_log_from_previous_run"}
+        assert judge._is_zero_work_session(diag) is True
+
+    def test_is_zero_work_session_zero_duration_no_comments(self) -> None:
+        """0s duration with no comments is zero-work."""
+        judge = JudgePhase()
+        diag = {
+            "failure_mode": "unknown",
+            "session_duration_seconds": 0,
+            "has_approval_comment": False,
+            "has_rejection_comment": False,
+        }
+        assert judge._is_zero_work_session(diag) is True
+
+    def test_is_not_zero_work_session_real_duration(self) -> None:
+        """30s duration with no special failure mode is NOT zero-work."""
+        judge = JudgePhase()
+        diag = {
+            "failure_mode": "started_reviewing_incomplete",
+            "session_duration_seconds": 30,
+            "has_approval_comment": False,
+            "has_rejection_comment": False,
+        }
+        assert judge._is_zero_work_session(diag) is False
+
+    def test_is_not_zero_work_session_comment_exists_label_missing(self) -> None:
+        """comment_exists_label_missing is NOT zero-work (judge did work)."""
+        judge = JudgePhase()
+        diag = {
+            "failure_mode": "comment_exists_label_missing",
+            "has_approval_comment": True,
+            "has_rejection_comment": False,
+        }
+        assert judge._is_zero_work_session(diag) is False
+
+    def test_is_not_zero_work_zero_duration_but_has_approval_comment(self) -> None:
+        """0s duration with approval comment is NOT zero-work."""
+        judge = JudgePhase()
+        diag = {
+            "failure_mode": "unknown",
+            "session_duration_seconds": 0,
+            "has_approval_comment": True,
+            "has_rejection_comment": False,
+        }
+        assert judge._is_zero_work_session(diag) is False
+
+    def test_retry_judge_succeeds_with_approval(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Retry succeeds when judge approves on second attempt."""
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+
+        judge = JudgePhase()
+        original_diag = {
+            "failure_mode": "agent_started_no_work",
+            "session_duration_seconds": 0,
+        }
+
+        def has_pr_label_side_effect(label: str) -> bool:
+            return label == "loom:pr"
+
+        mock_context.has_pr_label.side_effect = has_pr_label_side_effect
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=True),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+        ):
+            result = judge._retry_judge_for_zero_work(mock_context, original_diag)
+
+        assert result is not None
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("approved") is True
+        assert result.data.get("zero_work_retried") is True
+
+    def test_retry_judge_returns_none_on_nonzero_exit(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Retry returns None when judge exits with non-zero code."""
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+
+        judge = JudgePhase()
+        original_diag = {"failure_mode": "agent_started_no_work"}
+
+        with patch(
+            "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+            return_value=4,
+        ):
+            result = judge._retry_judge_for_zero_work(mock_context, original_diag)
+
+        assert result is None
+
+    def test_retry_judge_returns_none_on_validation_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Retry returns None when validation fails again."""
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+
+        judge = JudgePhase()
+        original_diag = {"failure_mode": "agent_started_no_work"}
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+        ):
+            result = judge._retry_judge_for_zero_work(mock_context, original_diag)
+
+        assert result is None
 
 
 class TestMergePhase:
