@@ -9,7 +9,7 @@ import sys
 import time
 from pathlib import Path
 
-from loom_tools.common.git import get_uncommitted_files
+from loom_tools.common.git import get_uncommitted_files, parse_porcelain_path
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import NamingConventions
 from loom_tools.common.repo import find_repo_root
@@ -225,7 +225,7 @@ def _is_loom_runtime(porcelain_line: str) -> bool:
         True if the file path starts with ``.loom/`` or ``.loom-``
     """
     # Format: "XY filename" or "XY filename -> renamed"
-    path = porcelain_line[3:] if len(porcelain_line) > 3 else ""
+    path = parse_porcelain_path(porcelain_line)
     if " -> " in path:
         path = path.split(" -> ")[-1]  # Use destination for renames
     return path.startswith(".loom/") or path.startswith(".loom-")
@@ -260,7 +260,7 @@ def _check_main_repo_clean(repo_root: Path, allow_dirty: bool) -> bool:
     for line in uncommitted[:10]:  # Show first 10 files
         # Parse porcelain format: "XY filename"
         status = line[:2].strip()
-        filename = line[3:] if len(line) > 3 else line
+        filename = parse_porcelain_path(line)
         print(f"  {status} {filename}", file=sys.stderr)
     if len(uncommitted) > 10:
         print(f"  ... and {len(uncommitted) - 10} more", file=sys.stderr)

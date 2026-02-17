@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loom_tools.claim import has_valid_claim
+from loom_tools.common.git import parse_porcelain_path
 from loom_tools.common.github import get_repo_nwo, gh_issue_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
@@ -580,7 +581,7 @@ def _cleanup_stale_worktree(repo_root: pathlib.Path, issue: int) -> bool:
         ".loom-in-use",
     )
     for line in status_result.stdout.strip().splitlines():
-        filepath = line[3:].strip().strip('"')
+        filepath = parse_porcelain_path(line)
         if not any(pat in filepath for pat in build_artifact_patterns):
             log_info(
                 f"Worktree issue-{issue} has meaningful uncommitted changes, "

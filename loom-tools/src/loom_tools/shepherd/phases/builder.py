@@ -17,7 +17,7 @@ from loom_tools.checkpoints import (
     get_recovery_recommendation,
     read_checkpoint,
 )
-from loom_tools.common.git import get_changed_files
+from loom_tools.common.git import get_changed_files, parse_porcelain_path
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.state import parse_command_output, read_json_file
@@ -2114,7 +2114,7 @@ class BuilderPhase:
             entries = set()
             for line in result.stdout.splitlines():
                 if len(line) > 3:
-                    entries.add(line[3:].strip())
+                    entries.add(parse_porcelain_path(line))
             return entries
         except (subprocess.TimeoutExpired, OSError):
             return set()
@@ -2139,7 +2139,7 @@ class BuilderPhase:
         new_entries: list[tuple[str, str]] = []  # (status, path)
         for line in result.stdout.splitlines():
             if len(line) > 3:
-                path = line[3:].strip()
+                path = parse_porcelain_path(line)
                 if path not in pre_dirty:
                     status = line[:2].strip()
                     new_entries.append((status, path))
@@ -2701,9 +2701,7 @@ class BuilderPhase:
         meaningful: list[str] = []
         artifacts: list[str] = []
         for line in porcelain_lines:
-            # git status --porcelain format: XY filename
-            # Strip the 2-char status prefix + space to get the path
-            path = line[3:].strip().strip('"') if len(line) > 3 else line.strip()
+            path = parse_porcelain_path(line)
             if any(
                 path == pat or path.startswith(pat)
                 for pat in _BUILD_ARTIFACT_PATTERNS
@@ -3940,7 +3938,7 @@ class BuilderPhase:
         # Extract file paths from porcelain lines (format: "XY filename")
         files_to_stage = []
         for line in meaningful:
-            path = line[3:].strip().strip('"') if len(line) > 3 else line.strip()
+            path = parse_porcelain_path(line)
             if path:
                 files_to_stage.append(path)
 

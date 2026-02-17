@@ -27,6 +27,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from loom_tools.common.git import parse_porcelain_path
 from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import find_progress_for_issue
@@ -766,7 +767,7 @@ def validate_builder(
         # Extract meaningful file paths from porcelain output
         files_to_stage = []
         for line in substantive:
-            path = line[3:].strip().strip('"') if len(line) > 3 else line.strip()
+            path = parse_porcelain_path(line)
             if path:
                 files_to_stage.append(path)
 
