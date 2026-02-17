@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 from loom_tools.checkpoints import read_checkpoint
 from loom_tools.claim import extend_claim
 from loom_tools.common.logging import log_warning, strip_ansi
-from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_json_file
 
 if TYPE_CHECKING:
@@ -129,6 +128,13 @@ DEGRADED_SCAN_TAIL_LINES = 100
 # How often (in seconds) to scan the log for degradation during polling.
 # Must be a multiple of _HEARTBEAT_POLL_INTERVAL for alignment.
 _DEGRADED_SCAN_INTERVAL = 30
+
+# Wall-clock duration threshold (in seconds) for ghost detection.
+# Sessions shorter than this with no meaningful output are classified as
+# ghost sessions.  Uses wall-clock timing from run_worker_phase() instead
+# of unreliable file timestamps (st_mtime - st_ctime), which read as ~0
+# when pipe-pane fails to capture output.  See issue #2639.
+GHOST_SESSION_WALL_CLOCK_THRESHOLD = 5.0
 
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
@@ -771,7 +777,9 @@ def _is_auth_failure(log_path: Path) -> bool:
     return False
 
 
-def _is_ghost_session(log_path: Path) -> bool:
+def _is_ghost_session(
+    log_path: Path, *, wall_clock_duration: float | None = None
+) -> bool:
     """Check if a session log indicates a ghost session (instant exit, no work).
 
     A ghost session is one where the CLI process spawned but exited almost
@@ -781,11 +789,15 @@ def _is_ghost_session(log_path: Path) -> bool:
 
     Ghost sessions are detected by combining two signals:
     1. No meaningful CLI output (same check as ``_is_low_output_session``)
-    2. Very short session duration (log file mtime ≈ ctime, indicating the
-       file was written once and never updated — the session lasted < 2s)
+    2. Very short session duration
 
-    The 2-second threshold accounts for minor filesystem timestamp jitter
-    and sessions that manage to emit a spinner frame before dying.
+    For duration, **wall-clock timing** from ``run_worker_phase()`` is
+    preferred over file timestamps.  The ``st_mtime - st_ctime`` heuristic
+    is unreliable when pipe-pane fails to capture output — the log file
+    appears unmodified (mtime == ctime) even though the session ran for
+    10-20 seconds, causing false-positive ghost detection.  See issue #2639.
+    The fallback file-timestamp path uses a 2-second threshold to account
+    for filesystem timestamp jitter.  See issue #2644.
 
     These represent infrastructure-level failures (API blip, spawn race,
     resource contention) rather than agent failures, and should be retried
@@ -794,6 +806,9 @@ def _is_ghost_session(log_path: Path) -> bool:
 
     Args:
         log_path: Path to the worker session log file.
+        wall_clock_duration: Wall-clock elapsed time (in seconds) from
+            ``run_worker_phase()``.  When provided, this is used instead
+            of file timestamps for duration estimation.  See issue #2639.
 
     Returns:
         True if the session appears to be a ghost (instant exit, no work).
@@ -802,16 +817,24 @@ def _is_ghost_session(log_path: Path) -> bool:
         return False
 
     try:
-        stat = log_path.stat()
-        # Session duration: time between file creation and last modification.
-        # A ghost session writes the log once and exits — mtime ≈ ctime.
-        # Use a 2-second threshold to account for filesystem timestamp
-        # jitter and sessions that emit a spinner frame before dying.
-        # See issue #2644.
-        duration = stat.st_mtime - stat.st_ctime
-        if duration > 2.0:
-            # Session ran for more than 2 seconds — not a ghost.
-            return False
+        # Prefer wall-clock duration (accurate) over file timestamps (fragile).
+        # File timestamps (st_mtime - st_ctime) are unreliable when pipe-pane
+        # fails to capture output — the log file appears unmodified even though
+        # the session ran for 10-20s.  See issue #2639.
+        if wall_clock_duration is not None:
+            if wall_clock_duration > GHOST_SESSION_WALL_CLOCK_THRESHOLD:
+                # Session ran for more than the threshold — not a ghost.
+                return False
+        else:
+            # Fallback to file timestamp heuristic (legacy path).
+            # Use a 2-second threshold to account for filesystem timestamp
+            # jitter and sessions that emit a spinner frame before dying.
+            # See issue #2644.
+            stat = log_path.stat()
+            duration = stat.st_mtime - stat.st_ctime
+            if duration > 2.0:
+                # Session ran for more than 2 seconds — not a ghost.
+                return False
 
         content = log_path.read_text()
         stripped = strip_ansi(content)
@@ -957,6 +980,22 @@ def _classify_low_output_cause(log_path: Path) -> str:
     return "unknown"
 
 
+def _session_log_path(repo_root: Path, name: str) -> Path:
+    """Compute the log file path for a given session name.
+
+    Agent sessions write their logs to ``.loom/logs/loom-{name}.log``.
+    See ``agent_spawn.py`` for the naming convention.
+
+    Args:
+        repo_root: Repository root path.
+        name: Session name (e.g., "judge-issue-42" or "judge-issue-42-a1").
+
+    Returns:
+        Path to the log file.
+    """
+    return repo_root / ".loom" / "logs" / f"loom-{name}.log"
+
+
 def _classify_ghost_cause(log_path: Path) -> str:
     """Classify the root cause of a ghost session from the worker log.
 
@@ -1021,6 +1060,7 @@ def run_worker_phase(
     pr_number: int | None = None,
     args: str | None = None,
     planning_timeout: int = 0,
+    attempt: int = 0,
 ) -> int:
     """Run a phase worker and wait for completion.
 
@@ -1031,7 +1071,7 @@ def run_worker_phase(
     Args:
         ctx: Shepherd context
         role: Worker role (e.g., "builder", "judge")
-        name: Session name (e.g., "builder-issue-42")
+        name: Base session name (e.g., "builder-issue-42")
         timeout: Timeout in seconds
         phase: Phase name for activity detection
         worktree: Optional worktree path
@@ -1040,6 +1080,9 @@ def run_worker_phase(
         planning_timeout: If > 0, abort the worker if it stays in the
             ``planning`` checkpoint stage for more than this many seconds.
             Only effective when *worktree* is set.  See issue #2443.
+        attempt: Retry attempt number (0-based).  When > 0, a suffix is
+            appended to the session name to prevent tmux state pollution
+            from rapid create/destroy cycles.  See issue #2639.
 
     Returns:
         Exit code from agent-wait-bg.sh (or synthetic):
@@ -1055,7 +1098,17 @@ def run_worker_phase(
         - 11: Degraded session detected (rate limits + Crystallizing loop, see issue #2631)
         - Other: Error
     """
+    # Use unique session name per retry attempt to prevent tmux state
+    # pollution (pipe-pane degradation) from rapid create/destroy cycles.
+    # See issue #2639.
+    actual_name = f"{name}-a{attempt}" if attempt > 0 else name
+
     scripts_dir = ctx.scripts_dir
+
+    # Track wall-clock time for reliable ghost session detection.
+    # File timestamps (st_mtime - st_ctime) are unreliable when pipe-pane
+    # fails to capture output.  See issue #2639.
+    phase_start = time.monotonic()
 
     # Guard against missing scripts directory.  This can happen when the
     # working tree is on a branch that predates the Loom installation (the
@@ -1075,7 +1128,7 @@ def run_worker_phase(
         "--role",
         role,
         "--name",
-        name,
+        actual_name,
         "--on-demand",
     ]
 
@@ -1124,7 +1177,7 @@ def run_worker_phase(
 
     wait_cmd = [
         str(wait_script),
-        name,
+        actual_name,
         "--timeout",
         str(timeout),
         "--poll-interval",
@@ -1213,7 +1266,7 @@ def run_worker_phase(
                     destroy_script = scripts_dir / "agent-destroy.sh"
                     if destroy_script.is_file():
                         subprocess.run(
-                            [str(destroy_script), name, "--force"],
+                            [str(destroy_script), actual_name, "--force"],
                             cwd=ctx.repo_root,
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
@@ -1231,12 +1284,10 @@ def run_worker_phase(
         degraded_elapsed = time.monotonic() - _last_degraded_scan
         if degraded_elapsed >= _DEGRADED_SCAN_INTERVAL:
             _last_degraded_scan = time.monotonic()
-            degraded_log_path = LoomPaths(ctx.repo_root).worker_log_file(
-                role, ctx.config.issue
-            )
+            degraded_log_path = _session_log_path(ctx.repo_root, actual_name)
             if _scan_log_for_degradation(degraded_log_path):
                 log_warning(
-                    f"Degraded session detected: {role} session '{name}' "
+                    f"Degraded session detected: {role} session '{actual_name}' "
                     f"shows rate limit warnings and Crystallizing loop, "
                     f"terminating early (log: {degraded_log_path})"
                 )
@@ -1245,7 +1296,7 @@ def run_worker_phase(
                 destroy_script = scripts_dir / "agent-destroy.sh"
                 if destroy_script.is_file():
                     subprocess.run(
-                        [str(destroy_script), name, "--force"],
+                        [str(destroy_script), actual_name, "--force"],
                         cwd=ctx.repo_root,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
@@ -1267,7 +1318,7 @@ def run_worker_phase(
     # Clean up the worker session
     destroy_script = scripts_dir / "agent-destroy.sh"
     if destroy_script.is_file():
-        destroy_cmd = [str(destroy_script), name, "--force"]
+        destroy_cmd = [str(destroy_script), actual_name, "--force"]
         subprocess.run(
             destroy_cmd,
             cwd=ctx.repo_root,
@@ -1275,6 +1326,10 @@ def run_worker_phase(
             stderr=subprocess.DEVNULL,
             check=False,
         )
+
+    # Wall-clock elapsed time for reliable ghost detection.
+    # File timestamps are unreliable when pipe-pane fails.  See issue #2639.
+    elapsed = time.monotonic() - phase_start
 
     # Detect failure modes from the session log file and return synthetic
     # exit codes so the retry layer can handle each appropriately.
@@ -1284,8 +1339,10 @@ def run_worker_phase(
     # meaningful output — this is functionally a low-output session
     # and should be retried rather than treated as a builder error.
     # See issue #2446.
-    paths = LoomPaths(ctx.repo_root)
-    log_path = paths.worker_log_file(role, ctx.config.issue)
+    #
+    # Compute log path from the actual session name (which may include
+    # an attempt suffix for retry isolation).  See issue #2639.
+    log_path = _session_log_path(ctx.repo_root, actual_name)
 
     # Check for auth pre-flight failure first (exit code 9).  Auth failures
     # are NOT transient when a parent Claude session holds the config lock,
@@ -1294,7 +1351,7 @@ def run_worker_phase(
     # never be overridden by log pattern matching.  See issue #2540.
     if wait_exit != 0 and _is_auth_failure(log_path):
         log_warning(
-            f"Auth pre-flight failure for {role} session '{name}': "
+            f"Auth pre-flight failure for {role} session '{actual_name}': "
             f"authentication check failed (not retryable, log: {log_path})"
         )
         return 9
@@ -1304,13 +1361,15 @@ def run_worker_phase(
     # lasted < 2s.  These are infrastructure failures that should be retried
     # on a separate budget.  Check before MCP/low-output to avoid consuming
     # their retry budgets.  See issues #2604, #2644.
-    if wait_exit != 0 and _is_ghost_session(log_path):
+    # Use wall-clock timing for reliable duration estimation.  See issue #2639.
+    if wait_exit != 0 and _is_ghost_session(log_path, wall_clock_duration=elapsed):
         errors = extract_log_errors(log_path)
         cause = _classify_ghost_cause(log_path)
         detail = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"Ghost session detected for {role} session '{name}' "
+            f"Ghost session detected for {role} session '{actual_name}' "
             f"(cause: {cause}{detail}, "
+            f"{elapsed:.1f}s wall-clock, "
             f"exit code {wait_exit}, log: {log_path})"
         )
         return 10
@@ -1323,7 +1382,7 @@ def run_worker_phase(
     # See issue #2631.
     if _is_degraded_session(log_path):
         log_warning(
-            f"Degraded session detected for {role} session '{name}': "
+            f"Degraded session detected for {role} session '{actual_name}': "
             f"rate limit warnings and Crystallizing loop "
             f"(exit code {wait_exit}, log: {log_path})"
         )
@@ -1335,7 +1394,7 @@ def run_worker_phase(
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"MCP server failure detected for {role} session '{name}'{cause} "
+            f"MCP server failure detected for {role} session '{actual_name}'{cause} "
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 7
@@ -1343,7 +1402,7 @@ def run_worker_phase(
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"Low output detected for {role} session '{name}'{cause} "
+            f"Low output detected for {role} session '{actual_name}'{cause} "
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 6
@@ -1398,6 +1457,7 @@ def run_phase_with_retry(
     low_output_retries = 0
     mcp_failure_retries = 0
     ghost_retries = 0
+    attempt = 0  # Total attempt counter for unique session names (issue #2639)
 
     while True:
         attempt_start = time.monotonic()
@@ -1411,7 +1471,12 @@ def run_phase_with_retry(
             pr_number=pr_number,
             args=args,
             planning_timeout=planning_timeout,
+            attempt=attempt,
         )
+        # Compute the actual session name used for this attempt (must
+        # match the logic in run_worker_phase for log file lookups).
+        actual_name = f"{name}-a{attempt}" if attempt > 0 else name
+        attempt += 1
         attempt_elapsed = time.monotonic() - attempt_start
 
         # --- Planning stall (exit code 8) ---
@@ -1458,9 +1523,9 @@ def run_phase_with_retry(
         # MCP) retain their full retry budget.  See issues #2604, #2644.
         if exit_code == 10:
             # Classify root cause and select cause-specific retry strategy.
-            # See issue #2644.
-            paths = LoomPaths(ctx.repo_root)
-            log_path = paths.worker_log_file(role, ctx.config.issue)
+            # Use the actual session name (may include attempt suffix) for
+            # correct log file lookup.  See issues #2639, #2644.
+            log_path = _session_log_path(ctx.repo_root, actual_name)
             ghost_cause = _classify_ghost_cause(log_path)
             cause_max_retries, cause_backoff = GHOST_RETRY_STRATEGIES.get(
                 ghost_cause, GHOST_RETRY_STRATEGIES["unknown"]
@@ -1523,8 +1588,7 @@ def run_phase_with_retry(
 
             mcp_failure_retries += 1
             if mcp_failure_retries > MCP_FAILURE_MAX_RETRIES:
-                paths = LoomPaths(ctx.repo_root)
-                log_path = paths.worker_log_file(role, ctx.config.issue)
+                log_path = _session_log_path(ctx.repo_root, actual_name)
                 errors = extract_log_errors(log_path)
                 cause = f": {errors[-1]}" if errors else ""
                 log_warning(
@@ -1559,8 +1623,7 @@ def run_phase_with_retry(
         if exit_code == 6:
             # Classify root cause from the worker log and select a
             # cause-specific retry strategy.  See issue #2518.
-            paths = LoomPaths(ctx.repo_root)
-            log_path = paths.worker_log_file(role, ctx.config.issue)
+            log_path = _session_log_path(ctx.repo_root, actual_name)
             cause = _classify_low_output_cause(log_path)
             # Surface the classification on the context so callers
             # (e.g., _gather_diagnostics) can include it.  See issue #2562.
