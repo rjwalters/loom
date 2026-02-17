@@ -323,7 +323,7 @@ git push --force-with-lease
 
 I'll evaluate again once conflicts are resolved.
 EOF
-)"
+)" && \
             gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
         fi
     else
@@ -346,7 +346,7 @@ git push --force-with-lease
 
 I'll re-evaluate once conflicts are resolved, or the Doctor role will handle this.
 EOF
-)"
+)" && \
         gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
     fi
 fi
@@ -412,8 +412,8 @@ Please rebase your branch and resolve conflicts, or the Doctor role will handle 
 
 I'll evaluate the code once conflicts are resolved.
 FEEDBACK
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
 
 ### Edge Cases
@@ -494,8 +494,8 @@ Please fix these issues before the PR can be approved. Common causes:
 
 I'll evaluate again once CI passes.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:ci-failure"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:ci-failure"
 ```
 
 ### When Merge Conflicts Exist
@@ -528,8 +528,8 @@ git push --force-with-lease
 
 I'll re-evaluate once conflicts are resolved, or the Doctor role will handle this.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
 ```
 
 ### When CI is Pending
@@ -723,8 +723,8 @@ See Builder role docs for PR creation best practices.
 
 I'll evaluate the code changes once the PR description is fixed.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
 
 3. **Wait for fix before evaluating code**
@@ -803,8 +803,8 @@ gh pr comment <number> --body "$(cat <<'EOF'
 
 Code quality looks great - tests pass, implementation is clean, and documentation is complete.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Important Guidelines
@@ -831,8 +831,8 @@ sed -i '' 's/Issue #123/Closes #123/g' /tmp/pr-body.txt
 gh pr edit 42 --body-file /tmp/pr-body.txt
 
 # 4. Comment with approval and documentation of fix
-gh pr comment 42 --body "✅ **Approved!** Updated PR description to use 'Closes #123' for auto-close. Code looks great!"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment 42 --body "✅ **Approved!** Updated PR description to use 'Closes #123' for auto-close. Code looks great!" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 **Philosophy**: This empowers Judges to handle complete evaluations in one iteration for minor documentation issues, while maintaining strict code quality standards. The Builder's intent is preserved, and the evaluation process is faster.
@@ -900,8 +900,8 @@ Fixed during evaluation:
 
 Code quality is excellent, tests pass, implementation is solid.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Example Workflow
@@ -921,8 +921,8 @@ git commit -m "Remove unused import (during evaluation)"
 git push
 
 # 5. Approve with note about the fix
-gh pr comment 42 --body "✅ **Approved!** Removed unused import during evaluation. Code looks great!"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment 42 --body "✅ **Approved!** Removed unused import during evaluation. Code looks great!" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Important Guidelines
@@ -1295,8 +1295,8 @@ EOF
 )"
 
 # Then approve with reference to the issue
-gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent."
-gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent." && \
+  gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Benefits
