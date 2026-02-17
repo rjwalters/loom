@@ -2539,6 +2539,70 @@ class TestDoctorTestFixLoop:
         assert result == ShepherdExitCode.SHUTDOWN
 
 
+class TestTestTimeoutSkipsDoctor:
+    """Test that test timeouts skip the Doctor loop (issue #2391)."""
+
+    @patch("loom_tools.shepherd.cli._run_reflection")
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_timeout_skips_doctor(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        mock_mark_failure: MagicMock,
+        mock_reflection: MagicMock,
+    ) -> None:
+        """Test timeout returns PR_TESTS_FAILED without invoking Doctor."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            305,   # builder elapsed (timeout)
+            305,   # duration calc in reflection
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Builder reports test timeout (not just failure)
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification timed out after 300s (pytest)",
+            phase_name="builder",
+            data={"test_failure": True, "test_timeout": True},
+        )
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.PR_TESTS_FAILED
+
+        # Doctor should NOT have been called
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.assert_not_called()
+        # Should be marked as test failure
+        mock_mark_failure.assert_called_once()
+        # Reflection should report test_timeout status
+        ctx.report_milestone.assert_any_call(
+            "phase_completed",
+            phase="builder",
+            duration_seconds=300,
+            status="test_timeout",
+        )
+
+
 class TestDoctorRegressionGuard:
     """Test that the doctor test-fix loop aborts when doctor makes things worse."""
 

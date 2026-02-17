@@ -1587,7 +1587,7 @@ class BuilderPhase:
                     status=PhaseStatus.FAILED,
                     message=f"supplemental test timed out after {elapsed}s ({display_name})",
                     phase_name="builder",
-                    data={"test_failure": True},
+                    data={"test_failure": True, "test_timeout": True},
                 )
             except OSError as e:
                 log_warning(f"Could not run supplemental test ({display_name}): {e}")
@@ -2009,7 +2009,7 @@ class BuilderPhase:
                 status=PhaseStatus.FAILED,
                 message=f"test verification timed out after {elapsed}s ({display_name})",
                 phase_name="builder",
-                data={"test_failure": True},
+                data={"test_failure": True, "test_timeout": True},
             )
         except OSError as e:
             log_warning(f"Could not run tests ({display_name}): {e}")
@@ -2195,7 +2195,7 @@ class BuilderPhase:
                 status=PhaseStatus.FAILED,
                 message=f"test verification timed out after {elapsed}s ({display_name})",
                 phase_name="builder",
-                data={"test_failure": True},
+                data={"test_failure": True, "test_timeout": True},
             )
         except OSError as e:
             log_warning(f"Could not run tests ({display_name}): {e}")
