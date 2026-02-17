@@ -952,66 +952,35 @@ impl TerminalManager {
             .get(id)
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
-        // Check if terminal has a worktree_path for reference counting
-        if let Some(ref worktree_path) = info.worktree_path {
-            let path = PathBuf::from(worktree_path);
-            if path.to_string_lossy().contains(".loom/worktrees") {
-                // Count how many OTHER terminals are using this worktree
-                let other_users = self
-                    .terminals
-                    .values()
-                    .filter(|t| t.id != *id && t.worktree_path.as_ref() == Some(worktree_path))
-                    .count();
+        // Capture worktree info before killing the session.
+        // We need to kill the tmux session FIRST to avoid leaving the shell's
+        // CWD pointing at a deleted worktree path (see issue #2413).
+        let worktree_to_remove: Option<(String, PathBuf)> =
+            if let Some(ref worktree_path) = info.worktree_path {
+                let path = PathBuf::from(worktree_path);
+                if path.to_string_lossy().contains(".loom/worktrees") {
+                    let other_users = self
+                        .terminals
+                        .values()
+                        .filter(|t| t.id != *id && t.worktree_path.as_ref() == Some(worktree_path))
+                        .count();
 
-                if other_users == 0 {
-                    // This is the last terminal - safe to remove
-                    log::info!(
-                        "Removing worktree at {} (no other terminals using it)",
-                        path.display()
-                    );
-
-                    // Derive repo root from worktree path (e.g., /repo/.loom/worktrees/issue-42 → /repo)
-                    // Run git from repo root to avoid CWD-inside-worktree issues
-                    let repo_root = path
-                        .ancestors()
-                        .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
-                        .map(std::path::Path::to_path_buf);
-
-                    // First try to remove the worktree via git
-                    let mut cmd = Command::new("git");
-                    cmd.args(["worktree", "remove", worktree_path]);
-                    if let Some(ref root) = repo_root {
-                        cmd.current_dir(root);
+                    if other_users == 0 {
+                        Some((worktree_path.clone(), path))
+                    } else {
+                        log::info!(
+                            "Skipping worktree removal at {} ({} other terminal(s) still using it)",
+                            path.display(),
+                            other_users
+                        );
+                        None
                     }
-                    let output = cmd.output();
-
-                    if let Ok(output) = output {
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            log::warn!("git worktree remove failed: {stderr}");
-                            log::info!("Attempting force removal...");
-
-                            // Try force removal
-                            let mut cmd = Command::new("git");
-                            cmd.args(["worktree", "remove", "--force", worktree_path]);
-                            if let Some(ref root) = repo_root {
-                                cmd.current_dir(root);
-                            }
-                            let _ = cmd.output();
-                        }
-                    }
-
-                    // Also try to remove directory manually as fallback
-                    let _ = fs::remove_dir_all(&path);
                 } else {
-                    log::info!(
-                        "Skipping worktree removal at {} ({} other terminal(s) still using it)",
-                        path.display(),
-                        other_users
-                    );
+                    None
                 }
-            }
-        }
+            } else {
+                None
+            };
 
         // Stop pipe-pane (passing no command closes the pipe)
         let _ = Command::new("tmux")
@@ -1029,6 +998,46 @@ impl TerminalManager {
             .args(["kill-session", "-t", &info.tmux_session])
             .spawn()
             .and_then(|mut c| c.wait());
+
+        // Now that the tmux session is dead, safe to remove the worktree
+        // without breaking any shell's working directory.
+        if let Some((worktree_path, path)) = worktree_to_remove {
+            log::info!("Removing worktree at {} (no other terminals using it)", path.display());
+
+            // Derive repo root from worktree path (e.g., /repo/.loom/worktrees/issue-42 → /repo)
+            // Run git from repo root to avoid CWD-inside-worktree issues
+            let repo_root = path
+                .ancestors()
+                .find(|p| p.join(".loom").is_dir() && p.join(".git").exists())
+                .map(std::path::Path::to_path_buf);
+
+            // First try to remove the worktree via git
+            let mut cmd = Command::new("git");
+            cmd.args(["worktree", "remove", &worktree_path]);
+            if let Some(ref root) = repo_root {
+                cmd.current_dir(root);
+            }
+            let output = cmd.output();
+
+            if let Ok(output) = output {
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    log::warn!("git worktree remove failed: {stderr}");
+                    log::info!("Attempting force removal...");
+
+                    // Try force removal
+                    let mut cmd = Command::new("git");
+                    cmd.args(["worktree", "remove", "--force", &worktree_path]);
+                    if let Some(ref root) = repo_root {
+                        cmd.current_dir(root);
+                    }
+                    let _ = cmd.output();
+                }
+            }
+
+            // Also try to remove directory manually as fallback
+            let _ = fs::remove_dir_all(&path);
+        }
 
         // Clean up the output file
         let output_file = format!("/tmp/loom-{id}.out");

@@ -1283,6 +1283,7 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
             f"```\n\n"
             f"**Option B: Reset and retry**\n"
             f"```bash\n"
+            f'cd "$(git rev-parse --show-toplevel)"  # Avoid broken CWD after removal\n'
             f"git worktree remove {ctx.worktree_path or '.loom/worktrees/issue-' + str(ctx.config.issue)} --force\n"
             f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests --add-label loom:issue\n"
             f"```",

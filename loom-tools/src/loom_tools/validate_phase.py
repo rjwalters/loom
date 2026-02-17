@@ -361,6 +361,8 @@ class BuilderDiagnostics:
 
 **Option A: Clean worktree and retry** (recommended if worktree has no valuable changes)
 ```bash
+# Navigate to repo root first (worktree removal breaks shell CWD)
+cd "$(git rev-parse --show-toplevel)"
 # Remove stale worktree
 git worktree remove .loom/worktrees/issue-{issue} --force 2>/dev/null || true
 git branch -D feature/issue-{issue} 2>/dev/null || true
