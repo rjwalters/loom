@@ -317,49 +317,64 @@ check_cli_available() {
 check_auth_status() {
     local auth_output
     local auth_exit_code
+    local max_retries=3
+    local -a backoff_seconds=(2 5 10)
 
-    # Unset CLAUDECODE to avoid nested-session guard when running inside
-    # a Claude Code session (e.g., during testing or shepherd-spawned builds).
-    # Use timeout to prevent hanging after a long first attempt leaves
-    # auth in a bad state (see issue #2472).
-    auth_output=$(timeout 15 bash -c 'CLAUDECODE="" claude auth status --json 2>&1') || auth_exit_code=$?
-    auth_exit_code="${auth_exit_code:-0}"
+    for (( attempt=1; attempt<=max_retries; attempt++ )); do
+        auth_exit_code=0
 
-    # timeout exits with 124 when the command times out
-    if [[ "${auth_exit_code}" -eq 124 ]]; then
-        log_error "Authentication check timed out after 15s"
-        return 1
-    fi
+        # Unset CLAUDECODE to avoid nested-session guard when running inside
+        # a Claude Code session (e.g., during testing or shepherd-spawned builds).
+        # Use timeout to prevent hanging after a long first attempt leaves
+        # auth in a bad state (see issue #2472).
+        auth_output=$(timeout 15 bash -c 'CLAUDECODE="" claude auth status --json 2>&1') || auth_exit_code=$?
 
-    if [[ "${auth_exit_code}" -ne 0 ]]; then
-        log_error "Authentication check command failed (exit ${auth_exit_code})"
-        log_error "Output: ${auth_output}"
-        if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-            log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
-            log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
-        else
-            log_error "Run: claude auth login"
+        # timeout exits with 124 when the command times out
+        if [[ "${auth_exit_code}" -eq 124 ]]; then
+            if (( attempt < max_retries )); then
+                local backoff=${backoff_seconds[$((attempt - 1))]}
+                log_info "Authentication check timed out (attempt ${attempt}/${max_retries}), retrying in ${backoff}s..."
+                sleep "${backoff}"
+                continue
+            fi
+            log_error "Authentication check timed out after ${max_retries} attempts"
+            return 1
         fi
-        return 1
-    fi
 
-    # Parse the loggedIn field from JSON output
-    local logged_in
-    logged_in=$(echo "${auth_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
-
-    if [[ "${logged_in}" != "True" ]]; then
-        log_error "Authentication check failed: not logged in"
-        if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-            log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
-            log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
-        else
-            log_error "Run: claude auth login"
+        if [[ "${auth_exit_code}" -ne 0 ]]; then
+            log_error "Authentication check command failed (exit ${auth_exit_code})"
+            log_error "Output: ${auth_output}"
+            if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+                log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+                log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
+            else
+                log_error "Run: claude auth login"
+            fi
+            return 1
         fi
-        return 1
-    fi
 
-    log_info "Authentication check passed (logged in)"
-    return 0
+        # Parse the loggedIn field from JSON output
+        local logged_in
+        logged_in=$(echo "${auth_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
+
+        if [[ "${logged_in}" != "True" ]]; then
+            log_error "Authentication check failed: not logged in"
+            if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
+                log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+                log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
+            else
+                log_error "Run: claude auth login"
+            fi
+            return 1
+        fi
+
+        log_info "Authentication check passed (logged in)"
+        return 0
+    done
+
+    # Should not reach here, but guard against it
+    log_error "Authentication check failed after ${max_retries} attempts"
+    return 1
 }
 
 # Pre-flight check: verify API is reachable
