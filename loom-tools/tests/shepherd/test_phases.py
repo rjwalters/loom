@@ -1912,6 +1912,138 @@ class TestBuilderScopedTestVerification:
         assert "--directory" in cmd
         assert str(tmp_path / "loom-tools") in cmd
 
+    def test_get_scoped_test_commands_python_with_test_files(
+        self, tmp_path: Path
+    ) -> None:
+        """Should scope pytest to specific test files when changed_files provided."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_stitch_cmd.py").write_text("def test_a(): pass\n")
+
+        commands = builder._get_scoped_test_commands(
+            tmp_path,
+            {"python"},
+            changed_files=["src/stitch_cmd.py", "tests/test_stitch_cmd.py"],
+        )
+
+        assert len(commands) == 1
+        cmd, display = commands[0]
+        assert "tests/test_stitch_cmd.py" in cmd
+        assert "tests/test_stitch_cmd.py" in display
+
+    def test_get_scoped_test_commands_python_source_finds_test(
+        self, tmp_path: Path
+    ) -> None:
+        """Should find corresponding test file for a source file change."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "module.py").write_text("")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_module.py").write_text("def test_a(): pass\n")
+
+        commands = builder._get_scoped_test_commands(
+            tmp_path,
+            {"python"},
+            changed_files=["src/module.py"],
+        )
+
+        assert len(commands) == 1
+        cmd, display = commands[0]
+        assert "tests/test_module.py" in cmd
+        assert "tests/test_module.py" in display
+
+    def test_get_scoped_test_commands_python_no_test_found_falls_back(
+        self, tmp_path: Path
+    ) -> None:
+        """Should fall back to full pytest when no test file found for source."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "module.py").write_text("")
+        # No test file exists
+
+        commands = builder._get_scoped_test_commands(
+            tmp_path,
+            {"python"},
+            changed_files=["src/module.py"],
+        )
+
+        assert len(commands) == 1
+        cmd, display = commands[0]
+        assert display == "pytest"
+        # Should run full pytest (no specific files)
+        assert cmd == ["uv", "run", "pytest", "-x", "-q"]
+
+    def test_get_scoped_test_commands_python_no_changed_files(
+        self, tmp_path: Path
+    ) -> None:
+        """Should run full pytest when changed_files is None."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        commands = builder._get_scoped_test_commands(
+            tmp_path, {"python"}, changed_files=None
+        )
+
+        assert len(commands) == 1
+        assert commands[0][1] == "pytest"
+        assert commands[0][0] == ["uv", "run", "pytest", "-x", "-q"]
+
+    def test_get_scoped_test_commands_nested_python_with_test_files(
+        self, tmp_path: Path
+    ) -> None:
+        """Should scope to test files with --directory for nested python root."""
+        builder = BuilderPhase()
+        loom_tools = tmp_path / "loom-tools"
+        loom_tools.mkdir()
+        (loom_tools / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (loom_tools / "tests").mkdir()
+        (loom_tools / "tests" / "test_foo.py").write_text("def test_a(): pass\n")
+
+        commands = builder._get_scoped_test_commands(
+            tmp_path,
+            {"python"},
+            changed_files=["loom-tools/tests/test_foo.py"],
+        )
+
+        assert len(commands) == 1
+        cmd, display = commands[0]
+        assert "--directory" in cmd
+        assert str(loom_tools) in cmd
+        assert "tests/test_foo.py" in cmd
+        assert "tests/test_foo.py" in display
+
+    def test_get_python_test_files_deduplicates(self, tmp_path: Path) -> None:
+        """Should not include the same test file twice."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_foo.py").write_text("def test_a(): pass\n")
+
+        # Both source and test file point to the same test
+        test_files = builder._get_python_test_files(
+            tmp_path,
+            ["src/foo.py", "tests/test_foo.py"],
+            tmp_path,
+        )
+
+        assert test_files == ["tests/test_foo.py"]
+
+    def test_get_python_test_files_ignores_non_python(self, tmp_path: Path) -> None:
+        """Should skip non-Python files."""
+        builder = BuilderPhase()
+        (tmp_path / "pyproject.toml").write_text("[project]\nname = 'test'\n")
+
+        test_files = builder._get_python_test_files(
+            tmp_path,
+            ["README.md", "Cargo.toml", "src/main.rs"],
+            tmp_path,
+        )
+
+        assert test_files == []
+
     def test_scoped_verification_skips_unrelated_tests(
         self, mock_context: MagicMock, tmp_path: Path
     ) -> None:

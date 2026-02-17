@@ -1200,14 +1200,89 @@ class BuilderPhase:
                 return worktree / subdir
         return None
 
+    def _get_python_test_files(
+        self, worktree: Path, changed_files: list[str], python_root: Path
+    ) -> list[str]:
+        """Extract Python test file paths from changed files.
+
+        For each changed Python file, determines the relevant test file:
+        - If the file is already a test file (test_*.py or *_test.py), include it
+        - If the file is a source file, look for a corresponding test file
+
+        Returns paths relative to python_root suitable for passing to pytest.
+        Returns an empty list if no specific test files can be identified
+        (caller should fall back to running the full pytest suite).
+        """
+        test_files: list[str] = []
+
+        for filepath in changed_files:
+            if not filepath.endswith(".py") and not filepath.endswith(".pyi"):
+                continue
+
+            filename = Path(filepath).name
+            # Check if this is already a test file
+            if filename.startswith("test_") or filename.endswith("_test.py"):
+                # Resolve the path relative to python_root
+                abs_path = worktree / filepath
+                if abs_path.is_file():
+                    try:
+                        rel = str(abs_path.relative_to(python_root))
+                        if rel not in test_files:
+                            test_files.append(rel)
+                    except ValueError:
+                        # File is outside python_root, skip
+                        pass
+                continue
+
+            # Source file: try to find corresponding test file
+            stem = Path(filepath).stem
+            # Common patterns: module.py -> test_module.py
+            test_name = f"test_{stem}.py"
+            # Search for test file in the python_root's test directories
+            abs_path = worktree / filepath
+            parent = abs_path.parent
+
+            # Look for test file in common locations relative to the source
+            candidates = [
+                parent / test_name,                          # Same directory
+                worktree / "tests" / test_name,              # Root tests/
+                python_root / "tests" / test_name,           # Python root tests/
+            ]
+            # Also check tests/ relative to parent path structure
+            try:
+                rel_to_root = abs_path.relative_to(python_root)
+                # e.g. src/foo/bar.py -> tests/foo/test_bar.py
+                test_in_mirror = python_root / "tests" / rel_to_root.parent / test_name
+                candidates.append(test_in_mirror)
+            except ValueError:
+                pass
+
+            for candidate in candidates:
+                if candidate.is_file():
+                    try:
+                        rel = str(candidate.relative_to(python_root))
+                        if rel not in test_files:
+                            test_files.append(rel)
+                    except ValueError:
+                        pass
+                    break
+
+        return test_files
+
     def _get_scoped_test_commands(
-        self, worktree: Path, languages: set[str]
+        self,
+        worktree: Path,
+        languages: set[str],
+        changed_files: list[str] | None = None,
     ) -> list[tuple[list[str], str]]:
         """Get the test commands scoped to the changed languages.
 
         Returns a list of (command_args, display_name) tuples for the relevant
         test suites. If "config" is in languages, returns all test commands
         (config changes affect everything).
+
+        When changed_files is provided, pytest commands are scoped to specific
+        test files rather than running the entire suite.
 
         Returns an empty list if no relevant tests are detected.
         """
@@ -1227,7 +1302,25 @@ class BuilderPhase:
 
         # Python changes -> Python tests only
         if "python" in languages and python_root:
-            if python_root == worktree:
+            # Try to scope to specific test files
+            test_files: list[str] = []
+            if changed_files:
+                test_files = self._get_python_test_files(
+                    worktree, changed_files, python_root
+                )
+
+            if test_files:
+                # Scope pytest to specific test files
+                if python_root == worktree:
+                    cmd = ["uv", "run", "pytest", "-x", "-q"] + test_files
+                else:
+                    cmd = [
+                        "uv", "run", "--directory", str(python_root),
+                        "pytest", "-x", "-q",
+                    ] + test_files
+                display = f"pytest {' '.join(test_files)}"
+                commands.append((cmd, display))
+            elif python_root == worktree:
                 commands.append((["uv", "run", "pytest", "-x", "-q"], "pytest"))
             else:
                 commands.append(
@@ -2213,8 +2306,10 @@ class BuilderPhase:
                 f"languages: {sorted(languages) if languages else 'none detected'}"
             )
 
-            # Get scoped test commands based on changed languages
-            test_commands = self._get_scoped_test_commands(ctx.worktree_path, languages)
+            # Get scoped test commands based on changed languages and files
+            test_commands = self._get_scoped_test_commands(
+                ctx.worktree_path, languages, changed_files
+            )
 
             if test_commands:
                 # Run scoped tests instead of full suite
