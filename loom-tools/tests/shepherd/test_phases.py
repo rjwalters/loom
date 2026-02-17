@@ -11098,6 +11098,49 @@ class TestRunWorkerPhaseInstantExit:
 
         assert exit_code == 6
 
+    def test_spawn_env_disables_wrapper_retries(self, mock_context: MagicMock) -> None:
+        """Spawn subprocess should set LOOM_MAX_RETRIES=1 to prevent double retry.
+
+        The shepherd's run_phase_with_retry manages retries with milestones and
+        backoff. The shell wrapper should not retry internally, otherwise we get
+        N * M total attempts instead of the intended N.  See issue #2516.
+        """
+        spawn_envs: list[dict | None] = []
+
+        def capture_spawn_env(cmd, **kwargs):
+            spawn_envs.append(kwargs.get("env"))
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=capture_spawn_env),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+            ),
+        ):
+            run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        # First subprocess.run call is the spawn — it should have env with LOOM_MAX_RETRIES=1
+        assert len(spawn_envs) >= 1, "subprocess.run should have been called at least once"
+        spawn_env = spawn_envs[0]
+        assert spawn_env is not None, "spawn subprocess should receive explicit env"
+        assert spawn_env.get("LOOM_MAX_RETRIES") == "1"
+
     def test_normal_completion_returns_code_0(self, mock_context: MagicMock) -> None:
         """When agent completes normally, return exit code 0."""
 

@@ -640,11 +640,19 @@ def spawn_agent(
     if worktree and working_dir != repo_root:
         worktree_prefix = f"LOOM_WORKTREE_PATH='{working_dir}' "
 
+    # Propagate LOOM_MAX_RETRIES if the caller set it (e.g. shepherd
+    # sets it to 1 to prevent double-retry with run_phase_with_retry).
+    # See issue #2516.
+    max_retries_prefix = ""
+    max_retries_val = os.environ.get("LOOM_MAX_RETRIES")
+    if max_retries_val is not None:
+        max_retries_prefix = f"LOOM_MAX_RETRIES='{max_retries_val}' "
+
     # Build the Claude CLI command
     wrapper_script = repo_root / ".loom" / "scripts" / "claude-wrapper.sh"
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
         claude_cmd = (
-            f"{pythonpath_prefix}{worktree_prefix}"
+            f"{pythonpath_prefix}{worktree_prefix}{max_retries_prefix}"
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
             f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
             f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""

@@ -686,11 +686,22 @@ def run_worker_phase(
     # Spawn the worker
     # Redirect to DEVNULL to suppress output - agent logs are captured to
     # .loom/logs/<session>.log for debugging purposes
+    #
+    # Disable wrapper-level retries (LOOM_MAX_RETRIES=1) because
+    # run_phase_with_retry() manages retries with better observability
+    # (milestones, backoff).  Without this, the wrapper retries up to 5
+    # times internally *and* the Python code retries up to 3 times on top,
+    # causing up to 15 total CLI invocations instead of the intended 3.
+    # See issue #2516.
+    spawn_env = os.environ.copy()
+    spawn_env["LOOM_MAX_RETRIES"] = "1"
+
     spawn_result = subprocess.run(
         spawn_cmd,
         cwd=ctx.repo_root,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=spawn_env,
         check=False,
     )
 
