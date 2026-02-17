@@ -756,20 +756,126 @@ def validate_builder(
                 "No substantive changes to recover (only marker files found).",
             )
 
-    # No auto-recovery: fail with diagnostics
-    # Builder failed to create a PR. Mark the issue with failure label and
-    # provide diagnostics for manual intervention.
-    diag = _gather_builder_diagnostics(issue, worktree, repo_root)
-    _mark_phase_failed(
-        issue, "builder",
-        "Builder did not create a PR. Worktree has uncommitted or unpushed changes "
-        "that require manual review.",
-        repo_root, diag.to_markdown(),
-        failure_label="loom:failed:builder",
+    # Attempt mechanical recovery: stage, commit, push, create PR.
+    # The builder produced substantive changes but exited before completing
+    # the git/PR workflow.  We can finish the mechanical steps directly.
+    branch = f"feature/issue-{issue}"
+
+    # Step 1: Stage and commit if there are uncommitted changes
+    if status_output:
+        # Extract meaningful file paths from porcelain output
+        files_to_stage = []
+        for line in substantive:
+            path = line[3:].strip().strip('"') if len(line) > 3 else line.strip()
+            if path:
+                files_to_stage.append(path)
+
+        if files_to_stage:
+            r = subprocess.run(
+                ["git", "-C", worktree, "add", "--"] + files_to_stage,
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode != 0:
+                diag = _gather_builder_diagnostics(issue, worktree, repo_root)
+                _mark_phase_failed(
+                    issue, "builder",
+                    f"Recovery failed: git add failed: {r.stderr.strip()[:200]}",
+                    repo_root, diag.to_markdown(),
+                    failure_label="loom:failed:builder",
+                )
+                return ValidationResult(
+                    "builder", issue, ValidationStatus.FAILED,
+                    "Recovery failed: could not stage changes.",
+                )
+
+            commit_msg = f"feat: implement changes for issue #{issue}"
+            r = subprocess.run(
+                ["git", "-C", worktree, "commit", "-m", commit_msg],
+                capture_output=True, text=True, check=False,
+            )
+            if r.returncode != 0:
+                diag = _gather_builder_diagnostics(issue, worktree, repo_root)
+                _mark_phase_failed(
+                    issue, "builder",
+                    f"Recovery failed: git commit failed: {r.stderr.strip()[:200]}",
+                    repo_root, diag.to_markdown(),
+                    failure_label="loom:failed:builder",
+                )
+                return ValidationResult(
+                    "builder", issue, ValidationStatus.FAILED,
+                    "Recovery failed: could not commit changes.",
+                )
+
+    # Step 2: Push the branch
+    r = subprocess.run(
+        ["git", "-C", worktree, "push", "-u", "origin", branch],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        diag = _gather_builder_diagnostics(issue, worktree, repo_root)
+        _mark_phase_failed(
+            issue, "builder",
+            f"Recovery failed: git push failed: {r.stderr.strip()[:200]}",
+            repo_root, diag.to_markdown(),
+            failure_label="loom:failed:builder",
+        )
+        return ValidationResult(
+            "builder", issue, ValidationStatus.FAILED,
+            "Recovery failed: could not push branch.",
+        )
+
+    # Step 3: Create PR
+    # Fetch issue title for the PR title
+    r_title = _run_gh(
+        ["issue", "view", str(issue), "--json", "title", "--jq", ".title"],
+        repo_root,
+    )
+    pr_title = r_title.stdout.strip() if r_title.returncode == 0 and r_title.stdout.strip() else f"Issue #{issue}"
+
+    r = subprocess.run(
+        [
+            "gh", "pr", "create",
+            "--head", branch,
+            "--title", pr_title,
+            "--label", "loom:review-requested",
+            "--body", f"Closes #{issue}",
+        ],
+        cwd=repo_root,
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode != 0:
+        diag = _gather_builder_diagnostics(issue, worktree, repo_root)
+        _mark_phase_failed(
+            issue, "builder",
+            f"Recovery failed: gh pr create failed: {r.stderr.strip()[:200]}",
+            repo_root, diag.to_markdown(),
+            failure_label="loom:failed:builder",
+        )
+        return ValidationResult(
+            "builder", issue, ValidationStatus.FAILED,
+            "Recovery failed: could not create PR.",
+        )
+
+    # Extract PR number from output (format: "https://github.com/.../pull/123")
+    pr_url = r.stdout.strip()
+    recovered_pr = _parse_pr_number(pr_url.split("/")[-1] if "/" in pr_url else pr_url)
+
+    _report_milestone(
+        "heartbeat", task_id, repo_root,
+        action=f"recovery: created PR from uncommitted worktree changes for issue #{issue}",
+    )
+    _log_recovery_event(
+        issue=issue,
+        recovery_type="commit_and_pr",
+        reason="validation_failed",
+        repo_root=repo_root,
+        worktree_had_changes=bool(status_output),
+        pr_number=recovered_pr,
     )
     return ValidationResult(
-        "builder", issue, ValidationStatus.FAILED,
-        "No PR found. Builder failed without creating PR (no auto-recovery).",
+        "builder", issue, ValidationStatus.RECOVERED,
+        f"Recovered: staged, committed, pushed, and created PR from worktree changes",
+        "commit_and_pr",
     )
 
 

@@ -242,7 +242,7 @@ Before writing any code, confirm ALL of these:
 
 ## Progress Checkpoints
 
-**IMPORTANT**: Write checkpoints as you progress through implementation stages. Checkpoints allow the shepherd to detect partial progress if you fail, enabling smarter recovery instead of always retrying from scratch.
+**CRITICAL: Write checkpoints at every stage to enable recovery.** Without checkpoints, the shepherd cannot reliably distinguish "builder made real progress but crashed" from "builder never started meaningful work." While the shepherd can now detect some cases of uncommitted work via log analysis and file counts, checkpoints remain the primary and most reliable signal for recovery. Always write them — skipping checkpoints risks your completed work being retried from scratch instead of recovered.
 
 ### Checkpoint Stages
 

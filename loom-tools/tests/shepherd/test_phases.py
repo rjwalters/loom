@@ -8274,6 +8274,82 @@ class TestBuilderHasIncompleteWork:
         assert builder._has_incomplete_work(diag) is False
 
 
+class TestBuilderHasIncompleteWorkWithoutCheckpoint:
+    """Test _has_incomplete_work detects substantive changes without a checkpoint (issue #2572)."""
+
+    def test_uncommitted_with_implementation_activity_returns_true(self) -> None:
+        """Uncommitted changes + log implementation activity = incomplete work."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "log_has_implementation_activity": True,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_uncommitted_with_multiple_files_returns_true(self) -> None:
+        """Uncommitted changes + >=2 substantive files = incomplete work."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "uncommitted_file_count": 3,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+    def test_uncommitted_with_one_file_no_activity_returns_false(self) -> None:
+        """Uncommitted changes + 1 file + no activity = not incomplete (could be marker)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "log_has_implementation_activity": False,
+            "uncommitted_file_count": 1,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
+    def test_uncommitted_no_evidence_returns_false(self) -> None:
+        """Uncommitted changes + no checkpoint + no activity + 0 files = not incomplete."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "log_has_implementation_activity": False,
+            "uncommitted_file_count": 0,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
+    def test_uncommitted_with_exactly_two_files_returns_true(self) -> None:
+        """Boundary: exactly 2 uncommitted files should be treated as incomplete."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "uncommitted_file_count": 2,
+        }
+        assert builder._has_incomplete_work(diag) is True
+
+
 class TestBuilderRecoverFromExistingWorktree:
     """Test _recover_from_existing_worktree for exit code 6/7 recovery (issue #2507)."""
 

@@ -507,11 +507,12 @@ class TestValidateBuilder:
 # ---------------------------------------------------------------------------
 
 
-class TestBuilderNoAutoRecovery:
-    """Tests verifying auto-recovery was removed from builder validation.
+class TestBuilderRecoveryFromUncommittedChanges:
+    """Tests verifying auto-recovery from substantive uncommitted changes.
 
-    Note: Auto-recovery (commit, push, create PR) was removed in favor of
-    explicit failure labels. These tests verify the new behavior.
+    When the builder exits with substantive uncommitted changes in the worktree,
+    validate_builder should attempt mechanical recovery (stage, commit, push,
+    create PR) instead of immediately failing.
     """
 
     def _make_worktree(self, tmp_path: Path) -> Path:
@@ -521,69 +522,86 @@ class TestBuilderNoAutoRecovery:
         (wt / ".git").mkdir()  # Minimal git marker
         return wt
 
+    @patch("loom_tools.validate_phase._log_recovery_event")
+    @patch("loom_tools.validate_phase._report_milestone")
     @patch("loom_tools.validate_phase.subprocess.run")
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_worktree_with_changes_fails_instead_of_recovering(
-        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
+    def test_worktree_with_changes_recovers_via_commit_push_pr(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock,
+        mock_milestone: MagicMock, mock_log_recovery: MagicMock, tmp_path: Path,
     ):
-        """Verify that uncommitted changes result in failure, not recovery."""
+        """Verify that substantive uncommitted changes trigger recovery."""
         repo = _make_repo(tmp_path)
         wt = self._make_worktree(tmp_path)
 
-        mock_gh.return_value = _completed(stdout="OPEN\n")  # issue state
+        # First _run_gh call: issue state check (OPEN)
+        # Second _run_gh call: issue title for PR
+        mock_gh.side_effect = [
+            _completed(stdout="OPEN\n"),
+            _completed(stdout="Fix the widget\n"),
+        ]
         mock_find.return_value = None  # no existing PR
 
         def side_effect_fn(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
             # git -C worktree status --porcelain
             if "status" in cmd and "--porcelain" in cmd:
-                return _completed(stdout="M src/file.py\n")  # Has changes
-            # git -C worktree log --oneline @{upstream}..HEAD
-            if "log" in cmd and "@{upstream}" in cmd:
-                return _completed(stdout="abc123 Some commit\n")  # Has unpushed commits
-            # gh issue edit (for _mark_phase_failed)
-            if "gh" in cmd and "issue" in cmd and "edit" in cmd:
+                return _completed(stdout=" M src/file.py\n M src/other.py\n")
+            # git add
+            if "git" in cmd_str and "add" in cmd:
                 return _completed()
-            # gh issue comment (for _mark_phase_failed)
-            if "gh" in cmd and "issue" in cmd and "comment" in cmd:
+            # git commit
+            if "git" in cmd_str and "commit" in cmd:
                 return _completed()
+            # git push
+            if "git" in cmd_str and "push" in cmd:
+                return _completed()
+            # gh pr create
+            if "gh" in cmd_str and "pr" in cmd and "create" in cmd:
+                return _completed(stdout="https://github.com/org/repo/pull/99\n")
             return _completed()
 
         mock_run.side_effect = side_effect_fn
 
         result = validate_builder(42, repo, worktree=str(wt))
 
-        # Should FAIL, not RECOVER - no auto-recovery anymore
-        assert result.status == ValidationStatus.FAILED
-        assert "no auto-recovery" in result.message.lower()
+        assert result.status == ValidationStatus.RECOVERED
+        assert "commit_and_pr" == result.recovery_action
+        mock_log_recovery.assert_called_once()
 
     @patch("loom_tools.validate_phase.subprocess.run")
     @patch("loom_tools.validate_phase._find_pr_for_issue")
     @patch("loom_tools.validate_phase._run_gh")
-    def test_failure_applies_correct_label(
-        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path
+    def test_recovery_fails_on_git_add_marks_failed(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path,
     ):
-        """Verify failure applies loom:failed:builder label."""
+        """Verify that failed git add results in FAILED status with diagnostics."""
         repo = _make_repo(tmp_path)
         wt = self._make_worktree(tmp_path)
 
         mock_gh.return_value = _completed(stdout="OPEN\n")
         mock_find.return_value = None
 
-        label_calls = []
-
         def side_effect_fn(*args, **kwargs):
             cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
             if "status" in cmd and "--porcelain" in cmd:
-                return _completed(stdout="M src/file.py\n")
-            if "log" in cmd and "@{upstream}" in cmd:
-                return _completed(stdout="abc123 Commit\n")
-            if "gh" in cmd and "issue" in cmd and "edit" in cmd:
-                label_calls.append(cmd)
-                return _completed()
-            if "gh" in cmd and "issue" in cmd and "comment" in cmd:
-                return _completed()
+                return _completed(stdout=" M src/file.py\n")
+            if "git" in cmd_str and "add" in cmd:
+                return _completed(returncode=1, stderr="fatal: error")
+            # For _mark_phase_failed and _gather_builder_diagnostics
+            if "rev-parse" in cmd_str:
+                return _completed(stdout="feature/issue-42\n")
+            if "rev-list" in cmd_str:
+                return _completed(stdout="0\n")
+            if "ls-remote" in cmd_str:
+                return _completed(stdout="")
+            if "pr" in cmd_str and "list" in cmd_str:
+                return _completed(stdout="")
+            if "issue" in cmd_str and "view" in cmd_str:
+                return _completed(stdout="loom:building\n")
             return _completed()
 
         mock_run.side_effect = side_effect_fn
@@ -591,8 +609,45 @@ class TestBuilderNoAutoRecovery:
         result = validate_builder(42, repo, worktree=str(wt))
 
         assert result.status == ValidationStatus.FAILED
-        assert len(label_calls) == 1
-        assert "loom:failed:builder" in label_calls[0]
+        assert "could not stage changes" in result.message.lower()
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_only_marker_files_still_fails(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path,
+    ):
+        """Verify that only marker/infrastructure files do not trigger recovery."""
+        repo = _make_repo(tmp_path)
+        wt = self._make_worktree(tmp_path)
+
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        mock_find.return_value = None
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout="?? .loom-in-use\n")
+            # For _mark_phase_failed and _gather_builder_diagnostics
+            if "rev-parse" in cmd_str:
+                return _completed(stdout="feature/issue-42\n")
+            if "rev-list" in cmd_str:
+                return _completed(stdout="0\n")
+            if "ls-remote" in cmd_str:
+                return _completed(stdout="")
+            if "pr" in cmd_str and "list" in cmd_str:
+                return _completed(stdout="")
+            if "issue" in cmd_str and "view" in cmd_str:
+                return _completed(stdout="loom:building\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt))
+
+        assert result.status == ValidationStatus.FAILED
+        assert "marker files" in result.message.lower()
 
 
 # ---------------------------------------------------------------------------
