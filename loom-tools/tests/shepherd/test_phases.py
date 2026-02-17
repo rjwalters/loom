@@ -14652,6 +14652,34 @@ class TestClassifyLowOutputCause:
         # auth_timeout is checked first, so it should win
         assert _classify_low_output_cause(log) == "auth_timeout"
 
+    def test_wrapper_crash_syntax_error_unexpected_token(
+        self, tmp_path: Path
+    ) -> None:
+        """Log with bash 'syntax error near unexpected token' should return 'wrapper_crash'."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "/path/to/claude-wrapper.sh: line 42: syntax error near unexpected token `('\n"
+        )
+        assert _classify_low_output_cause(log) == "wrapper_crash"
+
+    def test_wrapper_crash_syntax_error_unexpected_eof(
+        self, tmp_path: Path
+    ) -> None:
+        """Log with bash 'syntax error: unexpected end of file' should return 'wrapper_crash'."""
+        log = tmp_path / "worker.log"
+        log.write_text(
+            "/path/to/claude-wrapper.sh: line 100: syntax error: unexpected end of file\n"
+        )
+        assert _classify_low_output_cause(log) == "wrapper_crash"
+
+    def test_wrapper_crash_not_triggered_by_unrelated_syntax_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Log with 'syntax error' but no matching second pattern should return 'unknown'."""
+        log = tmp_path / "worker.log"
+        log.write_text("There was a syntax error in the config file\n")
+        assert _classify_low_output_cause(log) == "unknown"
+
 
 class TestLowOutputRetryStrategies:
     """Test LOW_OUTPUT_RETRY_STRATEGIES constant values."""
@@ -14670,6 +14698,11 @@ class TestLowOutputRetryStrategies:
         max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["api_unreachable"]
         assert max_retries == 1
         assert backoff == [30]
+
+    def test_wrapper_crash_has_zero_retries(self) -> None:
+        max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["wrapper_crash"]
+        assert max_retries == 0
+        assert backoff == []
 
     def test_unknown_matches_original_constants(self) -> None:
         max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["unknown"]
@@ -14716,6 +14749,40 @@ class TestRunPhaseWithRetryLowOutputClassification:
             patch(
                 "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="auth_timeout",
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="builder",
+            )
+
+        assert exit_code == 6
+        assert call_count == 1  # No retries
+
+    def test_wrapper_crash_fails_fast_no_retries(
+        self, mock_context: MagicMock
+    ) -> None:
+        """wrapper_crash cause should return 6 immediately with zero retries."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 6
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
+                return_value="wrapper_crash",
             ),
             patch("time.sleep"),
         ):
