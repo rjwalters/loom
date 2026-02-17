@@ -361,10 +361,21 @@ class JudgePhase:
         )
 
         has_approval = self._has_approval_comment(ctx)
+        has_rejection = self._has_rejection_comment(ctx)
         checks_ok = self._pr_checks_passing(ctx)
 
         if not has_approval:
             log_info("[force-mode] No approval comment found in PR — fallback denied")
+            return False
+
+        # Rejection signals override approval signals (issue #2598).
+        # When both are present (e.g., a checklist-style review with ✅ for
+        # passing items and ❌ for the overall verdict), this is a rejection.
+        if has_rejection:
+            log_info(
+                "[force-mode] Both approval and rejection signals found "
+                "— deferring to rejection fallback"
+            )
             return False
 
         if not checks_ok:
