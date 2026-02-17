@@ -16316,3 +16316,124 @@ class TestRunPhaseWithRetryGhostSession:
 
         assert exit_code == 0
         assert call_count == 3
+
+
+class TestRunPhaseWithRetryGhostCauseSpecific:
+    """Test cause-specific retry behavior for ghost sessions.
+
+    When a ghost session (exit code 10) is detected, the retry loop
+    classifies the root cause and uses cause-specific retry strategies
+    from GHOST_RETRY_STRATEGIES.  See issues #2644, #2652.
+    """
+
+    @pytest.fixture()
+    def mock_context(self) -> MagicMock:
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(
+            issue=42, task_id="test-123", stuck_max_retries=2
+        )
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
+        return ctx
+
+    def test_mcp_init_failure_retries_three_times(
+        self, mock_context: MagicMock
+    ) -> None:
+        """mcp_init_failure should get 3 retries (issue #2652)."""
+        call_count = 0
+
+        def count_calls(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 10
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=count_calls,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="mcp_init_failure",
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        max_retries, _ = GHOST_RETRY_STRATEGIES["mcp_init_failure"]
+        assert max_retries == 3
+        # 1 initial call + 3 retries = 4 total
+        assert call_count == 1 + max_retries
+        assert exit_code == 10
+
+    def test_auth_failure_fails_fast(self, mock_context: MagicMock) -> None:
+        """auth_failure should fail immediately with 0 retries."""
+        call_count = 0
+
+        def count_calls(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 10
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=count_calls,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="auth_failure",
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # Should only call once — no retries for auth failures
+        assert call_count == 1
+        assert exit_code == 10
+
+    def test_mcp_init_failure_uses_escalating_backoff(
+        self, mock_context: MagicMock
+    ) -> None:
+        """mcp_init_failure should use [10, 30, 60] escalating backoff."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=10,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="mcp_init_failure",
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        _, backoff = GHOST_RETRY_STRATEGIES["mcp_init_failure"]
+        assert backoff == [10, 30, 60]
+        sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
+        assert sleep_calls == backoff

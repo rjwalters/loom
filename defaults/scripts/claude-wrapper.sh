@@ -831,7 +831,8 @@ start_startup_monitor() {
             local matched_pattern=""
             for pattern in \
                 "MCP server failed" \
-                "MCP servers failed"; do
+                "MCP servers failed" \
+                "plugins failed"; do
                 if echo "${head_content}" | grep -qi "${pattern}" 2>/dev/null; then
                     found_failure=true
                     matched_pattern="${pattern}"
@@ -841,11 +842,15 @@ start_startup_monitor() {
 
             if [[ "${found_failure}" == "true" ]]; then
                 log_warn "Startup monitor: detected '${matched_pattern}' in early output"
-                log_warn "Startup monitor: polling for loom MCP connection (up to ${STARTUP_GRACE_PERIOD}s)"
 
                 # Poll every 2s within the grace period for the loom MCP
                 # to connect.  MCP init typically takes ~5s so a single-shot
                 # check was prone to race conditions (see issue #2660).
+                # We still check loom MCP status for diagnostic logging, but
+                # we kill the session regardless — sessions that start with
+                # MCP failures often enter a degraded state where injected
+                # commands are not processed (see issue #2652).
+                log_warn "Startup monitor: polling for loom MCP connection (up to ${STARTUP_GRACE_PERIOD}s)"
                 local poll_interval=2
                 local grace_elapsed=0
                 local loom_connected=false
@@ -869,12 +874,18 @@ start_startup_monitor() {
                     fi
                 done
 
+                # Always kill the session when MCP/plugin failures are
+                # detected.  Even when the loom MCP connected, other failed
+                # MCPs/plugins can leave the CLI in a degraded state where
+                # injected commands (e.g. /judge) are never processed,
+                # producing ghost sessions.  A clean restart via the retry
+                # loop is more reliable than hoping the degraded session
+                # recovers.  See issue #2652.
                 if [[ "${loom_connected}" == "true" ]]; then
-                    log_warn "Startup monitor: loom MCP server OK despite other MCP failures — continuing"
-                    break
+                    log_warn "Startup monitor: loom MCP OK but other MCP/plugin failures detected — killing session for clean restart"
+                else
+                    log_warn "Startup monitor: loom MCP not connected after ${STARTUP_GRACE_PERIOD}s — killing degraded session"
                 fi
-
-                log_warn "Startup monitor: loom MCP not connected after ${STARTUP_GRACE_PERIOD}s — killing degraded session"
                 pkill -INT -P $$ -f "claude" 2>/dev/null || true
                 break
             fi

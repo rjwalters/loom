@@ -99,7 +99,7 @@ GHOST_SESSION_BACKOFF_SECONDS = [10, 30, 60]
 # Similar to LOW_OUTPUT_RETRY_STRATEGIES.  See issue #2644.
 GHOST_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
     "auth_failure": (0, []),           # Auth issues won't resolve with retries
-    "mcp_init_failure": (1, [30]),     # MCP might recover after rebuild
+    "mcp_init_failure": (3, [10, 30, 60]),  # MCP failures need retries; startup monitor now kills degraded sessions (issue #2652)
     "api_unreachable": (1, [30]),      # API blip might be transient
     "wrapper_crash": (0, []),          # Script errors won't self-heal
     "unknown": (GHOST_SESSION_MAX_RETRIES, list(GHOST_SESSION_BACKOFF_SECONDS)),
