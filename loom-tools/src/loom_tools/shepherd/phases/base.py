@@ -11,6 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+from loom_tools.checkpoints import read_checkpoint
 from loom_tools.claim import extend_claim
 from loom_tools.common.logging import log_warning, strip_ansi
 from loom_tools.common.paths import LoomPaths
@@ -434,6 +435,7 @@ def run_worker_phase(
     worktree: Path | None = None,
     pr_number: int | None = None,
     args: str | None = None,
+    planning_timeout: int = 0,
 ) -> int:
     """Run a phase worker and wait for completion.
 
@@ -450,6 +452,9 @@ def run_worker_phase(
         worktree: Optional worktree path
         pr_number: Optional PR number
         args: Optional arguments for the worker
+        planning_timeout: If > 0, abort the worker if it stays in the
+            ``planning`` checkpoint stage for more than this many seconds.
+            Only effective when *worktree* is set.  See issue #2443.
 
     Returns:
         Exit code from agent-wait-bg.sh (or synthetic):
@@ -459,6 +464,7 @@ def run_worker_phase(
         - 5: Failures are pre-existing (Doctor only)
         - 6: Instant exit detected (session < 5s with no meaningful output)
         - 7: MCP server failure detected (session exited due to MCP init failure)
+        - 8: Planning stall detected (stuck in planning checkpoint)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir
@@ -559,6 +565,11 @@ def run_worker_phase(
     last_claim_extend = time.monotonic()
     agent_id = f"shepherd-{ctx.config.task_id}"
 
+    # Planning stall detection state (issue #2443).
+    # Track when we first observe the checkpoint at "planning" stage.
+    # If it stays there beyond planning_timeout, terminate the worker.
+    _planning_first_seen: float | None = None
+
     while wait_proc.poll() is None:
         heartbeats = _read_heartbeats(progress_file, phase=phase)
         for hb in heartbeats[seen_heartbeats:]:
@@ -569,10 +580,40 @@ def run_worker_phase(
 
         # Extend file-based claim periodically to prevent TTL expiry
         # during long worker phases.  See issue #2405.
-        elapsed = time.monotonic() - last_claim_extend
-        if elapsed >= _CLAIM_EXTEND_INTERVAL:
+        claim_elapsed = time.monotonic() - last_claim_extend
+        if claim_elapsed >= _CLAIM_EXTEND_INTERVAL:
             extend_claim(ctx.repo_root, ctx.config.issue, agent_id)
             last_claim_extend = time.monotonic()
+
+        # Check for planning stall
+        if planning_timeout > 0 and worktree is not None:
+            checkpoint = read_checkpoint(worktree)
+            if checkpoint is not None and checkpoint.stage == "planning":
+                if _planning_first_seen is None:
+                    _planning_first_seen = time.monotonic()
+                elif time.monotonic() - _planning_first_seen > planning_timeout:
+                    elapsed = int(time.monotonic() - _planning_first_seen)
+                    log_warning(
+                        f"Planning stall detected: builder stuck in planning "
+                        f"checkpoint for {elapsed}s (limit {planning_timeout}s), "
+                        f"terminating"
+                    )
+                    wait_proc.terminate()
+                    wait_proc.wait(timeout=30)
+                    # Clean up the worker session before returning
+                    destroy_script = scripts_dir / "agent-destroy.sh"
+                    if destroy_script.is_file():
+                        subprocess.run(
+                            [str(destroy_script), name, "--force"],
+                            cwd=ctx.repo_root,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                        )
+                    return 8  # Planning stall
+            else:
+                # Checkpoint advanced past planning (or doesn't exist yet)
+                _planning_first_seen = None
 
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 
@@ -638,6 +679,7 @@ def run_phase_with_retry(
     worktree: Path | None = None,
     pr_number: int | None = None,
     args: str | None = None,
+    planning_timeout: int = 0,
 ) -> int:
     """Run a phase with automatic retry on stuck, instant-exit, or MCP failure.
 
@@ -646,11 +688,12 @@ def run_phase_with_retry(
     times with exponential backoff.
     On exit code 7 (MCP failure), retries up to MCP_FAILURE_MAX_RETRIES
     times with longer backoff (MCP failures are often systemic).
+    On exit code 8 (planning stall), returns immediately (not retryable).
 
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
                    6=instant-exit after retries, 7=MCP failure after retries,
-                   other=error
+                   8=planning stall, other=error
     """
     stuck_retries = 0
     instant_exit_retries = 0
@@ -666,7 +709,15 @@ def run_phase_with_retry(
             worktree=worktree,
             pr_number=pr_number,
             args=args,
+            planning_timeout=planning_timeout,
         )
+
+        # --- Planning stall (exit code 8) ---
+        # Not retryable: the builder was unable to progress past
+        # the planning stage, indicating an issue with the task or
+        # the agent's ability to proceed.  See issue #2443.
+        if exit_code == 8:
+            return 8
 
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or

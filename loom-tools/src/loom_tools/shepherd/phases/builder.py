@@ -367,6 +367,7 @@ class BuilderPhase:
             phase="builder",
             worktree=ctx.worktree_path,
             args=str(ctx.config.issue),
+            planning_timeout=ctx.config.planning_timeout,
         )
 
         if exit_code == 3:
@@ -392,6 +393,32 @@ class BuilderPhase:
                 message="builder stuck after retry",
                 phase_name="builder",
                 data={"log_file": str(self._get_log_path(ctx))},
+            )
+
+        if exit_code == 8:
+            # Planning stall: builder stayed in "planning" checkpoint beyond
+            # the planning_timeout without progressing to implementation.
+            # This is distinct from "stuck" (exit 4) which is general idle
+            # detection.  See issue #2443.
+            log_warning(
+                f"Builder stalled in planning checkpoint for issue "
+                f"#{ctx.config.issue} (planning_timeout="
+                f"{ctx.config.planning_timeout}s)"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    f"builder stalled in planning checkpoint without "
+                    f"progressing to implementation "
+                    f"(timeout={ctx.config.planning_timeout}s)"
+                ),
+                phase_name="builder",
+                data={
+                    "planning_stall": True,
+                    "planning_timeout": ctx.config.planning_timeout,
+                    "log_file": str(self._get_log_path(ctx)),
+                },
             )
 
         if exit_code not in (0, 3, 4):
