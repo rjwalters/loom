@@ -32,6 +32,7 @@ from loom_tools.common.github import gh_issue_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import (
+    find_progress_for_issue,
     read_daemon_state,
     read_json_file,
     read_progress_files,
@@ -310,12 +311,22 @@ def check_untracked_building(
             # Check file-based claim before flagging as orphaned.
             # A CLI shepherd may hold a valid claim without a daemon entry
             # or fresh progress heartbeat (e.g., during a long builder subprocess).
-            if repo_root is not None and has_valid_claim(repo_root, issue_num):
-                if verbose:
+            if repo_root is not None:
+                if has_valid_claim(repo_root, issue_num):
+                    if verbose:
+                        log_info(
+                            f"  SKIPPED: #{issue_num} has a valid file-based claim"
+                        )
+                    continue
+                elif verbose:
                     log_info(
-                        f"  SKIPPED: #{issue_num} has a valid file-based claim"
+                        f"  No valid file-based claim for #{issue_num}"
                     )
-                continue
+            else:
+                log_warning(
+                    f"  repo_root is None — skipping file-based claim check "
+                    f"for #{issue_num} (this may cause false positives)"
+                )
 
             if verbose:
                 log_warning(
@@ -545,23 +556,66 @@ def _cleanup_stale_worktree(repo_root: pathlib.Path, issue: int) -> bool:
     return True
 
 
+def _has_fresh_progress(
+    repo_root: pathlib.Path,
+    issue: int,
+    heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
+) -> bool:
+    """Re-read progress files from disk and check for a fresh heartbeat.
+
+    This is used as a last-chance guard before recovery to avoid acting on
+    stale scan results.  Returns True if a working progress file with a
+    fresh heartbeat exists for the given issue.
+    """
+    progress = find_progress_for_issue(repo_root, issue)
+    if progress is None or progress.status != "working":
+        return False
+    hb = progress.last_heartbeat
+    if not hb:
+        return False
+    try:
+        age = elapsed_seconds(hb)
+    except (ValueError, OverflowError):
+        return False
+    return age <= heartbeat_threshold
+
+
 def recover_issue(
     issue: int,
     reason: str,
     result: OrphanRecoveryResult,
     *,
     repo_root: pathlib.Path | None = None,
+    heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
 ) -> None:
     """Recovery action: Reset issue labels from loom:building to loom:issue.
 
     If ``repo_root`` is provided and a valid file-based claim exists for the
     issue, recovery is skipped to avoid disrupting an active shepherd.
+
+    Additionally, re-reads progress files from disk before acting.  A fresh
+    heartbeat that appeared after the initial scan will abort recovery.
     """
     if repo_root is not None and has_valid_claim(repo_root, issue):
         log_warning(
             f"Skipping recovery for issue #{issue}: valid file-based claim exists"
         )
         return
+
+    if repo_root is not None and _has_fresh_progress(
+        repo_root, issue, heartbeat_threshold
+    ):
+        log_warning(
+            f"Skipping recovery for issue #{issue}: "
+            "fresh progress heartbeat found on re-read"
+        )
+        return
+
+    if repo_root is None:
+        log_warning(
+            f"repo_root is None for issue #{issue} recovery — "
+            "cannot verify claims or progress files"
+        )
 
     # Clean up stale worktree if present (0 commits ahead, no meaningful changes)
     worktree_cleaned = False
@@ -727,7 +781,13 @@ def run_orphan_recovery(
                 )
         elif orphan.type == "untracked_building":
             if orphan.issue:
-                recover_issue(orphan.issue, orphan.reason, result, repo_root=repo_root)
+                recover_issue(
+                    orphan.issue,
+                    orphan.reason,
+                    result,
+                    repo_root=repo_root,
+                    heartbeat_threshold=heartbeat_threshold,
+                )
         elif orphan.type == "stale_heartbeat":
             # Find the matching progress file
             for progress in progress_files:

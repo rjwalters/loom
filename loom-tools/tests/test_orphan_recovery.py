@@ -21,6 +21,7 @@ from loom_tools.orphan_recovery import (
     _check_task_exists,
     _cleanup_stale_worktree,
     _get_heartbeat_stale_threshold,
+    _has_fresh_progress,
     _is_valid_task_id,
     check_daemon_state_tasks,
     check_stale_progress,
@@ -1187,6 +1188,204 @@ class TestCheckUntrackedBuildingClaims:
         ):
             check_untracked_building(daemon_state, [], result)
 
+        assert result.total_orphaned == 1
+
+
+class TestHasFreshProgress:
+    """Tests for _has_fresh_progress re-read helper."""
+
+    def test_fresh_heartbeat_returns_true(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+
+        fresh_hb = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "working",
+            "last_heartbeat": fresh_hb,
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-abc1234.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        assert _has_fresh_progress(tmp_path, 42) is True
+
+    def test_stale_heartbeat_returns_false(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+
+        old_time = datetime.now(timezone.utc) - timedelta(seconds=600)
+        stale_hb = old_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "working",
+            "last_heartbeat": stale_hb,
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-abc1234.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        assert _has_fresh_progress(tmp_path, 42, heartbeat_threshold=300) is False
+
+    def test_no_progress_file_returns_false(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+
+        assert _has_fresh_progress(tmp_path, 42) is False
+
+    def test_non_working_status_returns_false(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+
+        fresh_hb = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "completed",
+            "last_heartbeat": fresh_hb,
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-abc1234.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        assert _has_fresh_progress(tmp_path, 42) is False
+
+    def test_no_heartbeat_returns_false(self, tmp_path: pathlib.Path) -> None:
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "working",
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-abc1234.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        assert _has_fresh_progress(tmp_path, 42) is False
+
+
+class TestRecoverIssueProgressRecheck:
+    """Tests that recover_issue re-reads progress files before acting."""
+
+    def test_recover_skipped_with_fresh_progress_on_reread(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """recover_issue should skip when a fresh progress heartbeat exists on disk."""
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+        (tmp_path / ".git").mkdir(exist_ok=True)
+
+        fresh_hb = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "working",
+            "last_heartbeat": fresh_hb,
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-abc1234.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+            recover_issue(42, "no_daemon_entry", result, repo_root=tmp_path)
+
+        # gh_run should NOT be called — recovery is skipped
+        mock_gh.assert_not_called()
+        assert result.total_recovered == 0
+
+    def test_recover_proceeds_with_stale_progress_on_reread(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """recover_issue should proceed when progress heartbeat is stale on disk."""
+        loom_dir = tmp_path / ".loom"
+        progress_dir = loom_dir / "progress"
+        progress_dir.mkdir(parents=True)
+        (tmp_path / ".git").mkdir(exist_ok=True)
+
+        old_time = datetime.now(timezone.utc) - timedelta(seconds=600)
+        stale_hb = old_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+        progress_data = {
+            "task_id": "abc1234",
+            "issue": 42,
+            "status": "working",
+            "last_heartbeat": stale_hb,
+            "milestones": [],
+        }
+        (progress_dir / "shepherd-abc1234.json").write_text(
+            json.dumps(progress_data)
+        )
+
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch("loom_tools.orphan_recovery.gh_run"):
+            recover_issue(
+                42, "no_daemon_entry", result,
+                repo_root=tmp_path, heartbeat_threshold=300,
+            )
+
+        assert result.total_recovered == 1
+        assert result.recovered[0].action == "reset_issue_label"
+
+    def test_recover_proceeds_without_progress_file(self) -> None:
+        """recover_issue should proceed when no progress file exists on disk."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ), patch(
+            "loom_tools.orphan_recovery._has_fresh_progress", return_value=False
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run",
+        ):
+            recover_issue(
+                42, "no_daemon_entry", result,
+                repo_root=pathlib.Path("/fake"),
+            )
+
+        assert result.total_recovered == 1
+        assert result.recovered[0].action == "reset_issue_label"
+
+
+class TestCheckUntrackedBuildingLogging:
+    """Tests for logging behavior when repo_root is None."""
+
+    def test_no_repo_root_logs_warning(self) -> None:
+        """When repo_root is None, a warning should be logged about skipping claim check."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery.log_warning"
+        ) as mock_warn:
+            check_untracked_building(daemon_state, [], result)
+
+        # Should have warned about repo_root being None
+        assert any(
+            "repo_root is None" in str(call) for call in mock_warn.call_args_list
+        )
         assert result.total_orphaned == 1
 
 
