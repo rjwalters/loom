@@ -339,12 +339,12 @@ Local verification:
 
 ## PR Titles: Conventional Commit Style Required
 
-**CRITICAL:** PR titles MUST be descriptive and use conventional commit prefixes. Never use generic titles like "Issue #N".
+**CRITICAL:** PR titles MUST describe the actual change. Never use generic or issue-referencing titles.
 
 ### Format
 
 ```
-<type>: <short description of the change>
+<type>: <concise summary of what the code change does>
 ```
 
 ### Allowed Prefixes
@@ -361,13 +361,23 @@ Local verification:
 
 ### How to Derive the Title
 
-1. Read the issue title and your actual changes
-2. Pick the appropriate prefix based on what the change **does** (not what the issue asks)
-3. Write a concise description (under 70 characters total) that summarizes the change
+1. **Look at your diff**, not the issue title — what files changed and what do the changes accomplish?
+2. **Pick the correct prefix** based on the nature of the change (bug fix → `fix:`, new capability → `feat:`, etc.)
+3. **Summarize the change itself** in a few words — a reader should understand the change without opening the PR
+4. **Keep it under 70 characters** total (prefix + description)
+
+**Ask yourself:** "If someone reads only this title in `git log --oneline`, will they understand what changed?" If the answer is no, rewrite it.
 
 ### Examples
 
-**WRONG:**
+**WRONG (generic body that just references the issue):**
+```
+feat: implement changes for issue #2584
+fix: address issue #2557
+feat: implement feature from issue #123
+```
+
+**WRONG (bare issue number):**
 ```
 Issue #2557
 ```
@@ -377,17 +387,19 @@ Issue #2557
 Builder should generate descriptive PR titles instead of generic 'Issue #N'
 ```
 
-**CORRECT:**
+**CORRECT (describes what the code change actually does):**
 ```
-fix: require conventional commit PR titles in builder role
-feat: add workspace snapshot caching
+fix: standardize timestamp format to ISO 8601 UTC across log scripts
+feat: add workspace snapshot caching for daemon state
 refactor: rename instant-exit to low-output terminology
 docs: update troubleshooting guide for worktree cleanup
+fix: prevent duplicate label transitions in shepherd phase validator
 ```
 
 ### Why This Matters
 
 - `gh pr list`, `git log --oneline`, and release notes become readable at a glance
+- Generic titles like "implement changes for issue #N" provide zero information
 - Aligns with the existing commit style in this repository
 - Enables automated changelog generation
 
@@ -396,8 +408,10 @@ docs: update troubleshooting guide for worktree cleanup
 Before creating a PR, verify your title:
 - [ ] Starts with a conventional commit prefix (`fix:`, `feat:`, etc.)
 - [ ] Describes what the PR **does**, not what issue it addresses
+- [ ] Does NOT contain generic phrases like "implement changes for", "address issue", or "implement feature from"
+- [ ] Does NOT reference an issue number in the title (issue references go in the PR body)
 - [ ] Is under 70 characters
-- [ ] Does NOT contain "Issue #N" or the raw issue number as the title
+- [ ] A reader can understand the change from the title alone without looking at the diff
 
 ---
 
