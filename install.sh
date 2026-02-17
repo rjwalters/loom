@@ -74,6 +74,26 @@ install_hooks_and_cli() {
   fi
 }
 
+# Verify critical installation files exist
+verify_install() {
+  local target="$1"
+  local critical_files=(
+    ".loom/config.json"
+    ".loom/scripts/worktree.sh"
+    ".loom/scripts/lib/loom-tools.sh"
+  )
+  local missing=0
+  for file in "${critical_files[@]}"; do
+    if [[ ! -f "$target/$file" ]]; then
+      warning "Missing critical file: $file"
+      missing=$((missing + 1))
+    fi
+  done
+  if [[ $missing -gt 0 ]]; then
+    warning "$missing critical file(s) missing after installation"
+  fi
+}
+
 # Determine Loom repository root
 LOOM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -450,6 +470,7 @@ elif [[ -d "$TARGET_PATH/.loom" ]]; then
 
     # Install hooks and CLI wrapper (not handled by loom-daemon init)
     install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+    verify_install "$TARGET_PATH"
 
     echo ""
     success "Quick reinstallation complete!"
@@ -591,6 +612,7 @@ case "$METHOD" in
 
     # Install hooks and CLI wrapper (not handled by loom-daemon init)
     install_hooks_and_cli "$LOOM_ROOT" "$TARGET_PATH"
+    verify_install "$TARGET_PATH"
 
     echo ""
     success "Quick installation complete!"

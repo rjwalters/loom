@@ -144,7 +144,8 @@ pub fn initialize_workspace(
     sync_managed_dir(&defaults, &loom_path, "roles", is_reinstall, &mut report)?;
     sync_managed_dir(&defaults, &loom_path, "scripts", is_reinstall, &mut report)?;
     sync_managed_dir(&defaults, &loom_path, "hooks", is_reinstall, &mut report)?;
-    make_hooks_executable(&loom_path.join("hooks"));
+    make_shell_scripts_executable(&loom_path.join("hooks"));
+    make_shell_scripts_executable(&loom_path.join("scripts"));
 
     // Update .gitignore and setup scaffolding
     update_gitignore(workspace)?;
@@ -205,12 +206,22 @@ fn sync_managed_dir(
     Ok(())
 }
 
-/// Ensure all `.sh` files in the hooks directory are executable.
-fn make_hooks_executable(hooks_dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(hooks_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("sh") {
+/// Ensure all `.sh` files in a directory (and subdirectories) are executable.
+///
+/// This is applied to both hooks/ and scripts/ after copying from defaults.
+/// While `fs::copy` preserves permissions on Unix, some git configurations
+/// or filesystem operations may strip the execute bit. This ensures all
+/// shell scripts remain executable regardless of how they were copied.
+fn make_shell_scripts_executable(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(ft) = entry.file_type() {
+            if ft.is_dir() {
+                make_shell_scripts_executable(&path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("sh") {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -647,5 +658,230 @@ mod tests {
         assert!(hook_path.exists(), "Hook file should exist after reinstall");
         let content = fs::read_to_string(&hook_path).unwrap();
         assert_eq!(content, "#!/bin/bash\n# updated guard hook v2");
+    }
+
+    #[test]
+    fn test_scripts_lib_subdirectory_copied_on_fresh_install() {
+        // Verifies that scripts/lib/ subdirectory (containing loom-tools.sh
+        // and pipe-pane-cmd.sh) is correctly copied during initialization.
+        // This is the specific scenario reported in issue #2392.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults mirroring real structure with scripts/lib/
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("scripts").join("lib")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults.join("scripts").join("agent-spawn.sh"),
+            "#!/bin/bash\nsource \"$SCRIPT_DIR/lib/loom-tools.sh\"",
+        )
+        .unwrap();
+        fs::write(
+            defaults.join("scripts").join("lib").join("loom-tools.sh"),
+            "#!/bin/bash\n# shared helper library",
+        )
+        .unwrap();
+        fs::write(
+            defaults
+                .join("scripts")
+                .join("lib")
+                .join("pipe-pane-cmd.sh"),
+            "#!/bin/bash\n# pipe pane command",
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Verify scripts/lib/ subdirectory exists
+        let lib_dir = workspace.join(".loom").join("scripts").join("lib");
+        assert!(lib_dir.exists(), "scripts/lib/ directory should exist");
+        assert!(lib_dir.is_dir(), "scripts/lib/ should be a directory");
+
+        // Verify both lib files were copied
+        let loom_tools = lib_dir.join("loom-tools.sh");
+        assert!(loom_tools.exists(), "lib/loom-tools.sh should exist");
+        let content = fs::read_to_string(&loom_tools).unwrap();
+        assert_eq!(content, "#!/bin/bash\n# shared helper library");
+
+        let pipe_pane = lib_dir.join("pipe-pane-cmd.sh");
+        assert!(pipe_pane.exists(), "lib/pipe-pane-cmd.sh should exist");
+
+        // Verify the parent script was also copied
+        let agent_spawn = workspace
+            .join(".loom")
+            .join("scripts")
+            .join("agent-spawn.sh");
+        assert!(agent_spawn.exists(), "agent-spawn.sh should exist");
+
+        // Verify report includes subdirectory files
+        assert!(
+            report
+                .added
+                .contains(&".loom/scripts/lib/loom-tools.sh".to_string()),
+            "Report should include lib/loom-tools.sh, got: {:?}",
+            report.added
+        );
+        assert!(
+            report
+                .added
+                .contains(&".loom/scripts/lib/pipe-pane-cmd.sh".to_string()),
+            "Report should include lib/pipe-pane-cmd.sh, got: {:?}",
+            report.added
+        );
+
+        // Verify no verification failures
+        assert!(
+            report.verification_failures.is_empty(),
+            "Expected no verification failures, got: {:?}",
+            report.verification_failures
+        );
+    }
+
+    #[test]
+    fn test_scripts_lib_subdirectory_restored_on_reinstall() {
+        // On reinstall, scripts/lib/ should be cleaned and re-copied.
+        // This tests the case where lib/ existed but with stale content.
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with scripts/lib/
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("scripts").join("lib")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(
+            defaults.join("scripts").join("lib").join("loom-tools.sh"),
+            "#!/bin/bash\n# v2 helper",
+        )
+        .unwrap();
+
+        // Simulate existing installation with old lib/ content and a stale file
+        fs::create_dir_all(workspace.join(".loom").join("scripts").join("lib")).unwrap();
+        fs::write(
+            workspace
+                .join(".loom")
+                .join("scripts")
+                .join("lib")
+                .join("loom-tools.sh"),
+            "#!/bin/bash\n# v1 helper (old)",
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .join(".loom")
+                .join("scripts")
+                .join("lib")
+                .join("obsolete.sh"),
+            "#!/bin/bash\n# should be removed",
+        )
+        .unwrap();
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // lib/loom-tools.sh should have new content
+        let loom_tools = workspace
+            .join(".loom")
+            .join("scripts")
+            .join("lib")
+            .join("loom-tools.sh");
+        let content = fs::read_to_string(&loom_tools).unwrap();
+        assert_eq!(content, "#!/bin/bash\n# v2 helper");
+
+        // Stale file should be removed
+        let obsolete = workspace
+            .join(".loom")
+            .join("scripts")
+            .join("lib")
+            .join("obsolete.sh");
+        assert!(!obsolete.exists(), "Stale file in lib/ should be removed on reinstall");
+
+        // Report should track the removal
+        assert!(
+            report
+                .removed
+                .contains(&".loom/scripts/lib/obsolete.sh".to_string()),
+            "Report should list obsolete.sh as removed, got: {:?}",
+            report.removed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scripts_made_executable_including_subdirectories() {
+        // Verifies that make_shell_scripts_executable works recursively
+        // on scripts/ and its subdirectories (e.g., scripts/lib/).
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path();
+        let defaults = temp_dir.path().join("defaults");
+
+        fs::create_dir(workspace.join(".git")).unwrap();
+
+        // Create defaults with scripts that are NOT executable
+        fs::create_dir_all(defaults.join("roles")).unwrap();
+        fs::create_dir_all(defaults.join("scripts").join("lib")).unwrap();
+        fs::write(defaults.join("config.json"), "{}").unwrap();
+        fs::write(defaults.join("roles").join("builder.md"), "builder").unwrap();
+        fs::write(defaults.join("scripts").join("worktree.sh"), "#!/bin/bash\n# worktree helper")
+            .unwrap();
+        fs::write(
+            defaults.join("scripts").join("lib").join("loom-tools.sh"),
+            "#!/bin/bash\n# shared helper",
+        )
+        .unwrap();
+
+        // Remove execute bit from source files to simulate git clone stripping perms
+        for path in &[
+            defaults.join("scripts").join("worktree.sh"),
+            defaults.join("scripts").join("lib").join("loom-tools.sh"),
+        ] {
+            let metadata = fs::metadata(path).unwrap();
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o644); // rw-r--r-- (no execute)
+            fs::set_permissions(path, perms).unwrap();
+        }
+
+        let result =
+            initialize_workspace(workspace.to_str().unwrap(), defaults.to_str().unwrap(), false);
+
+        assert!(result.is_ok());
+
+        // Both scripts should be executable after init
+        let worktree_sh = workspace.join(".loom").join("scripts").join("worktree.sh");
+        let perms = fs::metadata(&worktree_sh).unwrap().permissions();
+        assert!(
+            perms.mode() & 0o111 != 0,
+            "worktree.sh should be executable, mode: {:o}",
+            perms.mode()
+        );
+
+        let loom_tools = workspace
+            .join(".loom")
+            .join("scripts")
+            .join("lib")
+            .join("loom-tools.sh");
+        let perms = fs::metadata(&loom_tools).unwrap().permissions();
+        assert!(
+            perms.mode() & 0o111 != 0,
+            "lib/loom-tools.sh should be executable, mode: {:o}",
+            perms.mode()
+        );
     }
 }
