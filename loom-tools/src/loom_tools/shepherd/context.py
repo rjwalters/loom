@@ -467,6 +467,17 @@ class ShepherdContext:
                         "Subsequent milestones will be skipped.",
                         self.config.task_id,
                     )
+            elif not result:
+                # Progress file may have been deleted mid-run by a concurrent
+                # shepherd cleaning up stale files for the same issue.
+                # Re-engage the silent suppression guard so subsequent
+                # milestone calls don't produce repeated error messages.
+                self._progress_initialized = False
+                logger.debug(
+                    "Progress file for task %s appears to have been removed. "
+                    "Disabling further milestone reporting.",
+                    self.config.task_id,
+                )
 
             return result
         except Exception as exc:
