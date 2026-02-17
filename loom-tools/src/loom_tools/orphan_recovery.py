@@ -478,6 +478,8 @@ def recover_shepherd(
     task_id: str | None,
     reason: str,
     result: OrphanRecoveryResult,
+    *,
+    label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
 ) -> None:
     """Recovery action: Reset shepherd entry in daemon-state to idle."""
     daemon_state_path = repo_root / ".loom" / "daemon-state.json"
@@ -503,7 +505,13 @@ def recover_shepherd(
     log_info(f"Reset shepherd {shepherd_id} to idle in daemon-state")
 
     if issue is not None and issue != 0:
-        recover_issue(issue, reason, result, repo_root=repo_root)
+        recover_issue(
+            issue,
+            reason,
+            result,
+            repo_root=repo_root,
+            label_grace_period=label_grace_period,
+        )
 
     result.recovered.append(
         RecoveryEntry(
@@ -772,6 +780,8 @@ def recover_progress_file(
     repo_root: pathlib.Path,
     progress: ShepherdProgress,
     result: OrphanRecoveryResult,
+    *,
+    label_grace_period: int = DEFAULT_LABEL_GRACE_PERIOD,
 ) -> None:
     """Recovery action: Mark progress file status as errored."""
     progress_dir = repo_root / ".loom" / "progress"
@@ -801,7 +811,13 @@ def recover_progress_file(
 
     issue = progress.issue if progress.issue else None
     if issue is not None and issue != 0:
-        recover_issue(issue, "stale_heartbeat", result, repo_root=repo_root)
+        recover_issue(
+            issue,
+            "stale_heartbeat",
+            result,
+            repo_root=repo_root,
+            label_grace_period=label_grace_period,
+        )
 
     result.recovered.append(
         RecoveryEntry(
@@ -867,6 +883,7 @@ def run_orphan_recovery(
                     orphan.task_id,
                     orphan.reason,
                     result,
+                    label_grace_period=label_grace_period,
                 )
         elif orphan.type == "untracked_building":
             if orphan.issue:
@@ -876,12 +893,18 @@ def run_orphan_recovery(
                     result,
                     repo_root=repo_root,
                     heartbeat_threshold=heartbeat_threshold,
+                    label_grace_period=label_grace_period,
                 )
         elif orphan.type == "stale_heartbeat":
             # Find the matching progress file
             for progress in progress_files:
                 if progress.task_id == orphan.task_id:
-                    recover_progress_file(repo_root, progress, result)
+                    recover_progress_file(
+                        repo_root,
+                        progress,
+                        result,
+                        label_grace_period=label_grace_period,
+                    )
                     break
 
     return result
