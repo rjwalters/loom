@@ -11961,6 +11961,7 @@ class TestBuilderMcpFailureMarkerDetection:
             "log_has_implementation_activity": False,
             "log_cli_output_length": 1000,
             "log_has_mcp_failure_markers": False,
+            "no_changes_marker_exists": True,
         }
         assert builder._is_no_changes_needed(diag) is True
 
@@ -11976,6 +11977,7 @@ class TestBuilderMcpFailureMarkerDetection:
             "main_branch_dirty": False,
             "log_has_implementation_activity": False,
             "log_cli_output_length": 1000,
+            "no_changes_marker_exists": True,
             # log_has_mcp_failure_markers not present — backwards compat
         }
         assert builder._is_no_changes_needed(diag) is True
