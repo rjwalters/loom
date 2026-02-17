@@ -2706,7 +2706,9 @@ class BuilderPhase:
             check=False,
         )
         if result.returncode == 0 and result.stdout.strip():
-            return set(result.stdout.strip().splitlines())
+            return set(
+                line for line in result.stdout.splitlines() if line
+            )
         return set()
 
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
@@ -2785,7 +2787,7 @@ class BuilderPhase:
                 check=False,
             )
             commits = (
-                log_res.stdout.strip().splitlines()
+                [line for line in log_res.stdout.splitlines() if line]
                 if log_res.returncode == 0 and log_res.stdout.strip()
                 else []
             )
@@ -2799,7 +2801,7 @@ class BuilderPhase:
                 check=False,
             )
             uncommitted_files = (
-                status_res.stdout.strip().splitlines()
+                [line for line in status_res.stdout.splitlines() if line]
                 if status_res.returncode == 0 and status_res.stdout.strip()
                 else []
             )
@@ -2919,7 +2921,9 @@ class BuilderPhase:
         )
         main_dirty_files: list[str] = []
         if main_status.returncode == 0 and main_status.stdout.strip():
-            main_dirty_files = main_status.stdout.strip().splitlines()
+            main_dirty_files = [
+                line for line in main_status.stdout.splitlines() if line
+            ]
 
         # Filter out pre-existing dirty files using the baseline snapshot
         if self._main_dirty_baseline is not None:
@@ -3603,7 +3607,7 @@ class BuilderPhase:
         if status_result.returncode != 0:
             return False  # Can't determine status, don't treat as stale
         uncommitted = (
-            status_result.stdout.strip().splitlines()
+            [line for line in status_result.stdout.splitlines() if line]
             if status_result.stdout.strip()
             else []
         )
@@ -3972,7 +3976,9 @@ class BuilderPhase:
             check=False,
         )
         if status_result.returncode == 0 and status_result.stdout.strip():
-            porcelain_lines = status_result.stdout.strip().splitlines()
+            porcelain_lines = [
+                line for line in status_result.stdout.splitlines() if line
+            ]
             meaningful, _ = self._filter_build_artifacts(porcelain_lines)
             if not meaningful:
                 log_info(
