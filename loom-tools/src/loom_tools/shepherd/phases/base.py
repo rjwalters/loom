@@ -397,7 +397,13 @@ def _get_cli_output(stripped: str) -> str:
         if line.strip() == _CLI_START_SENTINEL:
             sentinel_idx = i
 
-    start = (sentinel_idx + 1) if sentinel_idx is not None else 0
+    if sentinel_idx is None:
+        # No sentinel means Claude CLI never started — wrapper failed
+        # before reaching execution.  Return empty string so callers
+        # correctly treat this as an instant exit.  See issue #2473.
+        return ""
+
+    start = sentinel_idx + 1
     return "\n".join(line for line in lines[start:] if not line.startswith("# "))
 
 
