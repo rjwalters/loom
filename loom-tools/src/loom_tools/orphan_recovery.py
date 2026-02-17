@@ -9,6 +9,17 @@ This is distinct from stuck detection (stuck_detection.py):
 - Stuck = running but struggling
 - Orphan = not running at all
 
+Known invocation paths (see also issue #2567 investigation):
+- Daemon iteration loop: ``daemon_v2/iteration.py`` when snapshot detects
+  orphaned_count > 0 via ``determine_actions()``
+- Daemon startup cleanup: ``daemon_cleanup.py`` ``daemon-startup`` event
+- Daemon stall recovery: Level 2 escalation runs unconditionally
+- CLI: ``recover-orphaned-shepherds.sh [--recover]``
+
+No autonomous agent role calls this directly.  The Guide role runs the
+separate ``stale-building-check.sh`` script which has different thresholds
+(2h staleness vs 5min heartbeat) and detection logic.
+
 Exit codes:
     0 - No orphans detected
     1 - Error occurred
@@ -860,6 +871,17 @@ def run_orphan_recovery(
 ) -> OrphanRecoveryResult:
     """Run all orphan detection phases and optionally recover.
 
+    Known invocation paths:
+    - Daemon iteration loop (daemon_v2/iteration.py) when snapshot detects
+      orphaned_count > 0
+    - Daemon startup cleanup (daemon_cleanup.py daemon-startup event)
+    - Daemon stall recovery Level 2 (unconditional, bypasses orphaned_count gate)
+    - CLI: ``recover-orphaned-shepherds.sh [--recover]``
+
+    No autonomous agent role (Guide, Champion, Auditor) calls this directly.
+    The Guide role runs ``stale-building-check.sh`` which is a separate script
+    with different thresholds (2h vs 5min) and detection logic.
+
     Returns an OrphanRecoveryResult with all detected orphans
     and any recovery actions taken.
     """
@@ -869,6 +891,20 @@ def run_orphan_recovery(
 
     daemon_state = read_daemon_state(repo_root)
     progress_files = read_progress_files(repo_root)
+
+    # Log diagnostic context: is a daemon actively running?
+    # When daemon_state.running is False, this recovery was likely triggered
+    # by a CLI invocation, daemon startup cleanup, or a lingering daemon
+    # from a previous session.  This helps diagnose unexpected recovery
+    # events (see issue #2567).
+    if not daemon_state.running:
+        if verbose:
+            log_info(
+                "Orphan recovery running without active daemon "
+                "(daemon_state.running=False). "
+                "Invocation is likely from CLI, daemon startup, "
+                "or a lingering previous session."
+            )
 
     # Phase 1: Check daemon-state task IDs
     check_daemon_state_tasks(daemon_state, result, verbose=verbose)
