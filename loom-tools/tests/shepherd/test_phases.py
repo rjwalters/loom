@@ -5039,6 +5039,47 @@ class TestJudgePhase:
         # Should sleep between attempts (2 sleeps for 3 attempts)
         assert mock_sleep.call_count == 2
 
+    def test_validation_retries_use_check_only_for_non_final_attempts(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Non-final validation retries should use check_only=True (#2558).
+
+        This prevents duplicate 'Phase contract failed' comments from being
+        posted on every retry attempt.  Only the final attempt (when all
+        retries are exhausted) should use check_only=False so the comment
+        and failure label are applied exactly once.
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+
+        judge = JudgePhase()
+        check_only_values: list[bool] = []
+
+        def capture_check_only(ctx: ShepherdContext, *, check_only: bool = False) -> bool:
+            check_only_values.append(check_only)
+            return False  # Always fail to exhaust retries
+
+        fake_diag = {
+            "summary": "test",
+            "log_file": "/fake",
+            "log_exists": False,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+        with (
+            patch.object(judge, "validate", side_effect=capture_check_only),
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
+            ),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+        ):
+            judge.run(mock_context)
+
+        # 3 attempts: first two should be check_only=True, last should be False
+        assert check_only_values == [True, True, False]
+
     def test_cache_invalidated_before_validation(self, mock_context: MagicMock) -> None:
         """Cache should be invalidated BEFORE validation, not after.
 
@@ -5055,7 +5096,7 @@ class TestJudgePhase:
         def track_invalidate(pr: int | None = None) -> None:
             call_order.append("invalidate")
 
-        def track_validate(ctx: ShepherdContext) -> bool:
+        def track_validate(ctx: ShepherdContext, **kwargs: object) -> bool:
             call_order.append("validate")
             return True
 
