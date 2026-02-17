@@ -9860,6 +9860,64 @@ class TestIsInstantExit:
         log.write_text("")
         assert _is_instant_exit(log) is True
 
+    def test_wrapper_preflight_with_sentinel_and_no_cli_output(
+        self, tmp_path: Path
+    ) -> None:
+        """Wrapper pre-flight output before sentinel should be ignored (issue #2401).
+
+        When the claude-wrapper writes pre-flight messages that exceed the
+        100-char threshold but the CLI itself produces no output, the session
+        should still be detected as an instant exit.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "# Session: loom-judge-issue-42\n"
+            "[2026-02-16 21:22:21] [INFO] Claude wrapper starting\n"
+            "[2026-02-16 21:22:21] [INFO] Arguments: --resume\n"
+            "[2026-02-16 21:22:21] [INFO] Workspace: /path/to/repo\n"
+            "[2026-02-16 21:22:21] [INFO] Running pre-flight checks...\n"
+            "[2026-02-16 21:22:21] [INFO] Pre-flight checks passed\n"
+            "[2026-02-16 21:22:21] [INFO] Attempt 1/5: Starting Claude CLI\n"
+            "# CLAUDE_CLI_START\n"
+        )
+        assert _is_instant_exit(log) is True
+
+    def test_wrapper_preflight_with_sentinel_and_real_output(
+        self, tmp_path: Path
+    ) -> None:
+        """Real CLI output after sentinel should NOT be an instant exit."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[2026-02-16 21:22:21] [INFO] Claude wrapper starting\n"
+            "[2026-02-16 21:22:21] [INFO] Pre-flight checks passed\n"
+            "[2026-02-16 21:22:21] [INFO] Attempt 1/5: Starting Claude CLI\n"
+            "# CLAUDE_CLI_START\n"
+            + "x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1)
+        )
+        assert _is_instant_exit(log) is False
+
+    def test_no_sentinel_backwards_compat(self, tmp_path: Path) -> None:
+        """Without sentinel, all non-header output is counted (backward compat)."""
+        log = tmp_path / "session.log"
+        # Pre-flight output exceeds threshold — without sentinel this is NOT
+        # detected as instant exit (the pre-2401 behaviour).
+        log.write_text(
+            "# Loom Agent Log\n"
+            + "[INFO] wrapper line\n" * 20
+        )
+        assert _is_instant_exit(log) is False
+
+    def test_multiple_sentinels_uses_last(self, tmp_path: Path) -> None:
+        """With multiple sentinels (retries), only output after the last counts."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            + "x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1) + "\n"
+            "# CLAUDE_CLI_START\n"  # Second attempt — no output after this
+        )
+        assert _is_instant_exit(log) is True
+
 
 class TestRunWorkerPhaseInstantExit:
     """Test that run_worker_phase detects instant exits and returns code 6."""
@@ -10569,6 +10627,35 @@ class TestIsMcpFailure:
         log = tmp_path / "session.log"
         real_work = "x" * MCP_FAILURE_MIN_OUTPUT_CHARS
         log.write_text(f"# Header\n{real_work}\n1 MCP server failed\n")
+        assert _is_mcp_failure(log) is False
+
+    def test_wrapper_preflight_with_sentinel_and_mcp_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """MCP failure after sentinel should be detected even with pre-flight output."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[INFO] Claude wrapper starting\n"
+            "[INFO] Pre-flight checks passed\n"
+            "[INFO] Attempt 1/5: Starting Claude CLI\n"
+            "# CLAUDE_CLI_START\n"
+            "1 MCP server failed\n"
+        )
+        assert _is_mcp_failure(log) is True
+
+    def test_wrapper_preflight_with_sentinel_and_productive_session(
+        self, tmp_path: Path
+    ) -> None:
+        """Productive CLI output after sentinel should NOT be flagged as MCP failure."""
+        log = tmp_path / "session.log"
+        real_work = "Working on issue...\n" * 40
+        log.write_text(
+            "[INFO] Claude wrapper starting\n"
+            "# CLAUDE_CLI_START\n"
+            "1 MCP server failed\n"
+            f"{real_work}"
+        )
+        assert len(real_work) >= MCP_FAILURE_MIN_OUTPUT_CHARS
         assert _is_mcp_failure(log) is False
 
 

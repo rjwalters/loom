@@ -571,6 +571,10 @@ run_with_retry() {
         # Falls back to direct execution when no TTY is available (e.g., when spawned
         # from Claude Code's Bash tool rather than a tmux terminal).
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
+        # Write sentinel marker so _is_instant_exit() in the shepherd can
+        # distinguish wrapper pre-flight output from actual Claude CLI output.
+        # The "# " prefix means it is also filtered as a header line.
+        echo "# CLAUDE_CLI_START" >&2
         set +e  # Temporarily disable errexit to capture exit code
         unset CLAUDECODE  # Prevent nested session guard from blocking subprocess
         # Export per-agent config dir if set (for session isolation)

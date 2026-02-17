@@ -23,8 +23,13 @@ _HEARTBEAT_POLL_INTERVAL = 5
 
 # Minimum characters of non-header content required for "meaningful output".
 # Sessions with less than this are treated as transient spawn failures
-# (e.g., Claude API error on startup).  See issues #2135, #2381.
+# (e.g., Claude API error on startup).  See issues #2135, #2381, #2401.
 INSTANT_EXIT_MIN_OUTPUT_CHARS = 100
+
+# Sentinel line written by claude-wrapper.sh just before invoking the Claude
+# CLI.  Output before this marker is wrapper pre-flight boilerplate and should
+# be excluded when measuring meaningful output.  See issue #2401.
+_CLI_START_SENTINEL = "# CLAUDE_CLI_START"
 
 # Maximum retries for instant-exit detection, with exponential backoff.
 INSTANT_EXIT_MAX_RETRIES = 3
@@ -291,6 +296,35 @@ def _print_heartbeat(action: str) -> None:
     print(f"\033[2m[{ts}] \u27f3 {action}\033[0m", file=sys.stderr)
 
 
+def _get_cli_output(stripped: str) -> str:
+    """Extract non-header output produced after the CLI start sentinel.
+
+    If the ``# CLAUDE_CLI_START`` sentinel is present, only lines after the
+    **last** occurrence are considered (the wrapper may emit multiple sentinels
+    when retrying).  Lines starting with ``# `` are always excluded as log
+    headers.
+
+    If no sentinel is found, falls back to the previous behaviour of
+    considering all non-header lines.
+
+    Args:
+        stripped: ANSI-stripped log file content.
+
+    Returns:
+        The meaningful (non-header, post-sentinel) output as a single string.
+    """
+    lines = stripped.splitlines()
+
+    # Find the last sentinel index.
+    sentinel_idx: int | None = None
+    for i, line in enumerate(lines):
+        if line.strip() == _CLI_START_SENTINEL:
+            sentinel_idx = i
+
+    start = (sentinel_idx + 1) if sentinel_idx is not None else 0
+    return "\n".join(line for line in lines[start:] if not line.startswith("# "))
+
+
 def _is_mcp_failure(log_path: Path) -> bool:
     """Check if a session log indicates an MCP server initialization failure.
 
@@ -326,16 +360,15 @@ def _is_mcp_failure(log_path: Path) -> bool:
         content = log_path.read_text()
         stripped = strip_ansi(content)
 
-        # If the session produced substantial output beyond headers,
-        # it was productive — MCP text is just status bar noise.
-        non_header = "\n".join(
-            line for line in stripped.splitlines() if not line.startswith("# ")
-        )
-        if len(non_header.strip()) >= MCP_FAILURE_MIN_OUTPUT_CHARS:
+        # If the session produced substantial CLI output beyond headers
+        # and wrapper pre-flight, it was productive — MCP text is just
+        # status bar noise.  See issues #2374, #2381, #2401.
+        cli_output = _get_cli_output(stripped)
+        if len(cli_output.strip()) >= MCP_FAILURE_MIN_OUTPUT_CHARS:
             return False
 
         for pattern in MCP_FAILURE_PATTERNS:
-            if re.search(pattern, stripped, re.IGNORECASE):
+            if re.search(pattern, cli_output, re.IGNORECASE):
                 return True
     except OSError:
         pass
@@ -369,12 +402,11 @@ def _is_instant_exit(log_path: Path) -> bool:
     try:
         content = log_path.read_text()
         stripped = strip_ansi(content)
-        # Exclude log header lines (e.g. "# Loom Agent Log", "# Session: ...")
-        # so that a log with only the header is correctly detected as instant exit.
-        non_header = "\n".join(
-            line for line in stripped.splitlines() if not line.startswith("# ")
-        )
-        return len(non_header.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+        # Exclude log header lines and wrapper pre-flight output (everything
+        # before the last ``# CLAUDE_CLI_START`` sentinel) so that only
+        # actual Claude CLI output counts.  See issues #2135, #2381, #2401.
+        cli_output = _get_cli_output(stripped)
+        return len(cli_output.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
     except OSError:
         return False
 
