@@ -1014,7 +1014,7 @@ def run_worker_phase(
 
     # Check for MCP failure (exit code 7) — more specific than instant-exit,
     # with different retry/backoff strategy.  See issues #2135, #2279.
-    if _is_mcp_failure(log_path):
+    if wait_exit != 0 and _is_mcp_failure(log_path):
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
@@ -1022,7 +1022,7 @@ def run_worker_phase(
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 7
-    if _is_instant_exit(log_path):
+    if wait_exit != 0 and _is_instant_exit(log_path):
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
