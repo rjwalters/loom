@@ -1906,3 +1906,126 @@ class TestRecoverIssueGracePeriod:
 
         mock_gh.assert_not_called()
         assert result.total_recovered == 0
+
+
+class TestGetBuildingLabelAgeLogging:
+    """Tests that _get_building_label_age logs warnings on failure paths."""
+
+    def test_logs_warning_on_no_nwo(self) -> None:
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value=None
+        ), patch(
+            "loom_tools.orphan_recovery.log_warning"
+        ) as mock_warn:
+            _get_building_label_age(42)
+
+        assert any(
+            "repo NWO not available" in str(call)
+            for call in mock_warn.call_args_list
+        )
+
+    def test_logs_warning_on_api_exception(self) -> None:
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run",
+            side_effect=Exception("network error"),
+        ), patch(
+            "loom_tools.orphan_recovery.log_warning"
+        ) as mock_warn:
+            _get_building_label_age(42)
+
+        assert any(
+            "API call failed" in str(call)
+            for call in mock_warn.call_args_list
+        )
+
+    def test_logs_warning_on_nonzero_exit(self) -> None:
+        mock_result = type("R", (), {"returncode": 1, "stdout": ""})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ), patch(
+            "loom_tools.orphan_recovery.log_warning"
+        ) as mock_warn:
+            _get_building_label_age(42)
+
+        assert any(
+            "exit code 1" in str(call)
+            for call in mock_warn.call_args_list
+        )
+
+    def test_logs_warning_on_null_response(self) -> None:
+        mock_result = type("R", (), {"returncode": 0, "stdout": "null\n"})()
+
+        with patch(
+            "loom_tools.orphan_recovery.get_repo_nwo", return_value="owner/repo"
+        ), patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ), patch(
+            "loom_tools.orphan_recovery.log_warning"
+        ) as mock_warn:
+            _get_building_label_age(42)
+
+        assert any(
+            "no loom:building label events" in str(call)
+            for call in mock_warn.call_args_list
+        )
+
+
+class TestClaimCheckOrdering:
+    """Tests that claim check happens before label-age API call."""
+
+    def test_valid_claim_skips_label_age_api(self) -> None:
+        """When a valid claim exists, _get_building_label_age should not be called."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=True
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+        ) as mock_label_age:
+            check_untracked_building(
+                daemon_state, [], result,
+                repo_root=pathlib.Path("/fake"),
+                label_grace_period=600,
+            )
+
+        # Claim check should have short-circuited before the API call
+        mock_label_age.assert_not_called()
+        assert result.total_orphaned == 0
+
+    def test_no_claim_falls_through_to_label_age(self) -> None:
+        """When claim is invalid, should proceed to label-age check."""
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ), patch(
+            "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ), patch(
+            "loom_tools.orphan_recovery._get_building_label_age",
+            return_value=120,  # Within grace period
+        ):
+            check_untracked_building(
+                daemon_state, [], result,
+                repo_root=pathlib.Path("/fake"),
+                label_grace_period=600,
+            )
+
+        # No claim but label age within grace period should still protect
+        assert result.total_orphaned == 0

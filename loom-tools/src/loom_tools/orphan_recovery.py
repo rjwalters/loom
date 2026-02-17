@@ -187,6 +187,10 @@ def _get_building_label_age(issue: int) -> int | None:
     """
     nwo = get_repo_nwo()
     if not nwo:
+        log_warning(
+            f"Cannot determine label age for #{issue}: "
+            "repo NWO not available"
+        )
         return None
 
     try:
@@ -199,19 +203,35 @@ def _get_building_label_age(issue: int) -> int | None:
             ],
             check=False,
         )
-    except Exception:
+    except Exception as exc:
+        log_warning(
+            f"Cannot determine label age for #{issue}: "
+            f"API call failed ({exc})"
+        )
         return None
 
     if result.returncode != 0:
+        log_warning(
+            f"Cannot determine label age for #{issue}: "
+            f"gh returned exit code {result.returncode}"
+        )
         return None
 
     timestamp = result.stdout.strip().strip('"')
     if not timestamp or timestamp == "null":
+        log_warning(
+            f"Cannot determine label age for #{issue}: "
+            "no loom:building label events found"
+        )
         return None
 
     try:
         return elapsed_seconds(timestamp)
     except (ValueError, OverflowError):
+        log_warning(
+            f"Cannot determine label age for #{issue}: "
+            f"unparseable timestamp '{timestamp}'"
+        )
         return None
 
 
@@ -321,6 +341,28 @@ def check_untracked_building(
                 log_info(f"  OK: tracked in daemon-state")
             continue
 
+        # File-based claim check (primary protection).
+        # This is checked first because it's local (no API call) and
+        # therefore the most reliable protection against false positives.
+        # A CLI shepherd may hold a valid claim without a daemon entry
+        # or fresh progress heartbeat (e.g., during a long builder subprocess).
+        if repo_root is not None:
+            if has_valid_claim(repo_root, issue_num):
+                if verbose:
+                    log_info(
+                        f"  SKIPPED: #{issue_num} has a valid file-based claim"
+                    )
+                continue
+            elif verbose:
+                log_info(
+                    f"  No valid file-based claim for #{issue_num}"
+                )
+        else:
+            log_warning(
+                f"  repo_root is None — skipping file-based claim check "
+                f"for #{issue_num} (this may cause false positives)"
+            )
+
         # Label-age grace period: skip issues where loom:building was
         # applied recently.  This protects manual /shepherd runs and
         # newly-claimed issues from premature orphan recovery before
@@ -380,26 +422,6 @@ def check_untracked_building(
             break
 
         if not has_fresh_progress:
-            # Check file-based claim before flagging as orphaned.
-            # A CLI shepherd may hold a valid claim without a daemon entry
-            # or fresh progress heartbeat (e.g., during a long builder subprocess).
-            if repo_root is not None:
-                if has_valid_claim(repo_root, issue_num):
-                    if verbose:
-                        log_info(
-                            f"  SKIPPED: #{issue_num} has a valid file-based claim"
-                        )
-                    continue
-                elif verbose:
-                    log_info(
-                        f"  No valid file-based claim for #{issue_num}"
-                    )
-            else:
-                log_warning(
-                    f"  repo_root is None — skipping file-based claim check "
-                    f"for #{issue_num} (this may cause false positives)"
-                )
-
             if verbose:
                 log_warning(
                     f"  ORPHANED: #{issue_num} has loom:building "
