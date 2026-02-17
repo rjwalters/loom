@@ -22,7 +22,7 @@ from loom_tools.shepherd.errors import (
     ShutdownSignal,
 )
 from loom_tools.shepherd.exit_codes import ShepherdExitCode
-from loom_tools.shepherd.labels import transition_issue_labels
+from loom_tools.shepherd.labels import get_pr_for_issue, transition_issue_labels, transition_labels
 from loom_tools.shepherd.phases import (
     ApprovalPhase,
     BuilderPhase,
@@ -1884,6 +1884,61 @@ def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
     detect_systematic_failure(ctx.repo_root)
 
 
+def _cleanup_pr_labels_on_failure(ctx: ShepherdContext) -> None:
+    """Best-effort cleanup of stale workflow labels on the associated PR.
+
+    When shepherd fails, PR labels from in-progress workflow states can be
+    left behind (e.g., loom:treating, loom:reviewing, loom:review-requested,
+    loom:changes-requested). These are workflow state labels that become
+    contradictory once the shepherd is no longer driving the lifecycle.
+
+    Factual status labels (loom:merge-conflict, loom:ci-failure) are kept
+    since they reflect actual PR state regardless of shepherd status.
+    """
+    # Workflow state labels to remove from PR on shepherd failure.
+    # These indicate an active workflow step that is no longer running.
+    PR_WORKFLOW_LABELS = {
+        "loom:review-requested",
+        "loom:changes-requested",
+        "loom:treating",
+        "loom:reviewing",
+    }
+
+    # Find the associated PR
+    pr_number = ctx.pr_number
+    if pr_number is None:
+        try:
+            pr_number = get_pr_for_issue(ctx.config.issue, repo_root=ctx.repo_root)
+        except Exception:
+            return
+
+    if pr_number is None:
+        return  # No PR exists, nothing to clean up
+
+    try:
+        pr_labels = ctx.label_cache.get_pr_labels(pr_number, refresh=True)
+    except Exception:
+        return
+
+    stale_labels = PR_WORKFLOW_LABELS & pr_labels
+    if not stale_labels:
+        return
+
+    try:
+        transition_labels(
+            "pr",
+            pr_number,
+            remove=sorted(stale_labels),
+            repo_root=ctx.repo_root,
+        )
+        log_info(
+            f"Label cleanup: removed stale workflow labels "
+            f"{sorted(stale_labels)} from PR #{pr_number}"
+        )
+    except Exception:
+        pass
+
+
 def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
     """Best-effort cleanup of stale workflow labels when shepherd fails.
 
@@ -1897,13 +1952,19 @@ def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
     - If a _mark_* handler already set a loom:failed:* label: remove any
       contradictory state labels (loom:building, loom:blocked)
     - If loom:building is present with no failure label: revert to loom:issue
-    - PR labels are left intact (Judge/Champion manage those)
+    - Clean up stale PR workflow labels (loom:treating, loom:reviewing, etc.)
     """
     # No cleanup needed on success or skip
     if exit_code in (ShepherdExitCode.SUCCESS, ShepherdExitCode.SKIPPED):
         return
 
     issue = ctx.config.issue
+
+    # Always attempt PR label cleanup on failure
+    try:
+        _cleanup_pr_labels_on_failure(ctx)
+    except Exception:
+        pass
 
     try:
         # Fetch current labels fresh from API (cache may be stale after crash)
