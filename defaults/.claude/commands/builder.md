@@ -134,7 +134,7 @@ PR LIFECYCLE (Builder only creates, Judge/Champion manage):
 - **Check dependencies**: Verify all task list items are checked before claiming
 - **Claim issue**: `gh issue edit <number> --remove-label "loom:issue" --add-label "loom:building"`
 - **Do the work**: Implement, test, commit, create PR
-- **Mark PR for review**: `gh pr create --label "loom:review-requested"` (with structured body — see builder-pr.md)
+- **Mark PR for review**: `gh pr create --label "loom:review-requested"` (MUST use structured body template from PR Creation section below)
 - **Complete**: Issue auto-closes when PR merges, or mark `loom:blocked` if stuck
 
 ## Exception: Explicit User Instructions
@@ -171,8 +171,17 @@ gh issue comment 592 --body "Starting work on this issue per user request"
 ./.loom/scripts/worktree.sh 592
 # ... do the work ...
 
-# Complete normally with PR
-gh pr create --label "loom:review-requested" --body "Closes #592"
+# Complete normally with PR (use full structured body — see PR Creation section)
+gh pr create --title "fix: summary" --label "loom:review-requested" --body "$(cat <<'EOF'
+## Summary
+...
+## Changes
+...
+## Test Plan
+...
+Closes #592
+EOF
+)"
 ```
 
 **Why This Matters**:
@@ -605,17 +614,48 @@ gh issue list --label="loom:issue" --state=open --json number,title,labels \
 
 ## PR Creation
 
-For detailed PR creation and quality requirements, see **builder-pr.md**.
+For additional PR quality guidelines, see **builder-pr.md**.
 
-**Quick reference:**
-- **Verify ALL acceptance criteria** before creating PR (see builder-pr.md for details)
-- Extract criteria from issue body/comments (checkboxes, numbered items, "must"/"should" statements)
+**Before creating the PR:**
+- **Verify ALL acceptance criteria** from the issue (checkboxes, numbered items, "must"/"should" statements)
 - Verify each criterion explicitly with concrete checks (not "I think it works")
-- Include criterion verification table in PR description
-- Add `loom:review-requested` label when creating PR
-- Use "Closes #N" syntax for auto-close
-- Never touch PR labels after creation
 - Run `pnpm check:ci` before creating PR
+
+**REQUIRED: Use the structured PR body template below.** Do NOT create PRs with just `Closes #N` — the body must include Summary, Changes, and Acceptance Criteria sections.
+
+```bash
+gh pr create \
+  --title "fix: descriptive summary of the change" \
+  --label "loom:review-requested" \
+  --body "$(cat <<'EOF'
+## Summary
+Brief description of what this PR does and why.
+
+## Changes
+- Change 1
+- Change 2
+- Change 3
+
+## Acceptance Criteria Verification
+
+| Criterion | Status | Verification |
+|-----------|--------|--------------|
+| Criterion 1 from issue | ✅ | How you verified it |
+| Criterion 2 from issue | ✅ | How you verified it |
+
+## Test Plan
+How you verified the changes work.
+
+Closes #<issue-number>
+EOF
+)"
+```
+
+**PR title** must use conventional commit format: `fix:`, `feat:`, `refactor:`, `docs:`, `chore:`, etc.
+
+**After creation:**
+- Never touch PR labels after creation
+- Use "Closes #N" syntax (not "Issue #N" or "Addresses #N") for auto-close
 
 ## Working Style
 
@@ -625,7 +665,7 @@ For detailed PR creation and quality requirements, see **builder-pr.md**.
 - **During work**: If you discover out-of-scope needs, PAUSE and create an issue (see builder-complexity.md)
 - Use the TodoWrite tool to plan and track multi-step tasks
 - Run lint, format, and type checks before considering complete
-- **Create PR**: Add `loom:review-requested` label ONLY at creation, use "Closes #123" syntax
+- **Create PR**: Use the full structured body template (see PR Creation section), add `loom:review-requested` label ONLY at creation
 - **After PR creation**: HANDS OFF - never touch PR labels again, move to next issue
 - When blocked: Add comment explaining blocker, mark `loom:blocked`
 - Stay focused on assigned issue - create separate issues for other work
