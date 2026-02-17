@@ -866,7 +866,7 @@ run_with_retry() {
         #    Run claude directly with tee for error detection.
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
         start_startup_monitor "${temp_output}" "${startup_monitor_pid_file}"
-        # Write sentinel marker so _is_instant_exit() in the shepherd can
+        # Write sentinel marker so _is_low_output_session() in the shepherd can
         # distinguish wrapper pre-flight output from actual Claude CLI output.
         # The "# " prefix means it is also filtered as a header line.
         echo "# CLAUDE_CLI_START" >&2
@@ -1007,7 +1007,7 @@ run_preflight_checks() {
         else
             log_error "Authentication pre-flight check failed"
             # Write sentinel so the shepherd can distinguish auth failures from
-            # generic instant-exits and avoid futile retries.  See issue #2508.
+            # generic low-output sessions and avoid futile retries.  See issue #2508.
             echo "# AUTH_PREFLIGHT_FAILED" >&2
             return 1
         fi
