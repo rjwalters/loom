@@ -3488,7 +3488,9 @@ class BuilderPhase:
         commits_ahead = diag.get("commits_ahead", 0)
 
         if commits_ahead > 0:
-            # Real builder progress — always treat as incomplete
+            # Real builder progress — but check if workflow is already complete
+            if diag.get("pr_number") is not None and diag.get("pr_has_review_label", False):
+                return False  # PR exists with correct label — workflow is done
             return True
 
         if diag.get("has_uncommitted_changes", False):
