@@ -16161,15 +16161,63 @@ class TestIsGhostSession:
         """Log with no output but long duration is NOT a ghost.
 
         This is a low-output session, not a ghost — the session ran for a
-        meaningful amount of time but produced no output.
+        meaningful amount of time (> 30s) but produced no output.
         """
         log = tmp_path / "session.log"
         log.write_text("# CLAUDE_CLI_START\n")
-        # Backdate ctime by modifying mtime to simulate duration > 1s
+        # Backdate ctime by modifying mtime to simulate duration > 30s
         import os
         stat = log.stat()
-        os.utime(log, (stat.st_atime, stat.st_mtime + 5))
+        os.utime(log, (stat.st_atime, stat.st_mtime + 35))
         assert _is_ghost_session(log) is False
+
+    def test_no_output_wall_clock_over_threshold_not_ghost(self, tmp_path: Path) -> None:
+        """Session with no output but wall-clock > 30s is NOT a ghost.
+
+        Content-first detection identifies no meaningful output, but the
+        wall-clock duration exceeds the threshold, so this is classified
+        as low-output (exit code 6) instead of ghost (exit code 10).
+        """
+        log = tmp_path / "session.log"
+        log.write_text("# CLAUDE_CLI_START\n")
+        assert _is_ghost_session(log, wall_clock_duration=35.0) is False
+
+    def test_no_output_wall_clock_under_threshold_is_ghost(self, tmp_path: Path) -> None:
+        """Session with no output and wall-clock ≤ 30s IS a ghost.
+
+        Content-first detection identifies no meaningful output, and the
+        wall-clock duration is within the ghost threshold.  See issue #2659.
+        """
+        log = tmp_path / "session.log"
+        log.write_text("# CLAUDE_CLI_START\n")
+        assert _is_ghost_session(log, wall_clock_duration=15.0) is True
+
+    def test_spinner_only_session_is_ghost(self, tmp_path: Path) -> None:
+        """Session with only spinner output (Vibing..., thinking) IS a ghost.
+
+        Even if the session ran for several seconds, content-first detection
+        correctly identifies it as a ghost because spinner noise is stripped
+        before checking for meaningful output.  See issue #2659.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "(thinking)\n"
+            "Vibing...\n"
+            "(thinking)\n"
+            "Tinkering...\n"
+            "(thinking)\n"
+        )
+        assert _is_ghost_session(log, wall_clock_duration=7.0) is True
+
+    def test_meaningful_output_long_duration_not_ghost(self, tmp_path: Path) -> None:
+        """Session with meaningful output is NOT a ghost regardless of duration."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            + "x" * (LOW_OUTPUT_MIN_CHARS + 1)
+        )
+        assert _is_ghost_session(log, wall_clock_duration=2.0) is False
 
     def test_sentinel_present_no_cli_output_zero_duration(self, tmp_path: Path) -> None:
         """Sentinel present but no CLI output after it — ghost session."""
