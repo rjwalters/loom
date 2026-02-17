@@ -194,50 +194,7 @@ def _run_preflight_checks(ctx: DaemonContext) -> list[str]:
         failures.append("Error: 'tmux' not found in PATH")
         failures.append("Install tmux: brew install tmux (macOS)")
 
-    # Check 5: Required failure labels exist on the repo (non-blocking)
-    _check_failure_labels(ctx)
-
     return failures
-
-
-# Labels that must exist on the repo for failure-mode transitions to work.
-# Without these, _mark_* functions fall back to loom:blocked and log warnings.
-_REQUIRED_FAILURE_LABELS = frozenset({
-    "loom:failed:builder",
-    "loom:failed:builder-tests",
-    "loom:failed:judge",
-    "loom:failed:doctor",
-})
-
-
-def _check_failure_labels(ctx: DaemonContext) -> None:
-    """Warn if required failure-mode labels are missing from the repo.
-
-    This is a non-blocking check — the daemon will still start, but missing
-    labels degrade failure handling to a fallback (loom:blocked).  Warnings
-    are logged directly rather than added to the failures list.
-    """
-    try:
-        result = subprocess.run(
-            ["gh", "label", "list", "--json", "name", "--jq", ".[].name"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            cwd=ctx.repo_root,
-        )
-        if result.returncode != 0:
-            return  # Can't check labels — skip silently
-
-        repo_labels = set(result.stdout.strip().splitlines())
-        missing = _REQUIRED_FAILURE_LABELS - repo_labels
-
-        if missing:
-            log_warning(
-                f"Missing failure labels on repo: {', '.join(sorted(missing))}. "
-                f"Run: gh label sync --file .github/labels.yml"
-            )
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
-        pass  # Best-effort check — don't block startup
 
 
 def _rotate_state_file(ctx: DaemonContext) -> None:

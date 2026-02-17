@@ -2911,7 +2911,7 @@ class TestBuilderCommitInterruptedWork:
         # Verify label transitions
         mock_transition.assert_called_once_with(
             42,
-            add=["loom:needs-fix"],
+            add=["loom:blocked"],
             remove=["loom:building"],
             repo_root=tmp_path,
         )

@@ -4412,7 +4412,7 @@ class BuilderPhase:
         1. Stages all changes (git add -A)
         2. Creates a WIP commit with descriptive message
         3. Pushes the commit to remote
-        4. Labels the issue as loom:needs-fix for Doctor to pick up
+        4. Labels the issue as loom:blocked for Doctor to pick up
         5. Adds a comment explaining the situation
 
         Args:
@@ -4492,10 +4492,10 @@ class BuilderPhase:
             log_warning("Could not push WIP commit to remote")
             # Continue anyway - local commit still preserves work
 
-        # Transition label: loom:building -> loom:needs-fix
+        # Transition label: loom:building -> loom:blocked
         transition_issue_labels(
             ctx.config.issue,
-            add=["loom:needs-fix"],
+            add=["loom:blocked"],
             remove=["loom:building"],
             repo_root=ctx.repo_root,
         )
@@ -4549,7 +4549,7 @@ class BuilderPhase:
 
         log_info(
             f"Preserved interrupted work for issue #{ctx.config.issue} "
-            f"(WIP commit, labeled loom:needs-fix)"
+            f"(WIP commit, labeled loom:blocked)"
         )
         return True
 
@@ -4561,17 +4561,17 @@ class BuilderPhase:
         Instead of cleaning up, this method:
         1. Keeps the worktree intact (with marker for protection)
         2. Pushes existing commits to remote
-        3. Labels the issue ``loom:needs-fix`` so Doctor/Builder can continue
+        3. Labels the issue ``loom:blocked`` so Doctor/Builder can continue
         4. Writes test failure context to a file for Doctor to read
         5. Adds a comment with test failure context
         """
         # Push whatever commits exist to remote
         self._push_branch(ctx)
 
-        # Transition label: loom:building -> loom:needs-fix (atomic)
+        # Transition label: loom:building -> loom:blocked (atomic)
         transition_issue_labels(
             ctx.config.issue,
-            add=["loom:needs-fix"],
+            add=["loom:blocked"],
             remove=["loom:building"],
             repo_root=ctx.repo_root,
         )
@@ -4634,7 +4634,7 @@ class BuilderPhase:
 
         log_info(
             f"Preserved worktree for issue #{ctx.config.issue} "
-            f"(test failure, labeled loom:needs-fix)"
+            f"(test failure, labeled loom:blocked)"
         )
 
     # Maps file extension → set of test ecosystems that extension can affect.

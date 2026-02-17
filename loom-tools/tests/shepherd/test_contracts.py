@@ -24,11 +24,11 @@ class TestContract:
             name="test_contract",
             check=lambda ctx: True,
             violation_message="Test failed",
-            failure_label="loom:failed:test",
+            failure_label="loom:blocked",
         )
         assert c.name == "test_contract"
         assert c.violation_message == "Test failed"
-        assert c.failure_label == "loom:failed:test"
+        assert c.failure_label == "loom:blocked"
 
     def test_contract_without_failure_label(self) -> None:
         """Contract can be created without failure_label."""
@@ -80,17 +80,17 @@ class TestPhaseContracts:
         for contract in PHASE_CONTRACTS["builder"]:
             # Most builder contracts should have failure labels
             if contract.name != "no_existing_pr":
-                assert contract.failure_label == "loom:failed:builder"
+                assert contract.failure_label == "loom:blocked"
 
     def test_judge_has_failure_labels(self) -> None:
         """Judge contracts should specify failure labels."""
         for contract in PHASE_CONTRACTS["judge"]:
-            assert contract.failure_label == "loom:failed:judge"
+            assert contract.failure_label == "loom:blocked"
 
     def test_doctor_has_failure_labels(self) -> None:
         """Doctor contracts should specify failure labels."""
         for contract in PHASE_CONTRACTS["doctor"]:
-            assert contract.failure_label == "loom:failed:doctor"
+            assert contract.failure_label == "loom:blocked"
 
 
 class TestCheckPreconditions:
@@ -180,7 +180,7 @@ class TestApplyContractViolation:
             name="test",
             check=lambda c: True,
             violation_message="test failed",
-            failure_label="loom:failed:test",
+            failure_label="loom:blocked",
         )
         violation = ContractViolation(phase="test", contract=contract)
 
@@ -189,7 +189,7 @@ class TestApplyContractViolation:
         # Should have made two calls: edit labels and add comment
         assert mock_run.call_count == 2
         label_call = mock_run.call_args_list[0]
-        assert "loom:failed:test" in label_call[0][0]
+        assert "loom:blocked" in label_call[0][0]
 
     @patch("subprocess.run")
     def test_skips_label_when_not_specified(self, mock_run: MagicMock) -> None:
@@ -228,7 +228,7 @@ class TestApplyContractViolation:
             name="pr_exists",
             check=lambda c: True,
             violation_message="No PR exists",
-            failure_label="loom:failed:judge",
+            failure_label="loom:blocked",
         )
         violation = ContractViolation(
             phase="judge",

@@ -2,7 +2,7 @@
 
 .. deprecated::
     This module is deprecated. Auto-recovery was removed from the shepherd
-    system in favor of explicit failure labels (loom:failed:builder, etc.).
+    system in favor of the unified loom:blocked label.
     Recovery events are no longer generated, so this module only provides
     historical analysis of pre-existing events.
 

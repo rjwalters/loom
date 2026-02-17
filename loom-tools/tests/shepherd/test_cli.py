@@ -1967,7 +1967,7 @@ class TestMarkJudgeExhausted:
 
     @patch("subprocess.run")
     def test_transitions_labels(self, mock_run: MagicMock) -> None:
-        """Should run gh command to transition loom:building -> loom:failed:judge."""
+        """Should run gh command to transition loom:building -> loom:blocked."""
         mock_run.return_value = MagicMock(returncode=0)
 
         ctx = MagicMock()
@@ -1985,7 +1985,7 @@ class TestMarkJudgeExhausted:
         assert "--remove-label" in cmd
         assert "loom:building" in cmd
         assert "--add-label" in cmd
-        assert "loom:failed:judge" in cmd
+        assert "loom:blocked" in cmd
 
     @patch("subprocess.run")
     def test_records_blocked_reason(self, mock_run: MagicMock) -> None:
@@ -2038,7 +2038,7 @@ class TestMarkBuilderNoPr:
     def test_transitions_labels(
         self, mock_run: MagicMock, mock_gather: MagicMock
     ) -> None:
-        """Should run gh command to transition loom:building -> loom:failed:builder."""
+        """Should run gh command to transition loom:building -> loom:blocked."""
         mock_run.return_value = MagicMock(returncode=0)
         mock_gather.return_value = {
             "worktree_exists": False,
@@ -2065,7 +2065,7 @@ class TestMarkBuilderNoPr:
         assert "--remove-label" in cmd
         assert "loom:building" in cmd
         assert "--add-label" in cmd
-        assert "loom:failed:builder" in cmd
+        assert "loom:blocked" in cmd
 
     @patch("loom_tools.shepherd.cli._gather_no_pr_diagnostics")
     @patch("subprocess.run")
@@ -3809,12 +3809,12 @@ class TestCleanupLabelsOnFailure:
 
     @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
-    def test_no_revert_when_failure_label_present(
+    def test_no_revert_when_blocked_label_present(
         self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
-        """Should not revert to loom:issue when a loom:failed:* label exists."""
+        """Should not revert to loom:issue when loom:blocked label exists."""
         ctx = self._make_cleanup_ctx(
-            issue_labels={"loom:failed:builder-tests", "loom:curated"}
+            issue_labels={"loom:blocked", "loom:curated"}
         )
         _cleanup_labels_on_failure(ctx, ShepherdExitCode.PR_TESTS_FAILED)
 
@@ -3823,40 +3823,18 @@ class TestCleanupLabelsOnFailure:
 
     @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
     @patch("loom_tools.shepherd.cli.transition_issue_labels")
-    def test_removes_contradictory_labels_alongside_failure_label(
+    def test_removes_contradictory_building_label_alongside_blocked(
         self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
     ) -> None:
-        """Should remove loom:building when it coexists with a failure label."""
+        """Should remove loom:building when it coexists with loom:blocked."""
         ctx = self._make_cleanup_ctx(
-            issue_labels={"loom:failed:builder", "loom:building", "loom:curated"}
+            issue_labels={"loom:blocked", "loom:building", "loom:curated"}
         )
         _cleanup_labels_on_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
 
         mock_transition.assert_called_once_with(
             42,
             remove=["loom:building"],
-            repo_root=Path("/fake/repo"),
-        )
-
-    @patch("loom_tools.shepherd.cli._cleanup_pr_labels_on_failure")
-    @patch("loom_tools.shepherd.cli.transition_issue_labels")
-    def test_removes_multiple_contradictory_labels(
-        self, mock_transition: MagicMock, mock_pr_cleanup: MagicMock
-    ) -> None:
-        """Should remove both loom:building and loom:blocked if alongside failure label."""
-        ctx = self._make_cleanup_ctx(
-            issue_labels={
-                "loom:failed:builder-tests",
-                "loom:building",
-                "loom:blocked",
-                "loom:curated",
-            }
-        )
-        _cleanup_labels_on_failure(ctx, ShepherdExitCode.PR_TESTS_FAILED)
-
-        mock_transition.assert_called_once_with(
-            42,
-            remove=["loom:blocked", "loom:building"],
             repo_root=Path("/fake/repo"),
         )
 
@@ -4316,9 +4294,9 @@ class TestCleanupFallbackIntegration:
         mock_comment: MagicMock,
         mock_record: MagicMock,
     ) -> None:
-        """Should NOT post fallback comment when _mark_* handler already set failure label."""
+        """Should NOT post fallback comment when _mark_* handler already set loom:blocked."""
         ctx = self._make_cleanup_ctx(
-            issue_labels={"loom:failed:builder-tests", "loom:curated"}
+            issue_labels={"loom:blocked", "loom:curated"}
         )
         _cleanup_labels_on_failure(ctx, ShepherdExitCode.PR_TESTS_FAILED)
 

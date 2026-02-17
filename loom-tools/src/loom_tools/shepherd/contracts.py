@@ -4,7 +4,7 @@ This module provides a contract-based approach to phase validation.
 Each phase has preconditions that must be satisfied BEFORE the phase runs.
 If preconditions are not met, the phase is skipped with a clear failure message.
 
-Contract violations apply explicit failure labels (e.g., loom:failed:builder)
+Contract violations apply the loom:blocked label
 and add diagnostic comments to the issue for manual intervention.
 """
 
@@ -27,7 +27,7 @@ class Contract:
         name: Short name for the contract (e.g., "issue_open")
         check: Function that returns True if contract is satisfied
         violation_message: Human-readable message when contract is violated
-        failure_label: Optional label to apply on violation (e.g., "loom:failed:builder")
+        failure_label: Optional label to apply on violation (e.g., "loom:blocked")
     """
 
     name: str
@@ -149,19 +149,19 @@ BUILDER_CONTRACTS = [
         name="issue_exists",
         check=_check_issue_exists,
         violation_message="Issue does not exist",
-        failure_label="loom:failed:builder",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="issue_open",
         check=_check_issue_open,
         violation_message="Issue is not open",
-        failure_label="loom:failed:builder",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="issue_ready",
         check=_check_issue_has_loom_issue_label,
         violation_message="Issue does not have loom:issue label (not ready for work)",
-        failure_label="loom:failed:builder",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="no_existing_pr",
@@ -177,19 +177,19 @@ JUDGE_CONTRACTS = [
         name="pr_exists",
         check=_check_pr_exists,
         violation_message="No PR exists for this issue",
-        failure_label="loom:failed:judge",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="pr_open",
         check=_check_pr_is_open,
         violation_message="PR is not open",
-        failure_label="loom:failed:judge",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="review_requested",
         check=_check_pr_has_review_requested,
         violation_message="PR does not have loom:review-requested label",
-        failure_label="loom:failed:judge",
+        failure_label="loom:blocked",
     ),
 ]
 
@@ -199,19 +199,19 @@ DOCTOR_CONTRACTS = [
         name="pr_exists",
         check=_check_pr_exists,
         violation_message="No PR exists for this issue",
-        failure_label="loom:failed:doctor",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="pr_open",
         check=_check_pr_is_open,
         violation_message="PR is not open",
-        failure_label="loom:failed:doctor",
+        failure_label="loom:blocked",
     ),
     Contract(
         name="changes_requested",
         check=_check_pr_has_changes_requested,
         violation_message="PR does not have loom:changes-requested label",
-        failure_label="loom:failed:doctor",
+        failure_label="loom:blocked",
     ),
 ]
 

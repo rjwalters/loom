@@ -1319,60 +1319,37 @@ def _read_builder_log(ctx: ShepherdContext) -> str:
 
 
 def _apply_failure_label(
-    ctx: ShepherdContext, failure_label: str, *, remove_label: str = "loom:building"
+    ctx: ShepherdContext, *, remove_label: str = "loom:building"
 ) -> bool:
-    """Apply a failure label to an issue with fallback to loom:blocked.
+    """Apply loom:blocked to an issue, removing the in-progress label.
 
-    Attempts to transition from ``remove_label`` to ``failure_label``.
-    If the failure label doesn't exist on the repo (e.g. labels were never
-    synced), falls back to ``loom:blocked`` so the issue doesn't become a
-    dead letter with no workflow labels.
+    Transitions from ``remove_label`` to ``loom:blocked``.
 
     Args:
         ctx: Shepherd context
-        failure_label: The loom:failed:* label to apply
         remove_label: The label to remove (default "loom:building")
 
     Returns:
-        True if the intended failure label was applied, False if fallback was used.
+        True if the label was applied successfully.
     """
     success = transition_issue_labels(
-        ctx.config.issue,
-        add=[failure_label],
-        remove=[remove_label],
-        repo_root=ctx.repo_root,
-    )
-
-    if success:
-        return True
-
-    # Label transition failed — likely because the failure label doesn't
-    # exist on the repo.  Fall back to loom:blocked so the issue remains
-    # visible in the workflow.
-    log_warning(
-        f"Failed to apply '{failure_label}' to issue #{ctx.config.issue} "
-        f"(label may not exist on repo). Falling back to 'loom:blocked'. "
-        f"Run: gh label sync --file .github/labels.yml"
-    )
-
-    fallback_ok = transition_issue_labels(
         ctx.config.issue,
         add=["loom:blocked"],
         remove=[remove_label],
         repo_root=ctx.repo_root,
     )
 
-    if not fallback_ok:
+    if not success:
         log_error(
-            f"Fallback label transition also failed for issue #{ctx.config.issue}. "
+            f"Failed to apply 'loom:blocked' to issue #{ctx.config.issue}. "
             f"Issue may be in inconsistent label state."
         )
 
-    return False
+    return success
 
 
 def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
-    """Mark issue with loom:failed:builder-tests after test verification failed.
+    """Mark issue with loom:blocked after test verification failed.
 
     This replaces the old auto-recovery behavior. Instead of attempting to
     fix tests via Doctor, we now mark the failure explicitly and stop.
@@ -1380,8 +1357,8 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
     """
     import subprocess
 
-    # Atomic transition: loom:building -> loom:failed:builder-tests
-    _apply_failure_label(ctx, "loom:failed:builder-tests")
+    # Atomic transition: loom:building -> loom:blocked
+    _apply_failure_label(ctx)
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1422,13 +1399,13 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
             f"git add . && git commit -m 'Fix failing tests'\n"
             f"git push\n"
             f"gh pr create --title {shlex.quote(NamingConventions.pr_title(ctx.issue_title, ctx.config.issue))} --label loom:review-requested --body 'Closes #{ctx.config.issue}'\n"
-            f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests\n"
+            f"gh issue edit {ctx.config.issue} --remove-label loom:blocked\n"
             f"```\n\n"
             f"**Option B: Reset and retry**\n"
             f"```bash\n"
             f'cd "$(git rev-parse --show-toplevel)"  # Avoid broken CWD after removal\n'
             f"git worktree remove {ctx.worktree_path or '.loom/worktrees/issue-' + str(ctx.config.issue)} --force\n"
-            f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests --add-label loom:issue\n"
+            f"gh issue edit {ctx.config.issue} --remove-label loom:blocked --add-label loom:issue\n"
             f"```",
         ],
         cwd=ctx.repo_root,
@@ -1440,7 +1417,7 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
 def _mark_doctor_exhausted(
     ctx: ShepherdContext, *, failure_mode: str | None = None
 ) -> None:
-    """Mark issue with loom:failed:doctor due to retry exhaustion.
+    """Mark issue with loom:blocked due to doctor retry exhaustion.
 
     Args:
         ctx: Shepherd context
@@ -1449,8 +1426,8 @@ def _mark_doctor_exhausted(
     """
     import subprocess
 
-    # Atomic transition: loom:building -> loom:failed:doctor
-    _apply_failure_label(ctx, "loom:failed:doctor")
+    # Atomic transition: loom:building -> loom:blocked
+    _apply_failure_label(ctx)
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1543,11 +1520,11 @@ def _judge_retry_backoff(
 
 
 def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
-    """Mark issue with loom:failed:judge due to retry exhaustion."""
+    """Mark issue with loom:blocked due to judge retry exhaustion."""
     import subprocess
 
-    # Atomic transition: loom:building -> loom:failed:judge
-    _apply_failure_label(ctx, "loom:failed:judge")
+    # Atomic transition: loom:building -> loom:blocked
+    _apply_failure_label(ctx)
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1744,14 +1721,14 @@ def _format_diagnostics_for_comment(
             lines.append(f"git push -u origin feature/issue-{issue}")
         title = NamingConventions.pr_title(issue_title, issue)
         lines.append(f'gh pr create --title {shlex.quote(title)} --label "loom:review-requested" --body "Closes #{issue}"')
-        lines.append(f"gh issue edit {issue} --remove-label loom:failed:builder")
+        lines.append(f"gh issue edit {issue} --remove-label loom:blocked")
         lines.append("```")
 
     return "\n".join(lines)
 
 
 def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
-    """Mark issue with loom:failed:builder because no PR was created.
+    """Mark issue with loom:blocked because no PR was created.
 
     This handles the case where Builder completes without creating a PR,
     which is a precondition failure for the Judge phase. This covers unexpected
@@ -1768,8 +1745,8 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
     # Log diagnostics to stderr for visibility
     log_info(_format_diagnostics_for_log(diagnostics))
 
-    # Atomic transition: loom:building -> loom:failed:builder
-    _apply_failure_label(ctx, "loom:failed:builder")
+    # Atomic transition: loom:building -> loom:blocked
+    _apply_failure_label(ctx)
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -2017,9 +1994,9 @@ def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
 
     Rules:
     - On success/skip: no cleanup needed
-    - If a _mark_* handler already set a loom:failed:* label: remove any
-      contradictory state labels (loom:building, loom:blocked)
-    - If loom:building is present with no failure label: revert to loom:issue
+    - If a _mark_* handler already set loom:blocked: remove any
+      contradictory state labels (loom:building)
+    - If loom:building is present with no blocked label: revert to loom:issue
     - Clean up stale PR workflow labels (loom:treating, loom:reviewing, etc.)
     """
     # No cleanup needed on success or skip
@@ -2041,23 +2018,22 @@ def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
         # Can't reach GitHub API - nothing we can do
         return
 
-    # Check if a _mark_* handler already set a failure label
-    has_failure_label = any(l.startswith("loom:failed:") for l in current_labels)
+    # Check if a _mark_* handler already set loom:blocked
+    has_blocked_label = "loom:blocked" in current_labels
 
-    if has_failure_label:
+    if has_blocked_label:
         # _mark_* already handled the transition - just clean up any
-        # contradictory state labels that shouldn't coexist with a failure label
-        contradictory = {"loom:building", "loom:blocked"} & current_labels
-        if contradictory:
+        # contradictory state labels that shouldn't coexist with loom:blocked
+        if "loom:building" in current_labels:
             try:
                 transition_issue_labels(
                     issue,
-                    remove=sorted(contradictory),
+                    remove=["loom:building"],
                     repo_root=ctx.repo_root,
                 )
                 log_info(
-                    f"Label cleanup: removed contradictory labels "
-                    f"{sorted(contradictory)} from issue #{issue}"
+                    f"Label cleanup: removed contradictory label "
+                    f"loom:building from issue #{issue}"
                 )
             except Exception:
                 pass
