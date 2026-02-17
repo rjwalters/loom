@@ -712,6 +712,26 @@ is_transient_error() {
     return 1
 }
 
+# Check if error output specifically indicates an MCP/plugin failure.
+# Used to map exhausted-retry exits to exit code 7 so the Python retry
+# layer can recognize MCP failures even when the wrapper's own retries
+# are exhausted.  See issue #2746.
+is_mcp_error() {
+    local output="$1"
+    local mcp_patterns=(
+        "MCP server failed"
+        "MCP.*failed"
+        "plugins failed"
+        "plugin.*failed to install"
+    )
+    for pattern in "${mcp_patterns[@]}"; do
+        if echo "${output}" | grep -qi "${pattern}"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Monitor output file for API errors during execution.
 # If an API error pattern is detected and no new output arrives within
 # API_ERROR_IDLE_TIMEOUT seconds, sends SIGINT to the claude process.
@@ -1182,6 +1202,15 @@ run_with_retry() {
     log_error "Max retries (${MAX_RETRIES}) exceeded"
     log_error "Last error: ${output}"
     clear_retry_state
+
+    # When the last failure was MCP-related, exit with code 7 so the
+    # Python retry layer (run_phase_with_retry) can recognise and retry
+    # the MCP failure instead of treating it as a generic error.
+    # See issue #2746.
+    if is_mcp_error "${output}"; then
+        log_info "Last failure was MCP-related — exiting with code 7"
+        return 7
+    fi
     return 1
 }
 
