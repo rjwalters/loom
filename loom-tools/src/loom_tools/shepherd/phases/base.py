@@ -1147,7 +1147,7 @@ def run_worker_phase(
 
     # Check for ghost session (exit code 10) — instant exit with no work.
     # Ghost sessions are a specific subtype of low-output where the session
-    # lasted < 1s.  These are infrastructure failures that should be retried
+    # lasted < 2s.  These are infrastructure failures that should be retried
     # on a separate budget.  Check before MCP/low-output to avoid consuming
     # their retry budgets.  See issues #2604, #2644.
     if wait_exit != 0 and _is_ghost_session(log_path):
