@@ -61,18 +61,20 @@ If no argument is provided, use the normal finding work workflow below.
 gh pr list --label="loom:review-requested" --state=open
 ```
 
-**After approval (green → blue):**
+**After approval (green → blue) — BOTH commands are REQUIRED:**
 ```bash
-gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass, implementation is solid."
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment <number> --body "LGTM! Code quality is excellent, tests pass, implementation is solid." && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
-**If changes needed (green → amber):**
+**If changes needed (green → amber) — BOTH commands are REQUIRED:**
 ```bash
-gh pr comment <number> --body "Issues found that need addressing before approval..."
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+gh pr comment <number> --body "Issues found that need addressing before approval..." && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 # Fixer will address feedback and change back to loom:review-requested
 ```
+
+**CRITICAL: The `gh pr edit` label command is the PRIMARY deliverable of evaluation.** The comment alone is NOT sufficient — the shepherd orchestrator validates outcomes by checking labels, not comments. If you post a comment but skip the label, the evaluation is incomplete and triggers costly fallback detection.
 
 **Label transitions:**
 - `loom:review-requested` (green) → `loom:pr` (blue) [approved, ready for user to merge]
@@ -118,9 +120,9 @@ gh pr comment 599 --body "Starting evaluation of this PR per user request"
 gh pr checkout 599
 # ... run tests, evaluate code ...
 
-# Complete normally with approval or changes requested
-gh pr comment 599 --body "LGTM! Code quality is excellent."
-gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
+# Complete normally with approval or changes requested (chain with &&)
+gh pr comment 599 --body "LGTM! Code quality is excellent." && \
+  gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 ```
 
 **Why This Matters**:
@@ -159,9 +161,9 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 8. **Verify CI status**: Check GitHub CI passes before approving (see CI Status Check below)
 9. **Evaluate changes**: Examine diff, look for issues, suggest improvements
 10. **Provide feedback**: Use `gh pr comment` to provide evaluation feedback
-11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file):
-   - If approved: Comment with approval, remove `loom:review-requested` and `loom:reviewing`, add `loom:pr` (blue badge - ready for user to merge)
-   - If changes needed: Comment with issues, remove `loom:review-requested` and `loom:reviewing`, add `loom:changes-requested` (amber badge - Fixer will address)
+11. **Update labels** (⚠️ NEVER use `gh pr review` - see warning at top of file). **The label update is the PRIMARY deliverable — always run it immediately after the comment using `&&`:**
+   - If approved: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:pr"` (blue badge - ready for user to merge)
+   - If changes needed: `gh pr comment ... && gh pr edit <number> --remove-label "loom:review-requested" --remove-label "loom:reviewing" --add-label "loom:changes-requested"` (amber badge - Fixer will address)
 
 **Pre-approval checklist** (verify before executing approval commands):
 - [ ] I am using `gh pr comment`, NOT `gh pr review`
@@ -170,6 +172,7 @@ gh pr edit 599 --remove-label "loom:reviewing" --add-label "loom:pr"
 - [ ] All CI checks pass (verified via `gh pr checks`)
 - [ ] Merge state is CLEAN (verified via `gh pr view --json mergeStateStatus`)
 - [ ] I will NEVER call `gh pr review` in any form
+- [ ] I will run `gh pr comment` AND `gh pr edit` atomically (chained with `&&`)
 
 ### Fallback Queue (When No Labeled Work)
 
@@ -320,7 +323,7 @@ git push --force-with-lease
 
 I'll evaluate again once conflicts are resolved.
 EOF
-)"
+)" && \
             gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
         fi
     else
@@ -343,7 +346,7 @@ git push --force-with-lease
 
 I'll re-evaluate once conflicts are resolved, or the Doctor role will handle this.
 EOF
-)"
+)" && \
         gh pr edit $PR_NUMBER --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
     fi
 fi
@@ -409,8 +412,8 @@ Please rebase your branch and resolve conflicts, or the Doctor role will handle 
 
 I'll evaluate the code once conflicts are resolved.
 FEEDBACK
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
 
 ### Edge Cases
@@ -491,8 +494,8 @@ Please fix these issues before the PR can be approved. Common causes:
 
 I'll evaluate again once CI passes.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:ci-failure"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:ci-failure"
 ```
 
 ### When Merge Conflicts Exist
@@ -525,8 +528,8 @@ git push --force-with-lease
 
 I'll re-evaluate once conflicts are resolved, or the Doctor role will handle this.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested" --add-label "loom:merge-conflict"
 ```
 
 ### When CI is Pending
@@ -559,9 +562,9 @@ gh pr checks 42
 gh pr view 42 --json mergeStateStatus --jq '.mergeStateStatus'
 # Should output: CLEAN
 
-# 3. Only then proceed with approval
-gh pr comment 42 --body "✅ **Approved!** All CI checks pass, code looks great."
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+# 3. Only then proceed with approval (BOTH commands in one chain)
+gh pr comment 42 --body "✅ **Approved!** All CI checks pass, code looks great." && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Why CI Verification Matters
@@ -641,8 +644,8 @@ This re-evaluation used the abbreviated fast-track process because:
 
 <!-- loom:fast-track-evaluation -->
 EOF
-)"
-gh pr edit <PR_NUMBER> --remove-label "loom:review-requested" --add-label "loom:pr"
+)" && \
+  gh pr edit <PR_NUMBER> --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Escalation to Full Evaluation
@@ -720,8 +723,8 @@ See Builder role docs for PR creation best practices.
 
 I'll evaluate the code changes once the PR description is fixed.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 ```
 
 3. **Wait for fix before evaluating code**
@@ -800,8 +803,8 @@ gh pr comment <number> --body "$(cat <<'EOF'
 
 Code quality looks great - tests pass, implementation is clean, and documentation is complete.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Important Guidelines
@@ -828,8 +831,8 @@ sed -i '' 's/Issue #123/Closes #123/g' /tmp/pr-body.txt
 gh pr edit 42 --body-file /tmp/pr-body.txt
 
 # 4. Comment with approval and documentation of fix
-gh pr comment 42 --body "✅ **Approved!** Updated PR description to use 'Closes #123' for auto-close. Code looks great!"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment 42 --body "✅ **Approved!** Updated PR description to use 'Closes #123' for auto-close. Code looks great!" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 **Philosophy**: This empowers Judges to handle complete evaluations in one iteration for minor documentation issues, while maintaining strict code quality standards. The Builder's intent is preserved, and the evaluation process is faster.
@@ -897,8 +900,8 @@ Fixed during evaluation:
 
 Code quality is excellent, tests pass, implementation is solid.
 EOF
-)"
-gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
+)" && \
+  gh pr edit <number> --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Example Workflow
@@ -918,8 +921,8 @@ git commit -m "Remove unused import (during evaluation)"
 git push
 
 # 5. Approve with note about the fix
-gh pr comment 42 --body "✅ **Approved!** Removed unused import during evaluation. Code looks great!"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment 42 --body "✅ **Approved!** Removed unused import during evaluation. Code looks great!" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Important Guidelines
@@ -1292,8 +1295,8 @@ EOF
 )"
 
 # Then approve with reference to the issue
-gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent."
-gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
+gh pr comment 557 --body "✅ **Approved!** Created #XXX to track documentation update. Code quality is excellent." && \
+  gh pr edit 557 --remove-label "loom:review-requested" --add-label "loom:pr"
 ```
 
 ### Benefits
@@ -1357,6 +1360,7 @@ gh pr checkout 42
 pnpm check:all  # or equivalent for the project
 
 # Request changes (green → amber - Fixer will address)
+# IMPORTANT: Chain comment AND label update with && to ensure both execute
 gh pr comment 42 --body "$(cat <<'EOF'
 ❌ **Changes Requested**
 
@@ -1368,11 +1372,12 @@ Found a few issues that need addressing:
 
 Please address these and I'll take another look!
 EOF
-)"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
+)" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 # Note: PR now has loom:changes-requested (amber badge) - Fixer will address and change back to loom:review-requested
 
 # Approve PR (green → blue)
+# IMPORTANT: Chain comment AND label update with && to ensure both execute
 gh pr comment 42 --body "$(cat <<'EOF'
 ✅ **Approved!** Great work on this feature. Tests look comprehensive and the code is clean.
 
@@ -1383,8 +1388,8 @@ gh pr comment 42 --body "$(cat <<'EOF'
 2. Verify output contains expected format — ✅ Executed: Output matches expected format
 3. Start daemon and observe behavior — ⚠️ Skipped: requires manual observation
 EOF
-)"
-gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
+)" && \
+  gh pr edit 42 --remove-label "loom:review-requested" --add-label "loom:pr"
 # Note: PR now has loom:pr (blue badge) - ready for user to merge
 ```
 
