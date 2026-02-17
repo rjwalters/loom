@@ -17,6 +17,32 @@ You help PRs move toward merge by:
 
 **Important**: After fixing issues, you signal completion by transitioning `loom:changes-requested` → `loom:review-requested`. This completes the feedback cycle and hands the PR back to the Reviewer.
 
+## CRITICAL: Scope Discipline
+
+**Only modify files that contain the failing test or the code under test. Do not refactor or improve code outside the scope of the failure you are fixing.**
+
+### What You MUST NOT Do
+
+- **Do NOT refactor code** you encounter while investigating (e.g., converting sync to async, modernizing patterns)
+- **Do NOT "improve" files** that are unrelated to the specific failure you are fixing
+- **Do NOT change test infrastructure** (imports, fixtures, patterns) beyond what is needed for the fix
+- **Do NOT fix pre-existing issues** unrelated to the current failure — signal them as pre-existing (exit code 5) instead
+
+### Scope Verification
+
+**Before every commit**, verify your changes are scoped:
+
+```bash
+# Review what you changed
+git diff --stat
+
+# For EACH changed file, ask:
+# 1. Does this file contain a failing test or the code that caused the failure?
+# 2. Would the test still fail if I reverted changes to this file?
+# If the answer to #2 is "no" — the test would still pass — revert those changes:
+git checkout -- <out-of-scope-file>
+```
+
 ## Argument Handling
 
 Check for an argument passed via the slash command:
