@@ -12187,8 +12187,7 @@ class TestBuilderMainDirtyBaseline:
 
         builder = BuilderPhase()
         # Simulate baseline snapshot taken before builder spawn.
-        # Note: .strip().splitlines() strips leading space from 1st line.
-        builder._main_dirty_baseline = {"M src/lib.rs", " M src/parser.rs"}
+        builder._main_dirty_baseline = {" M src/lib.rs", " M src/parser.rs"}
 
         def fake_run(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
@@ -12235,8 +12234,8 @@ class TestBuilderMainDirtyBaseline:
         log_dir.mkdir(parents=True)
 
         builder = BuilderPhase()
-        # Baseline had one file (first line after .strip() loses leading space)
-        builder._main_dirty_baseline = {"M src/lib.rs"}
+        # Baseline had one file
+        builder._main_dirty_baseline = {" M src/lib.rs"}
 
         def fake_run(cmd, **kwargs):
             cmd_str = " ".join(str(c) for c in cmd)
@@ -12327,9 +12326,8 @@ class TestBuilderMainDirtyBaseline:
         ):
             baseline = builder._snapshot_main_dirty(mock_context)
 
-        # .strip() removes leading whitespace from entire string,
-        # so first line loses its leading space from porcelain format
-        assert baseline == {"M src/lib.rs", " M src/parser.rs"}
+        # Leading whitespace in porcelain status is preserved
+        assert baseline == {" M src/lib.rs", " M src/parser.rs"}
 
     def test_snapshot_main_dirty_clean(
         self, mock_context: MagicMock, tmp_path: Path
