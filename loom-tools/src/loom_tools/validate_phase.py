@@ -720,6 +720,7 @@ def validate_builder(
         # Validate PR title is not generic (anti-pattern detection)
         if not check_only:
             _warn_generic_pr_title(pr_num, issue, repo_root, task_id)
+            _recover_minimal_pr_body(pr_num, issue, repo_root, task_id)
 
         # Check for loom:review-requested label
         r = _run_gh(
@@ -1222,6 +1223,91 @@ def _warn_generic_pr_title(
                 ),
             )
             return
+
+
+def _recover_minimal_pr_body(
+    pr: int,
+    issue: int,
+    repo_root: Path,
+    task_id: str | None,
+) -> None:
+    """Enrich a PR body that contains no meaningful summary.
+
+    Detects "minimal" bodies where the only content (after stripping
+    ``Closes/Fixes/Resolves #N`` references) is less than 80 characters and
+    there is no ``## Summary`` section.  When detected, fetches the file
+    change list from the PR and prepends an auto-generated summary.
+    """
+    r = _run_gh(
+        ["pr", "view", str(pr), "--json", "body", "--jq", ".body"],
+        repo_root,
+        use_cache=False,
+    )
+    if r.returncode != 0:
+        return
+
+    body = r.stdout.strip() if r.stdout.strip() and r.stdout.strip() != "null" else ""
+
+    # Already has a summary section — nothing to do.
+    if re.search(r"^## Summary", body, re.MULTILINE):
+        return
+
+    # Strip close-keyword lines to measure remaining content.
+    stripped = re.sub(
+        r"(?mi)^(Closes|Fixes|Resolves)\s+#\d+\s*$", "", body,
+    ).strip()
+
+    if len(stripped) >= 80:
+        return
+
+    # Body is minimal — fetch file list to build an enriched body.
+    r = _run_gh(
+        ["pr", "view", str(pr), "--json", "files",
+         "--jq", '.files[] | "\\(.path) (+\\(.additions)/-\\(.deletions))"'],
+        repo_root,
+        use_cache=False,
+    )
+    file_lines: list[str] = []
+    if r.returncode == 0 and r.stdout.strip():
+        for line in r.stdout.strip().splitlines()[:25]:
+            file_lines.append(f"- `{line}`")
+
+    new_parts: list[str] = [
+        "## Summary",
+        "",
+        "> **Note:** This summary was auto-generated because the builder "
+        "created a PR with a minimal body.",
+        "",
+    ]
+
+    if file_lines:
+        new_parts.append("## Changes")
+        new_parts.append("")
+        new_parts.extend(file_lines)
+        new_parts.append("")
+
+    # Preserve original body at the end.
+    if body:
+        new_parts.append(body)
+
+    new_body = "\n".join(new_parts)
+
+    r = subprocess.run(
+        ["gh", "pr", "edit", str(pr), "--body", new_body],
+        capture_output=True, text=True, check=False, cwd=repo_root,
+    )
+    if r.returncode == 0:
+        _report_milestone(
+            "heartbeat", task_id, repo_root,
+            action=f"recovery: enriched minimal PR #{pr} body for issue #{issue}",
+        )
+        _log_recovery_event(
+            issue=issue,
+            recovery_type="enrich_pr_body",
+            reason="minimal_pr_body",
+            repo_root=repo_root,
+            pr_number=pr,
+        )
 
 
 # ---------------------------------------------------------------------------
