@@ -1,0 +1,8 @@
+This issue is a duplicate of #2568, which was already fixed by PR #2577 (merged 2026-02-17).
+
+PR #2577 implemented all three protections requested in this issue:
+1. File-based claim checking via has_valid_claim() (orphan_recovery.py:386)
+2. Label grace period via _get_building_label_age() with 600s threshold (orphan_recovery.py:327-336)
+3. Fresh progress re-read via _has_fresh_progress() (orphan_recovery.py:692-699)
+
+The fix is already on main and present in this worktree's branch base.
