@@ -3856,6 +3856,25 @@ class BuilderPhase:
                         f"for branch {branch}, skipping creation"
                     )
                     continue
+                # Build structured PR body with Summary and Changes
+                diff_stat_result = subprocess.run(
+                    ["git", "diff", "--stat", "origin/main...HEAD"],
+                    cwd=ctx.worktree_path or ctx.repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                diff_stat = diff_stat_result.stdout.strip()
+                pr_body_parts = [
+                    "## Summary",
+                    ctx.issue_title or f"Issue #{ctx.config.issue}",
+                    "",
+                    "## Changes",
+                    f"```\n{diff_stat}\n```" if diff_stat else "_No file changes detected._",
+                    "",
+                    f"Closes #{ctx.config.issue}",
+                ]
+                pr_body = "\n".join(pr_body_parts)
                 result = subprocess.run(
                     [
                         "gh",
@@ -3868,7 +3887,7 @@ class BuilderPhase:
                         "--label",
                         "loom:review-requested",
                         "--body",
-                        f"Closes #{ctx.config.issue}",
+                        pr_body,
                     ],
                     cwd=ctx.repo_root,
                     capture_output=True,
