@@ -298,8 +298,12 @@ class JudgePhase:
                     if bypass_result is not None:
                         return bypass_result
 
-                # All recovery paths exhausted — NOW post the failure
-                # comment and apply the failure label (#2588).
+                # All internal recovery paths exhausted.  Do NOT post a
+                # failure comment here — the CLI-level retry loop may
+                # re-run the judge phase, and premature comments create
+                # noise (#2661).  The CLI's _mark_judge_exhausted()
+                # handles the comment + label once *all* retries are
+                # truly exhausted.
                 from loom_tools.validate_phase import _mark_phase_failed
 
                 _mark_phase_failed(
@@ -308,6 +312,7 @@ class JudgePhase:
                     f"Judge phase did not produce a review decision on PR #{ctx.pr_number}.",
                     ctx.repo_root,
                     failure_label="loom:failed:judge",
+                    quiet=True,
                 )
                 # Add context about loom:review-requested state (issue #1998)
                 if ctx.has_pr_label("loom:review-requested"):
