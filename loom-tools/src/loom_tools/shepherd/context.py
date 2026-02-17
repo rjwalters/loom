@@ -351,6 +351,8 @@ class ShepherdContext:
         A stale remote branch ``feature/issue-N`` may indicate a previous
         attempt that left artifacts behind.  We warn but always proceed
         so orchestration is not blocked.
+
+        Branches that back an open PR are not considered stale.
         """
         logger = logging.getLogger(__name__)
         branch_name = NamingConventions.branch_name(issue)
@@ -363,6 +365,28 @@ class ShepherdContext:
                 check=False,
             )
             if result.returncode == 0 and result.stdout.strip():
+                # Check if this branch has an open PR — if so, it's not stale
+                try:
+                    open_prs = gh_list(
+                        "pr",
+                        head=branch_name,
+                        state="open",
+                        fields=["number"],
+                        limit=1,
+                    )
+                    if open_prs:
+                        logger.debug(
+                            "Branch %s has open PR #%s — not stale",
+                            branch_name,
+                            open_prs[0].get("number", "?"),
+                        )
+                        return
+                except Exception:
+                    # If the PR check fails, fall through to the warning
+                    logger.debug(
+                        "Could not check open PRs for branch %s", branch_name
+                    )
+
                 msg = (
                     f"Stale branch {branch_name} exists on remote. "
                     "Previous attempt may have left artifacts."
