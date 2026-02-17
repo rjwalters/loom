@@ -1806,6 +1806,28 @@ class BuilderPhase:
 
         return names
 
+    @staticmethod
+    def _extract_test_file_paths(failing_names: set[str]) -> set[str]:
+        """Extract file paths from failing test names.
+
+        pytest: "tests/test_foo.py::test_bar" -> "tests/test_foo.py"
+        vitest/jest: "src/foo.test.ts" -> "src/foo.test.ts" (already a path)
+        cargo: "some::module::test_name" -> skipped (not a file path)
+        """
+        paths: set[str] = set()
+        for name in failing_names:
+            if "::" in name:
+                # pytest format: file::test_name
+                # Distinguish from cargo (module::test) by checking for "/"
+                candidate = name.split("::")[0]
+                if "/" in candidate:
+                    paths.add(candidate)
+            elif "/" in name:
+                # vitest/jest format: already a file path
+                paths.add(name)
+            # cargo test names (module::paths with no file separator) are skipped
+        return paths
+
     def _has_pytest_output(self, output: str) -> bool:
         """Check if test output contains pytest results.
 
@@ -2442,6 +2464,10 @@ class BuilderPhase:
         if ctx.worktree_path:
             changed_files = get_changed_files(cwd=ctx.worktree_path)
 
+        # Extract failing test file paths for rebase-before-doctor check
+        failing_names = self._extract_failing_test_names(output)
+        failing_test_files = sorted(self._extract_test_file_paths(failing_names))
+
         # Compute new error count for regression detection across doctor iterations
         new_error_count = self._compute_new_error_count(
             output,
@@ -2456,6 +2482,7 @@ class BuilderPhase:
             "test_summary": summary or "",
             "test_command": display_name,
             "changed_files": changed_files,
+            "failing_test_files": failing_test_files,
         }
         if new_error_count is not None:
             data["new_error_count"] = new_error_count
@@ -2824,6 +2851,10 @@ class BuilderPhase:
         if ctx.worktree_path:
             changed_files = get_changed_files(cwd=ctx.worktree_path)
 
+        # Extract failing test file paths for rebase-before-doctor check
+        failing_names = self._extract_failing_test_names(primary_output)
+        failing_test_files = sorted(self._extract_test_file_paths(failing_names))
+
         # Compute new error count for regression detection across doctor iterations
         baseline_output_for_count = (
             baseline_result.stdout + "\n" + baseline_result.stderr
@@ -2840,6 +2871,7 @@ class BuilderPhase:
             "test_summary": summary or "",
             "test_command": display_name,
             "changed_files": changed_files,
+            "failing_test_files": failing_test_files,
         }
         if new_error_count is not None:
             data["new_error_count"] = new_error_count

@@ -17025,3 +17025,42 @@ class TestRunPhaseWithRetryGhostCauseSpecific:
         assert backoff == [10, 30, 60]
         sleep_calls = [c.args[0] for c in mock_sleep.call_args_list]
         assert sleep_calls == backoff
+
+
+class TestExtractTestFilePaths:
+    """Test BuilderPhase._extract_test_file_paths."""
+
+    def test_pytest_format(self) -> None:
+        """pytest names like 'tests/test_foo.py::test_bar' yield 'tests/test_foo.py'."""
+        names = {
+            "tests/test_foo.py::test_bar",
+            "tests/sub/test_deep.py::TestClass::test_method",
+        }
+        result = BuilderPhase._extract_test_file_paths(names)
+        assert result == {"tests/test_foo.py", "tests/sub/test_deep.py"}
+
+    def test_vitest_jest_format(self) -> None:
+        """vitest/jest names like 'src/foo.test.ts' are already file paths."""
+        names = {"src/foo.test.ts", "src/components/bar.test.tsx"}
+        result = BuilderPhase._extract_test_file_paths(names)
+        assert result == {"src/foo.test.ts", "src/components/bar.test.tsx"}
+
+    def test_cargo_format_skipped(self) -> None:
+        """cargo test names like 'some::module::test_name' have no file path."""
+        names = {"some::module::test_name", "another::test"}
+        result = BuilderPhase._extract_test_file_paths(names)
+        assert result == set()
+
+    def test_mixed_formats(self) -> None:
+        """Handles a mix of pytest, vitest, and cargo names."""
+        names = {
+            "tests/test_foo.py::test_bar",
+            "src/foo.test.ts",
+            "crate::module::test_name",
+        }
+        result = BuilderPhase._extract_test_file_paths(names)
+        assert result == {"tests/test_foo.py", "src/foo.test.ts"}
+
+    def test_empty_input(self) -> None:
+        result = BuilderPhase._extract_test_file_paths(set())
+        assert result == set()

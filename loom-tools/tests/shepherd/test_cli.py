@@ -4403,3 +4403,405 @@ class TestCleanupFallbackIntegration:
 
         mock_comment.assert_called_once_with(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
         mock_record.assert_called_once_with(ctx, ShepherdExitCode.SYSTEMIC_FAILURE)
+
+
+class TestRebaseBeforeDoctor:
+    """Test rebase-before-doctor optimization for unmodified-file test failures."""
+
+    @patch("loom_tools.shepherd.cli.is_branch_behind")
+    @patch("loom_tools.shepherd.cli.attempt_rebase")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_rebase_fixes_tests_skips_doctor(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+        mock_attempt_rebase: MagicMock,
+        mock_is_behind: MagicMock,
+    ) -> None:
+        """When failing tests are in unmodified files and rebase fixes them, Doctor is skipped."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Rebase + re-test
+            100,   # test_start (after rebase)
+            110,   # test elapsed
+            # Completion validation
+            110,   # completion_start
+            120,   # completion elapsed
+            # Judge
+            120,   # judge phase_start
+            170,   # judge elapsed
+            # Rebase phase
+            170,   # rebase phase_start
+            173,   # rebase elapsed
+            # Merge
+            173,   # merge phase_start
+            183,   # merge elapsed
+            183,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        MockCurator.return_value.should_skip.return_value = (True, "skipped")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+        # Builder reports test failure in files NOT modified by builder
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={
+                "test_failure": True,
+                "test_output_tail": "FAILED tests/test_other.py::test_bar",
+                "test_command": "pytest",
+                "changed_files": ["src/main.py"],
+                "failing_test_files": ["tests/test_other.py"],
+            },
+        )
+
+        # Rebase succeeds
+        mock_is_behind.return_value = True
+        mock_attempt_rebase.return_value = (True, "")
+
+        # After rebase, tests pass
+        builder_inst.run_test_verification_only.return_value = None
+        builder_inst.push_branch.return_value = True
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+
+        # Judge approves
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.SUCCESS
+
+        # Doctor was never called
+        MockDoctor.return_value.run_test_fix.assert_not_called()
+        # Rebase was attempted
+        mock_attempt_rebase.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli.is_branch_behind")
+    @patch("loom_tools.shepherd.cli.attempt_rebase")
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_rebase_succeeds_but_tests_still_fail_routes_to_doctor(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+        mock_attempt_rebase: MagicMock,
+        mock_is_behind: MagicMock,
+    ) -> None:
+        """When rebase succeeds but tests still fail, Doctor is invoked."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Rebase + re-test (still fails)
+            100,   # test_start
+            110,   # test elapsed
+            # Doctor test-fix
+            110,   # doctor phase_start
+            200,   # doctor elapsed
+            # Test re-verification after doctor
+            200,   # test_start
+            210,   # test elapsed
+            # Completion validation
+            210,   # completion_start
+            220,   # completion elapsed
+            # Judge
+            220,   # judge phase_start
+            270,   # judge elapsed
+            # Rebase
+            270,   # rebase phase_start
+            273,   # rebase elapsed
+            # Merge
+            273,   # merge phase_start
+            283,   # merge elapsed
+            283,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        MockCurator.return_value.should_skip.return_value = (True, "skipped")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+
+        # Initial test failure in unmodified files
+        test_fail_result = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={
+                "test_failure": True,
+                "test_output_tail": "FAILED tests/test_other.py::test_bar",
+                "test_command": "pytest",
+                "changed_files": ["src/main.py"],
+                "failing_test_files": ["tests/test_other.py"],
+            },
+        )
+        builder_inst.run.return_value = test_fail_result
+
+        # Rebase succeeds but tests still fail after
+        mock_is_behind.return_value = True
+        mock_attempt_rebase.return_value = (True, "")
+        builder_inst.push_branch.return_value = True
+
+        # Tests still fail after rebase (return a PhaseResult)
+        post_rebase_fail = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={"test_failure": True, "test_output_tail": "still failing"},
+        )
+        # First call: after rebase. Second call: after doctor.
+        builder_inst.run_test_verification_only.side_effect = [post_rebase_fail, None]
+
+        # Doctor succeeds
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.SUCCESS
+
+        # Doctor WAS called
+        doctor_inst.run_test_fix.assert_called_once()
+        # Rebase was attempted
+        mock_attempt_rebase.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli.is_branch_behind")
+    @patch("loom_tools.shepherd.cli.attempt_rebase")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_overlapping_files_skips_rebase(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+        mock_attempt_rebase: MagicMock,
+        mock_is_behind: MagicMock,
+    ) -> None:
+        """When failing test files overlap with changed files, rebase is skipped."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            5,     # builder phase_start
+            100,   # builder elapsed
+            # Doctor test-fix (no rebase)
+            100,   # doctor phase_start
+            200,   # doctor elapsed
+            # Test re-verification after doctor
+            200,   # test_start
+            210,   # test elapsed
+            # Completion validation
+            210,   # completion_start
+            220,   # completion elapsed
+            # Judge
+            220,   # judge phase_start
+            270,   # judge elapsed
+            # Rebase
+            270,   # rebase phase_start
+            273,   # rebase elapsed
+            # Merge
+            273,   # merge phase_start
+            283,   # merge elapsed
+            283,   # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+
+        MockCurator.return_value.should_skip.return_value = (True, "skipped")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+
+        # Failing test file IS in the changed files — builder's fault
+        builder_inst.run.return_value = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={
+                "test_failure": True,
+                "test_output_tail": "FAILED tests/test_foo.py::test_bar",
+                "test_command": "pytest",
+                "changed_files": ["tests/test_foo.py", "src/main.py"],
+                "failing_test_files": ["tests/test_foo.py"],
+            },
+        )
+
+        # After doctor, tests pass
+        builder_inst.run_test_verification_only.return_value = None
+        builder_inst.push_branch.return_value = True
+
+        # Doctor succeeds
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+
+        builder_inst.validate_and_complete.return_value = _success_result(
+            "builder", committed=True, pr_created=True
+        )
+
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.return_value = _success_result("judge", approved=True)
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.SUCCESS
+
+        # Rebase was NOT attempted (files overlap)
+        mock_is_behind.assert_not_called()
+        mock_attempt_rebase.assert_not_called()
+        # Doctor WAS called directly
+        doctor_inst.run_test_fix.assert_called_once()
+
+    @patch("loom_tools.shepherd.cli.is_branch_behind")
+    @patch("loom_tools.shepherd.cli.attempt_rebase")
+    @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.DoctorPhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_rebase_only_on_first_attempt(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockDoctor: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+        mock_mark_failure: MagicMock,
+        mock_attempt_rebase: MagicMock,
+        mock_is_behind: MagicMock,
+    ) -> None:
+        """Rebase check only fires on first test-fix attempt, not subsequent ones."""
+        # Allow enough time ticks for 2 doctor iterations + eventual failure
+        mock_time.time = MagicMock(side_effect=list(range(100)))
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+        ctx.pr_number = 100
+        ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
+        ctx.config.test_fix_max_retries = 2
+
+        MockCurator.return_value.should_skip.return_value = (True, "skipped")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (False, "")
+
+        # Failing tests in unmodified files — rebase eligible
+        test_fail = PhaseResult(
+            status=PhaseStatus.FAILED,
+            message="test verification failed",
+            phase_name="builder",
+            data={
+                "test_failure": True,
+                "test_output_tail": "FAILED tests/test_other.py::test_bar",
+                "test_command": "pytest",
+                "changed_files": ["src/main.py"],
+                "failing_test_files": ["tests/test_other.py"],
+            },
+        )
+        builder_inst.run.return_value = test_fail
+
+        # Branch is up-to-date, so rebase is skipped on first attempt
+        mock_is_behind.return_value = False
+
+        # Doctor tries but tests keep failing
+        doctor_inst = MockDoctor.return_value
+        doctor_inst.run_test_fix.return_value = _success_result("doctor")
+        builder_inst.run_test_verification_only.return_value = test_fail
+        builder_inst.push_branch.return_value = True
+
+        result = orchestrate(ctx)
+        assert result == ShepherdExitCode.PR_TESTS_FAILED
+
+        # is_branch_behind was only checked once (first attempt)
+        mock_is_behind.assert_called_once()
+        # attempt_rebase was never called (branch was up-to-date)
+        mock_attempt_rebase.assert_not_called()
