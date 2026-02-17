@@ -98,8 +98,8 @@ log_error() {
 # this, the fallback append logic (lines after the CLI invocation) never
 # executes because the process is killed before reaching it.
 #
-# Uses the same dedup threshold as the normal append path: only append if
-# pipe-pane captured less than half the expected output.
+# Uses sentinel-based detection and a conservative line-count ratio to
+# decide whether pipe-pane already captured the output.  See #2582.
 _flush_output_on_signal() {
     # Only flush if we have the required state
     if [[ -z "$_FLUSH_TEMP_OUTPUT" ]] || [[ ! -s "$_FLUSH_TEMP_OUTPUT" ]]; then
@@ -115,8 +115,19 @@ _flush_output_on_signal() {
         local _growth=$(( _post_lines - _FLUSH_PRE_LOG_LINES ))
         local _temp_lines
         _temp_lines=$(wc -l < "$_FLUSH_TEMP_OUTPUT" 2>/dev/null || echo "0")
-        # Same 50% threshold as the normal code path (issue #2569)
-        if [[ $_growth -lt $(( _temp_lines / 2 )) ]]; then
+        local _needs_append=true
+        # Tier 1: If log contains the CLI start sentinel with content after
+        # it, pipe-pane was working — no fallback append needed.  #2582.
+        if grep -q "^# CLAUDE_CLI_START" "$_FLUSH_LOG_FILE" 2>/dev/null; then
+            local _lines_after_sentinel
+            _lines_after_sentinel=$(sed -n '/^# CLAUDE_CLI_START/,$p' "$_FLUSH_LOG_FILE" 2>/dev/null | wc -l)
+            if [[ $_lines_after_sentinel -gt 3 ]]; then
+                _needs_append=false
+            fi
+        fi
+        # Tier 2: Tightened from 50% to 25% threshold.  #2582.
+        if [[ "$_needs_append" == "true" ]] && \
+           [[ $_growth -lt $(( _temp_lines / 4 )) ]]; then
             cat "$_FLUSH_TEMP_OUTPUT" >> "$_FLUSH_LOG_FILE" 2>/dev/null || true
         fi
     else
@@ -993,6 +1004,10 @@ run_with_retry() {
         # and post-mortem debugging is possible.  See issue #2550.
         # Only append if pipe-pane did NOT already capture sufficient output
         # (detected by comparing log line counts before/after CLI).  Issue #2569.
+        # Use a two-tier check: first, if the CLAUDE_CLI_START sentinel appears
+        # in the log with substantial content after it, pipe-pane was working
+        # and no fallback is needed (avoids multi-line block duplication).
+        # Second, use a conservative line-count ratio as a safety net.  #2582.
         if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID:-}" ]]; then
             if [[ -n "$_log_file" && -f "$_log_file" && -s "${temp_output}" ]]; then
                 local _post_log_lines
@@ -1000,11 +1015,23 @@ run_with_retry() {
                 local _log_growth=$(( _post_log_lines - _pre_log_lines ))
                 local _temp_lines
                 _temp_lines=$(wc -l < "${temp_output}")
-                # Only append if pipe-pane captured less than half the expected
-                # output.  Some wrapper log lines may appear in the log from
-                # pipe-pane even when CLI output is not flushed, so a threshold
-                # avoids false negatives.
-                if [[ $_log_growth -lt $(( _temp_lines / 2 )) ]]; then
+                local _needs_append=true
+                # Tier 1: If the log already contains the CLI start sentinel
+                # with content after it, pipe-pane captured the output.  #2582.
+                if grep -q "^# CLAUDE_CLI_START" "$_log_file" 2>/dev/null; then
+                    local _lines_after_sentinel
+                    _lines_after_sentinel=$(sed -n '/^# CLAUDE_CLI_START/,$p' "$_log_file" | wc -l)
+                    # More than just the sentinel line itself means pipe-pane
+                    # captured real CLI output — skip the fallback append.
+                    if [[ $_lines_after_sentinel -gt 3 ]]; then
+                        _needs_append=false
+                    fi
+                fi
+                # Tier 2: Even without the sentinel check, only append if
+                # pipe-pane captured less than 25% of expected output.
+                # Tightened from 50% to reduce false positives.  #2582.
+                if [[ "$_needs_append" == "true" ]] && \
+                   [[ $_log_growth -lt $(( _temp_lines / 4 )) ]]; then
                     cat "${temp_output}" >> "$_log_file"
                 fi
             fi
