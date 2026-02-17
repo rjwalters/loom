@@ -536,6 +536,15 @@ Without a comment, the next attempt starts from scratch with zero context. The c
 - Don't leave a vague comment like "couldn't figure it out" — be specific about what you investigated
 - Don't skip the `loom:blocked` label — the comment is supplemental, not a replacement
 
+### CRITICAL: Never Close Issues
+
+You MUST NOT close issues under any circumstances. Issues should only close via PR auto-close (`Closes #N` in the PR body). This includes:
+- DO NOT close issues you believe "don't need changes" — add label `loom:blocked` with a comment explaining why, then exit
+- DO NOT close duplicates — flag them for human review instead
+- DO NOT close issues for any reason — only GitHub's PR auto-close mechanism should close issues
+
+**Why this matters**: Closing an issue manually destroys a legitimate feature request and bypasses the PR review pipeline. The phase validator will detect this and reopen the issue, but the interruption to shepherd orchestration and loss of builder context is already done.
+
 ## Complexity Assessment
 
 For detailed complexity assessment and decomposition guidance, see **builder-complexity.md**.
