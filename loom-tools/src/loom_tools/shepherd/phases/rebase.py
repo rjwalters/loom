@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 from loom_tools.common.git import attempt_rebase, force_push_branch, is_branch_behind
+from loom_tools.common.logging import log_info
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.labels import add_pr_label, remove_pr_label
 from loom_tools.shepherd.phases.base import BasePhase, PhaseResult
@@ -20,6 +22,40 @@ def _is_pr_merged(pr_number: int, repo_root: str | None) -> bool:
         check=False,
     )
     return result.stdout.strip() == "MERGED"
+
+
+def _is_pr_mergeable(pr_number: int, repo_root: str | None) -> bool:
+    """Check if GitHub considers a PR mergeable despite local rebase failure.
+
+    Queries ``gh pr view --json mergeable,mergeStateStatus`` and returns True
+    only when GitHub reports the PR as ``MERGEABLE`` with merge state ``CLEAN``.
+
+    This handles cases where ``git rebase`` fails locally (stale tracking refs,
+    race conditions, algorithm differences) but GitHub's merge evaluation
+    considers the PR conflict-free.  See issue #2601.
+    """
+    result = subprocess.run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--json", "mergeable,mergeStateStatus",
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False
+
+    try:
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+    return (
+        data.get("mergeable") == "MERGEABLE"
+        and data.get("mergeStateStatus") == "CLEAN"
+    )
 
 
 class RebasePhase(BasePhase):
@@ -85,7 +121,24 @@ class RebasePhase(BasePhase):
 
             return self.success("rebased onto origin/main and force-pushed")
 
-        # Rebase failed — apply merge-conflict label and comment
+        # Rebase failed locally — check if GitHub still considers the PR
+        # mergeable before giving up.  Local rebase can disagree with GitHub
+        # due to stale tracking refs, race conditions, or algorithm
+        # differences.  Since the merge phase uses GitHub's API, we can
+        # safely skip the local rebase when GitHub says CLEAN.  See #2601.
+        if ctx.pr_number is not None and _is_pr_mergeable(
+            ctx.pr_number, ctx.repo_root
+        ):
+            log_info(
+                f"Local rebase failed but GitHub reports PR #{ctx.pr_number} "
+                f"as MERGEABLE/CLEAN — skipping local rebase"
+            )
+            return self.success(
+                f"local rebase failed but PR #{ctx.pr_number} is mergeable on GitHub",
+                {"reason": "github_mergeable_fallback", "local_detail": detail},
+            )
+
+        # Both local rebase and GitHub agree: conflicts exist
         if ctx.pr_number is not None:
             add_pr_label(ctx.pr_number, "loom:merge-conflict", ctx.repo_root)
             ctx.label_cache.invalidate_pr(ctx.pr_number)

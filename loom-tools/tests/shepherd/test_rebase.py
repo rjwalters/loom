@@ -10,7 +10,7 @@ import pytest
 from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import PhaseStatus
-from loom_tools.shepherd.phases.rebase import RebasePhase, _is_pr_merged
+from loom_tools.shepherd.phases.rebase import RebasePhase, _is_pr_mergeable, _is_pr_merged
 
 
 @pytest.fixture
@@ -109,6 +109,10 @@ class TestRebasePhase:
             patch(
                 "loom_tools.shepherd.phases.rebase.attempt_rebase",
                 return_value=(False, conflict_detail),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+                return_value=False,
             ),
             patch(
                 "loom_tools.shepherd.phases.rebase.add_pr_label"
@@ -378,3 +382,152 @@ class TestIsPrMerged:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout="")
             assert _is_pr_merged(100, "/fake/repo") is False
+
+
+class TestIsPrMergeable:
+    """Tests for the _is_pr_mergeable helper."""
+
+    def test_returns_true_when_mergeable_and_clean(self) -> None:
+        """Should return True when GitHub reports MERGEABLE + CLEAN."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN"}',
+            )
+            assert _is_pr_mergeable(100, "/fake/repo") is True
+
+    def test_returns_false_when_conflicting(self) -> None:
+        """Should return False when GitHub reports CONFLICTING."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}',
+            )
+            assert _is_pr_mergeable(100, "/fake/repo") is False
+
+    def test_returns_false_when_mergeable_but_not_clean(self) -> None:
+        """Should return False when mergeable but merge state is not CLEAN."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}',
+            )
+            assert _is_pr_mergeable(100, "/fake/repo") is False
+
+    def test_returns_false_when_unknown(self) -> None:
+        """Should return False when GitHub reports UNKNOWN merge status."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout='{"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN"}',
+            )
+            assert _is_pr_mergeable(100, "/fake/repo") is False
+
+    def test_returns_false_on_gh_failure(self) -> None:
+        """Should return False when gh command fails."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert _is_pr_mergeable(100, "/fake/repo") is False
+
+    def test_returns_false_on_invalid_json(self) -> None:
+        """Should return False when gh returns invalid JSON."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="not json")
+            assert _is_pr_mergeable(100, "/fake/repo") is False
+
+    def test_returns_false_on_empty_output(self) -> None:
+        """Should return False when gh returns empty output."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="")
+            assert _is_pr_mergeable(100, "/fake/repo") is False
+
+
+class TestRebaseGitHubFallback:
+    """Tests for the GitHub mergeable fallback when local rebase fails."""
+
+    def test_rebase_fails_but_github_says_mergeable(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When local rebase fails but GitHub says MERGEABLE/CLEAN, should SUCCESS."""
+        phase = RebasePhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.rebase.is_branch_behind", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.attempt_rebase",
+                return_value=(False, "Rebase failed (unknown conflicts)"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+                return_value=True,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.add_pr_label"
+            ) as mock_add_label,
+            patch("subprocess.run") as mock_subprocess,
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "mergeable on GitHub" in result.message
+        assert result.data.get("reason") == "github_mergeable_fallback"
+        # Should NOT apply merge-conflict label or post comment
+        mock_add_label.assert_not_called()
+        mock_subprocess.assert_not_called()
+
+    def test_rebase_fails_and_github_says_conflicting(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When both local rebase and GitHub agree on conflicts, should FAIL."""
+        phase = RebasePhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.rebase.is_branch_behind", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.attempt_rebase",
+                return_value=(False, "Conflicting files:\nsrc/main.py"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+                return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.add_pr_label"
+            ) as mock_add_label,
+            patch("subprocess.run"),
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert result.data.get("reason") == "merge_conflict"
+        mock_add_label.assert_called_once_with(
+            100, "loom:merge-conflict", mock_context.repo_root
+        )
+
+    def test_rebase_fails_no_pr_number_skips_github_check(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When rebase fails with no PR number, should skip GitHub check and FAIL."""
+        mock_context.pr_number = None
+        phase = RebasePhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.rebase.is_branch_behind", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.attempt_rebase",
+                return_value=(False, "conflicts"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_mergeable",
+            ) as mock_mergeable,
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        mock_mergeable.assert_not_called()
