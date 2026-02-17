@@ -314,6 +314,25 @@ def check_claim(repo_root: pathlib.Path, issue_number: int) -> int:
     return 0
 
 
+def has_valid_claim(repo_root: pathlib.Path, issue_number: int) -> bool:
+    """Check if an issue has a valid (non-expired) claim.
+
+    Unlike ``check_claim``, this returns a boolean and does not print
+    anything, making it suitable for programmatic checks.
+    """
+    claim_dir = _get_claim_dir(repo_root, issue_number)
+    claim_file = claim_dir / "claim.json"
+
+    if not claim_dir.exists() or not claim_file.exists():
+        return False
+
+    existing = _read_claim(claim_file)
+    if not existing:
+        return False
+
+    return not _is_expired(existing.expires_at)
+
+
 def list_claims(repo_root: pathlib.Path) -> int:
     """List all active claims."""
     _ensure_claims_dir(repo_root)

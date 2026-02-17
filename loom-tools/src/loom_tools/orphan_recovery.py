@@ -22,10 +22,12 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from typing import Any
 
+from loom_tools.claim import has_valid_claim
 from loom_tools.common.github import gh_issue_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
@@ -79,7 +81,7 @@ class OrphanEntry:
 class RecoveryEntry:
     """A recovery action taken."""
 
-    action: str  # reset_shepherd, reset_issue_label, mark_progress_errored
+    action: str  # reset_shepherd, reset_issue_label, cleanup_stale_worktree, mark_progress_errored
     shepherd_id: str | None = None
     issue: int | None = None
     task_id: str | None = None
@@ -222,13 +224,16 @@ def check_untracked_building(
     progress_files: list[ShepherdProgress],
     result: OrphanRecoveryResult,
     *,
+    repo_root: pathlib.Path | None = None,
     heartbeat_threshold: int = DEFAULT_HEARTBEAT_STALE_THRESHOLD,
     verbose: bool = False,
 ) -> None:
     """Phase 2: Find loom:building issues without active shepherds.
 
     Cross-references loom:building issues with daemon-state tracked issues
-    and checks progress files for fresh heartbeats.
+    and checks progress files for fresh heartbeats.  Issues with a valid
+    file-based claim are skipped even if no daemon entry or fresh heartbeat
+    exists, because a CLI shepherd may be legitimately working on them.
     """
     try:
         building_issues = gh_issue_list(labels=["loom:building"])
@@ -302,6 +307,16 @@ def check_untracked_building(
             break
 
         if not has_fresh_progress:
+            # Check file-based claim before flagging as orphaned.
+            # A CLI shepherd may hold a valid claim without a daemon entry
+            # or fresh progress heartbeat (e.g., during a long builder subprocess).
+            if repo_root is not None and has_valid_claim(repo_root, issue_num):
+                if verbose:
+                    log_info(
+                        f"  SKIPPED: #{issue_num} has a valid file-based claim"
+                    )
+                continue
+
             if verbose:
                 log_warning(
                     f"  ORPHANED: #{issue_num} has loom:building "
@@ -406,7 +421,7 @@ def recover_shepherd(
     log_info(f"Reset shepherd {shepherd_id} to idle in daemon-state")
 
     if issue is not None and issue != 0:
-        recover_issue(issue, reason, result)
+        recover_issue(issue, reason, result, repo_root=repo_root)
 
     result.recovered.append(
         RecoveryEntry(
@@ -419,12 +434,148 @@ def recover_shepherd(
     )
 
 
+def _cleanup_stale_worktree(repo_root: pathlib.Path, issue: int) -> bool:
+    """Remove a stale worktree and its local/remote branches for an issue.
+
+    A worktree is considered stale when it has zero commits ahead of main
+    and no meaningful uncommitted changes (build artifacts are ignored).
+
+    Returns True if cleanup was performed, False otherwise.
+    """
+    worktree_path = repo_root / ".loom" / "worktrees" / f"issue-{issue}"
+    if not worktree_path.is_dir():
+        return False
+
+    # Check for commits ahead of main
+    log_result = subprocess.run(
+        ["git", "-C", str(worktree_path), "log", "--oneline", "origin/main..HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if log_result.returncode != 0:
+        log_warning(
+            f"Cannot determine commit status for worktree issue-{issue}, "
+            "skipping cleanup"
+        )
+        return False
+
+    if log_result.stdout.strip():
+        log_info(
+            f"Worktree issue-{issue} has commits ahead of main, skipping cleanup"
+        )
+        return False
+
+    # Check for meaningful uncommitted changes (ignore build artifacts)
+    status_result = subprocess.run(
+        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if status_result.returncode != 0:
+        log_warning(
+            f"Cannot determine status for worktree issue-{issue}, skipping cleanup"
+        )
+        return False
+
+    build_artifact_patterns = (
+        "node_modules",
+        "pnpm-lock.yaml",
+        ".venv",
+        "target/",
+        "Cargo.lock",
+        "coverage/",
+        ".loom-checkpoint",
+        ".loom-in-use",
+    )
+    for line in status_result.stdout.strip().splitlines():
+        filepath = line[3:].strip().strip('"')
+        if not any(pat in filepath for pat in build_artifact_patterns):
+            log_info(
+                f"Worktree issue-{issue} has meaningful uncommitted changes, "
+                "skipping cleanup"
+            )
+            return False
+
+    # Get branch name before removal
+    branch_result = subprocess.run(
+        ["git", "-C", str(worktree_path), "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else ""
+
+    # Remove worktree
+    remove_result = subprocess.run(
+        ["git", "worktree", "remove", str(worktree_path), "--force"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if remove_result.returncode != 0:
+        log_warning(
+            f"Failed to remove worktree issue-{issue}: "
+            f"{remove_result.stderr.strip()}"
+        )
+        return False
+
+    # Delete local branch (best-effort)
+    if branch and branch != "main":
+        subprocess.run(
+            ["git", "-C", str(repo_root), "branch", "-D", branch],
+            capture_output=True,
+            check=False,
+        )
+
+    # Delete remote branch (best-effort)
+    if branch and branch != "main":
+        subprocess.run(
+            ["git", "-C", str(repo_root), "push", "origin", "--delete", branch],
+            capture_output=True,
+            check=False,
+        )
+
+    log_info(
+        f"Cleaned up stale worktree issue-{issue}"
+        + (f" (branch {branch})" if branch else "")
+    )
+    return True
+
+
 def recover_issue(
     issue: int,
     reason: str,
     result: OrphanRecoveryResult,
+    *,
+    repo_root: pathlib.Path | None = None,
 ) -> None:
-    """Recovery action: Reset issue labels from loom:building to loom:issue."""
+    """Recovery action: Reset issue labels from loom:building to loom:issue.
+
+    If ``repo_root`` is provided and a valid file-based claim exists for the
+    issue, recovery is skipped to avoid disrupting an active shepherd.
+    """
+    if repo_root is not None and has_valid_claim(repo_root, issue):
+        log_warning(
+            f"Skipping recovery for issue #{issue}: valid file-based claim exists"
+        )
+        return
+
+    # Clean up stale worktree if present (0 commits ahead, no meaningful changes)
+    worktree_cleaned = False
+    if repo_root is not None:
+        worktree_cleaned = _cleanup_stale_worktree(repo_root, issue)
+        if worktree_cleaned:
+            result.recovered.append(
+                RecoveryEntry(
+                    action="cleanup_stale_worktree",
+                    issue=issue,
+                    reason=reason,
+                )
+            )
+
     try:
         gh_run([
             "issue", "edit", str(issue),
@@ -436,6 +587,13 @@ def recover_issue(
         return
 
     ts = now_utc().strftime("%Y-%m-%dT%H:%M:%SZ")
+    actions = [
+        "- Removed `loom:building` label",
+        "- Added `loom:issue` label to return to ready queue",
+    ]
+    if worktree_cleaned:
+        actions.append("- Cleaned up stale worktree and branches")
+
     comment = (
         "## Orphan Recovery\n\n"
         "This issue was automatically recovered from an orphaned state.\n\n"
@@ -445,8 +603,8 @@ def recover_issue(
         "crashed or was terminated\n"
         "- The issue was left in `loom:building` state with no active worker\n\n"
         "**Action taken**:\n"
-        "- Removed `loom:building` label\n"
-        "- Added `loom:issue` label to return to ready queue\n\n"
+        + "\n".join(actions)
+        + "\n\n"
         "This issue is now available for a new shepherd to pick up.\n\n"
         "---\n"
         f"*Recovered by loom-recover-orphans at {ts}*"
@@ -501,7 +659,7 @@ def recover_progress_file(
 
     issue = progress.issue if progress.issue else None
     if issue is not None and issue != 0:
-        recover_issue(issue, "stale_heartbeat", result)
+        recover_issue(issue, "stale_heartbeat", result, repo_root=repo_root)
 
     result.recovered.append(
         RecoveryEntry(
@@ -538,6 +696,7 @@ def run_orphan_recovery(
         daemon_state,
         progress_files,
         result,
+        repo_root=repo_root,
         heartbeat_threshold=heartbeat_threshold,
         verbose=verbose,
     )
@@ -567,7 +726,7 @@ def run_orphan_recovery(
                 )
         elif orphan.type == "untracked_building":
             if orphan.issue:
-                recover_issue(orphan.issue, orphan.reason, result)
+                recover_issue(orphan.issue, orphan.reason, result, repo_root=repo_root)
         elif orphan.type == "stale_heartbeat":
             # Find the matching progress file
             for progress in progress_files:
@@ -648,9 +807,10 @@ Orphan types:
     stale_heartbeat     - Progress file heartbeat is stale
 
 Recovery actions:
-    reset_shepherd        - Reset shepherd entry to idle in daemon-state
-    reset_issue_label     - Swap loom:building -> loom:issue on issue
-    mark_progress_errored - Mark progress file status as errored
+    reset_shepherd          - Reset shepherd entry to idle in daemon-state
+    reset_issue_label       - Swap loom:building -> loom:issue on issue
+    cleanup_stale_worktree  - Remove stale worktree + branches (0 commits, no changes)
+    mark_progress_errored   - Mark progress file status as errored
 
 Environment variables:
     LOOM_HEARTBEAT_STALE_THRESHOLD  Seconds before heartbeat is stale (default: 300)

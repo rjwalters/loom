@@ -16,6 +16,7 @@ from loom_tools.claim import (
     claim_issue,
     cleanup_claims,
     extend_claim,
+    has_valid_claim,
     list_claims,
     main,
     release_claim,
@@ -338,3 +339,37 @@ class TestCLI:
         monkeypatch.chdir(mock_repo)
         result = main(["cleanup"])
         assert result == 0
+
+
+class TestHasValidClaim:
+    """Tests for has_valid_claim function."""
+
+    def test_no_claim_returns_false(self, mock_repo: pathlib.Path) -> None:
+        assert has_valid_claim(mock_repo, 42) is False
+
+    def test_active_claim_returns_true(self, mock_repo: pathlib.Path) -> None:
+        claim_issue(mock_repo, 42, "test-agent", 3600)
+        assert has_valid_claim(mock_repo, 42) is True
+
+    def test_expired_claim_returns_false(self, mock_repo: pathlib.Path) -> None:
+        claim_dir = mock_repo / ".loom" / "claims" / "issue-42.lock"
+        claim_dir.mkdir(parents=True)
+        claim_file = claim_dir / "claim.json"
+        claim_file.write_text(
+            json.dumps(
+                {
+                    "issue": 42,
+                    "agent_id": "test-agent",
+                    "claimed_at": "2020-01-01T00:00:00Z",
+                    "expires_at": "2020-01-01T01:00:00Z",
+                    "ttl_seconds": 3600,
+                }
+            )
+        )
+        assert has_valid_claim(mock_repo, 42) is False
+
+    def test_incomplete_claim_returns_false(self, mock_repo: pathlib.Path) -> None:
+        claim_dir = mock_repo / ".loom" / "claims" / "issue-42.lock"
+        claim_dir.mkdir(parents=True)
+        # Directory exists but no claim.json
+        assert has_valid_claim(mock_repo, 42) is False
