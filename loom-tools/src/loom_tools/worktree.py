@@ -24,7 +24,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
-from loom_tools.common.worktree_safety import is_worktree_safe_to_remove
 
 
 @dataclass
@@ -122,77 +121,45 @@ def _get_main_workspace() -> pathlib.Path | None:
     return None
 
 
-def _pull_latest_main(json_output: bool = False) -> bool:
-    """Pull latest changes from origin/main with stash handling.
+def _fetch_latest_main(json_output: bool = False) -> bool:
+    """Fetch latest changes from origin/main.
+
+    Uses fetch-only approach to avoid conflicts with worktrees that have
+    main checked out. Never touches the working tree or local branches.
 
     Returns:
         True if successful, False otherwise.
     """
     if not json_output:
-        log_info("Pulling latest changes from origin/main...")
+        log_info("Fetching latest changes from origin/main...")
 
-    stashed = False
-
-    # Stash any local changes first
     try:
-        result = _run_git(["stash", "push", "-m", "worktree-creation-auto-stash"], check=False)
-        stash_output = result.stdout + result.stderr
-        if "No local changes" not in stash_output and "nothing to save" not in stash_output:
-            stashed = True
-            if not json_output:
-                log_info("Stashed local changes")
-    except Exception:
-        pass
-
-    # Pull latest with fast-forward only
-    try:
-        result = _run_git(["pull", "--ff-only", "origin", "main"], check=False)
+        result = _run_git(["fetch", "origin", "main"], check=False)
         if result.returncode == 0:
             if not json_output:
-                log_success("Updated main to latest")
+                log_success("Fetched latest origin/main")
+            return True
         else:
             if not json_output:
-                log_warning("Could not fast-forward main (may need manual intervention)")
+                log_warning("Could not fetch origin/main (continuing with local state)")
+            return False
     except Exception:
         if not json_output:
-            log_warning("Could not pull latest main")
-
-    # Pop stash if we stashed
-    if stashed:
-        try:
-            result = _run_git(["stash", "pop"], check=False)
-            if result.returncode == 0:
-                if not json_output:
-                    log_info("Restored stashed changes")
-            else:
-                if not json_output:
-                    log_warning("Could not restore stash (check 'git stash list')")
-        except Exception:
-            if not json_output:
-                log_warning("Could not restore stash")
-
-    return True
+            log_warning("Could not fetch origin/main (continuing with local state)")
+        return False
 
 
-def _check_stale_worktree(worktree_path: pathlib.Path, json_output: bool = False) -> bool:
-    """Check if a worktree is stale and should be removed.
+def _reset_stale_worktree_in_place(worktree_path: pathlib.Path, json_output: bool = False) -> bool:
+    """Check if a worktree is stale and reset it in place.
 
-    Performs safety checks before removal to prevent destroying active sessions:
-    - Checks for .loom-in-use marker (shepherd is actively using worktree)
-    - Checks for active processes with CWD in the worktree
-    - Checks if worktree is within grace period (default 5 minutes)
+    Instead of removing stale worktrees (which can corrupt the shell's CWD),
+    resets them to origin/main via fetch + reset --hard.
 
     Returns:
-        True if worktree is stale and was removed, False otherwise.
+        True if worktree was stale and was reset (caller should exit 0),
+        False if worktree has real work and should be preserved.
     """
     try:
-        # Safety check: ensure worktree is safe to remove
-        safety = is_worktree_safe_to_remove(worktree_path)
-        if not safety.safe_to_remove:
-            if not json_output:
-                log_info(f"Worktree cannot be removed: {safety.reason}")
-            return False
-
         # Check commits ahead of main
         result = _run_git(
             ["rev-list", "--count", "origin/main..HEAD"],
@@ -213,38 +180,30 @@ def _check_stale_worktree(worktree_path: pathlib.Path, json_output: bool = False
         result = _run_git(["status", "--porcelain"], cwd=worktree_path, check=False)
         uncommitted = result.stdout.strip() if result.returncode == 0 else ""
 
-        # Stale if: no commits ahead, behind main, no uncommitted changes
-        if commits_ahead == 0 and commits_behind > 0 and not uncommitted:
-            if not json_output:
-                log_warning(
-                    f"Stale worktree detected ({commits_ahead} commits ahead, "
-                    f"{commits_behind} behind main, no uncommitted changes)"
-                )
-                log_info("Removing stale worktree and recreating from current main...")
+        # Has real work - not stale
+        if commits_ahead > 0 or uncommitted:
+            return False
 
-            # Get branch name before removing
-            result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_path, check=False)
-            branch = result.stdout.strip() if result.returncode == 0 else ""
-
-            # Remove worktree (run from repo root to avoid CWD-inside-worktree issues)
-            repo_root = _get_main_workspace()
-            _run_git(
-                ["worktree", "remove", str(worktree_path), "--force"],
-                cwd=repo_root,
-                check=False,
+        # Stale: no commits ahead, no uncommitted changes
+        if not json_output:
+            log_warning(
+                f"Stale worktree detected (0 commits ahead, "
+                f"{commits_behind} behind main, no uncommitted changes)"
             )
+            log_info("Resetting worktree in place to origin/main...")
 
-            # Delete empty branch if possible
-            if branch and branch != "main":
-                result = _run_git(["branch", "-d", branch], cwd=repo_root, check=False)
-                if result.returncode == 0 and not json_output:
-                    log_info(f"Removed empty branch: {branch}")
+        # Fetch and reset in place
+        fetch_result = _run_git(["fetch", "origin", "main"], cwd=worktree_path, check=False)
+        reset_result = _run_git(["reset", "--hard", "origin/main"], cwd=worktree_path, check=False)
 
+        if fetch_result.returncode == 0 and reset_result.returncode == 0:
             if not json_output:
-                log_success("Stale worktree cleaned up")
-            return True
+                log_success("Stale worktree reset to origin/main")
+        else:
+            if not json_output:
+                log_warning("Could not reset stale worktree (continuing to use as-is)")
 
-        return False
+        return True
     except Exception:
         return False
 
@@ -407,44 +366,11 @@ def create_worktree(
 
         if not json_output:
             log_success("Switched to main workspace")
-
-        # Check if we're on main branch
-        try:
-            result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], check=False)
-            current_branch = result.stdout.strip()
-            if current_branch != "main":
-                if not json_output:
-                    log_info(f"Switching from {current_branch} to main branch...")
-                result = _run_git(["checkout", "main"], check=False)
-                if result.returncode == 0:
-                    if not json_output:
-                        log_success("Switched to main branch")
-                else:
-                    return WorktreeResult(success=False, error="Failed to switch to main branch")
-        except Exception:
-            return WorktreeResult(success=False, error="Failed to switch to main branch")
-
-        if not json_output:
             print()
 
-    # Ensure we're on main branch
-    try:
-        result = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], check=False)
-        current_branch = result.stdout.strip()
-        if current_branch != "main":
-            if not json_output:
-                log_info(f"Switching from {current_branch} to main branch...")
-            result = _run_git(["checkout", "main"], check=False)
-            if result.returncode == 0:
-                if not json_output:
-                    log_success("Switched to main branch")
-            else:
-                return WorktreeResult(success=False, error="Failed to switch to main branch")
-    except Exception:
-        return WorktreeResult(success=False, error="Failed to switch to main branch")
-
-    # Pull latest changes
-    _pull_latest_main(json_output)
+    # Fetch latest changes from origin/main
+    # Uses fetch-only to avoid conflicts with worktrees that have main checked out
+    _fetch_latest_main(json_output)
 
     # Determine branch name
     if custom_branch:
@@ -463,12 +389,11 @@ def create_worktree(
         # Check if it's registered with git
         result = _run_git(["worktree", "list"], check=False)
         if str(worktree_path) in result.stdout or worktree_path.resolve().as_posix() in result.stdout:
-            # Check if stale
-            if _check_stale_worktree(worktree_path.resolve(), json_output):
-                # Stale worktree was removed, fall through to create new one
-                pass
-            else:
-                # Not stale - show info and exit
+            # Check if stale and reset in place (never remove)
+            was_stale = _reset_stale_worktree_in_place(worktree_path.resolve(), json_output)
+
+            if not was_stale:
+                # Has real work - show info
                 try:
                     commits_ahead = _run_git(
                         ["rev-list", "--count", "origin/main..HEAD"],
@@ -493,13 +418,18 @@ def create_worktree(
                     if not json_output:
                         log_info("Worktree is registered with git")
                         log_info(f"To use this worktree: cd {worktree_path}")
+            else:
+                # Stale worktree was reset in place
+                if not json_output:
+                    print()
+                    log_info(f"To use this worktree: cd {worktree_path}")
 
-                return WorktreeResult(
-                    success=True,
-                    worktree_path=str(worktree_path.resolve()),
-                    branch_name=branch_name,
-                    issue_number=issue_number,
-                )
+            return WorktreeResult(
+                success=True,
+                worktree_path=str(worktree_path.resolve()),
+                branch_name=branch_name,
+                issue_number=issue_number,
+            )
         else:
             return WorktreeResult(
                 success=False,
@@ -521,7 +451,7 @@ def create_worktree(
     else:
         if not json_output:
             log_info("Creating new branch from main")
-        create_args = [str(worktree_path), "-b", branch_name, "main"]
+        create_args = [str(worktree_path), "-b", branch_name, "origin/main"]
 
     # Create the worktree
     if not json_output:

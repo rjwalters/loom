@@ -158,19 +158,6 @@ if check_if_in_worktree; then
     # Change to main workspace
     if cd "$MAIN_WORKSPACE" 2>/dev/null; then
         print_success "Switched to main workspace"
-
-        # Check if we're on main branch, if not switch to it
-        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-        if [[ "$CURRENT_BRANCH" != "main" ]]; then
-            print_info "Switching from $CURRENT_BRANCH to main branch..."
-            if git checkout main 2>/dev/null; then
-                print_success "Switched to main branch"
-            else
-                print_error "Failed to switch to main branch"
-                print_info "Please manually run: git checkout main"
-                exit 1
-            fi
-        fi
     else
         print_error "Failed to change to main workspace: $MAIN_WORKSPACE"
         print_info "Please manually run: cd $MAIN_WORKSPACE"
@@ -188,6 +175,15 @@ fi
 
 # Worktree path
 WORKTREE_PATH=".loom/worktrees/issue-$ISSUE_NUMBER"
+
+# Fetch latest changes from origin/main before creating the worktree
+# Uses fetch-only to avoid conflicts with worktrees that have main checked out
+print_info "Fetching latest changes from origin/main..."
+if git fetch origin main 2>/dev/null; then
+    print_success "Fetched latest origin/main"
+else
+    print_warning "Could not fetch origin/main (continuing with local state)"
+fi
 
 # Check if worktree already exists
 if [[ -d "$WORKTREE_PATH" ]]; then
@@ -220,7 +216,7 @@ if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
 else
     # Create new branch from main
     print_info "Creating new branch from main"
-    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "main")
+    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/main")
 fi
 
 # Create the worktree

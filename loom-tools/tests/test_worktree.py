@@ -12,7 +12,7 @@ Key areas validated:
 2. Path naming conventions (.loom/worktrees/issue-N)
 3. Branch naming conventions (feature/issue-N, feature/<custom>)
 4. Worktree detection logic (_is_in_worktree)
-5. Stale worktree detection and cleanup
+5. Stale worktree in-place reset (fetch + reset --hard, never remove)
 6. JSON output format matching
 7. Error messages and exit codes
 """
@@ -158,3 +158,38 @@ class TestDocumentedBehaviorDifferences:
         result = WorktreeResult(success=True, worktree_path="/test", branch_name="feature/test", issue_number=42)
         assert result.success is True
         assert result.worktree_path == "/test"
+
+    def test_uses_fetch_not_pull(self) -> None:
+        """Document: Both bash and Python use git fetch instead of git pull.
+
+        This avoids the 'main branch locked' error when another worktree
+        has main checked out. git fetch only updates origin/main remote ref
+        without touching the working tree or local branches.
+        """
+        from loom_tools.worktree import _fetch_latest_main
+
+        assert callable(_fetch_latest_main)
+
+    def test_stale_worktrees_reset_in_place(self) -> None:
+        """Document: Stale worktrees are reset in place, never removed.
+
+        When a worktree has 0 commits ahead and no uncommitted changes,
+        it is reset via 'git fetch origin main && git reset --hard origin/main'
+        instead of being removed. This prevents CWD corruption when the
+        shell's working directory points to the deleted worktree.
+
+        Manual cleanup tools (loom-clean, stale-building-check.sh) remain
+        the proper place for worktree removal.
+        """
+        from loom_tools.worktree import _reset_stale_worktree_in_place
+
+        assert callable(_reset_stale_worktree_in_place)
+
+    def test_worktree_created_from_origin_main(self) -> None:
+        """Document: New branches are created from origin/main, not local main.
+
+        The create_args uses 'origin/main' as the start point for new branches.
+        This ensures worktrees are always based on the latest fetched state
+        and avoids needing to checkout or update the local main branch.
+        """
+        pass

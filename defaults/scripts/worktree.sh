@@ -37,44 +37,20 @@ print_warning() {
     echo -e "${YELLOW}⚠ $1${NC}"
 }
 
-# Function to pull latest changes from origin/main
-# Stashes local changes, pulls with fast-forward only, then restores stash
-pull_latest_main() {
+# Function to fetch latest changes from origin/main
+# Uses fetch-only approach to avoid conflicts with worktrees that have main checked out
+fetch_latest_main() {
     if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Pulling latest changes from origin/main..."
+        print_info "Fetching latest changes from origin/main..."
     fi
 
-    # Stash any local changes first
-    STASH_OUTPUT=$(git stash push -m "worktree-creation-auto-stash" 2>&1)
-    STASHED=false
-    if [[ "$STASH_OUTPUT" != *"No local changes"* ]] && [[ "$STASH_OUTPUT" != *"nothing to save"* ]]; then
-        STASHED=true
+    if git fetch origin main 2>/dev/null; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_info "Stashed local changes"
-        fi
-    fi
-
-    # Pull latest with fast-forward only (prevents accidental merge commits on main)
-    if git pull --ff-only origin main 2>/dev/null; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Updated main to latest"
+            print_success "Fetched latest origin/main"
         fi
     else
         if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_warning "Could not fast-forward main (may need manual intervention)"
-        fi
-    fi
-
-    # Pop stash if we stashed
-    if [[ "$STASHED" == "true" ]]; then
-        if git stash pop 2>/dev/null; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_info "Restored stashed changes"
-            fi
-        else
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Could not restore stash (check 'git stash list')"
-            fi
+            print_warning "Could not fetch origin/main (continuing with local state)"
         fi
     fi
 }
@@ -399,27 +375,6 @@ if check_if_in_worktree; then
         if [[ "$JSON_OUTPUT" != "true" ]]; then
             print_success "Switched to main workspace"
         fi
-
-        # Check if we're on main branch, if not switch to it
-        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-        if [[ "$CURRENT_BRANCH" != "main" ]]; then
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_info "Switching from $CURRENT_BRANCH to main branch..."
-            fi
-            if git checkout main 2>/dev/null; then
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Switched to main branch"
-                fi
-            else
-                if [[ "$JSON_OUTPUT" == "true" ]]; then
-                    echo '{"error": "Failed to switch to main branch"}'
-                else
-                    print_error "Failed to switch to main branch"
-                    print_info "Please manually run: git checkout main"
-                fi
-                exit 1
-            fi
-        fi
     else
         if [[ "$JSON_OUTPUT" == "true" ]]; then
             echo '{"error": "Failed to change to main workspace", "mainWorkspace": "'"$MAIN_WORKSPACE"'"}'
@@ -454,31 +409,9 @@ if [[ -n "$PRUNE_OUTPUT" ]]; then
     fi
 fi
 
-# Ensure we're on main branch and pull latest changes
-# This happens whether we came from a worktree (already switched above) or started in main workspace
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-if [[ "$CURRENT_BRANCH" != "main" ]]; then
-    if [[ "$JSON_OUTPUT" != "true" ]]; then
-        print_info "Switching from $CURRENT_BRANCH to main branch..."
-    fi
-    if git checkout main 2>/dev/null; then
-        if [[ "$JSON_OUTPUT" != "true" ]]; then
-            print_success "Switched to main branch"
-        fi
-    else
-        if [[ "$JSON_OUTPUT" == "true" ]]; then
-            echo '{"error": "Failed to switch to main branch"}'
-        else
-            print_error "Failed to switch to main branch"
-            print_info "Please manually run: git checkout main"
-        fi
-        exit 1
-    fi
-fi
-
-# Pull latest changes from origin/main before creating the worktree
-# This ensures new worktrees are based on the most up-to-date code
-pull_latest_main
+# Fetch latest changes from origin/main before creating the worktree
+# Uses fetch-only to avoid conflicts with worktrees that have main checked out
+fetch_latest_main
 
 # Determine branch name
 if [[ -n "$CUSTOM_BRANCH" ]]; then
@@ -501,111 +434,8 @@ if [[ -d "$WORKTREE_PATH" ]]; then
         local_commits_behind=$(git -C "$WORKTREE_PATH" rev-list --count "HEAD..origin/main" 2>/dev/null) || local_commits_behind="0"
         local_uncommitted=$(git -C "$WORKTREE_PATH" status --porcelain 2>/dev/null) || local_uncommitted=""
 
-        if [[ "$local_commits_ahead" == "0" && "$local_commits_behind" -gt 0 && -z "$local_uncommitted" ]]; then
-            # Potentially stale worktree: no work done, behind main, no uncommitted changes
-            # But first, check safety constraints before removal
-            if ! is_worktree_safe_to_remove "$WORKTREE_PATH"; then
-                # Safety check failed - reuse the worktree instead of removing
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_info "Worktree appears stale but cannot be safely removed - reusing"
-                    echo ""
-                    print_info "To use this worktree: cd $WORKTREE_PATH"
-                fi
-                exit 0
-            fi
-
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind main, no uncommitted changes)"
-                print_info "Removing stale worktree and recreating from current main..."
-            fi
-
-            # Remove the stale worktree (safety checks passed)
-            # Use absolute path and git -C to avoid CWD-inside-worktree issues
-            ABS_WORKTREE="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
-            REPO_DIR="$(pwd -P)"
-            local_branch=$(git -C "$ABS_WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || local_branch=""
-            git -C "$REPO_DIR" worktree remove "$ABS_WORKTREE" --force 2>/dev/null || {
-                print_error "Failed to remove stale worktree"
-                exit 1
-            }
-
-            # Delete the empty branch if it exists and has no commits ahead
-            if [[ -n "$local_branch" && "$local_branch" != "main" ]]; then
-                if git branch -d "$local_branch" 2>/dev/null; then
-                    if [[ "$JSON_OUTPUT" != "true" ]]; then
-                        print_info "Removed empty branch: $local_branch"
-                    fi
-                else
-                    # Branch may have diverged or have other references; force-delete only if truly empty
-                    if [[ "$JSON_OUTPUT" != "true" ]]; then
-                        print_warning "Could not delete branch $local_branch (may have upstream references)"
-                    fi
-                fi
-            fi
-
-            if [[ "$JSON_OUTPUT" != "true" ]]; then
-                print_success "Stale worktree cleaned up"
-                echo ""
-            fi
-            # Fall through to create fresh worktree below
-        elif [[ "$local_commits_ahead" == "0" && "$local_commits_behind" == "0" && -z "$local_uncommitted" ]]; then
-            # Worktree at same commit as main, no commits, no uncommitted changes
-            # Check if remote branch exists - if not, this is an abandoned worktree
-            if ! git ls-remote --heads origin "$BRANCH_NAME" 2>/dev/null | grep -q .; then
-                # No commits + no remote = abandoned worktree, safe to clean
-                if ! is_worktree_safe_to_remove "$WORKTREE_PATH"; then
-                    # Safety check failed - reuse the worktree instead of removing
-                    if [[ "$JSON_OUTPUT" != "true" ]]; then
-                        print_info "Worktree appears abandoned but cannot be safely removed - reusing"
-                        echo ""
-                        print_info "To use this worktree: cd $WORKTREE_PATH"
-                    fi
-                    exit 0
-                fi
-
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_warning "Abandoned worktree detected (0 commits, at same commit as main, no remote branch)"
-                    print_info "Removing abandoned worktree and recreating from current main..."
-                fi
-
-                # Remove the abandoned worktree (safety checks passed)
-                ABS_WORKTREE="$(cd "$WORKTREE_PATH" 2>/dev/null && pwd -P || echo "$WORKTREE_PATH")"
-                REPO_DIR="$(pwd -P)"
-                local_branch=$(git -C "$ABS_WORKTREE" rev-parse --abbrev-ref HEAD 2>/dev/null) || local_branch=""
-                git -C "$REPO_DIR" worktree remove "$ABS_WORKTREE" --force 2>/dev/null || {
-                    print_error "Failed to remove abandoned worktree"
-                    exit 1
-                }
-
-                # Delete the empty branch if it exists
-                if [[ -n "$local_branch" && "$local_branch" != "main" ]]; then
-                    if git branch -d "$local_branch" 2>/dev/null; then
-                        if [[ "$JSON_OUTPUT" != "true" ]]; then
-                            print_info "Removed empty branch: $local_branch"
-                        fi
-                    else
-                        if [[ "$JSON_OUTPUT" != "true" ]]; then
-                            print_warning "Could not delete branch $local_branch (may have upstream references)"
-                        fi
-                    fi
-                fi
-
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_success "Abandoned worktree cleaned up"
-                    echo ""
-                fi
-                # Fall through to create fresh worktree below
-            else
-                # Remote branch exists - preserve worktree
-                if [[ "$JSON_OUTPUT" != "true" ]]; then
-                    print_info "Worktree is registered with git"
-                    print_info "Remote branch exists - preserving worktree"
-                    echo ""
-                    print_info "To use this worktree: cd $WORKTREE_PATH"
-                fi
-                exit 0
-            fi
-        else
+        if [[ "$local_commits_ahead" -gt 0 || -n "$local_uncommitted" ]]; then
+            # Worktree has real work - preserve it
             if [[ "$JSON_OUTPUT" != "true" ]]; then
                 print_info "Worktree is registered with git"
                 if [[ "$local_commits_ahead" -gt 0 ]]; then
@@ -617,6 +447,30 @@ if [[ -d "$WORKTREE_PATH" ]]; then
                 print_info "To use this worktree: cd $WORKTREE_PATH"
             fi
             exit 0
+        else
+            # Stale worktree: no commits ahead, no uncommitted changes
+            # Reset in place instead of removing (avoids CWD corruption)
+            if [[ "$JSON_OUTPUT" != "true" ]]; then
+                print_warning "Stale worktree detected (0 commits ahead, $local_commits_behind behind main, no uncommitted changes)"
+                print_info "Resetting worktree in place to origin/main..."
+            fi
+
+            if git -C "$WORKTREE_PATH" fetch origin main 2>/dev/null && \
+               git -C "$WORKTREE_PATH" reset --hard origin/main 2>/dev/null; then
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_success "Stale worktree reset to origin/main"
+                    echo ""
+                    print_info "To use this worktree: cd $WORKTREE_PATH"
+                fi
+                exit 0
+            else
+                if [[ "$JSON_OUTPUT" != "true" ]]; then
+                    print_warning "Could not reset stale worktree (continuing to use as-is)"
+                    echo ""
+                    print_info "To use this worktree: cd $WORKTREE_PATH"
+                fi
+                exit 0
+            fi
         fi
     else
         print_error "Directory exists but is not a registered worktree"
@@ -643,7 +497,7 @@ else
     if [[ "$JSON_OUTPUT" != "true" ]]; then
         print_info "Creating new branch from main"
     fi
-    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "main")
+    CREATE_ARGS=("$WORKTREE_PATH" "-b" "$BRANCH_NAME" "origin/main")
 fi
 
 # Create the worktree
