@@ -502,7 +502,7 @@ class BuilderPhase:
                     },
                 )
 
-            # Recover from instant-exit (code 6) / MCP failure (code 7)
+            # Recover from low-output (code 6) / MCP failure (code 7)
             # when the worktree has incomplete work from a previous builder
             # run.  The current builder CLI couldn't start (auth timeout,
             # nesting protection, etc.) but the worktree may have commits
@@ -3163,7 +3163,7 @@ class BuilderPhase:
         diag: dict[str, Any],
         exit_code: int,
     ) -> PhaseResult | None:
-        """Attempt to recover from builder instant-exit/MCP failure using worktree state.
+        """Attempt to recover from builder low-output/MCP failure using worktree state.
 
         When the builder CLI can't start (auth timeout, nesting protection, MCP
         failure) but a previous builder run left meaningful work in the worktree,

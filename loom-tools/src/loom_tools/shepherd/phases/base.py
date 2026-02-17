@@ -27,7 +27,7 @@ _HEARTBEAT_POLL_INTERVAL = 5
 # Minimum characters of non-header content required for "meaningful output".
 # Sessions with less than this are treated as transient spawn failures
 # (e.g., Claude API error on startup).  See issues #2135, #2381, #2401.
-INSTANT_EXIT_MIN_OUTPUT_CHARS = 100
+LOW_OUTPUT_MIN_CHARS = 100
 
 # Sentinel line written by claude-wrapper.sh just before invoking the Claude
 # CLI.  Output before this marker is wrapper pre-flight boilerplate and should
@@ -39,24 +39,24 @@ _CLI_START_SENTINEL = "# CLAUDE_CLI_START"
 # should not be retried.  See issue #2508.
 _AUTH_FAILURE_SENTINEL = "# AUTH_PREFLIGHT_FAILED"
 
-# Maximum retries for instant-exit detection, with exponential backoff.
-INSTANT_EXIT_MAX_RETRIES = 3
-INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
+# Maximum retries for low-output detection, with exponential backoff.
+LOW_OUTPUT_MAX_RETRIES = 3
+LOW_OUTPUT_BACKOFF_SECONDS = [2, 4, 8]
 
-# If a single instant-exit attempt takes longer than this (in seconds),
+# If a single low-output attempt takes longer than this (in seconds),
 # the failure is likely an infrastructure issue (auth timeouts, lock
 # contention) rather than a transient blip.  Skip further retries to
 # avoid burning 9+ minutes on futile attempts.  See issue #2519.
-INSTANT_EXIT_MAX_ATTEMPT_SECONDS = 90
+LOW_OUTPUT_MAX_ATTEMPT_SECONDS = 90
 
-# Cause-specific retry strategies for instant-exit classification.
+# Cause-specific retry strategies for low-output classification.
 # Maps root cause → (max_retries, backoff_seconds).
 # See issue #2518.
-INSTANT_EXIT_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
+LOW_OUTPUT_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
     "auth_timeout": (0, []),
     "auth_lock_contention": (1, [60]),
     "api_unreachable": (1, [30]),
-    "unknown": (INSTANT_EXIT_MAX_RETRIES, list(INSTANT_EXIT_BACKOFF_SECONDS)),
+    "unknown": (LOW_OUTPUT_MAX_RETRIES, list(LOW_OUTPUT_BACKOFF_SECONDS)),
 }
 
 # How often (in seconds) to extend the file-based claim during worker polling.
@@ -81,13 +81,13 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 
 # Maximum retries for MCP failure detection, with longer backoff.
 # MCP failures are often systemic (stale build, resource contention)
-# so we use longer backoff than instant-exit.
+# so we use longer backoff than low-output.
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
-# that will NOT resolve with retries.  When detected after an instant-exit
+# that will NOT resolve with retries.  When detected after a low-output
 # or MCP failure, the shepherd should abort immediately instead of wasting
 # time on futile retry cycles.  See issue #2521.
 #
@@ -133,7 +133,7 @@ _SPINNER_DECORATION_THRESHOLD = 0.3
 # Claude Code's startup UI (version banner, model info, tips, permission
 # indicators, usage limits, etc.) generates ~2,700+ characters of terminal
 # output even when a session does zero actual work.  This defeats the
-# character-count thresholds in _is_instant_exit() and _is_mcp_failure().
+# character-count thresholds in _is_low_output_session() and _is_mcp_failure().
 #
 # The patterns below identify known UI chrome lines so they can be stripped
 # before counting output volume.
@@ -234,7 +234,7 @@ def _strip_ui_chrome(text: str) -> str:
     - Shell prompt lines and keyboard hints
 
     This prevents the ~2,700+ characters of UI chrome from inflating the
-    output volume metric used by ``_is_instant_exit()`` and
+    output volume metric used by ``_is_low_output_session()`` and
     ``_is_mcp_failure()``.  See issue #2435.
 
     Args:
@@ -560,7 +560,7 @@ def _get_cli_output(stripped: str) -> str:
     when retrying).  Lines starting with ``# `` are always excluded as log
     headers.
 
-    If no sentinel is found the session is considered an instant exit
+    If no sentinel is found the session is considered a low-output session
     (the wrapper always writes the sentinel before invoking Claude, so
     its absence means Claude never started).  See issue #2405.
 
@@ -581,7 +581,7 @@ def _get_cli_output(stripped: str) -> str:
     if sentinel_idx is None:
         # No sentinel means Claude CLI never started — wrapper failed
         # before reaching execution.  Return empty string so callers
-        # correctly treat this as an instant exit.  See issue #2473.
+        # correctly treat this as low output.  See issue #2473.
         return ""
 
     start = sentinel_idx + 1
@@ -593,7 +593,7 @@ def _is_mcp_failure(log_path: Path) -> bool:
 
     Detects cases where the Claude CLI exits immediately because the MCP
     server (mcp-loom) failed to initialize.  This is a distinct failure mode
-    from generic instant-exits (API errors, network issues) because it
+    from generic low-output sessions (API errors, network issues) because it
     typically has a systemic cause (stale build, resource contention) that
     benefits from different retry/backoff strategy.
 
@@ -638,11 +638,11 @@ def _is_mcp_failure(log_path: Path) -> bool:
     return False
 
 
-def _is_instant_exit(log_path: Path) -> bool:
-    """Check if a session log indicates an instant-exit (transient spawn failure).
+def _is_low_output_session(log_path: Path) -> bool:
+    """Check if a session log indicates a low-output session (transient spawn failure).
 
-    A session is considered an instant exit when the log file exists but has
-    no meaningful output (< INSTANT_EXIT_MIN_OUTPUT_CHARS non-header chars).
+    A session is considered low-output when the log file exists but has
+    no meaningful output (< LOW_OUTPUT_MIN_CHARS non-header chars).
 
     This detects cases where the Claude CLI spawns but immediately exits due to
     transient API errors, without producing any substantive work.
@@ -656,18 +656,18 @@ def _is_instant_exit(log_path: Path) -> bool:
         log_path: Path to the worker session log file.
 
     Returns:
-        True if the session appears to be an instant exit.
+        True if the session appears to be a low-output session.
     """
     if not log_path.is_file():
-        # No log file at all — could be spawn failure, not instant exit.
+        # No log file at all — could be spawn failure, not low output.
         return False
 
     try:
         content = log_path.read_text()
         stripped = strip_ansi(content)
 
-        # If the sentinel is absent, Claude never started — treat as instant
-        # exit regardless of how much wrapper pre-flight output exists.
+        # If the sentinel is absent, Claude never started — treat as low
+        # output regardless of how much wrapper pre-flight output exists.
         # See issue #2405.
         if _CLI_START_SENTINEL not in stripped:
             return True
@@ -681,7 +681,7 @@ def _is_instant_exit(log_path: Path) -> bool:
         # startup UI from defeating the threshold.  See issue #2435.
         cli_output = _get_cli_output(stripped)
         cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
-        return len(cleaned.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+        return len(cleaned.strip()) < LOW_OUTPUT_MIN_CHARS
     except OSError:
         return False
 
@@ -691,7 +691,7 @@ def _is_auth_failure(log_path: Path) -> bool:
 
     Auth failures are **systemic** when running as a subprocess of a parent
     Claude Code session (the parent holds the config lock, so retries will
-    always time out).  This is distinct from generic instant-exits which
+    always time out).  This is distinct from generic low-output sessions which
     *are* worth retrying.
 
     Detection uses two methods:
@@ -726,14 +726,14 @@ def _is_auth_failure(log_path: Path) -> bool:
     return False
 
 
-def _classify_instant_exit(log_path: Path) -> str:
-    """Classify the root cause of an instant-exit from the worker log.
+def _classify_low_output_cause(log_path: Path) -> str:
+    """Classify the root cause of a low-output session from the worker log.
 
-    After detecting an instant-exit, the log often contains specific error
+    After detecting a low-output session, the log often contains specific error
     patterns that indicate the problem will persist for much longer — or won't
     resolve by retrying at all.  This function parses the log for known
     patterns and returns a cause string used to select a retry strategy
-    from ``INSTANT_EXIT_RETRY_STRATEGIES``.
+    from ``LOW_OUTPUT_RETRY_STRATEGIES``.
 
     Args:
         log_path: Path to the worker session log file.
@@ -796,7 +796,7 @@ def run_worker_phase(
         - 3: Shutdown signal
         - 4: Agent stuck after retry
         - 5: Failures are pre-existing (Doctor only)
-        - 6: Instant exit detected (session < 5s with no meaningful output)
+        - 6: Low output detected (session produced no meaningful output)
         - 7: MCP server failure detected (session exited due to MCP init failure)
         - 8: Planning stall detected (stuck in planning checkpoint)
         - 9: Auth pre-flight failure (not retryable, see issue #2508)
@@ -994,7 +994,7 @@ def run_worker_phase(
     #
     # Check on ALL exit codes, not just 0.  A degraded CLI session may exit
     # with a non-zero code (e.g., 2 for API error) while still producing no
-    # meaningful output — this is functionally the same as an instant-exit
+    # meaningful output — this is functionally a low-output session
     # and should be retried rather than treated as a builder error.
     # See issue #2446.
     paths = LoomPaths(ctx.repo_root)
@@ -1012,7 +1012,7 @@ def run_worker_phase(
         )
         return 9
 
-    # Check for MCP failure (exit code 7) — more specific than instant-exit,
+    # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
     if wait_exit != 0 and _is_mcp_failure(log_path):
         errors = extract_log_errors(log_path)
@@ -1022,11 +1022,11 @@ def run_worker_phase(
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 7
-    if wait_exit != 0 and _is_instant_exit(log_path):
+    if wait_exit != 0 and _is_low_output_session(log_path):
         errors = extract_log_errors(log_path)
         cause = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"Instant-exit detected for {role} session '{name}'{cause} "
+            f"Low output detected for {role} session '{name}'{cause} "
             f"(exit code {wait_exit}, log: {log_path})"
         )
         return 6
@@ -1047,29 +1047,29 @@ def run_phase_with_retry(
     args: str | None = None,
     planning_timeout: int = 0,
 ) -> int:
-    """Run a phase with automatic retry on stuck, instant-exit, or MCP failure.
+    """Run a phase with automatic retry on stuck, low-output, or MCP failure.
 
     On exit code 4 (stuck), retries up to max_retries times.
-    On exit code 6 (instant exit), classifies the root cause from the
+    On exit code 6 (low output), classifies the root cause from the
     worker log and uses a cause-specific retry strategy from
-    ``INSTANT_EXIT_RETRY_STRATEGIES``.  See issue #2518.
+    ``LOW_OUTPUT_RETRY_STRATEGIES``.  See issue #2518.
     On exit code 7 (MCP failure), retries up to MCP_FAILURE_MAX_RETRIES
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
     On exit code 9 (auth failure), returns immediately (not retryable).
 
     For exit codes 6 and 7, if a single attempt takes longer than
-    INSTANT_EXIT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
+    LOW_OUTPUT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
     because the failure is likely an infrastructure issue rather than
     a transient blip.  See issue #2519.
 
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
-                   6=instant-exit after retries, 7=MCP failure after retries,
+                   6=low-output after retries, 7=MCP failure after retries,
                    8=planning stall, 9=auth failure, other=error
     """
     stuck_retries = 0
-    instant_exit_retries = 0
+    low_output_retries = 0
     mcp_failure_retries = 0
 
     while True:
@@ -1103,7 +1103,7 @@ def run_phase_with_retry(
 
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or
-        # loom:changes-requested) before the MCP/instant-exit failure
+        # loom:changes-requested) before the MCP/low-output failure
         # occurred, skip the retry entirely.  See issue #2335.
         if exit_code in (6, 7) and phase == "judge" and ctx.pr_number is not None:
             ctx.label_cache.invalidate_pr(ctx.pr_number)
@@ -1118,13 +1118,13 @@ def run_phase_with_retry(
 
         # --- MCP failure handling (exit code 7) ---
         # MCP failures are systemic (stale build, resource contention) so
-        # use longer backoff than generic instant-exits.  See issue #2279.
+        # use longer backoff than generic low-output sessions.  See issue #2279.
         if exit_code == 7:
-            # Same elapsed-time guard as instant-exit.  See issue #2519.
-            if attempt_elapsed > INSTANT_EXIT_MAX_ATTEMPT_SECONDS:
+            # Same elapsed-time guard as low-output.  See issue #2519.
+            if attempt_elapsed > LOW_OUTPUT_MAX_ATTEMPT_SECONDS:
                 log_warning(
                     f"MCP failure attempt for {role} took {attempt_elapsed:.0f}s "
-                    f"(>{INSTANT_EXIT_MAX_ATTEMPT_SECONDS}s), "
+                    f"(>{LOW_OUTPUT_MAX_ATTEMPT_SECONDS}s), "
                     f"likely infrastructure issue — not retrying"
                 )
                 return 7
@@ -1163,63 +1163,63 @@ def run_phase_with_retry(
             time.sleep(backoff)
             continue
 
-        # --- Instant-exit handling (exit code 6) ---
+        # --- Low-output handling (exit code 6) ---
         if exit_code == 6:
             # Classify root cause from the worker log and select a
             # cause-specific retry strategy.  See issue #2518.
             paths = LoomPaths(ctx.repo_root)
             log_path = paths.worker_log_file(role, ctx.config.issue)
-            cause = _classify_instant_exit(log_path)
-            cause_max_retries, cause_backoff = INSTANT_EXIT_RETRY_STRATEGIES.get(
-                cause, INSTANT_EXIT_RETRY_STRATEGIES["unknown"]
+            cause = _classify_low_output_cause(log_path)
+            cause_max_retries, cause_backoff = LOW_OUTPUT_RETRY_STRATEGIES.get(
+                cause, LOW_OUTPUT_RETRY_STRATEGIES["unknown"]
             )
 
             # Fail fast for causes that won't resolve with retries
             # (e.g., auth_timeout — 0 retries).
             if cause_max_retries == 0:
                 log_warning(
-                    f"Instant-exit for {role} classified as '{cause}': "
+                    f"Low output for {role} classified as '{cause}': "
                     f"not retryable, failing fast"
                 )
                 return 6
 
             # If the attempt took a long time, the failure is likely an
             # infrastructure issue — retrying won't help.  See issue #2519.
-            if attempt_elapsed > INSTANT_EXIT_MAX_ATTEMPT_SECONDS:
+            if attempt_elapsed > LOW_OUTPUT_MAX_ATTEMPT_SECONDS:
                 log_warning(
-                    f"Instant-exit attempt for {role} took {attempt_elapsed:.0f}s "
-                    f"(>{INSTANT_EXIT_MAX_ATTEMPT_SECONDS}s), "
+                    f"Low-output attempt for {role} took {attempt_elapsed:.0f}s "
+                    f"(>{LOW_OUTPUT_MAX_ATTEMPT_SECONDS}s), "
                     f"likely infrastructure issue — not retrying"
                 )
                 return 6
 
-            instant_exit_retries += 1
-            if instant_exit_retries > cause_max_retries:
+            low_output_retries += 1
+            if low_output_retries > cause_max_retries:
                 errors = extract_log_errors(log_path)
                 detail = f": {errors[-1]}" if errors else ""
                 log_warning(
-                    f"Instant-exit ({cause}) persisted for {role} after "
+                    f"Low output ({cause}) persisted for {role} after "
                     f"{cause_max_retries} retries{detail}"
                 )
                 return 6  # Caller should treat as failure
 
             # Use cause-specific backoff schedule
             backoff_idx = min(
-                instant_exit_retries - 1, max(0, len(cause_backoff) - 1)
+                low_output_retries - 1, max(0, len(cause_backoff) - 1)
             )
             backoff = cause_backoff[backoff_idx]
 
             ctx.report_milestone(
                 "error",
-                error=f"instant-exit detected for {role} (cause: {cause})",
+                error=f"low output detected for {role} (cause: {cause})",
                 will_retry=True,
             )
             ctx.report_milestone(
                 "heartbeat",
                 action=(
-                    f"retrying instant-exit {role} "
+                    f"retrying low-output {role} "
                     f"(cause: {cause}, "
-                    f"attempt {instant_exit_retries}/{cause_max_retries}, "
+                    f"attempt {low_output_retries}/{cause_max_retries}, "
                     f"backoff {backoff}s)"
                 ),
             )

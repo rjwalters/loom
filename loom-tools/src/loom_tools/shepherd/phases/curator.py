@@ -66,7 +66,7 @@ class CuratorPhase(BasePhase):
             # Curation is optional so skip rather than fail, but message
             # must be honest about what happened.
             reason = {
-                6: "all sessions failed to start (instant-exit after retries)",
+                6: "all sessions failed to start (low output after retries)",
                 7: "all sessions failed to start (MCP server failure after retries)",
                 9: "all sessions failed to start (auth pre-flight failure)",
             }[exit_code]

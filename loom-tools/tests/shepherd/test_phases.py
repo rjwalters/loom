@@ -25,18 +25,18 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import (
-    INSTANT_EXIT_BACKOFF_SECONDS,
-    INSTANT_EXIT_MAX_ATTEMPT_SECONDS,
-    INSTANT_EXIT_MAX_RETRIES,
-    INSTANT_EXIT_MIN_OUTPUT_CHARS,
-    INSTANT_EXIT_RETRY_STRATEGIES,
+    LOW_OUTPUT_BACKOFF_SECONDS,
+    LOW_OUTPUT_MAX_ATTEMPT_SECONDS,
+    LOW_OUTPUT_MAX_RETRIES,
+    LOW_OUTPUT_MIN_CHARS,
+    LOW_OUTPUT_RETRY_STRATEGIES,
     MCP_FAILURE_BACKOFF_SECONDS,
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
     _AUTH_FAILURE_SENTINEL,
-    _classify_instant_exit,
+    _classify_low_output_cause,
     _is_auth_failure,
-    _is_instant_exit,
+    _is_low_output_session,
     _is_mcp_failure,
     _print_heartbeat,
     _strip_spinner_noise,
@@ -202,10 +202,10 @@ class TestCuratorPhase:
         skip, reason = curator.should_skip(mock_context)
         assert skip is False
 
-    def test_exit_code_6_instant_exit_returns_skipped(
+    def test_exit_code_6_low_output_returns_skipped(
         self, mock_context: MagicMock
     ) -> None:
-        """Exit code 6 (instant-exit) should return SKIPPED, not SUCCESS."""
+        """Exit code 6 (low-output) should return SKIPPED, not SUCCESS."""
         mock_context.check_shutdown.return_value = False
         with patch(
             "loom_tools.shepherd.phases.curator.run_phase_with_retry", return_value=6
@@ -214,7 +214,7 @@ class TestCuratorPhase:
             result = curator.run(mock_context)
 
         assert result.status == PhaseStatus.SKIPPED
-        assert "instant-exit" in result.message
+        assert "low output" in result.message
         assert "failed to start" in result.message
 
     def test_exit_code_7_mcp_failure_returns_skipped(
@@ -818,12 +818,12 @@ class TestBuilderPhase:
         assert result.status == PhaseStatus.FAILED
         assert "exited with code 7" in result.message
 
-    def test_instant_exit_recovers_from_worktree_with_commits(
+    def test_low_output_recovers_from_worktree_with_commits(
         self, mock_context: MagicMock
     ) -> None:
         """Exit code 6 with commits ahead should attempt worktree recovery.
 
-        When the builder CLI instant-exits but a previous builder left commits
+        When the builder CLI low-outputs but a previous builder left commits
         in the worktree, the shepherd should try direct completion to push and
         create a PR.  See issue #2507.
         """
@@ -877,12 +877,12 @@ class TestBuilderPhase:
         assert result.data.get("pr_number") == 150
         assert result.data.get("recovered_from_worktree") is True
 
-    def test_instant_exit_stale_worktree_cleaned_up(
+    def test_low_output_stale_worktree_cleaned_up(
         self, mock_context: MagicMock
     ) -> None:
         """Exit code 6 with stale worktree should clean it up before failing.
 
-        When the builder CLI instant-exits and the worktree is clean (no commits,
+        When the builder CLI low-outputs and the worktree is clean (no commits,
         no changes), the shepherd should clean up the orphaned worktree.
         See issue #2507.
         """
@@ -5095,14 +5095,14 @@ class TestJudgePhase:
         assert mock_validate.call_count == 1
         mock_sleep.assert_not_called()
 
-    def test_exit_code_6_instant_exit_marks_blocked(
+    def test_exit_code_6_low_output_marks_blocked(
         self, mock_context: MagicMock
     ) -> None:
-        """Exit code 6 (instant-exit after retries) should mark issue blocked and return FAILED.
+        """Exit code 6 (low-output after retries) should mark issue blocked and return FAILED.
 
         When run_phase_with_retry returns exit code 6, the judge should:
-        - Mark the issue as blocked with error_class 'judge_instant_exit'
-        - Return PhaseStatus.FAILED with instant_exit data
+        - Mark the issue as blocked with error_class 'judge_low_output'
+        - Return PhaseStatus.FAILED with low_output data
         - NOT proceed to validation (no label checks needed)
         See issue #2139.
         """
@@ -5120,10 +5120,10 @@ class TestJudgePhase:
             result = judge.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
-        assert "instant-exit" in result.message
-        assert result.data == {"instant_exit": True}
+        assert "low output" in result.message
+        assert result.data == {"low_output": True}
         mock_blocked.assert_called_once_with(
-            mock_context, "judge_instant_exit", "agent instant-exit after retry"
+            mock_context, "judge_low_output", "agent low output after retry"
         )
         # Validation should NOT be called — exit code 6 short-circuits
         mock_validate.assert_not_called()
@@ -5154,7 +5154,7 @@ class TestJudgePhase:
             result = judge.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
-        assert result.data == {"instant_exit": True}
+        assert result.data == {"low_output": True}
         mock_blocked.assert_called_once()
         # Infrastructure bypass should be attempted
         mock_bypass.assert_called_once()
@@ -6495,7 +6495,7 @@ class TestJudgeInfrastructureBypass:
         ):
             result = judge.run(ctx)
         assert result.status == PhaseStatus.FAILED
-        assert result.data == {"instant_exit": True}
+        assert result.data == {"low_output": True}
         mock_blocked.assert_called_once()
 
     def test_bypass_denied_label_apply_fails(self, mock_context: MagicMock) -> None:
@@ -6554,7 +6554,7 @@ class TestJudgeInfrastructureBypass:
         assert result.status == PhaseStatus.SUCCESS
         assert "loom:infrastructure-bypass" in captured["body"]
         assert "NOT" in captured["body"]
-        assert "instant-exit" in captured["body"]
+        assert "low output" in captured["body"]
 
 
 class TestMergePhase:
@@ -6930,7 +6930,7 @@ class TestRunWorkerPhaseMissingScripts:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=False,
             ),
         ):
@@ -6982,7 +6982,7 @@ class TestRunWorkerPhaseClaudeCodeEnv:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=False,
             ),
             patch.dict("os.environ", {"CLAUDECODE": "1"}, clear=False),
@@ -7033,7 +7033,7 @@ class TestRunWorkerPhaseClaudeCodeEnv:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=False,
             ),
             patch.dict("os.environ", env_without_claudecode, clear=True),
@@ -7083,7 +7083,7 @@ class TestRunWorkerPhaseShepherdTaskId:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=False,
             ),
         ):
@@ -11137,45 +11137,45 @@ class TestExtractLogErrors:
 
 
 # ---------------------------------------------------------------------------
-# Instant-exit detection tests (issue #2135)
+# Low-output detection tests (issue #2135)
 # ---------------------------------------------------------------------------
 
 
-class TestIsInstantExit:
-    """Test _is_instant_exit helper function."""
+class TestIsLowOutputSession:
+    """Test _is_low_output_session helper function."""
 
     def test_no_log_file_returns_false(self, tmp_path: Path) -> None:
-        """Missing log file should not be flagged as instant exit."""
-        assert _is_instant_exit(tmp_path / "nonexistent.log") is False
+        """Missing log file should not be flagged as low output."""
+        assert _is_low_output_session(tmp_path / "nonexistent.log") is False
 
     def test_no_output_returns_true(self, tmp_path: Path) -> None:
-        """Log with only ANSI escape sequences is an instant exit."""
+        """Log with only ANSI escape sequences is an low output."""
         log = tmp_path / "session.log"
         # Write only ANSI escape sequences (no meaningful content)
         log.write_text("\x1b[?2026l\x1b[0m\n")
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
     def test_meaningful_output_returns_false(self, tmp_path: Path) -> None:
-        """Log with meaningful content after sentinel is NOT an instant exit."""
+        """Log with meaningful content after sentinel is NOT an low output."""
         log = tmp_path / "session.log"
         # Write sentinel + enough meaningful content to exceed threshold
         log.write_text(
             "# CLAUDE_CLI_START\n"
-            + "x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1)
+            + "x" * (LOW_OUTPUT_MIN_CHARS + 1)
         )
-        assert _is_instant_exit(log) is False
+        assert _is_low_output_session(log) is False
 
     def test_header_only_returns_true(self, tmp_path: Path) -> None:
-        """Log with only header lines is an instant exit."""
+        """Log with only header lines is an low output."""
         log = tmp_path / "session.log"
         log.write_text("# Loom Agent Log\n# Session: test\n")
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
     def test_empty_log_returns_true(self, tmp_path: Path) -> None:
-        """Completely empty log is an instant exit."""
+        """Completely empty log is an low output."""
         log = tmp_path / "session.log"
         log.write_text("")
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
     def test_wrapper_preflight_with_sentinel_and_no_cli_output(
         self, tmp_path: Path
@@ -11184,7 +11184,7 @@ class TestIsInstantExit:
 
         When the claude-wrapper writes pre-flight messages that exceed the
         100-char threshold but the CLI itself produces no output, the session
-        should still be detected as an instant exit.
+        should still be detected as an low output.
         """
         log = tmp_path / "session.log"
         log.write_text(
@@ -11198,24 +11198,24 @@ class TestIsInstantExit:
             "[2026-02-16 21:22:21] [INFO] Attempt 1/5: Starting Claude CLI\n"
             "# CLAUDE_CLI_START\n"
         )
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
     def test_wrapper_preflight_with_sentinel_and_real_output(
         self, tmp_path: Path
     ) -> None:
-        """Real CLI output after sentinel should NOT be an instant exit."""
+        """Real CLI output after sentinel should NOT be an low output."""
         log = tmp_path / "session.log"
         log.write_text(
             "[2026-02-16 21:22:21] [INFO] Claude wrapper starting\n"
             "[2026-02-16 21:22:21] [INFO] Pre-flight checks passed\n"
             "[2026-02-16 21:22:21] [INFO] Attempt 1/5: Starting Claude CLI\n"
             "# CLAUDE_CLI_START\n"
-            + "x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1)
+            + "x" * (LOW_OUTPUT_MIN_CHARS + 1)
         )
-        assert _is_instant_exit(log) is False
+        assert _is_low_output_session(log) is False
 
-    def test_no_sentinel_treated_as_instant_exit(self, tmp_path: Path) -> None:
-        """Without sentinel, session is treated as instant exit (issue #2405).
+    def test_no_sentinel_treated_as_low_output(self, tmp_path: Path) -> None:
+        """Without sentinel, session is treated as low output (issue #2405).
 
         The wrapper always writes the sentinel before invoking Claude CLI,
         so its absence means Claude never started.
@@ -11225,21 +11225,21 @@ class TestIsInstantExit:
             "# Loom Agent Log\n"
             + "[INFO] wrapper line\n" * 20
         )
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
     def test_multiple_sentinels_uses_last(self, tmp_path: Path) -> None:
         """With multiple sentinels (retries), only output after the last counts."""
         log = tmp_path / "session.log"
         log.write_text(
             "# CLAUDE_CLI_START\n"
-            + "x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1) + "\n"
+            + "x" * (LOW_OUTPUT_MIN_CHARS + 1) + "\n"
             "# CLAUDE_CLI_START\n"  # Second attempt — no output after this
         )
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
 
-class TestRunWorkerPhaseInstantExit:
-    """Test that run_worker_phase detects instant exits and returns code 6."""
+class TestRunWorkerPhaseLowOutput:
+    """Test that run_worker_phase detects low outputs and returns code 6."""
 
     @pytest.fixture
     def mock_context(self, tmp_path: Path) -> MagicMock:
@@ -11255,7 +11255,7 @@ class TestRunWorkerPhaseInstantExit:
         ctx.progress_dir = tmp_path / ".loom" / "progress"
         return ctx
 
-    def test_instant_exit_returns_code_6(self, mock_context: MagicMock) -> None:
+    def test_low_output_returns_code_6(self, mock_context: MagicMock) -> None:
         """When agent exits non-zero in <5s with no output, return exit code 6."""
 
         def mock_spawn(cmd, **kwargs):
@@ -11274,7 +11274,7 @@ class TestRunWorkerPhaseInstantExit:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=True
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=True
             ),
         ):
             exit_code = run_worker_phase(
@@ -11313,7 +11313,7 @@ class TestRunWorkerPhaseInstantExit:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=False
             ),
         ):
             run_worker_phase(
@@ -11349,7 +11349,7 @@ class TestRunWorkerPhaseInstantExit:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=False
             ),
         ):
             exit_code = run_worker_phase(
@@ -11362,14 +11362,14 @@ class TestRunWorkerPhaseInstantExit:
 
         assert exit_code == 0
 
-    def test_non_zero_exit_with_minimal_output_returns_instant_exit(
+    def test_non_zero_exit_with_minimal_output_returns_low_output(
         self, mock_context: MagicMock
     ) -> None:
-        """Non-zero exit with minimal output should still detect instant-exit.
+        """Non-zero exit with minimal output should still detect low-output.
 
         When a degraded CLI session exits with a non-zero code (e.g., 2 for
         API error) but produced no meaningful output, it's functionally the
-        same as an instant-exit and should be classified as code 6.
+        same as an low-output and should be classified as code 6.
         See issue #2446.
         """
 
@@ -11389,7 +11389,7 @@ class TestRunWorkerPhaseInstantExit:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=True
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=True
             ),
         ):
             exit_code = run_worker_phase(
@@ -11408,7 +11408,7 @@ class TestRunWorkerPhaseInstantExit:
         """Non-zero exit with normal output should return the raw exit code.
 
         When the CLI exits non-zero but produced substantial output (not an
-        instant-exit), the raw exit code should be returned as-is.
+        low-output), the raw exit code should be returned as-is.
         """
 
         def mock_spawn(cmd, **kwargs):
@@ -11427,7 +11427,7 @@ class TestRunWorkerPhaseInstantExit:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=False
             ),
             patch(
                 "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=False
@@ -11482,8 +11482,8 @@ class TestRunWorkerPhaseInstantExit:
         assert exit_code == 7
 
 
-class TestRunPhaseWithRetryInstantExit:
-    """Test that run_phase_with_retry retries on instant-exit (code 6)."""
+class TestRunPhaseWithRetryLowOutput:
+    """Test that run_phase_with_retry retries on low-output (code 6)."""
 
     @pytest.fixture
     def mock_context(self) -> MagicMock:
@@ -11499,7 +11499,7 @@ class TestRunPhaseWithRetryInstantExit:
         ctx.pr_number = None
         return ctx
 
-    def test_retries_on_instant_exit_then_succeeds(
+    def test_retries_on_low_output_then_succeeds(
         self, mock_context: MagicMock
     ) -> None:
         """Should retry on code 6 and return 0 when the retry succeeds."""
@@ -11508,7 +11508,7 @@ class TestRunPhaseWithRetryInstantExit:
         def mock_run_worker(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            # First call: instant exit; second call: success
+            # First call: low output; second call: success
             return 6 if call_count == 1 else 0
 
         with (
@@ -11530,12 +11530,12 @@ class TestRunPhaseWithRetryInstantExit:
         assert exit_code == 0
         assert call_count == 2
         # First backoff is 2 seconds
-        mock_sleep.assert_called_once_with(INSTANT_EXIT_BACKOFF_SECONDS[0])
+        mock_sleep.assert_called_once_with(LOW_OUTPUT_BACKOFF_SECONDS[0])
 
     def test_exhausts_retries_returns_code_6(
         self, mock_context: MagicMock
     ) -> None:
-        """Should return 6 after exhausting all instant-exit retries."""
+        """Should return 6 after exhausting all low-output retries."""
         with (
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
@@ -11557,7 +11557,7 @@ class TestRunPhaseWithRetryInstantExit:
     def test_retry_count_matches_constant(
         self, mock_context: MagicMock
     ) -> None:
-        """Should retry exactly INSTANT_EXIT_MAX_RETRIES times."""
+        """Should retry exactly LOW_OUTPUT_MAX_RETRIES times."""
         call_count = 0
 
         def count_calls(*args, **kwargs):
@@ -11581,11 +11581,11 @@ class TestRunPhaseWithRetryInstantExit:
                 phase="judge",
             )
 
-        # 1 initial call + INSTANT_EXIT_MAX_RETRIES retries
-        assert call_count == 1 + INSTANT_EXIT_MAX_RETRIES
+        # 1 initial call + LOW_OUTPUT_MAX_RETRIES retries
+        assert call_count == 1 + LOW_OUTPUT_MAX_RETRIES
 
     def test_backoff_timing(self, mock_context: MagicMock) -> None:
-        """Should use exponential backoff from INSTANT_EXIT_BACKOFF_SECONDS."""
+        """Should use exponential backoff from LOW_OUTPUT_BACKOFF_SECONDS."""
         with (
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
@@ -11604,7 +11604,7 @@ class TestRunPhaseWithRetryInstantExit:
 
         # Verify backoff values for each retry
         sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
-        assert sleep_values == INSTANT_EXIT_BACKOFF_SECONDS
+        assert sleep_values == LOW_OUTPUT_BACKOFF_SECONDS
 
     def test_reports_error_and_heartbeat_milestones(
         self, mock_context: MagicMock
@@ -11642,19 +11642,19 @@ class TestRunPhaseWithRetryInstantExit:
         assert milestone_calls[0].kwargs["will_retry"] is True
         # Second call: heartbeat with retry info
         assert milestone_calls[1].args[0] == "heartbeat"
-        assert "instant-exit" in milestone_calls[1].kwargs["action"]
+        assert "low-output" in milestone_calls[1].kwargs["action"]
 
-    def test_stuck_and_instant_exit_have_separate_counters(
+    def test_stuck_and_low_output_have_separate_counters(
         self, mock_context: MagicMock
     ) -> None:
-        """Stuck retries (code 4) and instant-exit retries (code 6) are independent."""
+        """Stuck retries (code 4) and low-output retries (code 6) are independent."""
         call_count = 0
 
         def mock_run_worker(*args, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                return 6  # Instant exit
+                return 6  # Low output
             elif call_count == 2:
                 return 4  # Stuck
             else:
@@ -11680,10 +11680,10 @@ class TestRunPhaseWithRetryInstantExit:
         assert call_count == 3
 
 
-class TestInstantExitElapsedTimeGuard:
-    """Test elapsed-time guard on instant-exit and MCP failure retries.
+class TestLowOutputElapsedTimeGuard:
+    """Test elapsed-time guard on low-output and MCP failure retries.
 
-    When a single attempt takes longer than INSTANT_EXIT_MAX_ATTEMPT_SECONDS,
+    When a single attempt takes longer than LOW_OUTPUT_MAX_ATTEMPT_SECONDS,
     the failure is likely an infrastructure issue and retries should be
     skipped entirely.  See issue #2519.
     """
@@ -11697,7 +11697,7 @@ class TestInstantExitElapsedTimeGuard:
         ctx.report_milestone = MagicMock()
         return ctx
 
-    def test_instant_exit_skips_retry_when_attempt_is_slow(
+    def test_low_output_skips_retry_when_attempt_is_slow(
         self, mock_context: MagicMock
     ) -> None:
         """Should return 6 immediately if the attempt took >90s."""
@@ -11735,7 +11735,7 @@ class TestInstantExitElapsedTimeGuard:
 
         assert exit_code == 6
 
-    def test_instant_exit_retries_when_attempt_is_fast(
+    def test_low_output_retries_when_attempt_is_fast(
         self, mock_context: MagicMock
     ) -> None:
         """Should retry normally if the attempt took <90s."""
@@ -11746,7 +11746,7 @@ class TestInstantExitElapsedTimeGuard:
             nonlocal call_count
             call_count += 1
             clock[0] += 5.0  # Simulate 5s elapsed (fast)
-            # First call: instant exit; second call: success
+            # First call: low output; second call: success
             return 6 if call_count == 1 else 0
 
         def mock_monotonic():
@@ -11856,7 +11856,7 @@ class TestInstantExitElapsedTimeGuard:
 
     def test_constant_value_is_90(self) -> None:
         """Verify the threshold constant is 90 seconds as specified."""
-        assert INSTANT_EXIT_MAX_ATTEMPT_SECONDS == 90
+        assert LOW_OUTPUT_MAX_ATTEMPT_SECONDS == 90
 
 
 class TestRunWorkerPhasePlanningStall:
@@ -11988,7 +11988,7 @@ class TestRunWorkerPhasePlanningStall:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=False
             ),
             patch(
                 "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=False
@@ -12034,7 +12034,7 @@ class TestRunWorkerPhasePlanningStall:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=False
             ),
             patch(
                 "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=False
@@ -13715,7 +13715,7 @@ class TestStripUiChrome:
         """Realistic UI chrome from a session with no productive work.
 
         This simulates the ~2,700+ chars of startup UI that defeat
-        the 100-char instant-exit threshold (issue #2435).
+        the 100-char low-output threshold (issue #2435).
         """
         ui_chrome = (
             " ▐▛███▜▌   Claude Code v2.1.29\n"
@@ -13737,21 +13737,21 @@ class TestStripUiChrome:
             "rwalters@studio issue-42 %\n"
         )
         # Verify the raw text exceeds the threshold
-        assert len(ui_chrome) > INSTANT_EXIT_MIN_OUTPUT_CHARS
+        assert len(ui_chrome) > LOW_OUTPUT_MIN_CHARS
         # But after stripping, it should be minimal
         result = _strip_ui_chrome(ui_chrome)
-        assert len(result.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+        assert len(result.strip()) < LOW_OUTPUT_MIN_CHARS
 
 
-class TestIsInstantExitWithUiChrome:
-    """Test that _is_instant_exit correctly detects instant exits with UI chrome.
+class TestIsLowOutputSessionWithUiChrome:
+    """Test that _is_low_output_session correctly detects low outputs with UI chrome.
 
     Regression tests for issue #2435: Claude Code's startup UI chrome
     generates ~2,700+ chars which defeated the old 100-char threshold.
     """
 
-    def test_ui_chrome_only_detected_as_instant_exit(self, tmp_path: Path) -> None:
-        """Session with only UI chrome (no productive work) should be instant exit."""
+    def test_ui_chrome_only_detected_as_low_output(self, tmp_path: Path) -> None:
+        """Session with only UI chrome (no productive work) should be low output."""
         log = tmp_path / "session.log"
         log.write_text(
             "# Loom Agent Log\n"
@@ -13773,12 +13773,12 @@ class TestIsInstantExitWithUiChrome:
             "· esc to interrupt\n"
             "rwalters@studio issue-42 %\n"
         )
-        assert _is_instant_exit(log) is True
+        assert _is_low_output_session(log) is True
 
-    def test_ui_chrome_plus_real_work_not_instant_exit(
+    def test_ui_chrome_plus_real_work_not_low_output(
         self, tmp_path: Path
     ) -> None:
-        """Session with UI chrome AND real work should NOT be instant exit."""
+        """Session with UI chrome AND real work should NOT be low output."""
         log = tmp_path / "session.log"
         log.write_text(
             "# CLAUDE_CLI_START\n"
@@ -13790,7 +13790,7 @@ class TestIsInstantExitWithUiChrome:
             "Editing /src/main.py line 15: adding error handling.\n"
             "Running pytest... all tests passed.\n"
         )
-        assert _is_instant_exit(log) is False
+        assert _is_low_output_session(log) is False
 
 
 class TestIsMcpFailureWithUiChrome:
@@ -13868,7 +13868,7 @@ class TestRunWorkerPhaseMcpFailure:
                 "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=True
             ),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=True
+                "loom_tools.shepherd.phases.base._is_low_output_session", return_value=True
             ),
         ):
             exit_code = run_worker_phase(
@@ -13879,13 +13879,13 @@ class TestRunWorkerPhaseMcpFailure:
                 phase="judge",
             )
 
-        # MCP failure (7) takes priority over generic instant-exit (6)
+        # MCP failure (7) takes priority over generic low-output (6)
         assert exit_code == 7
 
-    def test_mcp_failure_checked_before_instant_exit(
+    def test_mcp_failure_checked_before_low_output(
         self, mock_context: MagicMock
     ) -> None:
-        """MCP failure should be checked before generic instant-exit."""
+        """MCP failure should be checked before generic low-output."""
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -13906,8 +13906,8 @@ class TestRunWorkerPhaseMcpFailure:
                 "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=True
             ) as mock_mcp,
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit"
-            ) as mock_instant,
+                "loom_tools.shepherd.phases.base._is_low_output_session"
+            ) as mock_low_output,
         ):
             exit_code = run_worker_phase(
                 mock_context,
@@ -13919,8 +13919,8 @@ class TestRunWorkerPhaseMcpFailure:
 
         assert exit_code == 7
         mock_mcp.assert_called_once()
-        # _is_instant_exit should NOT be called when MCP failure is detected
-        mock_instant.assert_not_called()
+        # _is_low_output_session should NOT be called when MCP failure is detected
+        mock_low_output.assert_not_called()
 
 
 class TestRunPhaseWithRetryMcpFailure:
@@ -14081,10 +14081,10 @@ class TestRunPhaseWithRetryMcpFailure:
         assert milestone_calls[1].args[0] == "heartbeat"
         assert "MCP" in milestone_calls[1].kwargs["action"]
 
-    def test_mcp_and_instant_exit_have_separate_counters(
+    def test_mcp_and_low_output_have_separate_counters(
         self, mock_context: MagicMock
     ) -> None:
-        """MCP retries (code 7) and instant-exit retries (code 6) are independent."""
+        """MCP retries (code 7) and low-output retries (code 6) are independent."""
         call_count = 0
 
         def mock_run_worker(*args, **kwargs):
@@ -14093,7 +14093,7 @@ class TestRunPhaseWithRetryMcpFailure:
             if call_count == 1:
                 return 7  # MCP failure
             elif call_count == 2:
-                return 6  # Instant exit
+                return 6  # Low output
             else:
                 return 0  # Success
 
@@ -14323,7 +14323,7 @@ class TestRunWorkerPhaseAuthFailure:
                 return_value=False,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=False,
             ),
         ):
@@ -14337,10 +14337,10 @@ class TestRunWorkerPhaseAuthFailure:
 
         assert exit_code == 0
 
-    def test_exit_0_not_overridden_by_instant_exit_pattern(
+    def test_exit_0_not_overridden_by_low_output_pattern(
         self, mock_context: MagicMock
     ) -> None:
-        """Exit 0 should never be overridden by instant-exit log pattern (issue #2545)."""
+        """Exit 0 should never be overridden by low-output log pattern (issue #2545)."""
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -14366,7 +14366,7 @@ class TestRunWorkerPhaseAuthFailure:
                 return_value=False,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=True,
             ),
         ):
@@ -14409,7 +14409,7 @@ class TestRunWorkerPhaseAuthFailure:
                 return_value=True,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=False,
             ),
         ):
@@ -14423,10 +14423,10 @@ class TestRunWorkerPhaseAuthFailure:
 
         assert exit_code == 0
 
-    def test_auth_failure_takes_priority_over_instant_exit(
+    def test_auth_failure_takes_priority_over_low_output(
         self, mock_context: MagicMock
     ) -> None:
-        """Auth failure (code 9) should be checked before instant-exit (code 6)."""
+        """Auth failure (code 9) should be checked before low-output (code 6)."""
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -14448,7 +14448,7 @@ class TestRunWorkerPhaseAuthFailure:
                 return_value=True,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit",
+                "loom_tools.shepherd.phases.base._is_low_output_session",
                 return_value=True,
             ),
         ):
@@ -14460,7 +14460,7 @@ class TestRunWorkerPhaseAuthFailure:
                 phase="builder",
             )
 
-        # Auth failure takes priority over instant-exit
+        # Auth failure takes priority over low-output
         assert exit_code == 9
 
 
@@ -14531,8 +14531,8 @@ class TestRunPhaseWithRetryAuthFailure:
         assert call_count == 1
 
 
-class TestClassifyInstantExit:
-    """Test _classify_instant_exit root cause classification.
+class TestClassifyLowOutputCause:
+    """Test _classify_low_output_cause root cause classification.
 
     The classifier parses the worker log for known error patterns and
     returns a cause string used to select a retry strategy.  See issue #2518.
@@ -14540,13 +14540,13 @@ class TestClassifyInstantExit:
 
     def test_missing_log_returns_unknown(self, tmp_path: Path) -> None:
         """Missing log file should return 'unknown'."""
-        assert _classify_instant_exit(tmp_path / "nonexistent.log") == "unknown"
+        assert _classify_low_output_cause(tmp_path / "nonexistent.log") == "unknown"
 
     def test_empty_log_returns_unknown(self, tmp_path: Path) -> None:
         """Empty log file should return 'unknown'."""
         log = tmp_path / "worker.log"
         log.write_text("")
-        assert _classify_instant_exit(log) == "unknown"
+        assert _classify_low_output_cause(log) == "unknown"
 
     def test_auth_timeout_detected(self, tmp_path: Path) -> None:
         """Log with 'Authentication check timed out' should return 'auth_timeout'."""
@@ -14556,7 +14556,7 @@ class TestClassifyInstantExit:
             "Authentication check timed out (attempt 1/3), retrying in 4s...\n"
             "Authentication check timed out after 3 attempts\n"
         )
-        assert _classify_instant_exit(log) == "auth_timeout"
+        assert _classify_low_output_cause(log) == "auth_timeout"
 
     def test_auth_lock_contention_detected(self, tmp_path: Path) -> None:
         """Log with 'Auth cache lock held' should return 'auth_lock_contention'."""
@@ -14566,7 +14566,7 @@ class TestClassifyInstantExit:
             "Auth cache lock held by another process, waiting up to 60s...\n"
             "Auth cache still stale after 60s wait, proceeding with direct check\n"
         )
-        assert _classify_instant_exit(log) == "auth_lock_contention"
+        assert _classify_low_output_cause(log) == "auth_lock_contention"
 
     def test_api_unreachable_detected(self, tmp_path: Path) -> None:
         """Log with 'API endpoint' + 'unreachable' should return 'api_unreachable'."""
@@ -14575,19 +14575,19 @@ class TestClassifyInstantExit:
             "Checking connectivity...\n"
             "API endpoint https://api.anthropic.com is unreachable\n"
         )
-        assert _classify_instant_exit(log) == "api_unreachable"
+        assert _classify_low_output_cause(log) == "api_unreachable"
 
     def test_api_unreachable_requires_both_keywords(self, tmp_path: Path) -> None:
         """Only 'API endpoint' without 'unreachable' should return 'unknown'."""
         log = tmp_path / "worker.log"
         log.write_text("API endpoint returned 500\n")
-        assert _classify_instant_exit(log) == "unknown"
+        assert _classify_low_output_cause(log) == "unknown"
 
     def test_generic_error_returns_unknown(self, tmp_path: Path) -> None:
         """Log with unrecognized error patterns should return 'unknown'."""
         log = tmp_path / "worker.log"
         log.write_text("Some random error occurred\nSession terminated\n")
-        assert _classify_instant_exit(log) == "unknown"
+        assert _classify_low_output_cause(log) == "unknown"
 
     def test_ansi_codes_stripped(self, tmp_path: Path) -> None:
         """ANSI escape codes in the log should be stripped before matching."""
@@ -14595,7 +14595,7 @@ class TestClassifyInstantExit:
         log.write_text(
             "\033[31mAuthentication check timed out\033[0m after 3 attempts\n"
         )
-        assert _classify_instant_exit(log) == "auth_timeout"
+        assert _classify_low_output_cause(log) == "auth_timeout"
 
     def test_auth_timeout_takes_priority_over_lock_contention(
         self, tmp_path: Path
@@ -14607,37 +14607,37 @@ class TestClassifyInstantExit:
             "Authentication check timed out after 3 attempts\n"
         )
         # auth_timeout is checked first, so it should win
-        assert _classify_instant_exit(log) == "auth_timeout"
+        assert _classify_low_output_cause(log) == "auth_timeout"
 
 
-class TestInstantExitRetryStrategies:
-    """Test INSTANT_EXIT_RETRY_STRATEGIES constant values."""
+class TestLowOutputRetryStrategies:
+    """Test LOW_OUTPUT_RETRY_STRATEGIES constant values."""
 
     def test_auth_timeout_has_zero_retries(self) -> None:
-        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["auth_timeout"]
+        max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["auth_timeout"]
         assert max_retries == 0
         assert backoff == []
 
     def test_auth_lock_contention_has_one_retry(self) -> None:
-        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["auth_lock_contention"]
+        max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["auth_lock_contention"]
         assert max_retries == 1
         assert backoff == [60]
 
     def test_api_unreachable_has_one_retry(self) -> None:
-        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["api_unreachable"]
+        max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["api_unreachable"]
         assert max_retries == 1
         assert backoff == [30]
 
     def test_unknown_matches_original_constants(self) -> None:
-        max_retries, backoff = INSTANT_EXIT_RETRY_STRATEGIES["unknown"]
-        assert max_retries == INSTANT_EXIT_MAX_RETRIES
-        assert backoff == list(INSTANT_EXIT_BACKOFF_SECONDS)
+        max_retries, backoff = LOW_OUTPUT_RETRY_STRATEGIES["unknown"]
+        assert max_retries == LOW_OUTPUT_MAX_RETRIES
+        assert backoff == list(LOW_OUTPUT_BACKOFF_SECONDS)
 
 
-class TestRunPhaseWithRetryInstantExitClassification:
+class TestRunPhaseWithRetryLowOutputClassification:
     """Test cause-specific retry behavior in run_phase_with_retry.
 
-    When an instant-exit (exit code 6) is detected, the retry loop
+    When an low-output (exit code 6) is detected, the retry loop
     classifies the root cause and uses cause-specific retry strategies.
     See issue #2518.
     """
@@ -14671,7 +14671,7 @@ class TestRunPhaseWithRetryInstantExitClassification:
                 side_effect=mock_run_worker,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="auth_timeout",
             ),
             patch("time.sleep"),
@@ -14705,7 +14705,7 @@ class TestRunPhaseWithRetryInstantExitClassification:
                 side_effect=mock_run_worker,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="auth_lock_contention",
             ),
             patch("time.sleep") as mock_sleep,
@@ -14740,7 +14740,7 @@ class TestRunPhaseWithRetryInstantExitClassification:
                 side_effect=mock_run_worker,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="auth_lock_contention",
             ),
             patch("time.sleep"),
@@ -14775,7 +14775,7 @@ class TestRunPhaseWithRetryInstantExitClassification:
                 side_effect=mock_run_worker,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="api_unreachable",
             ),
             patch("time.sleep") as mock_sleep,
@@ -14810,7 +14810,7 @@ class TestRunPhaseWithRetryInstantExitClassification:
                 side_effect=mock_run_worker,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="unknown",
             ),
             patch("time.sleep") as mock_sleep,
@@ -14825,10 +14825,10 @@ class TestRunPhaseWithRetryInstantExitClassification:
             )
 
         assert exit_code == 6
-        # 1 initial + 3 retries = 4 total (same as INSTANT_EXIT_MAX_RETRIES)
-        assert call_count == 1 + INSTANT_EXIT_MAX_RETRIES
+        # 1 initial + 3 retries = 4 total (same as LOW_OUTPUT_MAX_RETRIES)
+        assert call_count == 1 + LOW_OUTPUT_MAX_RETRIES
         sleep_values = [call.args[0] for call in mock_sleep.call_args_list]
-        assert sleep_values == list(INSTANT_EXIT_BACKOFF_SECONDS)
+        assert sleep_values == list(LOW_OUTPUT_BACKOFF_SECONDS)
 
     def test_milestone_includes_cause_in_message(
         self, mock_context: MagicMock
@@ -14847,7 +14847,7 @@ class TestRunPhaseWithRetryInstantExitClassification:
                 side_effect=mock_run_worker,
             ),
             patch(
-                "loom_tools.shepherd.phases.base._classify_instant_exit",
+                "loom_tools.shepherd.phases.base._classify_low_output_cause",
                 return_value="auth_lock_contention",
             ),
             patch("time.sleep"),

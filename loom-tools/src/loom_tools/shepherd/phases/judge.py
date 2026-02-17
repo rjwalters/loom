@@ -155,24 +155,24 @@ class JudgePhase:
             )
 
         if exit_code == 6:
-            # Instant-exit: CLI sessions exited in <5s with no output after retries.
+            # Low output: CLI sessions produced no meaningful output after retries.
             # In force mode, try infrastructure bypass before marking blocked
             # (issue #2402): if CI is green and PR is mergeable, auto-approve.
             if ctx.config.is_force_mode:
                 bypass_result = self._try_infrastructure_bypass(
-                    ctx, failure_reason="instant-exit (CLI sessions exited with no output)"
+                    ctx, failure_reason="low output (CLI sessions produced no meaningful output)"
                 )
                 if bypass_result is not None:
                     return bypass_result
 
             self._mark_issue_blocked(
-                ctx, "judge_instant_exit", "agent instant-exit after retry"
+                ctx, "judge_low_output", "agent low output after retry"
             )
             return PhaseResult(
                 status=PhaseStatus.FAILED,
-                message="judge instant-exit after retry (CLI sessions exited in <5s with no output)",
+                message="judge low output after retry (CLI sessions produced no meaningful output)",
                 phase_name="judge",
-                data={"instant_exit": True},
+                data={"low_output": True},
             )
 
         if exit_code == 7:
@@ -433,7 +433,7 @@ class JudgePhase:
     ) -> PhaseResult | None:
         """Attempt infrastructure bypass in force mode (issue #2402).
 
-        When the judge phase fails due to infrastructure issues (instant-exit,
+        When the judge phase fails due to infrastructure issues (low-output,
         MCP failure) rather than code quality concerns, auto-approve the PR if:
         - CI checks are all passing
         - PR is in a mergeable state
