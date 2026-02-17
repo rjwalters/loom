@@ -3082,7 +3082,7 @@ class BuilderPhase:
         Returns:
             Exit code from the completion worker (0=success)
         """
-        from loom_tools.shepherd.phases.base import run_worker_phase
+        from loom_tools.shepherd.phases.base import run_phase_with_retry
 
         steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
 
@@ -3187,11 +3187,12 @@ class BuilderPhase:
             f"Do NOT implement anything new - just complete the git/PR workflow."
         )
 
-        exit_code = run_worker_phase(
+        exit_code = run_phase_with_retry(
             ctx,
             role="builder",
             name=f"builder-complete-{ctx.config.issue}",
             timeout=300,  # 5 minutes should be enough to commit/push/PR
+            max_retries=1,
             phase="builder",
             worktree=ctx.worktree_path,
             args=completion_args,

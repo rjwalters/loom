@@ -8247,7 +8247,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=2)
 
@@ -8272,7 +8272,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=1)
 
@@ -8297,7 +8297,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=1)
 
@@ -8324,7 +8324,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=2)
 
@@ -8351,7 +8351,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=1)
 
@@ -8376,7 +8376,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=2)
 
@@ -8400,7 +8400,7 @@ class TestBuilderCompletionPhaseTargetedInstructions:
         }
 
         with patch(
-            "loom_tools.shepherd.phases.base.run_worker_phase", return_value=0
+            "loom_tools.shepherd.phases.base.run_phase_with_retry", return_value=0
         ) as mock_run:
             builder._run_completion_phase(mock_context, diag, attempt=2)
 
