@@ -26,6 +26,7 @@ class ShepherdExitCode(IntEnum):
     | 5         | Skipped (already complete)    | No action                         |
     | 6         | No changes needed             | Mark blocked, await human review  |
     | 7         | Transient API error           | Requeue issue, retry after backoff|
+    | 9         | Systemic failure (auth/API)   | Requeue issue, do NOT retry       |
 
     Using IntEnum allows these to be used directly as exit codes:
         return ShepherdExitCode.SUCCESS
@@ -68,6 +69,12 @@ class ShepherdExitCode(IntEnum):
     # After 2 occurrences, daemon triggers architect decomposition
     BUDGET_EXHAUSTED = 8
 
+    # Systemic infrastructure failure (auth timeout, API outage, etc.)
+    # Retries will NOT help — the problem is environmental, not issue-specific.
+    # Daemon should requeue the issue but NOT retry immediately.
+    # See issue #2521.
+    SYSTEMIC_FAILURE = 9
+
 
 # Convenience mapping for code interpretation
 EXIT_CODE_DESCRIPTIONS = {
@@ -80,6 +87,7 @@ EXIT_CODE_DESCRIPTIONS = {
     ShepherdExitCode.NO_CHANGES_NEEDED: "No changes needed - marked blocked for human review",
     ShepherdExitCode.TRANSIENT_ERROR: "Transient API error - safe to retry after backoff",
     ShepherdExitCode.BUDGET_EXHAUSTED: "Budget exhausted - issue may need decomposition",
+    ShepherdExitCode.SYSTEMIC_FAILURE: "Systemic failure (auth/API) - do not retry immediately",
 }
 
 

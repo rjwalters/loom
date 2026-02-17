@@ -8,6 +8,7 @@ from loom_tools.shepherd.labels import remove_issue_label
 from loom_tools.shepherd.phases.base import (
     BasePhase,
     PhaseResult,
+    PhaseStatus,
     run_phase_with_retry,
 )
 
@@ -60,6 +61,16 @@ class CuratorPhase(BasePhase):
         if exit_code == 4:
             # Curator stuck - not critical, can proceed
             return self.skipped("curator stuck after retry - skipping curation")
+
+        if exit_code == 9:
+            # Auth pre-flight failure: systemic, not retryable.
+            # Abort the entire shepherd run.  See issue #2521.
+            return self.result(
+                PhaseStatus.FAILED,
+                "curator auth pre-flight failed: authentication check "
+                "timed out (systemic failure, not retryable)",
+                data={"auth_failure": True},
+            )
 
         # Validate phase
         if not self.validate(ctx):

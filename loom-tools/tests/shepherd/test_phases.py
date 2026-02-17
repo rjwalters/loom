@@ -13927,6 +13927,52 @@ class TestIsAuthFailure:
         )
         assert _is_auth_failure(log) is True
 
+    def test_pattern_fallback_auth_timed_out(self, tmp_path: Path) -> None:
+        """Auth failure detected via error pattern when sentinel is absent."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[ERROR] Authentication check timed out after 3 attempts\n"
+        )
+        assert _is_auth_failure(log) is True
+
+    def test_pattern_fallback_preflight_failed(self, tmp_path: Path) -> None:
+        """Auth failure detected via preflight-failed pattern (no sentinel)."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[ERROR] Authentication pre-flight check failed\n"
+        )
+        assert _is_auth_failure(log) is True
+
+    def test_pattern_fallback_api_unreachable(self, tmp_path: Path) -> None:
+        """API unreachable pattern detected as systemic failure."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[ERROR] API endpoint unreachable\n"
+        )
+        assert _is_auth_failure(log) is True
+
+    def test_pattern_fallback_auth_check_failed(self, tmp_path: Path) -> None:
+        """Auth check failed pattern detected as systemic failure."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[ERROR] Authentication check failed\n"
+        )
+        assert _is_auth_failure(log) is True
+
+    def test_no_false_positive_on_similar_text(self, tmp_path: Path) -> None:
+        """Non-error messages containing similar words should not match."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] Authentication check passed\n"
+            "[INFO] API endpoint available\n"
+        )
+        assert _is_auth_failure(log) is False
+
 
 class TestRunWorkerPhaseAuthFailure:
     """Test that run_worker_phase returns exit code 9 for auth failures."""
