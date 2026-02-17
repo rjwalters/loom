@@ -3154,7 +3154,7 @@ class BuilderPhase:
 
             # Commits ahead of main
             log_res = subprocess.run(
-                ["git", "-C", str(wt), "log", "--oneline", "main..HEAD"],
+                ["git", "-C", str(wt), "log", "--oneline", "origin/main..HEAD"],
                 capture_output=True,
                 text=True,
                 check=False,
@@ -3171,7 +3171,7 @@ class BuilderPhase:
             # See issue #2605.
             if commits:
                 diff_res = subprocess.run(
-                    ["git", "-C", str(wt), "diff", "--name-only", "main..HEAD"],
+                    ["git", "-C", str(wt), "diff", "--name-only", "origin/main..HEAD"],
                     capture_output=True,
                     text=True,
                     check=False,
