@@ -10252,10 +10252,13 @@ class TestIsInstantExit:
         assert _is_instant_exit(log) is True
 
     def test_meaningful_output_returns_false(self, tmp_path: Path) -> None:
-        """Log with meaningful content is NOT an instant exit."""
+        """Log with meaningful content after sentinel is NOT an instant exit."""
         log = tmp_path / "session.log"
-        # Write enough meaningful content to exceed threshold
-        log.write_text("x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1))
+        # Write sentinel + enough meaningful content to exceed threshold
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            + "x" * (INSTANT_EXIT_MIN_OUTPUT_CHARS + 1)
+        )
         assert _is_instant_exit(log) is False
 
     def test_header_only_returns_true(self, tmp_path: Path) -> None:
@@ -10307,16 +10310,18 @@ class TestIsInstantExit:
         )
         assert _is_instant_exit(log) is False
 
-    def test_no_sentinel_backwards_compat(self, tmp_path: Path) -> None:
-        """Without sentinel, all non-header output is counted (backward compat)."""
+    def test_no_sentinel_treated_as_instant_exit(self, tmp_path: Path) -> None:
+        """Without sentinel, session is treated as instant exit (issue #2405).
+
+        The wrapper always writes the sentinel before invoking Claude CLI,
+        so its absence means Claude never started.
+        """
         log = tmp_path / "session.log"
-        # Pre-flight output exceeds threshold — without sentinel this is NOT
-        # detected as instant exit (the pre-2401 behaviour).
         log.write_text(
             "# Loom Agent Log\n"
             + "[INFO] wrapper line\n" * 20
         )
-        assert _is_instant_exit(log) is False
+        assert _is_instant_exit(log) is True
 
     def test_multiple_sentinels_uses_last(self, tmp_path: Path) -> None:
         """With multiple sentinels (retries), only output after the last counts."""

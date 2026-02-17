@@ -282,6 +282,29 @@ def release_claim(
     return 0
 
 
+def has_valid_claim(repo_root: pathlib.Path, issue_number: int) -> bool:
+    """Check if an issue has a valid (non-expired) claim.
+
+    This is a non-mutating check suitable for use by other modules
+    (e.g., orphan recovery) to determine if an issue is actively claimed
+    before taking recovery actions.
+
+    Returns:
+        True if a non-expired claim exists for the issue, False otherwise.
+    """
+    claim_dir = _get_claim_dir(repo_root, issue_number)
+    claim_file = claim_dir / "claim.json"
+
+    if not claim_dir.exists() or not claim_file.exists():
+        return False
+
+    existing = _read_claim(claim_file)
+    if not existing:
+        return False
+
+    return not _is_expired(existing.expires_at)
+
+
 def check_claim(repo_root: pathlib.Path, issue_number: int) -> int:
     """Check if an issue is claimed and print claim metadata.
 

@@ -576,6 +576,7 @@ def recover_issue(
                 )
             )
 
+
     try:
         gh_run([
             "issue", "edit", str(issue),

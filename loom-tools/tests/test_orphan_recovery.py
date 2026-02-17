@@ -12,6 +12,7 @@ import pytest
 from loom_tools.common.time_utils import now_utc
 from loom_tools.models.daemon_state import DaemonState, ShepherdEntry
 from loom_tools.models.progress import ShepherdProgress
+from loom_tools.claim import claim_issue, has_valid_claim
 from loom_tools.orphan_recovery import (
     DEFAULT_HEARTBEAT_STALE_THRESHOLD,
     OrphanEntry,
@@ -315,6 +316,50 @@ class TestCheckUntrackedBuilding:
             check_untracked_building(daemon_state, [], result)
         assert result.total_orphaned == 0
 
+    def test_untracked_with_valid_claim_skipped(self, tmp_path: pathlib.Path) -> None:
+        """Issue with a valid file-based claim should NOT be flagged as orphaned."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".git").mkdir(exist_ok=True)
+        claim_issue(tmp_path, 42, "cli-shepherd")
+
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ):
+            check_untracked_building(
+                daemon_state, [], result, repo_root=tmp_path
+            )
+        assert result.total_orphaned == 0
+
+    def test_untracked_without_claim_still_orphaned(self, tmp_path: pathlib.Path) -> None:
+        """Issue without a claim should still be flagged as orphaned."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".git").mkdir(exist_ok=True)
+
+        daemon_state = DaemonState()
+        building_issues = [
+            {"number": 42, "title": "Test issue", "labels": [], "state": "OPEN"}
+        ]
+        result = OrphanRecoveryResult()
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_issue_list",
+            return_value=building_issues,
+        ):
+            check_untracked_building(
+                daemon_state, [], result, repo_root=tmp_path
+            )
+        assert result.total_orphaned == 1
+        assert result.orphaned[0].type == "untracked_building"
+
 
 class TestCheckStaleProgress:
     def test_no_progress_files(self) -> None:
@@ -502,6 +547,22 @@ class TestRecoverIssue:
             recover_issue(42, "test_reason", result)
 
         # Failed to update labels, no recovery entry added
+        assert result.total_recovered == 0
+
+    def test_recover_skipped_with_valid_claim(self, tmp_path: pathlib.Path) -> None:
+        """recover_issue should skip when a valid file-based claim exists."""
+        loom_dir = tmp_path / ".loom"
+        loom_dir.mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".git").mkdir(exist_ok=True)
+        claim_issue(tmp_path, 42, "cli-shepherd")
+
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+            recover_issue(42, "test_reason", result, repo_root=tmp_path)
+
+        # gh_run should never be called — recovery is skipped
+        mock_gh.assert_not_called()
         assert result.total_recovered == 0
 
 
