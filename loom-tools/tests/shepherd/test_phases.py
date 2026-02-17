@@ -61,6 +61,7 @@ def mock_context() -> MagicMock:
     ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
     ctx.worktree_path = Path("/fake/repo/.loom/worktrees/issue-42")
     ctx.pr_number = None
+    ctx.issue_title = "Issue #42"
     ctx.label_cache = MagicMock()
     ctx.warnings = []
     return ctx
@@ -8801,6 +8802,32 @@ class TestBuilderDirectCompletion:
         assert "loom:review-requested" in call_args
         assert "--body" in call_args
         assert "Closes #42" in call_args
+
+    def test_create_pr_uses_issue_title(self, mock_context: MagicMock) -> None:
+        """Should use ctx.issue_title for PR title instead of 'Issue #N'."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.issue_title = "fix: broken widget rendering"
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        call_args = mock_run.call_args[0][0]
+        assert "--title" in call_args
+        title_idx = call_args.index("--title") + 1
+        assert call_args[title_idx] == "fix: broken widget rendering"
 
     def test_create_pr_zero_commits_returns_false(self, mock_context: MagicMock) -> None:
         """Should refuse to create PR when remote exists but 0 commits ahead."""
