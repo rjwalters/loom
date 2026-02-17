@@ -998,7 +998,9 @@ def run_worker_phase(
     # Check for auth pre-flight failure first (exit code 9).  Auth failures
     # are NOT transient when a parent Claude session holds the config lock,
     # so retrying is futile.  See issue #2508.
-    if _is_auth_failure(log_path):
+    # Only reclassify non-zero exits — a successful process (exit 0) should
+    # never be overridden by log pattern matching.  See issue #2540.
+    if wait_exit != 0 and _is_auth_failure(log_path):
         log_warning(
             f"Auth pre-flight failure for {role} session '{name}': "
             f"authentication check failed (not retryable, log: {log_path})"
