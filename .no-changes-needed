@@ -1,0 +1,7 @@
+This issue is already fixed by PR #2595 (merged commit aee2e10, 2026-02-17), which addressed the identical root cause in issue #2586.
+
+Both issues report the same symptom: builder logs contain only claude-wrapper.sh startup boilerplate with no Claude CLI output, while judge and curator logs capture output correctly.
+
+The root cause (tmux kill-session sending SIGHUP/SIGTERM before the wrapper's fallback append could run) was fixed by adding a signal handler (_flush_output_on_signal) that flushes tee-captured output to the log file when receiving SIGHUP/SIGTERM. The fix is in defaults/scripts/claude-wrapper.sh.
+
+Verified that commit aee2e10 is present in the current branch and the fix addresses all symptoms described in this issue.
