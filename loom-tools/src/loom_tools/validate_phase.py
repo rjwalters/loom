@@ -713,8 +713,10 @@ def validate_builder(
     pr_num = pr[0] if pr else None
 
     if pr_num is not None:
-        # Ensure PR body references the issue (auto-close support)
-        if pr_found_by == "branch_name" and not check_only:
+        # Ensure PR body references the correct issue and remove wrong
+        # closing keywords.  Runs for all PRs (not just branch-name
+        # discoveries) because the builder may solve the wrong issue.
+        if not check_only:
             _ensure_pr_body_references_issue(pr_num, issue, repo_root, task_id)
 
         # Validate PR title is not generic (anti-pattern detection)
@@ -1154,26 +1156,72 @@ def _ensure_pr_body_references_issue(
     repo_root: Path,
     task_id: str | None,
 ) -> None:
-    """Ensure the PR body contains a ``Closes #N`` reference."""
+    """Ensure the PR body contains a ``Closes #N`` reference.
+
+    Also detects and removes closing keywords that reference wrong issues.
+    """
     r = _run_gh(
         ["pr", "view", str(pr), "--json", "body", "--jq", ".body"],
         repo_root,
     )
     body = r.stdout.strip() if r.returncode == 0 else ""
 
-    if re.search(rf"(Closes|Fixes|Resolves)\s+#{issue}", body):
-        return
-
-    new_body = f"Closes #{issue}" if not body or body == "null" else f"{body}\n\nCloses #{issue}"
-    r = subprocess.run(
-        ["gh", "pr", "edit", str(pr), "--body", new_body],
-        capture_output=True, text=True, check=False, cwd=repo_root,
+    # Detect wrong-issue references (Closes/Fixes/Resolves #N where N != issue)
+    wrong_refs = re.findall(
+        r"(Closes|Fixes|Resolves)\s+#(\d+)", body, re.IGNORECASE,
     )
-    if r.returncode == 0:
+    wrong_issues = [
+        (kw, int(num)) for kw, num in wrong_refs if int(num) != issue
+    ]
+
+    has_correct_ref = bool(
+        re.search(rf"(Closes|Fixes|Resolves)\s+#{issue}\b", body),
+    )
+    needs_edit = False
+
+    if wrong_issues:
+        for kw, num in wrong_issues:
+            body = re.sub(
+                rf"{kw}\s+#{num}\b",
+                f"~~{kw} #{num}~~ (removed: wrong issue)",
+                body,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        wrong_list = ", ".join(f"#{num}" for _, num in wrong_issues)
         _report_milestone(
             "heartbeat", task_id, repo_root,
-            action=f"recovery: added 'Closes #{issue}' to PR #{pr} body",
+            action=(
+                f"warning: PR #{pr} referenced wrong issue(s) {wrong_list} "
+                f"instead of #{issue} -- removed closing keywords"
+            ),
         )
+        needs_edit = True
+
+    if not has_correct_ref:
+        body = (
+            f"Closes #{issue}"
+            if not body or body == "null"
+            else f"{body}\n\nCloses #{issue}"
+        )
+        needs_edit = True
+
+    if needs_edit:
+        r = subprocess.run(
+            ["gh", "pr", "edit", str(pr), "--body", body],
+            capture_output=True, text=True, check=False, cwd=repo_root,
+        )
+        if r.returncode == 0:
+            action = f"recovery: ensured PR #{pr} body references #{issue}"
+            if wrong_issues:
+                wrong_list = ", ".join(
+                    f"#{num}" for _, num in wrong_issues
+                )
+                action += f" (removed wrong refs: {wrong_list})"
+            _report_milestone(
+                "heartbeat", task_id, repo_root,
+                action=action,
+            )
 
 
 # Generic PR title patterns that indicate the builder didn't derive a

@@ -395,8 +395,9 @@ class TestValidateBuilder:
         repo = _make_repo(tmp_path)
         mock_gh.side_effect = [
             _completed(stdout="OPEN\n"),           # issue state
+            _completed(stdout="## Summary\nGood body.\n\nCloses #42\n"),  # PR body (ensure ref)
             _completed(stdout="fix: a good title\n"),  # PR title (generic check)
-            _completed(stdout="## Summary\nGood body.\n"),  # PR body (minimal body check)
+            _completed(stdout="## Summary\nGood body.\n\nCloses #42\n"),  # PR body (minimal body check)
             _completed(stdout="loom:building\n"),  # PR labels
         ]
         mock_find.return_value = (100, "closes_keyword")
@@ -632,6 +633,151 @@ class TestWarnGenericPrTitle:
         _warn_generic_pr_title(10, 42, repo, "task123")
 
         mock_milestone.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _ensure_pr_body_references_issue tests
+# ---------------------------------------------------------------------------
+
+
+class TestEnsurePrBodyReferencesIssue:
+    """Tests for the wrong-issue closing keyword guard."""
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_correct_ref_no_change(
+        self, mock_gh, mock_subprocess, mock_milestone, tmp_path,
+    ):
+        """PR already has correct Closes reference -- no edit needed."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(
+            stdout="## Summary\nFix stuff.\n\nCloses #42\n",
+        )
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_not_called()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_missing_ref_gets_added(
+        self, mock_gh, mock_subprocess, mock_milestone, tmp_path,
+    ):
+        """PR has no closing keywords -- Closes #N is appended."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="## Summary\nFix stuff.\n")
+        mock_subprocess.run.return_value = _completed()
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        new_body = mock_subprocess.run.call_args[0][0][5]
+        assert "Closes #42" in new_body
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_wrong_issue_ref_gets_removed(
+        self, mock_gh, mock_subprocess, mock_milestone, tmp_path,
+    ):
+        """PR references wrong issue -- keyword is struck through."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(
+            stdout="## Summary\nFix stuff.\n\nCloses #999\n",
+        )
+        mock_subprocess.run.return_value = _completed()
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        new_body = mock_subprocess.run.call_args[0][0][5]
+        assert "~~Closes #999~~" in new_body
+        assert "Closes #42" in new_body
+        # Milestone reports the wrong-issue warning
+        calls = [
+            c for c in mock_milestone.call_args_list
+            if "wrong issue" in str(c)
+        ]
+        assert len(calls) >= 1
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_wrong_and_correct_refs_removes_only_wrong(
+        self, mock_gh, mock_subprocess, mock_milestone, tmp_path,
+    ):
+        """PR has both correct and wrong refs -- only wrong is removed."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(
+            stdout="## Summary\n\nCloses #999\nCloses #42\n",
+        )
+        mock_subprocess.run.return_value = _completed()
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        new_body = mock_subprocess.run.call_args[0][0][5]
+        assert "~~Closes #999~~" in new_body
+        assert "Closes #42" in new_body
+        assert "~~Closes #42~~" not in new_body
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_multiple_wrong_refs_all_removed(
+        self, mock_gh, mock_subprocess, mock_milestone, tmp_path,
+    ):
+        """PR references multiple wrong issues -- all are removed."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(
+            stdout="Fixes #100\nResolves #200\n",
+        )
+        mock_subprocess.run.return_value = _completed()
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        new_body = mock_subprocess.run.call_args[0][0][5]
+        assert "~~Fixes #100~~" in new_body
+        assert "~~Resolves #200~~" in new_body
+        assert "Closes #42" in new_body
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_gh_failure_is_noop(self, mock_gh, mock_milestone, tmp_path):
+        """gh pr view failure -- nothing happens."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(returncode=1)
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_milestone.assert_not_called()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_empty_body_gets_correct_ref(
+        self, mock_gh, mock_subprocess, mock_milestone, tmp_path,
+    ):
+        """Empty or null body gets Closes #N."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="null\n")
+        mock_subprocess.run.return_value = _completed()
+
+        from loom_tools.validate_phase import _ensure_pr_body_references_issue
+        _ensure_pr_body_references_issue(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        new_body = mock_subprocess.run.call_args[0][0][5]
+        assert new_body == "Closes #42"
 
 
 # ---------------------------------------------------------------------------
