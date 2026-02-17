@@ -38,6 +38,13 @@ _CLI_START_SENTINEL = "# CLAUDE_CLI_START"
 # should not be retried.  See issue #2508.
 _AUTH_FAILURE_SENTINEL = "# AUTH_PREFLIGHT_FAILED"
 
+# MCP pre-flight failures are detected via this sentinel written by the
+# wrapper's run_preflight_checks().  Unlike auth failures, MCP failures
+# *are* retryable (the MCP server may recover after a rebuild).  The
+# sentinel is checked in _is_mcp_failure() alongside runtime patterns.
+# See issue #2706.
+_MCP_PREFLIGHT_SENTINEL = "# MCP_PREFLIGHT_FAILED"
+
 # Maximum retries for low-output detection, with exponential backoff.
 LOW_OUTPUT_MAX_RETRIES = 3
 LOW_OUTPUT_BACKOFF_SECONDS = [2, 4, 8]
@@ -675,6 +682,13 @@ def _is_mcp_failure(log_path: Path) -> bool:
     try:
         content = log_path.read_text()
         stripped = strip_ansi(content)
+
+        # Check for explicit MCP pre-flight sentinel first (most reliable).
+        # The wrapper writes this when check_mcp_server() fails before
+        # the CLI even starts.  No output-volume gate needed — the
+        # sentinel is definitive.  See issue #2706.
+        if _MCP_PREFLIGHT_SENTINEL in stripped:
+            return True
 
         # If the session produced substantial CLI output beyond headers,
         # wrapper pre-flight, spinner noise, and UI chrome, it was

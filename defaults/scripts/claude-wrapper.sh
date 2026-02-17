@@ -1238,12 +1238,18 @@ run_preflight_checks() {
         fi
     fi
 
+    log_info "Running MCP server pre-flight check..."
     if ! check_mcp_server; then
         log_error "MCP server pre-flight check failed"
+        # Write sentinel so the shepherd can distinguish MCP pre-flight failures
+        # from generic low-output sessions.  Mirrors AUTH_PREFLIGHT_FAILED.
+        # See issue #2706.
+        echo "# MCP_PREFLIGHT_FAILED" >&2
         return 1
     fi
+    log_info "MCP server pre-flight check passed"
 
-    log_info "Pre-flight checks passed"
+    log_info "All pre-flight checks passed"
     return 0
 }
 
@@ -1277,6 +1283,7 @@ main() {
     fi
 
     # Run Claude with retry logic
+    log_info "Pre-flight complete, launching Claude CLI..."
     run_with_retry "$@"
     exit_code=$?
 

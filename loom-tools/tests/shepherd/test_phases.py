@@ -14951,6 +14951,30 @@ class TestIsMcpFailure:
         )
         assert _is_mcp_failure(log) is False
 
+    def test_mcp_preflight_sentinel_detected(self, tmp_path: Path) -> None:
+        """MCP_PREFLIGHT_FAILED sentinel should be detected as MCP failure.
+
+        The wrapper writes this sentinel when check_mcp_server() fails before
+        the CLI even starts.  See issue #2706.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[INFO] Claude wrapper starting\n"
+            "[INFO] Running MCP server pre-flight check...\n"
+            "[ERROR] MCP server pre-flight check failed\n"
+            "# MCP_PREFLIGHT_FAILED\n"
+        )
+        assert _is_mcp_failure(log) is True
+
+    def test_mcp_preflight_sentinel_with_ansi(self, tmp_path: Path) -> None:
+        """MCP pre-flight sentinel detected even with ANSI escape codes."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "\033[0;31m[ERROR] MCP server pre-flight check failed\033[0m\n"
+            "# MCP_PREFLIGHT_FAILED\n"
+        )
+        assert _is_mcp_failure(log) is True
+
 
 class TestStripSpinnerNoise:
     """Test _strip_spinner_noise helper function."""
