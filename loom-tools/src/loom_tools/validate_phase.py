@@ -227,9 +227,16 @@ def _build_recovery_pr_body(issue: int, worktree: str) -> str:
                  "creating a PR. Reviewers should examine the diff carefully.")
     lines.append("")
 
-    # Gather diff stats (committed changes vs main)
+    # Look up the default branch dynamically
     r = subprocess.run(
-        ["git", "-C", worktree, "diff", "--stat", "origin/main...HEAD"],
+        ["git", "-C", worktree, "rev-parse", "--abbrev-ref", "origin/HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    default_branch = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "origin/main"
+
+    # Gather diff stats (committed changes vs default branch)
+    r = subprocess.run(
+        ["git", "-C", worktree, "diff", "--stat", f"{default_branch}...HEAD"],
         capture_output=True, text=True, check=False,
     )
     if r.returncode == 0 and r.stdout.strip():
@@ -242,7 +249,7 @@ def _build_recovery_pr_body(issue: int, worktree: str) -> str:
 
     # Gather shortlog of commits
     r = subprocess.run(
-        ["git", "-C", worktree, "log", "--oneline", "origin/main..HEAD"],
+        ["git", "-C", worktree, "log", "--oneline", f"{default_branch}..HEAD"],
         capture_output=True, text=True, check=False,
     )
     if r.returncode == 0 and r.stdout.strip():
