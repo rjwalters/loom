@@ -741,7 +741,8 @@ def _classify_low_output_cause(log_path: Path) -> str:
 
     Returns:
         A cause string: ``"auth_timeout"``, ``"auth_lock_contention"``,
-        ``"api_unreachable"``, or ``"unknown"`` (generic transient failure).
+        ``"api_unreachable"``, ``"wrapper_crash"``, or ``"unknown"``
+        (generic transient failure).
     """
     if not log_path.is_file():
         return "unknown"
