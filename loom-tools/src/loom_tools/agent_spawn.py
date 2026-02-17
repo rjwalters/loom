@@ -594,6 +594,15 @@ def spawn_agent(
     # Unset CLAUDECODE to prevent nested session guard from blocking subprocess
     _tmux("set-environment", "-t", session_name, "-u", "CLAUDECODE")
 
+    # Propagate shepherd task ID so claude-wrapper.sh can skip auth pre-flight
+    # check for shepherd subprocess sessions (see issue #2524).
+    shepherd_task_id = os.environ.get("LOOM_SHEPHERD_TASK_ID", "")
+    if shepherd_task_id:
+        _tmux(
+            "set-environment", "-t", session_name,
+            "LOOM_SHEPHERD_TASK_ID", shepherd_task_id,
+        )
+
     # Create per-agent CLAUDE_CONFIG_DIR for session isolation
     config_dir = setup_agent_config_dir(name, repo_root)
     _tmux("set-environment", "-t", session_name, "CLAUDE_CONFIG_DIR", str(config_dir))
@@ -648,11 +657,16 @@ def spawn_agent(
     if max_retries_val is not None:
         max_retries_prefix = f"LOOM_MAX_RETRIES='{max_retries_val}' "
 
+    # Inline shepherd task ID prefix so claude-wrapper.sh sees it (see issue #2524).
+    shepherd_prefix = ""
+    if shepherd_task_id:
+        shepherd_prefix = f"LOOM_SHEPHERD_TASK_ID='{shepherd_task_id}' "
+
     # Build the Claude CLI command
     wrapper_script = repo_root / ".loom" / "scripts" / "claude-wrapper.sh"
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
         claude_cmd = (
-            f"{pythonpath_prefix}{worktree_prefix}{max_retries_prefix}"
+            f"{pythonpath_prefix}{worktree_prefix}{max_retries_prefix}{shepherd_prefix}"
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
             f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
             f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""

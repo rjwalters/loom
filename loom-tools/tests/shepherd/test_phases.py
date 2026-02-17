@@ -7047,6 +7047,55 @@ class TestRunWorkerPhaseClaudeCodeEnv:
         assert exit_code == 0
 
 
+class TestRunWorkerPhaseShepherdTaskId:
+    """Test run_worker_phase passes LOOM_SHEPHERD_TASK_ID to spawn env (issue #2524)."""
+
+    def test_shepherd_task_id_in_spawn_env(self, tmp_path: Path) -> None:
+        """LOOM_SHEPHERD_TASK_ID must be set in spawn subprocess env."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="abc-789")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        (scripts_dir / "agent-spawn.sh").touch()
+        (scripts_dir / "agent-wait-bg.sh").touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+
+        spawn_env_captured = {}
+
+        def mock_spawn(cmd, **kwargs):
+            spawn_env_captured.update(kwargs.get("env", {}))
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=False,
+            ),
+        ):
+            run_worker_phase(
+                ctx,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert spawn_env_captured.get("LOOM_SHEPHERD_TASK_ID") == "abc-789"
+
+
 class TestRunWorkerPhaseIdleThreshold:
     """Test run_worker_phase min-session-age threshold configuration."""
 

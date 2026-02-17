@@ -987,7 +987,9 @@ run_preflight_checks() {
 
     check_api_reachable  # Non-fatal, just logs
 
-    if ! check_auth_status; then
+    if [[ -n "${LOOM_SHEPHERD_TASK_ID:-}" ]]; then
+        log_info "Skipping auth pre-flight (shepherd subprocess, task=${LOOM_SHEPHERD_TASK_ID})"
+    elif ! check_auth_status; then
         if [[ "${SKIP_PERMISSIONS_MODE}" == "true" ]]; then
             log_warn "Authentication pre-flight check failed (non-fatal in --dangerously-skip-permissions mode)"
         else

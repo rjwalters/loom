@@ -496,6 +496,105 @@ class TestClaudeConfigDirIsolation:
         assert "claude-config/test-builder" in tmpdir_value
 
 
+class TestShepherdTaskIdPropagation:
+    """Test that LOOM_SHEPHERD_TASK_ID is propagated to tmux sessions (issue #2524)."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_propagates_shepherd_task_id(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent sets LOOM_SHEPHERD_TASK_ID in tmux when present in env."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        with patch.dict("os.environ", {"LOOM_SHEPHERD_TASK_ID": "task-xyz"}, clear=False):
+            spawn_agent(
+                role="builder",
+                name="test-builder",
+                args="",
+                worktree=str(mock_repo),
+                repo_root=mock_repo,
+            )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        task_id_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and "LOOM_SHEPHERD_TASK_ID" in c
+        ]
+        assert len(task_id_calls) == 1, (
+            f"Expected exactly one 'set-environment LOOM_SHEPHERD_TASK_ID' call, "
+            f"got {len(task_id_calls)}. All tmux calls: {tmux_calls}"
+        )
+        assert task_id_calls[0][-1] == "task-xyz"
+
+        # Also verify it's in the inline command sent to tmux
+        send_keys_calls = [c for c in tmux_calls if c[0] == "send-keys"]
+        assert len(send_keys_calls) == 1
+        # send-keys args: ('send-keys', '-t', session_name, command, 'C-m')
+        cmd_str = send_keys_calls[0][3]
+        assert "LOOM_SHEPHERD_TASK_ID='task-xyz'" in cmd_str
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_no_shepherd_task_id_when_absent(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent does not set LOOM_SHEPHERD_TASK_ID when not in env."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        # Ensure LOOM_SHEPHERD_TASK_ID is NOT in env
+        env_without = {
+            k: v for k, v in __import__("os").environ.items()
+            if k != "LOOM_SHEPHERD_TASK_ID"
+        }
+        with patch.dict("os.environ", env_without, clear=True):
+            spawn_agent(
+                role="builder",
+                name="test-builder",
+                args="",
+                worktree=str(mock_repo),
+                repo_root=mock_repo,
+            )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        task_id_calls = [
+            c
+            for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and "LOOM_SHEPHERD_TASK_ID" in c
+        ]
+        assert len(task_id_calls) == 0, (
+            f"Expected no 'set-environment LOOM_SHEPHERD_TASK_ID' call, "
+            f"got {len(task_id_calls)}. All tmux calls: {tmux_calls}"
+        )
+
+        # Also verify it's NOT in the inline command
+        send_keys_calls = [c for c in tmux_calls if c[0] == "send-keys"]
+        assert len(send_keys_calls) == 1
+        cmd_str = send_keys_calls[0][3]
+        assert "LOOM_SHEPHERD_TASK_ID" not in cmd_str
+
+
 class TestGitWorktreePinning:
     """Tests that GIT_WORK_TREE and GIT_DIR are set for worktree agents (#2418)."""
 

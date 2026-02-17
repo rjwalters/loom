@@ -794,9 +794,12 @@ def run_worker_phase(
     # times internally *and* the Python code retries up to 3 times on top,
     # causing up to 15 total CLI invocations instead of the intended 3.
     # See issue #2516.
+    #
+    # Pass LOOM_SHEPHERD_TASK_ID so subprocess claude-wrapper.sh can skip
+    # the auth pre-flight check (see issue #2524).
     spawn_env = os.environ.copy()
     spawn_env["LOOM_MAX_RETRIES"] = "1"
-
+    spawn_env["LOOM_SHEPHERD_TASK_ID"] = ctx.config.task_id
     spawn_result = subprocess.run(
         spawn_cmd,
         cwd=ctx.repo_root,
