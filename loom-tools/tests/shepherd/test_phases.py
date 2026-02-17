@@ -10951,6 +10951,79 @@ class TestDoctorCIWaiting:
 
 
 # ---------------------------------------------------------------------------
+# Log error extraction tests (issue #2513)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractLogErrors:
+    """Test extract_log_errors helper function."""
+
+    def test_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        assert extract_log_errors(tmp_path / "nonexistent.log") == []
+
+    def test_no_errors_returns_empty(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        log = tmp_path / "session.log"
+        log.write_text("# CLAUDE_CLI_START\nSome normal output\n")
+        assert extract_log_errors(log) == []
+
+    def test_extracts_single_error(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "[2026-01-23 10:15:00] [ERROR] Authentication pre-flight check failed\n"
+        )
+        assert extract_log_errors(log) == ["Authentication pre-flight check failed"]
+
+    def test_extracts_multiple_errors_returns_last_n(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[2026-01-23 10:15:00] [ERROR] Error one\n"
+            "[2026-01-23 10:15:01] [ERROR] Error two\n"
+            "[2026-01-23 10:15:02] [ERROR] Error three\n"
+            "[2026-01-23 10:15:03] [ERROR] Error four\n"
+        )
+        # Default max_errors=3, should return last 3
+        result = extract_log_errors(log)
+        assert result == ["Error two", "Error three", "Error four"]
+
+    def test_max_errors_parameter(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[ERROR] First\n"
+            "[ERROR] Second\n"
+            "[ERROR] Third\n"
+        )
+        assert extract_log_errors(log, max_errors=1) == ["Third"]
+
+    def test_strips_ansi_codes(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        log = tmp_path / "session.log"
+        # ANSI color codes around [ERROR]
+        log.write_text(
+            "\033[31m[ERROR]\033[0m Auth check failed\n"
+        )
+        assert extract_log_errors(log) == ["Auth check failed"]
+
+    def test_handles_error_without_timestamp(self, tmp_path: Path) -> None:
+        from loom_tools.shepherd.phases.base import extract_log_errors
+
+        log = tmp_path / "session.log"
+        log.write_text("[ERROR] Simple error message\n")
+        assert extract_log_errors(log) == ["Simple error message"]
+
+
+# ---------------------------------------------------------------------------
 # Instant-exit detection tests (issue #2135)
 # ---------------------------------------------------------------------------
 

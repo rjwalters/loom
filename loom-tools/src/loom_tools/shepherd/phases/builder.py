@@ -37,6 +37,7 @@ from loom_tools.shepherd.phases.base import (
     PhaseResult,
     PhaseStatus,
     _get_cli_output,
+    extract_log_errors,
     run_phase_with_retry,
 )
 
@@ -2752,6 +2753,10 @@ class BuilderPhase:
         log_path = self._get_log_path(ctx)
         diag["log_file"] = str(log_path)
         diag["log_exists"] = log_path.is_file()
+        # Extract last [ERROR] lines from the log for root-cause surfacing.
+        # These are included in the diagnostic summary for exit codes 6/7
+        # so the shepherd output is self-contained.  See issue #2513.
+        diag["log_errors"] = extract_log_errors(log_path)
         if log_path.is_file():
             try:
                 log_content = log_path.read_text()
@@ -2964,6 +2969,12 @@ class BuilderPhase:
 
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []
+        # Surface root cause errors from the log at the front of the
+        # summary so they're immediately visible in shepherd output
+        # instead of buried in the log file.  See issue #2513.
+        if diag["log_errors"]:
+            last_error = diag["log_errors"][-1]
+            parts.append(last_error)
         if diag["worktree_exists"]:
             if diag["has_uncommitted_changes"]:
                 uncommitted_note = f"{diag['uncommitted_file_count']} files"
