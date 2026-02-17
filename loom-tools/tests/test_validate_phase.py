@@ -396,6 +396,7 @@ class TestValidateBuilder:
         mock_gh.side_effect = [
             _completed(stdout="OPEN\n"),           # issue state
             _completed(stdout="fix: a good title\n"),  # PR title (generic check)
+            _completed(stdout="## Summary\nGood body.\n"),  # PR body (minimal body check)
             _completed(stdout="loom:building\n"),  # PR labels
         ]
         mock_find.return_value = (100, "closes_keyword")
@@ -631,6 +632,112 @@ class TestWarnGenericPrTitle:
         _warn_generic_pr_title(10, 42, repo, "task123")
 
         mock_milestone.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _recover_minimal_pr_body tests
+# ---------------------------------------------------------------------------
+
+
+class TestRecoverMinimalPrBody:
+    """Tests for auto-enrichment of minimal PR bodies."""
+
+    @patch("loom_tools.validate_phase._log_recovery_event")
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_minimal_body_gets_enriched(
+        self, mock_gh, mock_subprocess, mock_milestone, mock_recovery, tmp_path,
+    ):
+        repo = _make_repo(tmp_path)
+        mock_gh.side_effect = [
+            _completed(stdout="Closes #42\n"),
+            _completed(stdout="src/app.py (+10/-2)\nREADME.md (+1/-0)\n"),
+        ]
+        mock_subprocess.run.return_value = _completed(stdout="")
+
+        from loom_tools.validate_phase import _recover_minimal_pr_body
+        _recover_minimal_pr_body(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        call_args = mock_subprocess.run.call_args
+        assert call_args[0][0][:4] == ["gh", "pr", "edit", "10"]
+        new_body = call_args[0][0][5]
+        assert "## Summary" in new_body
+        assert "## Changes" in new_body
+        assert "src/app.py" in new_body
+        assert "Closes #42" in new_body
+        mock_milestone.assert_called_once()
+        mock_recovery.assert_called_once()
+
+    @patch("loom_tools.validate_phase._log_recovery_event")
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_adequate_body_no_change(
+        self, mock_gh, mock_subprocess, mock_milestone, mock_recovery, tmp_path,
+    ):
+        repo = _make_repo(tmp_path)
+        body = "## Summary\nThis PR adds feature X.\n\nCloses #42\n"
+        mock_gh.return_value = _completed(stdout=body)
+
+        from loom_tools.validate_phase import _recover_minimal_pr_body
+        _recover_minimal_pr_body(10, 42, repo, "task123")
+
+        mock_gh.assert_called_once()
+        mock_subprocess.run.assert_not_called()
+        mock_milestone.assert_not_called()
+
+    @patch("loom_tools.validate_phase._log_recovery_event")
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_long_body_without_summary_no_change(
+        self, mock_gh, mock_subprocess, mock_milestone, mock_recovery, tmp_path,
+    ):
+        repo = _make_repo(tmp_path)
+        body = "This is a long description that explains the change in detail. " * 5 + "\nCloses #42\n"
+        mock_gh.return_value = _completed(stdout=body)
+
+        from loom_tools.validate_phase import _recover_minimal_pr_body
+        _recover_minimal_pr_body(10, 42, repo, "task123")
+
+        mock_gh.assert_called_once()
+        mock_subprocess.run.assert_not_called()
+
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_gh_failure_is_noop(self, mock_gh, mock_milestone, tmp_path):
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(returncode=1)
+
+        from loom_tools.validate_phase import _recover_minimal_pr_body
+        _recover_minimal_pr_body(10, 42, repo, "task123")
+
+        mock_milestone.assert_not_called()
+
+    @patch("loom_tools.validate_phase._log_recovery_event")
+    @patch("loom_tools.validate_phase._report_milestone")
+    @patch("loom_tools.validate_phase.subprocess")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_empty_body_gets_enriched(
+        self, mock_gh, mock_subprocess, mock_milestone, mock_recovery, tmp_path,
+    ):
+        repo = _make_repo(tmp_path)
+        mock_gh.side_effect = [
+            _completed(stdout="null\n"),
+            _completed(stdout="src/main.py (+5/-3)\n"),
+        ]
+        mock_subprocess.run.return_value = _completed(stdout="")
+
+        from loom_tools.validate_phase import _recover_minimal_pr_body
+        _recover_minimal_pr_body(10, 42, repo, "task123")
+
+        mock_subprocess.run.assert_called_once()
+        call_args = mock_subprocess.run.call_args
+        new_body = call_args[0][0][5]
+        assert "## Summary" in new_body
+        assert "src/main.py" in new_body
 
 
 # ---------------------------------------------------------------------------
