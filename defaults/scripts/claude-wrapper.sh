@@ -801,6 +801,11 @@ stop_output_monitor() {
 # of output for failure indicators and kills the CLI session so the retry loop
 # can restart it cleanly.
 #
+# When all project MCP servers (from .mcp.json) connect successfully, only
+# global plugin/MCP failures remain.  Since these won't self-resolve on
+# restart (e.g. rust-analyzer-lsp in worktrees), the session is allowed to
+# continue rather than wasting retries.  See issue #2721.
+#
 # Arguments: $1 = output file path, $2 = PID file path to write monitor PID
 start_startup_monitor() {
     local output_file="$1"
@@ -846,10 +851,10 @@ start_startup_monitor() {
                 # Poll every 2s within the grace period for the loom MCP
                 # to connect.  MCP init typically takes ~5s so a single-shot
                 # check was prone to race conditions (see issue #2660).
-                # We still check loom MCP status for diagnostic logging, but
-                # we kill the session regardless — sessions that start with
-                # MCP failures often enter a degraded state where injected
-                # commands are not processed (see issue #2652).
+                # If all project MCPs connected, the session is allowed to
+                # continue (global plugin failures won't self-resolve).
+                # Otherwise, we kill the session to avoid a degraded state
+                # where injected commands are not processed (see #2652).
                 log_warn "Startup monitor: polling for loom MCP connection (up to ${STARTUP_GRACE_PERIOD}s)"
                 local poll_interval=2
                 local grace_elapsed=0
@@ -874,15 +879,37 @@ start_startup_monitor() {
                     fi
                 done
 
-                # Always kill the session when MCP/plugin failures are
-                # detected.  Even when the loom MCP connected, other failed
-                # MCPs/plugins can leave the CLI in a degraded state where
-                # injected commands (e.g. /judge) are never processed,
-                # producing ghost sessions.  A clean restart via the retry
-                # loop is more reliable than hoping the degraded session
-                # recovers.  See issue #2652.
                 if [[ "${loom_connected}" == "true" ]]; then
-                    log_warn "Startup monitor: loom MCP OK but other MCP/plugin failures detected — killing session for clean restart"
+                    # Check if ALL project MCP servers (from .mcp.json)
+                    # connected.  If they did, the only failures are from
+                    # global MCP servers or plugins (e.g. rust-analyzer-lsp,
+                    # swift-lsp) which won't self-resolve on restart.
+                    # Killing the session would just waste retries.
+                    # See issue #2721.
+                    local all_project_ok=true
+                    local mcp_json="${WORKSPACE}/.mcp.json"
+                    if [[ -f "${mcp_json}" ]] && command -v jq &>/dev/null; then
+                        local server_names
+                        server_names=$(jq -r '.mcpServers // {} | keys[]' "${mcp_json}" 2>/dev/null)
+                        for srv in ${server_names}; do
+                            if ! grep -q "MCP server \"${srv}\": Successfully connected" "${debug_log}" 2>/dev/null; then
+                                all_project_ok=false
+                                log_warn "Startup monitor: project MCP server '${srv}' did not connect"
+                                break
+                            fi
+                        done
+                    else
+                        # Can't determine project MCPs — fall back to
+                        # conservative kill behavior (see issue #2652).
+                        all_project_ok=false
+                    fi
+
+                    if [[ "${all_project_ok}" == "true" ]]; then
+                        log_warn "Startup monitor: all project MCP servers connected — only global plugin/MCP failures detected, allowing session to continue"
+                        break
+                    else
+                        log_warn "Startup monitor: project MCP failure detected — killing session for clean restart (see issue #2652)"
+                    fi
                 else
                     log_warn "Startup monitor: loom MCP not connected after ${STARTUP_GRACE_PERIOD}s — killing degraded session"
                 fi
