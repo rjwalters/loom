@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import pathlib
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -565,6 +565,8 @@ class TestRecoverIssue:
 
         with patch(
             "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=False
         ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result)
 
@@ -589,6 +591,8 @@ class TestRecoverIssue:
         result = OrphanRecoveryResult(recover_mode=True)
 
         with patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=False
+        ), patch(
             "loom_tools.orphan_recovery.gh_run",
             side_effect=Exception("gh failed"),
         ):
@@ -1214,6 +1218,8 @@ class TestRecoverIssueClaimsAndWorktree:
             "loom_tools.orphan_recovery._get_building_label_age", return_value=None
         ), patch(
             "loom_tools.orphan_recovery.has_valid_claim", return_value=False
+        ), patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=False
         ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result, repo_root=pathlib.Path("/fake"))
 
@@ -1246,6 +1252,8 @@ class TestRecoverIssueClaimsAndWorktree:
 
         with patch(
             "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=False
         ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
             recover_issue(42, "test_reason", result)
 
@@ -1268,6 +1276,8 @@ class TestRecoverIssueClaimsAndWorktree:
         ), patch(
             "loom_tools.orphan_recovery._cleanup_stale_worktree", return_value=True
         ), patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=False
+        ), patch(
             "loom_tools.orphan_recovery.gh_run"
         ) as mock_gh:
             recover_issue(42, "test_reason", result, repo_root=tmp_path)
@@ -1276,6 +1286,95 @@ class TestRecoverIssueClaimsAndWorktree:
         comment_call = mock_gh.call_args_list[1]
         comment_body = comment_call[0][0][-1]  # last arg is the body
         assert "stale worktree" in comment_body.lower()
+
+
+class TestOrphanCommentDedup:
+    """Tests for orphan recovery comment deduplication (issue #2658)."""
+
+    def test_recent_comment_skips_posting(self) -> None:
+        """When a recent orphan recovery comment exists, don't post another."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=True
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+            recover_issue(42, "test_reason", result)
+
+        # Should only call gh_run once (label edit), no comment posted
+        assert mock_gh.call_count == 1
+        label_call = mock_gh.call_args_list[0]
+        args = label_call[0][0]
+        assert "edit" in args
+        # Recovery entry should still be added (labels were updated)
+        assert result.total_recovered == 1
+
+    def test_no_recent_comment_posts_normally(self) -> None:
+        """When no recent orphan comment exists, post comment normally."""
+        result = OrphanRecoveryResult(recover_mode=True)
+
+        with patch(
+            "loom_tools.orphan_recovery._get_building_label_age", return_value=None
+        ), patch(
+            "loom_tools.orphan_recovery._has_recent_orphan_comment", return_value=False
+        ), patch("loom_tools.orphan_recovery.gh_run") as mock_gh:
+            recover_issue(42, "test_reason", result)
+
+        # Should call gh_run twice: label edit + comment
+        assert mock_gh.call_count == 2
+
+    def test_has_recent_orphan_comment_detects_recent(self) -> None:
+        """_has_recent_orphan_comment returns True for recent comments."""
+        from loom_tools.orphan_recovery import _has_recent_orphan_comment
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "2026-02-17T21:00:00Z\n"
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ), patch(
+            "loom_tools.orphan_recovery.elapsed_seconds", return_value=60
+        ):
+            assert _has_recent_orphan_comment(42) is True
+
+    def test_has_recent_orphan_comment_allows_old(self) -> None:
+        """_has_recent_orphan_comment returns False for old comments."""
+        from loom_tools.orphan_recovery import _has_recent_orphan_comment
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "2026-02-17T20:00:00Z\n"
+
+        with patch(
+            "loom_tools.orphan_recovery.gh_run", return_value=mock_result
+        ), patch(
+            "loom_tools.orphan_recovery.elapsed_seconds", return_value=600
+        ):
+            assert _has_recent_orphan_comment(42) is False
+
+    def test_has_recent_orphan_comment_no_comments(self) -> None:
+        """_has_recent_orphan_comment returns False when no comments exist."""
+        from loom_tools.orphan_recovery import _has_recent_orphan_comment
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = ""
+
+        with patch("loom_tools.orphan_recovery.gh_run", return_value=mock_result):
+            assert _has_recent_orphan_comment(42) is False
+
+    def test_has_recent_orphan_comment_gh_failure(self) -> None:
+        """_has_recent_orphan_comment returns False on gh command failure."""
+        from loom_tools.orphan_recovery import _has_recent_orphan_comment
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stdout = ""
+
+        with patch("loom_tools.orphan_recovery.gh_run", return_value=mock_result):
+            assert _has_recent_orphan_comment(42) is False
 
 
 class TestCheckUntrackedBuildingClaims:

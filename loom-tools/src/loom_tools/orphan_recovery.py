@@ -66,6 +66,11 @@ DEFAULT_HEARTBEAT_STALE_THRESHOLD = 300
 # being incorrectly recovered before claims or heartbeats are established.
 DEFAULT_LABEL_GRACE_PERIOD = 600
 
+# Deduplication window for orphan recovery comments (5 minutes).
+# If an "## Orphan Recovery" comment was posted within this window,
+# skip posting another to avoid duplicate noise (see issue #2658).
+ORPHAN_COMMENT_DEDUP_SECONDS = 300
+
 # Task ID format: exactly 7 lowercase hex characters
 TASK_ID_PATTERN = re.compile(r"^[a-f0-9]{7}$")
 
@@ -693,6 +698,42 @@ def _has_fresh_progress(
     return age <= heartbeat_threshold
 
 
+def _has_recent_orphan_comment(
+    issue: int, dedup_seconds: int = ORPHAN_COMMENT_DEDUP_SECONDS
+) -> bool:
+    """Check if an orphan recovery comment was posted recently on this issue.
+
+    Returns True if a comment starting with ``## Orphan Recovery`` was posted
+    within *dedup_seconds*, preventing duplicate comments from concurrent or
+    rapid-succession recovery runs (see issue #2658).
+    """
+    try:
+        result = gh_run(
+            [
+                "issue", "view", str(issue),
+                "--json", "comments",
+                "--jq",
+                '.comments | map(select(.body | startswith("## Orphan Recovery"))) '
+                '| sort_by(.createdAt) | last | .createdAt // empty',
+            ],
+            check=False,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return False
+        last_ts = result.stdout.strip()
+        age = elapsed_seconds(last_ts)
+        if age < dedup_seconds:
+            log_info(
+                f"Orphan recovery comment already posted on #{issue} "
+                f"{age}s ago (dedup window: {dedup_seconds}s)"
+            )
+            return True
+    except Exception:
+        # If we can't check, allow the comment to be posted
+        pass
+    return False
+
+
 def recover_issue(
     issue: int,
     reason: str,
@@ -794,10 +835,11 @@ def recover_issue(
         f"*Recovered by loom-recover-orphans at {ts}*"
     )
 
-    try:
-        gh_run(["issue", "comment", str(issue), "--body", comment])
-    except Exception as exc:
-        log_warning(f"Failed to add comment to issue #{issue}: {exc}")
+    if not _has_recent_orphan_comment(issue):
+        try:
+            gh_run(["issue", "comment", str(issue), "--body", comment])
+        except Exception as exc:
+            log_warning(f"Failed to add comment to issue #{issue}: {exc}")
 
     result.recovered.append(
         RecoveryEntry(
