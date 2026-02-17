@@ -47,7 +47,7 @@ def _use_color() -> bool:
 
 def _timestamp() -> str:
     now = datetime.now(timezone.utc)
-    return now.strftime("[%H:%M:%S]")
+    return now.strftime("[%Y-%m-%dT%H:%M:%SZ]")
 
 
 def _emit(color: str, label: str, message: str) -> None:
