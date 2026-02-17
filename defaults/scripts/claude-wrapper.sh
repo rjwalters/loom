@@ -24,6 +24,7 @@
 #   LOOM_BACKOFF_MULTIPLIER - Backoff multiplier (default: 2)
 #   LOOM_TERMINAL_ID       - Terminal ID for stop signal (optional)
 #   LOOM_WORKSPACE         - Workspace path for stop signal (optional)
+#   LOOM_AUTH_CACHE_TTL    - Auth cache TTL in seconds (default: 120)
 
 set -euo pipefail
 
@@ -36,6 +37,11 @@ MULTIPLIER="${LOOM_BACKOFF_MULTIPLIER:-2}"
 # Output monitor configuration
 # How long to wait after detecting an API error pattern before killing claude
 API_ERROR_IDLE_TIMEOUT="${LOOM_API_ERROR_IDLE_TIMEOUT:-60}"
+
+# Auth cache configuration
+# Short-TTL file cache to prevent concurrent `claude auth status` calls
+# from overwhelming the auth endpoint when multiple agents start simultaneously
+AUTH_CACHE_TTL="${LOOM_AUTH_CACHE_TTL:-120}"  # seconds
 
 # Startup health monitor configuration
 # How long (seconds) to watch early output for MCP/plugin failures
@@ -310,6 +316,108 @@ check_cli_available() {
     return 0
 }
 
+# --- Auth cache helpers ---
+# Prevent concurrent `claude auth status` calls from overwhelming the auth
+# endpoint when multiple agents start simultaneously (thundering-herd protection).
+# Cache is user-scoped and short-lived; any failure falls through to a direct call.
+
+_auth_cache_file() {
+    echo "/tmp/claude-auth-cache-$(id -u).json"
+}
+
+_auth_lock_dir() {
+    echo "/tmp/claude-auth-cache-$(id -u).lock"
+}
+
+# Acquire the cache lock (non-blocking).
+# Returns 0 if acquired, 1 if another process holds it.
+# Cleans up stale locks older than 30s first.
+_auth_cache_lock() {
+    local lock_dir
+    lock_dir=$(_auth_lock_dir)
+
+    # Clean up stale locks (process that created it likely died)
+    if [[ -d "${lock_dir}" ]]; then
+        local lock_age=0
+        if [[ "$(uname)" == "Darwin" ]]; then
+            lock_age=$(( $(date +%s) - $(stat -f '%m' "${lock_dir}" 2>/dev/null || echo "0") ))
+        else
+            lock_age=$(( $(date +%s) - $(stat -c '%Y' "${lock_dir}" 2>/dev/null || echo "0") ))
+        fi
+        if [[ "${lock_age}" -gt 30 ]]; then
+            log_info "Removing stale auth cache lock (age: ${lock_age}s)"
+            rmdir "${lock_dir}" 2>/dev/null || true
+        fi
+    fi
+
+    # Atomic lock acquisition via mkdir
+    mkdir "${lock_dir}" 2>/dev/null
+}
+
+# Release the cache lock.
+_auth_cache_unlock() {
+    local lock_dir
+    lock_dir=$(_auth_lock_dir)
+    rmdir "${lock_dir}" 2>/dev/null || true
+}
+
+# Read cached auth output if it exists and is within TTL.
+# On success, echoes the cached auth JSON output and returns 0.
+# Returns 1 if cache is missing, corrupt, or expired.
+_auth_cache_read() {
+    local cache_file
+    cache_file=$(_auth_cache_file)
+
+    if [[ ! -f "${cache_file}" ]]; then
+        return 1
+    fi
+
+    # Parse cache: extract time, exit_code, and output
+    local cache_time cache_exit cached_output
+    cache_time=$(python3 -c "import json,sys; d=json.load(open('${cache_file}')); print(d['time'])" 2>/dev/null) || return 1
+    cache_exit=$(python3 -c "import json,sys; d=json.load(open('${cache_file}')); print(d['exit_code'])" 2>/dev/null) || return 1
+
+    # Check TTL
+    local now
+    now=$(date +%s)
+    local age=$(( now - cache_time ))
+    if [[ "${age}" -gt "${AUTH_CACHE_TTL}" ]]; then
+        return 1
+    fi
+
+    # Only use cache if the original call succeeded
+    if [[ "${cache_exit}" -ne 0 ]]; then
+        return 1
+    fi
+
+    # Extract the output field
+    cached_output=$(python3 -c "import json,sys; print(json.load(open('${cache_file}'))['output'])" 2>/dev/null) || return 1
+    echo "${cached_output}"
+    return 0
+}
+
+# Write auth output to the cache file.
+# Arguments: $1 = auth JSON output, $2 = exit code
+_auth_cache_write() {
+    local output="$1"
+    local exit_code="$2"
+    local cache_file
+    cache_file=$(_auth_cache_file)
+    local now
+    now=$(date +%s)
+
+    python3 -c "
+import json, sys
+data = {
+    'time': ${now},
+    'exit_code': ${exit_code},
+    'output': sys.stdin.read()
+}
+with open('${cache_file}', 'w') as f:
+    json.dump(data, f)
+" <<< "${output}" 2>/dev/null || true
+}
+
 # Pre-flight check: verify authentication status
 # Uses `claude auth status --json` to confirm the CLI is logged in.
 # When CLAUDE_CONFIG_DIR is set, passes it through so the check uses
@@ -317,6 +425,44 @@ check_cli_available() {
 check_auth_status() {
     local auth_output
     local auth_exit_code
+
+    # --- Step 1: Try cache first ---
+    local cached_output
+    if cached_output=$(_auth_cache_read); then
+        local logged_in
+        logged_in=$(echo "${cached_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
+        if [[ "${logged_in}" == "True" ]]; then
+            log_info "Authentication check passed (cached)"
+            return 0
+        fi
+        # Cache says not logged in — fall through to fresh check
+    fi
+
+    # --- Step 2: Try to acquire lock for fresh check ---
+    local lock_acquired=false
+    if _auth_cache_lock; then
+        lock_acquired=true
+    else
+        # Another process is refreshing — wait briefly then re-read cache
+        log_info "Auth cache lock held by another process, waiting..."
+        local wait_elapsed=0
+        while [[ "${wait_elapsed}" -lt 5 ]]; do
+            sleep 1
+            wait_elapsed=$((wait_elapsed + 1))
+            if cached_output=$(_auth_cache_read); then
+                local logged_in
+                logged_in=$(echo "${cached_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
+                if [[ "${logged_in}" == "True" ]]; then
+                    log_info "Authentication check passed (cached, after wait)"
+                    return 0
+                fi
+            fi
+        done
+        # Still stale — fall through to direct check without lock
+        log_info "Auth cache still stale after wait, proceeding with direct check"
+    fi
+
+    # --- Step 3: Existing retry logic (with cache write on success) ---
     local max_retries=3
     local -a backoff_seconds=(2 5 10)
 
@@ -338,6 +484,7 @@ check_auth_status() {
                 continue
             fi
             log_error "Authentication check timed out after ${max_retries} attempts"
+            [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
         fi
 
@@ -350,8 +497,12 @@ check_auth_status() {
             else
                 log_error "Run: claude auth login"
             fi
+            [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
         fi
+
+        # Write successful result to cache (best-effort)
+        _auth_cache_write "${auth_output}" "${auth_exit_code}"
 
         # Parse the loggedIn field from JSON output
         local logged_in
@@ -365,15 +516,18 @@ check_auth_status() {
             else
                 log_error "Run: claude auth login"
             fi
+            [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
         fi
 
         log_info "Authentication check passed (logged in)"
+        [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
         return 0
     done
 
     # Should not reach here, but guard against it
     log_error "Authentication check failed after ${max_retries} attempts"
+    [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
     return 1
 }
 
