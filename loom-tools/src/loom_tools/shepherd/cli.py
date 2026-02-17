@@ -515,6 +515,35 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.is_shutdown:
                 raise ShutdownSignal(result.message)
 
+            # Handle test timeouts — skip Doctor since the code is likely correct
+            if (
+                result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK)
+                and result.data.get("test_timeout")
+            ):
+                log_error(
+                    f"Test verification timed out. Skipping Doctor — "
+                    f"timeouts indicate a resource/configuration issue, not a code defect. "
+                    f"Consider increasing test timeout or using scoped tests."
+                )
+                phase_durations["Builder"] = builder_total_elapsed
+                ctx.report_milestone(
+                    "phase_completed",
+                    phase="builder",
+                    duration_seconds=builder_total_elapsed,
+                    status="test_timeout",
+                )
+                _mark_builder_test_failure(ctx)
+                _run_reflection(
+                    ctx,
+                    exit_code=ShepherdExitCode.PR_TESTS_FAILED,
+                    duration=int(time.time() - start_time),
+                    phase_durations=phase_durations,
+                    completed_phases=completed_phases,
+                    test_fix_attempts=0,
+                    warnings=run_warnings,
+                )
+                return ShepherdExitCode.PR_TESTS_FAILED
+
             # Handle test failures with Doctor test-fix loop
             while (
                 result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK)
