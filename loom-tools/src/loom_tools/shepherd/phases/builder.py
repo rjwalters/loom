@@ -3465,7 +3465,7 @@ class BuilderPhase:
                         "--head",
                         branch,
                         "--title",
-                        ctx.issue_title or f"Issue #{ctx.config.issue}",
+                        NamingConventions.pr_title(ctx.issue_title, ctx.config.issue),
                         "--label",
                         "loom:review-requested",
                         "--body",
@@ -3564,7 +3564,7 @@ class BuilderPhase:
             if attempt >= 2:
                 instructions.append(
                     f"- Only if no PR exists, run: gh pr create "
-                    f"--title {shlex.quote(ctx.issue_title or f'Issue #{ctx.config.issue}')} "
+                    f"--title {shlex.quote(NamingConventions.pr_title(ctx.issue_title, ctx.config.issue))} "
                     f"--label loom:review-requested "
                     f"--body 'Closes #{ctx.config.issue}'"
                 )

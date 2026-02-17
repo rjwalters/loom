@@ -2189,8 +2189,8 @@ class TestFormatDiagnosticsForComment:
         assert "fix: broken widget" in output
         assert "Issue #42" not in output
 
-    def test_falls_back_to_issue_number_when_no_title(self) -> None:
-        """Should fall back to 'Issue #N' when issue_title is empty."""
+    def test_falls_back_to_conventional_title_when_no_title(self) -> None:
+        """Should fall back to conventional commit title when issue_title is empty."""
         diagnostics = {
             "worktree_exists": True,
             "worktree_path": "/path/to/.loom/worktrees/issue-42",
@@ -2204,7 +2204,8 @@ class TestFormatDiagnosticsForComment:
 
         output = _format_diagnostics_for_comment(diagnostics, 42)
 
-        assert "Issue #42" in output
+        assert "feat: implement changes for issue #42" in output
+        assert "Issue #42" not in output
 
     def test_escapes_special_characters_in_title(self) -> None:
         """Should shell-escape special characters in issue titles."""

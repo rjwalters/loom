@@ -8,6 +8,7 @@ This module provides a single source of truth for:
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -281,3 +282,43 @@ class NamingConventions:
             except ValueError:
                 pass
         return None
+
+    # Conventional commit prefixes recognized in issue titles
+    _CC_PREFIXES = ("fix:", "feat:", "refactor:", "docs:", "test:", "chore:", "perf:")
+    _CC_PREFIX_RE = re.compile(
+        r"^(fix|feat|refactor|docs|test|chore|perf)\s*:", re.IGNORECASE
+    )
+
+    @staticmethod
+    def pr_title(issue_title: str, issue: int | None = None) -> str:
+        """Generate a conventional-commit-style PR title from an issue title.
+
+        If the issue title already starts with a conventional commit prefix,
+        normalise it to lowercase.  Otherwise, prefix with ``feat:``.
+
+        Falls back to ``feat: implement changes for issue #<N>`` when the
+        title is empty/missing and an issue number is provided.
+
+        Args:
+            issue_title: The raw issue title from GitHub.
+            issue: Optional issue number used for the fallback title.
+
+        Returns:
+            A PR title with a conventional commit prefix.
+        """
+        title = (issue_title or "").strip()
+        if not title:
+            if issue is not None:
+                return f"feat: implement changes for issue #{issue}"
+            return "feat: implement changes"
+
+        m = NamingConventions._CC_PREFIX_RE.match(title)
+        if m:
+            # Already has a prefix – normalise the prefix to lowercase
+            prefix = m.group(1).lower()
+            rest = title[m.end():].strip()
+            return f"{prefix}: {rest}"
+
+        # No prefix – add one.  Use the title lowercased (first char).
+        first = title[0].lower() + title[1:] if len(title) > 1 else title.lower()
+        return f"feat: {first}"
