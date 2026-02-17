@@ -1176,6 +1176,9 @@ def run_phase_with_retry(
             paths = LoomPaths(ctx.repo_root)
             log_path = paths.worker_log_file(role, ctx.config.issue)
             cause = _classify_low_output_cause(log_path)
+            # Surface the classification on the context so callers
+            # (e.g., _gather_diagnostics) can include it.  See issue #2562.
+            ctx.last_low_output_cause = cause
             cause_max_retries, cause_backoff = LOW_OUTPUT_RETRY_STRATEGIES.get(
                 cause, LOW_OUTPUT_RETRY_STRATEGIES["unknown"]
             )
@@ -1195,7 +1198,8 @@ def run_phase_with_retry(
                 log_warning(
                     f"Low-output attempt for {role} took {attempt_elapsed:.0f}s "
                     f"(>{LOW_OUTPUT_MAX_ATTEMPT_SECONDS}s), "
-                    f"likely infrastructure issue — not retrying"
+                    f"likely infrastructure issue — not retrying "
+                    f"(cause: {cause})"
                 )
                 return 6
 
