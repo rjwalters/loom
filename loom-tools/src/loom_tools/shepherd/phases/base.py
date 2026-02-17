@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -62,6 +63,74 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 # so we use longer backoff than instant-exit.
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
+
+# Regex patterns for CLI spinner/thinking noise that should not count toward
+# output volume when checking for MCP failures.  The Claude CLI terminal
+# capture can produce garbled spinner frames (interleaved characters from
+# animated spinners) and repeated "(thinking)" lines that inflate the
+# character count without representing productive work.  See issue #2465.
+# Regex for known spinner phrases matched per-line (already stripped).
+# Matches "Tinkering…", "Thinking...", "Processing...", etc.
+_SPINNER_PHRASE_RE = re.compile(
+    r"^(?:Tinkering|Thinking|Processing|Analyzing|Loading|Working)"
+    r"(?:…|\.{2,3})$"
+)
+
+# Characters used by Claude CLI animated spinners.  Lines dominated by
+# these characters (mixed with a few regular chars from animation frame
+# interleaving) are garbled spinner fragments, not productive output.
+_SPINNER_DECORATION_CHARS = frozenset("✶✻✽✳✢·✦✧★☆●○◆◇▪▫•‣⁃※✱✲✴✵✷✸✹✺⟳⟲")
+
+# Fraction of non-whitespace characters that must be decoration chars
+# for a line to be classified as garbled spinner noise.
+_SPINNER_DECORATION_THRESHOLD = 0.3
+
+
+def _strip_spinner_noise(text: str) -> str:
+    """Remove CLI spinner and thinking noise from output text.
+
+    Strips:
+    - "(thinking)" lines
+    - Known spinner phrases ("Tinkering...", "Thinking...", etc.)
+    - Lines dominated by Unicode spinner decoration characters
+
+    This prevents garbled terminal capture of animated spinners from
+    inflating the output volume metric used by ``_is_mcp_failure()``.
+    See issue #2465.
+
+    Args:
+        text: CLI output text (already ANSI-stripped).
+
+    Returns:
+        Text with spinner noise removed.
+    """
+    lines = text.splitlines()
+    filtered = []
+    for line in lines:
+        stripped_line = line.strip()
+        if not stripped_line:
+            filtered.append(line)
+            continue
+
+        # "(thinking)" lines
+        if stripped_line == "(thinking)":
+            continue
+
+        # Known spinner phrases
+        if _SPINNER_PHRASE_RE.match(stripped_line):
+            continue
+
+        # Garbled spinner lines: lines where >30% of non-whitespace
+        # chars are Unicode decoration characters from spinner animation
+        non_ws = [c for c in stripped_line if not c.isspace()]
+        if non_ws:
+            deco_count = sum(1 for c in non_ws if c in _SPINNER_DECORATION_CHARS)
+            if deco_count / len(non_ws) > _SPINNER_DECORATION_THRESHOLD:
+                continue
+
+        filtered.append(line)
+
+    return "\n".join(filtered)
 
 
 class PhaseStatus(Enum):
@@ -362,16 +431,19 @@ def _is_mcp_failure(log_path: Path) -> bool:
         return False
 
     try:
-        import re
-
         content = log_path.read_text()
         stripped = strip_ansi(content)
 
-        # If the session produced substantial CLI output beyond headers
-        # and wrapper pre-flight, it was productive — MCP text is just
-        # status bar noise.  See issues #2374, #2381, #2401.
+        # If the session produced substantial CLI output beyond headers,
+        # wrapper pre-flight, and spinner noise, it was productive — MCP
+        # text is just status bar noise.  See issues #2374, #2381, #2401.
+        #
+        # Strip spinner/thinking noise before checking volume to prevent
+        # garbled terminal capture of animated spinners from inflating
+        # the character count.  See issue #2465.
         cli_output = _get_cli_output(stripped)
-        if len(cli_output.strip()) >= MCP_FAILURE_MIN_OUTPUT_CHARS:
+        cleaned_output = _strip_spinner_noise(cli_output)
+        if len(cleaned_output.strip()) >= MCP_FAILURE_MIN_OUTPUT_CHARS:
             return False
 
         for pattern in MCP_FAILURE_PATTERNS:
