@@ -546,9 +546,9 @@ def _print_heartbeat(action: str) -> None:
     """Print a heartbeat status line to stderr.
 
     Uses dim/gray ANSI to differentiate from cyan phase headers.
-    Format: ``[HH:MM:SS] ⟳ action``
+    Format: ``[YYYY-MM-DDTHH:MM:SSZ] ⟳ action``
     """
-    ts = time.strftime("%H:%M:%S")
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     # \033[2m = dim, \033[0m = reset
     print(f"\033[2m[{ts}] \u27f3 {action}\033[0m", file=sys.stderr)
 

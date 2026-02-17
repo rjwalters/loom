@@ -22,7 +22,7 @@ HOOK_ERROR_LOG="${MAIN_ROOT}/.loom/logs/hook-errors.log"
 
 log_hook_error() {
     mkdir -p "$(dirname "$HOOK_ERROR_LOG")" 2>/dev/null || true
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [guard-worktree-paths] $1" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [guard-worktree-paths] $1" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
 }
 
 # Top-level error trap: on ANY unexpected error, allow to prevent infinite retry loops

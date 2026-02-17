@@ -28,7 +28,7 @@ log_hook_error() {
     local msg="$1"
     # Ensure log directory exists
     mkdir -p "$(dirname "$HOOK_ERROR_LOG")" 2>/dev/null || true
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [guard-destructive] $msg" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [guard-destructive] $msg" >> "$HOOK_ERROR_LOG" 2>/dev/null || true
 }
 
 # Top-level error trap: on ANY unexpected error, output valid JSON "allow"
