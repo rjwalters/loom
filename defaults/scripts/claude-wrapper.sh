@@ -936,11 +936,13 @@ run_with_retry() {
         fi
         # Detect slash command prompt in arguments (e.g., "/judge 2434").
         # On-demand workers spawned by the shepherd receive a slash command
-        # as a positional prompt argument.  When present, we MUST use --print
-        # mode instead of interactive mode (script -q) because interactive mode
-        # can be blocked by onboarding dialogs or promotional banners that
-        # require user interaction before the prompt is processed.  --print
-        # explicitly skips all interactive dialogs.  See issue #2438.
+        # as a positional prompt argument.  This flag is used for log-capture
+        # heuristics (fallback append when pipe-pane misses output).
+        # Note: we do NOT switch to --print mode for slash commands because
+        # --print treats "/role" as a skill-definition print (exits with 0s
+        # duration, no actual work).  Interactive mode (script -q) is safe
+        # because CLAUDE_CONFIG_DIR isolation ensures onboarding is complete.
+        # Regression from #2537, fixed in #2608.
         _has_slash_cmd=false
         for _arg in "$@"; do
             case "$_arg" in
@@ -969,12 +971,7 @@ run_with_retry() {
         _FLUSH_PRE_LOG_LINES="${_pre_log_lines}"
         trap _flush_output_on_signal SIGHUP SIGTERM
 
-        if [[ "$_has_slash_cmd" == "true" ]]; then
-            # Slash command prompt detected - use --print for reliable execution
-            log_info "Slash command detected in arguments, using --print mode"
-            claude --print "$@" 2>&1 | tee "${temp_output}"
-            exit_code=${PIPESTATUS[0]}
-        elif [ -t 0 ]; then
+        if [ -t 0 ]; then
             # No prompt, TTY available - use script to preserve interactive mode
             script -q "${temp_output}" claude "$@"
             exit_code=$?
