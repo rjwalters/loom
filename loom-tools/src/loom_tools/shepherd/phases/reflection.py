@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 
 # Thresholds for flagging anomalies
 HIGH_RETRY_THRESHOLD = 2
+# Test-fix loops of 2 are routine (first attempt fails, second succeeds).
+# Only flag when the loop is genuinely excessive.
+HIGH_TEST_FIX_THRESHOLD = 3
 
 # Upstream repo for filing issues
 UPSTREAM_REPO = "rjwalters/loom"
@@ -116,50 +119,76 @@ class ReflectionPhase(BasePhase):
         """Analyze run data and return actionable findings.
 
         Only produces findings that are genuinely actionable:
-        - excessive_retries: Retries above threshold indicate systemic issues
+        - excessive_retries: Retries above threshold indicate systemic issues.
+          Skipped when the run ultimately succeeded (exit_code == 0) because
+          retries that self-heal are normal operation, not bugs.
         - builder_failure: Only filed when error context can be extracted
         """
         findings: list[Finding] = []
 
-        # Check for excessive retries
-        if summary.judge_retries >= HIGH_RETRY_THRESHOLD:
+        # Retries that self-heal (run succeeded) aren't actionable
+        run_failed = summary.exit_code != 0
+
+        # Check for excessive retries (only when the run failed)
+        if run_failed and summary.judge_retries >= HIGH_RETRY_THRESHOLD:
+            error_context = _extract_error_context(summary.log_content)
+            details = (
+                f"The Judge phase needed {summary.judge_retries} retries "
+                f"for issue #{summary.issue}. This may indicate problems "
+                f"with review prompt clarity or PR complexity."
+            )
+            if error_context:
+                details += (
+                    f"\n\n**Error context from logs:**\n"
+                    f"```\n{error_context}\n```"
+                )
             findings.append(
                 Finding(
                     category="excessive_retries",
                     title=f"Judge required {summary.judge_retries} retries",
-                    details=(
-                        f"The Judge phase needed {summary.judge_retries} retries "
-                        f"for issue #{summary.issue}. This may indicate problems "
-                        f"with review prompt clarity or PR complexity."
-                    ),
+                    details=details,
                     severity="enhancement",
                 )
             )
 
-        if summary.doctor_attempts >= HIGH_RETRY_THRESHOLD:
+        if run_failed and summary.doctor_attempts >= HIGH_RETRY_THRESHOLD:
+            error_context = _extract_error_context(summary.log_content)
+            details = (
+                f"The Doctor phase ran {summary.doctor_attempts} times "
+                f"for issue #{summary.issue}. This may indicate "
+                f"insufficient feedback specificity from the Judge."
+            )
+            if error_context:
+                details += (
+                    f"\n\n**Error context from logs:**\n"
+                    f"```\n{error_context}\n```"
+                )
             findings.append(
                 Finding(
                     category="excessive_retries",
                     title=f"Doctor required {summary.doctor_attempts} attempts",
-                    details=(
-                        f"The Doctor phase ran {summary.doctor_attempts} times "
-                        f"for issue #{summary.issue}. This may indicate "
-                        f"insufficient feedback specificity from the Judge."
-                    ),
+                    details=details,
                     severity="enhancement",
                 )
             )
 
-        if summary.test_fix_attempts >= HIGH_RETRY_THRESHOLD:
+        if run_failed and summary.test_fix_attempts >= HIGH_TEST_FIX_THRESHOLD:
+            error_context = _extract_error_context(summary.log_content)
+            details = (
+                f"The builder test-fix loop required "
+                f"{summary.test_fix_attempts} iterations for "
+                f"issue #{summary.issue}."
+            )
+            if error_context:
+                details += (
+                    f"\n\n**Error context from logs:**\n"
+                    f"```\n{error_context}\n```"
+                )
             findings.append(
                 Finding(
                     category="excessive_retries",
                     title=f"Test-fix loop ran {summary.test_fix_attempts} times",
-                    details=(
-                        f"The builder test-fix loop required "
-                        f"{summary.test_fix_attempts} iterations for "
-                        f"issue #{summary.issue}."
-                    ),
+                    details=details,
                     severity="enhancement",
                 )
             )
