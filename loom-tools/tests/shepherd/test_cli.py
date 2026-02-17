@@ -4183,7 +4183,7 @@ class TestPostFallbackFailureComment:
 class TestRecordFallbackFailure:
     """Test _record_fallback_failure helper (issue #2525)."""
 
-    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_records_auth_failure_class(
         self,
@@ -4206,7 +4206,7 @@ class TestRecordFallbackFailure:
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
-    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_records_unknown_failure_class(
         self,
@@ -4245,6 +4245,67 @@ class TestRecordFallbackFailure:
 
         # Should not raise
         _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+    @patch("subprocess.run")
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_escalates_on_systematic_failure(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_transition: MagicMock,
+        mock_subprocess: MagicMock,
+    ) -> None:
+        """Should escalate to loom:blocked when systematic failure detected (issue #2707)."""
+        from loom_tools.models.daemon_state import SystematicFailure
+
+        mock_detect.return_value = SystematicFailure(
+            active=True, pattern="builder_unknown_failure", count=3,
+        )
+
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        # Should transition labels
+        mock_transition.assert_called_once_with(
+            42,
+            add=["loom:blocked"],
+            remove=["loom:issue"],
+            repo_root=Path("/fake/repo"),
+        )
+        # Should post escalation comment via subprocess.run
+        mock_subprocess.assert_called_once()
+        call_args = mock_subprocess.call_args
+        cmd_list = call_args[0][0]  # First positional arg is the command list
+        # Find the --body value (element after "--body")
+        body_idx = cmd_list.index("--body") + 1
+        comment_body = cmd_list[body_idx]
+        assert "Systematic failure detected" in comment_body
+        assert "builder_unknown_failure" in comment_body
+        assert "3" in comment_body
+
+    @patch("loom_tools.shepherd.cli.transition_issue_labels")
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_no_escalation_when_no_systematic_failure(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_transition: MagicMock,
+    ) -> None:
+        """Should NOT escalate when detect_systematic_failure returns None."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.BUILDER_FAILED)
+
+        # Should NOT transition labels
+        mock_transition.assert_not_called()
 
 
 class TestCleanupFallbackIntegration:
