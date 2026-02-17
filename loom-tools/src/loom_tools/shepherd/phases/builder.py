@@ -2489,6 +2489,16 @@ class BuilderPhase:
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return None
 
+        # Short-circuit: skip test verification when builder produced zero
+        # artifacts.  Running baseline tests is pointless when there's nothing
+        # in the worktree to compare against.  See issue #2735.
+        if not self._has_builder_artifacts(ctx.worktree_path):
+            log_info(
+                "Skipping test verification: builder produced zero artifacts "
+                "(no commits, no uncommitted changes)"
+            )
+            return None
+
         # Ensure dependencies are installed before running tests
         self._ensure_dependencies(ctx.worktree_path)
 
@@ -4079,6 +4089,31 @@ class BuilderPhase:
         )
 
         return exit_code
+
+    def _has_builder_artifacts(self, worktree_path: Path) -> bool:
+        """Check if the worktree has any builder-produced artifacts.
+
+        Returns True if the worktree has commits ahead of origin/main or
+        uncommitted changes.  Used to short-circuit test verification when
+        the builder produced nothing (see issue #2735).
+        """
+        # Check commits ahead of main
+        log_res = subprocess.run(
+            ["git", "-C", str(worktree_path), "log", "--oneline", "origin/main..HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if log_res.returncode == 0 and log_res.stdout.strip():
+            return True
+
+        # Check uncommitted changes
+        status_res = subprocess.run(
+            ["git", "-C", str(worktree_path), "status", "--porcelain"],
+            capture_output=True, text=True, check=False,
+        )
+        if status_res.returncode == 0 and status_res.stdout.strip():
+            return True
+
+        return False
 
     def _is_stale_worktree(self, worktree_path: Path) -> bool:
         """Check if an existing worktree is stale (abandoned without commits).
