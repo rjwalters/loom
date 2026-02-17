@@ -283,8 +283,6 @@ class NamingConventions:
                 pass
         return None
 
-    # Conventional commit prefixes recognized in issue titles
-    _CC_PREFIXES = ("fix:", "feat:", "refactor:", "docs:", "test:", "chore:", "perf:")
     _CC_PREFIX_RE = re.compile(
         r"^(fix|feat|refactor|docs|test|chore|perf)\s*:", re.IGNORECASE
     )
