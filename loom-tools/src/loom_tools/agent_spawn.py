@@ -609,6 +609,20 @@ def spawn_agent(
         _tmux("set-environment", "-t", session_name, "PYTHONPATH", pythonpath_val)
         pythonpath_prefix = f"PYTHONPATH='{pythonpath_val}' "
 
+    # Pin git operations to the worktree so that absolute paths cannot
+    # accidentally resolve to the main repo (see issue #2418).
+    if worktree and working_dir != repo_root:
+        git_file = working_dir / ".git"
+        if git_file.exists():
+            _tmux(
+                "set-environment", "-t", session_name,
+                "GIT_WORK_TREE", str(working_dir),
+            )
+            _tmux(
+                "set-environment", "-t", session_name,
+                "GIT_DIR", str(git_file),
+            )
+
     # Build the role slash command
     role_cmd = f"/{role}"
     if args:

@@ -496,6 +496,128 @@ class TestClaudeConfigDirIsolation:
         assert "claude-config/test-builder" in tmpdir_value
 
 
+class TestGitWorktreePinning:
+    """Tests that GIT_WORK_TREE and GIT_DIR are set for worktree agents (#2418)."""
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_sets_git_env_for_worktree(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent sets GIT_WORK_TREE and GIT_DIR when using a worktree."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        # Create worktree directory with a .git file (like real worktrees)
+        worktree_dir = mock_repo / ".loom" / "worktrees" / "issue-42"
+        worktree_dir.mkdir(parents=True)
+        (worktree_dir / ".git").write_text(
+            f"gitdir: {mock_repo}/.git/worktrees/issue-42\n"
+        )
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="builder-issue-42",
+            args="42",
+            worktree=str(worktree_dir),
+            repo_root=mock_repo,
+            verify_timeout=0,
+        )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+
+        # Check GIT_WORK_TREE
+        work_tree_calls = [
+            c for c in tmux_calls
+            if len(c) >= 4 and c[0] == "set-environment" and "GIT_WORK_TREE" in c
+        ]
+        assert len(work_tree_calls) == 1
+        assert work_tree_calls[0][-1] == str(worktree_dir)
+
+        # Check GIT_DIR
+        git_dir_calls = [
+            c for c in tmux_calls
+            if len(c) >= 4 and c[0] == "set-environment" and "GIT_DIR" in c
+        ]
+        assert len(git_dir_calls) == 1
+        assert git_dir_calls[0][-1] == str(worktree_dir / ".git")
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_no_git_env_when_working_in_repo_root(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent does NOT set GIT_WORK_TREE when worktree == repo_root."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree=str(mock_repo),
+            repo_root=mock_repo,
+            verify_timeout=0,
+        )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        git_env_calls = [
+            c for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and c[-2] in ("GIT_WORK_TREE", "GIT_DIR")
+        ]
+        assert len(git_env_calls) == 0
+
+    @patch("loom_tools.agent_spawn._tmux")
+    def test_no_git_env_when_no_worktree(
+        self, mock_tmux: MagicMock, mock_repo: pathlib.Path
+    ) -> None:
+        """spawn_agent does NOT set GIT_WORK_TREE when worktree is empty."""
+        from loom_tools.agent_spawn import spawn_agent
+
+        (mock_repo / ".loom" / "roles" / "builder.md").write_text("# Builder")
+        wrapper = mock_repo / ".loom" / "scripts" / "claude-wrapper.sh"
+        wrapper.write_text("#!/bin/bash\nclaude \"$@\"")
+        wrapper.chmod(0o755)
+
+        mock_tmux.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=""
+        )
+
+        spawn_agent(
+            role="builder",
+            name="test-builder",
+            args="",
+            worktree="",
+            repo_root=mock_repo,
+            verify_timeout=0,
+        )
+
+        tmux_calls = [c.args for c in mock_tmux.call_args_list]
+        git_env_calls = [
+            c for c in tmux_calls
+            if len(c) >= 4
+            and c[0] == "set-environment"
+            and c[-2] in ("GIT_WORK_TREE", "GIT_DIR")
+        ]
+        assert len(git_env_calls) == 0
+
+
 class TestAnsiStripping:
     """Tests for ANSI escape sequence stripping in log output."""
 
