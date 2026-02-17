@@ -942,6 +942,20 @@ impl TerminalManager {
             .ok_or_else(|| anyhow!("Terminal not found"))?;
 
         info.worktree_path = Some(worktree_path.to_string());
+
+        // Set LOOM_WORKTREE_PATH on the tmux session so Claude Code's
+        // PreToolUse hook can block Edit/Write outside the worktree (issue #2441).
+        let _ = Command::new("tmux")
+            .args(["-L", "loom"])
+            .args([
+                "set-environment",
+                "-t",
+                &info.tmux_session,
+                "LOOM_WORKTREE_PATH",
+                worktree_path,
+            ])
+            .output();
+
         log::info!("Set worktree path for terminal {id}: {worktree_path}");
         Ok(())
     }

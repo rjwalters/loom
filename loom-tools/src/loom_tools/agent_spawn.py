@@ -611,6 +611,8 @@ def spawn_agent(
 
     # Pin git operations to the worktree so that absolute paths cannot
     # accidentally resolve to the main repo (see issue #2418).
+    # Also set LOOM_WORKTREE_PATH so the PreToolUse hook can block
+    # Edit/Write calls outside the worktree (see issue #2441).
     if worktree and working_dir != repo_root:
         git_file = working_dir / ".git"
         if git_file.exists():
@@ -622,17 +624,27 @@ def spawn_agent(
                 "set-environment", "-t", session_name,
                 "GIT_DIR", str(git_file),
             )
+        _tmux(
+            "set-environment", "-t", session_name,
+            "LOOM_WORKTREE_PATH", str(working_dir),
+        )
 
     # Build the role slash command
     role_cmd = f"/{role}"
     if args:
         role_cmd = f"{role_cmd} {args}"
 
+    # Worktree path prefix for the command line (makes LOOM_WORKTREE_PATH
+    # available to Claude Code's PreToolUse hooks — see issue #2441).
+    worktree_prefix = ""
+    if worktree and working_dir != repo_root:
+        worktree_prefix = f"LOOM_WORKTREE_PATH='{working_dir}' "
+
     # Build the Claude CLI command
     wrapper_script = repo_root / ".loom" / "scripts" / "claude-wrapper.sh"
     if wrapper_script.is_file() and os.access(wrapper_script, os.X_OK):
         claude_cmd = (
-            f"{pythonpath_prefix}"
+            f"{pythonpath_prefix}{worktree_prefix}"
             f"LOOM_TERMINAL_ID='{name}' LOOM_WORKSPACE='{working_dir}' "
             f"CLAUDE_CONFIG_DIR='{config_dir}' TMPDIR='{config_dir / 'tmp'}' "
             f"'{wrapper_script}' --dangerously-skip-permissions \"{role_cmd}\""
