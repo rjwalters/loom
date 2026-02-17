@@ -2826,6 +2826,24 @@ class BuilderPhase:
             )
             diag["commits_ahead"] = len(commits)
 
+            # Files changed in commits ahead of main (for fallback detection
+            # when builder accidentally commits the no-changes marker).
+            # See issue #2605.
+            if commits:
+                diff_res = subprocess.run(
+                    ["git", "-C", str(wt), "diff", "--name-only", "main..HEAD"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                diag["committed_files"] = (
+                    [f for f in diff_res.stdout.splitlines() if f]
+                    if diff_res.returncode == 0 and diff_res.stdout.strip()
+                    else []
+                )
+            else:
+                diag["committed_files"] = []
+
             # Uncommitted changes (with file count for diagnostic prompts)
             status_res = subprocess.run(
                 ["git", "-C", str(wt), "status", "--porcelain"],
@@ -2852,6 +2870,7 @@ class BuilderPhase:
         else:
             diag["branch"] = None
             diag["commits_ahead"] = 0
+            diag["committed_files"] = []
             diag["has_uncommitted_changes"] = False
             diag["uncommitted_file_count"] = 0
             diag["artifact_file_count"] = 0
@@ -3279,16 +3298,31 @@ class BuilderPhase:
         if diag.get("main_branch_dirty", False):
             return False
 
-        # All indicators of work must be absent
+        # All indicators of work must be absent — but if the builder
+        # accidentally committed *only* the marker file, treat that as
+        # equivalent to no work done (defense-in-depth for issue #2605).
+        commits_ahead = diag.get("commits_ahead", 0)
+        committed_files = diag.get("committed_files", [])
+        only_marker_committed = (
+            commits_ahead > 0
+            and committed_files == [NO_CHANGES_MARKER]
+        )
+
         has_any_work = (
             diag.get("has_uncommitted_changes", False)
-            or diag.get("commits_ahead", 0) > 0
+            or (commits_ahead > 0 and not only_marker_committed)
             or diag.get("remote_branch_exists", False)
             or diag.get("pr_number") is not None
         )
 
         if has_any_work:
             return False
+
+        if only_marker_committed:
+            log_warning(
+                "Builder accidentally committed the .no-changes-needed marker "
+                "file — treating as 'no changes needed' anyway (issue #2605)"
+            )
 
         # Session quality gate: if the builder log shows too little output,
         # the session was degraded/failed and never actually analyzed the issue.

@@ -325,6 +325,8 @@ echo "Bug is already fixed on main — verified by running the test suite" > .no
 
 The marker file should contain a brief explanation of why no changes are needed.
 
+**IMPORTANT: Do NOT commit the marker file.** Leave it as an untracked file in the worktree. The shepherd checks for the marker file on disk — if you `git add` and commit it, the commit shows as work done and defeats the detection mechanism.
+
 **Why this matters:** Without this marker file, the shepherd cannot distinguish between "builder deliberately decided no changes are needed" and "builder crashed/was killed before doing anything." An empty worktree without the marker is treated as a builder failure, not a deliberate decision.
 
 **Do NOT create this file if:**
