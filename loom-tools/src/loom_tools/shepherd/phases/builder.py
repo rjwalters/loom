@@ -440,6 +440,30 @@ class BuilderPhase:
                 },
             )
 
+        if exit_code == 9:
+            # Auth pre-flight failure: the wrapper's `claude auth status`
+            # timed out, likely because a parent Claude session holds the
+            # config lock.  Not retryable — fail fast instead of wasting
+            # ~5 minutes on futile retries.  See issue #2508.
+            log_error(
+                f"Auth pre-flight failure for issue #{ctx.config.issue}: "
+                f"authentication check timed out (not retryable)"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    "builder auth pre-flight failed: authentication check "
+                    "timed out (parent session may hold config lock)"
+                ),
+                phase_name="builder",
+                data={
+                    "auth_failure": True,
+                    "exit_code": exit_code,
+                    "log_file": str(self._get_log_path(ctx)),
+                },
+            )
+
         if exit_code not in (0, 3, 4):
             # Unexpected non-zero exit from builder subprocess
             diag = self._gather_diagnostics(ctx)
