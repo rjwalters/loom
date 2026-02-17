@@ -143,8 +143,6 @@ def _is_claim_abandoned(
 
     Returns True if the claim should be treated as abandoned.
     """
-    from datetime import timedelta
-
     # Extract task_id from agent_id (format: "shepherd-{task_id}")
     if not claim.agent_id.startswith("shepherd-"):
         # Non-shepherd claims can't be checked via progress files
