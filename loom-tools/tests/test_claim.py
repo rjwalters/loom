@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -11,6 +12,7 @@ from loom_tools.claim import (
     ClaimInfo,
     _get_expiration,
     _get_timestamp,
+    _is_claim_abandoned,
     _is_expired,
     check_claim,
     claim_issue,
@@ -373,3 +375,251 @@ class TestHasValidClaim:
         claim_dir.mkdir(parents=True)
         # Directory exists but no claim.json
         assert has_valid_claim(mock_repo, 42) is False
+
+    def test_abandoned_claim_returns_false(self, mock_repo: pathlib.Path) -> None:
+        """A claim with a stale heartbeat should not be considered valid."""
+        stale_time = (datetime.now(timezone.utc) - timedelta(seconds=600)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        claim_time = (datetime.now(timezone.utc) - timedelta(seconds=900)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        # Create claim by shepherd-abc123
+        claim_dir = mock_repo / ".loom" / "claims" / "issue-42.lock"
+        claim_dir.mkdir(parents=True)
+        claim_file = claim_dir / "claim.json"
+        claim_file.write_text(
+            json.dumps(
+                {
+                    "issue": 42,
+                    "agent_id": "shepherd-abc123",
+                    "claimed_at": claim_time,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "ttl_seconds": 7200,
+                }
+            )
+        )
+        # Create progress file with stale heartbeat
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        progress_file = progress_dir / "shepherd-abc123.json"
+        progress_file.write_text(
+            json.dumps(
+                {
+                    "task_id": "abc123",
+                    "issue": 42,
+                    "last_heartbeat": stale_time,
+                    "status": "working",
+                }
+            )
+        )
+        assert has_valid_claim(mock_repo, 42) is False
+
+
+def _fmt_ts(dt: datetime) -> str:
+    """Format datetime as ISO-8601 timestamp for tests."""
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class TestIsClaimAbandoned:
+    """Tests for _is_claim_abandoned function."""
+
+    def test_non_shepherd_claim_never_abandoned(self, mock_repo: pathlib.Path) -> None:
+        claim = ClaimInfo(
+            issue=42,
+            agent_id="builder-1",
+            claimed_at="2020-01-01T00:00:00Z",
+            expires_at="2099-01-01T00:00:00Z",
+            ttl_seconds=7200,
+        )
+        assert _is_claim_abandoned(mock_repo, claim) is False
+
+    def test_stale_heartbeat_is_abandoned(self, mock_repo: pathlib.Path) -> None:
+        """Shepherd with stale heartbeat (>300s) should be abandoned."""
+        stale_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=600))
+        claim = ClaimInfo(
+            issue=42,
+            agent_id="shepherd-abc123",
+            claimed_at=_fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=900)),
+            expires_at="2099-01-01T00:00:00Z",
+            ttl_seconds=7200,
+        )
+        # Create progress file with stale heartbeat
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        (progress_dir / "shepherd-abc123.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "abc123",
+                    "issue": 42,
+                    "last_heartbeat": stale_time,
+                    "status": "working",
+                }
+            )
+        )
+        assert _is_claim_abandoned(mock_repo, claim) is True
+
+    def test_fresh_heartbeat_not_abandoned(self, mock_repo: pathlib.Path) -> None:
+        """Shepherd with recent heartbeat should NOT be abandoned."""
+        fresh_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=30))
+        claim = ClaimInfo(
+            issue=42,
+            agent_id="shepherd-def456",
+            claimed_at=_fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=120)),
+            expires_at="2099-01-01T00:00:00Z",
+            ttl_seconds=7200,
+        )
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        (progress_dir / "shepherd-def456.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "def456",
+                    "issue": 42,
+                    "last_heartbeat": fresh_time,
+                    "status": "working",
+                }
+            )
+        )
+        assert _is_claim_abandoned(mock_repo, claim) is False
+
+    def test_no_progress_file_old_claim_abandoned(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Shepherd with no progress file and old claim (>10min) is abandoned."""
+        old_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=900))
+        claim = ClaimInfo(
+            issue=42,
+            agent_id="shepherd-ghi789",
+            claimed_at=old_time,
+            expires_at="2099-01-01T00:00:00Z",
+            ttl_seconds=7200,
+        )
+        # No progress file created
+        assert _is_claim_abandoned(mock_repo, claim) is True
+
+    def test_no_progress_file_recent_claim_not_abandoned(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Shepherd with no progress file but recent claim (<10min) is NOT abandoned."""
+        recent_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=60))
+        claim = ClaimInfo(
+            issue=42,
+            agent_id="shepherd-jkl012",
+            claimed_at=recent_time,
+            expires_at="2099-01-01T00:00:00Z",
+            ttl_seconds=7200,
+        )
+        assert _is_claim_abandoned(mock_repo, claim) is False
+
+
+class TestClaimStealing:
+    """Integration tests for claim stealing via stale heartbeat detection."""
+
+    def test_steal_claim_from_dead_shepherd(self, mock_repo: pathlib.Path) -> None:
+        """A new shepherd should be able to steal a claim from a dead one."""
+        stale_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=600))
+        claim_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=900))
+
+        # Create claim by dead shepherd
+        claim_dir = mock_repo / ".loom" / "claims" / "issue-42.lock"
+        claim_dir.mkdir(parents=True)
+        (claim_dir / "claim.json").write_text(
+            json.dumps(
+                {
+                    "issue": 42,
+                    "agent_id": "shepherd-dead123",
+                    "claimed_at": claim_time,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "ttl_seconds": 7200,
+                }
+            )
+        )
+
+        # Create stale progress file
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        (progress_dir / "shepherd-dead123.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "dead123",
+                    "issue": 42,
+                    "last_heartbeat": stale_time,
+                    "status": "working",
+                }
+            )
+        )
+
+        # New shepherd should be able to claim the issue
+        result = claim_issue(mock_repo, 42, "shepherd-new456", 7200)
+        assert result == 0
+
+        # Verify new agent owns the claim
+        claim_file = claim_dir / "claim.json"
+        data = json.loads(claim_file.read_text())
+        assert data["agent_id"] == "shepherd-new456"
+
+    def test_cannot_steal_from_active_shepherd(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """A new shepherd should NOT steal a claim from an active one."""
+        fresh_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=30))
+        claim_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=120))
+
+        # Create claim by active shepherd
+        claim_dir = mock_repo / ".loom" / "claims" / "issue-42.lock"
+        claim_dir.mkdir(parents=True)
+        (claim_dir / "claim.json").write_text(
+            json.dumps(
+                {
+                    "issue": 42,
+                    "agent_id": "shepherd-active789",
+                    "claimed_at": claim_time,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "ttl_seconds": 7200,
+                }
+            )
+        )
+
+        # Create fresh progress file
+        progress_dir = mock_repo / ".loom" / "progress"
+        progress_dir.mkdir(parents=True, exist_ok=True)
+        (progress_dir / "shepherd-active789.json").write_text(
+            json.dumps(
+                {
+                    "task_id": "active789",
+                    "issue": 42,
+                    "last_heartbeat": fresh_time,
+                    "status": "working",
+                }
+            )
+        )
+
+        # New shepherd should be blocked
+        result = claim_issue(mock_repo, 42, "shepherd-intruder", 7200)
+        assert result == 1
+
+    def test_steal_claim_no_progress_file_old(
+        self, mock_repo: pathlib.Path
+    ) -> None:
+        """Can steal a claim when there's no progress file and claim is >10min old."""
+        old_time = _fmt_ts(datetime.now(timezone.utc) - timedelta(seconds=900))
+
+        # Create old claim with no progress file
+        claim_dir = mock_repo / ".loom" / "claims" / "issue-42.lock"
+        claim_dir.mkdir(parents=True)
+        (claim_dir / "claim.json").write_text(
+            json.dumps(
+                {
+                    "issue": 42,
+                    "agent_id": "shepherd-vanished",
+                    "claimed_at": old_time,
+                    "expires_at": "2099-01-01T00:00:00Z",
+                    "ttl_seconds": 7200,
+                }
+            )
+        )
+
+        # Should be able to steal
+        result = claim_issue(mock_repo, 42, "shepherd-replacement", 7200)
+        assert result == 0
