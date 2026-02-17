@@ -37,6 +37,12 @@ MULTIPLIER="${LOOM_BACKOFF_MULTIPLIER:-2}"
 # How long to wait after detecting an API error pattern before killing claude
 API_ERROR_IDLE_TIMEOUT="${LOOM_API_ERROR_IDLE_TIMEOUT:-60}"
 
+# Startup health monitor configuration
+# How long (seconds) to watch early output for MCP/plugin failures
+STARTUP_MONITOR_WINDOW="${LOOM_STARTUP_MONITOR_WINDOW:-90}"
+# Grace period (seconds) after detecting startup failure before killing
+STARTUP_GRACE_PERIOD="${LOOM_STARTUP_GRACE_PERIOD:-10}"
+
 # Terminal identification for stop signals
 TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
 # Note: WORKSPACE may fail if CWD is invalid at startup - recover_cwd handles this
@@ -397,6 +403,8 @@ is_transient_error() {
         "temporarily unavailable"
         "MCP server failed"
         "MCP.*failed"
+        "plugins failed"
+        "plugin.*failed to install"
     )
 
     for pattern in "${patterns[@]}"; do
@@ -497,6 +505,74 @@ stop_output_monitor() {
     fi
 }
 
+# Monitor early CLI output for MCP/plugin startup failures.
+# If the CLI starts with failed MCP servers or plugins, it often runs in a
+# degraded state (stuck in thinking loops with no meaningful tool calls) rather
+# than crashing.  This monitor watches the first STARTUP_MONITOR_WINDOW seconds
+# of output for failure indicators and kills the CLI session so the retry loop
+# can restart it cleanly.
+#
+# Arguments: $1 = output file path, $2 = PID file path to write monitor PID
+start_startup_monitor() {
+    local output_file="$1"
+    local monitor_pid_file="$2"
+
+    (
+        local check_interval=5
+        local elapsed=0
+
+        while [[ "${elapsed}" -lt "${STARTUP_MONITOR_WINDOW}" ]]; do
+            sleep "${check_interval}"
+            elapsed=$((elapsed + check_interval))
+
+            # Exit if output file is gone (session ended)
+            if [[ ! -f "${output_file}" ]]; then
+                break
+            fi
+
+            # Check first 50 lines for startup failure patterns
+            local head_content
+            head_content=$(head -50 "${output_file}" 2>/dev/null || echo "")
+
+            if [[ -z "${head_content}" ]]; then
+                continue
+            fi
+
+            local found_failure=false
+            local matched_pattern=""
+            for pattern in \
+                "MCP server failed" \
+                "MCP servers failed" \
+                "plugins failed to install" \
+                "plugins failed" \
+                "plugin failed to install" \
+                "plugin failed"; do
+                if echo "${head_content}" | grep -qi "${pattern}" 2>/dev/null; then
+                    found_failure=true
+                    matched_pattern="${pattern}"
+                    break
+                fi
+            done
+
+            if [[ "${found_failure}" == "true" ]]; then
+                log_warn "Startup monitor: detected '${matched_pattern}' in early output"
+                log_warn "Startup monitor: waiting ${STARTUP_GRACE_PERIOD}s grace period before kill"
+                sleep "${STARTUP_GRACE_PERIOD}"
+
+                # Re-check: if output file is gone, session already ended
+                if [[ ! -f "${output_file}" ]]; then
+                    break
+                fi
+
+                log_warn "Startup monitor: killing degraded CLI session for retry"
+                pkill -INT -P $$ -f "claude" 2>/dev/null || true
+                break
+            fi
+        done
+    ) &
+    echo $! > "${monitor_pid_file}"
+}
+
 # Calculate wait time with exponential backoff
 calculate_wait_time() {
     local attempt="$1"
@@ -564,6 +640,10 @@ run_with_retry() {
         local monitor_pid_file
         monitor_pid_file=$(mktemp)
 
+        # Start startup health monitor to detect MCP/plugin failures in early output
+        local startup_monitor_pid_file
+        startup_monitor_pid_file=$(mktemp)
+
         # Run claude with all arguments passed to wrapper
         # Use macOS `script` to preserve TTY (so Claude CLI sees isatty(stdout) = true)
         # while still capturing output to a file. A plain pipe (`| tee`) would replace
@@ -571,6 +651,7 @@ run_with_retry() {
         # Falls back to direct execution when no TTY is available (e.g., when spawned
         # from Claude Code's Bash tool rather than a tmux terminal).
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
+        start_startup_monitor "${temp_output}" "${startup_monitor_pid_file}"
         # Write sentinel marker so _is_instant_exit() in the shepherd can
         # distinguish wrapper pre-flight output from actual Claude CLI output.
         # The "# " prefix means it is also filtered as a header line.
@@ -596,6 +677,7 @@ run_with_retry() {
         fi
         set -e
         stop_output_monitor "${monitor_pid_file}"
+        stop_output_monitor "${startup_monitor_pid_file}"
 
         output=$(cat "${temp_output}")
         rm -f "${temp_output}"
