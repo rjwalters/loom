@@ -1,5 +1,3 @@
-#!/usr/bin/env node
-
 /**
  * Loom MCP Server - Unified Model Context Protocol server for Loom
  *
