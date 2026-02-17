@@ -2041,6 +2041,101 @@ def _cleanup_labels_on_failure(ctx: ShepherdContext, exit_code: int) -> None:
         except Exception:
             pass
 
+        # Post a diagnostic comment so operators know why the issue was recycled.
+        # Without this comment, failures are invisible — the issue silently
+        # returns to the ready pool with no record of what went wrong.
+        _post_fallback_failure_comment(ctx, exit_code)
+
+        # Track repeated fallback failures via the systematic failure detector
+        # so escalation happens after N consecutive recycling events.
+        _record_fallback_failure(ctx, exit_code)
+
+
+def _post_fallback_failure_comment(ctx: ShepherdContext, exit_code: int) -> None:
+    """Post a diagnostic comment when the fallback cleanup path fires.
+
+    This makes silent recycling visible: operators can see *why* the issue
+    was returned to the ready pool and distinguish infrastructure failures
+    (auth/API) from implementation failures.
+
+    Best-effort — never raises.
+    """
+    import subprocess
+
+    from loom_tools.shepherd.exit_codes import describe_exit_code
+
+    issue = ctx.config.issue
+
+    # Distinguish infrastructure failures from implementation failures
+    if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
+        failure_type = "infrastructure failure (auth/API)"
+        advice = (
+            "This is an **infrastructure failure**, not an issue with the code. "
+            "Check authentication tokens and API availability before retrying."
+        )
+    else:
+        failure_type = "unexpected failure"
+        advice = (
+            "If this issue fails repeatedly, it may need manual investigation "
+            "or more detailed implementation guidance."
+        )
+
+    comment_body = (
+        f"**Shepherd fallback cleanup**: The builder phase did not produce a PR "
+        f"and no specific failure handler ran. The issue has been returned to the "
+        f"ready pool.\n\n"
+        f"**Exit code**: {exit_code} ({describe_exit_code(exit_code)})\n"
+        f"**Failure type**: {failure_type}\n\n"
+        f"{advice}"
+    )
+
+    try:
+        subprocess.run(
+            [
+                "gh", "issue", "comment", str(issue),
+                "--body", comment_body,
+            ],
+            cwd=ctx.repo_root,
+            capture_output=True,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def _record_fallback_failure(ctx: ShepherdContext, exit_code: int) -> None:
+    """Record failure metadata when the fallback cleanup path fires.
+
+    Feeds into the systematic failure detector so repeated fallback
+    recycling triggers escalation.
+
+    Best-effort — never raises.
+    """
+    from loom_tools.common.systematic_failure import (
+        detect_systematic_failure,
+        record_blocked_reason,
+    )
+
+    # Classify the failure based on exit code
+    if exit_code == ShepherdExitCode.SYSTEMIC_FAILURE:
+        error_class = "auth_infrastructure_failure"
+        details = "Builder failed due to auth/API infrastructure issue (fallback cleanup)"
+    else:
+        error_class = "builder_unknown_failure"
+        details = f"Builder failed without specific handler (exit code {exit_code}, fallback cleanup)"
+
+    try:
+        record_blocked_reason(
+            ctx.repo_root,
+            ctx.config.issue,
+            error_class=error_class,
+            phase="builder",
+            details=details,
+        )
+        detect_systematic_failure(ctx.repo_root)
+    except Exception:
+        pass
+
 
 def main(argv: list[str] | None = None) -> int:
     """Main entry point for loom-shepherd CLI."""
