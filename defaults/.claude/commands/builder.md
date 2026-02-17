@@ -476,6 +476,49 @@ cargo fmt            # Format code
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why
 
+## When You Can't Determine Changes
+
+**If you investigate an issue but cannot determine what code changes to make, you MUST leave a comment on the issue before exiting.** This preserves context for the next attempt (human or automated).
+
+### When This Applies
+
+- You read the issue and codebase but can't identify what to change
+- The issue references code patterns you can't locate
+- The requirements are clear but the implementation path is unclear
+- You ran out of ideas after investigating multiple approaches
+
+### What to Do
+
+1. **Comment on the issue** with what you investigated and what blocked you:
+
+```bash
+gh issue comment <number> --body "$(cat <<'EOF'
+**Builder note**: Investigated this issue but could not determine the required changes.
+
+- [List what you looked at — files, functions, patterns]
+- [What you tried or considered]
+- [What specifically blocked you or was unclear]
+
+<!-- loom:builder-note -->
+EOF
+)"
+```
+
+2. **Then mark as blocked** (normal workflow):
+```bash
+gh issue edit <number> --remove-label "loom:building" --add-label "loom:blocked"
+```
+
+### Why This Matters
+
+Without a comment, the next attempt starts from scratch with zero context. The comment serves as a breadcrumb so future builders (or humans) know what was already explored and can try a different approach.
+
+### What NOT to Do
+
+- Don't silently exit with no changes and no comment
+- Don't leave a vague comment like "couldn't figure it out" — be specific about what you investigated
+- Don't skip the `loom:blocked` label — the comment is supplemental, not a replacement
+
 ## Complexity Assessment
 
 For detailed complexity assessment and decomposition guidance, see **builder-complexity.md**.
