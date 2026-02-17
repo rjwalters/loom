@@ -14,6 +14,7 @@ from loom_tools.common.github import gh_issue_view, gh_list
 from loom_tools.common.paths import LoomPaths, NamingConventions
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import read_json_file
+from loom_tools.common.time_utils import elapsed_seconds
 from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.errors import (
     IssueBlockedError,
@@ -22,6 +23,13 @@ from loom_tools.shepherd.errors import (
     IssueNotFoundError,
 )
 from loom_tools.shepherd.labels import LabelCache, remove_issue_label
+
+# Heartbeats fresher than this (in seconds) indicate a live shepherd.
+# agent-wait-bg.sh sends heartbeats every 60s, so 300s gives ~5 missed
+# heartbeats before we consider the shepherd dead.
+_HEARTBEAT_FRESH_THRESHOLD = int(
+    os.environ.get("LOOM_HEARTBEAT_STALE_THRESHOLD", "300")
+)
 
 
 @dataclass
@@ -61,6 +69,10 @@ class ShepherdContext:
         When a new shepherd starts for an issue that already has a progress
         file (from a previous crashed/orphaned run), remove it to prevent
         stale data from interfering with the new run.
+
+        Files with a fresh heartbeat (< ``_HEARTBEAT_FRESH_THRESHOLD``
+        seconds old) are left intact because they likely belong to a
+        shepherd that is still actively running.
         """
         logger = logging.getLogger(__name__)
         if not self._paths.progress_dir.is_dir():
@@ -78,6 +90,26 @@ class ShepherdContext:
             # Don't remove our own progress file (matched by task_id)
             if data.get("task_id") == self.config.task_id:
                 continue
+
+            # Don't remove files with fresh heartbeats — another shepherd
+            # is likely still running.
+            last_hb = data.get("last_heartbeat", "")
+            if last_hb:
+                try:
+                    age = elapsed_seconds(last_hb)
+                    if age < _HEARTBEAT_FRESH_THRESHOLD:
+                        logger.info(
+                            "Skipping progress file %s for issue #%s — "
+                            "heartbeat is fresh (%ds old, threshold %ds)",
+                            progress_file.name,
+                            issue,
+                            age,
+                            _HEARTBEAT_FRESH_THRESHOLD,
+                        )
+                        continue
+                except (ValueError, OverflowError):
+                    # Unparseable timestamp — treat as stale
+                    pass
 
             logger.info(
                 "Removing stale progress file %s for issue #%s (task_id: %s)",
