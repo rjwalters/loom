@@ -3587,6 +3587,162 @@ class TestBuilderBaselineTests:
             assert mock_run.call_count == 1
 
 
+class TestBuilderBaselineSkipOnHealthyPreflight:
+    """Tests for skipping baseline when preflight confirms main is healthy."""
+
+    def test_skips_baseline_when_preflight_healthy(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return None immediately without spawning subprocess."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+        mock_context.preflight_baseline_status = "healthy"
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is None
+        mock_run.assert_not_called()
+
+    def test_runs_baseline_when_preflight_unknown(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should run baseline normally when preflight status is unknown."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+        mock_context.preflight_baseline_status = "unknown"
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok\n", stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ) as mock_run,
+            patch.object(builder, "_get_dirty_files", return_value=set()),
+            patch.object(builder, "_cleanup_new_artifacts"),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is not None
+        mock_run.assert_called_once()
+
+    def test_runs_baseline_when_preflight_failing(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should run baseline normally when preflight status is failing."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+        mock_context.preflight_baseline_status = "failing"
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="FAIL\n", stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ) as mock_run,
+            patch.object(builder, "_get_dirty_files", return_value=set()),
+            patch.object(builder, "_cleanup_new_artifacts"),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is not None
+        mock_run.assert_called_once()
+
+    def test_runs_baseline_when_preflight_none(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should run baseline normally when preflight was skipped (None)."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+        mock_context.preflight_baseline_status = None
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok\n", stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ) as mock_run,
+            patch.object(builder, "_get_dirty_files", return_value=set()),
+            patch.object(builder, "_cleanup_new_artifacts"),
+        ):
+            result = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        assert result is not None
+        mock_run.assert_called_once()
+
+    def test_worktree_failure_treated_as_new_when_baseline_skipped(
+        self, mock_context: MagicMock
+    ) -> None:
+        """With healthy preflight, worktree test failure should be treated as new."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+        mock_context.worktree_path = MagicMock()
+        mock_context.worktree_path.is_dir.return_value = True
+        mock_context.preflight_baseline_status = "healthy"
+        mock_context.config.test_verify_timeout = 300
+
+        worktree_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="FAIL src/bad.test.ts\n1 failed, 2 passed\n",
+            stderr="",
+        )
+        with (
+            patch.object(builder, "_run_baseline_tests", return_value=None),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=worktree_result,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder._build_worktree_env",
+                return_value={},
+            ),
+        ):
+            result = builder._run_single_test_with_baseline(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+
+        # Should return a failure result (not None which means "pass or pre-existing")
+        assert result is not None
+        assert result.status == PhaseStatus.FAILED
+
+
 class TestBuilderExtractErrorLines:
     """Test builder phase error line extraction."""
 

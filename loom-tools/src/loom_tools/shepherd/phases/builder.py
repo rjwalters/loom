@@ -2181,6 +2181,15 @@ class BuilderPhase:
         if not ctx.repo_root or not ctx.repo_root.is_dir():
             return None
 
+        # Skip baseline when preflight already confirmed main is healthy.
+        # Returning None tells the comparison logic to treat any worktree
+        # failure as genuinely new, which is correct when main is known-good.
+        if ctx.preflight_baseline_status == "healthy":
+            log_info(
+                f"Skipping baseline (preflight confirmed healthy): {display_name}"
+            )
+            return None
+
         if use_provided_cmd:
             baseline_cmd = test_cmd
         else:

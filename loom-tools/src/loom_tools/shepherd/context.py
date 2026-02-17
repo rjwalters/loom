@@ -56,6 +56,10 @@ class ShepherdContext:
     # Low-output cause classification (set by run_phase_with_retry)
     last_low_output_cause: str | None = field(default=None, init=False)
 
+    # Preflight baseline status (set by orchestrator after preflight phase).
+    # "healthy" means baseline tests pass and builder can skip re-running them.
+    preflight_baseline_status: str | None = field(default=None, init=False)
+
     # Progress tracking state
     _progress_initialized: bool = field(default=False, init=False, repr=False)
 
