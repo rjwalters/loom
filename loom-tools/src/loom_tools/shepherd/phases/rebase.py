@@ -10,6 +10,18 @@ from loom_tools.shepherd.labels import add_pr_label, remove_pr_label
 from loom_tools.shepherd.phases.base import BasePhase, PhaseResult
 
 
+def _is_pr_merged(pr_number: int, repo_root: str | None) -> bool:
+    """Check if a PR is already merged via ``gh pr view``."""
+    result = subprocess.run(
+        ["gh", "pr", "view", str(pr_number), "--json", "state", "--jq", ".state"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.strip() == "MERGED"
+
+
 class RebasePhase(BasePhase):
     """Phase 5.5: Rebase — Update feature branch onto main before merge."""
 
@@ -52,6 +64,15 @@ class RebasePhase(BasePhase):
         if success:
             # Force-push the rebased branch
             if not force_push_branch(cwd=cwd):
+                # Check if the PR was already merged (e.g., by Champion)
+                # before declaring failure — force-push to a merged branch
+                # is expected to fail and is not an error.
+                if ctx.pr_number is not None and _is_pr_merged(
+                    ctx.pr_number, ctx.repo_root
+                ):
+                    return self.success(
+                        f"force-push failed but PR #{ctx.pr_number} is already merged"
+                    )
                 return self.failed(
                     "rebase succeeded but force-push failed",
                     {"reason": "push_failed"},

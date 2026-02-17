@@ -10,7 +10,7 @@ import pytest
 from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import PhaseStatus
-from loom_tools.shepherd.phases.rebase import RebasePhase
+from loom_tools.shepherd.phases.rebase import RebasePhase, _is_pr_merged
 
 
 @pytest.fixture
@@ -176,11 +176,71 @@ class TestRebasePhase:
                 "loom_tools.shepherd.phases.rebase.force_push_branch",
                 return_value=False,
             ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_merged",
+                return_value=False,
+            ),
         ):
             result = phase.run(mock_context)
 
         assert result.status == PhaseStatus.FAILED
         assert "push_failed" in result.data.get("reason", "")
+
+    def test_force_push_failure_but_pr_already_merged(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When force-push fails but PR is already merged, should return SUCCESS."""
+        phase = RebasePhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.rebase.is_branch_behind", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.attempt_rebase",
+                return_value=(True, ""),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.force_push_branch",
+                return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_merged",
+                return_value=True,
+            ),
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "already merged" in result.message
+
+    def test_force_push_failure_no_pr_number_skips_merged_check(
+        self, mock_context: MagicMock
+    ) -> None:
+        """When force-push fails with no PR number, should FAIL without merged check."""
+        mock_context.pr_number = None
+        phase = RebasePhase()
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.rebase.is_branch_behind", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.attempt_rebase",
+                return_value=(True, ""),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase.force_push_branch",
+                return_value=False,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.rebase._is_pr_merged",
+            ) as mock_merged,
+        ):
+            result = phase.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        mock_merged.assert_not_called()
 
     def test_no_pr_number_skips_label_operations(
         self, mock_context: MagicMock
@@ -290,3 +350,31 @@ class TestRebasePhaseValidate:
         mock_context.worktree_path = None
         phase = RebasePhase()
         assert phase.validate(mock_context) is False
+
+
+class TestIsPrMerged:
+    """Tests for the _is_pr_merged helper."""
+
+    def test_returns_true_when_merged(self) -> None:
+        """Should return True when gh reports MERGED."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="MERGED\n")
+            assert _is_pr_merged(100, "/fake/repo") is True
+
+    def test_returns_false_when_open(self) -> None:
+        """Should return False when gh reports OPEN."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="OPEN\n")
+            assert _is_pr_merged(100, "/fake/repo") is False
+
+    def test_returns_false_when_closed(self) -> None:
+        """Should return False when gh reports CLOSED."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="CLOSED\n")
+            assert _is_pr_merged(100, "/fake/repo") is False
+
+    def test_returns_false_on_empty_output(self) -> None:
+        """Should return False when gh returns empty output."""
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="")
+            assert _is_pr_merged(100, "/fake/repo") is False
