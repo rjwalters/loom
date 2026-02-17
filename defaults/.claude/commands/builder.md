@@ -315,6 +315,23 @@ You can read the current checkpoint:
 ./.loom/scripts/checkpoint.sh read --json  # For programmatic use
 ```
 
+## Signaling "No Changes Needed"
+
+If after analyzing the issue you determine that **no code changes are required** (e.g. the bug is already fixed on main, the feature already exists, the issue is invalid), you **MUST** create a `.no-changes-needed` marker file in the worktree root before exiting:
+
+```bash
+echo "Bug is already fixed on main — verified by running the test suite" > .no-changes-needed
+```
+
+The marker file should contain a brief explanation of why no changes are needed.
+
+**Why this matters:** Without this marker file, the shepherd cannot distinguish between "builder deliberately decided no changes are needed" and "builder crashed/was killed before doing anything." An empty worktree without the marker is treated as a builder failure, not a deliberate decision.
+
+**Do NOT create this file if:**
+- You made code changes (even if you later reverted them)
+- You're unsure whether changes are needed
+- You ran out of time or hit an error before completing analysis
+
 ## Reading Issues: ALWAYS Read Comments First
 
 **CRITICAL:** Curator adds implementation guidance in comments (and sometimes amends descriptions). You MUST read both the issue body AND all comments before starting work.

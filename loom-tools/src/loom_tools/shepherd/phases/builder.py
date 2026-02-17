@@ -80,6 +80,13 @@ _IMPLEMENTATION_TOOL_RE = re.compile("|".join(_IMPLEMENTATION_TOOL_PATTERNS))
 # Below this, even with tool patterns, the session may not have done real work.
 _SUBSTANTIVE_OUTPUT_MIN_CHARS = 2000
 
+# Minimum CLI output (chars) to believe the builder actually analyzed an issue
+# and intentionally decided "no changes needed."  A builder that exits with
+# near-zero output was degraded/failed, not making an analytical conclusion.
+# Set lower than _SUBSTANTIVE_OUTPUT_MIN_CHARS because analysis (Read/Grep)
+# produces less output than implementation (Edit/Write).
+_MIN_ANALYSIS_OUTPUT_CHARS = 500
+
 # File extensions mapped to language categories for scoped test verification
 _LANGUAGE_EXTENSIONS: dict[str, str] = {
     # Python
@@ -2908,6 +2915,18 @@ class BuilderPhase:
         )
 
         if has_any_work:
+            return False
+
+        # Session quality gate: if the builder log shows too little output,
+        # the session was degraded/failed and never actually analyzed the issue.
+        # Don't mistake a failed session for "no changes needed."  (Issue #2436)
+        cli_output_len = diag.get("log_cli_output_length", 0)
+        if cli_output_len < _MIN_ANALYSIS_OUTPUT_CHARS:
+            log_warning(
+                f"Builder session too short to conclude 'no changes needed' "
+                f"({cli_output_len} chars of output, minimum "
+                f"{_MIN_ANALYSIS_OUTPUT_CHARS}) — treating as builder failure"
+            )
             return False
 
         # No git artifacts — but check the builder log for signs of
