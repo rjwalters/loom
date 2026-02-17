@@ -90,6 +90,11 @@ MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 # that will NOT resolve with retries.  When detected after an instant-exit
 # or MCP failure, the shepherd should abort immediately instead of wasting
 # time on futile retry cycles.  See issue #2521.
+#
+# Note: check_auth_status() logs at [WARN] level (issue #2541), so only
+# the fatal caller path emits [ERROR].  The primary active pattern here is
+# "Authentication pre-flight check failed" (from run_preflight_checks).
+# Other auth patterns are retained as defense-in-depth.
 SYSTEMIC_FAILURE_PATTERNS = [
     re.compile(r"\[ERROR\]\s*Authentication check timed out", re.IGNORECASE),
     re.compile(r"\[ERROR\]\s*Authentication pre-flight check failed", re.IGNORECASE),

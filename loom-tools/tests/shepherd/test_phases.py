@@ -14025,7 +14025,7 @@ class TestIsAuthFailure:
         log.write_text(
             "# Loom Agent Log\n"
             "[INFO] Running pre-flight checks...\n"
-            "[ERROR] Authentication check timed out after 3 attempts\n"
+            "[WARN] Authentication check timed out after 3 attempts\n"
             "[ERROR] Authentication pre-flight check failed\n"
             "# AUTH_PREFLIGHT_FAILED\n"
         )
@@ -14041,7 +14041,7 @@ class TestIsAuthFailure:
         assert _is_auth_failure(log) is True
 
     def test_pattern_fallback_auth_timed_out(self, tmp_path: Path) -> None:
-        """Auth failure detected via error pattern when sentinel is absent."""
+        """[ERROR] auth timeout still detected via pattern (defense-in-depth)."""
         log = tmp_path / "test.log"
         log.write_text(
             "# Loom Agent Log\n"
@@ -14075,6 +14075,38 @@ class TestIsAuthFailure:
             "[ERROR] Authentication check failed\n"
         )
         assert _is_auth_failure(log) is True
+
+    def test_warn_auth_timeout_not_classified(self, tmp_path: Path) -> None:
+        """[WARN] auth timeout (from check_auth_status) is NOT a systemic failure.
+
+        After issue #2541, check_auth_status() logs at [WARN] level.  Only the
+        fatal caller path emits [ERROR], so [WARN] messages should not trigger
+        _is_auth_failure().
+        """
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[WARN] Authentication check timed out after 3 attempts\n"
+        )
+        assert _is_auth_failure(log) is False
+
+    def test_warn_auth_check_failed_not_classified(self, tmp_path: Path) -> None:
+        """[WARN] auth check failed (from check_auth_status) is NOT a systemic failure."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[WARN] Authentication check failed: not logged in\n"
+        )
+        assert _is_auth_failure(log) is False
+
+    def test_warn_auth_command_failed_not_classified(self, tmp_path: Path) -> None:
+        """[WARN] auth command failed (from check_auth_status) is NOT a systemic failure."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[WARN] Authentication check command failed (exit 1)\n"
+        )
+        assert _is_auth_failure(log) is False
 
     def test_no_false_positive_on_similar_text(self, tmp_path: Path) -> None:
         """Non-error messages containing similar words should not match."""
