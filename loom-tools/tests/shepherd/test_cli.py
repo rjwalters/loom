@@ -1715,6 +1715,156 @@ class TestJudgeRetry:
 
     @patch("loom_tools.shepherd.cli.MergePhase")
     @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_infrastructure_failure_adds_backoff_before_retry(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Infrastructure failures (low_output, mcp_failure, ghost_session) should
+        trigger backoff sleep before judge retry.  See issue #2666."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (infrastructure failure)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Judge attempt 2 (succeeds)
+            10,    # judge phase_start
+            20,    # judge elapsed
+            # Merge
+            20,   # rebase phase_start
+            20,   # rebase elapsed (0s, skipped)
+            20,    # merge phase_start
+            25,    # merge elapsed
+            25,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: first call fails with low_output infrastructure flag,
+        # second call succeeds
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="judge low output after retry",
+                phase_name="judge",
+                data={"low_output": True},
+            ),
+            _success_result("judge", approved=True),
+        ]
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Verify backoff sleep was called (30s for first retry)
+        sleep_calls = mock_time.sleep.call_args_list
+        assert any(c[0][0] == 30 for c in sleep_calls), (
+            f"Expected 30s backoff sleep for infrastructure failure, "
+            f"got: {sleep_calls}"
+        )
+
+        # Verify heartbeat milestone reported the backoff
+        heartbeat_calls = [
+            c for c in ctx.report_milestone.call_args_list
+            if c[0][0] == "heartbeat"
+            and "infrastructure backoff" in c.kwargs.get("action", "")
+        ]
+        assert len(heartbeat_calls) == 1
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
+    @patch("loom_tools.shepherd.cli.JudgePhase")
+    @patch("loom_tools.shepherd.cli.BuilderPhase")
+    @patch("loom_tools.shepherd.cli.ApprovalPhase")
+    @patch("loom_tools.shepherd.cli.CuratorPhase")
+    @patch("loom_tools.shepherd.cli.time")
+    def test_non_infrastructure_failure_no_backoff(
+        self,
+        mock_time: MagicMock,
+        MockCurator: MagicMock,
+        MockApproval: MagicMock,
+        MockBuilder: MagicMock,
+        MockJudge: MagicMock,
+        MockRebase: MagicMock,
+        MockMerge: MagicMock,
+    ) -> None:
+        """Non-infrastructure judge failures should NOT add backoff sleep.
+        See issue #2666."""
+        mock_time.time = MagicMock(side_effect=[
+            0,     # start_time
+            0,     # approval phase_start
+            5,     # approval elapsed
+            # Judge attempt 1 (non-infra failure)
+            5,     # judge phase_start
+            10,    # judge elapsed
+            # Judge attempt 2 (succeeds)
+            10,    # judge phase_start
+            20,    # judge elapsed
+            # Merge
+            20,   # rebase phase_start
+            20,   # rebase elapsed (0s, skipped)
+            20,    # merge phase_start
+            25,    # merge elapsed
+            25,    # duration calc
+        ])
+
+        ctx = _make_ctx(start_from=Phase.BUILDER)
+
+        curator_inst = MockCurator.return_value
+        curator_inst.should_skip.return_value = (True, "skipped via --from")
+        MockApproval.return_value.run.return_value = _success_result("approval")
+        builder_inst = MockBuilder.return_value
+        builder_inst.should_skip.return_value = (True, "skipped via --from")
+
+        # Judge: first call fails with NO infrastructure flags, second succeeds
+        judge_inst = MockJudge.return_value
+        judge_inst.should_skip.return_value = (False, "")
+        judge_inst.run.side_effect = [
+            _failed_result("judge", "validation failed"),
+            _success_result("judge", approved=True),
+        ]
+
+        MockRebase.return_value.run.return_value = PhaseResult(
+            status=PhaseStatus.SKIPPED, message="up to date", phase_name="rebase"
+        )
+        MockMerge.return_value.run.return_value = _success_result("merge", merged=True)
+
+        result = orchestrate(ctx)
+        assert result == 0
+
+        # Verify NO backoff sleep was called (non-infrastructure failure)
+        sleep_calls = mock_time.sleep.call_args_list
+        assert not any(c[0][0] >= 30 for c in sleep_calls), (
+            f"Expected no infrastructure backoff for non-infra failure, "
+            f"got: {sleep_calls}"
+        )
+
+    @patch("loom_tools.shepherd.cli.MergePhase")
+    @patch("loom_tools.shepherd.cli.RebasePhase")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")

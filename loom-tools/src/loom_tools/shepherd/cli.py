@@ -915,6 +915,11 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         max_retries=ctx.config.judge_max_retries,
                         reason=result.message,
                     )
+                    # Backoff for infrastructure failures (issue #2666).
+                    # When the failure is due to low output, MCP failure,
+                    # or ghost session, the underlying issue is persistent
+                    # and rapid retrying just hits the same problem.
+                    _judge_retry_backoff(ctx, result, judge_retries)
                     continue
                 else:
                     log_error(
@@ -1085,6 +1090,8 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         max_retries=ctx.config.judge_max_retries,
                         reason=result.message,
                     )
+                    # Backoff for infrastructure failures (issue #2666).
+                    _judge_retry_backoff(ctx, result, judge_retries)
                     continue
                 else:
                     log_error(
@@ -1504,6 +1511,35 @@ def _mark_doctor_exhausted(
         capture_output=True,
         check=False,
     )
+
+
+def _judge_retry_backoff(
+    ctx: ShepherdContext,
+    result: PhaseResult,
+    judge_retries: int,
+) -> None:
+    """Apply backoff before judge retry when failure is infrastructure-related.
+
+    Infrastructure failures (low output, MCP failure, ghost session) are
+    persistent — rapid retrying just hits the same problem.  Adding backoff
+    gives transient issues time to resolve (e.g., MCP server restart, plugin
+    recovery).  See issue #2666.
+    """
+    is_infrastructure = (
+        result.data.get("low_output")
+        or result.data.get("mcp_failure")
+        or result.data.get("ghost_session")
+    )
+    if is_infrastructure:
+        backoff = min(30 * judge_retries, 120)  # 30s, 60s, 120s
+        log_info(
+            f"Infrastructure failure detected, waiting {backoff}s before retry"
+        )
+        ctx.report_milestone(
+            "heartbeat",
+            action=f"judge infrastructure backoff {backoff}s before retry {judge_retries}",
+        )
+        time.sleep(backoff)
 
 
 def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
