@@ -651,6 +651,160 @@ class TestBuilderRecoveryFromUncommittedChanges:
 
 
 # ---------------------------------------------------------------------------
+# quiet mode (issue #2609)
+# ---------------------------------------------------------------------------
+
+
+class TestQuietModeSuppressesSideEffects:
+    """Tests that quiet=True suppresses diagnostic comments and label changes.
+
+    When the shepherd's retry loop calls validate_builder() on intermediate
+    attempts, quiet=True prevents noisy comments from accumulating on the
+    issue even if the shepherd later recovers (issue #2609).
+    """
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_builder_quiet_skips_comment_and_label(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path,
+    ):
+        """quiet=True should not post comments or change labels on failure."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        mock_find.return_value = None  # no PR
+        mock_run.return_value = _completed()
+        result = validate_builder(42, repo, worktree=None, quiet=True)
+        assert result.status == ValidationStatus.FAILED
+        # No subprocess calls should have been made (quiet skips _mark_phase_failed entirely)
+        mock_run.assert_not_called()
+
+    @patch("loom_tools.validate_phase._mark_phase_failed")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_builder_quiet_still_attempts_recovery(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_mark: MagicMock, tmp_path: Path,
+    ):
+        """quiet=True should still attempt mechanical recovery (stage/commit/push/PR)."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        mock_gh.side_effect = [
+            _completed(stdout="OPEN\n"),  # issue state
+            _completed(stdout="Fix the widget\n"),  # issue title for PR
+        ]
+        mock_find.return_value = None
+
+        recovery_calls = []
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout=" M src/file.py\n")
+            if "git" in cmd_str and "add" in cmd:
+                recovery_calls.append("git_add")
+                return _completed()
+            if "git" in cmd_str and "commit" in cmd:
+                recovery_calls.append("git_commit")
+                return _completed()
+            if "git" in cmd_str and "push" in cmd:
+                recovery_calls.append("git_push")
+                return _completed()
+            if "gh" in cmd_str and "pr" in cmd and "create" in cmd:
+                recovery_calls.append("pr_create")
+                return _completed(stdout="https://github.com/org/repo/pull/99\n")
+            return _completed()
+
+        with patch("loom_tools.validate_phase.subprocess.run", side_effect=side_effect_fn), \
+             patch("loom_tools.validate_phase._log_recovery_event"), \
+             patch("loom_tools.validate_phase._report_milestone"):
+            result = validate_builder(42, repo, worktree=str(wt), quiet=True)
+
+        # Recovery should have run the full mechanical pipeline
+        assert "git_add" in recovery_calls
+        assert "git_commit" in recovery_calls
+        assert "git_push" in recovery_calls
+        assert "pr_create" in recovery_calls
+        assert result.status == ValidationStatus.RECOVERED
+        # And _mark_phase_failed should NOT have been called
+        mock_mark.assert_not_called()
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._find_pr_for_issue")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_builder_quiet_recovery_failure_no_comment(
+        self, mock_gh: MagicMock, mock_find: MagicMock, mock_run: MagicMock, tmp_path: Path,
+    ):
+        """When recovery fails with quiet=True, no comment or label change should happen."""
+        repo = _make_repo(tmp_path)
+        wt = tmp_path / ".loom" / "worktrees" / "issue-42"
+        wt.mkdir(parents=True)
+        (wt / ".git").mkdir()
+
+        mock_gh.return_value = _completed(stdout="OPEN\n")
+        mock_find.return_value = None
+
+        gh_issue_comment_calls = []
+
+        def side_effect_fn(*args, **kwargs):
+            cmd = args[0] if args else kwargs.get("args", [])
+            cmd_str = " ".join(str(c) for c in cmd)
+            if "status" in cmd and "--porcelain" in cmd:
+                return _completed(stdout=" M src/file.py\n")
+            if "git" in cmd_str and "add" in cmd:
+                return _completed(returncode=1, stderr="fatal: error")
+            # Track any gh issue comment or edit calls
+            if "issue" in cmd_str and "comment" in cmd_str:
+                gh_issue_comment_calls.append(cmd)
+            if "issue" in cmd_str and "edit" in cmd_str:
+                gh_issue_comment_calls.append(cmd)
+            # For diagnostics gathering
+            if "rev-parse" in cmd_str:
+                return _completed(stdout="feature/issue-42\n")
+            if "rev-list" in cmd_str:
+                return _completed(stdout="0\n")
+            return _completed()
+
+        mock_run.side_effect = side_effect_fn
+
+        result = validate_builder(42, repo, worktree=str(wt), quiet=True)
+        assert result.status == ValidationStatus.FAILED
+        # No gh issue comment or edit calls should have been made
+        assert len(gh_issue_comment_calls) == 0
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_judge_quiet_skips_comment_and_label(
+        self, mock_gh: MagicMock, mock_run: MagicMock, tmp_path: Path,
+    ):
+        """Judge quiet=True should not post comments or change labels."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="loom:review-requested\n")
+        mock_run.return_value = _completed()
+        result = validate_judge(42, repo, pr_number=100, quiet=True)
+        assert result.status == ValidationStatus.FAILED
+        # No subprocess calls for gh issue comment/edit
+        mock_run.assert_not_called()
+
+    @patch("loom_tools.validate_phase.subprocess.run")
+    @patch("loom_tools.validate_phase._run_gh")
+    def test_doctor_quiet_skips_comment_and_label(
+        self, mock_gh: MagicMock, mock_run: MagicMock, tmp_path: Path,
+    ):
+        """Doctor quiet=True should not post comments or change labels."""
+        repo = _make_repo(tmp_path)
+        mock_gh.return_value = _completed(stdout="loom:pr\n")
+        mock_run.return_value = _completed()
+        result = validate_doctor(42, repo, pr_number=100, quiet=True)
+        assert result.status == ValidationStatus.FAILED
+        # No subprocess calls for gh issue comment/edit
+        mock_run.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # validate_judge
 # ---------------------------------------------------------------------------
 
