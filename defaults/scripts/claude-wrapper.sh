@@ -93,13 +93,34 @@ log_error() {
     echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [ERROR] $*" >&2
 }
 
+# Check whether pipe-pane already captured the CLI output by comparing
+# content fingerprints.  Normalizes both the new log portion and probe
+# lines from captured output by stripping non-alphanumeric chars, then
+# checks for substring match.  Handles garbled pipe-pane output where
+# terminal control characters are interleaved with actual text.  #2590.
+_pipe_pane_captured_content() {
+    local _pp_temp="$1" _pp_log="$2" _pp_growth="$3"
+    [[ $_pp_growth -le 0 ]] && return 1
+    local _pp_log_norm
+    _pp_log_norm=$(tail -n "$_pp_growth" "$_pp_log" 2>/dev/null | tr -cd '[:alnum:]' | head -c 5000)
+    [[ ${#_pp_log_norm} -lt 10 ]] && return 1
+    local _pp_probe
+    while IFS= read -r _pp_probe; do
+        _pp_probe=$(tr -cd '[:alnum:]' <<< "$_pp_probe")
+        [[ ${#_pp_probe} -lt 12 ]] && continue
+        [[ "$_pp_log_norm" == *"$_pp_probe"* ]] && return 0
+    done < <(grep -v '^[[:space:]]*$' "$_pp_temp" 2>/dev/null | grep -v '^#' | tail -20 | head -5)
+    return 1
+}
+
 # Flush tee-captured output to the log file on signal (issue #2586).
 # Called via trap when tmux kill-session sends SIGHUP/SIGTERM.  Without
 # this, the fallback append logic (lines after the CLI invocation) never
 # executes because the process is killed before reaching it.
 #
-# Uses sentinel-based detection and a conservative line-count ratio to
-# decide whether pipe-pane already captured the output.  See #2582.
+# Uses sentinel detection, content fingerprinting, and a conservative
+# line-count ratio to decide whether pipe-pane already captured output.
+# See #2582, #2590.
 _flush_output_on_signal() {
     # Only flush if we have the required state
     if [[ -z "$_FLUSH_TEMP_OUTPUT" ]] || [[ ! -s "$_FLUSH_TEMP_OUTPUT" ]]; then
@@ -117,15 +138,22 @@ _flush_output_on_signal() {
         _temp_lines=$(wc -l < "$_FLUSH_TEMP_OUTPUT" 2>/dev/null || echo "0")
         local _needs_append=true
         # Tier 1: If log contains the CLI start sentinel with content after
-        # it, pipe-pane was working — no fallback append needed.  #2582.
-        if grep -q "^# CLAUDE_CLI_START" "$_FLUSH_LOG_FILE" 2>/dev/null; then
+        # it, pipe-pane was working — no fallback append needed.
+        # Unanchored match handles garbled pipe-pane output.  #2582, #2590.
+        if grep -q "CLAUDE_CLI_START" "$_FLUSH_LOG_FILE" 2>/dev/null; then
             local _lines_after_sentinel
-            _lines_after_sentinel=$(sed -n '/^# CLAUDE_CLI_START/,$p' "$_FLUSH_LOG_FILE" 2>/dev/null | wc -l)
-            if [[ $_lines_after_sentinel -gt 3 ]]; then
+            _lines_after_sentinel=$(sed -n '/CLAUDE_CLI_START/,$p' "$_FLUSH_LOG_FILE" 2>/dev/null | wc -l)
+            if [[ $_lines_after_sentinel -gt 1 ]]; then
                 _needs_append=false
             fi
         fi
-        # Tier 2: Tightened from 50% to 25% threshold.  #2582.
+        # Tier 2: Content fingerprint — check if distinctive text from
+        # captured output already appears in the new log portion.  #2590.
+        if [[ "$_needs_append" == "true" ]] && \
+           _pipe_pane_captured_content "$_FLUSH_TEMP_OUTPUT" "$_FLUSH_LOG_FILE" "$_growth"; then
+            _needs_append=false
+        fi
+        # Tier 3: Conservative line-count ratio as safety net.  #2582.
         if [[ "$_needs_append" == "true" ]] && \
            [[ $_growth -lt $(( _temp_lines / 4 )) ]]; then
             cat "$_FLUSH_TEMP_OUTPUT" >> "$_FLUSH_LOG_FILE" 2>/dev/null || true
@@ -1009,12 +1037,9 @@ run_with_retry() {
         # Append captured output to the log file so log-based heuristics
         # (_is_low_output_session, _is_mcp_failure) have content to analyze
         # and post-mortem debugging is possible.  See issue #2550.
-        # Only append if pipe-pane did NOT already capture sufficient output
-        # (detected by comparing log line counts before/after CLI).  Issue #2569.
-        # Use a two-tier check: first, if the CLAUDE_CLI_START sentinel appears
-        # in the log with substantial content after it, pipe-pane was working
-        # and no fallback is needed (avoids multi-line block duplication).
-        # Second, use a conservative line-count ratio as a safety net.  #2582.
+        # Only append if pipe-pane did NOT already capture sufficient output.
+        # Three-tier detection: sentinel, content fingerprint, line-count.
+        # See #2569, #2582, #2590.
         if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID:-}" ]]; then
             if [[ -n "$_log_file" && -f "$_log_file" && -s "${temp_output}" ]]; then
                 local _post_log_lines
@@ -1023,20 +1048,23 @@ run_with_retry() {
                 local _temp_lines
                 _temp_lines=$(wc -l < "${temp_output}")
                 local _needs_append=true
-                # Tier 1: If the log already contains the CLI start sentinel
-                # with content after it, pipe-pane captured the output.  #2582.
-                if grep -q "^# CLAUDE_CLI_START" "$_log_file" 2>/dev/null; then
+                # Tier 1: If the log contains the CLI start sentinel with
+                # content after it, pipe-pane captured the output.
+                # Unanchored match handles garbled pipe-pane.  #2582, #2590.
+                if grep -q "CLAUDE_CLI_START" "$_log_file" 2>/dev/null; then
                     local _lines_after_sentinel
-                    _lines_after_sentinel=$(sed -n '/^# CLAUDE_CLI_START/,$p' "$_log_file" | wc -l)
-                    # More than just the sentinel line itself means pipe-pane
-                    # captured real CLI output — skip the fallback append.
-                    if [[ $_lines_after_sentinel -gt 3 ]]; then
+                    _lines_after_sentinel=$(sed -n '/CLAUDE_CLI_START/,$p' "$_log_file" | wc -l)
+                    if [[ $_lines_after_sentinel -gt 1 ]]; then
                         _needs_append=false
                     fi
                 fi
-                # Tier 2: Even without the sentinel check, only append if
-                # pipe-pane captured less than 25% of expected output.
-                # Tightened from 50% to reduce false positives.  #2582.
+                # Tier 2: Content fingerprint — normalize text and check if
+                # distinctive output already appears in the log.  #2590.
+                if [[ "$_needs_append" == "true" ]] && \
+                   _pipe_pane_captured_content "${temp_output}" "$_log_file" "$_log_growth"; then
+                    _needs_append=false
+                fi
+                # Tier 3: Conservative line-count ratio as safety net.  #2582.
                 if [[ "$_needs_append" == "true" ]] && \
                    [[ $_log_growth -lt $(( _temp_lines / 4 )) ]]; then
                     cat "${temp_output}" >> "$_log_file"
