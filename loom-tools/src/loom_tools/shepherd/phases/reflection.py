@@ -31,8 +31,7 @@ TITLE_PREFIX = "[shepherd-reflection]"
 # Label applied to reflection-filed issues (goes through normal triage pipeline)
 REFLECTION_ISSUE_LABEL = "loom:triage"
 
-# Duplicate detection: how recently closed issues block re-filing (days)
-DUPLICATE_RECENCY_DAYS = 7
+# Duplicate detection: only open issues block re-filing
 
 
 @dataclass
@@ -347,14 +346,12 @@ def _extract_error_context(log_content: str) -> str:
 def _is_recent_duplicate(
     issue: dict[str, Any], stable_title: str
 ) -> bool:
-    """Check if an existing issue is a recent duplicate.
+    """Check if an existing issue is a duplicate.
 
-    An issue is a duplicate if its title matches the stable title prefix.
-    Open issues are always duplicates; closed issues are duplicates only
-    if closed within DUPLICATE_RECENCY_DAYS.
+    An issue is a duplicate only if it is still open and its title matches.
+    Closed issues are never duplicates — a recurrence of the same problem
+    after the original was fixed/closed should be tracked as a new issue.
     """
-    from datetime import datetime, timedelta, timezone
-
     existing_title = issue.get("title", "")
     # Match if the existing title starts with the same prefix
     # (stable_title is the full "[shepherd-reflection] Builder failed to create PR")
@@ -366,11 +363,5 @@ def _is_recent_duplicate(
         # Issue is open — it's a duplicate
         return True
 
-    # Closed issue — only counts if closed recently
-    try:
-        closed_time = datetime.fromisoformat(closed_at.replace("Z", "+00:00"))
-        cutoff = datetime.now(timezone.utc) - timedelta(days=DUPLICATE_RECENCY_DAYS)
-        return closed_time > cutoff
-    except (ValueError, TypeError):
-        # Can't parse date — treat as duplicate to be safe
-        return True
+    # Closed issue — never a duplicate; recurrence should be tracked
+    return False

@@ -13,7 +13,6 @@ from loom_tools.shepherd.config import ShepherdConfig
 from loom_tools.shepherd.context import ShepherdContext
 from loom_tools.shepherd.phases.base import PhaseStatus
 from loom_tools.shepherd.phases.reflection import (
-    DUPLICATE_RECENCY_DAYS,
     HIGH_RETRY_THRESHOLD,
     REFLECTION_ISSUE_LABEL,
     TITLE_PREFIX,
@@ -289,12 +288,13 @@ class TestDuplicateDetection:
         assert phase._should_file_issue(finding, mock_context) is False
 
     @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
-    def test_skips_when_recently_closed_duplicate_exists(
+    def test_files_when_recently_closed_duplicate_exists(
         self,
         mock_run: MagicMock,
         mock_context: MagicMock,
         clean_summary: RunSummary,
     ) -> None:
+        """Closed issues are never duplicates — recurrence should be tracked."""
         recently_closed = (
             datetime.now(timezone.utc) - timedelta(days=1)
         ).isoformat()
@@ -312,7 +312,7 @@ class TestDuplicateDetection:
             details="details",
         )
         phase = ReflectionPhase(run_summary=clean_summary)
-        assert phase._should_file_issue(finding, mock_context) is False
+        assert phase._should_file_issue(finding, mock_context) is True
 
     @patch("loom_tools.shepherd.phases.reflection.subprocess.run")
     def test_files_when_old_closed_duplicate(
@@ -321,9 +321,9 @@ class TestDuplicateDetection:
         mock_context: MagicMock,
         clean_summary: RunSummary,
     ) -> None:
-        """Closed more than DUPLICATE_RECENCY_DAYS ago — OK to refile."""
+        """Closed issues are never duplicates — OK to refile."""
         old_closed = (
-            datetime.now(timezone.utc) - timedelta(days=DUPLICATE_RECENCY_DAYS + 1)
+            datetime.now(timezone.utc) - timedelta(days=30)
         ).isoformat()
         mock_run.return_value = MagicMock(
             returncode=0,
@@ -420,13 +420,14 @@ class TestIsRecentDuplicate:
         }
         assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is True
 
-    def test_recently_closed_is_duplicate(self) -> None:
+    def test_recently_closed_is_not_duplicate(self) -> None:
+        """Closed issues are never duplicates — recurrence should be tracked."""
         closed = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         issue = {
             "title": "[shepherd-reflection] Builder failed to create PR",
             "closedAt": closed,
         }
-        assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is True
+        assert _is_recent_duplicate(issue, "[shepherd-reflection] Builder failed to create PR") is False
 
     def test_old_closed_is_not_duplicate(self) -> None:
         closed = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
