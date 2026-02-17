@@ -12219,13 +12219,19 @@ class TestIsMcpFailure:
     def test_log_with_mcp_failure_pattern_returns_true(self, tmp_path: Path) -> None:
         """Log containing 'MCP server failed' with minimal output should be flagged."""
         log = tmp_path / "session.log"
-        log.write_text("bypasspermissionson · 1 MCP server failed · /mcp\n")
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "bypasspermissionson · 1 MCP server failed · /mcp\n"
+        )
         assert _is_mcp_failure(log) is True
 
     def test_log_with_mcp_failed_pattern_returns_true(self, tmp_path: Path) -> None:
         """Log containing 'MCP.*failed' regex should be flagged."""
         log = tmp_path / "session.log"
-        log.write_text("1 MCP server(s) failed to initialize\n")
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "1 MCP server(s) failed to initialize\n"
+        )
         assert _is_mcp_failure(log) is True
 
     def test_log_without_mcp_pattern_returns_false(self, tmp_path: Path) -> None:
@@ -12237,13 +12243,19 @@ class TestIsMcpFailure:
     def test_case_insensitive_match(self, tmp_path: Path) -> None:
         """MCP failure pattern matching should be case-insensitive."""
         log = tmp_path / "session.log"
-        log.write_text("mcp SERVER FAILED\n")
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "mcp SERVER FAILED\n"
+        )
         assert _is_mcp_failure(log) is True
 
     def test_ansi_content_stripped(self, tmp_path: Path) -> None:
         """ANSI escape codes should be stripped before pattern matching."""
         log = tmp_path / "session.log"
-        log.write_text("\x1b[0m1 MCP server failed\x1b[0m\n")
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "\x1b[0m1 MCP server failed\x1b[0m\n"
+        )
         assert _is_mcp_failure(log) is True
 
     def test_empty_log_returns_false(self, tmp_path: Path) -> None:
@@ -12266,6 +12278,7 @@ class TestIsMcpFailure:
         # Generate enough output to exceed MCP_FAILURE_MIN_OUTPUT_CHARS
         productive_output = "Implementing feature for issue #42...\n" * 30
         log.write_text(
+            "# CLAUDE_CLI_START\n"
             "Claude CLI started. Loading /builder skill.\n"
             "bypasspermissionson · 1 MCP server failed · /mcp\n"
             f"{productive_output}"
@@ -12278,7 +12291,10 @@ class TestIsMcpFailure:
     ) -> None:
         """Session with minimal output and MCP pattern IS a real MCP failure."""
         log = tmp_path / "session.log"
-        log.write_text("1 MCP server failed\n")
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "1 MCP server failed\n"
+        )
         assert _is_mcp_failure(log) is True
 
     def test_header_lines_excluded_from_output_volume(
@@ -12288,7 +12304,7 @@ class TestIsMcpFailure:
         log = tmp_path / "session.log"
         # Lots of header lines but minimal non-header content
         headers = "# Loom Agent Log\n# Session: test\n" * 50
-        log.write_text(f"{headers}1 MCP server failed\n")
+        log.write_text(f"{headers}# CLAUDE_CLI_START\n1 MCP server failed\n")
         assert _is_mcp_failure(log) is True
 
     def test_substantial_non_header_output_returns_false(
@@ -12297,7 +12313,7 @@ class TestIsMcpFailure:
         """Session with enough non-header output should NOT be flagged."""
         log = tmp_path / "session.log"
         real_work = "x" * MCP_FAILURE_MIN_OUTPUT_CHARS
-        log.write_text(f"# Header\n{real_work}\n1 MCP server failed\n")
+        log.write_text(f"# Header\n# CLAUDE_CLI_START\n{real_work}\n1 MCP server failed\n")
         assert _is_mcp_failure(log) is False
 
     def test_wrapper_preflight_with_sentinel_and_mcp_failure(
@@ -12365,6 +12381,24 @@ class TestIsMcpFailure:
             + "Tinkering…\n" * 5
             + "(thinking)\n" * 5
             + real_work
+        )
+        assert _is_mcp_failure(log) is False
+
+    def test_no_sentinel_with_mcp_pattern_returns_false(
+        self, tmp_path: Path
+    ) -> None:
+        """Without sentinel, MCP pattern should NOT match (issue #2473).
+
+        If the wrapper failed before reaching Claude CLI execution, there
+        can be no real MCP failure — the CLI never started.  The absence of
+        the sentinel means _get_cli_output returns empty, so the MCP pattern
+        search finds nothing.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "[INFO] Claude wrapper starting\n"
+            "[INFO] Pre-flight checks passed\n"
+            "1 MCP server failed\n"
         )
         assert _is_mcp_failure(log) is False
 
