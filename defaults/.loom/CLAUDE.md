@@ -286,15 +286,15 @@ gh pr create --label "loom:review-requested"
    # Review code, run tests, check for issues
    ```
 
-3. **Provide feedback**:
+3. **Provide feedback** (use comments + labels, not `gh pr review` which fails with self-review restriction):
    ```bash
    # If changes needed:
-   gh pr review 123 --request-changes --body "Feedback here"
-   gh pr edit 123 --remove-label "loom:review-requested"
+   gh pr comment 123 --body "Changes needed: ..." && \
+     gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:changes-requested"
 
    # If approved:
-   gh pr review 123 --approve
-   gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:pr"
+   gh pr comment 123 --body "LGTM! Approved." && \
+     gh pr edit 123 --remove-label "loom:review-requested" --add-label "loom:pr"
    ```
 
 ### As a Curator (Autonomous or Manual)
