@@ -20,7 +20,7 @@ mod claude_config {
     /// Must match the Python `_SHARED_CONFIG_FILES` list.
     /// NOTE: .claude.json is NOT here — it lives at ~/.claude.json (home root),
     /// not inside ~/.claude/. It's handled separately via `resolve_state_file()`.
-    const SHARED_CONFIG_FILES: &[&str] = &["settings.json", "config.json", "mcp.json", ".mcp.json"];
+    const SHARED_CONFIG_FILES: &[&str] = &["settings.json", "config.json"];
 
     /// Shared directories to symlink from ~/.claude/ (read-only caches).
     /// Must match the Python `_SHARED_CONFIG_DIRS` list.
