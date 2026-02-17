@@ -823,11 +823,20 @@ run_with_retry() {
         startup_monitor_pid_file=$(mktemp)
 
         # Run claude with all arguments passed to wrapper
-        # Use macOS `script` to preserve TTY (so Claude CLI sees isatty(stdout) = true)
-        # while still capturing output to a file. A plain pipe (`| tee`) would replace
-        # stdout with a pipe fd, causing Claude to switch to non-interactive --print mode.
-        # Falls back to direct execution when no TTY is available (e.g., when spawned
-        # from Claude Code's Bash tool rather than a tmux terminal).
+        # Three execution modes for Claude CLI:
+        #
+        # 1. Slash command prompt detected (e.g., "/judge 2434"):
+        #    Use --print mode for reliable one-shot execution.  Interactive mode
+        #    (script -q) can be blocked by onboarding/promotional dialogs that
+        #    require user interaction before the prompt is processed. (Issue #2438)
+        #
+        # 2. No prompt, TTY available (autonomous agents):
+        #    Use macOS `script` to preserve TTY so Claude CLI sees isatty(stdout) = true.
+        #    A plain pipe (`| tee`) would replace stdout with a pipe fd, causing Claude
+        #    to switch to non-interactive --print mode.
+        #
+        # 3. No prompt, no TTY (spawned from Claude Code's Bash tool):
+        #    Run claude directly with tee for error detection.
         start_output_monitor "${temp_output}" "${monitor_pid_file}"
         start_startup_monitor "${temp_output}" "${startup_monitor_pid_file}"
         # Write sentinel marker so _is_instant_exit() in the shepherd can
@@ -843,8 +852,28 @@ run_with_retry() {
         if [[ -n "${TMPDIR:-}" ]]; then
             export TMPDIR
         fi
-        if [ -t 0 ]; then
-            # TTY available - use script to preserve interactive mode
+        # Detect slash command prompt in arguments (e.g., "/judge 2434").
+        # On-demand workers spawned by the shepherd receive a slash command
+        # as a positional prompt argument.  When present, we MUST use --print
+        # mode instead of interactive mode (script -q) because interactive mode
+        # can be blocked by onboarding dialogs or promotional banners that
+        # require user interaction before the prompt is processed.  --print
+        # explicitly skips all interactive dialogs.  See issue #2438.
+        _has_slash_cmd=false
+        for _arg in "$@"; do
+            case "$_arg" in
+                --*|-*) ;;  # Skip flags
+                /*) _has_slash_cmd=true; break ;;
+            esac
+        done
+
+        if [[ "$_has_slash_cmd" == "true" ]]; then
+            # Slash command prompt detected - use --print for reliable execution
+            log_info "Slash command detected in arguments, using --print mode"
+            claude --print "$@" 2>&1 | tee "${temp_output}"
+            exit_code=${PIPESTATUS[0]}
+        elif [ -t 0 ]; then
+            # No prompt, TTY available - use script to preserve interactive mode
             script -q "${temp_output}" claude "$@"
             exit_code=$?
         else
