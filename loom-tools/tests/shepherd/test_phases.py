@@ -10407,6 +10407,191 @@ class TestBuilderIsNoChangesNeededWithArtifacts:
         assert builder._is_no_changes_needed(diag) is True
 
 
+class TestBuilderMainBranchDirtyDetection:
+    """Test _is_no_changes_needed rejects false positives from worktree escape."""
+
+    def test_main_dirty_blocks_no_changes_needed(self) -> None:
+        """When main branch is dirty, never return 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": True,
+            "main_dirty_file_count": 3,
+            "main_dirty_files": [" M src/lib.rs", " M src/parser.rs", " M src/types.rs"],
+        }
+        # Should NOT be treated as "no changes needed" — builder escaped worktree
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_main_clean_allows_no_changes_needed(self) -> None:
+        """When main is clean and worktree is clean, no changes needed is valid."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "main_dirty_file_count": 0,
+            "main_dirty_files": [],
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_main_dirty_missing_key_defaults_safe(self) -> None:
+        """Missing main_branch_dirty key should default to False (safe)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            # main_branch_dirty not present — backwards compatibility
+        }
+        # Missing key defaults to False via .get(), so no changes needed is valid
+        assert builder._is_no_changes_needed(diag) is True
+
+
+class TestBuilderGatherDiagnosticsMainBranch:
+    """Test that _gather_diagnostics includes main branch dirty state."""
+
+    def test_diagnostics_includes_main_branch_dirty(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should detect uncommitted changes on main branch."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                # Check if this is the main branch check (uses repo_root)
+                # or worktree check (uses wt_dir)
+                cwd = kwargs.get("cwd")
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # Main branch is dirty
+                    result.stdout = " M src/lib.rs\n M src/parser.rs\n"
+                else:
+                    # Worktree is clean
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is True
+        assert diag["main_dirty_file_count"] == 2
+        assert len(diag["main_dirty_files"]) == 2
+
+    def test_diagnostics_main_branch_clean(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should report clean main branch when no changes exist."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                result.stdout = ""  # Both worktree and main clean
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is False
+        assert diag["main_dirty_file_count"] == 0
+        assert diag["main_dirty_files"] == []
+
+    def test_diagnostics_summary_includes_main_dirty_warning(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Summary should include warning when main branch is dirty."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    result.stdout = " M src/lib.rs\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert "WARNING: main branch dirty" in diag["summary"]
+
+
 class TestBuilderStaleWorktreeWithArtifacts:
     """Test _is_stale_worktree treats artifact-only changes as stale."""
 

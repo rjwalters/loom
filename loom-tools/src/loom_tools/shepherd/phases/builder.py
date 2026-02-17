@@ -461,6 +461,15 @@ class BuilderPhase:
                         },
                     )
 
+                # Detect worktree escape: clean worktree but dirty main
+                if diag.get("main_branch_dirty", False):
+                    log_warning(
+                        f"Builder may have escaped worktree for issue "
+                        f"#{ctx.config.issue} — main branch has "
+                        f"{diag.get('main_dirty_file_count', 0)} uncommitted "
+                        f"file(s)"
+                    )
+
                 # No incomplete work pattern — nothing to retry
                 self._cleanup_stale_worktree(ctx)
                 return PhaseResult(
@@ -620,6 +629,15 @@ class BuilderPhase:
                             "reason": "already_resolved",
                             "diagnostics": diag,
                         },
+                    )
+
+                # Detect worktree escape: clean worktree but dirty main
+                if diag.get("main_branch_dirty", False):
+                    log_warning(
+                        f"Builder may have escaped worktree for issue "
+                        f"#{ctx.config.issue} — main branch has "
+                        f"{diag.get('main_dirty_file_count', 0)} uncommitted "
+                        f"file(s)"
                     )
 
                 # No incomplete work pattern — nothing to retry
@@ -2523,6 +2541,24 @@ class BuilderPhase:
             diag["checkpoint_recovery_path"] = "retry_from_scratch"
             diag["checkpoint_skip_stages"] = []
 
+        # -- Main branch state (detect worktree escape) -----------------------
+        # Check if the builder accidentally modified files on main instead
+        # of in the worktree.  This is a critical signal for
+        # _is_no_changes_needed() — if main is dirty after a builder run
+        # with a clean worktree, the builder likely escaped the worktree.
+        main_status = subprocess.run(
+            ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        main_dirty_files: list[str] = []
+        if main_status.returncode == 0 and main_status.stdout.strip():
+            main_dirty_files = main_status.stdout.strip().splitlines()
+        diag["main_branch_dirty"] = bool(main_dirty_files)
+        diag["main_dirty_file_count"] = len(main_dirty_files)
+        diag["main_dirty_files"] = main_dirty_files[:10]  # Cap for readability
+
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []
         if diag["worktree_exists"]:
@@ -2556,6 +2592,10 @@ class BuilderPhase:
         parts.append(f"labels=[{diag['issue_labels']}]")
         if diag.get("checkpoint_stage"):
             parts.append(f"checkpoint={diag['checkpoint_stage']}")
+        if diag["main_branch_dirty"]:
+            parts.append(
+                f"WARNING: main branch dirty ({diag['main_dirty_file_count']} files)"
+            )
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
 
@@ -2698,15 +2738,26 @@ class BuilderPhase:
         Returns True when all of these conditions hold:
         - Worktree exists (builder analyzed the issue)
         - No commits ahead of main (builder made no changes)
-        - No uncommitted changes (no work in progress)
+        - No uncommitted changes in worktree (no work in progress)
         - No remote branch exists (nothing pushed)
         - No PR exists (nothing created)
+        - Main branch is clean (no worktree escape detected)
 
         This pattern indicates the builder analyzed the issue and determined
         that no changes are required - the reported problem either doesn't
         exist or is already resolved on main.
+
+        If main has uncommitted changes, the builder may have escaped the
+        worktree and modified files on main instead.  This is NOT a "no
+        changes needed" situation — it's a worktree escape bug.
         """
         if not diag.get("worktree_exists"):
+            return False
+
+        # If main branch is dirty, the builder may have escaped the worktree
+        # and made changes on main instead.  Never treat this as "no changes
+        # needed" — it requires human intervention to recover.
+        if diag.get("main_branch_dirty", False):
             return False
 
         # All indicators of work must be absent
