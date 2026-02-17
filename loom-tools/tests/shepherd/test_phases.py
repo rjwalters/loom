@@ -5132,6 +5132,9 @@ class TestJudgePhase:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ) as mock_mark_failed,
         ):
             result = judge.run(mock_context)
 
@@ -5142,16 +5145,18 @@ class TestJudgePhase:
         assert mock_validate.call_count == 3
         # Should sleep between attempts (2 sleeps for 3 attempts)
         assert mock_sleep.call_count == 2
+        # Failure comment posted after all retries exhausted (#2588)
+        mock_mark_failed.assert_called_once()
 
-    def test_validation_retries_use_check_only_for_non_final_attempts(
+    def test_validation_retries_all_use_check_only(
         self, mock_context: MagicMock
     ) -> None:
-        """Non-final validation retries should use check_only=True (#2558).
+        """ALL validation retries should use check_only=True (#2558, #2588).
 
-        This prevents duplicate 'Phase contract failed' comments from being
-        posted on every retry attempt.  Only the final attempt (when all
-        retries are exhausted) should use check_only=False so the comment
-        and failure label are applied exactly once.
+        This prevents 'Phase contract failed' comments from being posted
+        before fallback recovery has a chance to run.  The failure comment
+        is now posted explicitly in the else branch after all recovery
+        paths are exhausted.
         """
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
@@ -5178,11 +5183,14 @@ class TestJudgePhase:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             judge.run(mock_context)
 
-        # 3 attempts: first two should be check_only=True, last should be False
-        assert check_only_values == [True, True, False]
+        # All 3 attempts should use check_only=True (#2588)
+        assert check_only_values == [True, True, True]
 
     def test_cache_invalidated_before_validation(self, mock_context: MagicMock) -> None:
         """Cache should be invalidated BEFORE validation, not after.
@@ -5376,6 +5384,9 @@ class TestJudgeFallbackApproval:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(mock_context)
 
@@ -5404,6 +5415,9 @@ class TestJudgeFallbackApproval:
             patch.object(judge, "_has_rejection_comment", return_value=False),
 
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(ctx)
 
@@ -5431,6 +5445,9 @@ class TestJudgeFallbackApproval:
             patch.object(judge, "_has_rejection_comment", return_value=False),
 
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(ctx)
 
@@ -5521,6 +5538,9 @@ class TestJudgeFallbackApproval:
                 return_value=MagicMock(returncode=1),  # label application fails
             ),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(ctx)
 
@@ -5821,6 +5841,9 @@ class TestJudgeDiagnostics:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(mock_context)
 
@@ -6474,6 +6497,9 @@ class TestJudgeFallbackChangesRequested:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(mock_context)
 
@@ -6502,6 +6528,9 @@ class TestJudgeFallbackChangesRequested:
             patch.object(judge, "_has_rejection_comment", return_value=False),
 
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(ctx)
 
@@ -6601,6 +6630,9 @@ class TestJudgeFallbackChangesRequested:
                 return_value=MagicMock(returncode=1),  # label application fails
             ),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(ctx)
 
@@ -6638,6 +6670,9 @@ class TestJudgeFallbackChangesRequested:
                 judge, "_try_fallback_changes_requested", side_effect=track_rejection
             ),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed",
+            ),
         ):
             result = judge.run(ctx)
 

@@ -224,15 +224,17 @@ class JudgePhase:
         # Retry validation with backoff to handle the race condition
         # where the judge applies comment and label in separate API calls
         # (see issue #1764).
-        # Use check_only=True for non-final attempts to avoid posting
-        # duplicate "Phase contract failed" comments (issue #2558).
+        # Use check_only=True for ALL attempts so that _mark_phase_failed
+        # is only called after fallback recovery also fails (#2588).
+        # Previously the final attempt used check_only=False which posted
+        # "Phase contract failed" comments before fallback had a chance
+        # to recover (#2558, #2588).
         validated = False
         for attempt in range(VALIDATION_MAX_RETRIES):
-            is_last_attempt = attempt == VALIDATION_MAX_RETRIES - 1
-            if self.validate(ctx, check_only=not is_last_attempt):
+            if self.validate(ctx, check_only=True):
                 validated = True
                 break
-            if not is_last_attempt:
+            if attempt < VALIDATION_MAX_RETRIES - 1:
                 time.sleep(VALIDATION_RETRY_DELAY_SECONDS)
                 # Re-invalidate cache before each retry to get fresh data
                 ctx.label_cache.invalidate_pr(ctx.pr_number)
@@ -269,6 +271,17 @@ class JudgePhase:
                     data={"changes_requested": True, "fallback_used": True},
                 )
             else:
+                # All recovery paths exhausted — NOW post the failure
+                # comment and apply the failure label (#2588).
+                from loom_tools.validate_phase import _mark_phase_failed
+
+                _mark_phase_failed(
+                    ctx.config.issue,
+                    "judge",
+                    f"Judge phase did not produce a review decision on PR #{ctx.pr_number}.",
+                    ctx.repo_root,
+                    failure_label="loom:failed:judge",
+                )
                 diag = self._gather_diagnostics(ctx, phase_start_time)
                 # Add context about loom:review-requested state (issue #1998)
                 if ctx.has_pr_label("loom:review-requested"):
