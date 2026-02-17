@@ -2794,6 +2794,11 @@ class BuilderPhase:
             diag["log_has_implementation_activity"] = False
             diag["log_has_mcp_failure_markers"] = False
 
+        # -- Low-output cause classification (set by run_phase_with_retry) ---
+        # Surfaced here so the diagnostic summary is self-contained
+        # without having to cross-reference the retry log.  See issue #2562.
+        diag["low_output_cause"] = ctx.last_low_output_cause
+
         # -- Worktree state --------------------------------------------------
         wt = ctx.worktree_path
         diag["worktree_exists"] = bool(wt and wt.is_dir())
@@ -2976,6 +2981,8 @@ class BuilderPhase:
         if diag["log_errors"]:
             last_error = diag["log_errors"][-1]
             parts.append(last_error)
+        if diag["low_output_cause"]:
+            parts.append(f"low_output_cause={diag['low_output_cause']}")
         if diag["worktree_exists"]:
             if diag["has_uncommitted_changes"]:
                 uncommitted_note = f"{diag['uncommitted_file_count']} files"

@@ -53,6 +53,9 @@ class ShepherdContext:
     # Caches
     label_cache: LabelCache = field(init=False)
 
+    # Low-output cause classification (set by run_phase_with_retry)
+    last_low_output_cause: str | None = field(default=None, init=False)
+
     # Progress tracking state
     _progress_initialized: bool = field(default=False, init=False, repr=False)
 

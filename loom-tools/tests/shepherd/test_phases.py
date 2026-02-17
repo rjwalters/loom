@@ -1123,6 +1123,7 @@ class TestBuilderDiagnostics:
         mock_context.worktree_path = tmp_path / "nonexistent"
         mock_context.config = ShepherdConfig(issue=42)
         mock_context.repo_root = tmp_path
+        mock_context.last_low_output_cause = None
 
         builder = BuilderPhase()
 
@@ -1153,6 +1154,7 @@ class TestBuilderDiagnostics:
         assert "PR" in parts[2] or "no PR" in parts[2]
         assert "labels=" in parts[3]
         assert "log=" in parts[4]
+        assert diag["low_output_cause"] is None
 
 
 class TestBuilderQualityValidation:
