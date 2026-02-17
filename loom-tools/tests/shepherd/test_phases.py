@@ -9036,6 +9036,19 @@ class TestBuilderHasIncompleteWork:
         }
         assert builder._has_incomplete_work(diag) is True
 
+    def test_commits_ahead_with_review_requested_pr_returns_false(self) -> None:
+        """PR exists with loom:review-requested and commits ahead — workflow is done (#2709)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": 456,
+            "pr_has_review_label": True,
+        }
+        assert builder._has_incomplete_work(diag) is False
+
     def test_remote_exists_no_pr_with_commits_returns_true(self) -> None:
         """Remote branch pushed with commits but no PR should be incomplete."""
         builder = BuilderPhase()
