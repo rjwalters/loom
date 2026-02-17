@@ -86,6 +86,15 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 
+# Ghost session detection and retry settings.
+# A "ghost session" is one that exits almost immediately (0s duration)
+# with no meaningful output — the CLI spawned but never did any work.
+# These are infrastructure failures (API blip, spawn race) that should
+# NOT consume the main retry budget intended for legitimate failures.
+# See issue #2604.
+GHOST_SESSION_MAX_RETRIES = 3
+GHOST_SESSION_RETRY_DELAY_SECONDS = 5
+
 # Systemic failure patterns detected in session logs.
 # These indicate infrastructure-level failures (auth timeout, API outage)
 # that will NOT resolve with retries.  When detected after a low-output
@@ -727,6 +736,53 @@ def _is_auth_failure(log_path: Path) -> bool:
     return False
 
 
+def _is_ghost_session(log_path: Path) -> bool:
+    """Check if a session log indicates a ghost session (instant exit, no work).
+
+    A ghost session is one where the CLI process spawned but exited almost
+    immediately without producing any meaningful output.  This is distinct
+    from low-output sessions (which may have *some* output) and MCP failures
+    (which have specific MCP error patterns).
+
+    Ghost sessions are detected by combining two signals:
+    1. No meaningful CLI output (same check as ``_is_low_output_session``)
+    2. Very short session duration (log file mtime == ctime, indicating the
+       file was written once and never updated — the session lasted < 1s)
+
+    These represent infrastructure-level failures (API blip, spawn race,
+    resource contention) rather than agent failures, and should be retried
+    on a separate budget to preserve the main retry budget for legitimate
+    failures.  See issue #2604.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the session appears to be a ghost (instant exit, no work).
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        stat = log_path.stat()
+        # Session duration: time between file creation and last modification.
+        # A ghost session writes the log once and exits — mtime ≈ ctime.
+        duration = stat.st_mtime - stat.st_ctime
+        if duration > 1.0:
+            # Session ran for more than 1 second — not a ghost.
+            return False
+
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+
+        # Check for meaningful output after the CLI start sentinel.
+        cli_output = _get_cli_output(stripped)
+        cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
+        return len(cleaned.strip()) < LOW_OUTPUT_MIN_CHARS
+    except OSError:
+        return False
+
+
 def _classify_low_output_cause(log_path: Path) -> str:
     """Classify the root cause of a low-output session from the worker log.
 
@@ -806,6 +862,7 @@ def run_worker_phase(
         - 7: MCP server failure detected (session exited due to MCP init failure)
         - 8: Planning stall detected (stuck in planning checkpoint)
         - 9: Auth pre-flight failure (not retryable, see issue #2508)
+        - 10: Ghost session detected (instant exit, no work — see issue #2604)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir
@@ -1018,6 +1075,19 @@ def run_worker_phase(
         )
         return 9
 
+    # Check for ghost session (exit code 10) — instant exit with no work.
+    # Ghost sessions are a specific subtype of low-output where the session
+    # lasted < 1s.  These are infrastructure failures that should be retried
+    # on a separate budget.  Check before MCP/low-output to avoid consuming
+    # their retry budgets.  See issue #2604.
+    if wait_exit != 0 and _is_ghost_session(log_path):
+        log_warning(
+            f"[WARN] Ghost session detected for {role} session '{name}' "
+            f"(0s duration, no meaningful output, exit code {wait_exit}, "
+            f"log: {log_path})"
+        )
+        return 10
+
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
     if wait_exit != 0 and _is_mcp_failure(log_path):
@@ -1063,6 +1133,11 @@ def run_phase_with_retry(
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
     On exit code 9 (auth failure), returns immediately (not retryable).
+    On exit code 10 (ghost session), retries up to GHOST_SESSION_MAX_RETRIES
+    times on a **separate** budget that does not deplete the main retry
+    counters.  Ghost sessions are infrastructure failures (0s duration,
+    no output) that should not consume the budget intended for legitimate
+    review failures.  See issue #2604.
 
     For exit codes 6 and 7, if a single attempt takes longer than
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
@@ -1072,11 +1147,13 @@ def run_phase_with_retry(
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
                    6=low-output after retries, 7=MCP failure after retries,
-                   8=planning stall, 9=auth failure, other=error
+                   8=planning stall, 9=auth failure,
+                   10=ghost session after retries, other=error
     """
     stuck_retries = 0
     low_output_retries = 0
     mcp_failure_retries = 0
+    ghost_retries = 0
 
     while True:
         attempt_start = time.monotonic()
@@ -1109,9 +1186,9 @@ def run_phase_with_retry(
 
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or
-        # loom:changes-requested) before the MCP/low-output failure
+        # loom:changes-requested) before the MCP/low-output/ghost failure
         # occurred, skip the retry entirely.  See issue #2335.
-        if exit_code in (6, 7) and phase == "judge" and ctx.pr_number is not None:
+        if exit_code in (6, 7, 10) and phase == "judge" and ctx.pr_number is not None:
             ctx.label_cache.invalidate_pr(ctx.pr_number)
             if ctx.has_pr_label("loom:pr") or ctx.has_pr_label(
                 "loom:changes-requested"
@@ -1121,6 +1198,37 @@ def run_phase_with_retry(
                     f"skipping retry despite exit code {exit_code}"
                 )
                 return 0
+
+        # --- Ghost session handling (exit code 10) ---
+        # Ghost sessions are infrastructure-level failures (0s duration, no
+        # output) that should NOT deplete the main retry budget.  They use a
+        # separate counter so that legitimate failures (stuck, low-output,
+        # MCP) retain their full retry budget.  See issue #2604.
+        if exit_code == 10:
+            ghost_retries += 1
+            if ghost_retries > GHOST_SESSION_MAX_RETRIES:
+                log_warning(
+                    f"Ghost session persisted for {role} after "
+                    f"{GHOST_SESSION_MAX_RETRIES} retries"
+                )
+                return 10
+
+            ctx.report_milestone(
+                "error",
+                error=f"ghost session detected for {role} (0s duration, no output)",
+                will_retry=True,
+            )
+            ctx.report_milestone(
+                "heartbeat",
+                action=(
+                    f"retrying ghost session {role} "
+                    f"(attempt {ghost_retries}/{GHOST_SESSION_MAX_RETRIES}, "
+                    f"backoff {GHOST_SESSION_RETRY_DELAY_SECONDS}s)"
+                ),
+            )
+
+            time.sleep(GHOST_SESSION_RETRY_DELAY_SECONDS)
+            continue
 
         # --- MCP failure handling (exit code 7) ---
         # MCP failures are systemic (stale build, resource contention) so
