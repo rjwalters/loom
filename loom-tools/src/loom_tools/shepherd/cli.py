@@ -71,6 +71,7 @@ EXIT CODES:
     4  NEEDS_INTERVENTION - Stuck/blocked, needs human intervention
     5  SKIPPED            - Issue already complete (no action needed)
     6  NO_CHANGES_NEEDED  - No changes determined, issue marked blocked
+    9  SYSTEMIC_FAILURE   - Auth/API failure, do not retry immediately
 
 NOTE:
     Force mode does NOT skip the Judge phase. Code review always runs because
@@ -437,6 +438,8 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
             if result.status == PhaseStatus.FAILED:
                 log_error(result.message)
+                if result.data.get("auth_failure"):
+                    return ShepherdExitCode.SYSTEMIC_FAILURE
                 return ShepherdExitCode.BUILDER_FAILED
 
             if result.status == PhaseStatus.SKIPPED:
@@ -758,16 +761,23 @@ def orchestrate(ctx: ShepherdContext) -> int:
             if result.status in (PhaseStatus.FAILED, PhaseStatus.STUCK):
                 if not result.data.get("test_failure"):
                     log_error(result.message)
+                    # Auth/systemic failures get a distinct exit code so the
+                    # daemon knows not to retry immediately.  See issue #2521.
+                    exit_code = (
+                        ShepherdExitCode.SYSTEMIC_FAILURE
+                        if result.data.get("auth_failure")
+                        else ShepherdExitCode.BUILDER_FAILED
+                    )
                     _run_reflection(
                         ctx,
-                        exit_code=ShepherdExitCode.BUILDER_FAILED,
+                        exit_code=exit_code,
                         duration=int(time.time() - start_time),
                         phase_durations=phase_durations,
                         completed_phases=completed_phases,
                         test_fix_attempts=test_fix_attempts,
                         warnings=run_warnings,
                     )
-                    return ShepherdExitCode.BUILDER_FAILED
+                    return exit_code
                 # Test failure after exhausting retries is handled above
 
             # Builder succeeded or was skipped

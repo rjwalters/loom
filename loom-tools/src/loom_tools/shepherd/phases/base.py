@@ -75,6 +75,19 @@ MCP_FAILURE_MIN_OUTPUT_CHARS = 500
 MCP_FAILURE_MAX_RETRIES = 3
 MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 
+# Systemic failure patterns detected in session logs.
+# These indicate infrastructure-level failures (auth timeout, API outage)
+# that will NOT resolve with retries.  When detected after an instant-exit
+# or MCP failure, the shepherd should abort immediately instead of wasting
+# time on futile retry cycles.  See issue #2521.
+SYSTEMIC_FAILURE_PATTERNS = [
+    re.compile(r"\[ERROR\]\s*Authentication check timed out", re.IGNORECASE),
+    re.compile(r"\[ERROR\]\s*Authentication pre-flight check failed", re.IGNORECASE),
+    re.compile(r"\[ERROR\]\s*Authentication check command failed", re.IGNORECASE),
+    re.compile(r"\[ERROR\]\s*Authentication check failed", re.IGNORECASE),
+    re.compile(r"\[ERROR\]\s*API endpoint unreachable", re.IGNORECASE),
+]
+
 # Regex patterns for CLI spinner/thinking noise that should not count toward
 # output volume when checking for MCP failures.  The Claude CLI terminal
 # capture can produce garbled spinner frames (interleaved characters from
@@ -625,28 +638,41 @@ def _is_instant_exit(log_path: Path) -> bool:
 def _is_auth_failure(log_path: Path) -> bool:
     """Check if a session log indicates an authentication pre-flight failure.
 
-    Auth failures are **not transient** when running as a subprocess of a
-    parent Claude Code session (the parent holds the config lock, so retries
-    will always time out).  This is distinct from generic instant-exits which
+    Auth failures are **systemic** when running as a subprocess of a parent
+    Claude Code session (the parent holds the config lock, so retries will
+    always time out).  This is distinct from generic instant-exits which
     *are* worth retrying.
 
-    The wrapper writes ``# AUTH_PREFLIGHT_FAILED`` to the log file when
-    ``check_auth_status`` fails.  See issue #2508.
+    Detection uses two methods:
+    1. Sentinel: ``# AUTH_PREFLIGHT_FAILED`` written by the wrapper (issue #2508).
+    2. Fallback patterns: known ``[ERROR]`` messages from ``check_auth_status``
+       and other systemic failure indicators (issue #2521).
 
     Args:
         log_path: Path to the worker session log file.
 
     Returns:
-        True if the log contains the auth failure sentinel.
+        True if the log contains auth failure indicators.
     """
     if not log_path.is_file():
         return False
 
     try:
         content = log_path.read_text()
-        return _AUTH_FAILURE_SENTINEL in strip_ansi(content)
+        stripped = strip_ansi(content)
+
+        # Check for explicit sentinel first (most reliable)
+        if _AUTH_FAILURE_SENTINEL in stripped:
+            return True
+
+        # Fallback: check for known systemic failure patterns in log text
+        for pattern in SYSTEMIC_FAILURE_PATTERNS:
+            if pattern.search(stripped):
+                return True
     except OSError:
-        return False
+        pass
+
+    return False
 
 
 def run_worker_phase(
