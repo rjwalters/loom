@@ -400,7 +400,7 @@ def attempt_rebase(
         conflicting files.
     """
     try:
-        result = run_git(["rebase", base], cwd=cwd, check=False)
+        result = run_git(["rebase", "--autostash", base], cwd=cwd, check=False)
         if result.returncode == 0:
             return True, ""
 
@@ -415,7 +415,13 @@ def attempt_rebase(
         # Abort the failed rebase
         run_git(["rebase", "--abort"], cwd=cwd, check=False)
 
-        detail = f"Conflicting files:\n{conflicting}" if conflicting else "Rebase failed (unknown conflicts)"
+        stderr_info = result.stderr.strip() if result.stderr else ""
+        if conflicting:
+            detail = f"Conflicting files:\n{conflicting}"
+        elif stderr_info:
+            detail = f"Rebase failed: {stderr_info}"
+        else:
+            detail = "Rebase failed (unknown conflicts)"
         return False, detail
     except Exception as exc:
         # Safety: abort any in-progress rebase
