@@ -375,6 +375,27 @@ class BuilderPhase:
         # Create marker to prevent premature cleanup
         self._create_worktree_marker(ctx)
 
+        # Pre-flight worktree anchor verification (issue #2630):
+        # Confirm the worktree is a valid git directory before spawning the
+        # builder.  This provides a clear audit trail.  We warn instead of
+        # failing because the builder would fail naturally on git operations
+        # if the worktree is invalid.
+        if ctx.worktree_path and ctx.worktree_path.is_dir():
+            anchor_check = subprocess.run(
+                ["git", "-C", str(ctx.worktree_path), "rev-parse", "--git-dir"],
+                capture_output=True, text=True, check=False,
+            )
+            if anchor_check.returncode != 0:
+                log_warning(
+                    f"Worktree at {ctx.worktree_path} may not be a valid "
+                    f"git directory — builder may fail"
+                )
+            else:
+                log_info(
+                    f"Worktree anchor verified: builder will work in "
+                    f"{ctx.worktree_path} (branch={ctx.worktree_path.name})"
+                )
+
         # Snapshot main's dirty state before spawning the builder so we can
         # distinguish pre-existing dirt from actual worktree escapes later.
         self._main_dirty_baseline = self._snapshot_main_dirty(ctx)
@@ -549,6 +570,15 @@ class BuilderPhase:
                 phase_name="builder",
                 data={"exit_code": exit_code, "diagnostics": diag},
             )
+
+        # Early worktree escape detection (issue #2630):
+        # Check for dirty main immediately after builder exits — before
+        # entering the validation/completion loop.  When the builder
+        # escapes the worktree and modifies main instead, completion
+        # retries are futile (they operate on the empty worktree).
+        escape = self._detect_worktree_escape(ctx)
+        if escape is not None:
+            return escape
 
         # Run test verification in worktree (unless explicitly skipped)
         if skip_test_verification:
@@ -2826,6 +2856,159 @@ class BuilderPhase:
             )
         return set()
 
+    def _detect_worktree_escape(
+        self, ctx: ShepherdContext
+    ) -> PhaseResult | None:
+        """Detect worktree escape early — before the validation/completion loop.
+
+        When the builder escapes the worktree and modifies main instead,
+        two signals are present simultaneously:
+          1. Main has NEW dirty files (compared to the pre-builder baseline).
+          2. The worktree is clean (0 commits ahead, no uncommitted changes).
+
+        When both hold, completion retries are futile — they operate on the
+        empty worktree — so we short-circuit to FAILED immediately.
+
+        Also detects wrong-issue confusion: if the worktree has commits but
+        they reference a different issue number than the one assigned.
+
+        Returns:
+            PhaseResult if escape or wrong-issue detected, else None.
+
+        See issue #2630.
+        """
+        wt = ctx.worktree_path
+        if not wt or not wt.is_dir():
+            return None
+
+        # --- Check for dirty main (worktree escape) --------------------------
+        new_dirty = self._get_new_main_dirty_files(ctx)
+        if new_dirty:
+            # Check if worktree is empty (no real work there)
+            wt_status = subprocess.run(
+                ["git", "-C", str(wt), "status", "--porcelain"],
+                capture_output=True, text=True, check=False,
+            )
+            wt_uncommitted = bool(
+                wt_status.returncode == 0 and wt_status.stdout.strip()
+            )
+            log_res = subprocess.run(
+                ["git", "-C", str(wt), "log", "--oneline", "main..HEAD"],
+                capture_output=True, text=True, check=False,
+            )
+            commits_ahead = (
+                len([l for l in log_res.stdout.splitlines() if l])
+                if log_res.returncode == 0 and log_res.stdout.strip()
+                else 0
+            )
+
+            if commits_ahead == 0 and not wt_uncommitted:
+                # Classic escape: builder worked on main, worktree is untouched
+                dirty_preview = new_dirty[:5]
+                log_error(
+                    f"Builder escaped worktree for issue #{ctx.config.issue} — "
+                    f"main branch has {len(new_dirty)} new dirty file(s): "
+                    f"{dirty_preview}"
+                )
+                self._cleanup_stale_worktree(ctx)
+                return PhaseResult(
+                    status=PhaseStatus.FAILED,
+                    message=(
+                        f"builder escaped worktree: main branch has "
+                        f"{len(new_dirty)} new dirty file(s) but worktree "
+                        f"is clean (0 commits, no uncommitted changes)"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "worktree_escape": True,
+                        "main_dirty_files": new_dirty[:10],
+                    },
+                )
+
+        # --- Check for wrong-issue confusion ----------------------------------
+        wrong_issue = self._detect_wrong_issue(ctx)
+        if wrong_issue is not None:
+            issue_refs, commit_messages = wrong_issue
+            log_error(
+                f"Builder confused: commits in worktree for issue "
+                f"#{ctx.config.issue} reference other issue(s): "
+                f"{issue_refs}"
+            )
+            self._cleanup_stale_worktree(ctx)
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message=(
+                    f"builder confused session: commits reference "
+                    f"issue(s) {issue_refs} instead of #{ctx.config.issue}"
+                ),
+                phase_name="builder",
+                data={
+                    "wrong_issue": True,
+                    "referenced_issues": sorted(issue_refs),
+                    "commit_messages": commit_messages,
+                },
+            )
+
+        return None
+
+    def _get_new_main_dirty_files(self, ctx: ShepherdContext) -> list[str]:
+        """Return list of NEW dirty files on main since baseline snapshot."""
+        main_status = subprocess.run(
+            ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
+            capture_output=True, text=True, check=False,
+        )
+        if not (main_status.returncode == 0 and main_status.stdout.strip()):
+            return []
+
+        current = [line for line in main_status.stdout.splitlines() if line]
+        if self._main_dirty_baseline is not None:
+            return [f for f in current if f not in self._main_dirty_baseline]
+        return current
+
+    def _detect_wrong_issue(
+        self, ctx: ShepherdContext
+    ) -> tuple[set[int], list[str]] | None:
+        """Check if worktree commits reference a different issue number.
+
+        Returns (wrong_issue_numbers, commit_messages) if wrong-issue
+        detected, else None.
+        """
+        wt = ctx.worktree_path
+        if not wt or not wt.is_dir():
+            return None
+
+        log_res = subprocess.run(
+            ["git", "-C", str(wt), "log", "--format=%s", "main..HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        if log_res.returncode != 0 or not log_res.stdout.strip():
+            return None
+
+        commit_messages = [
+            line for line in log_res.stdout.splitlines() if line
+        ]
+        if not commit_messages:
+            return None
+
+        # Find all issue references (#NNN) in commit messages
+        assigned = ctx.config.issue
+        other_issues: set[int] = set()
+        for msg in commit_messages:
+            refs = re.findall(r"#(\d+)", msg)
+            for ref in refs:
+                num = int(ref)
+                if num != assigned and num > 0:
+                    other_issues.add(num)
+
+        # Only flag when commits reference OTHER issues but NOT the assigned one
+        references_assigned = any(
+            f"#{assigned}" in msg for msg in commit_messages
+        )
+        if other_issues and not references_assigned:
+            return other_issues, commit_messages
+
+        return None
+
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info about the builder environment.
 
@@ -3081,6 +3264,16 @@ class BuilderPhase:
         diag["main_dirty_file_count"] = len(new_dirty_files)
         diag["main_dirty_files"] = new_dirty_files[:10]  # Cap for readability
 
+        # -- Wrong-issue detection (issue #2630) ----------------------------
+        wrong = self._detect_wrong_issue(ctx)
+        if wrong is not None:
+            wrong_issues, wrong_msgs = wrong
+            diag["wrong_issue_refs"] = sorted(wrong_issues)
+            diag["wrong_issue_commit_messages"] = wrong_msgs
+        else:
+            diag["wrong_issue_refs"] = []
+            diag["wrong_issue_commit_messages"] = []
+
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []
         # Surface root cause errors from the log at the front of the
@@ -3129,6 +3322,11 @@ class BuilderPhase:
         elif main_dirty_files and not new_dirty_files:
             parts.append(
                 f"main branch dirty ({len(main_dirty_files)} pre-existing files, ignored)"
+            )
+        if diag.get("wrong_issue_refs"):
+            parts.append(
+                f"WARNING: commits reference wrong issue(s): "
+                f"{diag['wrong_issue_refs']}"
             )
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
