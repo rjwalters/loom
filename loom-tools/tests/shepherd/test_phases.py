@@ -10655,6 +10655,96 @@ class TestBuilderMainBranchDirtyDetection:
         assert builder._is_no_changes_needed(diag) is True
 
 
+class TestBuilderImplementationActivityDetection:
+    """Test _is_no_changes_needed rejects false positives from builder crash/timeout.
+
+    When the builder log shows Edit/Write tool calls with substantial output,
+    the builder was actively implementing — not concluding 'no changes needed.'
+    See issue #2425.
+    """
+
+    def test_implementation_activity_blocks_no_changes_needed(self) -> None:
+        """Builder with Edit/Write activity should NOT be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_has_implementation_activity": True,
+        }
+        assert builder._is_no_changes_needed(diag) is False
+
+    def test_no_implementation_activity_allows_no_changes_needed(self) -> None:
+        """Builder without implementation activity can be 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,
+            "log_has_implementation_activity": False,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_missing_activity_key_defaults_safe(self) -> None:
+        """Missing log_has_implementation_activity defaults to False (no block)."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            # log_has_implementation_activity not present — backwards compat
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
+    def test_activity_with_git_work_still_returns_false(self) -> None:
+        """Implementation activity + git artifacts = not 'no changes needed'."""
+        builder = BuilderPhase()
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "log_has_implementation_activity": True,
+        }
+        # Already False due to has_uncommitted_changes — activity is redundant
+        assert builder._is_no_changes_needed(diag) is False
+
+
+class TestImplementationToolRegex:
+    """Test _IMPLEMENTATION_TOOL_RE matches expected patterns."""
+
+    def test_matches_edit_tool(self) -> None:
+        from loom_tools.shepherd.phases.builder import _IMPLEMENTATION_TOOL_RE
+
+        assert _IMPLEMENTATION_TOOL_RE.search("✓ Edit loom-tools/src/foo.py")
+
+    def test_matches_write_tool(self) -> None:
+        from loom_tools.shepherd.phases.builder import _IMPLEMENTATION_TOOL_RE
+
+        assert _IMPLEMENTATION_TOOL_RE.search("✓ Write /tmp/new_file.py")
+
+    def test_matches_wrote_to(self) -> None:
+        from loom_tools.shepherd.phases.builder import _IMPLEMENTATION_TOOL_RE
+
+        assert _IMPLEMENTATION_TOOL_RE.search("Wrote to /Users/dev/project/src/main.py")
+
+    def test_no_match_on_read_only(self) -> None:
+        from loom_tools.shepherd.phases.builder import _IMPLEMENTATION_TOOL_RE
+
+        assert not _IMPLEMENTATION_TOOL_RE.search(
+            "Read file src/lib.rs\nGrep results: 3 matches"
+        )
+
+
 class TestBuilderGatherDiagnosticsMainBranch:
     """Test that _gather_diagnostics includes main branch dirty state."""
 
