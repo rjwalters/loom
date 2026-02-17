@@ -623,10 +623,12 @@ def run_worker_phase(
 
     wait_cmd.extend(["--task-id", ctx.config.task_id])
 
-    # Set LOOM_STUCK_ACTION for retry behavior
+    # Use --max-idle for stuck termination (sets critical threshold + action=retry).
+    # Default 600s (10 min) matches agent-wait-bg.sh default.  See issue #2406.
+    wait_cmd.extend(["--max-idle", "600"])
+
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)  # Prevent nested session guard from blocking subprocess
-    env["LOOM_STUCK_ACTION"] = "retry"
 
     # Launch wait process (non-blocking) so we can poll for heartbeats
     wait_proc = subprocess.Popen(

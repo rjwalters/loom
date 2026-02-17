@@ -6651,6 +6651,7 @@ class TestRunWorkerPhaseClaudeCodeEnv:
         ctx.progress_dir = tmp_path / ".loom" / "progress"
 
         captured_env = {}
+        captured_cmd = []
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -6659,6 +6660,7 @@ class TestRunWorkerPhaseClaudeCodeEnv:
 
         def mock_popen(cmd, **kwargs):
             captured_env.update(kwargs.get("env", {}))
+            captured_cmd.extend(cmd)
             proc = MagicMock()
             proc.poll.return_value = 0
             proc.returncode = 0
@@ -6683,7 +6685,10 @@ class TestRunWorkerPhaseClaudeCodeEnv:
             )
 
         assert "CLAUDECODE" not in captured_env
-        assert captured_env.get("LOOM_STUCK_ACTION") == "retry"
+        # --max-idle flag should be passed for stuck detection (issue #2406)
+        assert "--max-idle" in captured_cmd
+        max_idle_idx = captured_cmd.index("--max-idle")
+        assert captured_cmd[max_idle_idx + 1] == "600"
 
     def test_works_when_claudecode_not_set(self, tmp_path: Path) -> None:
         """No error when CLAUDECODE is not in the environment."""
