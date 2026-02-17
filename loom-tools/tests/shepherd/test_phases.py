@@ -6830,6 +6830,190 @@ class TestJudgeInfrastructureBypass:
         assert "NOT" in captured["body"]
         assert "low output" in captured["body"]
 
+    def test_bypass_on_zero_work_validation_failure_force_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Zero-work validation failure in force mode: bypass succeeds when CI passes.
+
+        When the judge CLI exits code 0 but does no work (0s duration, no comments,
+        no labels), the exit-code-based ghost detection is skipped (issue #2540).
+        The bypass should be attempted in the validation failure path (issue #2636).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        # Diagnostics indicating a zero-work session
+        fake_diag = {
+            "summary": "no judge comments; session duration: 0s",
+            "session_duration_seconds": 0,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass"
+            ) as mock_bypass,
+        ):
+            # Bypass succeeds
+            mock_bypass.return_value = PhaseResult(
+                status=PhaseStatus.SUCCESS,
+                message="[force-mode] Infrastructure bypass applied",
+                phase_name="judge",
+                data={"approved": True, "infrastructure_bypass": True},
+            )
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("infrastructure_bypass") is True
+        mock_bypass.assert_called_once()
+        assert "zero-work session" in mock_bypass.call_args.kwargs["failure_reason"]
+
+    def test_bypass_not_attempted_for_nonzero_duration_validation_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Validation failure with real session duration should NOT attempt bypass.
+
+        When the judge ran for a meaningful duration but still failed validation,
+        this is not an infrastructure failure — do not bypass (issue #2636).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        # Diagnostics indicating a real session that did some work
+        fake_diag = {
+            "summary": "no judge comments; session duration: 30s",
+            "session_duration_seconds": 30,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": ["some output"],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass"
+            ) as mock_bypass,
+            patch("loom_tools.validate_phase._mark_phase_failed"),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+        # Bypass should NOT be attempted for sessions with real duration
+        mock_bypass.assert_not_called()
+
+    def test_bypass_not_attempted_for_zero_work_default_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Zero-work validation failure outside force mode should NOT attempt bypass.
+
+        Infrastructure bypass is only available in force mode (issue #2636).
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        judge = JudgePhase()
+
+        fake_diag = {
+            "summary": "no judge comments; session duration: 0s",
+            "session_duration_seconds": 0,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass"
+            ) as mock_bypass,
+            patch("loom_tools.validate_phase._mark_phase_failed"),
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        mock_bypass.assert_not_called()
+
+    def test_bypass_denied_falls_through_to_failure_for_zero_work(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Zero-work bypass denied (CI fails) should fall through to FAILED.
+
+        When the infrastructure bypass is attempted but denied (e.g., CI not
+        passing), the normal failure path should execute (issue #2636).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        fake_diag = {
+            "summary": "no judge comments; session duration: 0s",
+            "session_duration_seconds": 0,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass", return_value=None
+            ) as mock_bypass,
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed"
+            ) as mock_mark_failed,
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "validation failed" in result.message
+        mock_bypass.assert_called_once()
+        mock_mark_failed.assert_called_once()
+
 
 class TestMergePhase:
     """Test MergePhase."""
