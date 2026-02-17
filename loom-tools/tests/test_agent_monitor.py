@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 from unittest import mock
@@ -409,19 +410,19 @@ class TestSignalChecking:
         (tmp_path / ".git").mkdir()
         return tmp_path
 
-    @pytest.mark.asyncio
-    async def test_check_signals_none(self, temp_repo: pathlib.Path) -> None:
+    
+    def test_check_signals_none(self, temp_repo: pathlib.Path) -> None:
         config = MonitorConfig(name="test-agent")
         with mock.patch(
             "loom_tools.agent_monitor.find_repo_root", return_value=temp_repo
         ):
             monitor = AgentMonitor(config)
-            signal = await monitor._check_signals()
+            signal = asyncio.run(monitor._check_signals())
 
         assert signal is None
 
-    @pytest.mark.asyncio
-    async def test_check_signals_shutdown(self, temp_repo: pathlib.Path) -> None:
+    
+    def test_check_signals_shutdown(self, temp_repo: pathlib.Path) -> None:
         config = MonitorConfig(name="test-agent")
         stop_file = temp_repo / ".loom" / "stop-shepherds"
         stop_file.touch()
@@ -430,12 +431,12 @@ class TestSignalChecking:
             "loom_tools.agent_monitor.find_repo_root", return_value=temp_repo
         ):
             monitor = AgentMonitor(config)
-            signal = await monitor._check_signals()
+            signal = asyncio.run(monitor._check_signals())
 
         assert signal == SignalType.SHUTDOWN
 
-    @pytest.mark.asyncio
-    async def test_check_signals_abort(self, temp_repo: pathlib.Path) -> None:
+    
+    def test_check_signals_abort(self, temp_repo: pathlib.Path) -> None:
         config = MonitorConfig(name="test-agent", issue=42)
 
         mock_result = mock.Mock()
@@ -446,7 +447,7 @@ class TestSignalChecking:
         ):
             with mock.patch("subprocess.run", return_value=mock_result):
                 monitor = AgentMonitor(config)
-                signal = await monitor._check_signals()
+                signal = asyncio.run(monitor._check_signals())
 
         assert signal == SignalType.ABORT
 
