@@ -220,6 +220,7 @@ def _mark_phase_failed(
     diagnostics: str = "",
     *,
     failure_label: str | None = None,
+    quiet: bool = False,
 ) -> None:
     """Mark issue with phase-specific failure label and add comment.
 
@@ -231,7 +232,14 @@ def _mark_phase_failed(
         diagnostics: Optional diagnostic markdown to append
         failure_label: Specific failure label to apply (e.g., "loom:failed:builder")
                       If None, uses "loom:blocked" as fallback
+        quiet: If True, skip label changes and diagnostic comment.
+               Used during intermediate recovery attempts to avoid noisy
+               comments that persist even when the shepherd later recovers
+               (see issue #2609).
     """
+    if quiet:
+        return
+
     # Determine label to apply
     target_label = failure_label or "loom:blocked"
 
@@ -512,6 +520,7 @@ def validate_curator(
     *,
     task_id: str | None = None,
     check_only: bool = False,
+    quiet: bool = False,
 ) -> ValidationResult:
     """Curator contract: issue must have ``loom:curated`` label."""
     r = _run_gh(
@@ -554,8 +563,16 @@ def validate_builder(
     pr_number: int | None = None,
     task_id: str | None = None,
     check_only: bool = False,
+    quiet: bool = False,
 ) -> ValidationResult:
-    """Builder contract: PR with ``loom:review-requested`` must exist for the issue."""
+    """Builder contract: PR with ``loom:review-requested`` must exist for the issue.
+
+    Args:
+        quiet: If True, attempt recovery but suppress diagnostic comments and
+               label changes on failure.  Used by retry loops to avoid posting
+               noisy intermediate-failure comments that persist even when the
+               shepherd later recovers (see issue #2609).
+    """
 
     # Pre-check: workflow violation detection
     if worktree and not Path(worktree).is_dir():
@@ -607,6 +624,7 @@ def validate_builder(
                 "Issue has been automatically reopened.",
                 repo_root,
                 failure_label="loom:failed:builder",
+                quiet=quiet,
             )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED,
@@ -682,6 +700,7 @@ def validate_builder(
             f"and 'Closes/Fixes/Resolves #{issue}' in PR body. No worktree available.",
             repo_root,
             failure_label="loom:failed:builder",
+            quiet=quiet,
         )
         return ValidationResult("builder", issue, ValidationStatus.FAILED, msg)
 
@@ -693,6 +712,7 @@ def validate_builder(
             "Builder did not create a PR and worktree path does not exist.",
             repo_root, diag.to_markdown(),
             failure_label="loom:failed:builder",
+            quiet=quiet,
         )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED,
@@ -710,6 +730,7 @@ def validate_builder(
             "Builder did not create a PR and worktree is not a valid git directory.",
             repo_root,
             failure_label="loom:failed:builder",
+            quiet=quiet,
         )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED, "Could not check worktree status",
@@ -730,6 +751,7 @@ def validate_builder(
                 "Builder did not create a PR. Worktree had no uncommitted or unpushed changes.",
                 repo_root, diag.to_markdown(),
                 failure_label="loom:failed:builder",
+                quiet=quiet,
             )
             return ValidationResult(
                 "builder", issue, ValidationStatus.FAILED,
@@ -751,6 +773,7 @@ def validate_builder(
                 "Only marker/infrastructure files were found in the worktree.",
                 repo_root, diag.to_markdown(),
                 failure_label="loom:failed:builder",
+                quiet=quiet,
             )
             return ValidationResult(
                 "builder", issue, ValidationStatus.FAILED,
@@ -783,6 +806,7 @@ def validate_builder(
                     f"Recovery failed: git add failed: {r.stderr.strip()[:200]}",
                     repo_root, diag.to_markdown(),
                     failure_label="loom:failed:builder",
+                    quiet=quiet,
                 )
                 return ValidationResult(
                     "builder", issue, ValidationStatus.FAILED,
@@ -801,6 +825,7 @@ def validate_builder(
                     f"Recovery failed: git commit failed: {r.stderr.strip()[:200]}",
                     repo_root, diag.to_markdown(),
                     failure_label="loom:failed:builder",
+                    quiet=quiet,
                 )
                 return ValidationResult(
                     "builder", issue, ValidationStatus.FAILED,
@@ -819,6 +844,7 @@ def validate_builder(
             f"Recovery failed: git push failed: {r.stderr.strip()[:200]}",
             repo_root, diag.to_markdown(),
             failure_label="loom:failed:builder",
+            quiet=quiet,
         )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED,
@@ -851,6 +877,7 @@ def validate_builder(
             f"Recovery failed: gh pr create failed: {r.stderr.strip()[:200]}",
             repo_root, diag.to_markdown(),
             failure_label="loom:failed:builder",
+            quiet=quiet,
         )
         return ValidationResult(
             "builder", issue, ValidationStatus.FAILED,
@@ -887,6 +914,7 @@ def validate_judge(
     pr_number: int | None = None,
     task_id: str | None = None,
     check_only: bool = False,
+    quiet: bool = False,
 ) -> ValidationResult:
     """Judge contract: PR must have ``loom:pr`` or ``loom:changes-requested``."""
     if pr_number is None:
@@ -933,6 +961,7 @@ def validate_judge(
             f"Judge phase did not produce a review decision on PR #{pr_number}.",
             repo_root,
             failure_label="loom:failed:judge",
+            quiet=quiet,
         )
 
     return ValidationResult("judge", issue, ValidationStatus.FAILED, msg)
@@ -945,6 +974,7 @@ def validate_doctor(
     pr_number: int | None = None,
     task_id: str | None = None,
     check_only: bool = False,
+    quiet: bool = False,
 ) -> ValidationResult:
     """Doctor contract: PR must have ``loom:review-requested``."""
     if pr_number is None:
@@ -974,6 +1004,7 @@ def validate_doctor(
             f"Doctor phase did not apply loom:review-requested to PR #{pr_number}.",
             repo_root,
             failure_label="loom:failed:doctor",
+            quiet=quiet,
         )
 
     return ValidationResult("doctor", issue, ValidationStatus.FAILED, msg)
@@ -1083,10 +1114,16 @@ def validate_phase(
     pr_number: int | None = None,
     task_id: str | None = None,
     check_only: bool = False,
+    quiet: bool = False,
 ) -> ValidationResult:
     """Validate a shepherd phase contract.
 
     This is the main Python API — importable from other modules.
+
+    Args:
+        quiet: If True, attempt recovery but suppress diagnostic comments and
+               label changes on failure.  Used by retry loops to avoid posting
+               noisy intermediate-failure comments (see issue #2609).
     """
     if phase not in _VALIDATORS:
         return ValidationResult(
@@ -1100,6 +1137,7 @@ def validate_phase(
     kwargs: dict[str, Any] = {
         "task_id": task_id,
         "check_only": check_only,
+        "quiet": quiet,
     }
 
     if phase == "builder":

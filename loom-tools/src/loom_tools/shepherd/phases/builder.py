@@ -562,11 +562,13 @@ class BuilderPhase:
         # Validate phase with completion retry
         # If builder made changes but didn't complete commit/push/PR workflow,
         # spawn a focused completion phase to finish the work.
+        # Use quiet=True to suppress intermediate diagnostic comments that
+        # would persist even if a later retry succeeds (issue #2609).
         completion_attempts = 0
         max_completion_attempts = ctx.config.builder_completion_retries
 
         while True:
-            if self.validate(ctx):
+            if self.validate(ctx, quiet=True):
                 break  # Validation passed
 
             # Re-diagnose on each iteration to detect partial progress
@@ -687,11 +689,16 @@ class BuilderPhase:
             data={"pr_number": pr},
         )
 
-    def validate(self, ctx: ShepherdContext) -> bool:
+    def validate(self, ctx: ShepherdContext, *, quiet: bool = False) -> bool:
         """Validate builder phase contract.
 
         Calls the Python validate_phase module directly for comprehensive
         validation with recovery.
+
+        Args:
+            quiet: If True, attempt recovery but suppress diagnostic comments
+                   and label changes on failure.  Used by retry loops to avoid
+                   posting noisy intermediate-failure comments (issue #2609).
         """
         from loom_tools.validate_phase import validate_phase
 
@@ -701,6 +708,7 @@ class BuilderPhase:
             repo_root=ctx.repo_root,
             worktree=str(ctx.worktree_path) if ctx.worktree_path else None,
             task_id=ctx.config.task_id,
+            quiet=quiet,
         )
         return result.satisfied
 
@@ -733,11 +741,12 @@ class BuilderPhase:
             PhaseResult with FAILED status if completion could not be achieved.
         """
         # Run validation with completion retry
+        # Use quiet=True to suppress intermediate diagnostic comments (issue #2609).
         completion_attempts = 0
         max_completion_attempts = ctx.config.builder_completion_retries
 
         while True:
-            if self.validate(ctx):
+            if self.validate(ctx, quiet=True):
                 break  # Validation passed
 
             # Re-diagnose on each iteration to detect partial progress
