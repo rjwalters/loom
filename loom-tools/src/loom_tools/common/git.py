@@ -222,6 +222,33 @@ def has_uncommitted_changes(cwd: pathlib.Path | str | None = None) -> bool:
         return False
 
 
+def parse_porcelain_path(line: str) -> str:
+    """Extract the file path from a ``git status --porcelain`` line.
+
+    The porcelain v1 format is ``XY PATH`` where ``XY`` is a 2-character
+    status code followed by a single space.  The ``line[3:]`` slice that
+    was used historically is fragile when whitespace varies.  This helper
+    skips the 2-char status and strips any leading whitespace, then removes
+    surrounding quotes that git adds for paths with special characters.
+
+    For rename lines (``XY old -> new``), the full ``old -> new`` string
+    is returned so callers can split further if needed.
+
+    Parameters
+    ----------
+    line:
+        A single line from ``git status --porcelain`` output.
+
+    Returns
+    -------
+    str
+        The file path (or rename pair) with quotes stripped.
+    """
+    if len(line) < 3:
+        return line.strip()
+    return line[2:].lstrip().strip('"')
+
+
 def get_uncommitted_files(cwd: pathlib.Path | str | None = None) -> list[str]:
     """Get list of uncommitted files (staged, unstaged, and untracked).
 
