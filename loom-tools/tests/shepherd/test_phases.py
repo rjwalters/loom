@@ -10141,10 +10141,54 @@ class TestRunWorkerPhaseInstantExit:
 
         assert exit_code == 0
 
-    def test_non_zero_exit_skips_instant_exit_check(
+    def test_non_zero_exit_with_minimal_output_returns_instant_exit(
         self, mock_context: MagicMock
     ) -> None:
-        """Exit codes other than 0 should not trigger instant-exit detection."""
+        """Non-zero exit with minimal output should still detect instant-exit.
+
+        When a degraded CLI session exits with a non-zero code (e.g., 2 for
+        API error) but produced no meaningful output, it's functionally the
+        same as an instant-exit and should be classified as code 6.
+        See issue #2446.
+        """
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 2  # Non-zero exit (e.g., API error)
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=True
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 6
+
+    def test_non_zero_exit_with_normal_output_returns_raw_code(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Non-zero exit with normal output should return the raw exit code.
+
+        When the CLI exits non-zero but produced substantial output (not an
+        instant-exit), the raw exit code should be returned as-is.
+        """
 
         def mock_spawn(cmd, **kwargs):
             result = MagicMock()
@@ -10162,8 +10206,11 @@ class TestRunWorkerPhaseInstantExit:
             patch("subprocess.Popen", side_effect=mock_popen),
             patch("time.sleep"),
             patch(
-                "loom_tools.shepherd.phases.base._is_instant_exit"
-            ) as mock_check,
+                "loom_tools.shepherd.phases.base._is_instant_exit", return_value=False
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=False
+            ),
         ):
             exit_code = run_worker_phase(
                 mock_context,
@@ -10174,7 +10221,44 @@ class TestRunWorkerPhaseInstantExit:
             )
 
         assert exit_code == 4
-        mock_check.assert_not_called()
+
+    def test_non_zero_exit_with_mcp_failure_returns_code_7(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Non-zero exit with MCP failure log should return code 7.
+
+        When the CLI exits non-zero but the log shows MCP failure,
+        it should be classified as code 7 for MCP-specific retry.
+        """
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 1  # Non-zero exit
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure", return_value=True
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 7
 
 
 class TestRunPhaseWithRetryInstantExit:

@@ -574,27 +574,32 @@ def run_worker_phase(
             check=False,
         )
 
-    # Detect instant-exit: session completed (exit 0) but ran for < 5s with
-    # no meaningful output.  Return synthetic exit code 6 so the retry layer
-    # can handle it with backoff.  See issue #2135.
+    # Detect instant-exit / MCP failure: session produced no meaningful output.
+    # Return synthetic exit code 6 (instant-exit) or 7 (MCP failure) so the
+    # retry layer can handle it with backoff.  See issues #2135, #2279.
+    #
+    # Check on ALL exit codes, not just 0.  A degraded CLI session may exit
+    # with a non-zero code (e.g., 2 for API error) while still producing no
+    # meaningful output — this is functionally the same as an instant-exit
+    # and should be retried rather than treated as a builder error.
+    # See issue #2446.
     #
     # Check for MCP failure first (exit code 7) since it's a more specific
-    # failure mode with different retry/backoff strategy.  See issue #2279.
-    if wait_exit == 0:
-        paths = LoomPaths(ctx.repo_root)
-        log_path = paths.worker_log_file(role, ctx.config.issue)
-        if _is_mcp_failure(log_path):
-            log_warning(
-                f"MCP server failure detected for {role} session '{name}': "
-                f"MCP server failed to initialize (log: {log_path})"
-            )
-            return 7
-        if _is_instant_exit(log_path):
-            log_warning(
-                f"Instant-exit detected for {role} session '{name}': "
-                f"session produced no meaningful output (log: {log_path})"
-            )
-            return 6
+    # failure mode with different retry/backoff strategy.
+    paths = LoomPaths(ctx.repo_root)
+    log_path = paths.worker_log_file(role, ctx.config.issue)
+    if _is_mcp_failure(log_path):
+        log_warning(
+            f"MCP server failure detected for {role} session '{name}': "
+            f"MCP server failed to initialize (exit code {wait_exit}, log: {log_path})"
+        )
+        return 7
+    if _is_instant_exit(log_path):
+        log_warning(
+            f"Instant-exit detected for {role} session '{name}': "
+            f"session produced no meaningful output (exit code {wait_exit}, log: {log_path})"
+        )
+        return 6
 
     return wait_exit
 
