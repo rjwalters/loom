@@ -158,9 +158,12 @@ def _spawn_single_shepherd(
     has_branch = _has_existing_branch(ctx.repo_root, issue_num)
 
     # Build spawn arguments
+    # Always pass --merge so shepherds complete the full PR lifecycle
+    # (build → review → merge). Without this, normal-mode shepherds exit
+    # at the merge gate and nothing in the pipeline merges the resulting
+    # loom:pr PRs — they pile up unmerged (#2387).
     args = str(issue_num)
-    if ctx.config.force_mode:
-        args += " --force"
+    args += " --merge"
     args += " --allow-dirty-main"
 
     if has_checkpoint or has_branch:
