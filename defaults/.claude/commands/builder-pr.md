@@ -245,6 +245,11 @@ Issue #123 acceptance criteria:
 2. [ ] Criterion B - Verified by: [describe how you checked]
 3. [ ] Criterion C - Verified by: [describe how you checked]
 
+Root cause verification (for process/behavior issues):
+- [ ] Changes address root cause, not just surface symptom
+- [ ] Fix is structural (enforcement, validation, inlining) not just documentation
+- [ ] If documentation-only: justified why docs will change behavior this time
+
 Local verification:
 - [ ] `pnpm check:ci` passes (or equivalent)
 - [ ] Relevant tests pass

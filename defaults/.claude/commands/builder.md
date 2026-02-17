@@ -495,6 +495,41 @@ cargo fmt            # Format code
 - **Create quality PRs**: Clear description, references issue, requests review
 - **Get unstuck**: Mark `loom:blocked` if you can't proceed, explain why
 
+## Root Cause Verification
+
+**CRITICAL**: Before creating a PR, verify that your changes address the **root cause** of the problem, not just the surface symptom. This is especially important for process-improvement issues.
+
+### The Superficial Fix Anti-Pattern
+
+When an issue reports a process failure (e.g., "builder doesn't follow instructions in document X"), the tempting fix is to add a cross-reference or note pointing to document X. **This is almost never sufficient.** If the documentation already existed and wasn't followed, adding another pointer to it won't change behavior.
+
+**Superficial fixes to avoid:**
+- Adding parenthetical cross-references (e.g., `"see builder-pr.md"`)
+- Adding comments pointing to existing documentation
+- Rewording existing instructions without structural changes
+- Adding "reminder" notes that duplicate existing guidance
+
+### What Constitutes a Structural Fix
+
+A structural fix changes the **mechanism**, not just the **documentation**:
+
+| Problem Type | Superficial Fix | Structural Fix |
+|---|---|---|
+| Agent doesn't follow template | Add note "see template" | Inline the template at point of use, or add validation that rejects non-conforming output |
+| Agent skips a workflow step | Add reminder to docs | Add a checkpoint/gate that blocks progression without the step |
+| Agent produces low-quality output | Add quality guidelines | Add a self-check with concrete pass/fail criteria |
+| Process isn't enforced | Document the process | Add script enforcement or pre-commit hooks |
+
+### Pre-PR Root Cause Check
+
+Before creating your PR, answer these questions:
+
+1. **What is the root cause?** (Not "what does the issue say" but "why does this problem actually occur?")
+2. **Would my fix prevent recurrence?** If the same situation arises again, will my changes actually produce a different outcome?
+3. **Am I changing mechanism or just documentation?** If I'm only changing `.md` files with no structural enforcement, is that truly sufficient?
+
+If your fix is documentation-only for a process issue, you must justify why documentation alone will change behavior this time when it didn't before. If you can't justify it, find a structural approach.
+
 ## When You Can't Determine Changes
 
 **If you investigate an issue but cannot determine what code changes to make, you MUST leave a comment on the issue before exiting.** This preserves context for the next attempt (human or automated).
