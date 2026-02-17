@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from loom_tools.claim import has_valid_claim
-from loom_tools.common.github import get_repo_nwo, gh_api_rest, gh_issue_list, gh_run
+from loom_tools.common.github import get_repo_nwo, gh_issue_list, gh_run
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
 from loom_tools.common.repo import find_repo_root
 from loom_tools.common.state import (
