@@ -203,12 +203,15 @@ class JudgePhase:
         # Retry validation with backoff to handle the race condition
         # where the judge applies comment and label in separate API calls
         # (see issue #1764).
+        # Use check_only=True for non-final attempts to avoid posting
+        # duplicate "Phase contract failed" comments (issue #2558).
         validated = False
         for attempt in range(VALIDATION_MAX_RETRIES):
-            if self.validate(ctx):
+            is_last_attempt = attempt == VALIDATION_MAX_RETRIES - 1
+            if self.validate(ctx, check_only=not is_last_attempt):
                 validated = True
                 break
-            if attempt < VALIDATION_MAX_RETRIES - 1:
+            if not is_last_attempt:
                 time.sleep(VALIDATION_RETRY_DELAY_SECONDS)
                 # Re-invalidate cache before each retry to get fresh data
                 ctx.label_cache.invalidate_pr(ctx.pr_number)
@@ -289,10 +292,15 @@ class JudgePhase:
             phase_name="judge",
         )
 
-    def validate(self, ctx: ShepherdContext) -> bool:
+    def validate(self, ctx: ShepherdContext, *, check_only: bool = False) -> bool:
         """Validate judge phase contract.
 
         Calls the Python validate_phase module directly.
+
+        Args:
+            check_only: If True, skip side-effects (comments, label changes)
+                on failure.  Used by the retry loop to avoid posting duplicate
+                "Phase contract failed" comments on non-final attempts (#2558).
         """
         if ctx.pr_number is None:
             return False
@@ -305,6 +313,7 @@ class JudgePhase:
             repo_root=ctx.repo_root,
             pr_number=ctx.pr_number,
             task_id=ctx.config.task_id,
+            check_only=check_only,
         )
         return result.satisfied
 
