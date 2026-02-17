@@ -4207,6 +4207,29 @@ class TestRecordFallbackFailure:
         )
         mock_detect.assert_called_once_with(Path("/fake/repo"))
 
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure", return_value=None)
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    def test_records_worktree_escape_class(
+        self,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+    ) -> None:
+        """Should record builder_worktree_escape for worktree escape exit code."""
+        ctx = MagicMock()
+        ctx.config.issue = 42
+        ctx.repo_root = Path("/fake/repo")
+
+        _record_fallback_failure(ctx, ShepherdExitCode.WORKTREE_ESCAPE)
+
+        mock_record.assert_called_once_with(
+            Path("/fake/repo"),
+            42,
+            error_class="builder_worktree_escape",
+            phase="builder",
+            details="Builder escaped worktree and modified main instead (fallback cleanup)",
+        )
+        mock_detect.assert_called_once_with(Path("/fake/repo"))
+
     @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
     @patch("loom_tools.common.systematic_failure.record_blocked_reason")
     def test_survives_record_failure(
