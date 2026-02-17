@@ -161,6 +161,13 @@ class BuilderPhase:
         # Baseline snapshot of main's dirty files before builder spawns.
         # Used to distinguish pre-existing dirt from worktree escapes.
         self._main_dirty_baseline: set[str] | None = None
+        # Cache baseline test results keyed by the actual command tuple.
+        # This prevents re-running baselines on main between Doctor
+        # iterations, which eliminates flaky-test false positives caused
+        # by non-deterministic baseline results across runs.
+        self._baseline_cache: dict[
+            tuple[str, ...], subprocess.CompletedProcess[str] | None
+        ] = {}
 
     def should_skip(self, ctx: ShepherdContext) -> tuple[bool, str]:
         """Check if builder phase should be skipped.
@@ -1868,6 +1875,13 @@ class BuilderPhase:
                 return None
             baseline_cmd, _ = baseline_test_info
 
+        # Return cached baseline if available (avoids flaky-test false
+        # positives when baselines are re-run between Doctor iterations).
+        cache_key = tuple(baseline_cmd)
+        if cache_key in self._baseline_cache:
+            log_info(f"Using cached baseline for: {display_name}")
+            return self._baseline_cache[cache_key]
+
         log_info(f"Running baseline tests on main: {display_name}")
 
         # Snapshot dirty state before running tests so we can clean up artifacts
@@ -1885,12 +1899,15 @@ class BuilderPhase:
         except subprocess.TimeoutExpired:
             log_warning("Baseline test run timed out, skipping comparison")
             self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
+            self._baseline_cache[cache_key] = None
             return None
         except OSError as e:
             log_warning(f"Could not run baseline tests: {e}")
+            self._baseline_cache[cache_key] = None
             return None
 
         self._cleanup_new_artifacts(ctx.repo_root, pre_dirty)
+        self._baseline_cache[cache_key] = result
         return result
 
     @staticmethod
@@ -1976,6 +1993,7 @@ class BuilderPhase:
             log_info(
                 f"Cleaned {cleaned} artifact(s) from main after baseline test run"
             )
+
 
     def _run_single_test_with_baseline(
         self,

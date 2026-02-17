@@ -3011,6 +3011,125 @@ class TestBuilderBaselineTests:
         clean_calls = [c for c in run_calls if c[0] == "git" and c[1] in ("checkout", "clean")]
         assert len(clean_calls) == 0
 
+    def test_baseline_cache_returns_cached_result(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return cached baseline on second call instead of re-running."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="FAIL foo\n", stderr=""
+        )
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "check:ci"], "pnpm check:ci"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                return_value=completed,
+            ) as mock_run,
+            patch.object(builder, "_get_dirty_files", return_value=set()),
+            patch.object(builder, "_cleanup_new_artifacts"),
+        ):
+            # First call — runs baseline
+            result1 = builder._run_baseline_tests(
+                mock_context, ["pnpm", "check:ci"], "pnpm check:ci"
+            )
+            assert mock_run.call_count == 1
+
+            # Second call — should use cache, not re-run
+            result2 = builder._run_baseline_tests(
+                mock_context, ["pnpm", "check:ci"], "pnpm check:ci"
+            )
+            assert mock_run.call_count == 1  # No additional subprocess call
+
+        assert result1 is result2
+        assert result1 is not None
+        assert result1.returncode == 1
+
+    def test_baseline_cache_keyed_by_command(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Different test commands should get separate cache entries."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        result_a = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="OK\n", stderr=""
+        )
+        result_b = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="FAIL\n", stderr=""
+        )
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=[result_a, result_b],
+            ) as mock_run,
+            patch.object(builder, "_get_dirty_files", return_value=set()),
+            patch.object(builder, "_cleanup_new_artifacts"),
+        ):
+            r1 = builder._run_baseline_tests(
+                mock_context, ["pytest"], "pytest", use_provided_cmd=True
+            )
+            r2 = builder._run_baseline_tests(
+                mock_context, ["cargo", "test"], "cargo test", use_provided_cmd=True
+            )
+            assert mock_run.call_count == 2
+
+            # Repeated calls use cache
+            r1b = builder._run_baseline_tests(
+                mock_context, ["pytest"], "pytest", use_provided_cmd=True
+            )
+            r2b = builder._run_baseline_tests(
+                mock_context, ["cargo", "test"], "cargo test", use_provided_cmd=True
+            )
+            assert mock_run.call_count == 2  # No new calls
+
+        assert r1 is r1b
+        assert r2 is r2b
+        assert r1.returncode == 0
+        assert r2.returncode == 1
+
+    def test_baseline_cache_caches_none_on_timeout(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Timeout result (None) should be cached to avoid retrying."""
+        builder = BuilderPhase()
+        mock_context.repo_root = MagicMock()
+        mock_context.repo_root.is_dir.return_value = True
+
+        with (
+            patch.object(
+                builder,
+                "_detect_test_command",
+                return_value=(["pnpm", "test"], "pnpm test"),
+            ),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(cmd="pnpm test", timeout=300),
+            ) as mock_run,
+            patch.object(builder, "_get_dirty_files", return_value=set()),
+            patch.object(builder, "_cleanup_new_artifacts"),
+        ):
+            result1 = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+            assert result1 is None
+            assert mock_run.call_count == 1
+
+            # Second call should return cached None without running
+            result2 = builder._run_baseline_tests(
+                mock_context, ["pnpm", "test"], "pnpm test"
+            )
+            assert result2 is None
+            assert mock_run.call_count == 1
+
 
 class TestBuilderExtractErrorLines:
     """Test builder phase error line extraction."""
