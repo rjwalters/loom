@@ -5916,6 +5916,69 @@ class TestMergePhase:
         assert result.status == PhaseStatus.FAILED
         assert "merge-pr.sh not available" in result.message
 
+    @patch("loom_tools.shepherd.phases.merge.subprocess.run")
+    def test_recovers_when_pr_merged_despite_script_error(
+        self,
+        mock_subprocess: MagicMock,
+        mock_context: MagicMock,
+    ) -> None:
+        """Should return SUCCESS when PR actually merged despite CalledProcessError.
+
+        Post-merge cleanup failures (label removal, branch deletion, worktree
+        removal) cause merge-pr.sh to exit non-zero even though the merge
+        itself succeeded. The error handler should check actual PR state via
+        validate() before declaring failure (issue #2400).
+        """
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.run_script.side_effect = subprocess.CalledProcessError(1, "merge-pr.sh")
+
+        # Simulate gh pr view returning MERGED state
+        mock_subprocess.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="MERGED\n", stderr=""
+        )
+
+        merge = MergePhase()
+        result = merge.run(mock_context)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert "recovered from post-merge cleanup error" in result.message
+        assert result.data.get("merged") is True
+
+    @patch("loom_tools.common.systematic_failure.detect_systematic_failure")
+    @patch("loom_tools.common.systematic_failure.record_blocked_reason")
+    @patch("loom_tools.shepherd.phases.merge.subprocess.run")
+    def test_still_fails_when_pr_not_merged_and_script_error(
+        self,
+        mock_subprocess: MagicMock,
+        mock_record: MagicMock,
+        mock_detect: MagicMock,
+        mock_context: MagicMock,
+    ) -> None:
+        """Should still return FAILED when PR genuinely failed to merge.
+
+        When merge-pr.sh fails and the PR is NOT in MERGED state,
+        the original failure behavior should be preserved (issue #2400).
+        """
+        mock_context.config = ShepherdConfig(issue=42, mode=ExecutionMode.FORCE_MERGE)
+        mock_context.check_shutdown.return_value = False
+        mock_context.pr_number = 100
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.run_script.side_effect = subprocess.CalledProcessError(1, "merge-pr.sh")
+
+        # Simulate gh pr view returning OPEN state (merge genuinely failed)
+        mock_subprocess.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="OPEN\n", stderr=""
+        )
+
+        merge = MergePhase()
+        result = merge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        assert f"failed to merge PR #100" in result.message
+
 
 class TestPhaseStatus:
     """Test PhaseStatus enum and PhaseResult."""

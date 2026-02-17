@@ -59,6 +59,14 @@ class MergePhase:
                     phase_name="merge",
                 )
             except subprocess.CalledProcessError:
+                # Check if PR merged despite script error (post-merge cleanup may have failed)
+                if self.validate(ctx):
+                    return PhaseResult(
+                        status=PhaseStatus.SUCCESS,
+                        message=f"PR #{ctx.pr_number} merged (recovered from post-merge cleanup error)",
+                        phase_name="merge",
+                        data={"merged": True},
+                    )
                 self._mark_issue_blocked(
                     ctx, "merge_failed", f"failed to merge PR #{ctx.pr_number}"
                 )
