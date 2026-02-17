@@ -212,6 +212,56 @@ def _log_recovery_event(
         log_warning(f"Failed to write recovery event to {recovery_file}")
 
 
+def _build_recovery_pr_body(issue: int, worktree: str) -> str:
+    """Build a descriptive PR body for recovery-created PRs.
+
+    Gathers diff stats from git to provide reviewers with context about what
+    changed, since the builder did not create the PR itself.
+    """
+    lines: list[str] = []
+
+    lines.append(f"Closes #{issue}")
+    lines.append("")
+    lines.append("> **Note:** This PR was created automatically via the builder "
+                 "recovery path. The builder produced changes but exited before "
+                 "creating a PR. Reviewers should examine the diff carefully.")
+    lines.append("")
+
+    # Gather diff stats (committed changes vs main)
+    r = subprocess.run(
+        ["git", "-C", worktree, "diff", "--stat", "origin/main...HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        lines.append("## Changes")
+        lines.append("")
+        lines.append("```")
+        lines.append(r.stdout.strip())
+        lines.append("```")
+        lines.append("")
+
+    # Gather shortlog of commits
+    r = subprocess.run(
+        ["git", "-C", worktree, "log", "--oneline", "origin/main..HEAD"],
+        capture_output=True, text=True, check=False,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        commits = r.stdout.strip().splitlines()
+        lines.append("## Commits")
+        lines.append("")
+        for commit in commits:
+            lines.append(f"- `{commit}`")
+        lines.append("")
+
+    lines.append("## Test plan")
+    lines.append("")
+    lines.append("- [ ] Review diff carefully (recovery-created PR)")
+    lines.append("- [ ] Verify changes match issue requirements")
+    lines.append("- [ ] Run tests locally if needed")
+
+    return "\n".join(lines)
+
+
 def _mark_phase_failed(
     issue: int,
     phase: str,
@@ -859,13 +909,15 @@ def validate_builder(
     )
     pr_title = r_title.stdout.strip() if r_title.returncode == 0 and r_title.stdout.strip() else f"Issue #{issue}"
 
+    pr_body = _build_recovery_pr_body(issue, worktree)
+
     r = subprocess.run(
         [
             "gh", "pr", "create",
             "--head", branch,
             "--title", pr_title,
             "--label", "loom:review-requested",
-            "--body", f"Closes #{issue}",
+            "--body", pr_body,
         ],
         cwd=repo_root,
         capture_output=True, text=True, check=False,
