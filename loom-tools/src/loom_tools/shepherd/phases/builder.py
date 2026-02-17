@@ -1349,8 +1349,14 @@ class BuilderPhase:
         """
         commands: list[tuple[list[str], str]] = []
 
-        # Config changes affect everything - run all tests
+        # Config changes affect everything - run all tests.
+        # Prefer decomposing &&-chained pipelines to avoid short-circuit
+        # masking failures in later stages (see issue #2610).
         if "config" in languages:
+            for script_name in ("check:ci:lite", "check:ci"):
+                decomposed = self._decompose_pipeline_script(worktree, script_name)
+                if decomposed:
+                    return decomposed
             full_cmd = self._detect_test_command(worktree)
             if full_cmd:
                 return [full_cmd]
@@ -1451,11 +1457,17 @@ class BuilderPhase:
                     commands.append((["pnpm", "test:unit"], "pnpm test:unit"))
 
         # If "other" category or no specific tests detected, fall back to
-        # full test suite
+        # full test suite (decomposing pipelines to avoid short-circuit issues)
         if not commands and ("other" in languages or not languages):
-            full_cmd = self._detect_test_command(worktree)
-            if full_cmd:
-                commands.append(full_cmd)
+            for script_name in ("check:ci:lite", "check:ci"):
+                decomposed = self._decompose_pipeline_script(worktree, script_name)
+                if decomposed:
+                    commands = decomposed
+                    break
+            if not commands:
+                full_cmd = self._detect_test_command(worktree)
+                if full_cmd:
+                    commands.append(full_cmd)
 
         return commands
 
@@ -1493,6 +1505,54 @@ class BuilderPhase:
                 )
 
         return None
+
+    def _decompose_pipeline_script(
+        self, worktree: Path, script_name: str
+    ) -> list[tuple[list[str], str]] | None:
+        """Decompose a &&-chained package.json script into individual commands.
+
+        When a script like ``check:ci:lite`` contains multiple commands joined
+        with ``&&``, running it as a single command allows early failures to
+        short-circuit the pipeline, preventing later test suites from executing.
+        This makes baseline comparison unreliable because both sides may fail
+        at the same early step while the worktree has regressions in later steps.
+
+        This method reads the script value from ``package.json``, splits on
+        ``&&``, and returns individual ``(command_args, display_name)`` tuples
+        so each step can be run and compared independently.
+
+        Returns None if the script is not a pipeline (single command) or if
+        the script is not found in package.json.
+        """
+        try:
+            if not (worktree / "package.json").is_file():
+                return None
+
+            pkg = read_json_file(worktree / "package.json")
+            if not isinstance(pkg, dict):
+                return None
+
+            scripts = pkg.get("scripts", {})
+            script_value = scripts.get(script_name, "")
+
+            if not isinstance(script_value, str) or " && " not in script_value:
+                return None
+
+            parts = [p.strip() for p in script_value.split(" && ") if p.strip()]
+            if len(parts) <= 1:
+                return None
+
+            commands: list[tuple[list[str], str]] = []
+            for part in parts:
+                args = shlex.split(part)
+                if not args:
+                    continue
+                commands.append((args, part))
+
+            return commands if commands else None
+        except Exception:
+            # Decomposition is best-effort; fall back to single-command path
+            return None
 
     def _parse_test_summary(self, output: str) -> str | None:
         """Extract a brief test summary from command output.
@@ -2398,6 +2458,27 @@ class BuilderPhase:
             return None
 
         test_cmd, display_name = test_info
+
+        # If the detected command is a &&-chained pipeline (e.g. check:ci:lite),
+        # decompose it into individual steps to avoid short-circuit masking
+        # failures in later stages (see issue #2610).
+        if display_name.startswith("pnpm "):
+            script_name = display_name[len("pnpm "):]
+            pipeline_cmds = self._decompose_pipeline_script(
+                ctx.worktree_path, script_name
+            )
+            if pipeline_cmds:
+                log_info(
+                    f"Decomposing pipeline '{display_name}' into "
+                    f"{len(pipeline_cmds)} steps"
+                )
+                for step_cmd, step_name in pipeline_cmds:
+                    result = self._run_single_test_with_baseline(
+                        ctx, step_cmd, step_name
+                    )
+                    if result is not None:
+                        return result
+                return None
 
         # Run baseline tests on main to detect pre-existing failures
         baseline_result = self._run_baseline_tests(ctx, test_cmd, display_name)
