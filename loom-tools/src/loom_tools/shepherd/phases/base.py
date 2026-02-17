@@ -144,6 +144,42 @@ _UI_CHROME_LINE_PATTERNS = [
 ]
 
 
+# Regex to match [ERROR] lines in wrapper/CLI log files.
+# Format: "[timestamp] [ERROR] message" or just "[ERROR] message".
+_LOG_ERROR_RE = re.compile(r"\[ERROR\]\s*(.*)")
+
+
+def extract_log_errors(log_path: Path, *, max_errors: int = 3) -> list[str]:
+    """Extract the last N [ERROR] lines from a session log file.
+
+    Reads the log, strips ANSI codes, and returns the error messages
+    (without timestamp prefixes) from the last ``max_errors`` lines
+    matching ``[ERROR]``.  Returns an empty list if the log doesn't
+    exist or contains no error lines.
+
+    Args:
+        log_path: Path to the worker session log file.
+        max_errors: Maximum number of error lines to return.
+
+    Returns:
+        List of error message strings, most recent last.
+    """
+    if not log_path.is_file():
+        return []
+
+    try:
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        errors: list[str] = []
+        for line in stripped.splitlines():
+            m = _LOG_ERROR_RE.search(line)
+            if m:
+                errors.append(m.group(1).strip())
+        return errors[-max_errors:]
+    except OSError:
+        return []
+
+
 def _strip_ui_chrome(text: str) -> str:
     """Remove Claude Code UI chrome from output text.
 
@@ -841,15 +877,19 @@ def run_worker_phase(
     paths = LoomPaths(ctx.repo_root)
     log_path = paths.worker_log_file(role, ctx.config.issue)
     if _is_mcp_failure(log_path):
+        errors = extract_log_errors(log_path)
+        cause = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"MCP server failure detected for {role} session '{name}': "
-            f"MCP server failed to initialize (exit code {wait_exit}, log: {log_path})"
+            f"MCP server failure detected for {role} session '{name}'{cause} "
+            f"(exit code {wait_exit}, log: {log_path})"
         )
         return 7
     if _is_instant_exit(log_path):
+        errors = extract_log_errors(log_path)
+        cause = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"Instant-exit detected for {role} session '{name}': "
-            f"session produced no meaningful output (exit code {wait_exit}, log: {log_path})"
+            f"Instant-exit detected for {role} session '{name}'{cause} "
+            f"(exit code {wait_exit}, log: {log_path})"
         )
         return 6
 
@@ -928,9 +968,13 @@ def run_phase_with_retry(
         if exit_code == 7:
             mcp_failure_retries += 1
             if mcp_failure_retries > MCP_FAILURE_MAX_RETRIES:
+                paths = LoomPaths(ctx.repo_root)
+                log_path = paths.worker_log_file(role, ctx.config.issue)
+                errors = extract_log_errors(log_path)
+                cause = f": {errors[-1]}" if errors else ""
                 log_warning(
                     f"MCP server failure persisted for {role} after "
-                    f"{MCP_FAILURE_MAX_RETRIES} retries"
+                    f"{MCP_FAILURE_MAX_RETRIES} retries{cause}"
                 )
                 return 7  # Caller should treat as failure
 
@@ -960,9 +1004,13 @@ def run_phase_with_retry(
         if exit_code == 6:
             instant_exit_retries += 1
             if instant_exit_retries > INSTANT_EXIT_MAX_RETRIES:
+                paths = LoomPaths(ctx.repo_root)
+                log_path = paths.worker_log_file(role, ctx.config.issue)
+                errors = extract_log_errors(log_path)
+                cause = f": {errors[-1]}" if errors else ""
                 log_warning(
                     f"Instant-exit persisted for {role} after "
-                    f"{INSTANT_EXIT_MAX_RETRIES} retries"
+                    f"{INSTANT_EXIT_MAX_RETRIES} retries{cause}"
                 )
                 return 6  # Caller should treat as failure
 
