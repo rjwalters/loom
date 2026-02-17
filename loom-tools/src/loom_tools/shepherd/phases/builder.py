@@ -151,6 +151,7 @@ _BUILD_ARTIFACT_PATTERNS: list[str] = [
     ".loom-interrupted-context.json",
     "pnpm-lock.yaml",
     ".venv",
+    NO_CHANGES_MARKER,
 ]
 
 
