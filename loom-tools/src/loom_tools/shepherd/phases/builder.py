@@ -157,6 +157,14 @@ def _build_worktree_env(worktree_path: Path | None) -> dict[str, str] | None:
 class BuilderPhase:
     """Phase 3: Builder - Create worktree, implement, create PR."""
 
+    def __init__(self) -> None:
+        # Baseline of dirty files on main captured before spawning the builder.
+        # Used by _gather_diagnostics to distinguish pre-existing dirt from
+        # files the builder may have accidentally modified on main (worktree
+        # escape).  Defaults to empty so callers that skip run() (e.g.
+        # validate_and_complete) conservatively treat all dirty files as new.
+        self._pre_builder_dirty_files: set[str] = set()
+
     def should_skip(self, ctx: ShepherdContext) -> tuple[bool, str]:
         """Check if builder phase should be skipped.
 
@@ -340,6 +348,12 @@ class BuilderPhase:
 
         # Create marker to prevent premature cleanup
         self._create_worktree_marker(ctx)
+
+        # Snapshot main's dirty files before spawning the builder so that
+        # post-builder diagnostics can distinguish pre-existing dirt from
+        # files the builder accidentally modified on main (worktree escape).
+        # See issue #2455.
+        self._pre_builder_dirty_files = self._snapshot_main_dirty_files(ctx)
 
         # Run builder worker with retry
         exit_code = run_phase_with_retry(
@@ -2491,6 +2505,24 @@ class BuilderPhase:
         paths = LoomPaths(ctx.repo_root)
         return paths.builder_log_file(ctx.config.issue)
 
+    def _snapshot_main_dirty_files(self, ctx: ShepherdContext) -> set[str]:
+        """Capture the current set of dirty files on main.
+
+        Returns a set of ``git status --porcelain`` output lines representing
+        files that are currently dirty on the main branch.  This is used as a
+        baseline so that post-builder diagnostics can distinguish pre-existing
+        dirt from files the builder may have modified on main (worktree escape).
+        """
+        result = subprocess.run(
+            ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return set(result.stdout.splitlines())
+        return set()
+
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info about the builder environment.
 
@@ -2686,12 +2718,21 @@ class BuilderPhase:
             text=True,
             check=False,
         )
-        main_dirty_files: list[str] = []
+        all_dirty_files: list[str] = []
         if main_status.returncode == 0 and main_status.stdout.strip():
-            main_dirty_files = main_status.stdout.strip().splitlines()
-        diag["main_branch_dirty"] = bool(main_dirty_files)
-        diag["main_dirty_file_count"] = len(main_dirty_files)
-        diag["main_dirty_files"] = main_dirty_files[:10]  # Cap for readability
+            all_dirty_files = main_status.stdout.splitlines()
+
+        # Only flag files that are *newly* dirty — subtract the pre-builder
+        # baseline so that pre-existing dirt (allowed via --allow-dirty-main
+        # or --merge) does not trigger false "worktree escape" warnings.
+        # See issue #2455.
+        new_dirty_files = [
+            f for f in all_dirty_files
+            if f not in self._pre_builder_dirty_files
+        ]
+        diag["main_branch_dirty"] = bool(new_dirty_files)
+        diag["main_dirty_file_count"] = len(new_dirty_files)
+        diag["main_dirty_files"] = new_dirty_files[:10]  # Cap for readability
 
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []

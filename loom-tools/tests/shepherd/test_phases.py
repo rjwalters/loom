@@ -11328,6 +11328,179 @@ class TestBuilderGatherDiagnosticsMainBranch:
 
         assert "WARNING: main branch dirty" in diag["summary"]
 
+    def test_pre_existing_dirty_files_excluded(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Pre-existing dirty files should not trigger escape detection (issue #2455)."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+        # Simulate pre-builder snapshot captured the same files
+        builder._pre_builder_dirty_files = {
+            " M src/lib.rs",
+            " M src/parser.rs",
+        }
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # Same files still dirty — no new changes
+                    result.stdout = " M src/lib.rs\n M src/parser.rs\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        assert diag["main_branch_dirty"] is False
+        assert diag["main_dirty_file_count"] == 0
+        assert diag["main_dirty_files"] == []
+        assert "WARNING: main branch dirty" not in diag["summary"]
+
+    def test_newly_dirty_files_detected_with_pre_existing(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """New dirty files should be detected even when pre-existing ones exist (issue #2455)."""
+        wt_dir = tmp_path / "worktree"
+        wt_dir.mkdir()
+        mock_context.worktree_path = wt_dir
+        mock_context.config = ShepherdConfig(issue=42)
+        mock_context.repo_root = tmp_path
+
+        log_dir = tmp_path / ".loom" / "logs"
+        log_dir.mkdir(parents=True)
+
+        builder = BuilderPhase()
+        # Pre-builder snapshot had only one file dirty
+        builder._pre_builder_dirty_files = {" M src/lib.rs"}
+
+        def fake_run(cmd, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            result = subprocess.CompletedProcess(
+                args=cmd, returncode=0, stdout="", stderr=""
+            )
+            if "rev-parse" in cmd_str:
+                result.stdout = "feature/issue-42\n"
+            elif "log" in cmd_str and "main..HEAD" in cmd_str:
+                result.stdout = ""
+            elif "status --porcelain" in cmd_str:
+                if "-C" in cmd and str(tmp_path) in cmd_str and str(wt_dir) not in cmd_str:
+                    # Original file + new file dirty after builder
+                    result.stdout = " M src/lib.rs\n M src/new_file.rs\n"
+                else:
+                    result.stdout = ""
+            elif "ls-remote" in cmd_str:
+                result.stdout = ""
+            elif "gh" in cmd_str:
+                result.stdout = "loom:building"
+            return result
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run", side_effect=fake_run
+        ):
+            diag = builder._gather_diagnostics(mock_context)
+
+        # Only the new file should be flagged
+        assert diag["main_branch_dirty"] is True
+        assert diag["main_dirty_file_count"] == 1
+        assert diag["main_dirty_files"] == [" M src/new_file.rs"]
+        assert "WARNING: main branch dirty (1 files)" in diag["summary"]
+
+
+class TestBuilderSnapshotMainDirtyFiles:
+    """Test _snapshot_main_dirty_files helper."""
+
+    def test_captures_dirty_files(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Should return set of dirty file lines."""
+        mock_context.repo_root = tmp_path
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0,
+                stdout=" M src/lib.rs\n M src/parser.rs\n", stderr=""
+            ),
+        ):
+            result = builder._snapshot_main_dirty_files(mock_context)
+
+        assert result == {" M src/lib.rs", " M src/parser.rs"}
+
+    def test_returns_empty_when_clean(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Should return empty set when main is clean."""
+        mock_context.repo_root = tmp_path
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            ),
+        ):
+            result = builder._snapshot_main_dirty_files(mock_context)
+
+        assert result == set()
+
+    def test_returns_empty_on_git_failure(self, mock_context: MagicMock, tmp_path: Path) -> None:
+        """Should return empty set when git command fails."""
+        mock_context.repo_root = tmp_path
+        builder = BuilderPhase()
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run",
+            return_value=subprocess.CompletedProcess(
+                args=[], returncode=128, stdout="", stderr="fatal: not a git repository"
+            ),
+        ):
+            result = builder._snapshot_main_dirty_files(mock_context)
+
+        assert result == set()
+
+
+class TestBuilderPreDirtyNoChangesNeeded:
+    """Test _is_no_changes_needed with pre-builder dirty baseline (issue #2455)."""
+
+    def test_pre_dirty_main_allows_no_changes_needed(self) -> None:
+        """When all dirty files are pre-existing, should allow 'no changes needed'."""
+        builder = BuilderPhase()
+        # With the baseline subtraction in _gather_diagnostics, the diag dict
+        # will have main_branch_dirty=False when all dirty files are pre-existing.
+        diag = {
+            "worktree_exists": True,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "main_branch_dirty": False,  # No *new* dirty files
+            "main_dirty_file_count": 0,
+            "main_dirty_files": [],
+            "log_has_implementation_activity": False,
+            "log_cli_output_length": 50000,
+        }
+        assert builder._is_no_changes_needed(diag) is True
+
 
 class TestBuilderStaleWorktreeWithArtifacts:
     """Test _is_stale_worktree treats artifact-only changes as stale."""
