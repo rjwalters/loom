@@ -914,6 +914,18 @@ run_with_retry() {
         stop_output_monitor "${startup_monitor_pid_file}"
 
         output=$(cat "${temp_output}")
+
+        # In --print mode, pipe-pane may not flush before session exit.
+        # Append captured output to the log file so log-based heuristics
+        # (_is_instant_exit, _is_mcp_failure) have content to analyze
+        # and post-mortem debugging is possible.  See issue #2550.
+        if [[ "$_has_slash_cmd" == "true" && -n "${TERMINAL_ID}" ]]; then
+            local _log_file="${WORKSPACE}/.loom/logs/loom-${TERMINAL_ID}.log"
+            if [[ -f "$_log_file" && -s "${temp_output}" ]]; then
+                cat "${temp_output}" >> "$_log_file"
+            fi
+        fi
+
         rm -f "${temp_output}"
 
         # Check exit code
