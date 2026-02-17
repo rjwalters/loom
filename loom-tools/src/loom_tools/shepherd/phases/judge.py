@@ -196,6 +196,27 @@ class JudgePhase:
                 data={"mcp_failure": True},
             )
 
+        if exit_code == 10:
+            # Ghost session: CLI spawned but exited instantly with no work.
+            # In force mode, try infrastructure bypass before marking blocked.
+            # See issue #2604.
+            if ctx.config.is_force_mode:
+                bypass_result = self._try_infrastructure_bypass(
+                    ctx, failure_reason="ghost session (0s duration, no meaningful output)"
+                )
+                if bypass_result is not None:
+                    return bypass_result
+
+            self._mark_issue_blocked(
+                ctx, "judge_ghost_session", "ghost session after retry (0s duration, no output)"
+            )
+            return PhaseResult(
+                status=PhaseStatus.FAILED,
+                message="judge ghost session after retry (0s duration, no meaningful output)",
+                phase_name="judge",
+                data={"ghost_session": True},
+            )
+
         # Invalidate caches BEFORE validation so the first attempt
         # fetches fresh data instead of stale cached labels.
         ctx.label_cache.invalidate_pr(ctx.pr_number)

@@ -25,6 +25,8 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import (
+    GHOST_SESSION_MAX_RETRIES,
+    GHOST_SESSION_RETRY_DELAY_SECONDS,
     LOW_OUTPUT_BACKOFF_SECONDS,
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS,
     LOW_OUTPUT_MAX_RETRIES,
@@ -36,6 +38,7 @@ from loom_tools.shepherd.phases.base import (
     _AUTH_FAILURE_SENTINEL,
     _classify_low_output_cause,
     _is_auth_failure,
+    _is_ghost_session,
     _is_low_output_session,
     _is_mcp_failure,
     _print_heartbeat,
@@ -15147,3 +15150,505 @@ class TestRunPhaseWithRetryLowOutputClassification:
         # heartbeat milestone should mention the cause
         heartbeat_call = milestone_calls[1]
         assert "auth_lock_contention" in heartbeat_call.kwargs["action"]
+
+
+# ── Ghost session detection tests (issue #2604) ──────────────────────── #
+
+
+class TestIsGhostSession:
+    """Test _is_ghost_session helper function."""
+
+    def test_no_file(self, tmp_path: Path) -> None:
+        """Missing log file should not be classified as ghost session."""
+        assert _is_ghost_session(tmp_path / "nonexistent.log") is False
+
+    def test_empty_file_zero_duration(self, tmp_path: Path) -> None:
+        """Empty log with 0s duration is a ghost session."""
+        log = tmp_path / "session.log"
+        log.write_text("")
+        # File just created — mtime == ctime (0s duration)
+        assert _is_ghost_session(log) is True
+
+    def test_no_output_zero_duration(self, tmp_path: Path) -> None:
+        """Log with only ANSI sequences and 0s duration is a ghost session."""
+        log = tmp_path / "session.log"
+        log.write_text("\x1b[?2026l\x1b[0m\n")
+        assert _is_ghost_session(log) is True
+
+    def test_meaningful_output_zero_duration_not_ghost(self, tmp_path: Path) -> None:
+        """Log with meaningful output but 0s duration is NOT a ghost.
+
+        A fast legitimate failure (e.g., immediate validation error) should
+        not be classified as a ghost session.
+        """
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            + "x" * (LOW_OUTPUT_MIN_CHARS + 1)
+        )
+        assert _is_ghost_session(log) is False
+
+    def test_no_output_long_duration_not_ghost(self, tmp_path: Path) -> None:
+        """Log with no output but long duration is NOT a ghost.
+
+        This is a low-output session, not a ghost — the session ran for a
+        meaningful amount of time but produced no output.
+        """
+        log = tmp_path / "session.log"
+        log.write_text("# CLAUDE_CLI_START\n")
+        # Backdate ctime by modifying mtime to simulate duration > 1s
+        import os
+        stat = log.stat()
+        os.utime(log, (stat.st_atime, stat.st_mtime + 5))
+        assert _is_ghost_session(log) is False
+
+    def test_sentinel_present_no_cli_output_zero_duration(self, tmp_path: Path) -> None:
+        """Sentinel present but no CLI output after it — ghost session."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] wrapper starting\n"
+            "# CLAUDE_CLI_START\n"
+        )
+        assert _is_ghost_session(log) is True
+
+    def test_no_sentinel_zero_duration(self, tmp_path: Path) -> None:
+        """No sentinel means CLI never started — ghost session if 0s duration."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] wrapper crashed\n"
+        )
+        assert _is_ghost_session(log) is True
+
+    def test_ui_chrome_only_zero_duration(self, tmp_path: Path) -> None:
+        """UI chrome output without real content is still a ghost session."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            "Claude Code v2.1.29\n"
+            "Opus 4.5 · Claude Max\n"
+            "───────────────────\n"
+        )
+        assert _is_ghost_session(log) is True
+
+
+class TestRunWorkerPhaseGhostSession:
+    """Test that run_worker_phase detects ghost sessions and returns code 10."""
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script in ("agent-spawn.sh", "agent-wait-bg.sh", "agent-destroy.sh"):
+            (scripts_dir / script).touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+        return ctx
+
+    def test_ghost_session_returns_code_10(self, mock_context: MagicMock) -> None:
+        """When agent exits non-zero with ghost session pattern, return exit code 10."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 1
+            proc.returncode = 1
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_ghost_session", return_value=True
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 10
+
+    def test_ghost_checked_before_mcp_and_low_output(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Ghost session check takes priority over MCP and low-output checks.
+
+        When a session is a ghost (0s duration, no output), it should be
+        classified as exit code 10, not 6 or 7.
+        """
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 1
+            proc.returncode = 1
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_ghost_session", return_value=True
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_mcp_failure"
+            ) as mock_mcp,
+            patch(
+                "loom_tools.shepherd.phases.base._is_low_output_session"
+            ) as mock_low,
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 10
+        # MCP and low-output should NOT be checked when ghost is detected
+        mock_mcp.assert_not_called()
+        mock_low.assert_not_called()
+
+    def test_successful_exit_not_reclassified_as_ghost(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 0 should not be overridden by ghost session detection."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_ghost_session"
+            ) as mock_ghost,
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        # Ghost check should NOT be called for exit code 0
+        mock_ghost.assert_not_called()
+
+
+class TestRunPhaseWithRetryGhostSession:
+    """Test that run_phase_with_retry handles ghost sessions (code 10).
+
+    Ghost sessions use a separate retry counter from stuck, low-output,
+    and MCP failure counters, preserving those budgets for legitimate
+    failures.  See issue #2604.
+    """
+
+    @pytest.fixture
+    def mock_context(self) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(
+            issue=42, task_id="test-123", stuck_max_retries=2
+        )
+        ctx.repo_root = Path("/fake/repo")
+        ctx.scripts_dir = Path("/fake/repo/.loom/scripts")
+        ctx.progress_dir = Path("/tmp/progress")
+        ctx.label_cache = MagicMock()
+        ctx.pr_number = None
+        return ctx
+
+    def test_retries_on_ghost_then_succeeds(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry on code 10 and return 0 when the retry succeeds."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 10 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep") as mock_sleep,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 2
+        mock_sleep.assert_called_once_with(GHOST_SESSION_RETRY_DELAY_SECONDS)
+
+    def test_exhausts_ghost_retries_returns_code_10(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return 10 after exhausting all ghost session retries."""
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                return_value=10,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 10
+
+    def test_ghost_retry_count_matches_constant(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should retry exactly GHOST_SESSION_MAX_RETRIES times."""
+        call_count = 0
+
+        def count_calls(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 10
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=count_calls,
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # 1 initial call + GHOST_SESSION_MAX_RETRIES retries
+        assert call_count == 1 + GHOST_SESSION_MAX_RETRIES
+
+    def test_ghost_reports_error_and_heartbeat_milestones(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should report error milestone with will_retry and heartbeat milestone."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 10 if call_count == 1 else 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        milestone_calls = mock_context.report_milestone.call_args_list
+        assert len(milestone_calls) == 2
+        # First call: error with will_retry
+        assert milestone_calls[0].args[0] == "error"
+        assert "ghost session" in milestone_calls[0].kwargs["error"]
+        assert milestone_calls[0].kwargs["will_retry"] is True
+        # Second call: heartbeat with ghost retry info
+        assert milestone_calls[1].args[0] == "heartbeat"
+        assert "ghost session" in milestone_calls[1].kwargs["action"]
+
+    def test_ghost_and_low_output_have_separate_counters(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Ghost retries (code 10) and low-output retries (code 6) are independent."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 10  # Ghost session
+            elif call_count == 2:
+                return 6  # Low output
+            else:
+                return 0  # Success
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3
+
+    def test_ghost_and_mcp_have_separate_counters(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Ghost retries (code 10) and MCP retries (code 7) are independent."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 10  # Ghost session
+            elif call_count == 2:
+                return 7  # MCP failure
+            else:
+                return 0  # Success
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3
+
+    def test_ghost_does_not_deplete_main_retry_budget(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Ghost retries should NOT consume the stuck/low-output/MCP budgets.
+
+        After exhausting ghost retries, if the next failure is a different
+        type, it should still have its full retry budget available.
+        """
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            # First GHOST_SESSION_MAX_RETRIES+1 calls: ghost sessions
+            if call_count <= GHOST_SESSION_MAX_RETRIES:
+                return 10
+            # Then a successful recovery
+            elif call_count == GHOST_SESSION_MAX_RETRIES + 1:
+                return 0
+            return 0
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        # Should succeed: ghost retries recover before exhaustion
+        assert exit_code == 0
+
+    def test_ghost_then_stuck_both_retry(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Ghost session followed by stuck — both should use their own budgets."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 10  # Ghost
+            elif call_count == 2:
+                return 4  # Stuck
+            else:
+                return 0  # Success
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.base.run_worker_phase",
+                side_effect=mock_run_worker,
+            ),
+            patch("time.sleep"),
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="judge",
+                name="judge-issue-42",
+                timeout=600,
+                max_retries=2,
+                phase="judge",
+            )
+
+        assert exit_code == 0
+        assert call_count == 3
