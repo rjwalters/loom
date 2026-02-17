@@ -8181,13 +8181,18 @@ class TestBuilderDirectCompletion:
         """Should return False when non-mechanical steps remain."""
         builder = BuilderPhase()
         diag = {
-            "has_uncommitted_changes": True,
-            "commits_ahead": 0,
+            "has_uncommitted_changes": False,
+            "commits_ahead": 1,
             "remote_branch_exists": False,
             "pr_number": None,
             "pr_has_review_label": False,
         }
-        result = builder._direct_completion(mock_context, diag)
+        # Inject a hypothetical non-mechanical step
+        with patch.object(
+            builder, "_diagnose_remaining_steps",
+            return_value=["resolve_conflicts", "push_branch"],
+        ):
+            result = builder._direct_completion(mock_context, diag)
         assert result is False
 
     def test_push_failure_returns_false(self, mock_context: MagicMock) -> None:
@@ -8338,11 +8343,44 @@ class TestBuilderDirectCompletion:
         call_args = mock_run.call_args[0][0]
         assert "feature/issue-55" in call_args
 
-    def test_stage_and_commit_with_create_pr_returns_false(
+    def test_stage_and_commit_full_pipeline(
         self, mock_context: MagicMock
     ) -> None:
-        """Multi-step with non-mechanical stage_and_commit should fall through."""
+        """Should handle stage_and_commit + push + create_pr as mechanical steps."""
         builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.worktree_path = Path("/fake/worktree")
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with (
+            patch.object(builder, "_push_branch", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        # Verify git add, git commit, and gh pr create were all called
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        assert calls[0] == ["git", "add", "-A"]
+        assert calls[1][:2] == ["git", "commit"]
+        assert calls[2][:3] == ["gh", "pr", "create"]
+
+    def test_stage_and_commit_git_add_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return False when git add fails."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = Path("/fake/worktree")
         diag = {
             "has_uncommitted_changes": True,
             "commits_ahead": 0,
@@ -8350,8 +8388,69 @@ class TestBuilderDirectCompletion:
             "pr_number": None,
             "pr_has_review_label": False,
         }
-        result = builder._direct_completion(mock_context, diag)
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=1, stderr="fatal: not a git repository"
+            )
+            result = builder._direct_completion(mock_context, diag)
+
         assert result is False
+
+    def test_stage_and_commit_git_commit_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should return False when git commit fails."""
+        builder = BuilderPhase()
+        mock_context.worktree_path = Path("/fake/worktree")
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        add_ok = MagicMock(returncode=0, stderr="")
+        commit_fail = MagicMock(returncode=1, stderr="nothing to commit")
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            mock_run.side_effect = [add_ok, commit_fail]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is False
+
+    def test_stage_and_commit_allows_zero_commits_ahead_for_create_pr(
+        self, mock_context: MagicMock
+    ) -> None:
+        """create_pr safety guard should not block when stage_and_commit will create a commit."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        mock_context.worktree_path = Path("/fake/worktree")
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,  # 0 now, but stage_and_commit will create one
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with (
+            patch.object(builder, "_push_branch", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            result = builder._direct_completion(mock_context, diag)
+
+        # Should succeed — stage_and_commit makes the 0-commit guard inapplicable
+        assert result is True
 
 
 class TestBuilderCompletionRetryDefault:

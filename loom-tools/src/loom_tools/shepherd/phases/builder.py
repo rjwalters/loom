@@ -3123,22 +3123,26 @@ class BuilderPhase:
     ) -> bool:
         """Attempt to complete mechanical operations directly in Python.
 
-        Handles simple operations (push branch, create PR, add label) without
-        spawning a full agent. Returns True if all remaining steps were
-        completed.
+        Handles simple operations (stage/commit, push branch, create PR, add
+        label) without spawning a full agent. Returns True if all remaining
+        steps were completed.
         """
         steps = self._diagnose_remaining_steps(diag, ctx.config.issue)
 
         # Only handle purely mechanical steps directly
-        mechanical_steps = {"push_branch", "add_review_label", "create_pr"}
+        mechanical_steps = {
+            "stage_and_commit", "push_branch", "add_review_label", "create_pr",
+        }
         if not steps or not set(steps).issubset(mechanical_steps):
             return False
 
         # Safety guard: refuse to create a PR when there are 0 commits
-        # ahead of main.  A PR with an empty diff is useless and creates
-        # cleanup work.  This guards against edge cases where
-        # _diagnose_remaining_steps logic is bypassed.
-        if "create_pr" in steps and diag.get("commits_ahead", 0) == 0:
+        # ahead of main AND we're not about to create one via stage_and_commit.
+        if (
+            "create_pr" in steps
+            and diag.get("commits_ahead", 0) == 0
+            and "stage_and_commit" not in steps
+        ):
             log_warning(
                 f"Direct completion: refusing to create PR for issue "
                 f"#{ctx.config.issue} with 0 commits ahead of main"
@@ -3151,7 +3155,39 @@ class BuilderPhase:
         )
 
         for step in steps:
-            if step == "push_branch":
+            if step == "stage_and_commit":
+                result = subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=ctx.worktree_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    log_warning(
+                        f"Direct completion: git add failed: "
+                        f"{result.stderr.strip()[:200]}"
+                    )
+                    return False
+                result = subprocess.run(
+                    [
+                        "git", "commit", "-m",
+                        f"fix: implement changes for issue #{ctx.config.issue}",
+                    ],
+                    cwd=ctx.worktree_path,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    log_warning(
+                        f"Direct completion: git commit failed: "
+                        f"{result.stderr.strip()[:200]}"
+                    )
+                    return False
+                log_success("Direct completion: changes staged and committed")
+
+            elif step == "push_branch":
                 if not self._push_branch(ctx):
                     log_warning("Direct completion: push failed")
                     return False
