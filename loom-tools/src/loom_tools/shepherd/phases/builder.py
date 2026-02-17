@@ -157,6 +157,11 @@ def _build_worktree_env(worktree_path: Path | None) -> dict[str, str] | None:
 class BuilderPhase:
     """Phase 3: Builder - Create worktree, implement, create PR."""
 
+    def __init__(self) -> None:
+        # Baseline snapshot of main's dirty files before builder spawns.
+        # Used to distinguish pre-existing dirt from worktree escapes.
+        self._main_dirty_baseline: set[str] | None = None
+
     def should_skip(self, ctx: ShepherdContext) -> tuple[bool, str]:
         """Check if builder phase should be skipped.
 
@@ -340,6 +345,10 @@ class BuilderPhase:
 
         # Create marker to prevent premature cleanup
         self._create_worktree_marker(ctx)
+
+        # Snapshot main's dirty state before spawning the builder so we can
+        # distinguish pre-existing dirt from actual worktree escapes later.
+        self._main_dirty_baseline = self._snapshot_main_dirty(ctx)
 
         # Run builder worker with retry
         exit_code = run_phase_with_retry(
@@ -2491,6 +2500,23 @@ class BuilderPhase:
         paths = LoomPaths(ctx.repo_root)
         return paths.builder_log_file(ctx.config.issue)
 
+    @staticmethod
+    def _snapshot_main_dirty(ctx: ShepherdContext) -> set[str]:
+        """Snapshot main's dirty files (git status --porcelain lines).
+
+        Called before the builder spawns so that _gather_diagnostics can
+        distinguish pre-existing dirt from new files added by a worktree escape.
+        """
+        result = subprocess.run(
+            ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return set(result.stdout.strip().splitlines())
+        return set()
+
     def _gather_diagnostics(self, ctx: ShepherdContext) -> dict[str, Any]:
         """Collect diagnostic info about the builder environment.
 
@@ -2677,9 +2703,8 @@ class BuilderPhase:
 
         # -- Main branch state (detect worktree escape) -----------------------
         # Check if the builder accidentally modified files on main instead
-        # of in the worktree.  This is a critical signal for
-        # _is_no_changes_needed() — if main is dirty after a builder run
-        # with a clean worktree, the builder likely escaped the worktree.
+        # of in the worktree.  Only flag files that are NEW since the builder
+        # started — pre-existing dirty files are not evidence of escape.
         main_status = subprocess.run(
             ["git", "-C", str(ctx.repo_root), "status", "--porcelain"],
             capture_output=True,
@@ -2689,9 +2714,19 @@ class BuilderPhase:
         main_dirty_files: list[str] = []
         if main_status.returncode == 0 and main_status.stdout.strip():
             main_dirty_files = main_status.stdout.strip().splitlines()
-        diag["main_branch_dirty"] = bool(main_dirty_files)
-        diag["main_dirty_file_count"] = len(main_dirty_files)
-        diag["main_dirty_files"] = main_dirty_files[:10]  # Cap for readability
+
+        # Filter out pre-existing dirty files using the baseline snapshot
+        if self._main_dirty_baseline is not None:
+            new_dirty_files = [
+                f for f in main_dirty_files
+                if f not in self._main_dirty_baseline
+            ]
+        else:
+            new_dirty_files = main_dirty_files
+
+        diag["main_branch_dirty"] = bool(new_dirty_files)
+        diag["main_dirty_file_count"] = len(new_dirty_files)
+        diag["main_dirty_files"] = new_dirty_files[:10]  # Cap for readability
 
         # -- Human-readable summary -----------------------------------------
         parts: list[str] = []
@@ -2728,7 +2763,11 @@ class BuilderPhase:
             parts.append(f"checkpoint={diag['checkpoint_stage']}")
         if diag["main_branch_dirty"]:
             parts.append(
-                f"WARNING: main branch dirty ({diag['main_dirty_file_count']} files)"
+                f"WARNING: main branch dirty ({diag['main_dirty_file_count']} NEW files)"
+            )
+        elif main_dirty_files and not new_dirty_files:
+            parts.append(
+                f"main branch dirty ({len(main_dirty_files)} pre-existing files, ignored)"
             )
         parts.append(f"log={diag['log_file']}")
         diag["summary"] = "; ".join(parts)
@@ -2893,16 +2932,18 @@ class BuilderPhase:
         but crashed or timed out before committing.  This is a builder failure,
         not a "no changes needed" determination.  See issue #2425.
 
-        If main has uncommitted changes, the builder may have escaped the
-        worktree and modified files on main instead.  This is NOT a "no
-        changes needed" situation — it's a worktree escape bug.
+        If main has NEW uncommitted changes (compared to pre-builder baseline),
+        the builder may have escaped the worktree and modified files on main
+        instead.  This is NOT a "no changes needed" situation — it's a
+        worktree escape bug.  Pre-existing dirty files are excluded from this
+        check (see issue #2457).
         """
         if not diag.get("worktree_exists"):
             return False
 
-        # If main branch is dirty, the builder may have escaped the worktree
-        # and made changes on main instead.  Never treat this as "no changes
-        # needed" — it requires human intervention to recover.
+        # If main branch has NEW dirty files (not pre-existing), the builder
+        # may have escaped the worktree and made changes on main instead.
+        # Never treat this as "no changes needed".
         if diag.get("main_branch_dirty", False):
             return False
 
