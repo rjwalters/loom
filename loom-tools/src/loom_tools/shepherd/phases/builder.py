@@ -42,9 +42,6 @@ from loom_tools.shepherd.phases.base import (
 
 logger = logging.getLogger(__name__)
 
-# Default timeout for test verification (seconds)
-_TEST_VERIFY_TIMEOUT = int(os.environ.get("LOOM_TEST_VERIFY_TIMEOUT", "300"))
-
 # Pre-implementation reproducibility check settings
 _REPRODUCIBILITY_RUNS = 3  # Number of times to run each test for flakiness
 _REPRODUCIBILITY_TIMEOUT = 120  # seconds per run
@@ -1644,7 +1641,7 @@ class BuilderPhase:
                     cwd=ctx.worktree_path,
                     text=True,
                     capture_output=True,
-                    timeout=_TEST_VERIFY_TIMEOUT,
+                    timeout=ctx.config.test_verify_timeout,
                     check=False,
                     env=_build_worktree_env(ctx.worktree_path),
                 )
@@ -1938,7 +1935,7 @@ class BuilderPhase:
                 cwd=ctx.repo_root,
                 text=True,
                 capture_output=True,
-                timeout=_TEST_VERIFY_TIMEOUT,
+                timeout=ctx.config.test_verify_timeout,
                 check=False,
             )
         except subprocess.TimeoutExpired:
@@ -2073,7 +2070,7 @@ class BuilderPhase:
                 cwd=ctx.worktree_path,
                 text=True,
                 capture_output=True,
-                timeout=_TEST_VERIFY_TIMEOUT,
+                timeout=ctx.config.test_verify_timeout,
                 check=False,
                 env=_build_worktree_env(ctx.worktree_path),
             )
@@ -2259,7 +2256,7 @@ class BuilderPhase:
                 cwd=ctx.worktree_path,
                 text=True,
                 capture_output=True,
-                timeout=_TEST_VERIFY_TIMEOUT,
+                timeout=ctx.config.test_verify_timeout,
                 check=False,
                 env=_build_worktree_env(ctx.worktree_path),
             )

@@ -166,6 +166,9 @@ class ShepherdConfig:
     poll_interval: int = field(
         default_factory=lambda: env_int("LOOM_POLL_INTERVAL", 5)
     )
+    test_verify_timeout: int = field(
+        default_factory=lambda: env_int("LOOM_TEST_VERIFY_TIMEOUT", 600)
+    )
 
     # Retry limits
     doctor_max_retries: int = field(

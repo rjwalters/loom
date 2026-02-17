@@ -231,6 +231,22 @@ class TestShepherdConfig:
             config = ShepherdConfig(issue=42)
             assert config.test_fix_max_retries == 5
 
+    def test_test_verify_timeout_default(self) -> None:
+        """test_verify_timeout should default to 600."""
+        config = ShepherdConfig(issue=42)
+        assert config.test_verify_timeout == 600
+
+    def test_test_verify_timeout_env_override(self) -> None:
+        """LOOM_TEST_VERIFY_TIMEOUT env var should override default."""
+        with patch.dict(os.environ, {"LOOM_TEST_VERIFY_TIMEOUT": "900"}):
+            config = ShepherdConfig(issue=42)
+            assert config.test_verify_timeout == 900
+
+    def test_test_verify_timeout_explicit(self) -> None:
+        """test_verify_timeout can be explicitly set."""
+        config = ShepherdConfig(issue=42, test_verify_timeout=1200)
+        assert config.test_verify_timeout == 1200
+
     def test_worktree_marker_file(self) -> None:
         """Worktree marker file should have default value."""
         config = ShepherdConfig(issue=42)
