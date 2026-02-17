@@ -1454,7 +1454,6 @@ class TestJudgeRetry:
         assert len(retry_calls) == 1
         assert retry_calls[0].kwargs["attempt"] == 1
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli._mark_judge_exhausted")
     @patch("loom_tools.shepherd.cli.JudgePhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -1469,7 +1468,6 @@ class TestJudgeRetry:
         MockBuilder: MagicMock,
         MockJudge: MagicMock,
         mock_mark_exhausted: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """Judge always fails — should call _mark_judge_exhausted and return 1."""
         mock_time.time = MagicMock(side_effect=[
@@ -1482,7 +1480,6 @@ class TestJudgeRetry:
             # Judge attempt 2 (fails again — retries exhausted)
             10,    # judge phase_start
             15,    # judge elapsed
-            15,    # _run_reflection duration
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -2834,7 +2831,6 @@ class TestDoctorTestFixLoop:
         # Doctor was called
         doctor_inst.run_test_fix.assert_called_once()
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -2849,7 +2845,6 @@ class TestDoctorTestFixLoop:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         mock_mark_failure: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """When Doctor retries are exhausted, should mark builder test failure."""
         # test_fix_max_retries defaults to 2
@@ -2868,7 +2863,6 @@ class TestDoctorTestFixLoop:
                 150 + i * 100,   # test_start
                 160 + i * 100,   # test elapsed
             ])
-        time_values.append(360)  # _run_reflection duration
 
         mock_time.time = MagicMock(side_effect=time_values)
 
@@ -2907,7 +2901,6 @@ class TestDoctorTestFixLoop:
         # Mark as test failure after exhaustion
         mock_mark_failure.assert_called_once()
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
     @patch("loom_tools.shepherd.cli.ApprovalPhase")
@@ -2920,7 +2913,6 @@ class TestDoctorTestFixLoop:
         MockApproval: MagicMock,
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """Non-test builder failures should NOT route to Doctor."""
         mock_time.time = MagicMock(side_effect=[
@@ -2929,7 +2921,6 @@ class TestDoctorTestFixLoop:
             5,     # approval elapsed
             5,     # builder phase_start
             100,   # builder elapsed
-            100,   # _run_reflection duration
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -3004,7 +2995,6 @@ class TestDoctorTestFixLoop:
 class TestTestTimeoutSkipsDoctor:
     """Test that test timeouts skip the Doctor loop (issue #2391)."""
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -3019,7 +3009,6 @@ class TestTestTimeoutSkipsDoctor:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         mock_mark_failure: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """Test timeout returns PR_TESTS_FAILED without invoking Doctor."""
         mock_time.time = MagicMock(side_effect=[
@@ -3028,7 +3017,6 @@ class TestTestTimeoutSkipsDoctor:
             5,     # approval elapsed
             5,     # builder phase_start
             305,   # builder elapsed (timeout)
-            305,   # duration calc in reflection
         ])
 
         ctx = _make_ctx(start_from=Phase.BUILDER)
@@ -3056,7 +3044,7 @@ class TestTestTimeoutSkipsDoctor:
         doctor_inst.run_test_fix.assert_not_called()
         # Should be marked as test failure
         mock_mark_failure.assert_called_once()
-        # Reflection should report test_timeout status
+        # Should report test_timeout status
         ctx.report_milestone.assert_any_call(
             "phase_completed",
             phase="builder",
@@ -3068,7 +3056,6 @@ class TestTestTimeoutSkipsDoctor:
 class TestDoctorRegressionGuard:
     """Test that the doctor test-fix loop aborts when doctor makes things worse."""
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -3083,7 +3070,6 @@ class TestDoctorRegressionGuard:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         mock_mark_failure: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """When doctor increases error count, loop should abort immediately."""
         time_values = [
@@ -3098,8 +3084,6 @@ class TestDoctorRegressionGuard:
             # Test re-verification
             150,   # test_start
             160,   # test elapsed
-            # Regression detected → duration calc for _run_reflection
-            160,
         ]
         mock_time.time = MagicMock(side_effect=time_values)
 
@@ -3139,7 +3123,6 @@ class TestDoctorRegressionGuard:
         # Marked as test failure
         mock_mark_failure.assert_called_once()
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -3154,7 +3137,6 @@ class TestDoctorRegressionGuard:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         mock_mark_failure: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """When doctor keeps same error count, loop should continue retrying."""
         # test_fix_max_retries defaults to 2
@@ -3173,7 +3155,6 @@ class TestDoctorRegressionGuard:
                 150 + i * 100,   # test_start
                 160 + i * 100,   # test elapsed
             ])
-        time_values.append(360)  # _run_reflection duration
 
         mock_time.time = MagicMock(side_effect=time_values)
 
@@ -3391,7 +3372,6 @@ class TestPostDoctorPush:
         # push_branch was called after Doctor succeeded
         builder_inst.push_branch.assert_called_once_with(ctx)
 
-    @patch("loom_tools.shepherd.cli._run_reflection")
     @patch("loom_tools.shepherd.cli._mark_builder_test_failure")
     @patch("loom_tools.shepherd.cli.DoctorPhase")
     @patch("loom_tools.shepherd.cli.BuilderPhase")
@@ -3406,7 +3386,6 @@ class TestPostDoctorPush:
         MockBuilder: MagicMock,
         MockDoctor: MagicMock,
         mock_mark_failure: MagicMock,
-        mock_reflection: MagicMock,
     ) -> None:
         """push_branch should NOT be called when Doctor fails."""
         time_values = [
@@ -3424,7 +3403,6 @@ class TestPostDoctorPush:
                 150 + i * 100,   # test_start
                 160 + i * 100,   # test elapsed
             ])
-        time_values.append(360)  # _run_reflection duration
 
         mock_time.time = MagicMock(side_effect=time_values)
 
