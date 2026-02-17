@@ -476,6 +476,19 @@ class BuilderPhase:
                     },
                 )
 
+            # Recover from instant-exit (code 6) / MCP failure (code 7)
+            # when the worktree has incomplete work from a previous builder
+            # run.  The current builder CLI couldn't start (auth timeout,
+            # nesting protection, etc.) but the worktree may have commits
+            # or changes that can be completed mechanically.  See issue #2507.
+            if exit_code in (6, 7) and diag.get("worktree_exists"):
+                recovery = self._recover_from_existing_worktree(
+                    ctx, diag, exit_code
+                )
+                if recovery is not None:
+                    return recovery
+                # Recovery wasn't possible — fall through to generic handling
+
             # If there are uncommitted changes, preserve them as a WIP commit
             if diag.get("has_uncommitted_changes"):
                 reason = f"builder exited with code {exit_code}"
@@ -494,6 +507,11 @@ class BuilderPhase:
                             "work_preserved": True,
                         },
                     )
+
+            # Clean up stale worktree to avoid leaving orphans
+            if exit_code in (6, 7) and diag.get("worktree_exists"):
+                if self._is_stale_worktree(ctx.worktree_path):
+                    self._cleanup_stale_worktree(ctx)
 
             return PhaseResult(
                 status=PhaseStatus.FAILED,
@@ -3098,6 +3116,88 @@ class BuilderPhase:
             return True
 
         return False
+
+    def _recover_from_existing_worktree(
+        self,
+        ctx: ShepherdContext,
+        diag: dict[str, Any],
+        exit_code: int,
+    ) -> PhaseResult | None:
+        """Attempt to recover from builder instant-exit/MCP failure using worktree state.
+
+        When the builder CLI can't start (auth timeout, nesting protection, MCP
+        failure) but a previous builder run left meaningful work in the worktree,
+        try to complete the commit/push/PR workflow mechanically.
+
+        Returns a PhaseResult if recovery succeeded or failed definitively,
+        or None if no recovery was possible (caller should fall through to
+        generic failure handling).
+
+        See issue #2507.
+        """
+        if not self._has_incomplete_work(diag):
+            return None
+
+        log_info(
+            f"Builder exited with code {exit_code} but worktree has "
+            f"incomplete work for issue #{ctx.config.issue} — "
+            f"attempting recovery"
+        )
+
+        # Try direct completion first (push, PR creation, label addition)
+        # — avoids spawning an LLM agent for purely mechanical steps.
+        if self._direct_completion(ctx, diag):
+            log_success(
+                f"Recovered incomplete work for issue #{ctx.config.issue} "
+                f"via direct completion after builder exit code {exit_code}"
+            )
+            diag = self._gather_diagnostics(ctx)
+            if diag.get("pr_number") is not None:
+                ctx.pr_number = diag["pr_number"]
+                ctx.report_milestone("pr_created", pr_number=diag["pr_number"])
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"builder phase complete - PR #{diag['pr_number']} "
+                        f"created (recovered from exit code {exit_code})"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "pr_number": diag["pr_number"],
+                        "exit_code": exit_code,
+                        "recovered_from_worktree": True,
+                    },
+                )
+
+        # Direct completion couldn't handle it (non-mechanical steps remain).
+        # Try a focused completion phase agent.
+        completion_exit = self._run_completion_phase(ctx, diag)
+        if completion_exit == 0:
+            diag = self._gather_diagnostics(ctx)
+            if diag.get("pr_number") is not None:
+                ctx.pr_number = diag["pr_number"]
+                ctx.report_milestone("pr_created", pr_number=diag["pr_number"])
+                return PhaseResult(
+                    status=PhaseStatus.SUCCESS,
+                    message=(
+                        f"builder phase complete - PR #{diag['pr_number']} "
+                        f"created (completion phase recovered from "
+                        f"exit code {exit_code})"
+                    ),
+                    phase_name="builder",
+                    data={
+                        "pr_number": diag["pr_number"],
+                        "exit_code": exit_code,
+                        "recovered_from_worktree": True,
+                    },
+                )
+
+        # Neither recovery path succeeded
+        log_warning(
+            f"Worktree recovery failed for issue #{ctx.config.issue} "
+            f"(direct_completion=False, completion_phase={completion_exit})"
+        )
+        return None
 
     def _is_no_changes_needed(self, diag: dict[str, Any]) -> bool:
         """Check if diagnostics indicate "no changes needed" condition.
