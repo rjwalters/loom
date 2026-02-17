@@ -35,9 +35,7 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
     PreflightPhase,
     RebasePhase,
-    ReflectionPhase,
 )
-from loom_tools.shepherd.phases.reflection import RunSummary
 from loom_tools.shepherd.phases.base import PhaseResult
 
 
@@ -160,13 +158,6 @@ EXAMPLES:
         action="store_true",
         dest="allow_dirty_main",
         help="Proceed even if main repo has uncommitted changes",
-    )
-
-    parser.add_argument(
-        "--no-reflect",
-        action="store_true",
-        dest="no_reflect",
-        help="Skip post-run reflection phase",
     )
 
     parser.add_argument(
@@ -355,7 +346,6 @@ def _create_config(args: argparse.Namespace) -> ShepherdConfig:
         start_from=start_from,
         stop_after=args.stop_after,
         quality_gates=quality_gates,
-        no_reflect=args.no_reflect,
         skip_builder=skip_builder,
         pr_number_override=pr_number_override,
         resume=args.resume,
@@ -394,7 +384,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
     start_time = time.time()
     completed_phases: list[str] = []
     phase_durations: dict[str, int] = {}
-    run_warnings: list[str] = []
 
     try:
         # Validate issue
@@ -406,9 +395,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
         except IssueIsEpicError as e:
             log_info(str(e))
             return ShepherdExitCode.SKIPPED
-
-        # Collect warnings from context initialization (e.g. stale branch)
-        run_warnings.extend(ctx.warnings)
 
         log_info(f"Issue: #{ctx.config.issue}")
         log_info(f"Mode: {ctx.config.mode.value}")
@@ -517,10 +503,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
             # Store preflight result so builder can skip baseline tests
             ctx.preflight_baseline_status = result.data.get("baseline_status")
 
-            # Capture missing baseline warning for reflection
-            if ctx.preflight_baseline_status == "unknown":
-                run_warnings.append("No baseline health cache found")
-
             # Log result inline (no header for passing checks)
             log_info(f"Baseline health: {result.message}")
 
@@ -563,15 +545,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                     status="test_timeout",
                 )
                 _mark_builder_test_failure(ctx)
-                _run_reflection(
-                    ctx,
-                    exit_code=ShepherdExitCode.PR_TESTS_FAILED,
-                    duration=int(time.time() - start_time),
-                    phase_durations=phase_durations,
-                    completed_phases=completed_phases,
-                    test_fix_attempts=0,
-                    warnings=run_warnings,
-                )
                 return ShepherdExitCode.PR_TESTS_FAILED
 
             # Handle test failures with Doctor test-fix loop
@@ -605,15 +578,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         status="doctor_regression",
                     )
                     _mark_builder_test_failure(ctx)
-                    _run_reflection(
-                        ctx,
-                        exit_code=ShepherdExitCode.PR_TESTS_FAILED,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return ShepherdExitCode.PR_TESTS_FAILED
                 else:
                     # Update tracked count (same or improved)
@@ -637,15 +601,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         status="test_failure",
                     )
                     _mark_builder_test_failure(ctx)
-                    _run_reflection(
-                        ctx,
-                        exit_code=ShepherdExitCode.PR_TESTS_FAILED,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return ShepherdExitCode.PR_TESTS_FAILED
 
                 # Route to Doctor for test fix
@@ -786,15 +741,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         if result.data.get("auth_failure")
                         else ShepherdExitCode.BUILDER_FAILED
                     )
-                    _run_reflection(
-                        ctx,
-                        exit_code=exit_code,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return exit_code
                 # Test failure after exhausting retries is handled above
 
@@ -833,15 +779,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
         if ctx.pr_number is None:
             log_error("Cannot enter Judge phase: no PR was created during Builder phase")
             _mark_builder_no_pr(ctx)
-            _run_reflection(
-                ctx,
-                exit_code=ShepherdExitCode.BUILDER_FAILED,
-                duration=int(time.time() - start_time),
-                phase_durations=phase_durations,
-                completed_phases=completed_phases,
-                test_fix_attempts=test_fix_attempts,
-                warnings=run_warnings,
-            )
             return ShepherdExitCode.BUILDER_FAILED
 
         doctor_attempts = 0
@@ -930,17 +867,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         f"retry attempt(s): {result.message}"
                     )
                     _mark_judge_exhausted(ctx, judge_retries)
-                    _run_reflection(
-                        ctx,
-                        exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        judge_retries=judge_retries,
-                        doctor_attempts=doctor_attempts,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return ShepherdExitCode.NEEDS_INTERVENTION
 
             # Judge succeeded — reset retry counter for this loop iteration
@@ -1010,17 +936,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                 if doctor_attempts >= ctx.config.doctor_max_retries:
                     log_error(f"Doctor max retries ({ctx.config.doctor_max_retries}) exceeded")
                     _mark_doctor_exhausted(ctx)
-                    _run_reflection(
-                        ctx,
-                        exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        judge_retries=judge_retries,
-                        doctor_attempts=doctor_attempts,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return ShepherdExitCode.NEEDS_INTERVENTION
 
                 # ─── Doctor Phase ─────────────────────────────────────
@@ -1056,17 +971,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         log_error(result.message)
                         _mark_doctor_exhausted(ctx)
 
-                    _run_reflection(
-                        ctx,
-                        exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        judge_retries=judge_retries,
-                        doctor_attempts=doctor_attempts,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return ShepherdExitCode.NEEDS_INTERVENTION
 
                 completed_phases.append("Doctor (fixes applied)")
@@ -1102,17 +1006,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
                         f"retry attempt(s): {result.message}"
                     )
                     _mark_judge_exhausted(ctx, judge_retries)
-                    _run_reflection(
-                        ctx,
-                        exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                        duration=int(time.time() - start_time),
-                        phase_durations=phase_durations,
-                        completed_phases=completed_phases,
-                        judge_retries=judge_retries,
-                        doctor_attempts=doctor_attempts,
-                        test_fix_attempts=test_fix_attempts,
-                        warnings=run_warnings,
-                    )
                     return ShepherdExitCode.NEEDS_INTERVENTION
 
         # Print skipped header if Doctor never ran (Judge approved first try)
@@ -1141,17 +1034,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
 
         if result.status == PhaseStatus.FAILED:
             log_error(result.message)
-            _run_reflection(
-                ctx,
-                exit_code=ShepherdExitCode.NEEDS_INTERVENTION,
-                duration=int(time.time() - start_time),
-                phase_durations=phase_durations,
-                completed_phases=completed_phases,
-                judge_retries=judge_retries,
-                doctor_attempts=doctor_attempts,
-                test_fix_attempts=test_fix_attempts,
-                warnings=run_warnings,
-            )
             return ShepherdExitCode.NEEDS_INTERVENTION
 
         if result.status == PhaseStatus.SKIPPED:
@@ -1198,19 +1080,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
         else:
             ctx.report_milestone("completed")
 
-        # ─── PHASE 7: Reflection ─────────────────────────────────────────
-        _run_reflection(
-            ctx,
-            exit_code=ShepherdExitCode.SUCCESS,
-            duration=duration,
-            phase_durations=phase_durations,
-            completed_phases=completed_phases,
-            judge_retries=judge_retries,
-            doctor_attempts=doctor_attempts,
-            test_fix_attempts=test_fix_attempts,
-            warnings=run_warnings,
-        )
-
         _print_phase_header("SHEPHERD ORCHESTRATION COMPLETE")
         print(file=sys.stderr)
         log_info(f"Issue: #{ctx.config.issue} - {ctx.issue_title}")
@@ -1253,72 +1122,6 @@ def orchestrate(ctx: ShepherdContext) -> int:
     except ShepherdError as e:
         log_error(str(e))
         return ShepherdExitCode.NEEDS_INTERVENTION
-
-
-def _run_reflection(
-    ctx: ShepherdContext,
-    *,
-    exit_code: int,
-    duration: int,
-    phase_durations: dict[str, int],
-    completed_phases: list[str],
-    judge_retries: int = 0,
-    doctor_attempts: int = 0,
-    test_fix_attempts: int = 0,
-    warnings: list[str] | None = None,
-) -> None:
-    """Run the reflection phase (best-effort, never affects exit code).
-
-    Analyzes the shepherd run and optionally files upstream issues.
-    """
-    skip, reason = ReflectionPhase().should_skip(ctx)
-    if skip:
-        log_info(f"Skipping reflection phase ({reason})")
-        return
-
-    # Best-effort: read builder log for error extraction
-    log_content = _read_builder_log(ctx)
-
-    summary = RunSummary(
-        issue=ctx.config.issue,
-        issue_title=ctx.issue_title,
-        mode=ctx.config.mode.value,
-        task_id=ctx.config.task_id,
-        duration=duration,
-        exit_code=exit_code,
-        phase_durations=phase_durations,
-        completed_phases=completed_phases,
-        judge_retries=judge_retries,
-        doctor_attempts=doctor_attempts,
-        test_fix_attempts=test_fix_attempts,
-        warnings=warnings or [],
-        log_content=log_content,
-    )
-
-    try:
-        _print_phase_header("PHASE 7: REFLECTION")
-        reflection = ReflectionPhase(run_summary=summary)
-        reflection.run(ctx)
-    except Exception as exc:
-        log_warning(f"Reflection phase failed (non-fatal): {exc}")
-
-
-def _read_builder_log(ctx: ShepherdContext) -> str:
-    """Read the builder log file for error extraction (best-effort).
-
-    Returns the last portion of the log file, or empty string if unavailable.
-    """
-    from pathlib import Path
-
-    try:
-        log_path = Path(ctx.repo_root) / ".loom" / "logs" / f"loom-builder-issue-{ctx.config.issue}.log"
-        if not log_path.is_file():
-            return ""
-        content = log_path.read_text(errors="replace")
-        # Return the last 10KB to keep memory bounded while capturing errors
-        return content[-10240:] if len(content) > 10240 else content
-    except (OSError, TypeError):
-        return ""
 
 
 def _apply_failure_label(
