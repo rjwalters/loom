@@ -22,9 +22,21 @@ class TestParsePorcelainPath:
     def test_quoted_path_with_spaces(self) -> None:
         assert parse_porcelain_path(' M "path with spaces/file"') == "path with spaces/file"
 
-    def test_rename_format(self) -> None:
-        # Callers split on " -> " further if needed
-        assert parse_porcelain_path("R  old -> new") == "old -> new"
+    def test_rename_returns_new_path(self) -> None:
+        assert parse_porcelain_path("R  old_name.py -> new_name.py") == "new_name.py"
+
+    def test_rename_with_directories(self) -> None:
+        assert parse_porcelain_path("R  src/old.py -> src/new.py") == "src/new.py"
+
+    def test_rename_with_quoted_paths(self) -> None:
+        assert (
+            parse_porcelain_path('R  "old name.py" -> "new name.py"')
+            == "new name.py"
+        )
+
+    def test_non_rename_with_arrow_in_path(self) -> None:
+        # A modified file whose name contains " -> " should not be split
+        assert parse_porcelain_path(" M file -> backup.py") == "file -> backup.py"
 
     def test_short_line(self) -> None:
         # "M " is not valid porcelain (2 chars < 3 min), falls through to strip

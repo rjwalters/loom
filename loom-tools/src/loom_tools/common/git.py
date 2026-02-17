@@ -231,8 +231,9 @@ def parse_porcelain_path(line: str) -> str:
     skips the 2-char status and strips any leading whitespace, then removes
     surrounding quotes that git adds for paths with special characters.
 
-    For rename lines (``XY old -> new``), the full ``old -> new`` string
-    is returned so callers can split further if needed.
+    For rename lines (``R  old -> new``), only the *new* (destination)
+    path is returned since callers typically need it for ``git add`` or
+    path matching.
 
     Parameters
     ----------
@@ -242,11 +243,16 @@ def parse_porcelain_path(line: str) -> str:
     Returns
     -------
     str
-        The file path (or rename pair) with quotes stripped.
+        The file path with quotes stripped.  For renames, the destination path.
     """
     if len(line) < 3:
         return line.strip()
-    return line[2:].lstrip().strip('"')
+    raw = line[2:].lstrip().strip('"')
+    # Handle rename entries: "old -> new"
+    if line[0] == "R" and " -> " in raw:
+        _, new_path = raw.rsplit(" -> ", 1)
+        return new_path.strip('"')
+    return raw
 
 
 def get_uncommitted_files(cwd: pathlib.Path | str | None = None) -> list[str]:
