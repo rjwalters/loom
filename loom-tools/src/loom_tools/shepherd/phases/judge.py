@@ -732,9 +732,26 @@ class JudgePhase:
         return True
 
     def _get_log_path(self, ctx: ShepherdContext) -> Path:
-        """Return the expected judge worker log file path."""
-        paths = LoomPaths(ctx.repo_root)
-        return paths.worker_log_file("judge", ctx.config.issue)
+        """Return the most recent judge worker log file path.
+
+        When unique session names are used per retry attempt (issue #2639),
+        multiple log files may exist (e.g., ``loom-judge-issue-42.log``,
+        ``loom-judge-issue-42-a1.log``).  Returns the most recently
+        modified one so that diagnostics reflect the latest attempt.
+        """
+        log_dir = LoomPaths(ctx.repo_root).logs_dir
+        base = f"loom-judge-issue-{ctx.config.issue}"
+        # Match base name and any attempt suffixes, excluding rotated
+        # timestamp logs (e.g., .20260217-095910.log)
+        candidates = [
+            p for p in log_dir.glob(f"{base}*.log")
+            if not any(c.isdigit() and len(c) > 4 for c in p.stem.split(".")[-1:])
+        ]
+        if candidates:
+            # Return the most recently modified log
+            return max(candidates, key=lambda p: p.stat().st_mtime)
+        # Fallback to the expected base name
+        return LoomPaths(ctx.repo_root).worker_log_file("judge", ctx.config.issue)
 
     def _has_meaningful_output(self, log_path: Path) -> bool:
         """Check if log file contains substantive content beyond control sequences.
