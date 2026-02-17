@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -1360,7 +1361,7 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
             f"# Fix the failing tests\n"
             f"git add . && git commit -m 'Fix failing tests'\n"
             f"git push\n"
-            f"gh pr create --label loom:review-requested --body 'Closes #{ctx.config.issue}'\n"
+            f"gh pr create --title {shlex.quote(ctx.issue_title or f'Issue #{ctx.config.issue}')} --label loom:review-requested --body 'Closes #{ctx.config.issue}'\n"
             f"gh issue edit {ctx.config.issue} --remove-label loom:failed:builder-tests\n"
             f"```\n\n"
             f"**Option B: Reset and retry**\n"
@@ -1629,6 +1630,7 @@ def _format_diagnostics_for_log(diagnostics: dict[str, str | int | list[str] | b
 def _format_diagnostics_for_comment(
     diagnostics: dict[str, str | int | list[str] | bool],
     issue: int,
+    issue_title: str = "",
 ) -> str:
     """Format diagnostic information for GitHub issue comment."""
     lines = ["**Builder phase failed**: No PR was created.",
@@ -1679,7 +1681,8 @@ def _format_diagnostics_for_comment(
             lines.append('git commit -m "Complete implementation"')
         if not remote_exists or commits_ahead > 0 or uncommitted_count > 0:
             lines.append(f"git push -u origin feature/issue-{issue}")
-        lines.append(f'gh pr create --label "loom:review-requested" --body "Closes #{issue}"')
+        title = issue_title or f"Issue #{issue}"
+        lines.append(f'gh pr create --title {shlex.quote(title)} --label "loom:review-requested" --body "Closes #{issue}"')
         lines.append(f"gh issue edit {issue} --remove-label loom:failed:builder")
         lines.append("```")
 
@@ -1737,7 +1740,7 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
     detect_systematic_failure(ctx.repo_root)
 
     # Add diagnostic comment to the issue
-    comment_body = _format_diagnostics_for_comment(diagnostics, ctx.config.issue)
+    comment_body = _format_diagnostics_for_comment(diagnostics, ctx.config.issue, ctx.issue_title)
     subprocess.run(
         [
             "gh",
