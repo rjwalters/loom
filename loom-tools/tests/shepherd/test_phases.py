@@ -5290,6 +5290,8 @@ class TestJudgePhase:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep") as mock_sleep,
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(judge, "_try_fallback_changes_requested", return_value=False),
             patch(
                 "loom_tools.validate_phase._mark_phase_failed",
             ) as mock_mark_failed,
@@ -5341,6 +5343,8 @@ class TestJudgePhase:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(judge, "_try_fallback_changes_requested", return_value=False),
             patch(
                 "loom_tools.validate_phase._mark_phase_failed",
             ),
@@ -5524,16 +5528,19 @@ class TestJudgeFallbackApproval:
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("approved") is True
 
-    def test_fallback_does_not_activate_in_default_mode(
+    def test_fallback_activates_in_default_mode(
         self, mock_context: MagicMock
     ) -> None:
-        """Fallback should NOT activate when not in force mode."""
+        """Fallback should activate in default mode too (issue #2657).
+
+        Previously fallback was force-mode only. Now it runs in all modes
+        because the judge frequently posts comments without applying labels.
+        """
         mock_context.config = ShepherdConfig(issue=42)  # Default mode
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -5541,15 +5548,13 @@ class TestJudgeFallbackApproval:
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
-            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
-            patch(
-                "loom_tools.validate_phase._mark_phase_failed",
-            ),
+            patch.object(judge, "_try_fallback_approval", return_value=True) as mock_fb,
         ):
             result = judge.run(mock_context)
 
-        assert result.status == PhaseStatus.FAILED
-        assert "validation failed" in result.message
+        assert result.status == PhaseStatus.SUCCESS
+        assert "Fallback approval" in result.message
+        mock_fb.assert_called_once()
 
     def test_fallback_denied_without_approval_comment(
         self, mock_context: MagicMock
@@ -5581,14 +5586,19 @@ class TestJudgeFallbackApproval:
 
         assert result.status == PhaseStatus.FAILED
 
-    def test_fallback_denied_without_passing_checks(
+    def test_fallback_succeeds_without_passing_checks(
         self, mock_context: MagicMock
     ) -> None:
-        """Fallback should fail when PR checks are not passing."""
+        """Fallback should succeed even when PR checks are not passing.
+
+        Issue #2657: CI checks are no longer required for comment-based
+        fallback approval — the judge already reviewed the code.
+        """
         ctx = self._make_force_context(mock_context)
+        ctx.has_pr_label.return_value = True
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
+        add_label_call = MagicMock(returncode=0)
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -5597,19 +5607,17 @@ class TestJudgeFallbackApproval:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_has_approval_comment", return_value=True),
-            # Checks not passing
+            # Checks not passing — should not matter for comment-based fallback
             patch.object(judge, "_pr_checks_passing", return_value=False),
-            # Rejection fallback also fails — no signals
             patch.object(judge, "_has_rejection_comment", return_value=False),
-
-            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
             patch(
-                "loom_tools.validate_phase._mark_phase_failed",
+                "loom_tools.shepherd.phases.judge.subprocess.run",
+                return_value=add_label_call,
             ),
         ):
             result = judge.run(ctx)
 
-        assert result.status == PhaseStatus.FAILED
+        assert result.status == PhaseStatus.SUCCESS
 
     def test_fallback_applies_loom_pr_label(self, mock_context: MagicMock) -> None:
         """Fallback should apply loom:pr label via gh pr edit."""
@@ -5751,7 +5759,7 @@ class TestJudgeFallbackApproval:
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("approved") is True
         assert result.data.get("fallback_used") is True
-        assert "[force-mode] Fallback approval applied" in result.message
+        assert "Fallback approval applied" in result.message
 
         # CRITICAL: has_pr_label should NOT have been called after fallback succeeded.
         # Any calls before the fallback (during validation retry loop) are fine,
@@ -5999,6 +6007,8 @@ class TestJudgeDiagnostics:
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(judge, "_try_fallback_changes_requested", return_value=False),
             patch(
                 "loom_tools.validate_phase._mark_phase_failed",
             ),
@@ -6581,11 +6591,6 @@ class TestJudgeFallbackChangesRequested:
             MagicMock(returncode=0, stdout="Changes requested\n"),
             # _try_fallback_approval -> _has_rejection_comment
             MagicMock(returncode=0, stdout="Changes requested\n"),
-            # _try_fallback_approval -> _pr_checks_passing
-            MagicMock(
-                returncode=0,
-                stdout=json.dumps({"mergeable": "MERGEABLE", "statusCheckRollup": []}),
-            ),
             # _try_fallback_changes_requested -> _has_rejection_comment
             MagicMock(returncode=0, stdout="Changes requested\n"),
             # _try_fallback_changes_requested -> gh pr edit --add-label
@@ -6637,16 +6642,19 @@ class TestJudgeFallbackChangesRequested:
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("changes_requested") is True
 
-    def test_fallback_does_not_activate_in_default_mode(
+    def test_fallback_activates_in_default_mode(
         self, mock_context: MagicMock
     ) -> None:
-        """Fallback should NOT activate when not in force mode."""
+        """Fallback should activate in default mode too (issue #2657).
+
+        Previously fallback was force-mode only. Now it runs in all modes
+        because the judge frequently posts comments without applying labels.
+        """
         mock_context.config = ShepherdConfig(issue=42)  # Default mode
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
 
         judge = JudgePhase()
-        fake_diag = {"summary": "no judge comments detected", "log_tail": []}
 
         with (
             patch.object(judge, "validate", return_value=False),
@@ -6654,15 +6662,18 @@ class TestJudgeFallbackChangesRequested:
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry", return_value=0
             ),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
-            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
-            patch(
-                "loom_tools.validate_phase._mark_phase_failed",
-            ),
+            # Approval fallback fails
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            # Changes-requested fallback succeeds
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=True
+            ) as mock_fb,
         ):
             result = judge.run(mock_context)
 
-        assert result.status == PhaseStatus.FAILED
-        assert "validation failed" in result.message
+        assert result.status == PhaseStatus.SUCCESS
+        assert "Fallback detected changes requested" in result.message
+        mock_fb.assert_called_once()
 
     def test_fallback_denied_without_rejection_signals(
         self, mock_context: MagicMock
@@ -6872,7 +6883,7 @@ class TestJudgeFallbackChangesRequested:
         assert result.status == PhaseStatus.SUCCESS
         assert result.data.get("changes_requested") is True
         assert result.data.get("fallback_used") is True
-        assert "[force-mode] Fallback detected changes requested" in result.message
+        assert "Fallback detected changes requested" in result.message
 
 
 class TestJudgeInfrastructureBypass:
@@ -7101,12 +7112,13 @@ class TestJudgeInfrastructureBypass:
         mock_retry.assert_not_called()
         mock_bypass.assert_not_called()
 
-    def test_retry_not_attempted_for_zero_work_default_mode(
+    def test_retry_attempted_for_zero_work_default_mode(
         self, mock_context: MagicMock
     ) -> None:
-        """Zero-work validation failure outside force mode should NOT retry.
+        """Zero-work sessions should be retried in default mode too.
 
-        Zero-work retry is only available in force mode (issue #2679).
+        Issue #2657: Previously force-mode only. Now retries in all modes
+        since zero-work is a transient agent issue, not a mode-specific one.
         """
         mock_context.pr_number = 100
         mock_context.check_shutdown.return_value = False
@@ -7125,6 +7137,13 @@ class TestJudgeInfrastructureBypass:
             "has_rejection_comment": False,
         }
 
+        retry_result = PhaseResult(
+            status=PhaseStatus.SUCCESS,
+            message="Retry succeeded",
+            phase_name="judge",
+            data={"approved": True},
+        )
+
         with (
             patch(
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry",
@@ -7132,20 +7151,17 @@ class TestJudgeInfrastructureBypass:
             ),
             patch.object(judge, "validate", return_value=False),
             patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(judge, "_try_fallback_changes_requested", return_value=False),
             patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
             patch.object(
-                judge, "_retry_judge_for_zero_work"
+                judge, "_retry_judge_for_zero_work", return_value=retry_result
             ) as mock_retry,
-            patch.object(
-                judge, "_try_infrastructure_bypass"
-            ) as mock_bypass,
-            patch("loom_tools.validate_phase._mark_phase_failed"),
         ):
             result = judge.run(mock_context)
 
-        assert result.status == PhaseStatus.FAILED
-        mock_retry.assert_not_called()
-        mock_bypass.assert_not_called()
+        assert result.status == PhaseStatus.SUCCESS
+        mock_retry.assert_called_once()
 
     def test_zero_work_retry_fails_falls_through_to_failure(
         self, mock_context: MagicMock
@@ -7393,6 +7409,8 @@ class TestJudgeZeroWorkRetry:
         judge = JudgePhase()
         original_diag = {"failure_mode": "agent_started_no_work"}
 
+        retry_diag = {"failure_mode": "agent_started_no_work", "session_duration_seconds": 0}
+
         with (
             patch(
                 "loom_tools.shepherd.phases.judge.run_phase_with_retry",
@@ -7404,6 +7422,7 @@ class TestJudgeZeroWorkRetry:
             patch.object(
                 judge, "_try_fallback_changes_requested", return_value=False
             ),
+            patch.object(judge, "_gather_diagnostics", return_value=retry_diag),
         ):
             result = judge._retry_judge_for_zero_work(mock_context, original_diag)
 
