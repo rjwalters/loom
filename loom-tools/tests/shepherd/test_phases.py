@@ -8719,12 +8719,19 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            # First call: gh pr list (no existing PR), second: gh pr create
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stderr=""),
+            ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
+        # Verify gh pr list check was called first
+        check_args = mock_run.call_args_list[0][0][0]
+        assert check_args[:3] == ["gh", "pr", "list"]
         # Verify gh pr create was called
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_run.call_args_list[1][0][0]
         assert call_args[:3] == ["gh", "pr", "create"]
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
@@ -8781,7 +8788,11 @@ class TestBuilderDirectCompletion:
                 "loom_tools.shepherd.phases.builder.subprocess.run"
             ) as mock_run,
         ):
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            # First call: gh pr list (no existing PR), second: gh pr create
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stderr=""),
+            ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
@@ -8831,11 +8842,15 @@ class TestBuilderDirectCompletion:
         with patch(
             "loom_tools.shepherd.phases.builder.subprocess.run"
         ) as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            # First call: gh pr list (no existing PR), second: gh pr create
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stderr=""),
+            ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is True
-        call_args = mock_run.call_args[0][0]
+        call_args = mock_run.call_args_list[1][0][0]
         assert call_args[:3] == ["gh", "pr", "create"]
         assert "--head" in call_args
         assert "feature/issue-42" in call_args
@@ -8846,6 +8861,69 @@ class TestBuilderDirectCompletion:
         assert "loom:review-requested" in call_args
         assert "--body" in call_args
         assert "Closes #42" in call_args
+
+    def test_create_pr_skips_when_pr_already_exists(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should skip PR creation when a PR already exists for the branch."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # gh pr list returns an existing PR number
+            mock_run.return_value = MagicMock(
+                returncode=0, stdout="999\n", stderr=""
+            )
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        # Only the check call should have happened, NOT gh pr create
+        assert mock_run.call_count == 1
+        check_args = mock_run.call_args[0][0]
+        assert check_args[:3] == ["gh", "pr", "list"]
+        assert "--head" in check_args
+        assert "feature/issue-42" in check_args
+
+    def test_create_pr_check_failure_falls_through_to_create(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Should proceed with PR creation when the pre-check command fails."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": True,
+            "pr_number": None,
+            "pr_has_review_label": False,
+            "branch": "feature/issue-42",
+        }
+
+        with patch(
+            "loom_tools.shepherd.phases.builder.subprocess.run"
+        ) as mock_run:
+            # First call: gh pr list fails (transient error), second: gh pr create
+            mock_run.side_effect = [
+                MagicMock(returncode=1, stdout="", stderr="network error"),
+                MagicMock(returncode=0, stderr=""),
+            ]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        # Both calls should have been made
+        assert mock_run.call_count == 2
+        create_args = mock_run.call_args_list[1][0][0]
+        assert create_args[:3] == ["gh", "pr", "create"]
 
     def test_create_pr_zero_commits_returns_false(self, mock_context: MagicMock) -> None:
         """Should refuse to create PR when remote exists but 0 commits ahead."""
@@ -8878,9 +8956,11 @@ class TestBuilderDirectCompletion:
         with patch(
             "loom_tools.shepherd.phases.builder.subprocess.run"
         ) as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=1, stderr="GraphQL: error"
-            )
+            # First call: gh pr list (no existing PR), second: gh pr create (fails)
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=1, stderr="GraphQL: error"),
+            ]
             result = builder._direct_completion(mock_context, diag)
 
         assert result is False
@@ -8904,11 +8984,18 @@ class TestBuilderDirectCompletion:
         with patch(
             "loom_tools.shepherd.phases.builder.subprocess.run"
         ) as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            # First call: gh pr list (no existing PR), second: gh pr create
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stderr=""),
+            ]
             builder._direct_completion(mock_context, diag)
 
-        call_args = mock_run.call_args[0][0]
-        assert "custom/my-branch" in call_args
+        # Both the check and create calls should use the custom branch
+        check_args = mock_run.call_args_list[0][0][0]
+        assert "custom/my-branch" in check_args
+        create_args = mock_run.call_args_list[1][0][0]
+        assert "custom/my-branch" in create_args
 
     def test_create_pr_fallback_branch_name(
         self, mock_context: MagicMock
@@ -8929,11 +9016,15 @@ class TestBuilderDirectCompletion:
         with patch(
             "loom_tools.shepherd.phases.builder.subprocess.run"
         ) as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stderr="")
+            # First call: gh pr list (no existing PR), second: gh pr create
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stderr=""),
+            ]
             builder._direct_completion(mock_context, diag)
 
-        call_args = mock_run.call_args[0][0]
-        assert "feature/issue-55" in call_args
+        create_args = mock_run.call_args_list[1][0][0]
+        assert "feature/issue-55" in create_args
 
     def test_stage_and_commit_failure_returns_false(
         self, mock_context: MagicMock
