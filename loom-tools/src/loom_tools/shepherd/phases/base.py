@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, Protocol
 from loom_tools.checkpoints import read_checkpoint
 from loom_tools.claim import extend_claim
 from loom_tools.common.logging import log_warning, strip_ansi
-from loom_tools.common.paths import LoomPaths
 from loom_tools.common.state import read_json_file
 
 if TYPE_CHECKING:
@@ -91,9 +90,44 @@ MCP_FAILURE_BACKOFF_SECONDS = [5, 15, 30]
 # with no meaningful output — the CLI spawned but never did any work.
 # These are infrastructure failures (API blip, spawn race) that should
 # NOT consume the main retry budget intended for legitimate failures.
-# See issue #2604.
+# See issues #2604, #2644.
 GHOST_SESSION_MAX_RETRIES = 3
-GHOST_SESSION_RETRY_DELAY_SECONDS = 5
+GHOST_SESSION_BACKOFF_SECONDS = [10, 30, 60]
+
+# Cause-specific retry strategies for ghost session classification.
+# Maps root cause → (max_retries, backoff_seconds).
+# Similar to LOW_OUTPUT_RETRY_STRATEGIES.  See issue #2644.
+GHOST_RETRY_STRATEGIES: dict[str, tuple[int, list[int]]] = {
+    "auth_failure": (0, []),           # Auth issues won't resolve with retries
+    "mcp_init_failure": (1, [30]),     # MCP might recover after rebuild
+    "api_unreachable": (1, [30]),      # API blip might be transient
+    "wrapper_crash": (0, []),          # Script errors won't self-heal
+    "unknown": (GHOST_SESSION_MAX_RETRIES, list(GHOST_SESSION_BACKOFF_SECONDS)),
+}
+
+# Degraded session detection patterns.
+# These appear in Claude CLI output when the session is running under
+# rate limits or has entered a non-productive loop (e.g., "Crystallizing..."
+# repeated).  A degraded session produces no useful work and should be
+# aborted early rather than waiting for the full timeout.  See issue #2631.
+DEGRADED_SESSION_PATTERNS = [
+    # Rate limit warnings embedded in Claude CLI output
+    re.compile(r"You've used \d+% of your weekly limit", re.IGNORECASE),
+    # Crystallizing loop — Claude's extended thinking under resource pressure
+    re.compile(r"Crystallizing", re.IGNORECASE),
+]
+
+# Minimum number of "Crystallizing" occurrences in the last N lines
+# to classify a session as degraded (a single occurrence during normal
+# thinking is not concerning).
+DEGRADED_CRYSTALLIZING_THRESHOLD = 5
+
+# Minimum lines of log tail to scan for degraded session patterns.
+DEGRADED_SCAN_TAIL_LINES = 100
+
+# How often (in seconds) to scan the log for degradation during polling.
+# Must be a multiple of _HEARTBEAT_POLL_INTERVAL for alignment.
+_DEGRADED_SCAN_INTERVAL = 30
 
 # Wall-clock duration threshold (in seconds) for ghost detection.
 # Sessions shorter than this with no meaningful output are classified as
@@ -762,11 +796,13 @@ def _is_ghost_session(
     is unreliable when pipe-pane fails to capture output — the log file
     appears unmodified (mtime == ctime) even though the session ran for
     10-20 seconds, causing false-positive ghost detection.  See issue #2639.
+    The fallback file-timestamp path uses a 2-second threshold to account
+    for filesystem timestamp jitter.  See issue #2644.
 
     These represent infrastructure-level failures (API blip, spawn race,
     resource contention) rather than agent failures, and should be retried
     on a separate budget to preserve the main retry budget for legitimate
-    failures.  See issue #2604.
+    failures.  See issues #2604, #2644.
 
     Args:
         log_path: Path to the worker session log file.
@@ -791,10 +827,13 @@ def _is_ghost_session(
                 return False
         else:
             # Fallback to file timestamp heuristic (legacy path).
+            # Use a 2-second threshold to account for filesystem timestamp
+            # jitter and sessions that emit a spinner frame before dying.
+            # See issue #2644.
             stat = log_path.stat()
             duration = stat.st_mtime - stat.st_ctime
-            if duration > 1.0:
-                # Session ran for more than 1 second — not a ghost.
+            if duration > 2.0:
+                # Session ran for more than 2 seconds — not a ghost.
                 return False
 
         content = log_path.read_text()
@@ -804,6 +843,101 @@ def _is_ghost_session(
         cli_output = _get_cli_output(stripped)
         cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
         return len(cleaned.strip()) < LOW_OUTPUT_MIN_CHARS
+    except OSError:
+        return False
+
+
+def _is_degraded_session(log_path: Path) -> bool:
+    """Check if a session log indicates a degraded session (rate limits, Crystallizing loops).
+
+    A degraded session is one where the builder ran but produced no useful work
+    because it was resource-constrained.  This manifests as:
+    - Rate limit warnings ("You've used 87% of your weekly limit")
+    - Repeated "Crystallizing..." output (Claude's extended thinking under pressure)
+
+    Degraded sessions are distinct from low-output sessions (which never started)
+    and stuck sessions (which started but stopped making progress).  A degraded
+    session actively produces output but the output is non-productive.
+
+    Detection requires BOTH:
+    1. A rate limit warning in the log, AND
+    2. Excessive "Crystallizing" repetitions (>= DEGRADED_CRYSTALLIZING_THRESHOLD)
+
+    This two-signal approach prevents false positives: a single rate limit warning
+    during an otherwise productive session is harmless, and brief "Crystallizing"
+    during normal thinking is expected.  The combination indicates the session has
+    entered a non-recoverable degraded state.  See issue #2631.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the session shows signs of degradation.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        content = log_path.read_text()
+        stripped = strip_ansi(content)
+        cli_output = _get_cli_output(stripped)
+        if not cli_output:
+            return False
+
+        # Signal 1: Rate limit warning present
+        has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(cli_output))
+        if not has_rate_limit:
+            return False
+
+        # Signal 2: Excessive Crystallizing repetitions
+        lines = cli_output.splitlines()
+        tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
+        crystallizing_count = sum(
+            1 for line in tail if DEGRADED_SESSION_PATTERNS[1].search(line)
+        )
+        return crystallizing_count >= DEGRADED_CRYSTALLIZING_THRESHOLD
+
+    except OSError:
+        return False
+
+
+def _scan_log_for_degradation(log_path: Path) -> bool:
+    """Quick scan of a live log file for degradation patterns.
+
+    This is a lighter-weight version of ``_is_degraded_session()`` designed
+    for in-flight polling during ``run_worker_phase()``.  It reads only the
+    tail of the file to minimize I/O overhead.
+
+    Returns True if the log shows both rate limit warnings and excessive
+    "Crystallizing" repetitions.  See issue #2631.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        # Read only the tail to minimize I/O during polling
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            # Read last ~10KB (enough for DEGRADED_SCAN_TAIL_LINES of output)
+            start_pos = max(0, file_size - 10_000)
+            f.seek(start_pos)
+            content = f.read().decode("utf-8", errors="replace")
+
+        stripped = strip_ansi(content)
+        lines = stripped.splitlines()
+        tail = lines[-DEGRADED_SCAN_TAIL_LINES:]
+        text = "\n".join(tail)
+
+        has_rate_limit = bool(DEGRADED_SESSION_PATTERNS[0].search(text))
+        if not has_rate_limit:
+            return False
+
+        crystallizing_count = sum(
+            1 for line in tail if DEGRADED_SESSION_PATTERNS[1].search(line)
+        )
+        return crystallizing_count >= DEGRADED_CRYSTALLIZING_THRESHOLD
+
     except OSError:
         return False
 
@@ -862,6 +996,59 @@ def _session_log_path(repo_root: Path, name: str) -> Path:
     return repo_root / ".loom" / "logs" / f"loom-{name}.log"
 
 
+def _classify_ghost_cause(log_path: Path) -> str:
+    """Classify the root cause of a ghost session from the worker log.
+
+    Ghost sessions (0s duration, no meaningful output) can have several root
+    causes.  This function parses the log for known patterns and returns a
+    cause string used to select a retry strategy from
+    ``GHOST_RETRY_STRATEGIES``.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        A cause string: ``"auth_failure"``, ``"mcp_init_failure"``,
+        ``"api_unreachable"``, ``"wrapper_crash"``, or ``"unknown"``.
+
+    See issue #2644.
+    """
+    if not log_path.is_file():
+        return "unknown"
+
+    try:
+        content = strip_ansi(log_path.read_text())
+    except OSError:
+        return "unknown"
+
+    # Check for auth-related failures
+    if _AUTH_FAILURE_SENTINEL in content:
+        return "auth_failure"
+    if "Authentication check timed out" in content:
+        return "auth_failure"
+    if "Authentication check failed" in content:
+        return "auth_failure"
+    if "Auth cache lock held" in content:
+        return "auth_failure"
+
+    # Check for MCP initialization failure
+    for pattern in MCP_FAILURE_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            return "mcp_init_failure"
+
+    # Check for API unreachable
+    if "API endpoint" in content and "unreachable" in content:
+        return "api_unreachable"
+
+    # Check for wrapper script crash
+    if "syntax error near unexpected token" in content or (
+        "syntax error" in content and "unexpected end of file" in content
+    ):
+        return "wrapper_crash"
+
+    return "unknown"
+
+
 def run_worker_phase(
     ctx: ShepherdContext,
     *,
@@ -908,6 +1095,7 @@ def run_worker_phase(
         - 8: Planning stall detected (stuck in planning checkpoint)
         - 9: Auth pre-flight failure (not retryable, see issue #2508)
         - 10: Ghost session detected (instant exit, no work — see issue #2604)
+        - 11: Degraded session detected (rate limits + Crystallizing loop, see issue #2631)
         - Other: Error
     """
     # Use unique session name per retry attempt to prevent tmux state
@@ -1039,6 +1227,11 @@ def run_worker_phase(
     # If it stays there beyond planning_timeout, terminate the worker.
     _planning_first_seen: float | None = None
 
+    # Degraded session detection state (issue #2631).
+    # Periodically scan the log for rate limit + Crystallizing patterns
+    # and abort early rather than waiting for the full timeout.
+    _last_degraded_scan: float = time.monotonic()
+
     while wait_proc.poll() is None:
         heartbeats = _read_heartbeats(progress_file, phase=phase)
         for hb in heartbeats[seen_heartbeats:]:
@@ -1083,6 +1276,33 @@ def run_worker_phase(
             else:
                 # Checkpoint advanced past planning (or doesn't exist yet)
                 _planning_first_seen = None
+
+        # In-flight degraded session detection (issue #2631).
+        # Periodically scan the log for rate limit + Crystallizing patterns.
+        # Abort early to avoid wasting the entire builder time budget on a
+        # session that will never produce useful output.
+        degraded_elapsed = time.monotonic() - _last_degraded_scan
+        if degraded_elapsed >= _DEGRADED_SCAN_INTERVAL:
+            _last_degraded_scan = time.monotonic()
+            degraded_log_path = _session_log_path(ctx.repo_root, actual_name)
+            if _scan_log_for_degradation(degraded_log_path):
+                log_warning(
+                    f"Degraded session detected: {role} session '{actual_name}' "
+                    f"shows rate limit warnings and Crystallizing loop, "
+                    f"terminating early (log: {degraded_log_path})"
+                )
+                wait_proc.terminate()
+                wait_proc.wait(timeout=30)
+                destroy_script = scripts_dir / "agent-destroy.sh"
+                if destroy_script.is_file():
+                    subprocess.run(
+                        [str(destroy_script), actual_name, "--force"],
+                        cwd=ctx.repo_root,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                return 11  # Degraded session
 
         time.sleep(_HEARTBEAT_POLL_INTERVAL)
 
@@ -1138,17 +1358,35 @@ def run_worker_phase(
 
     # Check for ghost session (exit code 10) — instant exit with no work.
     # Ghost sessions are a specific subtype of low-output where the session
-    # lasted < 1s.  These are infrastructure failures that should be retried
+    # lasted < 2s.  These are infrastructure failures that should be retried
     # on a separate budget.  Check before MCP/low-output to avoid consuming
-    # their retry budgets.  See issue #2604.
+    # their retry budgets.  See issues #2604, #2644.
     # Use wall-clock timing for reliable duration estimation.  See issue #2639.
     if wait_exit != 0 and _is_ghost_session(log_path, wall_clock_duration=elapsed):
+        errors = extract_log_errors(log_path)
+        cause = _classify_ghost_cause(log_path)
+        detail = f": {errors[-1]}" if errors else ""
         log_warning(
-            f"[WARN] Ghost session detected for {role} session '{actual_name}' "
-            f"({elapsed:.1f}s wall-clock, no meaningful output, "
+            f"Ghost session detected for {role} session '{actual_name}' "
+            f"(cause: {cause}{detail}, "
+            f"{elapsed:.1f}s wall-clock, "
             f"exit code {wait_exit}, log: {log_path})"
         )
         return 10
+
+    # Check for degraded session (exit code 11) — rate limits + Crystallizing.
+    # Degraded sessions produce output but it's non-productive garbage.
+    # This is NOT retryable: the underlying resource constraint (rate limits)
+    # will persist until the limit resets.  Check before MCP/low-output
+    # because degraded sessions may have substantial output volume.
+    # See issue #2631.
+    if _is_degraded_session(log_path):
+        log_warning(
+            f"Degraded session detected for {role} session '{actual_name}': "
+            f"rate limit warnings and Crystallizing loop "
+            f"(exit code {wait_exit}, log: {log_path})"
+        )
+        return 11
 
     # Check for MCP failure (exit code 7) — more specific than low-output,
     # with different retry/backoff strategy.  See issues #2135, #2279.
@@ -1195,11 +1433,13 @@ def run_phase_with_retry(
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
     On exit code 9 (auth failure), returns immediately (not retryable).
-    On exit code 10 (ghost session), retries up to GHOST_SESSION_MAX_RETRIES
-    times on a **separate** budget that does not deplete the main retry
-    counters.  Ghost sessions are infrastructure failures (0s duration,
-    no output) that should not consume the budget intended for legitimate
-    review failures.  See issue #2604.
+    On exit code 11 (degraded session), returns immediately (not retryable;
+    rate limits won't resolve with retries).  See issue #2631.
+    On exit code 10 (ghost session), classifies the root cause from the
+    worker log and uses a cause-specific retry strategy from
+    ``GHOST_RETRY_STRATEGIES``.  Retries on a **separate** budget that does
+    not deplete the main retry counters.  Uses escalating backoff (default
+    [10, 30, 60]s) instead of a fixed delay.  See issues #2604, #2644.
 
     For exit codes 6 and 7, if a single attempt takes longer than
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS, retries are skipped entirely
@@ -1210,7 +1450,8 @@ def run_phase_with_retry(
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
                    6=low-output after retries, 7=MCP failure after retries,
                    8=planning stall, 9=auth failure,
-                   10=ghost session after retries, other=error
+                   10=ghost session after retries,
+                   11=degraded session, other=error
     """
     stuck_retries = 0
     low_output_retries = 0
@@ -1252,6 +1493,14 @@ def run_phase_with_retry(
         if exit_code == 9:
             return 9
 
+        # --- Degraded session (exit code 11) ---
+        # Not retryable: the builder session was degraded by rate limits
+        # and entered a Crystallizing loop.  The underlying rate limit
+        # won't resolve with retries — the daemon should back off or
+        # pick a different issue.  See issue #2631.
+        if exit_code == 11:
+            return 11
+
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or
         # loom:changes-requested) before the MCP/low-output/ghost failure
@@ -1271,31 +1520,57 @@ def run_phase_with_retry(
         # Ghost sessions are infrastructure-level failures (0s duration, no
         # output) that should NOT deplete the main retry budget.  They use a
         # separate counter so that legitimate failures (stuck, low-output,
-        # MCP) retain their full retry budget.  See issue #2604.
+        # MCP) retain their full retry budget.  See issues #2604, #2644.
         if exit_code == 10:
-            ghost_retries += 1
-            if ghost_retries > GHOST_SESSION_MAX_RETRIES:
+            # Classify root cause and select cause-specific retry strategy.
+            # Use the actual session name (may include attempt suffix) for
+            # correct log file lookup.  See issues #2639, #2644.
+            log_path = _session_log_path(ctx.repo_root, actual_name)
+            ghost_cause = _classify_ghost_cause(log_path)
+            cause_max_retries, cause_backoff = GHOST_RETRY_STRATEGIES.get(
+                ghost_cause, GHOST_RETRY_STRATEGIES["unknown"]
+            )
+
+            # Fail fast for causes that won't resolve with retries.
+            if cause_max_retries == 0:
                 log_warning(
-                    f"Ghost session persisted for {role} after "
-                    f"{GHOST_SESSION_MAX_RETRIES} retries"
+                    f"Ghost session for {role} classified as '{ghost_cause}': "
+                    f"not retryable, failing fast"
                 )
                 return 10
 
+            ghost_retries += 1
+            if ghost_retries > cause_max_retries:
+                errors = extract_log_errors(log_path)
+                detail = f": {errors[-1]}" if errors else ""
+                log_warning(
+                    f"Ghost session ({ghost_cause}) persisted for {role} after "
+                    f"{cause_max_retries} retries{detail}"
+                )
+                return 10
+
+            # Use cause-specific escalating backoff schedule.
+            backoff_idx = min(
+                ghost_retries - 1, max(0, len(cause_backoff) - 1)
+            )
+            backoff = cause_backoff[backoff_idx]
+
             ctx.report_milestone(
                 "error",
-                error=f"ghost session detected for {role} (0s duration, no output)",
+                error=f"ghost session detected for {role} (cause: {ghost_cause}, 0s duration, no output)",
                 will_retry=True,
             )
             ctx.report_milestone(
                 "heartbeat",
                 action=(
                     f"retrying ghost session {role} "
-                    f"(attempt {ghost_retries}/{GHOST_SESSION_MAX_RETRIES}, "
-                    f"backoff {GHOST_SESSION_RETRY_DELAY_SECONDS}s)"
+                    f"(cause: {ghost_cause}, "
+                    f"attempt {ghost_retries}/{cause_max_retries}, "
+                    f"backoff {backoff}s)"
                 ),
             )
 
-            time.sleep(GHOST_SESSION_RETRY_DELAY_SECONDS)
+            time.sleep(backoff)
             continue
 
         # --- MCP failure handling (exit code 7) ---

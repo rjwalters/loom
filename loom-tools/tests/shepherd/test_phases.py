@@ -25,8 +25,9 @@ from loom_tools.shepherd.phases import (
     PhaseStatus,
 )
 from loom_tools.shepherd.phases.base import (
+    GHOST_RETRY_STRATEGIES,
+    GHOST_SESSION_BACKOFF_SECONDS,
     GHOST_SESSION_MAX_RETRIES,
-    GHOST_SESSION_RETRY_DELAY_SECONDS,
     LOW_OUTPUT_BACKOFF_SECONDS,
     LOW_OUTPUT_MAX_ATTEMPT_SECONDS,
     LOW_OUTPUT_MAX_RETRIES,
@@ -36,6 +37,7 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
     _AUTH_FAILURE_SENTINEL,
+    _classify_ghost_cause,
     _classify_low_output_cause,
     _is_auth_failure,
     _is_ghost_session,
@@ -6827,6 +6829,190 @@ class TestJudgeInfrastructureBypass:
         assert "loom:infrastructure-bypass" in captured["body"]
         assert "NOT" in captured["body"]
         assert "low output" in captured["body"]
+
+    def test_bypass_on_zero_work_validation_failure_force_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Zero-work validation failure in force mode: bypass succeeds when CI passes.
+
+        When the judge CLI exits code 0 but does no work (0s duration, no comments,
+        no labels), the exit-code-based ghost detection is skipped (issue #2540).
+        The bypass should be attempted in the validation failure path (issue #2636).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        # Diagnostics indicating a zero-work session
+        fake_diag = {
+            "summary": "no judge comments; session duration: 0s",
+            "session_duration_seconds": 0,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass"
+            ) as mock_bypass,
+        ):
+            # Bypass succeeds
+            mock_bypass.return_value = PhaseResult(
+                status=PhaseStatus.SUCCESS,
+                message="[force-mode] Infrastructure bypass applied",
+                phase_name="judge",
+                data={"approved": True, "infrastructure_bypass": True},
+            )
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.SUCCESS
+        assert result.data.get("infrastructure_bypass") is True
+        mock_bypass.assert_called_once()
+        assert "zero-work session" in mock_bypass.call_args.kwargs["failure_reason"]
+
+    def test_bypass_not_attempted_for_nonzero_duration_validation_failure(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Validation failure with real session duration should NOT attempt bypass.
+
+        When the judge ran for a meaningful duration but still failed validation,
+        this is not an infrastructure failure — do not bypass (issue #2636).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        # Diagnostics indicating a real session that did some work
+        fake_diag = {
+            "summary": "no judge comments; session duration: 30s",
+            "session_duration_seconds": 30,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": ["some output"],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass"
+            ) as mock_bypass,
+            patch("loom_tools.validate_phase._mark_phase_failed"),
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+        # Bypass should NOT be attempted for sessions with real duration
+        mock_bypass.assert_not_called()
+
+    def test_bypass_not_attempted_for_zero_work_default_mode(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Zero-work validation failure outside force mode should NOT attempt bypass.
+
+        Infrastructure bypass is only available in force mode (issue #2636).
+        """
+        mock_context.pr_number = 100
+        mock_context.check_shutdown.return_value = False
+        judge = JudgePhase()
+
+        fake_diag = {
+            "summary": "no judge comments; session duration: 0s",
+            "session_duration_seconds": 0,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass"
+            ) as mock_bypass,
+            patch("loom_tools.validate_phase._mark_phase_failed"),
+        ):
+            result = judge.run(mock_context)
+
+        assert result.status == PhaseStatus.FAILED
+        mock_bypass.assert_not_called()
+
+    def test_bypass_denied_falls_through_to_failure_for_zero_work(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Zero-work bypass denied (CI fails) should fall through to FAILED.
+
+        When the infrastructure bypass is attempted but denied (e.g., CI not
+        passing), the normal failure path should execute (issue #2636).
+        """
+        ctx = self._make_force_context(mock_context)
+        judge = JudgePhase()
+
+        fake_diag = {
+            "summary": "no judge comments; session duration: 0s",
+            "session_duration_seconds": 0,
+            "log_file": "/fake/repo/.loom/logs/loom-judge-issue-42.log",
+            "log_exists": True,
+            "log_tail": [],
+            "pr_reviews": [],
+            "pr_labels": [],
+        }
+
+        with (
+            patch(
+                "loom_tools.shepherd.phases.judge.run_phase_with_retry",
+                return_value=0,
+            ),
+            patch.object(judge, "validate", return_value=False),
+            patch("loom_tools.shepherd.phases.judge.time.sleep"),
+            patch.object(judge, "_try_fallback_approval", return_value=False),
+            patch.object(
+                judge, "_try_fallback_changes_requested", return_value=False
+            ),
+            patch.object(judge, "_gather_diagnostics", return_value=fake_diag),
+            patch.object(
+                judge, "_try_infrastructure_bypass", return_value=None
+            ) as mock_bypass,
+            patch(
+                "loom_tools.validate_phase._mark_phase_failed"
+            ) as mock_mark_failed,
+        ):
+            result = judge.run(ctx)
+
+        assert result.status == PhaseStatus.FAILED
+        assert "validation failed" in result.message
+        mock_bypass.assert_called_once()
+        mock_mark_failed.assert_called_once()
 
 
 class TestMergePhase:
@@ -15795,6 +15981,10 @@ class TestRunPhaseWithRetryGhostSession:
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
             ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
             patch("time.sleep") as mock_sleep,
         ):
             exit_code = run_phase_with_retry(
@@ -15808,7 +15998,8 @@ class TestRunPhaseWithRetryGhostSession:
 
         assert exit_code == 0
         assert call_count == 2
-        mock_sleep.assert_called_once_with(GHOST_SESSION_RETRY_DELAY_SECONDS)
+        # Escalating backoff: first retry uses GHOST_SESSION_BACKOFF_SECONDS[0]
+        mock_sleep.assert_called_once_with(GHOST_SESSION_BACKOFF_SECONDS[0])
 
     def test_exhausts_ghost_retries_returns_code_10(
         self, mock_context: MagicMock
@@ -15818,6 +16009,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 return_value=10,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15835,7 +16030,7 @@ class TestRunPhaseWithRetryGhostSession:
     def test_ghost_retry_count_matches_constant(
         self, mock_context: MagicMock
     ) -> None:
-        """Should retry exactly GHOST_SESSION_MAX_RETRIES times."""
+        """Should retry exactly GHOST_SESSION_MAX_RETRIES times for unknown cause."""
         call_count = 0
 
         def count_calls(*args, **kwargs):
@@ -15847,6 +16042,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=count_calls,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15878,6 +16077,10 @@ class TestRunPhaseWithRetryGhostSession:
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
             ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
             patch("time.sleep"),
         ):
             run_phase_with_retry(
@@ -15891,13 +16094,15 @@ class TestRunPhaseWithRetryGhostSession:
 
         milestone_calls = mock_context.report_milestone.call_args_list
         assert len(milestone_calls) == 2
-        # First call: error with will_retry
+        # First call: error with will_retry and cause info
         assert milestone_calls[0].args[0] == "error"
         assert "ghost session" in milestone_calls[0].kwargs["error"]
+        assert "unknown" in milestone_calls[0].kwargs["error"]
         assert milestone_calls[0].kwargs["will_retry"] is True
-        # Second call: heartbeat with ghost retry info
+        # Second call: heartbeat with ghost retry info and cause
         assert milestone_calls[1].args[0] == "heartbeat"
         assert "ghost session" in milestone_calls[1].kwargs["action"]
+        assert "unknown" in milestone_calls[1].kwargs["action"]
 
     def test_ghost_and_low_output_have_separate_counters(
         self, mock_context: MagicMock
@@ -15919,6 +16124,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15954,6 +16163,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):
@@ -15995,6 +16208,10 @@ class TestRunPhaseWithRetryGhostSession:
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
             ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
+            ),
             patch("time.sleep"),
         ):
             exit_code = run_phase_with_retry(
@@ -16029,6 +16246,10 @@ class TestRunPhaseWithRetryGhostSession:
             patch(
                 "loom_tools.shepherd.phases.base.run_worker_phase",
                 side_effect=mock_run_worker,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._classify_ghost_cause",
+                return_value="unknown",
             ),
             patch("time.sleep"),
         ):

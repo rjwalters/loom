@@ -51,8 +51,9 @@ AUTH_CACHE_LOCK_WAIT="${LOOM_AUTH_CACHE_LOCK_WAIT:-60}"  # seconds
 # Startup health monitor configuration
 # How long (seconds) to watch early output for MCP/plugin failures
 STARTUP_MONITOR_WINDOW="${LOOM_STARTUP_MONITOR_WINDOW:-90}"
-# Grace period (seconds) after detecting startup failure before killing
-STARTUP_GRACE_PERIOD="${LOOM_STARTUP_GRACE_PERIOD:-10}"
+# Grace period (seconds) after detecting startup failure before killing.
+# The monitor polls every 2s within this window for loom MCP connection.
+STARTUP_GRACE_PERIOD="${LOOM_STARTUP_GRACE_PERIOD:-20}"
 
 # Terminal identification for stop signals
 TERMINAL_ID="${LOOM_TERMINAL_ID:-}"
@@ -844,25 +845,40 @@ start_startup_monitor() {
 
             if [[ "${found_failure}" == "true" ]]; then
                 log_warn "Startup monitor: detected '${matched_pattern}' in early output"
-                log_warn "Startup monitor: waiting ${STARTUP_GRACE_PERIOD}s grace period before kill"
-                sleep "${STARTUP_GRACE_PERIOD}"
+                log_warn "Startup monitor: polling for loom MCP connection (up to ${STARTUP_GRACE_PERIOD}s)"
 
-                # Re-check: if output file is gone, session already ended
-                if [[ ! -f "${output_file}" ]]; then
-                    break
-                fi
-
-                # Check if the critical "loom" MCP server connected successfully.
-                # If it did, the failure is a non-critical server (e.g. stale sphere
-                # config) and the session can continue working.
+                # Poll every 2s within the grace period for the loom MCP
+                # to connect.  MCP init typically takes ~5s so a single-shot
+                # check was prone to race conditions (see issue #2660).
+                local poll_interval=2
+                local grace_elapsed=0
+                local loom_connected=false
                 local debug_log="${CLAUDE_CONFIG_DIR:-}/debug/latest"
-                if [[ -L "${debug_log}" || -f "${debug_log}" ]] && \
-                   grep -q 'MCP server "loom": Successfully connected' "${debug_log}" 2>/dev/null; then
+
+                while [[ "${grace_elapsed}" -lt "${STARTUP_GRACE_PERIOD}" ]]; do
+                    sleep "${poll_interval}"
+                    grace_elapsed=$((grace_elapsed + poll_interval))
+
+                    # Session ended on its own — nothing to kill
+                    if [[ ! -f "${output_file}" ]]; then
+                        loom_connected=true  # not a failure, just exited
+                        break
+                    fi
+
+                    # Check if the critical "loom" MCP server connected
+                    if [[ -L "${debug_log}" || -f "${debug_log}" ]] && \
+                       grep -q 'MCP server "loom": Successfully connected' "${debug_log}" 2>/dev/null; then
+                        loom_connected=true
+                        break
+                    fi
+                done
+
+                if [[ "${loom_connected}" == "true" ]]; then
                     log_warn "Startup monitor: loom MCP server OK despite other MCP failures — continuing"
                     break
                 fi
 
-                log_warn "Startup monitor: killing degraded CLI session for retry"
+                log_warn "Startup monitor: loom MCP not connected after ${STARTUP_GRACE_PERIOD}s — killing degraded session"
                 pkill -INT -P $$ -f "claude" 2>/dev/null || true
                 break
             fi

@@ -271,6 +271,33 @@ class JudgePhase:
                     data={"changes_requested": True, "fallback_used": True},
                 )
             else:
+                # Gather diagnostics BEFORE marking failed, so we can
+                # attempt infrastructure bypass for zero-work sessions
+                # that exited cleanly (issue #2636).
+                diag = self._gather_diagnostics(ctx, phase_start_time)
+
+                # Check if this looks like an infrastructure failure
+                # (ghost-like session that exited code 0 but did no work).
+                # The exit-code-based ghost/low-output detection in base.py
+                # is deliberately guarded by `wait_exit != 0` (issue #2540),
+                # so the bypass must be attempted here in the validation
+                # failure path.  Only trigger when session_duration_seconds
+                # is present (log exists and is current) AND shows a
+                # near-instant session.
+                duration = diag.get("session_duration_seconds")
+                if (
+                    ctx.config.is_force_mode
+                    and duration is not None
+                    and duration <= 1
+                ):
+                    bypass_result = self._try_infrastructure_bypass(
+                        ctx,
+                        failure_reason="validation failed with zero-work session "
+                        "(0s duration, clean exit, no comments/labels)",
+                    )
+                    if bypass_result is not None:
+                        return bypass_result
+
                 # All recovery paths exhausted — NOW post the failure
                 # comment and apply the failure label (#2588).
                 from loom_tools.validate_phase import _mark_phase_failed
@@ -282,7 +309,6 @@ class JudgePhase:
                     ctx.repo_root,
                     failure_label="loom:failed:judge",
                 )
-                diag = self._gather_diagnostics(ctx, phase_start_time)
                 # Add context about loom:review-requested state (issue #1998)
                 if ctx.has_pr_label("loom:review-requested"):
                     diag["intermediate_state"] = "doctor_fixed_awaiting_judging"

@@ -3434,7 +3434,8 @@ class TestCleanupPrLabelsOnFailure:
     def test_removes_workflow_labels_from_pr(
         self, mock_transition: MagicMock
     ) -> None:
-        """Should remove stale workflow labels from the PR."""
+        """Should remove stale workflow labels but preserve review-requested
+        when judge produced no outcome."""
         ctx = self._make_cleanup_ctx(
             pr_number=100,
             pr_labels={
@@ -3445,10 +3446,11 @@ class TestCleanupPrLabelsOnFailure:
         )
         _cleanup_pr_labels_on_failure(ctx)
 
+        # loom:review-requested preserved (no judge outcome), only loom:treating removed
         mock_transition.assert_called_once_with(
             "pr",
             100,
-            remove=["loom:review-requested", "loom:treating"],
+            remove=["loom:treating"],
             repo_root=Path("/fake/repo"),
         )
 
@@ -3528,6 +3530,65 @@ class TestCleanupPrLabelsOnFailure:
         # Should not raise
         _cleanup_pr_labels_on_failure(ctx)
         mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_preserves_review_requested_when_no_judge_outcome(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should preserve loom:review-requested when judge produced no outcome."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=100,
+            pr_labels={"loom:review-requested"},
+        )
+        _cleanup_pr_labels_on_failure(ctx)
+
+        # No judge outcome (no loom:pr or loom:changes-requested),
+        # so loom:review-requested is preserved — nothing to remove
+        mock_transition.assert_not_called()
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_removes_review_requested_when_judge_approved(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should remove loom:review-requested when judge approved (loom:pr present)."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=100,
+            pr_labels={"loom:review-requested", "loom:pr"},
+        )
+        _cleanup_pr_labels_on_failure(ctx)
+
+        mock_transition.assert_called_once_with(
+            "pr",
+            100,
+            remove=["loom:review-requested"],
+            repo_root=Path("/fake/repo"),
+        )
+
+    @patch("loom_tools.shepherd.cli.transition_labels")
+    def test_removes_review_requested_when_judge_requested_changes(
+        self, mock_transition: MagicMock
+    ) -> None:
+        """Should remove loom:review-requested when judge requested changes."""
+        ctx = self._make_cleanup_ctx(
+            pr_number=100,
+            pr_labels={
+                "loom:review-requested",
+                "loom:changes-requested",
+                "loom:treating",
+            },
+        )
+        _cleanup_pr_labels_on_failure(ctx)
+
+        mock_transition.assert_called_once_with(
+            "pr",
+            100,
+            remove=[
+                "loom:changes-requested",
+                "loom:review-requested",
+                "loom:treating",
+            ],
+            repo_root=Path("/fake/repo"),
+        )
 
 
 class TestCleanupLabelsOnFailure:

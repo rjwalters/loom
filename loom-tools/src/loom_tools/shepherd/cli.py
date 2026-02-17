@@ -1311,6 +1311,59 @@ def _read_builder_log(ctx: ShepherdContext) -> str:
         return ""
 
 
+def _apply_failure_label(
+    ctx: ShepherdContext, failure_label: str, *, remove_label: str = "loom:building"
+) -> bool:
+    """Apply a failure label to an issue with fallback to loom:blocked.
+
+    Attempts to transition from ``remove_label`` to ``failure_label``.
+    If the failure label doesn't exist on the repo (e.g. labels were never
+    synced), falls back to ``loom:blocked`` so the issue doesn't become a
+    dead letter with no workflow labels.
+
+    Args:
+        ctx: Shepherd context
+        failure_label: The loom:failed:* label to apply
+        remove_label: The label to remove (default "loom:building")
+
+    Returns:
+        True if the intended failure label was applied, False if fallback was used.
+    """
+    success = transition_issue_labels(
+        ctx.config.issue,
+        add=[failure_label],
+        remove=[remove_label],
+        repo_root=ctx.repo_root,
+    )
+
+    if success:
+        return True
+
+    # Label transition failed — likely because the failure label doesn't
+    # exist on the repo.  Fall back to loom:blocked so the issue remains
+    # visible in the workflow.
+    log_warning(
+        f"Failed to apply '{failure_label}' to issue #{ctx.config.issue} "
+        f"(label may not exist on repo). Falling back to 'loom:blocked'. "
+        f"Run: gh label sync --file .github/labels.yml"
+    )
+
+    fallback_ok = transition_issue_labels(
+        ctx.config.issue,
+        add=["loom:blocked"],
+        remove=[remove_label],
+        repo_root=ctx.repo_root,
+    )
+
+    if not fallback_ok:
+        log_error(
+            f"Fallback label transition also failed for issue #{ctx.config.issue}. "
+            f"Issue may be in inconsistent label state."
+        )
+
+    return False
+
+
 def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
     """Mark issue with loom:failed:builder-tests after test verification failed.
 
@@ -1321,21 +1374,7 @@ def _mark_builder_test_failure(ctx: ShepherdContext) -> None:
     import subprocess
 
     # Atomic transition: loom:building -> loom:failed:builder-tests
-    subprocess.run(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(ctx.config.issue),
-            "--remove-label",
-            "loom:building",
-            "--add-label",
-            "loom:failed:builder-tests",
-        ],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        check=False,
-    )
+    _apply_failure_label(ctx, "loom:failed:builder-tests")
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1404,21 +1443,7 @@ def _mark_doctor_exhausted(
     import subprocess
 
     # Atomic transition: loom:building -> loom:failed:doctor
-    subprocess.run(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(ctx.config.issue),
-            "--remove-label",
-            "loom:building",
-            "--add-label",
-            "loom:failed:doctor",
-        ],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        check=False,
-    )
+    _apply_failure_label(ctx, "loom:failed:doctor")
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1486,21 +1511,7 @@ def _mark_judge_exhausted(ctx: ShepherdContext, retries: int) -> None:
     import subprocess
 
     # Atomic transition: loom:building -> loom:failed:judge
-    subprocess.run(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(ctx.config.issue),
-            "--remove-label",
-            "loom:building",
-            "--add-label",
-            "loom:failed:judge",
-        ],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        check=False,
-    )
+    _apply_failure_label(ctx, "loom:failed:judge")
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1722,21 +1733,7 @@ def _mark_builder_no_pr(ctx: ShepherdContext) -> None:
     log_info(_format_diagnostics_for_log(diagnostics))
 
     # Atomic transition: loom:building -> loom:failed:builder
-    subprocess.run(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(ctx.config.issue),
-            "--remove-label",
-            "loom:building",
-            "--add-label",
-            "loom:failed:builder",
-        ],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        check=False,
-    )
+    _apply_failure_label(ctx, "loom:failed:builder")
 
     # Record blocked reason and update systematic failure tracking
     from loom_tools.common.systematic_failure import (
@@ -1846,21 +1843,16 @@ def _mark_baseline_blocked(ctx: ShepherdContext, result: "PhaseResult") -> None:
 
     # Atomic transition: loom:building -> loom:blocked
     # (issue may or may not have loom:building at this point)
-    subprocess.run(
-        [
-            "gh",
-            "issue",
-            "edit",
-            str(ctx.config.issue),
-            "--remove-label",
-            "loom:building",
-            "--add-label",
-            "loom:blocked",
-        ],
-        cwd=ctx.repo_root,
-        capture_output=True,
-        check=False,
+    success = transition_issue_labels(
+        ctx.config.issue,
+        add=["loom:blocked"],
+        remove=["loom:building"],
+        repo_root=ctx.repo_root,
     )
+    if not success:
+        log_warning(
+            f"Failed to transition issue #{ctx.config.issue} to loom:blocked"
+        )
 
     # Build comment
     test_list = ""
@@ -1915,9 +1907,13 @@ def _cleanup_pr_labels_on_failure(ctx: ShepherdContext) -> None:
     """Best-effort cleanup of stale workflow labels on the associated PR.
 
     When shepherd fails, PR labels from in-progress workflow states can be
-    left behind (e.g., loom:treating, loom:reviewing, loom:review-requested,
-    loom:changes-requested). These are workflow state labels that become
-    contradictory once the shepherd is no longer driving the lifecycle.
+    left behind (e.g., loom:treating, loom:reviewing, loom:changes-requested).
+    These are workflow state labels that become contradictory once the shepherd
+    is no longer driving the lifecycle.
+
+    Special case: loom:review-requested is preserved when the judge never
+    produced an outcome (no loom:pr or loom:changes-requested on the PR).
+    This keeps the PR visible for retry instead of leaving it with zero labels.
 
     Factual status labels (loom:merge-conflict, loom:ci-failure) are kept
     since they reflect actual PR state regardless of shepherd status.
@@ -1947,7 +1943,16 @@ def _cleanup_pr_labels_on_failure(ctx: ShepherdContext) -> None:
     except Exception:
         return
 
-    stale_labels = PR_WORKFLOW_LABELS & pr_labels
+    # If the judge never produced an outcome (no loom:pr or loom:changes-requested),
+    # preserve loom:review-requested so the PR remains visible for retry.
+    judge_produced_outcome = bool(
+        {"loom:pr", "loom:changes-requested"} & pr_labels
+    )
+    labels_to_remove = PR_WORKFLOW_LABELS.copy()
+    if not judge_produced_outcome:
+        labels_to_remove.discard("loom:review-requested")
+
+    stale_labels = labels_to_remove & pr_labels
     if not stale_labels:
         return
 
