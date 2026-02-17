@@ -510,19 +510,19 @@ check_auth_status() {
                 sleep "${backoff}"
                 continue
             fi
-            log_error "Authentication check timed out after ${max_retries} attempts"
+            log_warn "Authentication check timed out after ${max_retries} attempts"
             [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
         fi
 
         if [[ "${auth_exit_code}" -ne 0 ]]; then
-            log_error "Authentication check command failed (exit ${auth_exit_code})"
-            log_error "Output: ${auth_output}"
+            log_warn "Authentication check command failed (exit ${auth_exit_code})"
+            log_warn "Output: ${auth_output}"
             if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-                log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
-                log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
+                log_warn "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+                log_warn "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
             else
-                log_error "Run: claude auth login"
+                log_warn "Run: claude auth login"
             fi
             [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
@@ -536,12 +536,12 @@ check_auth_status() {
         logged_in=$(echo "${auth_output}" | python3 -c "import json,sys; print(json.load(sys.stdin).get('loggedIn', False))" 2>/dev/null || echo "")
 
         if [[ "${logged_in}" != "True" ]]; then
-            log_error "Authentication check failed: not logged in"
+            log_warn "Authentication check failed: not logged in"
             if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-                log_error "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
-                log_error "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
+                log_warn "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR}"
+                log_warn "Run: CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR} claude auth login"
             else
-                log_error "Run: claude auth login"
+                log_warn "Run: claude auth login"
             fi
             [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
             return 1
@@ -553,7 +553,7 @@ check_auth_status() {
     done
 
     # Should not reach here, but guard against it
-    log_error "Authentication check failed after ${max_retries} attempts"
+    log_warn "Authentication check failed after ${max_retries} attempts"
     [[ "${lock_acquired}" == "true" ]] && _auth_cache_unlock
     return 1
 }
