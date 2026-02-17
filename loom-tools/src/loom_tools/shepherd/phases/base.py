@@ -34,6 +34,11 @@ INSTANT_EXIT_MIN_OUTPUT_CHARS = 100
 # be excluded when measuring meaningful output.  See issue #2401.
 _CLI_START_SENTINEL = "# CLAUDE_CLI_START"
 
+# Sentinel written by claude-wrapper.sh when authentication pre-flight fails.
+# Auth failures are not transient (e.g., parent session holds config lock) and
+# should not be retried.  See issue #2508.
+_AUTH_FAILURE_SENTINEL = "# AUTH_PREFLIGHT_FAILED"
+
 # Maximum retries for instant-exit detection, with exponential backoff.
 INSTANT_EXIT_MAX_RETRIES = 3
 INSTANT_EXIT_BACKOFF_SECONDS = [2, 4, 8]
@@ -611,6 +616,33 @@ def _is_instant_exit(log_path: Path) -> bool:
         return False
 
 
+def _is_auth_failure(log_path: Path) -> bool:
+    """Check if a session log indicates an authentication pre-flight failure.
+
+    Auth failures are **not transient** when running as a subprocess of a
+    parent Claude Code session (the parent holds the config lock, so retries
+    will always time out).  This is distinct from generic instant-exits which
+    *are* worth retrying.
+
+    The wrapper writes ``# AUTH_PREFLIGHT_FAILED`` to the log file when
+    ``check_auth_status`` fails.  See issue #2508.
+
+    Args:
+        log_path: Path to the worker session log file.
+
+    Returns:
+        True if the log contains the auth failure sentinel.
+    """
+    if not log_path.is_file():
+        return False
+
+    try:
+        content = log_path.read_text()
+        return _AUTH_FAILURE_SENTINEL in strip_ansi(content)
+    except OSError:
+        return False
+
+
 def run_worker_phase(
     ctx: ShepherdContext,
     *,
@@ -651,6 +683,7 @@ def run_worker_phase(
         - 6: Instant exit detected (session < 5s with no meaningful output)
         - 7: MCP server failure detected (session exited due to MCP init failure)
         - 8: Planning stall detected (stuck in planning checkpoint)
+        - 9: Auth pre-flight failure (not retryable, see issue #2508)
         - Other: Error
     """
     scripts_dir = ctx.scripts_dir
@@ -826,20 +859,29 @@ def run_worker_phase(
             check=False,
         )
 
-    # Detect instant-exit / MCP failure: session produced no meaningful output.
-    # Return synthetic exit code 6 (instant-exit) or 7 (MCP failure) so the
-    # retry layer can handle it with backoff.  See issues #2135, #2279.
+    # Detect failure modes from the session log file and return synthetic
+    # exit codes so the retry layer can handle each appropriately.
     #
     # Check on ALL exit codes, not just 0.  A degraded CLI session may exit
     # with a non-zero code (e.g., 2 for API error) while still producing no
     # meaningful output — this is functionally the same as an instant-exit
     # and should be retried rather than treated as a builder error.
     # See issue #2446.
-    #
-    # Check for MCP failure first (exit code 7) since it's a more specific
-    # failure mode with different retry/backoff strategy.
     paths = LoomPaths(ctx.repo_root)
     log_path = paths.worker_log_file(role, ctx.config.issue)
+
+    # Check for auth pre-flight failure first (exit code 9).  Auth failures
+    # are NOT transient when a parent Claude session holds the config lock,
+    # so retrying is futile.  See issue #2508.
+    if _is_auth_failure(log_path):
+        log_warning(
+            f"Auth pre-flight failure for {role} session '{name}': "
+            f"authentication check failed (not retryable, log: {log_path})"
+        )
+        return 9
+
+    # Check for MCP failure (exit code 7) — more specific than instant-exit,
+    # with different retry/backoff strategy.  See issues #2135, #2279.
     if _is_mcp_failure(log_path):
         log_warning(
             f"MCP server failure detected for {role} session '{name}': "
@@ -877,11 +919,12 @@ def run_phase_with_retry(
     On exit code 7 (MCP failure), retries up to MCP_FAILURE_MAX_RETRIES
     times with longer backoff (MCP failures are often systemic).
     On exit code 8 (planning stall), returns immediately (not retryable).
+    On exit code 9 (auth failure), returns immediately (not retryable).
 
     Returns:
         Exit code: 0=success, 3=shutdown, 4=stuck after retries,
                    6=instant-exit after retries, 7=MCP failure after retries,
-                   8=planning stall, other=error
+                   8=planning stall, 9=auth failure, other=error
     """
     stuck_retries = 0
     instant_exit_retries = 0
@@ -906,6 +949,13 @@ def run_phase_with_retry(
         # the agent's ability to proceed.  See issue #2443.
         if exit_code == 8:
             return 8
+
+        # --- Auth pre-flight failure (exit code 9) ---
+        # Not retryable: auth timeouts when a parent Claude session holds
+        # the config lock will always fail.  Retrying wastes ~45s per
+        # attempt with zero chance of success.  See issue #2508.
+        if exit_code == 9:
+            return 9
 
         # --- Pre-retry approval check (judge phase only) ---
         # If the judge already completed its work (applied loom:pr or

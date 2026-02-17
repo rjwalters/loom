@@ -957,6 +957,9 @@ run_preflight_checks() {
 
     if ! check_auth_status; then
         log_error "Authentication pre-flight check failed"
+        # Write sentinel so the shepherd can distinguish auth failures from
+        # generic instant-exits and avoid futile retries.  See issue #2508.
+        echo "# AUTH_PREFLIGHT_FAILED" >> "${LOG_FILE}"
         return 1
     fi
 

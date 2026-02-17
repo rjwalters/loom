@@ -31,6 +31,8 @@ from loom_tools.shepherd.phases.base import (
     MCP_FAILURE_BACKOFF_SECONDS,
     MCP_FAILURE_MAX_RETRIES,
     MCP_FAILURE_MIN_OUTPUT_CHARS,
+    _AUTH_FAILURE_SENTINEL,
+    _is_auth_failure,
     _is_instant_exit,
     _is_mcp_failure,
     _print_heartbeat,
@@ -13581,3 +13583,210 @@ class TestRunPhaseWithRetryMcpFailure:
 
         assert exit_code == 0
         assert call_count == 3
+
+
+# ── Auth pre-flight failure tests (issue #2508) ──────────────────────── #
+
+
+class TestIsAuthFailure:
+    """Test _is_auth_failure() detection function."""
+
+    def test_no_file(self, tmp_path: Path) -> None:
+        """Missing log file should not be classified as auth failure."""
+        assert _is_auth_failure(tmp_path / "nonexistent.log") is False
+
+    def test_empty_file(self, tmp_path: Path) -> None:
+        """Empty log file should not be classified as auth failure."""
+        log = tmp_path / "test.log"
+        log.write_text("")
+        assert _is_auth_failure(log) is False
+
+    def test_normal_log(self, tmp_path: Path) -> None:
+        """Normal session log should not be classified as auth failure."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] Pre-flight checks passed\n"
+            "# CLAUDE_CLI_START\n"
+            "Some output here\n"
+        )
+        assert _is_auth_failure(log) is False
+
+    def test_auth_failure_detected(self, tmp_path: Path) -> None:
+        """Log with AUTH_PREFLIGHT_FAILED sentinel should be detected."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "[INFO] Running pre-flight checks...\n"
+            "[ERROR] Authentication check timed out after 3 attempts\n"
+            "[ERROR] Authentication pre-flight check failed\n"
+            "# AUTH_PREFLIGHT_FAILED\n"
+        )
+        assert _is_auth_failure(log) is True
+
+    def test_auth_failure_with_ansi(self, tmp_path: Path) -> None:
+        """Auth failure sentinel should be detected even with ANSI codes."""
+        log = tmp_path / "test.log"
+        log.write_text(
+            "\033[0;31m[ERROR] Authentication pre-flight check failed\033[0m\n"
+            "# AUTH_PREFLIGHT_FAILED\n"
+        )
+        assert _is_auth_failure(log) is True
+
+
+class TestRunWorkerPhaseAuthFailure:
+    """Test that run_worker_phase returns exit code 9 for auth failures."""
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        """Create a mock ShepherdContext."""
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        scripts_dir = tmp_path / ".loom" / "scripts"
+        scripts_dir.mkdir(parents=True)
+        for script in ("agent-spawn.sh", "agent-wait-bg.sh", "agent-destroy.sh"):
+            (scripts_dir / script).touch()
+        ctx.scripts_dir = scripts_dir
+        ctx.progress_dir = tmp_path / ".loom" / "progress"
+        return ctx
+
+    def test_auth_failure_returns_code_9(self, mock_context: MagicMock) -> None:
+        """When auth pre-flight fails, return exit code 9."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_auth_failure",
+                return_value=True,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        assert exit_code == 9
+
+    def test_auth_failure_takes_priority_over_instant_exit(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Auth failure (code 9) should be checked before instant-exit (code 6)."""
+
+        def mock_spawn(cmd, **kwargs):
+            result = MagicMock()
+            result.returncode = 0
+            return result
+
+        def mock_popen(cmd, **kwargs):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.returncode = 0
+            return proc
+
+        with (
+            patch("subprocess.run", side_effect=mock_spawn),
+            patch("subprocess.Popen", side_effect=mock_popen),
+            patch("time.sleep"),
+            patch(
+                "loom_tools.shepherd.phases.base._is_auth_failure",
+                return_value=True,
+            ),
+            patch(
+                "loom_tools.shepherd.phases.base._is_instant_exit",
+                return_value=True,
+            ),
+        ):
+            exit_code = run_worker_phase(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                phase="builder",
+            )
+
+        # Auth failure takes priority over instant-exit
+        assert exit_code == 9
+
+
+class TestRunPhaseWithRetryAuthFailure:
+    """Test that auth failure (exit code 9) is not retried."""
+
+    @pytest.fixture
+    def mock_context(self, tmp_path: Path) -> MagicMock:
+        ctx = MagicMock(spec=ShepherdContext)
+        ctx.config = ShepherdConfig(issue=42, task_id="test-123")
+        ctx.repo_root = tmp_path
+        ctx.pr_number = None
+        return ctx
+
+    def test_auth_failure_returns_immediately(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Exit code 9 should be returned immediately without retry."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 9
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase",
+            side_effect=mock_run_worker,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=3,
+                phase="builder",
+            )
+
+        assert exit_code == 9
+        # Only called once — no retries
+        assert call_count == 1
+
+    def test_auth_failure_not_retried_even_with_high_max_retries(
+        self, mock_context: MagicMock
+    ) -> None:
+        """Auth failure should never be retried regardless of max_retries."""
+        call_count = 0
+
+        def mock_run_worker(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return 9
+
+        with patch(
+            "loom_tools.shepherd.phases.base.run_worker_phase",
+            side_effect=mock_run_worker,
+        ):
+            exit_code = run_phase_with_retry(
+                mock_context,
+                role="builder",
+                name="builder-issue-42",
+                timeout=600,
+                max_retries=10,
+                phase="builder",
+            )
+
+        assert exit_code == 9
+        assert call_count == 1
