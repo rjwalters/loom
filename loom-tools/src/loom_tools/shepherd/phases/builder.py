@@ -3107,14 +3107,11 @@ class BuilderPhase:
         Returns True if the worktree exists and any of these conditions hold:
         - Has commits ahead of main (needs: push, PR)
         - Has uncommitted changes AND a checkpoint exists (builder made progress)
+        - Has uncommitted changes with evidence of implementation activity
+          (log shows Edit/Write tool calls) or multiple substantive files
         - Remote branch exists but no PR (needs: PR creation)
         - PR exists but missing loom:review-requested label (needs: label)
         - Checkpoint indicates recoverable stage (tested, committed, pushed)
-
-        When uncommitted changes exist but no checkpoint is present and
-        commits_ahead == 0, returns False — the builder never started
-        meaningful work, so a full retry is more appropriate than a
-        completion phase.
         """
         if not diag.get("worktree_exists"):
             return False
@@ -3127,14 +3124,21 @@ class BuilderPhase:
 
         if diag.get("has_uncommitted_changes", False):
             # Uncommitted changes exist but no commits ahead.
-            # Only treat as incomplete if a checkpoint proves the builder
-            # actually started meaningful work.  Without a checkpoint,
-            # the builder never progressed past initialisation and a
-            # full retry is more appropriate than a completion phase.
+            # Treat as incomplete if any of these prove meaningful work:
+            # 1. A checkpoint exists (builder explicitly reported progress)
             checkpoint_stage = diag.get("checkpoint_stage")
             if checkpoint_stage is not None:
                 return True
-            # No checkpoint → builder never started, not incomplete
+            # 2. Builder log shows implementation activity (Edit/Write tool calls)
+            #    — the builder was actively coding, not just initialising
+            if diag.get("log_has_implementation_activity", False):
+                return True
+            # 3. Multiple substantive uncommitted files suggest real work
+            #    (a single file could be a marker or artifact, but ≥2 is
+            #    strong evidence of implementation)
+            if diag.get("uncommitted_file_count", 0) >= 2:
+                return True
+            # No evidence of meaningful work → full retry is more appropriate
             return False
 
         # Remote branch exists but no PR — only incomplete if there are
