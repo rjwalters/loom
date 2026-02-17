@@ -267,6 +267,119 @@ Modify `builder.py` to call it.
         vague_warnings = [f for f in result.warnings if "vague" in f.message.lower()]
         assert len(vague_warnings) >= 1
 
+    def test_numbered_action_items_satisfy_ac_check(self) -> None:
+        """Numbered action items with verbs should count as acceptance criteria."""
+        body = """## Summary
+
+Refactor the authentication module.
+
+## Implementation
+
+1. Ensure the login endpoint validates tokens correctly
+2. Verify that expired tokens return 401
+3. Update the middleware to check roles
+
+Modify `auth/middleware.py` to implement.
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert not any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_requirement_statements_satisfy_ac_check(self) -> None:
+        """Should/must/shall statements should count as acceptance criteria."""
+        body = """## Summary
+
+Fix the dashboard widget rendering.
+
+The widget should display the correct count when data is loaded.
+The API response must include pagination metadata.
+The cache should be invalidated after updates.
+
+See `dashboard/widgets.py` for the rendering logic.
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert not any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_bug_report_pattern_satisfies_ac_check(self) -> None:
+        """Observed + Expected Behavior headings should count as acceptance criteria."""
+        body = """## Summary
+
+Login button does not respond on mobile.
+
+## Observed Behavior
+
+Clicking the login button on mobile does nothing. No network request is made.
+
+## Expected Behavior
+
+Clicking the login button should trigger the OAuth flow and redirect to the provider.
+
+## Steps to Reproduce
+
+1. Open the app on a mobile device
+2. Click "Login"
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert not any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_multiple_file_refs_satisfy_ac_check(self) -> None:
+        """3+ file references should indicate a well-researched issue."""
+        body = """## Summary
+
+Update the shepherd configuration to support new timeout settings.
+
+The changes affect `config.py`, `builder.py`, and `issue_quality.py`.
+Also update the tests in `test_config.py`.
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert not any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_single_numbered_item_not_enough(self) -> None:
+        """A single numbered action item should not satisfy the check."""
+        body = """## Summary
+
+Fix the crash bug.
+
+1. Ensure it doesn't crash anymore.
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_single_requirement_not_enough(self) -> None:
+        """A single should/must statement should not satisfy the check."""
+        body = """## Summary
+
+The system should not crash.
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_vague_issue_still_warns(self) -> None:
+        """Genuinely vague issues without quality signals should still warn."""
+        body = "Fix the crash bug."
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert any("acceptance criteria" in w.lower() for w in warnings)
+
+    def test_observed_without_expected_not_enough(self) -> None:
+        """Only Observed Behavior without Expected Behavior should not satisfy the check."""
+        body = """## Summary
+
+Bug report.
+
+## Observed Behavior
+
+The app crashes on startup.
+"""
+        result = validate_issue_quality(body)
+        warnings = [f.message for f in result.warnings]
+        assert any("acceptance criteria" in w.lower() for w in warnings)
+
     def test_severity_classification(self) -> None:
         """Warnings and infos should have correct severity levels."""
         # Issue with no AC, no test plan, no file refs
@@ -436,6 +549,22 @@ Modify `builder.py`.
         result = validate_issue_quality_with_gates(body, gates)
         assert result.has_blocking_findings is True
         assert any("vague" in f.message.lower() for f in result.blocks)
+
+    def test_strict_gates_with_quality_signals_no_block(self) -> None:
+        """Strict gates should not block when content-quality signals are present."""
+        body = """## Summary
+
+Refactor the auth module.
+
+1. Ensure tokens are validated properly
+2. Verify expired tokens return 401
+3. Check that role-based access works
+
+See `auth/middleware.py` and `auth/tokens.py`.
+"""
+        gates = QualityGates.strict()
+        result = validate_issue_quality_with_gates(body, gates)
+        assert not any("acceptance criteria" in f.message.lower() for f in result.blocks)
 
     def test_all_info_gates_no_warnings(self) -> None:
         """When all gates are INFO, findings should be INFO level."""
