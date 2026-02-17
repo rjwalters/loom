@@ -75,8 +75,8 @@ def test_strip_ansi_keypad_mode() -> None:
 def test_strip_ansi_realistic_log_output() -> None:
     """Strips ANSI from realistic terminal log output."""
     # Typical colored log line
-    text = "\x1b[0;34m[10:30:45]\x1b[0m \x1b[0;32m[INFO]\x1b[0m Starting build..."
-    assert strip_ansi(text) == "[10:30:45] [INFO] Starting build..."
+    text = "\x1b[0;34m[2026-02-17T10:30:45Z]\x1b[0m \x1b[0;32m[INFO]\x1b[0m Starting build..."
+    assert strip_ansi(text) == "[2026-02-17T10:30:45Z] [INFO] Starting build..."
 
 
 def test_strip_ansi_multiline() -> None:

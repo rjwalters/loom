@@ -74,15 +74,15 @@ fi
 
 # Logging helpers
 log_info() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*" >&2
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [INFO] $*" >&2
 }
 
 log_warn() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $*" >&2
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [WARN] $*" >&2
 }
 
 log_error() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*" >&2
+    echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] [ERROR] $*" >&2
 }
 
 # Write retry state to a JSON file for external observability (issue #2296).
