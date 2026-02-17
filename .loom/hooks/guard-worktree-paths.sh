@@ -66,10 +66,10 @@ fi
 # Normalize the path: resolve .. and . components without requiring the file to exist.
 # Use Python's os.path.normpath for reliable path normalization (handles ../ etc.)
 # Falls back to the raw path if Python is unavailable.
-NORM_PATH=$(python3 -c "import os; print(os.path.normpath('$FILE_PATH'))" 2>/dev/null) || NORM_PATH="$FILE_PATH"
+NORM_PATH=$(printf '%s' "$FILE_PATH" | python3 -c "import os,sys; print(os.path.normpath(sys.stdin.read()))" 2>/dev/null) || NORM_PATH="$FILE_PATH"
 
 # Check if the normalized path starts with the worktree path
-if [[ "$NORM_PATH" == "$WORKTREE_REAL"* ]] || [[ "$NORM_PATH" == "$WORKTREE_PATH"* ]]; then
+if [[ "$NORM_PATH/" == "$WORKTREE_REAL/"* ]] || [[ "$NORM_PATH/" == "$WORKTREE_PATH/"* ]]; then
     # Path is within the worktree — allow
     exit 0
 fi
