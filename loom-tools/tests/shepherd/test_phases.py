@@ -9415,6 +9415,73 @@ class TestBuilderDirectCompletion:
 
         assert result is False
 
+    def test_checkpoints_written_after_each_step(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """Should write checkpoints after stage_and_commit, push, and create_pr."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": True,
+            "commits_ahead": 0,
+            "remote_branch_exists": False,
+            "pr_number": None,
+            "pr_has_review_label": False,
+        }
+
+        with (
+            patch.object(builder, "_stage_and_commit", return_value=True),
+            patch.object(builder, "_push_branch", return_value=True),
+            patch(
+                "loom_tools.shepherd.phases.builder.subprocess.run"
+            ) as mock_run,
+        ):
+            mock_run.side_effect = [
+                MagicMock(returncode=0, stdout="", stderr=""),
+                MagicMock(returncode=0, stderr=""),
+            ]
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        # Verify checkpoint file exists and reflects final stage
+        from loom_tools.checkpoints import read_checkpoint
+        checkpoint = read_checkpoint(worktree)
+        assert checkpoint is not None
+        assert checkpoint.stage == "pr_created"
+        assert checkpoint.issue == 42
+
+    def test_checkpoint_written_after_push_only(
+        self, mock_context: MagicMock, tmp_path: Path
+    ) -> None:
+        """When only push_branch runs, checkpoint should be 'pushed'."""
+        builder = BuilderPhase()
+        mock_context.repo_root = Path("/fake/repo")
+        worktree = tmp_path / "issue-42"
+        worktree.mkdir()
+        mock_context.worktree_path = worktree
+        mock_context.config = ShepherdConfig(issue=42)
+        diag = {
+            "has_uncommitted_changes": False,
+            "commits_ahead": 2,
+            "remote_branch_exists": False,
+            "pr_number": 100,
+            "pr_has_review_label": True,
+            "branch": "feature/issue-42",
+        }
+
+        with patch.object(builder, "_push_branch", return_value=True):
+            result = builder._direct_completion(mock_context, diag)
+
+        assert result is True
+        from loom_tools.checkpoints import read_checkpoint
+        checkpoint = read_checkpoint(worktree)
+        assert checkpoint is not None
+        assert checkpoint.stage == "pushed"
+
 
 class TestBuilderStageAndCommit:
     """Test _stage_and_commit for direct mechanical staging and committing."""

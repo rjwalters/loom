@@ -16,6 +16,7 @@ from loom_tools.checkpoints import (
     Checkpoint,
     get_recovery_recommendation,
     read_checkpoint,
+    write_checkpoint,
 )
 from loom_tools.common.git import get_changed_files, parse_porcelain_path
 from loom_tools.common.logging import log_error, log_info, log_success, log_warning
@@ -3545,12 +3546,22 @@ class BuilderPhase:
                     log_warning("Direct completion: stage_and_commit failed")
                     return False
                 log_success("Direct completion: changes committed")
+                if ctx.worktree_path:
+                    write_checkpoint(
+                        ctx.worktree_path, "committed",
+                        issue=ctx.config.issue, quiet=True,
+                    )
 
             elif step == "push_branch":
                 if not self._push_branch(ctx):
                     log_warning("Direct completion: push failed")
                     return False
                 log_success("Direct completion: branch pushed")
+                if ctx.worktree_path:
+                    write_checkpoint(
+                        ctx.worktree_path, "pushed",
+                        issue=ctx.config.issue, quiet=True,
+                    )
 
             elif step == "create_pr":
                 branch = diag.get(
@@ -3607,6 +3618,11 @@ class BuilderPhase:
                 log_success(
                     f"Direct completion: PR created for issue #{ctx.config.issue}"
                 )
+                if ctx.worktree_path:
+                    write_checkpoint(
+                        ctx.worktree_path, "pr_created",
+                        issue=ctx.config.issue, quiet=True,
+                    )
 
             elif step == "add_review_label":
                 pr_num = diag.get("pr_number")
