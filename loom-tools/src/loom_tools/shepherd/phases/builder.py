@@ -3484,10 +3484,11 @@ class BuilderPhase:
             self._remove_stale_worktree(ctx)
 
     def _remove_stale_worktree(self, ctx: ShepherdContext) -> None:
-        """Remove a stale worktree and its branch.
+        """Remove a stale worktree and its branches (local and remote).
 
         Called as a fallback when resetting fails. Removes the worktree
-        and deletes the local branch so worktree.sh can recreate it.
+        and deletes both local and remote branches so worktree.sh can
+        recreate cleanly without stale artifacts (issue #2415).
         """
         if not ctx.worktree_path or not ctx.worktree_path.is_dir():
             return
@@ -3509,13 +3510,26 @@ class BuilderPhase:
             check=False,
         )
 
-        # Delete branch
         if branch and branch != "main":
+            # Delete local branch
             subprocess.run(
                 ["git", "-C", str(ctx.repo_root), "branch", "-D", branch],
                 capture_output=True,
                 check=False,
             )
+
+            # Delete remote branch to prevent stale artifacts (issue #2415)
+            del_result = subprocess.run(
+                [
+                    "git", "-C", str(ctx.repo_root),
+                    "push", "origin", "--delete", branch,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if del_result.returncode == 0:
+                log_info(f"Deleted stale remote branch {branch}")
 
         log_info(f"Removed stale worktree {ctx.worktree_path} and branch {branch}")
 
@@ -3570,10 +3584,18 @@ class BuilderPhase:
                 check=False,
             )
 
-            # Remove empty branch
+            # Remove empty branch (local and remote, issue #2415)
             if branch and branch != "main":
                 subprocess.run(
                     ["git", "-C", str(ctx.repo_root), "branch", "-d", branch],
+                    capture_output=True,
+                    check=False,
+                )
+                subprocess.run(
+                    [
+                        "git", "-C", str(ctx.repo_root),
+                        "push", "origin", "--delete", branch,
+                    ],
                     capture_output=True,
                     check=False,
                 )

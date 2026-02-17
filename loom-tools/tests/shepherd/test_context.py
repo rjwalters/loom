@@ -725,3 +725,152 @@ class TestValidateIssueMergedPR:
 
         assert exc_info.value.state == "RESOLVED by merged PR #333"
         assert exc_info.value.issue == 42
+
+class TestStaleBranchCleanup:
+    """Tests for stale branch cleanup in force/merge mode (issue #2415)."""
+
+    def test_force_mode_cleans_up_stale_branch(self, tmp_path: Path) -> None:
+        """In force mode, stale remote branches are deleted."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            if "ls-remote" in cmd:
+                result.returncode = 0
+                result.stdout = "abc123\trefs/heads/feature/issue-42\n"
+            elif "push" in cmd and "--delete" in cmd:
+                result.returncode = 0
+                result.stdout = ""
+                result.stderr = ""
+            else:
+                result.returncode = 0
+                result.stdout = ""
+                result.stderr = ""
+            return result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run),              patch("loom_tools.shepherd.context.gh_list", return_value=[]):
+            ctx._check_stale_branch(42)
+
+        # Should have called git push origin --delete
+        push_calls = [c for c in calls if "push" in c and "--delete" in c]
+        assert len(push_calls) == 1
+        assert "feature/issue-42" in push_calls[0]
+
+    def test_force_mode_closes_stale_prs(self, tmp_path: Path) -> None:
+        """In force mode, open PRs on stale branches are closed."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            if "ls-remote" in cmd:
+                result.returncode = 0
+                result.stdout = "abc123\trefs/heads/feature/issue-42\n"
+            else:
+                result.returncode = 0
+                result.stdout = ""
+                result.stderr = ""
+            return result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run),              patch("loom_tools.shepherd.context.gh_list", return_value=[{"number": 99}]):
+            ctx._check_stale_branch(42)
+
+        # Should have called gh pr close 99
+        pr_close_calls = [c for c in calls if "gh" in c and "close" in c]
+        assert len(pr_close_calls) == 1
+        assert "99" in pr_close_calls[0]
+
+    def test_default_mode_only_warns(self, tmp_path: Path) -> None:
+        """In default mode, stale branches produce a warning but no cleanup."""
+        ctx = _make_context(tmp_path, issue=42)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            if "ls-remote" in cmd:
+                result.returncode = 0
+                result.stdout = "abc123\trefs/heads/feature/issue-42\n"
+            else:
+                result.returncode = 0
+                result.stdout = ""
+            return result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run),              patch("loom_tools.shepherd.context.gh_list", return_value=[]):
+            ctx._check_stale_branch(42)
+
+        # Should NOT have called git push origin --delete
+        push_calls = [c for c in calls if "push" in c and "--delete" in c]
+        assert len(push_calls) == 0
+        # Should have a warning
+        assert len(ctx.warnings) == 1
+        assert "Stale branch" in ctx.warnings[0]
+
+    def test_default_mode_skips_branch_with_open_pr(self, tmp_path: Path) -> None:
+        """In default mode, branches with open PRs are not considered stale."""
+        ctx = _make_context(tmp_path, issue=42)
+
+        def mock_run(cmd, **kwargs):
+            result = MagicMock()
+            if "ls-remote" in cmd:
+                result.returncode = 0
+                result.stdout = "abc123\trefs/heads/feature/issue-42\n"
+            else:
+                result.returncode = 0
+                result.stdout = ""
+            return result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run),              patch("loom_tools.shepherd.context.gh_list", return_value=[{"number": 99}]):
+            ctx._check_stale_branch(42)
+
+        # No warning -- branch has an open PR
+        assert len(ctx.warnings) == 0
+
+    def test_force_mode_cleans_up_branch_with_open_pr(self, tmp_path: Path) -> None:
+        """In force mode, branches with open PRs ARE cleaned up."""
+        config = ShepherdConfig(
+            issue=42, task_id="abc1234", mode=ExecutionMode.FORCE_MERGE
+        )
+        (tmp_path / ".loom" / "progress").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".loom" / "worktrees").mkdir(parents=True, exist_ok=True)
+        ctx = ShepherdContext(config=config, repo_root=tmp_path)
+
+        calls: list[list[str]] = []
+
+        def mock_run(cmd, **kwargs):
+            calls.append(cmd)
+            result = MagicMock()
+            if "ls-remote" in cmd:
+                result.returncode = 0
+                result.stdout = "abc123\trefs/heads/feature/issue-42\n"
+            else:
+                result.returncode = 0
+                result.stdout = ""
+                result.stderr = ""
+            return result
+
+        with patch("loom_tools.shepherd.context.subprocess.run", side_effect=mock_run), \
+             patch("loom_tools.shepherd.context.gh_list", return_value=[{"number": 88}]):
+            ctx._check_stale_branch(42)
+
+        # Should have closed the PR AND deleted the branch
+        pr_close_calls = [c for c in calls if "gh" in c and "close" in c]
+        push_calls = [c for c in calls if "push" in c and "--delete" in c]
+        assert len(pr_close_calls) == 1
+        assert len(push_calls) == 1
