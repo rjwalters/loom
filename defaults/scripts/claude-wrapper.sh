@@ -824,6 +824,16 @@ start_startup_monitor() {
                     break
                 fi
 
+                # Check if the critical "loom" MCP server connected successfully.
+                # If it did, the failure is a non-critical server (e.g. stale sphere
+                # config) and the session can continue working.
+                local debug_log="${CLAUDE_CONFIG_DIR:-}/debug/latest"
+                if [[ -L "${debug_log}" || -f "${debug_log}" ]] && \
+                   grep -q 'MCP server "loom": Successfully connected' "${debug_log}" 2>/dev/null; then
+                    log_warn "Startup monitor: loom MCP server OK despite other MCP failures — continuing"
+                    break
+                fi
+
                 log_warn "Startup monitor: killing degraded CLI session for retry"
                 pkill -INT -P $$ -f "claude" 2>/dev/null || true
                 break
