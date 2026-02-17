@@ -35,6 +35,7 @@ from loom_tools.shepherd.phases.base import (
     _is_mcp_failure,
     _print_heartbeat,
     _strip_spinner_noise,
+    _strip_ui_chrome,
     _read_heartbeats,
     run_phase_with_retry,
     run_worker_phase,
@@ -12443,6 +12444,221 @@ class TestStripSpinnerNoise:
         text = "(thinking)\n" * 20 + "Tinkering…\n" * 10
         result = _strip_spinner_noise(text)
         assert len(result.strip()) == 0
+
+
+class TestStripUiChrome:
+    """Test _strip_ui_chrome helper function (issue #2435)."""
+
+    def test_strips_version_banner(self) -> None:
+        text = "real output\n ▐▛███▜▌   Claude Code v2.1.29\nmore output\n"
+        result = _strip_ui_chrome(text)
+        assert "Claude Code v" not in result
+        assert "real output" in result
+        assert "more output" in result
+
+    def test_strips_model_info(self) -> None:
+        text = "real output\n▝▜█████▛▘  Opus 4.5 · Claude Max\nmore output\n"
+        result = _strip_ui_chrome(text)
+        assert "Opus 4.5" not in result
+        assert "real output" in result
+
+    def test_strips_sonnet_model_info(self) -> None:
+        text = "Sonnet 4.5 · API\n"
+        result = _strip_ui_chrome(text)
+        assert len(result.strip()) == 0
+
+    def test_strips_haiku_model_info(self) -> None:
+        text = "Haiku 4.5 · API\n"
+        result = _strip_ui_chrome(text)
+        assert len(result.strip()) == 0
+
+    def test_strips_working_directory(self) -> None:
+        text = "  ▘▘ ▝▝    ~/GitHub/loom/.loom/worktrees/issue-42\n"
+        result = _strip_ui_chrome(text)
+        assert "~/GitHub" not in result
+
+    def test_strips_separator_lines(self) -> None:
+        text = "real output\n────────────────────────────────\nmore output\n"
+        result = _strip_ui_chrome(text)
+        assert "─" not in result
+        assert "real output" in result
+
+    def test_strips_prompt_lines(self) -> None:
+        text = '❯ Try "how do I log an error?"\nreal output\n'
+        result = _strip_ui_chrome(text)
+        assert "❯" not in result
+        assert "real output" in result
+
+    def test_strips_permission_indicators(self) -> None:
+        text = "  ⏵⏵ bypass permissions on (shift+tab to cycle)\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "bypass permissions" not in result
+        assert "real output" in result
+
+    def test_strips_esc_to_interrupt(self) -> None:
+        text = "· esc to interrupt\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "esc to interrupt" not in result
+
+    def test_strips_usage_limit(self) -> None:
+        text = "You've used\n91% of\nyour weekly\nresets Feb 5 at 10pm\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "You've used" not in result
+        assert "91% of" not in result
+        assert "your weekly" not in result
+        assert "resets Feb" not in result
+        assert "real output" in result
+
+    def test_strips_shell_prompt(self) -> None:
+        text = "rwalters@studio issue-2435 %\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "rwalters@studio" not in result
+        assert "real output" in result
+
+    def test_strips_command_echo(self) -> None:
+        text = "/builder 2055\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "/builder" not in result
+        assert "real output" in result
+
+    def test_strips_block_art_lines(self) -> None:
+        text = "▐▛███▜▌\n▝▜█████▛▘\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "▐▛" not in result
+        assert "real output" in result
+
+    def test_strips_spinner_status_line(self) -> None:
+        text = "· Photosynthesizing…\nreal output\n"
+        result = _strip_ui_chrome(text)
+        assert "Photosynthesizing" not in result
+        assert "real output" in result
+
+    def test_preserves_normal_output(self) -> None:
+        text = "Reading file /src/main.py\nEditing line 42\nRunning tests...\n"
+        result = _strip_ui_chrome(text)
+        assert result.strip() == text.strip()
+
+    def test_preserves_blank_lines(self) -> None:
+        text = "line1\n\nline2\n"
+        result = _strip_ui_chrome(text)
+        assert "\n\n" in result
+
+    def test_full_ui_chrome_session_stripped(self) -> None:
+        """Realistic UI chrome from a session with no productive work.
+
+        This simulates the ~2,700+ chars of startup UI that defeat
+        the 100-char instant-exit threshold (issue #2435).
+        """
+        ui_chrome = (
+            " ▐▛███▜▌   Claude Code v2.1.29\n"
+            "▝▜█████▛▘  Opus 4.5 · Claude Max\n"
+            "  ▘▘ ▝▝    ~/GitHub/loom/.loom/worktrees/issue-42\n"
+            "\n"
+            "────────────────────────────────────────────────────\n"
+            '❯ Try "how do I log an error?"\n'
+            "────────────────────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+            "/builder 2055\n"
+            "· Photosynthesizing…\n"
+            "· esc to interrupt\n"
+            "You've used\n"
+            " 91% of\n"
+            "your weekly\n"
+            " limit ·\n"
+            "resets Feb 5 at 10pm\n"
+            "rwalters@studio issue-42 %\n"
+        )
+        # Verify the raw text exceeds the threshold
+        assert len(ui_chrome) > INSTANT_EXIT_MIN_OUTPUT_CHARS
+        # But after stripping, it should be minimal
+        result = _strip_ui_chrome(ui_chrome)
+        assert len(result.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+
+
+class TestIsInstantExitWithUiChrome:
+    """Test that _is_instant_exit correctly detects instant exits with UI chrome.
+
+    Regression tests for issue #2435: Claude Code's startup UI chrome
+    generates ~2,700+ chars which defeated the old 100-char threshold.
+    """
+
+    def test_ui_chrome_only_detected_as_instant_exit(self, tmp_path: Path) -> None:
+        """Session with only UI chrome (no productive work) should be instant exit."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# Loom Agent Log\n"
+            "# Session: loom-builder-issue-42\n"
+            "[INFO] Claude wrapper starting\n"
+            "[INFO] Pre-flight checks passed\n"
+            "[INFO] Attempt 1/5: Starting Claude CLI\n"
+            "# CLAUDE_CLI_START\n"
+            " ▐▛███▜▌   Claude Code v2.1.29\n"
+            "▝▜█████▛▘  Opus 4.5 · Claude Max\n"
+            "  ▘▘ ▝▝    ~/GitHub/loom/.loom/worktrees/issue-42\n"
+            "\n"
+            "────────────────────────────────────────────────────\n"
+            '❯ Try "how do I log an error?"\n'
+            "────────────────────────────────────────────────────\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+            "/builder 42\n"
+            "· Photosynthesizing…\n"
+            "· esc to interrupt\n"
+            "rwalters@studio issue-42 %\n"
+        )
+        assert _is_instant_exit(log) is True
+
+    def test_ui_chrome_plus_real_work_not_instant_exit(
+        self, tmp_path: Path
+    ) -> None:
+        """Session with UI chrome AND real work should NOT be instant exit."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            " ▐▛███▜▌   Claude Code v2.1.29\n"
+            "▝▜█████▛▘  Opus 4.5 · Claude Max\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+            "Reading file /src/main.py...\n"
+            "Found 42 functions to analyze.\n"
+            "Editing /src/main.py line 15: adding error handling.\n"
+            "Running pytest... all tests passed.\n"
+        )
+        assert _is_instant_exit(log) is False
+
+
+class TestIsMcpFailureWithUiChrome:
+    """Test that _is_mcp_failure correctly detects failures with UI chrome.
+
+    Regression tests for issue #2435.
+    """
+
+    def test_mcp_failure_with_ui_chrome_detected(self, tmp_path: Path) -> None:
+        """MCP failure message should be detected even with UI chrome padding."""
+        log = tmp_path / "session.log"
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            " ▐▛███▜▌   Claude Code v2.1.29\n"
+            "▝▜█████▛▘  Opus 4.5 · Claude Max\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+            "────────────────────────────────────────────────────\n"
+            "1 MCP server failed\n"
+            "rwalters@studio issue-42 %\n"
+        )
+        assert _is_mcp_failure(log) is True
+
+    def test_mcp_pattern_with_productive_output_not_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """Session with UI chrome + real work + MCP pattern should NOT be failure."""
+        log = tmp_path / "session.log"
+        productive = "Implementing feature for issue #42...\n" * 50
+        log.write_text(
+            "# CLAUDE_CLI_START\n"
+            " ▐▛███▜▌   Claude Code v2.1.29\n"
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)\n"
+            "bypasspermissionson · 1 MCP server failed · /mcp\n"
+            f"{productive}"
+        )
+        assert _is_mcp_failure(log) is False
 
 
 class TestRunWorkerPhaseMcpFailure:

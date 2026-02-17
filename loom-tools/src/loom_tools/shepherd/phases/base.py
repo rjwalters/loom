@@ -85,6 +85,109 @@ _SPINNER_DECORATION_CHARS = frozenset("✶✻✽✳✢·✦✧★☆●○◆◇
 # for a line to be classified as garbled spinner noise.
 _SPINNER_DECORATION_THRESHOLD = 0.3
 
+# --------------------------------------------------------------------------- #
+# Claude Code UI chrome filtering (issue #2435)
+#
+# Claude Code's startup UI (version banner, model info, tips, permission
+# indicators, usage limits, etc.) generates ~2,700+ characters of terminal
+# output even when a session does zero actual work.  This defeats the
+# character-count thresholds in _is_instant_exit() and _is_mcp_failure().
+#
+# The patterns below identify known UI chrome lines so they can be stripped
+# before counting output volume.
+# --------------------------------------------------------------------------- #
+
+# Block-element and box-drawing characters used in Claude Code's decorative
+# banner art.  Lines dominated by these characters are UI decoration.
+_UI_BLOCK_CHARS = frozenset(
+    "▐▛▜▝▘█▌▀▄░▒▓│╭╮╰╯├┤┬┴┼─═║╔╗╚╝╠╣╦╩╬"
+)
+
+# Fraction of non-whitespace characters that must be block/box-drawing
+# chars for a line to be classified as decorative UI art.
+_UI_BLOCK_THRESHOLD = 0.5
+
+# Per-line regex patterns matching known Claude Code UI chrome text.
+# Applied to ANSI-stripped lines.
+_UI_CHROME_LINE_PATTERNS = [
+    # Version banner: " ▐▛███▜▌   Claude Code v2.1.29"
+    re.compile(r"Claude Code\s+v\d"),
+    # Model info: "Opus 4.5 · Claude Max", "Sonnet 4.5 · API", etc.
+    re.compile(r"(?:Opus|Sonnet|Haiku)\s+\d+\.\d+"),
+    # Working directory display (after banner art prefix)
+    re.compile(r"~/"),
+    # Separator lines: pure horizontal rules
+    re.compile(r"^─+$"),
+    # Prompt / suggestion lines
+    re.compile(r"^❯"),
+    re.compile(r'^Try "'),
+    # Permission mode indicators
+    re.compile(r"bypass permissions"),
+    re.compile(r"⏵"),
+    # Keyboard hints
+    re.compile(r"esc to interrupt"),
+    re.compile(r"shift\+tab"),
+    # Usage limit warnings
+    re.compile(r"You've used"),
+    re.compile(r"\d+%\s+of\b"),
+    re.compile(r"your weekly"),
+    re.compile(r"resets\s+\w+\s+\d"),
+    # Shell prompt capture: "user@host dir % "
+    re.compile(r"^\w+@\w+\s+\S+\s+%\s*$"),
+    # Skill/command echo: "/builder 2055"
+    re.compile(r"^/\w+\s+\d+\s*$"),
+    # Spinner status line: "· Photosynthesizing…"
+    re.compile(r"^·\s"),
+]
+
+
+def _strip_ui_chrome(text: str) -> str:
+    """Remove Claude Code UI chrome from output text.
+
+    Strips startup UI elements that appear in every CLI session regardless
+    of whether productive work was performed:
+
+    - Version banner and model info
+    - Decorative block/box-drawing banner art
+    - Working directory display
+    - Separator / horizontal rule lines
+    - Prompt suggestions and permission mode indicators
+    - Usage limit warnings
+    - Shell prompt lines and keyboard hints
+
+    This prevents the ~2,700+ characters of UI chrome from inflating the
+    output volume metric used by ``_is_instant_exit()`` and
+    ``_is_mcp_failure()``.  See issue #2435.
+
+    Args:
+        text: CLI output text (already ANSI-stripped).
+
+    Returns:
+        Text with UI chrome lines removed.
+    """
+    lines = text.splitlines()
+    filtered = []
+    for line in lines:
+        stripped_line = line.strip()
+        if not stripped_line:
+            filtered.append(line)
+            continue
+
+        # Check against known UI chrome patterns
+        if any(p.search(stripped_line) for p in _UI_CHROME_LINE_PATTERNS):
+            continue
+
+        # Lines dominated by block/box-drawing characters (banner art)
+        non_ws = [c for c in stripped_line if not c.isspace()]
+        if non_ws:
+            block_count = sum(1 for c in non_ws if c in _UI_BLOCK_CHARS)
+            if block_count / len(non_ws) >= _UI_BLOCK_THRESHOLD:
+                continue
+
+        filtered.append(line)
+
+    return "\n".join(filtered)
+
 
 def _strip_spinner_noise(text: str) -> str:
     """Remove CLI spinner and thinking noise from output text.
@@ -441,14 +544,11 @@ def _is_mcp_failure(log_path: Path) -> bool:
         stripped = strip_ansi(content)
 
         # If the session produced substantial CLI output beyond headers,
-        # wrapper pre-flight, and spinner noise, it was productive — MCP
-        # text is just status bar noise.  See issues #2374, #2381, #2401.
-        #
-        # Strip spinner/thinking noise before checking volume to prevent
-        # garbled terminal capture of animated spinners from inflating
-        # the character count.  See issue #2465.
+        # wrapper pre-flight, spinner noise, and UI chrome, it was
+        # productive — MCP text is just status bar noise.
+        # See issues #2374, #2381, #2401, #2435, #2465.
         cli_output = _get_cli_output(stripped)
-        cleaned_output = _strip_spinner_noise(cli_output)
+        cleaned_output = _strip_ui_chrome(_strip_spinner_noise(cli_output))
         if len(cleaned_output.strip()) >= MCP_FAILURE_MIN_OUTPUT_CHARS:
             return False
 
@@ -497,8 +597,13 @@ def _is_instant_exit(log_path: Path) -> bool:
         # Exclude log header lines and wrapper pre-flight output (everything
         # before the last ``# CLAUDE_CLI_START`` sentinel) so that only
         # actual Claude CLI output counts.  See issues #2135, #2381, #2401.
+        #
+        # Strip UI chrome (version banner, tips, permission indicators, etc.)
+        # and spinner noise before counting to prevent the ~2,700+ chars of
+        # startup UI from defeating the threshold.  See issue #2435.
         cli_output = _get_cli_output(stripped)
-        return len(cli_output.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
+        cleaned = _strip_ui_chrome(_strip_spinner_noise(cli_output))
+        return len(cleaned.strip()) < INSTANT_EXIT_MIN_OUTPUT_CHARS
     except OSError:
         return False
 
